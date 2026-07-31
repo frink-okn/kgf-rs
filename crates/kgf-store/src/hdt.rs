@@ -296,7 +296,7 @@ pub struct BitmapTriples<'a> {
 
 impl<'a> BitmapTriples<'a> {
     /// Assemble a permutation from its four regions and their directories.
-    pub fn new(
+    pub(crate) fn new(
         array_y: PackedArray<'a>,
         bitmap_y: RankedBitmap<'a>,
         array_z: PackedArray<'a>,
