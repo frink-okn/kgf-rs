@@ -16,9 +16,9 @@ Source/
 
 All three are Jim's. hdtc is github.com/frink-okn/hdtc; kgf-rs has **no remote yet**.
 
-| repo | branch | unpushed / uncommitted |
+| repo | branch | status |
 |---|---|---|
-| `kgf-rs` | `main` | 4 commits, no remote; unit 3 uncommitted |
+| `kgf-rs` | `main` | no remote; units 1–4 implemented |
 | `kgf` | `main` | 2 commits ahead of `origin/main` |
 | `hdtc` | `lib` | 1 commit, plus uncommitted work: the `try_init` change (below) and unit 3's façade additions |
 

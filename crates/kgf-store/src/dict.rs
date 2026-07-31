@@ -310,12 +310,8 @@ impl PfcView<'_> {
         Ok(&self.buffer[start as usize..end as usize])
     }
 
-    fn block_head(&self, block: u64) -> Result<&[u8]> {
-        let bytes = self.block(block)?;
-        let end = terminator(bytes).ok_or_else(|| {
-            Error::Region(format!("PFC block {block} head has no null terminator"))
-        })?;
-        Ok(&bytes[..end])
+    fn compare_block_head(&self, block: u64, key: &[u8]) -> Result<Ordering> {
+        compare_terminated_head(self.block(block)?, key, block)
     }
 
     /// Find the first zero-based position whose term is not less than `key`.
@@ -334,7 +330,7 @@ impl PfcView<'_> {
         let mut high = self.blocks();
         while low < high {
             let middle = low + (high - low) / 2;
-            if self.block_head(middle)?.cmp(key) != Ordering::Greater {
+            if self.compare_block_head(middle, key)? != Ordering::Greater {
                 low = middle + 1;
             } else {
                 high = middle;
@@ -402,6 +398,35 @@ impl PfcView<'_> {
 
 fn terminator(bytes: &[u8]) -> Option<usize> {
     bytes.iter().position(|&byte| byte == 0)
+}
+
+/// Compare a block's verbatim, null-terminated head with `key` without first
+/// scanning the whole head. Request terms are capped, while a legal stored
+/// literal can be megabytes, so a binary-search probe must stop as soon as the
+/// ordering is known.
+fn compare_terminated_head(block: &[u8], key: &[u8], block_index: u64) -> Result<Ordering> {
+    for (index, &key_byte) in key.iter().enumerate() {
+        let head_byte = *block.get(index).ok_or_else(|| {
+            Error::Region(format!(
+                "PFC block {block_index} head ends without a null terminator"
+            ))
+        })?;
+        if head_byte == 0 {
+            return Ok(Ordering::Less);
+        }
+        match head_byte.cmp(&key_byte) {
+            Ordering::Equal => {}
+            ordering => return Ok(ordering),
+        }
+    }
+
+    match block.get(key.len()) {
+        Some(0) => Ok(Ordering::Equal),
+        Some(_) => Ok(Ordering::Greater),
+        None => Err(Error::Region(format!(
+            "PFC block {block_index} head ends without a null terminator"
+        ))),
+    }
 }
 
 fn decode_next(
@@ -652,6 +677,27 @@ mod tests {
             predicates: u64::MAX,
         };
         assert!(no_one_past_predicate.validate_role_lengths().is_err());
+    }
+
+    #[test]
+    fn block_head_comparison_stops_when_order_is_known() {
+        // The missing terminator is a canary: payload verification is off the
+        // query path, which must not inspect bytes after the decisive first
+        // byte. A valid head may have an equally large tail before its terminator.
+        let long_tail = vec![b'z'; 1024 * 1024];
+        assert_eq!(
+            compare_terminated_head(&long_tail, b"a", 0).unwrap(),
+            Ordering::Greater
+        );
+
+        assert_eq!(
+            compare_terminated_head(b"alpha\0suffix", b"alpha", 0).unwrap(),
+            Ordering::Equal
+        );
+        assert_eq!(
+            compare_terminated_head(b"alpha\0suffix", b"alphabet", 0).unwrap(),
+            Ordering::Less
+        );
     }
 
     #[test]
