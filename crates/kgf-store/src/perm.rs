@@ -20,7 +20,8 @@
 //! [`PackedArray`](crate::map::PackedArray) either way.
 
 use hdtc::format::{
-    PermutationComponent, PermutationIndex, PermutationSection, PermutationSectionKind,
+    PermutationComponent, PermutationIndex, PermutationIndexOpenError, PermutationSection,
+    PermutationSectionKind,
 };
 
 use crate::error::{Error, Result};
@@ -143,12 +144,20 @@ impl Permutations {
     /// obligation documented by [`Mapping::open`](crate::map::Mapping::open).
     pub fn open(hdt: Mapping, sidecar: Mapping) -> Result<Self> {
         let hdt_layout = HdtLayout::parse(&hdt)?;
-        let index = PermutationIndex::open(sidecar.path(), hdt.path()).map_err(|error| {
-            Error::Malformed {
-                artifact: sidecar.path().to_path_buf(),
-                detail: format!("{error:#}"),
-            }
-        })?;
+        let index =
+            PermutationIndex::open(sidecar.path(), hdt.path()).map_err(|error| match error {
+                PermutationIndexOpenError::Binding { source } => Error::ArtifactBindingMismatch {
+                    artifact: sidecar.path().to_path_buf(),
+                    hdt: hdt.path().to_path_buf(),
+                    detail: format!("{source:#}"),
+                },
+                PermutationIndexOpenError::Sidecar { source } => Error::Format(source.context(
+                    format!("opening permutation index {}", sidecar.path().display()),
+                )),
+                PermutationIndexOpenError::Source { source } => Error::Format(
+                    source.context(format!("validating source HDT {}", hdt.path().display())),
+                ),
+            })?;
         let pos = PermutationSpec::sidecar(&index, &sidecar, PermutationComponent::Pos)?;
         let ops = PermutationSpec::sidecar(&index, &sidecar, PermutationComponent::Ops)?;
         let spo = PermutationSpec::spo(&index, &sidecar, *hdt_layout.spo())?;
@@ -362,10 +371,18 @@ mod tests {
 
         let error = Permutations::open(second.map_hdt(), first.map_perm())
             .expect_err("foreign sidecar must be refused");
-        assert!(
-            error.to_string().contains("permutation/HDT"),
-            "unexpected error: {error:#}"
-        );
+        match error {
+            Error::ArtifactBindingMismatch {
+                artifact,
+                hdt,
+                detail,
+            } => {
+                assert_eq!(artifact, first.perm_path());
+                assert_eq!(hdt, second.hdt_path());
+                assert!(detail.contains("permutation/HDT"), "{detail}");
+            }
+            other => panic!("expected a binding mismatch, got {other:#}"),
+        }
     }
 
     #[test]
@@ -379,6 +396,7 @@ mod tests {
         let error = Permutations::open(fixture.map_hdt(), map_fixture(&path))
             .expect_err("truncated sidecar must be refused");
         assert!(error.to_string().contains("data.hdt.perm"), "{error:#}");
+        assert!(matches!(error, Error::Format(_)));
     }
 
     #[test]

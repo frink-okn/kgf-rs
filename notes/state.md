@@ -20,11 +20,11 @@ All three are Jim's. hdtc is github.com/frink-okn/hdtc; kgf-rs has **no remote y
 |---|---|---|
 | `kgf-rs` | `main` | no remote; units 1–5 implemented |
 | `kgf` | `main` | 2 commits ahead of `origin/main` |
-| `hdtc` | `lib` | unit 3 committed as `0a31692`; unit 5's façade additions are uncommitted |
+| `hdtc` | `lib` | unit 3 is `0a31692`; unit 5 is `8cba61c` plus review fix `48f90f3` |
 
-**hdtc has uncommitted changes this repo now depends on.** Unit 3's scan forms are in
-`0a31692`; unit 5 added typed permutation section identifiers and exposed rank geometry
-in the parsed header. `kgf-store` will not build against an hdtc without both.
+**kgf-rs depends on hdtc through `48f90f3`.** Unit 3's scan forms are in `0a31692`;
+unit 5's typed section identifiers and rank geometry are in `8cba61c`, followed by
+classified open errors in `48f90f3` that preserve binding-error semantics.
 
 ## What is built
 
