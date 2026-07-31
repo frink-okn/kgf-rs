@@ -348,6 +348,14 @@ impl<'a> BitmapTriples<'a> {
         find_in(self.array_y, range, value)
     }
 
+    /// First `ArrayY` position whose value is greater than `value`.
+    ///
+    /// Used by the `s ? o` cursor, whose route-independent resume position is
+    /// the last predicate id returned rather than a route-specific Y position.
+    pub(crate) fn level2_upper_bound(&self, range: Range<u64>, value: u64) -> u64 {
+        upper_bound_in(self.array_y, range, value)
+    }
+
     /// Binary search for `value` within a sorted `ArrayZ` range.
     ///
     /// # Panics
@@ -399,6 +407,11 @@ impl<'a> BitmapTriples<'a> {
     pub fn level3_at(&self, z_position: u64) -> u64 {
         self.array_z.get(z_position)
     }
+
+    /// Packed width of a level-3 value, for the bounded linear-probe heuristic.
+    pub(crate) fn level3_width(&self) -> u8 {
+        self.array_z.width()
+    }
 }
 
 /// Positions belonging to zero-based `group`, where set bits close groups.
@@ -413,13 +426,7 @@ fn group_range(bitmap: &RankedBitmap<'_>, group: u64) -> Range<u64> {
 }
 
 fn find_in(array: PackedArray<'_>, range: Range<u64>, value: u64) -> Option<u64> {
-    assert!(
-        range.start <= range.end && range.end <= array.len(),
-        "array range {}..{} out of range for {} entries",
-        range.start,
-        range.end,
-        array.len()
-    );
+    assert_array_range(&array, &range);
     let (mut low, mut high) = (range.start, range.end);
     while low < high {
         let middle = low + (high - low) / 2;
@@ -430,6 +437,30 @@ fn find_in(array: PackedArray<'_>, range: Range<u64>, value: u64) -> Option<u64>
         }
     }
     None
+}
+
+fn upper_bound_in(array: PackedArray<'_>, range: Range<u64>, value: u64) -> u64 {
+    assert_array_range(&array, &range);
+    let (mut low, mut high) = (range.start, range.end);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if array.get(middle) <= value {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+
+fn assert_array_range(array: &PackedArray<'_>, range: &Range<u64>) {
+    assert!(
+        range.start <= range.end && range.end <= array.len(),
+        "array range {}..{} out of range for {} entries",
+        range.start,
+        range.end,
+        array.len()
+    );
 }
 
 fn assert_position(array: &str, position: u64, len: u64) {

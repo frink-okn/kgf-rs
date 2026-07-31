@@ -1,4 +1,4 @@
-# Where kgf-rs stands — 2026-07-31 (unit 6 landed)
+# Where kgf-rs stands — 2026-07-31 (unit 7 landed)
 
 A point-in-time handoff. `CLAUDE.md` has the conventions and the design rules,
 `notes/plan.md` has the route and the recorded decisions, `../kgf/docs/20-read-layer.md`
@@ -18,7 +18,7 @@ All three are Jim's. hdtc is github.com/frink-okn/hdtc; kgf-rs has **no remote y
 
 | repo | branch | status |
 |---|---|---|
-| `kgf-rs` | `main` | no remote; units 1–6 implemented |
+| `kgf-rs` | `main` | no remote; units 1–7 implemented |
 | `kgf` | `main` | 2 commits ahead of `origin/main` |
 | `hdtc` | `lib` | unit 3 is `0a31692`; unit 5 is `8cba61c` plus review fix `48f90f3` |
 
@@ -28,7 +28,7 @@ classified open errors in `48f90f3` that preserve binding-error semantics.
 
 ## What is built
 
-Six of eight units from `notes/plan.md`, all complete with tests. 40 tests, ~2 s,
+Seven of eight units from `notes/plan.md`, all complete with tests. 44 tests, ~3 s,
 clean under `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and
 `cargo doc` with no warnings.
 
@@ -39,7 +39,8 @@ clean under `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, an
 | `hdt.rs` | **done** — `HdtLayout`/`TriplesLayout` plus shared `BitmapTriples` traversal |
 | `dict.rs` | **done** — mapped PFC `locate`/`extract`/`prefix_bounds`, role/shared arithmetic |
 | `perm.rs` | **done** — mapped POS/OPS and cross-file SPO rank binding; shared `BitmapTriples` projections |
-| `testing.rs` | shared test support (`Rng`, `bit`, `TINY_NT`, `tiny_id_triples`, `Fixture`) |
+| `pattern.rs` | **done** — eight patterns, exact counts, positional paging/`at`, dual-route `s ? o` |
+| `testing.rs` | shared test support (`Rng`, `bit`, golden ids/bundle, independent hdtc search) |
 | `error.rs` | complete enough to build on |
 | everything else | skeleton: real signatures and doc comments, `todo!()` bodies |
 
@@ -243,11 +244,29 @@ The golden-bundle test reconstructs all three projections from dictionary-resolv
 fixture ids and checks every group boundary, reverse mapping, value read, binary-search
 hit/miss, and final traversal order. There are 40 tests after this unit.
 
+## Unit 7: pattern selection
+
+`resolve` now implements doc 20 §20.2's complete dispatch table. A `Selection` holds
+either one contiguous range in SPO/POS/OPS or an `s ? o` group plan, all borrowing the
+bundle they were resolved against. Bound ids are checked in their role spaces before
+descent. Counts are exact; paging and `at` materialize ids directly from mapped views.
+
+Contiguous cursors are result offsets. `s ? o` instead resumes after the last predicate
+id returned, which is stable across its SPO and OPS routes. The route probes the lower
+degree endpoint; groups occupying at most two packed pages scan linearly, while larger
+groups binary-search. Count and random access share that bounded probe because this is
+the one non-contiguous pattern. Doc 03's `sample` cost row and doc 20 §20.5's indicative
+`at` comment still need to state that existing §20.2.1 exception explicitly.
+
+All valid bound/unbound combinations in the golden graph are checked at adversarial
+page sizes and every resume position. All eight representative shapes also agree with
+hdtc's independent search path. Predicate/object count sums and POS/OPS pair counts
+also close independently. There are 44 tests after this unit.
+
 ## Next
 
-Unit 7, `pattern`: implement the doc 20 §20.2 dispatch table, exact counts, paging,
-random access for `/sample`, and the bounded dual-route `s ? o` algorithm. Enumeration
-order becomes a stable cursor contract in this unit.
+Unit 8, `store` and `catalog`: required-artifact checks, immutable store opening, lazy
+singleflight catalog entries, and concurrent eviction by dropping the final `Arc`.
 
 Two smaller unit-3 follow-ups remain:
 

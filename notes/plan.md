@@ -162,7 +162,7 @@ compares the result with role ids resolved through the dictionary. There are 40
 measurement becomes possible. Everything after it is contract work rather than
 discovery.
 
-### 7. `pattern` — the §20.2 table
+### 7. `pattern` — the §20.2 table ✅
 
 Eight patterns to `Selection`; exact counts by rank difference; `page`; `at` for
 `/sample`. `s ? o` gets its dual route, choosing on `min(deg(s), deg(o))` — both
@@ -171,8 +171,26 @@ for ranges spanning a page or two and binary search above that.
 
 The enumeration order fixed here is a contract: cursors are positions in it.
 
-*Verified by* differential comparison against `hdtc search` for all eight shapes, plus
-the §20.9 consistency properties.
+**What landed.** `Selection` is either a contiguous Z range in the table's canonical
+permutation or the bounded `s ? o` group plan. Resolution validates role-scoped ids,
+enumerates nothing, and fixes exact counts, random access, and paging. Contiguous
+cursors are result offsets; `s ? o` cursors carry the last predicate id, so resumption
+is route-independent. Its planner compares endpoint degrees, scans groups spanning at
+most two packed pages, and binary-searches larger groups.
+
+`Selection::at` is constant-rank work for contiguous patterns. For `s ? o`, random
+access necessarily costs the same bounded predicate-group probe as enumeration and
+count because no permutation makes the answer contiguous. Doc 03's `sample` row and
+doc 20 §20.5's indicative `O(log)` comment should eventually name this existing
+`s ? o` exception; the implementation follows §20.2.1's bounded algorithm.
+
+*Verified by* differential comparison against `hdtc search` for all eight shapes,
+plus exhaustive resolution over every valid bound/unbound id combination in the
+golden graph. Counts equal enumeration lengths; `at(i)` equals row `i`; page sizes 1,
+2, 3, 7, and over-cap reconstruct the same order; and resuming at every cursor
+position yields exactly the suffix. Predicate- and object-rooted count sums close to
+N, and `? p o` agrees between POS and OPS. There are 44 `kgf-store` tests after this
+unit.
 
 ### 8. `store` and `catalog`
 

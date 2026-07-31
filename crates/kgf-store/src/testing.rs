@@ -198,6 +198,29 @@ impl Fixture {
     pub fn map_perm(&self) -> crate::map::Mapping {
         map_fixture(&self.perm_path())
     }
+
+    /// Run hdtc's independent search path and return its non-empty output rows.
+    pub fn search(&self, query: &str) -> Vec<Vec<u8>> {
+        let hdtc = hdtc_binary();
+        let output = std::process::Command::new(&hdtc)
+            .arg("search")
+            .arg(self.hdt_path())
+            .arg("--query")
+            .arg(query)
+            .output()
+            .unwrap_or_else(|error| panic!("run {} search: {error}", hdtc.display()));
+        assert!(
+            output.status.success(),
+            "hdtc search failed for {query}:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect()
+    }
 }
 
 const HDT: &str = crate::store::artifact::HDT;
