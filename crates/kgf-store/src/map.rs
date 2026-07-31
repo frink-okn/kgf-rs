@@ -14,8 +14,12 @@
 //! [`crate::store::Store::open`] checks each sidecar's binding to its HDT before
 //! any region is read, so a swapped file is caught rather than mapped.
 //!
-//! Anything that maps a file *not* covered by that guarantee does not belong in
-//! this crate.
+//! That is a *project* invariant, though, not one this crate can enforce — so
+//! [`Mapping::open`] is an `unsafe fn` and the obligation is stated where a
+//! caller has to acknowledge it. Wrapping it in a safe function whose docs asked
+//! callers to be careful would be exactly the unsound pattern `memmap2` marks
+//! `unsafe` to avoid. Everything above `Mapping::open` is safe code over
+//! `&[u8]`.
 //!
 //! # One element reader; the difference is framing
 //!
@@ -65,8 +69,26 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
+
+/// Identifies one live [`Mapping`], so that a spec cannot be projected onto a
+/// file it was not validated against.
+///
+/// A bundle holds several mappings of similar size — `data.hdt` and
+/// `data.hdt.perm` both run to gigabytes — and [`RankedSpec`](crate::rank::RankedSpec)
+/// deliberately spans two of them, since the SPO rank directories live in the
+/// sidecar while the bitmaps they index live in the HDT. Swapping those two
+/// arguments would pass any size check and yield plausible wrong answers, so
+/// identity is what the projection asserts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MappingId(u64);
+
+fn next_mapping_id() -> MappingId {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    MappingId(NEXT.fetch_add(1, Ordering::Relaxed))
+}
 
 /// Bytes needed to hold `len` entries of `width` bits.
 ///
@@ -83,14 +105,24 @@ fn packed_bytes(len: u64, width: u8) -> Result<u64> {
 pub struct Mapping {
     mmap: memmap2::Mmap,
     path: PathBuf,
+    id: MappingId,
 }
 
 impl Mapping {
     /// Map `path` read-only.
     ///
-    /// The caller must have established that the file belongs to an immutable
-    /// published bundle version — see the soundness argument above.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// # Safety
+    ///
+    /// The file must not be modified or truncated for as long as this `Mapping`
+    /// lives. Nothing in this crate can check that, which is why the obligation
+    /// is the caller's: reads go through `&[u8]` over the mapped pages, so a
+    /// concurrent write is a data race and a truncation is a fault.
+    ///
+    /// KGF satisfies this by construction — a published bundle version is
+    /// immutable (doc 04 §4.6), written once under a fresh directory and
+    /// replaced only by a new version under a new name. A caller mapping
+    /// anything else has to establish the equivalent.
+    pub unsafe fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
         if len == 0 {
@@ -100,16 +132,14 @@ impl Mapping {
             });
         }
 
-        // SAFETY: the mapped bytes are only sound while the file's contents stay
-        // put. That is the module-level invariant: bundle versions are published
-        // once and never edited in place, so no writer exists for this file. A
-        // caller that maps something outside that guarantee breaks this, which is
-        // why `Mapping::open` is reached only through `Store::open`.
+        // SAFETY: forwarded to this function's caller, who has undertaken that
+        // the file will not change while the mapping lives.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
         Ok(Self {
             mmap,
             path: path.to_path_buf(),
+            id: next_mapping_id(),
         })
     }
 
@@ -121,6 +151,12 @@ impl Mapping {
     /// The file this was mapped from, for error messages.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// This mapping's identity, which specs record so they cannot be projected
+    /// onto a different file.
+    pub fn id(&self) -> MappingId {
+        self.id
     }
 
     /// Length in bytes.
@@ -166,8 +202,8 @@ impl Mapping {
 /// [`PackedArray`] whenever the bytes are actually needed.
 #[derive(Debug, Clone, Copy)]
 pub struct PackedSpec {
+    mapping: MappingId,
     offset: u64,
-    bytes: u64,
     len: u64,
     width: u8,
     mask: u64,
@@ -194,8 +230,8 @@ impl PackedSpec {
             )));
         }
         Ok(Self {
+            mapping: mapping.id(),
             offset,
-            bytes,
             len,
             width,
             mask: entry_mask(width),
@@ -217,17 +253,17 @@ impl PackedSpec {
         self.width
     }
 
-    /// Project onto a mapping.
+    /// Project onto the mapping this spec was validated against.
     ///
-    /// Panics if `mapping` is not the one this spec was validated against, or
-    /// another of at least the same length — specs and their mappings are held
-    /// side by side in a `Store`, so a mismatch is a bug rather than a
-    /// condition to report.
+    /// Panics if given a different one. That subsumes a bounds check: the extent
+    /// was validated against this exact mapping at open, and a mapping's length
+    /// cannot change while it lives. Specs and their mappings sit side by side
+    /// in a `Store`, so a mismatch is a bug rather than a condition to report.
     pub fn view<'a>(&self, mapping: &'a Mapping) -> PackedArray<'a> {
-        assert!(
-            self.offset + self.bytes <= mapping.byte_len(),
-            "packed spec at {} does not fit {}",
-            self.offset,
+        assert_eq!(
+            self.mapping,
+            mapping.id(),
+            "packed spec projected onto {}, which is not the file it was validated against",
             mapping.path().display()
         );
         PackedArray {
@@ -349,8 +385,8 @@ impl<'a> PackedArray<'a> {
 /// Where a bitmap lives and how long it is, validated once.
 #[derive(Debug, Clone, Copy)]
 pub struct BitmapSpec {
+    mapping: MappingId,
     offset: u64,
-    bytes: u64,
     bits: u64,
 }
 
@@ -369,8 +405,8 @@ impl BitmapSpec {
             )));
         }
         Ok(Self {
+            mapping: mapping.id(),
             offset,
-            bytes,
             bits,
         })
     }
@@ -385,13 +421,13 @@ impl BitmapSpec {
         self.bits == 0
     }
 
-    /// Project onto a mapping. Panics if it does not fit — see
-    /// [`PackedSpec::view`].
+    /// Project onto the mapping this spec was validated against. Panics if
+    /// given a different one — see [`PackedSpec::view`].
     pub fn view<'a>(&self, mapping: &'a Mapping) -> BitmapView<'a> {
-        assert!(
-            self.offset + self.bytes <= mapping.byte_len(),
-            "bitmap spec at {} does not fit {}",
-            self.offset,
+        assert_eq!(
+            self.mapping,
+            mapping.id(),
+            "bitmap spec projected onto {}, which is not the file it was validated against",
             mapping.path().display()
         );
         BitmapView {
@@ -458,7 +494,16 @@ impl<'a> BitmapView<'a> {
         let mut position = start;
 
         while position < self.bits {
-            let byte = self.bytes[(position / 8) as usize];
+            let mut byte = self.bytes[(position / 8) as usize];
+            // The last byte may carry bits past the bitmap's end. The format
+            // requires them to be zero, but a reader that trusts that returns a
+            // position outside its own length when they are not — a wrong
+            // answer where this type promises a panic. Masking costs one branch
+            // on one byte per scan.
+            let left = self.bits - position;
+            if left < 8 {
+                byte &= (1u8 << left) - 1;
+            }
             let ones = u64::from(byte.count_ones());
             if remaining < ones {
                 for bit in 0..8 {
@@ -682,6 +727,35 @@ mod tests {
                 naive_count(&bytes, bits, 0..bits)
             );
         }
+    }
+
+    #[test]
+    fn stray_tail_bits_cannot_produce_a_position_outside_the_bitmap() {
+        // The format requires unused tail bits to be zero. A reader that trusts
+        // that returns a position past its own length when they are not, which
+        // is a wrong answer where this type promises a panic — so both scans
+        // mask instead.
+        for (bits, byte) in [(1u64, 0x80u8), (3, 0xF0), (5, 0xE0), (7, 0x80)] {
+            let bytes = [byte];
+            let view = BitmapView::new(&bytes, bits).unwrap();
+            assert_eq!(view.count_ones_in(0..bits), 0, "{bits} bits of {byte:#04x}");
+            assert_eq!(view.select_from(0, 0), None, "{bits} bits of {byte:#04x}");
+        }
+
+        // A real bit before the garbage is still found, at its real position.
+        let view = BitmapView::new(&[0b1000_0001], 1).unwrap();
+        assert_eq!(view.select_from(0, 0), Some(0));
+        assert_eq!(view.count_ones_in(0..1), 1);
+    }
+
+    #[test]
+    fn select_from_walks_set_bits_in_order() {
+        let bytes = [0b0100_1001u8, 0b0000_0011];
+        let view = BitmapView::new(&bytes, 16).unwrap();
+        let found: Vec<u64> = (0..5).filter_map(|k| view.select_from(0, k)).collect();
+        assert_eq!(found, vec![0, 3, 6, 8, 9]);
+        assert_eq!(view.select_from(8, 0), Some(8));
+        assert_eq!(view.select_from(0, 5), None);
     }
 
     #[test]

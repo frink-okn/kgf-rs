@@ -30,3 +30,17 @@ impl Rng {
 pub fn bit(bytes: &[u8], index: u64) -> bool {
     bytes[(index / 8) as usize] >> (index % 8) & 1 == 1
 }
+
+/// Map a file a test has just written and will not touch again.
+///
+/// [`Mapping::open`](crate::map::Mapping::open) is `unsafe` because the caller
+/// must guarantee the file does not change while mapped. Tests satisfy that by
+/// writing a fixture into a `tempdir` and leaving it alone, so the obligation is
+/// discharged once here rather than at every call site — keeping the crate's
+/// `unsafe` surface to `map` plus this one test-only wrapper.
+#[allow(unsafe_code)]
+pub fn map_fixture(path: &std::path::Path) -> crate::map::Mapping {
+    // SAFETY: the caller has just written this file into a temporary directory
+    // and does not modify or truncate it for the mapping's lifetime.
+    unsafe { crate::map::Mapping::open(path) }.expect("map fixture")
+}

@@ -84,6 +84,8 @@ impl RankedSpec {
 
         check_directory(superrank.len(), want_super, "superrank", bits)?;
         check_directory(subrank.len(), want_sub, "subrank", bits)?;
+        check_width(&superrank, SUPERRANK_WIDTH, "superrank")?;
+        check_width(&subrank, SUBRANK_WIDTH, "subrank")?;
 
         Ok(Self {
             bitmap,
@@ -108,6 +110,42 @@ impl RankedSpec {
             sentinel: self.sentinel,
             subs_per_super: self.subs_per_super,
         }
+    }
+}
+
+/// Natural widths of the two directory arrays (`permutation-index-format.md`
+/// §7.2). A directory at any other width is a different structure being read as
+/// this one, which the entry counts alone would not catch — and since open
+/// deliberately skips CRC verification (doc 20 §20.6), cheap structural checks
+/// are what stand between a misparsed sidecar and wrong answers.
+const SUPERRANK_WIDTH: u8 = 64;
+const SUBRANK_WIDTH: u8 = 16;
+
+/// Reject a directory array that is not at its natural width.
+///
+/// Empty arrays are exempt: an empty dataset stores no directory at all
+/// (`permutation-index-format.md` §6.2), and an absent section declares no
+/// width.
+fn check_width(array: &PackedSpec, want: u8, name: &str) -> Result<()> {
+    if array.is_empty() || array.width() == want {
+        Ok(())
+    } else {
+        Err(Error::Region(format!(
+            "{name} is {} bits per entry, expected {want}",
+            array.width()
+        )))
+    }
+}
+
+/// The same check over an already-projected view.
+fn check_view_width(array: &PackedArray<'_>, want: u8, name: &str) -> Result<()> {
+    if array.is_empty() || array.width() == want {
+        Ok(())
+    } else {
+        Err(Error::Region(format!(
+            "{name} is {} bits per entry, expected {want}",
+            array.width()
+        )))
     }
 }
 
@@ -182,6 +220,8 @@ impl<'a> RankedBitmap<'a> {
 
         check_directory(superrank.len(), want_super, "superrank", bits)?;
         check_directory(subrank.len(), want_sub, "subrank", bits)?;
+        check_view_width(&superrank, SUPERRANK_WIDTH, "superrank")?;
+        check_view_width(&subrank, SUBRANK_WIDTH, "subrank")?;
 
         Ok(Self {
             bitmap,
@@ -295,7 +335,7 @@ fn last_index_not_above(array: &PackedArray<'_>, lo: u64, hi: u64, target: u64) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{Rng, bit};
+    use crate::testing::{Rng, bit, map_fixture};
 
     const SUPER: u32 = 4096;
     const SUB: u32 = 512;
@@ -538,8 +578,8 @@ mod tests {
         packed.extend_from_slice(&directory.subrank);
         std::fs::write(&directory_path, &packed).unwrap();
 
-        let bitmap_map = Mapping::open(&bitmap_path).unwrap();
-        let directory_map = Mapping::open(&directory_path).unwrap();
+        let bitmap_map = map_fixture(&bitmap_path);
+        let directory_map = map_fixture(&directory_path);
 
         let spec = RankedSpec::new(
             BitmapSpec::new(&bitmap_map, 0, bits).unwrap(),
@@ -573,11 +613,32 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "not the file it was validated against")]
+    fn a_spec_refuses_a_mapping_it_was_not_validated_against() {
+        // The hazard `RankedSpec::view`'s two-mapping signature creates: both
+        // files are large enough for either spec, so only identity catches the
+        // swap. Getting a plausible wrong answer here would be far worse than a
+        // panic.
+        let dir = tempfile::tempdir().unwrap();
+        let one = dir.path().join("data.hdt");
+        let two = dir.path().join("data.hdt.perm");
+        std::fs::write(&one, [0u8; 64]).unwrap();
+        std::fs::write(&two, [0u8; 64]).unwrap();
+
+        let first = map_fixture(&one);
+        let second = map_fixture(&two);
+
+        let spec = PackedSpec::new(&first, 0, 8, 64).unwrap();
+        spec.view(&second);
+    }
+
+    #[test]
     fn a_spec_that_runs_past_its_file_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("small");
         std::fs::write(&path, [0u8; 16]).unwrap();
-        let mapping = Mapping::open(&path).unwrap();
+        // SAFETY: a file this test just wrote and does not touch again.
+        let mapping = map_fixture(&path);
 
         assert!(PackedSpec::new(&mapping, 0, 2, 64).is_ok());
         assert!(PackedSpec::new(&mapping, 0, 3, 64).is_err());

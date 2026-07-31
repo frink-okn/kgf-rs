@@ -92,7 +92,7 @@ impl Store {
     /// synchronous within one blocking task holding an `Arc<Store>` (doc 20
     /// §20.4), so nothing needs to outlive the borrow; resumption goes through
     /// an encoded cursor token, not a live `Selection`.
-    pub fn resolve(&self, _pattern: IdPattern) -> Result<Selection<'_>> {
-        todo!("delegate to pattern::resolve with this store's permutations")
+    pub fn resolve(&self, pattern: IdPattern) -> Result<Selection<'_>> {
+        crate::pattern::resolve(&self._perms, pattern)
     }
 }

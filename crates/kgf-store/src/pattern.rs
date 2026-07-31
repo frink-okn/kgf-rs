@@ -20,7 +20,7 @@
 //! `/count` at `O(log N)`, and doc 04's invariant that top-level VoID numbers
 //! equal `/count` results.
 
-use crate::{IdTriple, error::Result};
+use crate::{IdTriple, error::Result, perm::Permutations};
 
 /// A triple pattern in id space; `None` is a variable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +66,7 @@ pub struct Count {
 #[derive(Debug)]
 pub struct Selection<'a> {
     _permutation: Permutation,
-    _store: std::marker::PhantomData<&'a ()>,
+    _perms: std::marker::PhantomData<&'a Permutations>,
 }
 
 impl Selection<'_> {
@@ -111,6 +111,12 @@ pub enum SubjectObjectRoute {
 }
 
 /// Resolve a pattern against a bundle's permutations.
-pub fn resolve(_pattern: IdPattern) -> Result<Selection<'static>> {
+///
+/// Borrows the permutations it resolved against, which is the whole point of
+/// the lifetime: a `Selection` that outlived its store would be reading a
+/// mapping that had been unmapped. [`Store::resolve`](crate::store::Store::resolve)
+/// is the entry point callers use; this is where the §20.2 dispatch lives.
+pub fn resolve(perms: &Permutations, _pattern: IdPattern) -> Result<Selection<'_>> {
+    let _ = perms;
     todo!("dispatch on the bound positions per the §20.2 table")
 }
