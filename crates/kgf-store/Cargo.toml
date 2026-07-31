@@ -1,0 +1,18 @@
+[package]
+name = "kgf-store"
+description = "Memory-mapped read layer over KGF bundles (KGF doc 20)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hdtc.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+memmap2.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

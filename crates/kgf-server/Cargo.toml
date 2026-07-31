@@ -1,0 +1,14 @@
+[package]
+name = "kgf-server"
+description = "The KGF HTTP API over kgf-store (KGF doc 03)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kgf-store.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

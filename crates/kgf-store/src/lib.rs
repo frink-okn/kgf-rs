@@ -1,0 +1,87 @@
+//! The KGF read layer: bundles on disk, answers in id space.
+//!
+//! This crate is the implementation of **KGF doc 20**. It opens a published
+//! bundle, memory-maps its artifacts, and answers triple patterns at the bounds
+//! doc 03 §3.5 promises. It contains no HTTP, no async, and no locks on the read
+//! path; the server holds an [`Arc<Store>`](std::sync::Arc) per request and calls
+//! synchronous methods from a blocking pool.
+//!
+//! # The three things worth knowing before reading further
+//!
+//! **Open is free.** Opening a bundle maps files and parses headers — no data
+//! pages are touched, because rank directories are *persisted* in `data.hdt.perm`
+//! rather than rebuilt (doc 20 §20.3). An open-but-idle bundle costs address
+//! space, not memory, which is what makes lazy multi-tenant serving work: dozens
+//! of datasets and historical versions resident on one VM, with the page cache
+//! holding whatever is hot across all of them.
+//!
+//! **Id-space in, id-space through, strings at the edges.** Every operation
+//! resolves terms to ids once at the boundary, runs entirely over ids, and
+//! materializes strings only while serializing. Term caches belong to the
+//! server, not here.
+//!
+//! **One implementation per operation.** There is no fallback path for a missing
+//! or superseded index (doc 20 §20.8). A bundle without `data.hdt.perm` is
+//! refused at open; `.hdt.index.v1-1` is never read; `data.hdt.graphs` without
+//! `data.hdt.graphs.idx` is refused. What looks like a fallback in [`pattern`] —
+//! `s ? o` probing whichever endpoint is smaller — is one algorithm making a
+//! cost decision, and both routes emit in the same order and resume from the
+//! same cursor.
+//!
+//! # Status
+//!
+//! Skeleton. The module boundaries and the public shape are settled; the bodies
+//! are not written. Every unimplemented entry point says so with `todo!()`
+//! rather than returning a plausible wrong answer.
+
+#![deny(unsafe_code)]
+#![warn(missing_docs)]
+
+// The only module permitted to map memory. Keeping the `unsafe` surface to one
+// audited file is a doc 20 §20.9 obligation, not a style preference.
+#[allow(unsafe_code)]
+pub mod map;
+
+pub mod catalog;
+pub mod dict;
+pub mod error;
+pub mod hdt;
+pub mod pattern;
+pub mod perm;
+pub mod rank;
+pub mod store;
+
+pub use catalog::Catalog;
+pub use error::{Error, Result};
+pub use store::{OpenOptions, Store};
+
+/// A term identifier in one of HDT's role-scoped id spaces.
+///
+/// Ids are 1-based and scoped by [`Role`]: the same integer means a different
+/// term as a subject than as an object, except within the shared section, where
+/// subject and object ids coincide by construction. Nothing outside [`dict`]
+/// should reason about that overlap — ask the dictionary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TermId(pub u64);
+
+/// Which of HDT's identifier spaces a [`TermId`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Role {
+    /// Subjects: the shared section followed by subject-only terms.
+    Subject,
+    /// Predicates: their own space.
+    Predicate,
+    /// Objects: the shared section followed by object-only terms.
+    Object,
+}
+
+/// A triple in id space, the unit everything below the serialization edge deals in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IdTriple {
+    /// Subject id, in [`Role::Subject`]'s space.
+    pub subject: u64,
+    /// Predicate id, in [`Role::Predicate`]'s space.
+    pub predicate: u64,
+    /// Object id, in [`Role::Object`]'s space.
+    pub object: u64,
+}

@@ -1,0 +1,18 @@
+[package]
+name = "kgf"
+description = "The KGF server and build tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "kgf"
+path = "src/main.rs"
+
+[dependencies]
+kgf-server.workspace = true
+kgf-store.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
