@@ -107,7 +107,7 @@ disjoint id ranges. `PrefixBounds` preserves both and still gives an exact `O(lo
 count; the server will merge the two sorted runs when it implements `/terms`. The code
 follows the format here; the single-range sketch in doc 20 is the bug.
 
-### 5. `perm` — map the sidecar
+### 5. `perm` — map the sidecar ✅
 
 `hdtc::format::PermutationIndex::open` for the header, directory, and binding checks;
 then map each region from its directory entry. Assemble the POS and OPS
@@ -116,6 +116,27 @@ directories that ride in the sidecar.
 
 hdtc's `PermutationIndex::triples` is a seek-based path for its own CLI and is not
 used.
+
+**What landed.** `Permutations::open` owns the coupled HDT and sidecar mappings,
+parses the HDT layout, and delegates the sidecar header, directory, and cheap source
+binding checks to `hdtc::format::PermutationIndex`. Directory entries become
+`PackedSpec`/`BitmapSpec`/`RankedSpec`s without reading payloads. POS and OPS project
+entirely from the sidecar; SPO projects arrays and bitmaps from the HDT while taking
+both rank directories from the sidecar. The three public projections therefore return
+the same `BitmapTriples` type and cannot be paired with mappings from another bundle.
+
+The work closed another façade gap in hdtc: permutation components and section kinds
+are now typed public identifiers rather than copied numeric constants, and the parsed
+header exposes its superblock/subblock widths. hdtc remains the only owner of the wire
+ids and validates that directory parameters agree with those header widths. Its cheap
+open also now rejects unequal POS/OPS pair counts, an impossible representation of the
+same `(predicate, object)` key set.
+
+*Verified by* a golden bundle built by hdtc: every mapped array stays in its declared
+id space; bitmap populations close exactly the level-1 and level-2 groups implied by
+the dictionary and pair counts; all three projections assemble; a sidecar from another
+HDT and a truncated sidecar are refused before a view is returned. There are 39
+`kgf-store` tests after this unit.
 
 ### 6. `hdt::BitmapTriples` — the shared traversal
 

@@ -129,6 +129,11 @@ impl Fixture {
     pub fn map_hdt(&self) -> crate::map::Mapping {
         map_fixture(&self.hdt_path())
     }
+
+    /// Map `data.hdt.perm`.
+    pub fn map_perm(&self) -> crate::map::Mapping {
+        map_fixture(&self.perm_path())
+    }
 }
 
 const HDT: &str = crate::store::artifact::HDT;

@@ -1,4 +1,4 @@
-# Where kgf-rs stands — 2026-07-31 (unit 4 landed)
+# Where kgf-rs stands — 2026-07-31 (unit 5 landed)
 
 A point-in-time handoff. `CLAUDE.md` has the conventions and the design rules,
 `notes/plan.md` has the route and the recorded decisions, `../kgf/docs/20-read-layer.md`
@@ -18,16 +18,17 @@ All three are Jim's. hdtc is github.com/frink-okn/hdtc; kgf-rs has **no remote y
 
 | repo | branch | status |
 |---|---|---|
-| `kgf-rs` | `main` | no remote; units 1–4 implemented |
+| `kgf-rs` | `main` | no remote; units 1–5 implemented |
 | `kgf` | `main` | 2 commits ahead of `origin/main` |
-| `hdtc` | `lib` | 1 commit, plus uncommitted work: the `try_init` change (below) and unit 3's façade additions |
+| `hdtc` | `lib` | unit 3 committed as `0a31692`; unit 5's façade additions are uncommitted |
 
-**hdtc has uncommitted changes this repo now depends on.** Unit 3 added the scan forms
-described below; `kgf-store` will not build against an hdtc without them.
+**hdtc has uncommitted changes this repo now depends on.** Unit 3's scan forms are in
+`0a31692`; unit 5 added typed permutation section identifiers and exposed rank geometry
+in the parsed header. `kgf-store` will not build against an hdtc without both.
 
 ## What is built
 
-Four of eight units from `notes/plan.md`, all complete with tests. 34 tests, ~1 s,
+Five of eight units from `notes/plan.md`, all complete with tests. 39 tests, ~2 s,
 clean under `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and
 `cargo doc` with no warnings.
 
@@ -37,6 +38,7 @@ clean under `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, an
 | `rank.rs` | **done** — `RankedSpec`/`RankedBitmap`: `rank1`, `select1`, `count` |
 | `hdt.rs` | `HdtLayout::parse` + `TriplesLayout` **done**; `BitmapTriples`' traversal is unit 6 |
 | `dict.rs` | **done** — mapped PFC `locate`/`extract`/`prefix_bounds`, role/shared arithmetic |
+| `perm.rs` | **done** — mapped POS/OPS and cross-file SPO rank binding; shared `BitmapTriples` projections |
 | `testing.rs` | shared test support (`Rng`, `bit`, `TINY_NT`, `Fixture`) |
 | `error.rs` | complete enough to build on |
 | everything else | skeleton: real signatures and doc comments, `todo!()` bodies |
@@ -65,7 +67,7 @@ The reason is not speed. Without the split every query re-validates and `.expect
 so a malformed bundle panics on the ten-thousandth request instead of being refused by
 `Store::open` with a path and a remedy — contradicting doc 20 §20.8.
 
-Consequences worth knowing before writing units 4–8:
+Consequences worth knowing before writing units 6–8:
 
 - **`Selection<'a>` borrows the `Store`.** Query execution is synchronous inside one
   blocking task holding an `Arc<Store>` (doc 20 §20.4), so nothing outlives the
@@ -78,6 +80,10 @@ Consequences worth knowing before writing units 4–8:
 - **`RankedSpec::view` takes two mappings.** The SPO bitmaps live in `data.hdt` while
   their rank directories ride in `data.hdt.perm`. POS and OPS pass the same mapping
   twice. There is a test over two real files for the cross-file case.
+- **`Permutations` owns both mappings and the `HdtLayout`.** That keeps the HDT-side
+  specs and sidecar-side directories coupled to the exact mappings they were validated
+  against. `Store` reaches the dictionary through this owner rather than holding a
+  second copy of the HDT mapping.
 - `map` is the only module allowed `unsafe`; every crate carries
   `#![deny(unsafe_code)]` and `map` the single `#[allow]`. The soundness argument —
   published bundle versions are immutable, so no writer exists for a mapped file — is
@@ -156,7 +162,7 @@ not require them to be slow.
 `ArrayZ` × 2 is 92.5% of the sidecar; rank directories are 0.29%. Every region matches
 doc 20 §20.3's closed form to the byte. This closed both open Phase 0 questions — the
 FoQ fallback is withdrawn and delta-block encoding declined — so `.perm` v1 is frozen
-and this is a real bundle to test against once unit 5 lands.
+and this is the real bundle for mapped-reader measurements.
 
 One measurement still outstanding: `hdtc index` on the same file, to pin the FoQ
 comparison exactly rather than at the estimated ~1.4–1.6×. About 4 minutes, writes
@@ -188,9 +194,6 @@ Recorded in `notes/plan.md` under "Decisions recorded here" unless noted:
 - **hdtc gaps, not on this crate's path:** no sketch probe API, no key-set intersect
   (`../kgf` doc 07 §7.5 items 18–19). hdtc work when the operations that need them
   arrive; do not fill them in here.
-- **hdtc has an uncommitted `try_init` change** on the `lib` branch — `run()` no longer
-  panics if an embedder already installed a tracing subscriber. Sensible consequence of
-  lib-ification, not committed yet.
 
 ## Unit 4: mapped dictionary access
 
@@ -201,7 +204,7 @@ searched section; `extract` decodes only the addressed block into a caller buffe
 `dict`.
 
 The differential test uses hdtc's independent sequential PFC reader as the oracle and
-compares every id and term across multiple blocks. There are 34 tests after this unit.
+compares every id and term across multiple blocks. There are 35 tests after this unit.
 
 The implementation exposed a bug in doc 20 §20.5's indicative signature:
 `Range<TermId>` cannot represent every subject/object prefix. Their ids concatenate
@@ -210,13 +213,27 @@ a prefix may have one disjoint range in each. `PrefixBounds` returns up to two r
 and an exact count. `/terms` will merge those two sorted runs; the cost remains
 `O(log D + limit)`.
 
+## Unit 5: mapped permutation sidecar
+
+`Permutations::open` binds one mapped HDT to one mapped `.hdt.perm`. hdtc parses and
+validates the header/directory and cheap source metadata; `kgf-store` turns its region
+descriptors into specs without using hdtc's seek-based triples reader. POS and OPS use
+the sidecar for data and directories. SPO uses `data.hdt` for data and the sidecar for
+directories. `pos()`, `ops()`, and `spo()` all project to `BitmapTriples`.
+
+The façade now exports typed `PermutationComponent`/`PermutationSectionKind` values
+and the header's rank geometry, so this crate contains no copied section numbers or
+assumed block widths. The golden-bundle tests cover region shapes, id ranges, bitmap
+populations, all three projections, a foreign sidecar, and truncation. There are 39
+tests after this unit.
+
 ## Next
 
-Unit 5, `perm`: open `data.hdt.perm` through `hdtc::format::PermutationIndex`, turn
-its directory entries into mapped specs, assemble POS and OPS, and bind the SPO
-bitmaps in `data.hdt` to the component `0x03` rank directories.
+Unit 6, `hdt::BitmapTriples`: implement the seven shared traversal primitives over
+the SPO/POS/OPS projections. This is the first point where the mapped structures
+answer triple patterns in id space and enables the Ubergraph cold-start measurement.
 
-Two smaller things this unit left open:
+Two smaller unit-3 follow-ups remain:
 
 - `../kgf` doc 20 §20.4's io-primitives bullet still describes hdtc's `skip_*` forms as
   what locates sections. It sanctioned the change that replaced them ("Where hdtc offers

@@ -377,18 +377,28 @@ mod tests {
         // The sidecar's SPO directories record the length of each HDT bitmap
         // they index, which is an independent statement of what the walk found.
         // Kinds 5–6 index BitmapY, 7–8 BitmapZ.
-        let indexed_bits = |kind: u32| {
+        let indexed_bits = |kind| {
+            let section_type = hdtc::format::PermutationComponent::Spo.section_type(kind);
             index
                 .sections()
                 .iter()
-                .find(|s| s.section_type == (0x03 << 8) | kind)
-                .unwrap_or_else(|| panic!("missing SPO directory section for kind {kind}"))
+                .find(|s| s.section_type == section_type)
+                .unwrap_or_else(|| panic!("missing SPO directory section {section_type:#06x}"))
                 .indexed_bits
         };
-        assert_eq!(indexed_bits(5), layout.spo().bitmap_y().len());
-        assert_eq!(indexed_bits(6), layout.spo().bitmap_y().len());
-        assert_eq!(indexed_bits(7), layout.spo().bitmap_z().len());
-        assert_eq!(indexed_bits(8), layout.spo().bitmap_z().len());
+        use hdtc::format::PermutationSectionKind::{
+            BitmapYSubrank, BitmapYSuperrank, BitmapZSubrank, BitmapZSuperrank,
+        };
+        assert_eq!(
+            indexed_bits(BitmapYSuperrank),
+            layout.spo().bitmap_y().len()
+        );
+        assert_eq!(indexed_bits(BitmapYSubrank), layout.spo().bitmap_y().len());
+        assert_eq!(
+            indexed_bits(BitmapZSuperrank),
+            layout.spo().bitmap_z().len()
+        );
+        assert_eq!(indexed_bits(BitmapZSubrank), layout.spo().bitmap_z().len());
 
         // And against the source: the fixture is duplicate-free, so one line is
         // one triple, and a misidentified `ArrayZ` could not match.
