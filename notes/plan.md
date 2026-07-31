@@ -138,11 +138,24 @@ the dictionary and pair counts; all three projections assemble; a sidecar from a
 HDT and a truncated sidecar are refused before a view is returned. There are 39
 `kgf-store` tests after this unit.
 
-### 6. `hdt::BitmapTriples` — the shared traversal
+### 6. `hdt::BitmapTriples` — the shared traversal ✅
 
 `level2_range`, `level3_range`, `find_level2`, `find_level3`, `level1_of`,
-`level2_of`, `level3_at`. One implementation over all three permutations, which is
-possible because all three have implicit level 1 and the same two-level shape.
+`level2_of`, `level2_at`, `level3_at`. One implementation over all three permutations,
+which is possible because all three have implicit level 1 and the same two-level shape.
+
+**What landed.** Group ranges are select-derived, owning groups are rank-derived, and
+both packed levels use one bounded binary-search implementation. `level2_at` is the
+eighth primitive: the original list omitted the `ArrayY` read needed to materialize an
+unbound triple after `level2_of` recovers its position. Without it the stated milestone
+was impossible; adding the symmetric accessor corrects the plan without changing the
+format or enumeration contract.
+
+*Verified by* reconstructing the complete golden fixture independently in SPO, POS,
+and OPS order. The test exhausts every range boundary, inverse rank mapping, packed
+value, successful search, missing value on both sides, and empty terminal range, then
+compares the result with role ids resolved through the dictionary. There are 40
+`kgf-store` tests after this unit.
 
 **This is the real milestone.** At this point the store answers patterns over a
 606 M-triple bundle in id space, and doc 20 §20.6's cold-start-with-N-bundles

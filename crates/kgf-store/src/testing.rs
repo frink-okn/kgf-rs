@@ -67,6 +67,70 @@ pub const TINY_NT: &str = concat!(
     "_:b1 <http://example.org/type> <http://example.org/Thing> .\n",
 );
 
+/// The golden fixture's triples in role-scoped id space.
+///
+/// Dictionary lookup is independent of BitmapTriples traversal, so this is an
+/// oracle for traversal and pattern tests without copying hdtc's reader.
+pub fn tiny_id_triples(dictionary: &crate::dict::Dictionary<'_>) -> Vec<crate::IdTriple> {
+    use crate::{IdTriple, Role};
+
+    let id = |role, term: &[u8]| {
+        dictionary
+            .locate(role, term)
+            .expect("read fixture dictionary")
+            .unwrap_or_else(|| panic!("fixture term is absent: {}", String::from_utf8_lossy(term)))
+            .0
+    };
+    let subject = |term| id(Role::Subject, term);
+    let predicate = |term| id(Role::Predicate, term);
+    let object = |term| id(Role::Object, term);
+
+    let alice = b"http://example.org/alice";
+    let bob = b"http://example.org/bob";
+    vec![
+        IdTriple {
+            subject: subject(alice),
+            predicate: predicate(b"http://example.org/name"),
+            object: object(b"\"Alice\""),
+        },
+        IdTriple {
+            subject: subject(alice),
+            predicate: predicate(b"http://example.org/knows"),
+            object: object(bob),
+        },
+        IdTriple {
+            subject: subject(alice),
+            predicate: predicate(b"http://example.org/label"),
+            object: object(b"\"Alice\"@en"),
+        },
+        IdTriple {
+            subject: subject(alice),
+            predicate: predicate(b"http://example.org/label"),
+            object: object(b"\"Alicia\"@es"),
+        },
+        IdTriple {
+            subject: subject(alice),
+            predicate: predicate(b"http://example.org/age"),
+            object: object(b"\"30\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+        },
+        IdTriple {
+            subject: subject(bob),
+            predicate: predicate(b"http://example.org/name"),
+            object: object(b"\"Bob\""),
+        },
+        IdTriple {
+            subject: subject(bob),
+            predicate: predicate(b"http://example.org/knows"),
+            object: object(alice),
+        },
+        IdTriple {
+            subject: subject(b"_:b1"),
+            predicate: predicate(b"http://example.org/type"),
+            object: object(b"http://example.org/Thing"),
+        },
+    ]
+}
+
 /// A bundle built by hdtc into a temporary directory.
 ///
 /// Doc 20 §20.9's golden bundle: the fixture RDF is checked in and hdtc builds

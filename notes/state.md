@@ -1,4 +1,4 @@
-# Where kgf-rs stands — 2026-07-31 (unit 5 landed)
+# Where kgf-rs stands — 2026-07-31 (unit 6 landed)
 
 A point-in-time handoff. `CLAUDE.md` has the conventions and the design rules,
 `notes/plan.md` has the route and the recorded decisions, `../kgf/docs/20-read-layer.md`
@@ -18,7 +18,7 @@ All three are Jim's. hdtc is github.com/frink-okn/hdtc; kgf-rs has **no remote y
 
 | repo | branch | status |
 |---|---|---|
-| `kgf-rs` | `main` | no remote; units 1–5 implemented |
+| `kgf-rs` | `main` | no remote; units 1–6 implemented |
 | `kgf` | `main` | 2 commits ahead of `origin/main` |
 | `hdtc` | `lib` | unit 3 is `0a31692`; unit 5 is `8cba61c` plus review fix `48f90f3` |
 
@@ -28,7 +28,7 @@ classified open errors in `48f90f3` that preserve binding-error semantics.
 
 ## What is built
 
-Five of eight units from `notes/plan.md`, all complete with tests. 39 tests, ~2 s,
+Six of eight units from `notes/plan.md`, all complete with tests. 40 tests, ~2 s,
 clean under `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and
 `cargo doc` with no warnings.
 
@@ -36,10 +36,10 @@ clean under `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, an
 |---|---|
 | `map.rs` | **done** — `Mapping`, `PackedSpec`/`PackedArray`, `BitmapSpec`/`BitmapView`, `BytesSpec` |
 | `rank.rs` | **done** — `RankedSpec`/`RankedBitmap`: `rank1`, `select1`, `count` |
-| `hdt.rs` | `HdtLayout::parse` + `TriplesLayout` **done**; `BitmapTriples`' traversal is unit 6 |
+| `hdt.rs` | **done** — `HdtLayout`/`TriplesLayout` plus shared `BitmapTriples` traversal |
 | `dict.rs` | **done** — mapped PFC `locate`/`extract`/`prefix_bounds`, role/shared arithmetic |
 | `perm.rs` | **done** — mapped POS/OPS and cross-file SPO rank binding; shared `BitmapTriples` projections |
-| `testing.rs` | shared test support (`Rng`, `bit`, `TINY_NT`, `Fixture`) |
+| `testing.rs` | shared test support (`Rng`, `bit`, `TINY_NT`, `tiny_id_triples`, `Fixture`) |
 | `error.rs` | complete enough to build on |
 | everything else | skeleton: real signatures and doc comments, `todo!()` bodies |
 
@@ -227,11 +227,27 @@ assumed block widths. The golden-bundle tests cover region shapes, id ranges, bi
 populations, all three projections, a foreign sidecar, and truncation. There are 39
 tests after this unit.
 
+## Unit 6: shared BitmapTriples traversal
+
+`BitmapTriples` now derives level-2 and level-3 group ranges with select, recovers
+their owners with rank, binary-searches either sorted packed level, and reads both
+packed values directly. The same implementation serves SPO, POS, and OPS.
+
+The plan's original seven primitives omitted `level2_at`: `level2_of(z_position)`
+recovers the owning `ArrayY` position, but materializing an unbound triple also needs
+the value at that position. The symmetric accessor is now the eighth primitive. This
+is an implementation-plan correction; the format and doc 20 enumeration contract are
+unchanged.
+
+The golden-bundle test reconstructs all three projections from dictionary-resolved
+fixture ids and checks every group boundary, reverse mapping, value read, binary-search
+hit/miss, and final traversal order. There are 40 tests after this unit.
+
 ## Next
 
-Unit 6, `hdt::BitmapTriples`: implement the seven shared traversal primitives over
-the SPO/POS/OPS projections. This is the first point where the mapped structures
-answer triple patterns in id space and enables the Ubergraph cold-start measurement.
+Unit 7, `pattern`: implement the doc 20 §20.2 dispatch table, exact counts, paging,
+random access for `/sample`, and the bounded dual-route `s ? o` algorithm. Enumeration
+order becomes a stable cursor contract in this unit.
 
 Two smaller unit-3 follow-ups remain:
 

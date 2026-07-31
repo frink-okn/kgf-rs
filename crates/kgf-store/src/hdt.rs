@@ -22,6 +22,7 @@
 //! (its component `0x03`), since standard HDT has nowhere to put them.
 
 use std::io::Cursor;
+use std::ops::Range;
 
 use crate::Role;
 use crate::dict::{DictionaryLayout, PfcLayout};
@@ -287,10 +288,10 @@ fn with_artifact<T>(mapping: &Mapping, result: Result<T>) -> Result<T> {
 /// traversal over differently sourced views.
 #[derive(Debug, Clone, Copy)]
 pub struct BitmapTriples<'a> {
-    _array_y: PackedArray<'a>,
-    _bitmap_y: RankedBitmap<'a>,
-    _array_z: PackedArray<'a>,
-    _bitmap_z: RankedBitmap<'a>,
+    array_y: PackedArray<'a>,
+    bitmap_y: RankedBitmap<'a>,
+    array_z: PackedArray<'a>,
+    bitmap_z: RankedBitmap<'a>,
 }
 
 impl<'a> BitmapTriples<'a> {
@@ -302,59 +303,270 @@ impl<'a> BitmapTriples<'a> {
         bitmap_z: RankedBitmap<'a>,
     ) -> Self {
         Self {
-            _array_y: array_y,
-            _bitmap_y: bitmap_y,
-            _array_z: array_z,
-            _bitmap_z: bitmap_z,
+            array_y,
+            bitmap_y,
+            array_z,
+            bitmap_z,
         }
     }
 
     /// The half-open `ArrayY` range holding level-1 key `first`'s level-2 values.
     ///
     /// Two select operations. `first` is 1-based, as HDT ids are.
-    pub fn level2_range(&self, _first: u64) -> std::ops::Range<u64> {
-        todo!("select1 on BitmapY around the level-1 group")
+    ///
+    /// # Panics
+    ///
+    /// Panics if `first` is not a level-1 key in this permutation.
+    pub fn level2_range(&self, first: u64) -> Range<u64> {
+        let level1_count = self.bitmap_y.count();
+        assert!(
+            first != 0 && first <= level1_count,
+            "level-1 key {first} out of range for {level1_count} keys"
+        );
+        group_range(&self.bitmap_y, first - 1)
     }
 
     /// The half-open `ArrayZ` range for the level-2 entry at `y_position`.
-    pub fn level3_range(&self, _y_position: u64) -> std::ops::Range<u64> {
-        todo!("select1 on BitmapZ around the level-2 group")
+    ///
+    /// # Panics
+    ///
+    /// Panics if `y_position` is not an `ArrayY` position.
+    pub fn level3_range(&self, y_position: u64) -> Range<u64> {
+        assert_position("ArrayY", y_position, self.array_y.len());
+        group_range(&self.bitmap_z, y_position)
     }
 
     /// Binary search for `value` within a sorted `ArrayY` range.
     ///
     /// Sorted-within-group is normative in every permutation, which is what
     /// makes this legal.
-    pub fn find_level2(&self, _range: std::ops::Range<u64>, _value: u64) -> Option<u64> {
-        todo!("binary search ArrayY over the range")
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` is not within `ArrayY`.
+    pub fn find_level2(&self, range: Range<u64>, value: u64) -> Option<u64> {
+        find_in(self.array_y, range, value)
     }
 
     /// Binary search for `value` within a sorted `ArrayZ` range.
-    pub fn find_level3(&self, _range: std::ops::Range<u64>, _value: u64) -> Option<u64> {
-        todo!("binary search ArrayZ over the range")
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` is not within `ArrayZ`.
+    pub fn find_level3(&self, range: Range<u64>, value: u64) -> Option<u64> {
+        find_in(self.array_z, range, value)
     }
 
     /// The level-1 key owning `y_position`, by rank.
-    pub fn level1_of(&self, _y_position: u64) -> u64 {
-        todo!("rank1 on BitmapY")
+    ///
+    /// # Panics
+    ///
+    /// Panics if `y_position` is not an `ArrayY` position.
+    pub fn level1_of(&self, y_position: u64) -> u64 {
+        assert_position("ArrayY", y_position, self.array_y.len());
+        self.bitmap_y.rank1(y_position) + 1
     }
 
     /// The `ArrayY` position owning `z_position`, by rank.
-    pub fn level2_of(&self, _z_position: u64) -> u64 {
-        todo!("rank1 on BitmapZ")
+    ///
+    /// # Panics
+    ///
+    /// Panics if `z_position` is not an `ArrayZ` position.
+    pub fn level2_of(&self, z_position: u64) -> u64 {
+        assert_position("ArrayZ", z_position, self.array_z.len());
+        self.bitmap_z.rank1(z_position)
+    }
+
+    /// Raw level-2 value at an `ArrayY` position.
+    ///
+    /// Together with [`level2_of`](Self::level2_of), this materializes the
+    /// middle component of an otherwise unbound triple.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `y_position` is not an `ArrayY` position.
+    #[inline]
+    pub fn level2_at(&self, y_position: u64) -> u64 {
+        self.array_y.get(y_position)
     }
 
     /// Raw level-3 value at a position — the innermost read on every hot path.
-    pub fn level3_at(&self, _z_position: u64) -> u64 {
-        todo!("PackedArray::get on ArrayZ")
+    ///
+    /// # Panics
+    ///
+    /// Panics if `z_position` is not an `ArrayZ` position.
+    #[inline]
+    pub fn level3_at(&self, z_position: u64) -> u64 {
+        self.array_z.get(z_position)
     }
+}
+
+/// Positions belonging to zero-based `group`, where set bits close groups.
+fn group_range(bitmap: &RankedBitmap<'_>, group: u64) -> Range<u64> {
+    let end = bitmap.select1(group) + 1;
+    let start = if group == 0 {
+        0
+    } else {
+        bitmap.select1(group - 1) + 1
+    };
+    start..end
+}
+
+fn find_in(array: PackedArray<'_>, range: Range<u64>, value: u64) -> Option<u64> {
+    assert!(
+        range.start <= range.end && range.end <= array.len(),
+        "array range {}..{} out of range for {} entries",
+        range.start,
+        range.end,
+        array.len()
+    );
+    let (mut low, mut high) = (range.start, range.end);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match array.get(middle).cmp(&value) {
+            std::cmp::Ordering::Less => low = middle + 1,
+            std::cmp::Ordering::Greater => high = middle,
+            std::cmp::Ordering::Equal => return Some(middle),
+        }
+    }
+    None
+}
+
+fn assert_position(array: &str, position: u64, len: u64) {
+    assert!(
+        position < len,
+        "{array} position {position} out of range for {len} entries"
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::IdTriple;
     use crate::dict::Section;
-    use crate::testing::{Fixture, TINY_NT};
+    use crate::perm::Permutations;
+    use crate::testing::{Fixture, TINY_NT, tiny_id_triples};
+
+    fn sorted_projection(
+        triples: &[IdTriple],
+        project: impl Fn(IdTriple) -> [u64; 3],
+    ) -> Vec<[u64; 3]> {
+        let mut projected: Vec<_> = triples.iter().copied().map(project).collect();
+        projected.sort_unstable();
+        projected
+    }
+
+    fn assert_projection(
+        name: &str,
+        triples: BitmapTriples<'_>,
+        first_count: u64,
+        expected: &[[u64; 3]],
+    ) {
+        let mut actual = Vec::new();
+        let (mut next_y, mut next_z) = (0, 0);
+
+        for first in 1..=first_count {
+            let y_range = triples.level2_range(first);
+            assert_eq!(y_range.start, next_y, "{name}: level-2 gap");
+            assert!(!y_range.is_empty(), "{name}: implicit key {first} is empty");
+            assert_eq!(triples.find_level2(y_range.clone(), 0), None, "{name}");
+            assert_eq!(
+                triples.find_level2(y_range.clone(), u64::MAX),
+                None,
+                "{name}"
+            );
+
+            for y_position in y_range.clone() {
+                assert_eq!(triples.level1_of(y_position), first, "{name}");
+                let second = triples.level2_at(y_position);
+                assert_eq!(
+                    triples.find_level2(y_range.clone(), second),
+                    Some(y_position),
+                    "{name}"
+                );
+
+                let z_range = triples.level3_range(y_position);
+                assert_eq!(z_range.start, next_z, "{name}: level-3 gap");
+                assert!(!z_range.is_empty(), "{name}: level-2 group is empty");
+                assert_eq!(triples.find_level3(z_range.clone(), 0), None, "{name}");
+                assert_eq!(
+                    triples.find_level3(z_range.clone(), u64::MAX),
+                    None,
+                    "{name}"
+                );
+
+                for z_position in z_range.clone() {
+                    assert_eq!(triples.level2_of(z_position), y_position, "{name}");
+                    let third = triples.level3_at(z_position);
+                    assert_eq!(
+                        triples.find_level3(z_range.clone(), third),
+                        Some(z_position),
+                        "{name}"
+                    );
+                    actual.push([first, second, third]);
+                }
+                next_z = z_range.end;
+            }
+            next_y = y_range.end;
+        }
+
+        let expected_pairs = expected
+            .iter()
+            .map(|triple| [triple[0], triple[1]])
+            .collect::<std::collections::BTreeSet<_>>()
+            .len() as u64;
+        assert_eq!(next_y, expected_pairs, "{name}: level-2 coverage");
+        assert_eq!(next_z, expected.len() as u64, "{name}: level-3 coverage");
+        assert_eq!(
+            triples.find_level2(next_y..next_y, 1),
+            None,
+            "{name}: empty level-2 search"
+        );
+        assert_eq!(
+            triples.find_level3(next_z..next_z, 1),
+            None,
+            "{name}: empty level-3 search"
+        );
+        assert_eq!(actual, expected, "{name}: traversal order");
+    }
+
+    #[test]
+    fn shared_traversal_reconstructs_every_projection_and_inverse() {
+        let fixture = Fixture::build(TINY_NT);
+        let permutations =
+            Permutations::open(fixture.map_hdt(), fixture.map_perm()).expect("open permutations");
+        let dictionary = permutations
+            .hdt_layout()
+            .dictionary()
+            .view(permutations.hdt_mapping());
+        let counts = *dictionary.counts();
+        let triples = tiny_id_triples(&dictionary);
+
+        assert_projection(
+            "SPO",
+            permutations.spo(),
+            counts.len(Role::Subject),
+            &sorted_projection(&triples, |triple| {
+                [triple.subject, triple.predicate, triple.object]
+            }),
+        );
+        assert_projection(
+            "POS",
+            permutations.pos(),
+            counts.len(Role::Predicate),
+            &sorted_projection(&triples, |triple| {
+                [triple.predicate, triple.object, triple.subject]
+            }),
+        );
+        assert_projection(
+            "OPS",
+            permutations.ops(),
+            counts.len(Role::Object),
+            &sorted_projection(&triples, |triple| {
+                [triple.object, triple.predicate, triple.subject]
+            }),
+        );
+    }
 
     /// The walk must agree with what hdtc records about the same file from its
     /// own read of it — the differential check this unit is verified by.
