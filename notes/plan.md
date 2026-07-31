@@ -69,7 +69,7 @@ sizes, and the bit lengths its SPO directories say they index — plus: every re
 projects and reads in range, `BitmapY` has one set bit per subject and `BitmapZ` one
 per (subject, predicate) pair, and a non-HDT or truncated file is refused by name.
 
-### 4. `dict` — PFC random access
+### 4. `dict` — PFC random access ✅
 
 `locate`, `extract`, `prefix_bounds`, and the role/shared-section arithmetic, over the
 `PfcLayout`s unit 3 already located (term count, block size, the block-offset
@@ -82,9 +82,30 @@ a sentinel. `locate` binary-searches block heads, which are stored uncompressed;
 block-offset array is mapped in place, never materialized.
 
 *Verified by* the strongest differential test available in the system: the dictionary
-is fully enumerable, so `extract` over every id must reproduce `hdtc dump`'s
-sequential output term for term. If that passes over Ubergraph's 355 MB of strings,
+is fully enumerable, so `extract` over every id must reproduce hdtc's independent
+sequential PFC reader term for term. If that passes over Ubergraph's 355 MB of strings,
 PFC random access is right.
+
+**What landed.** `DictionaryLayout::view` projects the four mapped sections for a
+request; block offsets stay packed and are never materialized. Lookup upper-bounds
+block heads and decodes one candidate block per searched section, extraction decodes
+only the addressed block into the caller's buffer, and prefix bounds use the same
+lower-bound search.
+Role arithmetic is confined to `dict`: shared ids retain their subject/object ids and
+role-only local ids are offset exactly once. Payload corruption is reported explicitly
+rather than being treated as a missing term.
+
+The differential test enumerates every section through hdtc's independent sequential
+PFC reader and compares every `extract` and `locate`, using enough terms to cross
+multiple blocks. Prefix ranges are checked against that enumeration, including empty
+and unbounded byte prefixes.
+
+One spec correction surfaced: doc 20 §20.5 sketches one `Range<TermId>` for a role
+prefix, but `dictionaryFour` concatenates two *independently sorted* sections for
+subjects and objects (shared, then role-only). A prefix can therefore occupy two
+disjoint id ranges. `PrefixBounds` preserves both and still gives an exact `O(log D)`
+count; the server will merge the two sorted runs when it implements `/terms`. The code
+follows the format here; the single-range sketch in doc 20 is the bug.
 
 ### 5. `perm` — map the sidecar
 

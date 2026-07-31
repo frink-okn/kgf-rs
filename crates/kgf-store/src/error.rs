@@ -54,6 +54,17 @@ pub enum Error {
     #[error("region does not match its descriptor: {0}")]
     Region(String),
 
+    /// A role-scoped dictionary id is zero or beyond that role's id space.
+    #[error("{role:?} term id {id} is out of range (valid ids: 1..={maximum})")]
+    TermIdOutOfRange {
+        /// The id space the caller addressed.
+        role: crate::Role,
+        /// The rejected id.
+        id: u64,
+        /// The largest valid id in that role.
+        maximum: u64,
+    },
+
     /// A cursor was issued against different data or a different request.
     #[error("stale cursor")]
     StaleCursor,

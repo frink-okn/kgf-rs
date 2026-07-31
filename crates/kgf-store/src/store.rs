@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 use crate::dict::Dictionary;
 use crate::error::Result;
+use crate::hdt::HdtLayout;
+use crate::map::Mapping;
 use crate::pattern::{IdPattern, Selection};
 use crate::perm::Permutations;
 
@@ -51,7 +53,8 @@ pub struct OpenOptions {
 #[derive(Debug)]
 pub struct Store {
     _dir: PathBuf,
-    _dict: Dictionary,
+    _hdt: Mapping,
+    _hdt_layout: HdtLayout,
     _perms: Permutations,
 }
 
@@ -71,8 +74,8 @@ impl Store {
     }
 
     /// The dictionary.
-    pub fn dict(&self) -> &Dictionary {
-        &self._dict
+    pub fn dict(&self) -> Dictionary<'_> {
+        self._hdt_layout.dictionary().view(&self._hdt)
     }
 
     /// The permutations.
@@ -82,7 +85,7 @@ impl Store {
 
     /// Total triples in the bundle.
     pub fn triples(&self) -> u64 {
-        todo!("from the HDT layout parsed at open — one ArrayZ entry per triple")
+        self._hdt_layout.triples()
     }
 
     /// Resolve a pattern. `O(log N)`; enumerates nothing.

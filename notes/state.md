@@ -1,4 +1,4 @@
-# Where kgf-rs stands — 2026-07-31 (unit 3 landed)
+# Where kgf-rs stands — 2026-07-31 (unit 4 landed)
 
 A point-in-time handoff. `CLAUDE.md` has the conventions and the design rules,
 `notes/plan.md` has the route and the recorded decisions, `../kgf/docs/20-read-layer.md`
@@ -27,7 +27,7 @@ described below; `kgf-store` will not build against an hdtc without them.
 
 ## What is built
 
-Three of eight units from `notes/plan.md`, all complete with tests. 32 tests, ~1 s,
+Four of eight units from `notes/plan.md`, all complete with tests. 34 tests, ~1 s,
 clean under `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and
 `cargo doc` with no warnings.
 
@@ -36,7 +36,7 @@ clean under `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, an
 | `map.rs` | **done** — `Mapping`, `PackedSpec`/`PackedArray`, `BitmapSpec`/`BitmapView`, `BytesSpec` |
 | `rank.rs` | **done** — `RankedSpec`/`RankedBitmap`: `rank1`, `select1`, `count` |
 | `hdt.rs` | `HdtLayout::parse` + `TriplesLayout` **done**; `BitmapTriples`' traversal is unit 6 |
-| `dict.rs` | `PfcLayout`/`DictionaryLayout`/`Section` **done**; `locate`/`extract`/`prefix_bounds` are unit 4 |
+| `dict.rs` | **done** — mapped PFC `locate`/`extract`/`prefix_bounds`, role/shared arithmetic |
 | `testing.rs` | shared test support (`Rng`, `bit`, `TINY_NT`, `Fixture`) |
 | `error.rs` | complete enough to build on |
 | everything else | skeleton: real signatures and doc comments, `todo!()` bodies |
@@ -192,22 +192,29 @@ Recorded in `notes/plan.md` under "Decisions recorded here" unless noted:
   panics if an embedder already installed a tracing subscriber. Sensible consequence of
   lib-ification, not committed yet.
 
+## Unit 4: mapped dictionary access
+
+`DictionaryLayout::view` projects the four PFC sections without materializing their
+block-offset arrays. `locate` binary-searches block heads then decodes one block per
+searched section; `extract` decodes only the addressed block into a caller buffer;
+`prefix_bounds` uses the same search. All shared/role-only id arithmetic lives in
+`dict`.
+
+The differential test uses hdtc's independent sequential PFC reader as the oracle and
+compares every id and term across multiple blocks. There are 34 tests after this unit.
+
+The implementation exposed a bug in doc 20 §20.5's indicative signature:
+`Range<TermId>` cannot represent every subject/object prefix. Their ids concatenate
+shared and role-only sections, which are individually sorted but not jointly sorted, so
+a prefix may have one disjoint range in each. `PrefixBounds` returns up to two ranges
+and an exact count. `/terms` will merge those two sorted runs; the cost remains
+`O(log D + limit)`.
+
 ## Next
 
-Unit 4, `dict`: `locate`, `extract`, `prefix_bounds`, and the role/shared-section
-arithmetic, over the `PfcLayout`s unit 3 already located — term count, block size, the
-block-offset `PackedSpec`, and the string buffer's `BytesSpec`. Nothing more needs
-locating; what is missing is the block decode and the two binary searches.
-
-It gets the strongest differential test in the system: the dictionary is fully
-enumerable, so `extract` over every id must reproduce `hdtc dump`'s sequential output
-term for term. `testing::Fixture` already builds a bundle with the hdtc binary, so
-adding a `dump` invocation to compare against is a few lines.
-
-One decision waiting there: `Section` distinguishes the four PFC sections, and doc 20
-§20.5's `Role` spans two of them. The arithmetic mapping (`Role`, id) → (`Section`,
-local index) belongs in `dict` and nothing outside it should reason about the shared
-section's id overlap.
+Unit 5, `perm`: open `data.hdt.perm` through `hdtc::format::PermutationIndex`, turn
+its directory entries into mapped specs, assemble POS and OPS, and bind the SPO
+bitmaps in `data.hdt` to the component `0x03` rank directories.
 
 Two smaller things this unit left open:
 
