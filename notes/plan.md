@@ -1,0 +1,150 @@
+# kgf-store implementation plan
+
+The route from the current skeleton to a working query core: mapped `data.hdt` +
+`data.hdt.perm`, all eight patterns at doc 20 §20.2's bounds, exact counts, stable
+positional cursors. Spec references are to `../kgf/docs`.
+
+Ordered so that every unit is verifiable when it lands rather than at the end. The
+first two touch nothing external — no hdtc, no files, no I/O — which is where the
+bit-twiddling everything else trusts belongs.
+
+## Units
+
+### 1. `map` — mapped regions and packed element access
+
+`Mapping` (the crate's only `unsafe`), `PackedArray`, `BitmapView`.
+
+Entry `i` of a packed array begins at bit `i * width`, LSB-first, `width` in
+`0..=64`; `width == 0` means every entry is zero. One reader serves both the HDT and
+the sidecar — see the module docs for why the difference between them is framing
+rather than element access.
+
+*Verified by* round-tripping against a naive bit-by-bit encoder: every width `0..=64`,
+random lengths, every entry, and the final entries specifically (the case where the
+backing slice has no slack).
+
+### 2. `rank` — `RankedBitmap`
+
+`rank1`, `select1`, `count` over the persisted two-level directories, with the
+superblock and subblock widths read from the header rather than assumed. Read-only:
+nothing here constructs a directory, because constructing one is a full pass over
+every bitmap byte — the exact cost lazy open exists to avoid.
+
+*Verified by* naive prefix-popcount and naive scan over random bitmaps at adversarial
+densities (empty, single bit, all ones, alternating) and lengths landing exactly on
+and either side of multiples of 512 and 4096. The `rank1(L)` sentinel case gets its
+own test; it is the one the general formula would index one past the end for.
+
+A directory builder lives in `#[cfg(test)]` so the properties can be checked without
+a bundle.
+
+### 3. `hdt::HdtLayout` — locate sections in a mapped `data.hdt`
+
+Walk the global control info, the header, the dictionary's four PFC sections, and the
+triples' `ArrayY`/`BitmapY`/`ArrayZ`/`BitmapZ`, recording offsets and shapes.
+
+**This is a preamble walk, not a scan.** Every section states its own size, so
+locating all of them costs about a dozen small reads — well under a kilobyte, a dozen
+pages — and touches no payload. Use `hdtc::format`'s *skip* forms
+(`skip_log_array_section`, `skip_bitmap_section`) and the PFC preamble.
+
+**Do not call hdtc's materializing readers here.** `LogArrayReader::read_from` and
+`PfcSectionHeader::read_from` read their whole payload into a `Vec` and verify CRCs.
+That is right for a bounded-memory CLI and wrong for us: on Ubergraph the object
+dictionary's block-offset array alone is ~1.3 M entries. If hdtc offers only a
+materializing form for something we need, add a preamble-only variant *to hdtc*
+rather than reimplementing the parse here (doc 20 §20.4).
+
+*Verified by* building a fixture with hdtc and asserting the offsets and shapes agree
+with what hdtc itself reports.
+
+### 4. `dict` — PFC random access
+
+`locate`, `extract`, `prefix_bounds`, and the role/shared-section arithmetic.
+
+Standard HDT already supports all of this: each section is lexicographically sorted in
+blocks of `block_size` (16 by default), preceded by a `LogArray` of block offsets with
+a sentinel. `locate` binary-searches block heads, which are stored uncompressed;
+`extract` decodes at most one block; `prefix_bounds` falls out of the same search. The
+block-offset array is mapped in place, never materialized.
+
+*Verified by* the strongest differential test available in the system: the dictionary
+is fully enumerable, so `extract` over every id must reproduce `hdtc dump`'s
+sequential output term for term. If that passes over Ubergraph's 355 MB of strings,
+PFC random access is right.
+
+### 5. `perm` — map the sidecar
+
+`hdtc::format::PermutationIndex::open` for the header, directory, and binding checks;
+then map each region from its directory entry. Assemble the POS and OPS
+`BitmapTriples`, and bind the host HDT's SPO bitmaps to the component `0x03`
+directories that ride in the sidecar.
+
+hdtc's `PermutationIndex::triples` is a seek-based path for its own CLI and is not
+used.
+
+### 6. `hdt::BitmapTriples` — the shared traversal
+
+`level2_range`, `level3_range`, `find_level2`, `find_level3`, `level1_of`,
+`level2_of`, `level3_at`. One implementation over all three permutations, which is
+possible because all three have implicit level 1 and the same two-level shape.
+
+**This is the real milestone.** At this point the store answers patterns over a
+606 M-triple bundle in id space, and doc 20 §20.6's cold-start-with-N-bundles
+measurement becomes possible. Everything after it is contract work rather than
+discovery.
+
+### 7. `pattern` — the §20.2 table
+
+Eight patterns to `Selection`; exact counts by rank difference; `page`; `at` for
+`/sample`. `s ? o` gets its dual route, choosing on `min(deg(s), deg(o))` — both
+degrees are rank differences, so choosing is cheap — with linear scan inside a route
+for ranges spanning a page or two and binary search above that.
+
+The enumeration order fixed here is a contract: cursors are positions in it.
+
+*Verified by* differential comparison against `hdtc search` for all eight shapes, plus
+the §20.9 consistency properties.
+
+### 8. `store` and `catalog`
+
+Required-artifact checks with errors that name the command to run, cheap binding
+verification, `Arc<Store>`, lazy open with a singleflight guard, eviction by dropping
+the `Arc`.
+
+*Verified by* opening `ubergraph2` and by an N-threads × M-bundles stress under
+eviction.
+
+## Testing spine
+
+Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
+matter are differential and property-based:
+
+- **Golden bundles** — tiny fixture RDF checked in, built by hdtc in CI.
+- **Differential** — every pattern shape against `hdtc search`; the dictionary against
+  `hdtc dump`.
+- **Permutation consistency** — `Σₚ count(? p ?) = N = Σₒ count(? ? o)`;
+  `count(? p o)` agreeing between POS and OPS; every triple from `? ? ?` found by all
+  applicable bound patterns.
+- **Paging** — counts equal enumeration lengths under exhaustive paging at
+  adversarial page sizes (1, 2, a prime, the cap).
+- **Cursors** — resume at every position of every pattern yields exactly the suffix;
+  stale digests and foreign-request tokens rejected.
+
+## Decisions recorded here
+
+**Element reads go through `u128` uniformly** rather than splitting a `u64` path for
+widths ≤ 57. One code path covers `0..=64` and is correct by construction; the split
+would be measurably cheaper on the widths Ubergraph actually uses (25, 16, 11) and is
+the obvious first optimization, but it is an optimization, and the house rule is that
+those follow a profile. This is the innermost read in the system, so it will get one.
+
+**No `madvise` tuning yet.** Random versus sequential access hints trade against each
+other — bindings joins want `RANDOM`, full-page enumeration wants readahead — and
+picking without measurement is guessing. Revisit with the §20.6 cold-start numbers.
+
+## Not in this plan
+
+Composed operations (`/search`, `/labels`, ranges, star, key resolution), graph
+scoping, and everything gated on a sidecar beyond `.perm`. Those are doc 20 §20.8's
+M2 and M3, and they compose through the `Store` this plan builds.

@@ -8,9 +8,10 @@
 //! POS and OPS in `data.hdt.perm` have exactly this shape (doc 20 §20.2), which
 //! is why [`BitmapTriples`] serves all three and [`crate::perm`] only supplies
 //! the differently-sourced views. What is *not* shared is the framing: sections
-//! here carry preambles and sit at unaligned offsets, so they are located
-//! through `hdtc::format` and wrapped with the tail-safe reader
-//! ([`crate::map`]).
+//! here carry preambles and sit at unaligned offsets, so they are located by
+//! walking those preambles with `hdtc::format`'s *skip* forms, which read shapes
+//! without touching payloads. Nothing on this path may call hdtc's materializing
+//! readers ([`crate::map`] explains the element access that results).
 //!
 //! The rank directories for this file's two bitmaps live in `data.hdt.perm`
 //! (its component `0x03`), since standard HDT has nowhere to put them.

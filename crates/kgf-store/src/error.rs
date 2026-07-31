@@ -46,6 +46,14 @@ pub enum Error {
         detail: String,
     },
 
+    /// A mapped region does not match the shape its descriptor claims.
+    ///
+    /// Carries no path: this is raised deep in [`crate::map`], where only the
+    /// region and its declared shape are known. Callers that do know which file
+    /// a region came from should wrap it in [`Error::Malformed`].
+    #[error("region does not match its descriptor: {0}")]
+    Region(String),
+
     /// A cursor was issued against different data or a different request.
     #[error("stale cursor")]
     StaleCursor,
