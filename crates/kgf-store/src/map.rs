@@ -34,13 +34,34 @@
 //! guarantee then means sidecar reads never take the second path, without that
 //! being a property callers have to know or a flag they have to set.
 //!
-//! # Where errors live
+//! # Specs and views
 //!
-//! Shapes are checked **once, at construction**: a view that exists is a view
-//! whose backing bytes are big enough for the entries it claims. Accessors are
-//! therefore infallible and bounds-check with `assert!` — they are the innermost
-//! reads in the system, and threading a `Result` through them would price every
-//! lookup for a condition that construction already excluded.
+//! A **spec** ([`PackedSpec`], [`BitmapSpec`]) is a validated description of
+//! where a region is and what shape it has: offsets, lengths, widths, and the
+//! arithmetic derived from them. Building one is fallible and happens **once,
+//! at open**, where the file path is in hand for the error message. A **view**
+//! ([`PackedArray`], [`BitmapView`]) is a spec projected onto a mapping, and
+//! projecting is infallible.
+//!
+//! The split exists because a [`Store`](crate::store::Store) owns its
+//! [`Mapping`]s and so cannot also hold views of them — that would be a
+//! self-referential struct. Holding specs instead means a malformed bundle is
+//! rejected by `Store::open` with a path and a remedy, rather than panicking on
+//! some later request; without it, every query would re-validate and
+//! `.expect()`, which is the same check moved somewhere it cannot be acted on.
+//!
+//! Specs are plain `Copy` data, so they are `Send + Sync` and a view costs a
+//! bounds compare and a slice. Any number of threads may project the same spec
+//! at once; nothing is shared but an immutable mapping.
+//!
+//! Past construction, accessors are infallible and bounds-check with `assert!`.
+//! They are the innermost reads in the system, and threading a `Result` through
+//! them would price every lookup for a condition construction already excluded.
+//!
+//! Projections run from a region's offset to the end of the file rather than to
+//! the end of the region, which costs nothing and hands every view whatever
+//! trailing slack the file has — so the widened read path above stays live
+//! without any caller having to know it exists.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -97,23 +118,27 @@ impl Mapping {
         &self.mmap
     }
 
-    /// File length in bytes.
-    pub fn len(&self) -> usize {
-        self.mmap.len()
-    }
-
-    /// Whether the mapping is empty. Never true — [`Mapping::open`] rejects
-    /// empty files — but required alongside [`Mapping::len`].
-    pub fn is_empty(&self) -> bool {
-        self.mmap.is_empty()
-    }
-
     /// The file this was mapped from, for error messages.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Length in bytes.
+    fn byte_len(&self) -> u64 {
+        self.mmap.len() as u64
+    }
+
+    /// The bytes from `offset` to the end of the file.
+    ///
+    /// Specs validate their own extent, so a projection needs only a start.
+    fn from(&self, offset: u64) -> &[u8] {
+        &self.mmap[offset as usize..]
+    }
+
     /// A sub-slice of the mapping, checked against its length.
+    ///
+    /// For one-off reads during a header walk. Repeatedly-read regions should
+    /// go through a [`PackedSpec`] or [`BitmapSpec`] instead.
     ///
     /// Regions are located by a section directory or a preamble walk, both of
     /// which come from the file itself, so a range that does not fit means the
@@ -133,19 +158,94 @@ impl Mapping {
         }
         Ok(&self.mmap[offset as usize..end as usize])
     }
+}
 
-    /// A region extended by whatever slack the file has after it, up to `slack`
-    /// bytes.
+/// Where a packed array lives and what shape it has, validated once.
+///
+/// Built at open against the mapping it describes; projected to a
+/// [`PackedArray`] whenever the bytes are actually needed.
+#[derive(Debug, Clone, Copy)]
+pub struct PackedSpec {
+    offset: u64,
+    bytes: u64,
+    len: u64,
+    width: u8,
+    mask: u64,
+}
+
+impl PackedSpec {
+    /// Validate `len` entries of `width` bits at `offset` within `mapping`.
+    pub fn new(mapping: &Mapping, offset: u64, len: u64, width: u8) -> Result<Self> {
+        if width > 64 {
+            return Err(Error::Region(format!(
+                "packed entry width {width} exceeds 64 bits"
+            )));
+        }
+        let bytes = packed_bytes(len, width)?;
+        let end = offset.checked_add(bytes).ok_or_else(|| {
+            Error::Region(format!("region at {offset} of {bytes} bytes overflows u64"))
+        })?;
+        if end > mapping.byte_len() {
+            return Err(Error::Region(format!(
+                "{len} entries of {width} bits at {offset} need {bytes} bytes, \
+                 past the end of {} ({} bytes)",
+                mapping.path().display(),
+                mapping.byte_len()
+            )));
+        }
+        Ok(Self {
+            offset,
+            bytes,
+            len,
+            width,
+            mask: entry_mask(width),
+        })
+    }
+
+    /// Number of entries.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the array holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Bits per entry.
+    pub fn width(&self) -> u8 {
+        self.width
+    }
+
+    /// Project onto a mapping.
     ///
-    /// Element reads widen to 16 bytes where they can (see the module docs), so
-    /// handing a view its trailing slack keeps the fast path live. Passing a
-    /// region without slack is always correct, just marginally slower at the
-    /// last entry or two.
-    pub fn region_with_slack(&self, offset: u64, length: u64, slack: u64) -> Result<&[u8]> {
-        self.region(offset, length)?;
-        let total = self.mmap.len() as u64;
-        let end = (offset + length).saturating_add(slack).min(total);
-        Ok(&self.mmap[offset as usize..end as usize])
+    /// Panics if `mapping` is not the one this spec was validated against, or
+    /// another of at least the same length — specs and their mappings are held
+    /// side by side in a `Store`, so a mismatch is a bug rather than a
+    /// condition to report.
+    pub fn view<'a>(&self, mapping: &'a Mapping) -> PackedArray<'a> {
+        assert!(
+            self.offset + self.bytes <= mapping.byte_len(),
+            "packed spec at {} does not fit {}",
+            self.offset,
+            mapping.path().display()
+        );
+        PackedArray {
+            bytes: mapping.from(self.offset),
+            len: self.len,
+            width: self.width,
+            mask: self.mask,
+        }
+    }
+}
+
+/// `width` low bits set; `0` when `width == 0`, which makes the zero-width case
+/// fall out of an ordinary read instead of needing a branch.
+fn entry_mask(width: u8) -> u64 {
+    if width == 0 {
+        0
+    } else {
+        u64::MAX >> (64 - u32::from(width))
     }
 }
 
@@ -159,10 +259,15 @@ pub struct PackedArray<'a> {
     bytes: &'a [u8],
     len: u64,
     width: u8,
+    mask: u64,
 }
 
 impl<'a> PackedArray<'a> {
-    /// Wrap `bytes` as `len` entries of `width` bits.
+    /// Wrap a bare slice as `len` entries of `width` bits.
+    ///
+    /// The form for callers that already hold a slice. Anything reached
+    /// repeatedly from a `Store` should go through [`PackedSpec`] instead, so
+    /// that validation happens at open where the path is known.
     ///
     /// `bytes` must be at least `ceil(len * width / 8)` long; anything past that
     /// is slack the reader may use to widen its loads, and need not exist.
@@ -179,7 +284,12 @@ impl<'a> PackedArray<'a> {
                 bytes.len()
             )));
         }
-        Ok(Self { bytes, len, width })
+        Ok(Self {
+            bytes,
+            len,
+            width,
+            mask: entry_mask(width),
+        })
     }
 
     /// Number of entries.
@@ -202,38 +312,91 @@ impl<'a> PackedArray<'a> {
     /// Panics if `index >= len()`. Callers hold ranges derived from the same
     /// headers that sized this view, so an out-of-range index is a bug here, not
     /// a condition to report.
+    #[inline]
     pub fn get(&self, index: u64) -> u64 {
         assert!(
             index < self.len,
             "packed array index {index} out of range for {} entries",
             self.len
         );
-        if self.width == 0 {
-            return 0;
-        }
         let bit_start = index * u64::from(self.width);
         let byte_start = (bit_start / 8) as usize;
         let bit_offset = bit_start % 8;
 
         // At most 7 + 64 = 71 bits are needed, so one 16-byte window always
-        // covers an entry wherever it starts.
+        // covers an entry wherever it starts. After shifting, the entry occupies
+        // the low `width` bits, so truncating to `u64` cannot lose any of it.
         let window = self.load_window(byte_start);
-        let mask = (1u128 << self.width) - 1;
-        ((window >> bit_offset) & mask) as u64
+        ((window >> bit_offset) as u64) & self.mask
     }
 
     /// Sixteen bytes from `byte_start`, zero-filled if the region ends first.
     #[inline]
     fn load_window(&self, byte_start: usize) -> u128 {
-        match self.bytes.get(byte_start..byte_start + 16) {
-            Some(chunk) => u128::from_le_bytes(chunk.try_into().expect("16-byte chunk")),
+        let tail = &self.bytes[byte_start..];
+        match tail.first_chunk::<16>() {
+            Some(chunk) => u128::from_le_bytes(*chunk),
             None => {
+                // `first_chunk` failing means fewer than 16 bytes remain.
                 let mut buf = [0u8; 16];
-                let tail = &self.bytes[byte_start..];
-                let take = tail.len().min(16);
-                buf[..take].copy_from_slice(&tail[..take]);
+                buf[..tail.len()].copy_from_slice(tail);
                 u128::from_le_bytes(buf)
             }
+        }
+    }
+}
+
+/// Where a bitmap lives and how long it is, validated once.
+#[derive(Debug, Clone, Copy)]
+pub struct BitmapSpec {
+    offset: u64,
+    bytes: u64,
+    bits: u64,
+}
+
+impl BitmapSpec {
+    /// Validate `bits` bits at `offset` within `mapping`.
+    pub fn new(mapping: &Mapping, offset: u64, bits: u64) -> Result<Self> {
+        let bytes = bits.div_ceil(8);
+        let end = offset.checked_add(bytes).ok_or_else(|| {
+            Error::Region(format!("region at {offset} of {bytes} bytes overflows u64"))
+        })?;
+        if end > mapping.byte_len() {
+            return Err(Error::Region(format!(
+                "{bits} bits at {offset} need {bytes} bytes, past the end of {} ({} bytes)",
+                mapping.path().display(),
+                mapping.byte_len()
+            )));
+        }
+        Ok(Self {
+            offset,
+            bytes,
+            bits,
+        })
+    }
+
+    /// Number of bits.
+    pub fn len(&self) -> u64 {
+        self.bits
+    }
+
+    /// Whether the bitmap holds no bits.
+    pub fn is_empty(&self) -> bool {
+        self.bits == 0
+    }
+
+    /// Project onto a mapping. Panics if it does not fit — see
+    /// [`PackedSpec::view`].
+    pub fn view<'a>(&self, mapping: &'a Mapping) -> BitmapView<'a> {
+        assert!(
+            self.offset + self.bytes <= mapping.byte_len(),
+            "bitmap spec at {} does not fit {}",
+            self.offset,
+            mapping.path().display()
+        );
+        BitmapView {
+            bytes: mapping.from(self.offset),
+            bits: self.bits,
         }
     }
 }
@@ -246,7 +409,10 @@ pub struct BitmapView<'a> {
 }
 
 impl<'a> BitmapView<'a> {
-    /// Wrap a region as `bits` bits.
+    /// Wrap a bare slice as `bits` bits.
+    ///
+    /// The form for callers that already hold a slice; see
+    /// [`PackedArray::new`] for when to prefer a spec.
     pub fn new(bytes: &'a [u8], bits: u64) -> Result<Self> {
         let needed = bits.div_ceil(8);
         if (bytes.len() as u64) < needed {
@@ -279,9 +445,35 @@ impl<'a> BitmapView<'a> {
         byte >> (index % 8) & 1 == 1
     }
 
-    /// The byte holding bit `index * 8`, for callers scanning a bounded run.
-    pub fn byte(&self, index: usize) -> u8 {
-        self.bytes[index]
+    /// Position of the `k`-th set bit at or after `start`, or `None` if the
+    /// bitmap runs out first.
+    ///
+    /// Lives here rather than in [`crate::rank`] because it is the one operation
+    /// that has to know the within-byte bit order, and keeping that knowledge in
+    /// one file is why this type exists. `rank` supplies the bounded starting
+    /// point from its directories and owns no bit layout of its own.
+    pub fn select_from(&self, start: u64, k: u64) -> Option<u64> {
+        debug_assert_eq!(start % 8, 0, "scans start on a byte boundary");
+        let mut remaining = k;
+        let mut position = start;
+
+        while position < self.bits {
+            let byte = self.bytes[(position / 8) as usize];
+            let ones = u64::from(byte.count_ones());
+            if remaining < ones {
+                for bit in 0..8 {
+                    if byte >> bit & 1 == 1 {
+                        if remaining == 0 {
+                            return Some(position + bit);
+                        }
+                        remaining -= 1;
+                    }
+                }
+            }
+            remaining -= ones;
+            position += 8;
+        }
+        None
     }
 
     /// Set bits in `range`, clamped to the bitmap's length.
@@ -289,7 +481,7 @@ impl<'a> BitmapView<'a> {
     /// Used by [`crate::rank`] for the partial subblock a `rank1` ends in, which
     /// is bounded by the subblock width.
     pub fn count_ones_in(&self, range: std::ops::Range<u64>) -> u64 {
-        let start = range.start.min(self.bits);
+        let start = range.start;
         let end = range.end.min(self.bits);
         if start >= end {
             return 0;
@@ -298,19 +490,22 @@ impl<'a> BitmapView<'a> {
         let first = (start / 8) as usize;
         let last = ((end - 1) / 8) as usize;
         let low_mask = 0xFFu8 << (start % 8);
-        let high_bit = (end - 1) % 8;
-        let high_mask = if high_bit == 7 {
-            0xFFu8
-        } else {
-            (1u8 << (high_bit + 1)) - 1
-        };
+        let high_mask = 0xFFu8 >> (7 - (end - 1) % 8);
 
         if first == last {
             return u64::from((self.bytes[first] & low_mask & high_mask).count_ones());
         }
 
+        // The whole bytes between the two partial ends, eight at a time: the
+        // caller is a `rank1` finishing inside one subblock, so this is the
+        // "at most eight u64 popcounts" the format's §7.2 costs it at.
+        let middle = &self.bytes[first + 1..last];
         let mut count = u64::from((self.bytes[first] & low_mask).count_ones());
-        for &byte in &self.bytes[first + 1..last] {
+        let mut words = middle.chunks_exact(8);
+        for word in &mut words {
+            count += u64::from(u64::from_le_bytes(word.try_into().expect("8 bytes")).count_ones());
+        }
+        for &byte in words.remainder() {
             count += u64::from(byte.count_ones());
         }
         count + u64::from((self.bytes[last] & high_mask).count_ones())
@@ -320,6 +515,7 @@ impl<'a> BitmapView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{Rng, bit};
 
     /// Encode `values` at `width` bits each, one bit at a time.
     ///
@@ -341,22 +537,8 @@ mod tests {
         bytes
     }
 
-    /// A cheap deterministic generator; no dev-dependency for four call sites.
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            // SplitMix64.
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-    }
-
     fn values_of_width(count: usize, width: u8, seed: u64) -> Vec<u64> {
-        let mut rng = Rng(seed);
+        let mut rng = Rng::new(seed);
         let mask = if width == 0 { 0 } else { (1u128 << width) - 1 };
         (0..count)
             .map(|_| (u128::from(rng.next()) & mask) as u64)
@@ -456,13 +638,13 @@ mod tests {
 
     fn naive_count(bytes: &[u8], bits: u64, range: std::ops::Range<u64>) -> u64 {
         (range.start..range.end.min(bits))
-            .filter(|bit| bytes[(bit / 8) as usize] >> (bit % 8) & 1 == 1)
+            .filter(|index| bit(bytes, *index))
             .count() as u64
     }
 
     #[test]
     fn bitmap_bits_and_counts_match_a_naive_walk() {
-        let mut rng = Rng(0xB1_7B_17);
+        let mut rng = Rng::new(0xB1_7B_17);
         for bits in [
             0u64, 1, 7, 8, 9, 63, 64, 65, 511, 512, 513, 4095, 4096, 4097,
         ] {
@@ -478,11 +660,11 @@ mod tests {
 
             let view = BitmapView::new(&bytes, bits).unwrap();
             assert_eq!(view.len(), bits);
-            for bit in 0..bits {
+            for index in 0..bits {
                 assert_eq!(
-                    view.get(bit),
-                    bytes[(bit / 8) as usize] >> (bit % 8) & 1 == 1,
-                    "{bits} bits, bit {bit}"
+                    view.get(index),
+                    bit(&bytes, index),
+                    "{bits} bits, bit {index}"
                 );
             }
 

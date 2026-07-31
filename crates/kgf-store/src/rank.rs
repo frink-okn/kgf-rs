@@ -41,7 +41,108 @@
 //! Detecting that is `kgf verify`'s job, off the read path (doc 20 §20.6).
 
 use crate::error::{Error, Result};
-use crate::map::{BitmapView, PackedArray};
+use crate::map::{BitmapSpec, BitmapView, Mapping, PackedArray, PackedSpec};
+
+/// Where a bitmap and its directory live, and the geometry relating them,
+/// validated once.
+///
+/// The bitmap and the directory need not share a mapping: the SPO directories
+/// sit in `data.hdt.perm` and index bitmaps inside `data.hdt`, which is why
+/// [`view`](RankedSpec::view) takes both files rather than one.
+///
+/// Building a spec reads no payload — only the sizes the headers already
+/// declared — so binding every directory in a bundle stays part of a
+/// header-only open.
+#[derive(Debug, Clone, Copy)]
+pub struct RankedSpec {
+    bitmap: BitmapSpec,
+    superrank: PackedSpec,
+    subrank: PackedSpec,
+    superblock_bits: u64,
+    subblock_bits: u64,
+    sentinel: u64,
+    subs_per_super: u64,
+}
+
+impl RankedSpec {
+    /// Bind a bitmap to its directory.
+    ///
+    /// Fails if the directory is not sized for the bitmap. A mismatch means the
+    /// sidecar does not describe this HDT, which is a binding failure rather
+    /// than something to work around.
+    pub fn new(
+        bitmap: BitmapSpec,
+        superrank: PackedSpec,
+        subrank: PackedSpec,
+        superblock_bits: u32,
+        subblock_bits: u32,
+    ) -> Result<Self> {
+        let superblock_bits = u64::from(superblock_bits);
+        let subblock_bits = u64::from(subblock_bits);
+        let bits = bitmap.len();
+        let (want_super, want_sub) = directory_shape(bits, superblock_bits, subblock_bits)?;
+
+        check_directory(superrank.len(), want_super, "superrank", bits)?;
+        check_directory(subrank.len(), want_sub, "subrank", bits)?;
+
+        Ok(Self {
+            bitmap,
+            superrank,
+            subrank,
+            superblock_bits,
+            subblock_bits,
+            sentinel: want_super.saturating_sub(1),
+            subs_per_super: superblock_bits / subblock_bits,
+        })
+    }
+
+    /// Project onto the mapping holding the bitmap and the one holding the
+    /// directory. They are frequently the same file; pass it twice.
+    pub fn view<'a>(&self, bitmap: &'a Mapping, directory: &'a Mapping) -> RankedBitmap<'a> {
+        RankedBitmap {
+            bitmap: self.bitmap.view(bitmap),
+            superrank: self.superrank.view(directory),
+            subrank: self.subrank.view(directory),
+            superblock_bits: self.superblock_bits,
+            subblock_bits: self.subblock_bits,
+            sentinel: self.sentinel,
+            subs_per_super: self.subs_per_super,
+        }
+    }
+}
+
+/// Directory entry counts for a bitmap of `bits` bits, or an error if the block
+/// widths do not nest.
+fn directory_shape(bits: u64, superblock_bits: u64, subblock_bits: u64) -> Result<(u64, u64)> {
+    if subblock_bits == 0 || superblock_bits == 0 {
+        return Err(Error::Region(
+            "rank directory block widths must be non-zero".to_owned(),
+        ));
+    }
+    if !superblock_bits.is_multiple_of(subblock_bits) {
+        return Err(Error::Region(format!(
+            "superblock width {superblock_bits} is not a multiple of subblock width {subblock_bits}"
+        )));
+    }
+    Ok(if bits == 0 {
+        (0, 0)
+    } else {
+        (
+            bits.div_ceil(superblock_bits) + 1,
+            bits.div_ceil(subblock_bits),
+        )
+    })
+}
+
+fn check_directory(got: u64, want: u64, name: &str, bits: u64) -> Result<()> {
+    if got == want {
+        Ok(())
+    } else {
+        Err(Error::Region(format!(
+            "{name} has {got} entries, expected {want} for {bits} bits"
+        )))
+    }
+}
 
 /// A bitmap together with the directory that indexes it.
 ///
@@ -54,14 +155,19 @@ pub struct RankedBitmap<'a> {
     subrank: PackedArray<'a>,
     superblock_bits: u64,
     subblock_bits: u64,
+    /// Index of the sentinel superrank entry, i.e. `superrank.len() - 1`.
+    /// Pure arithmetic fixed at bind time; reading its *value* is deliberately
+    /// left to `count()` so that binding touches no payload page.
+    sentinel: u64,
+    /// Subblocks per superblock.
+    subs_per_super: u64,
 }
 
 impl<'a> RankedBitmap<'a> {
-    /// Bind a bitmap to its directory.
+    /// Bind already-projected views.
     ///
-    /// Fails if the directory is not sized for the bitmap. A mismatch means the
-    /// sidecar does not describe this HDT, which is a binding failure rather
-    /// than something to work around.
+    /// The form for callers that already hold views; anything reached from a
+    /// `Store` should bind a [`RankedSpec`] at open instead.
     pub fn new(
         bitmap: BitmapView<'a>,
         superrank: PackedArray<'a>,
@@ -71,40 +177,11 @@ impl<'a> RankedBitmap<'a> {
     ) -> Result<Self> {
         let superblock_bits = u64::from(superblock_bits);
         let subblock_bits = u64::from(subblock_bits);
-
-        if subblock_bits == 0 || superblock_bits == 0 {
-            return Err(Error::Region(
-                "rank directory block widths must be non-zero".to_owned(),
-            ));
-        }
-        if superblock_bits % subblock_bits != 0 {
-            return Err(Error::Region(format!(
-                "superblock width {superblock_bits} is not a multiple of subblock width {subblock_bits}"
-            )));
-        }
-
         let bits = bitmap.len();
-        let (want_super, want_sub) = if bits == 0 {
-            (0, 0)
-        } else {
-            (
-                bits.div_ceil(superblock_bits) + 1,
-                bits.div_ceil(subblock_bits),
-            )
-        };
+        let (want_super, want_sub) = directory_shape(bits, superblock_bits, subblock_bits)?;
 
-        if superrank.len() != want_super {
-            return Err(Error::Region(format!(
-                "superrank has {} entries, expected {want_super} for {bits} bits",
-                superrank.len()
-            )));
-        }
-        if subrank.len() != want_sub {
-            return Err(Error::Region(format!(
-                "subrank has {} entries, expected {want_sub} for {bits} bits",
-                subrank.len()
-            )));
-        }
+        check_directory(superrank.len(), want_super, "superrank", bits)?;
+        check_directory(subrank.len(), want_sub, "subrank", bits)?;
 
         Ok(Self {
             bitmap,
@@ -112,6 +189,8 @@ impl<'a> RankedBitmap<'a> {
             subrank,
             superblock_bits,
             subblock_bits,
+            sentinel: want_super.saturating_sub(1),
+            subs_per_super: superblock_bits / subblock_bits,
         })
     }
 
@@ -135,8 +214,7 @@ impl<'a> RankedBitmap<'a> {
         if self.bitmap.is_empty() {
             return 0;
         }
-        self.superrank
-            .get(self.bitmap.len().div_ceil(self.superblock_bits))
+        self.superrank.get(self.sentinel)
     }
 
     /// Set bits strictly before `position`.
@@ -154,9 +232,8 @@ impl<'a> RankedBitmap<'a> {
             position <= bits,
             "rank1({position}) out of range for {bits} bits"
         );
-        if bits == 0 {
-            return 0;
-        }
+        // Also covers the empty bitmap, where `position` can only be zero and
+        // `count()` is zero.
         if position == bits {
             return self.count();
         }
@@ -179,61 +256,34 @@ impl<'a> RankedBitmap<'a> {
 
         // The last superblock whose prefix count has not yet passed `i`. The
         // sentinel entry holds `total`, so it is never selected.
-        let last_superblock = self.bitmap.len().div_ceil(self.superblock_bits);
-        let superblock = last_index_not_above(last_superblock, i, |k| self.superrank.get(k));
+        let superblock = last_index_not_above(&self.superrank, 0, self.sentinel, i);
         let base = self.superrank.get(superblock);
 
         // Within that superblock, the last subblock whose prefix count has not
         // passed `i`. The first subblock of a superblock always holds zero, so
         // the search always has a valid answer.
-        let per_superblock = self.superblock_bits / self.subblock_bits;
-        let first_sub = superblock * per_superblock;
-        let last_sub = ((superblock + 1) * per_superblock).min(self.subrank.len()) - 1;
-        let subblock = first_sub
-            + last_index_not_above(last_sub - first_sub, i - base, |offset| {
-                self.subrank.get(first_sub + offset)
-            });
+        let first_sub = superblock * self.subs_per_super;
+        let last_sub = ((superblock + 1) * self.subs_per_super).min(self.subrank.len()) - 1;
+        let subblock = last_index_not_above(&self.subrank, first_sub, last_sub, i - base);
 
-        let mut seen = base + self.subrank.get(subblock);
-        let mut position = subblock * self.subblock_bits;
-
-        // Subblock starts are byte-aligned for any subblock width that is a
-        // multiple of eight, which every real one is, so the scan can proceed a
-        // byte at a time. It covers less than one subblock.
-        debug_assert_eq!(position % 8, 0, "subblock width must be a multiple of 8");
-        loop {
-            assert!(
-                position < self.bitmap.len(),
-                "directory claims {total} set bits but the bitmap has fewer"
-            );
-            let byte = self.bitmap.byte((position / 8) as usize);
-            let ones = u64::from(byte.count_ones());
-            if seen + ones > i {
-                for bit in 0..8 {
-                    if byte >> bit & 1 == 1 {
-                        if seen == i {
-                            return position + bit;
-                        }
-                        seen += 1;
-                    }
-                }
-                unreachable!("the target bit is in this byte");
-            }
-            seen += ones;
-            position += 8;
-        }
+        // Everything above located a bounded starting point; finding the bit
+        // within it belongs to the bitmap, which owns bit order.
+        let seen = base + self.subrank.get(subblock);
+        self.bitmap
+            .select_from(subblock * self.subblock_bits, i - seen)
+            .unwrap_or_else(|| panic!("directory claims {total} set bits but the bitmap has fewer"))
     }
 }
 
-/// The largest index in `0..=hi` whose value does not exceed `target`.
+/// The largest index in `lo..=hi` whose value does not exceed `target`.
 ///
-/// Assumes `value(0) <= target` and that `value` is non-decreasing, both of
+/// Assumes `array[lo] <= target` and that the range is non-decreasing, both of
 /// which hold for a cumulative-count directory queried below its total.
-fn last_index_not_above(hi: u64, target: u64, value: impl Fn(u64) -> u64) -> u64 {
-    let (mut low, mut high) = (0u64, hi);
+fn last_index_not_above(array: &PackedArray<'_>, lo: u64, hi: u64, target: u64) -> u64 {
+    let (mut low, mut high) = (lo, hi);
     while low < high {
-        let mid = (low + high).div_ceil(2);
-        if value(mid) <= target {
+        let mid = low + (high - low).div_ceil(2);
+        if array.get(mid) <= target {
             low = mid;
         } else {
             high = mid - 1;
@@ -245,6 +295,7 @@ fn last_index_not_above(hi: u64, target: u64, value: impl Fn(u64) -> u64) -> u64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{Rng, bit};
 
     const SUPER: u32 = 4096;
     const SUB: u32 = 512;
@@ -259,10 +310,11 @@ mod tests {
         subrank: Vec<u8>,
     }
 
-    fn build_directory(bytes: &[u8], bits: u64, superblock: u64, subblock: u64) -> Directory {
+    fn build_directory(bytes: &[u8], bits: u64) -> Directory {
+        let (superblock, subblock) = (u64::from(SUPER), u64::from(SUB));
         let ones_before = |end: u64| -> u64 {
             (0..end.min(bits))
-                .filter(|bit| bytes[(*bit / 8) as usize] >> (bit % 8) & 1 == 1)
+                .filter(|index| bit(bytes, *index))
                 .count() as u64
         };
 
@@ -290,16 +342,10 @@ mod tests {
 
     fn ranked<'a>(bytes: &'a [u8], bits: u64, directory: &'a Directory) -> RankedBitmap<'a> {
         let bitmap = BitmapView::new(bytes, bits).unwrap();
-        let super_len = if bits == 0 {
-            0
-        } else {
-            bits.div_ceil(u64::from(SUPER)) + 1
-        };
-        let sub_len = if bits == 0 {
-            0
-        } else {
-            bits.div_ceil(u64::from(SUB))
-        };
+        // Derived from the bytes actually emitted, so the sizing rule lives in
+        // one place and a wrong shared change cannot pass green.
+        let super_len = directory.superrank.len() as u64 / 8;
+        let sub_len = directory.subrank.len() as u64 / 2;
         RankedBitmap::new(
             bitmap,
             PackedArray::new(&directory.superrank, super_len, 64).unwrap(),
@@ -326,10 +372,10 @@ mod tests {
             let mut ranks = Vec::with_capacity(bits as usize + 1);
             let mut ones = Vec::new();
             let mut seen = 0;
-            for bit in 0..bits {
+            for position in 0..bits {
                 ranks.push(seen);
-                if bytes[(bit / 8) as usize] >> (bit % 8) & 1 == 1 {
-                    ones.push(bit);
+                if bit(bytes, position) {
+                    ones.push(position);
                     seen += 1;
                 }
             }
@@ -350,21 +396,9 @@ mod tests {
         }
     }
 
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-    }
-
     /// Fill `bits` bits with roughly `ones_in_64` set bits per 64, tail zeroed.
     fn make_bitmap(bits: u64, ones_in_64: u32, seed: u64) -> Vec<u8> {
-        let mut rng = Rng(seed);
+        let mut rng = Rng::new(seed);
         let mut bytes = vec![0u8; bits.div_ceil(8) as usize];
         for bit in 0..bits {
             let keep = match ones_in_64 {
@@ -391,7 +425,7 @@ mod tests {
         for &bits in LENGTHS {
             for density in [0u32, 1, 32, 63, 64] {
                 let bytes = make_bitmap(bits, density, bits * 31 + u64::from(density));
-                let directory = build_directory(&bytes, bits, u64::from(SUPER), u64::from(SUB));
+                let directory = build_directory(&bytes, bits);
                 let ranked = ranked(&bytes, bits, &directory);
                 let oracle = Oracle::new(&bytes, bits);
 
@@ -412,7 +446,7 @@ mod tests {
         // the general formula would index one past the end of `subrank` for.
         for &bits in &[512u64, 1024, 4096, 8192] {
             let bytes = make_bitmap(bits, 32, bits);
-            let directory = build_directory(&bytes, bits, u64::from(SUPER), u64::from(SUB));
+            let directory = build_directory(&bytes, bits);
             let ranked = ranked(&bytes, bits, &directory);
 
             let total = Oracle::new(&bytes, bits).count();
@@ -426,7 +460,7 @@ mod tests {
         for &bits in LENGTHS {
             for density in [1u32, 32, 63, 64] {
                 let bytes = make_bitmap(bits, density, bits * 17 + u64::from(density));
-                let directory = build_directory(&bytes, bits, u64::from(SUPER), u64::from(SUB));
+                let directory = build_directory(&bytes, bits);
                 let ranked = ranked(&bytes, bits, &directory);
                 let oracle = Oracle::new(&bytes, bits);
                 assert_eq!(ranked.count(), oracle.count());
@@ -446,7 +480,7 @@ mod tests {
     fn rank_and_select_invert_each_other() {
         let bits = 20_000u64;
         let bytes = make_bitmap(bits, 7, 0xDEFACED);
-        let directory = build_directory(&bytes, bits, u64::from(SUPER), u64::from(SUB));
+        let directory = build_directory(&bytes, bits);
         let ranked = ranked(&bytes, bits, &directory);
 
         for i in 0..ranked.count() {
@@ -465,7 +499,7 @@ mod tests {
         for position in [0u64, 1, 511, 512, 513, 4095, 4096, 4097, 8190, 8191] {
             let mut bytes = vec![0u8; (bits / 8) as usize];
             bytes[(position / 8) as usize] |= 1 << (position % 8);
-            let directory = build_directory(&bytes, bits, u64::from(SUPER), u64::from(SUB));
+            let directory = build_directory(&bytes, bits);
             let ranked = ranked(&bytes, bits, &directory);
 
             assert_eq!(ranked.count(), 1, "bit at {position}");
@@ -477,7 +511,7 @@ mod tests {
 
     #[test]
     fn an_empty_bitmap_ranks_and_counts_zero() {
-        let directory = build_directory(&[], 0, u64::from(SUPER), u64::from(SUB));
+        let directory = build_directory(&[], 0);
         let ranked = ranked(&[], 0, &directory);
         assert!(ranked.is_empty());
         assert_eq!(ranked.len(), 0);
@@ -486,10 +520,78 @@ mod tests {
     }
 
     #[test]
+    fn a_spec_bound_at_open_projects_to_the_same_answers() {
+        // The shape a Store actually uses: specs validated once against the
+        // mappings, then projected per query. Also the cross-file case — SPO's
+        // bitmap lives in data.hdt while its directory rides in data.hdt.perm —
+        // so the two mappings are deliberately different files.
+        let bits = 20_000u64;
+        let bytes = make_bitmap(bits, 9, 0x5EC0);
+        let directory = build_directory(&bytes, bits);
+
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("data.hdt");
+        let directory_path = dir.path().join("data.hdt.perm");
+        std::fs::write(&bitmap_path, &bytes).unwrap();
+        let mut packed = directory.superrank.clone();
+        let subrank_at = packed.len() as u64;
+        packed.extend_from_slice(&directory.subrank);
+        std::fs::write(&directory_path, &packed).unwrap();
+
+        let bitmap_map = Mapping::open(&bitmap_path).unwrap();
+        let directory_map = Mapping::open(&directory_path).unwrap();
+
+        let spec = RankedSpec::new(
+            BitmapSpec::new(&bitmap_map, 0, bits).unwrap(),
+            PackedSpec::new(&directory_map, 0, directory.superrank.len() as u64 / 8, 64).unwrap(),
+            PackedSpec::new(
+                &directory_map,
+                subrank_at,
+                directory.subrank.len() as u64 / 2,
+                16,
+            )
+            .unwrap(),
+            SUPER,
+            SUB,
+        )
+        .unwrap();
+
+        let ranked = spec.view(&bitmap_map, &directory_map);
+        let oracle = Oracle::new(&bytes, bits);
+        assert_eq!(ranked.count(), oracle.count());
+        for position in (0..=bits).step_by(97) {
+            assert_eq!(ranked.rank1(position), oracle.rank(position));
+        }
+        for i in (0..ranked.count()).step_by(13) {
+            assert_eq!(ranked.select1(i), oracle.select(i));
+        }
+
+        // Projecting twice yields independent views over the same bytes, which
+        // is what lets threads read concurrently without coordination.
+        let again = spec.view(&bitmap_map, &directory_map);
+        assert_eq!(again.select1(0), ranked.select1(0));
+    }
+
+    #[test]
+    fn a_spec_that_runs_past_its_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small");
+        std::fs::write(&path, [0u8; 16]).unwrap();
+        let mapping = Mapping::open(&path).unwrap();
+
+        assert!(PackedSpec::new(&mapping, 0, 2, 64).is_ok());
+        assert!(PackedSpec::new(&mapping, 0, 3, 64).is_err());
+        assert!(PackedSpec::new(&mapping, 8, 2, 64).is_err());
+        assert!(BitmapSpec::new(&mapping, 0, 128).is_ok());
+        assert!(BitmapSpec::new(&mapping, 0, 129).is_err());
+        assert!(PackedSpec::new(&mapping, 0, 1, 65).is_err());
+    }
+
+    #[test]
     fn a_directory_sized_for_a_different_bitmap_is_rejected() {
         let bits = 8192u64;
         let bytes = make_bitmap(bits, 32, 1);
-        let directory = build_directory(&bytes, bits, u64::from(SUPER), u64::from(SUB));
+        let directory = build_directory(&bytes, bits);
         let bitmap = BitmapView::new(&bytes, bits).unwrap();
 
         // Right bitmap, directory sized for half of it.

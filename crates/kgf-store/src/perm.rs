@@ -15,9 +15,10 @@
 //!
 //! Section payloads are bare packed regions at 64-byte-aligned absolute
 //! offsets with no preamble, and the format guarantees a full `u64` may be
-//! loaded anywhere inside one (`permutation-index-format.md` §2.1). That is why
-//! these use [`PackedArray::aligned`](crate::map::PackedArray::aligned) while
-//! the HDT side does not.
+//! loaded anywhere inside one (`permutation-index-format.md` §2.1). Locating
+//! them is therefore a directory read rather than a preamble walk — the
+//! difference from [`crate::hdt`]. Element access is the same
+//! [`PackedArray`](crate::map::PackedArray) either way.
 
 use crate::error::Result;
 use crate::hdt::BitmapTriples;
@@ -54,7 +55,8 @@ pub mod section {
     }
 }
 
-/// The mapped permutation sidecar.
+/// The mapped permutation sidecar: its mapping, plus the specs validated
+/// against it at open.
 #[derive(Debug)]
 pub struct Permutations {
     _triples: u64,
@@ -68,12 +70,15 @@ impl Permutations {
     /// Full CRC verification is off the open path by design — it belongs to
     /// publish and to `kgf verify` (doc 20 §20.6).
     pub fn open(_hdt_path: &std::path::Path) -> Result<Self> {
-        todo!("hdtc::format::PermutationIndex::open, then map each section by its directory entry")
+        todo!(
+            "hdtc::format::PermutationIndex::open, then build a spec per directory entry \
+             — validation only, no payload read"
+        )
     }
 
     /// The POS permutation: predicate → objects → subjects.
     pub fn pos(&self) -> BitmapTriples<'_> {
-        todo!("assemble from sections 0x0101..0x0108")
+        todo!("project the specs for sections 0x0101..0x0108")
     }
 
     /// The OPS permutation: object → predicates → subjects.
@@ -85,6 +90,6 @@ impl Permutations {
     /// object, unbounded on exactly the hub literals where bounds matter most
     /// (doc 20 §20.2).
     pub fn ops(&self) -> BitmapTriples<'_> {
-        todo!("assemble from sections 0x0201..0x0208")
+        todo!("project the specs for sections 0x0201..0x0208")
     }
 }

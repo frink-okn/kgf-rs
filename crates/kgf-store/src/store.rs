@@ -42,6 +42,12 @@ pub struct OpenOptions {
 }
 
 /// An open bundle version.
+///
+/// Holds the mappings and the **specs** validated against them at open
+/// ([`crate::map`]), never views: a view borrows from a mapping this struct
+/// owns, so holding both would be self-referential. Callers project what they
+/// need for the duration of a query, which costs a bounds compare and a slice
+/// and needs no synchronisation.
 #[derive(Debug)]
 pub struct Store {
     _dir: PathBuf,
@@ -80,7 +86,13 @@ impl Store {
     }
 
     /// Resolve a pattern. `O(log N)`; enumerates nothing.
-    pub fn resolve(&self, _pattern: IdPattern) -> Result<Selection> {
+    ///
+    /// The returned [`Selection`] borrows this store, which is what makes
+    /// "resolved against a different bundle" unrepresentable. Query execution is
+    /// synchronous within one blocking task holding an `Arc<Store>` (doc 20
+    /// §20.4), so nothing needs to outlive the borrow; resumption goes through
+    /// an encoded cursor token, not a live `Selection`.
+    pub fn resolve(&self, _pattern: IdPattern) -> Result<Selection<'_>> {
         todo!("delegate to pattern::resolve with this store's permutations")
     }
 }

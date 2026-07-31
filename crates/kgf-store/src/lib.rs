@@ -51,6 +51,9 @@ pub mod perm;
 pub mod rank;
 pub mod store;
 
+#[cfg(test)]
+mod testing;
+
 pub use catalog::Catalog;
 pub use error::{Error, Result};
 pub use store::{OpenOptions, Store};

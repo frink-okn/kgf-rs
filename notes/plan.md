@@ -133,6 +133,32 @@ matter are differential and property-based:
 
 ## Decisions recorded here
 
+**Specs are validated at open; views are projected per query.** A `Store` owns
+its `Mapping`s, so it cannot also hold views of them — that is a self-referential
+struct. It holds `PackedSpec`/`BitmapSpec`/`RankedSpec` instead: validated
+offsets and shapes, plain `Copy` data. Projecting a spec onto a mapping is
+infallible and costs a bounds compare and a slice.
+
+The reason is not speed. Without the split, every query would re-validate and
+`.expect()`, so a malformed bundle would panic on some later request instead of
+being refused by `Store::open` with a path and a remedy — which contradicts doc
+20 §20.8 and this crate's "shapes validated once" rule. Building a spec reads no
+payload, so open stays header-only, and the ~30 checks per bundle replace 8–16
+per query forever. A projection running from the region's offset to end-of-file
+also hands each view its trailing slack for free, keeping the widened read path
+live without a caller ever naming a slack constant.
+
+`Selection<'a>` borrows the `Store` it was resolved against, which makes
+"resolved against a different bundle" unrepresentable. Query execution is
+synchronous within one blocking task holding an `Arc<Store>` (doc 20 §20.4), so
+nothing needs to outlive the borrow; resumption goes through an encoded cursor
+token rather than a live `Selection`.
+
+Not done, and deliberately: caching the rank directories' sentinel *value* at
+bind time. It would make `count()` free, but it faults a directory page during
+open, and rapid startup is worth more than one load.
+
+
 **Element reads go through `u128` uniformly** rather than splitting a `u64` path for
 widths ≤ 57. One code path covers `0..=64` and is correct by construction; the split
 would be measurably cheaper on the widths Ubergraph actually uses (25, 16, 11) and is

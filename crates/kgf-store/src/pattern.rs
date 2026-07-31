@@ -60,13 +60,16 @@ pub struct Count {
 /// A resolved pattern: a contiguous range in one permutation, or the bounded
 /// group plan `s ? o` requires.
 ///
-/// Resolution is `O(log N)` and enumerates nothing.
+/// Resolution is `O(log N)` and enumerates nothing. Borrows the store it was
+/// resolved against, so the views it pages through stay valid without being
+/// re-projected per row.
 #[derive(Debug)]
-pub struct Selection {
+pub struct Selection<'a> {
     _permutation: Permutation,
+    _store: std::marker::PhantomData<&'a ()>,
 }
 
-impl Selection {
+impl Selection<'_> {
     /// Which permutation this reads.
     pub fn permutation(&self) -> Permutation {
         self._permutation
@@ -108,6 +111,6 @@ pub enum SubjectObjectRoute {
 }
 
 /// Resolve a pattern against a bundle's permutations.
-pub fn resolve(_pattern: IdPattern) -> Result<Selection> {
+pub fn resolve(_pattern: IdPattern) -> Result<Selection<'static>> {
     todo!("dispatch on the bound positions per the §20.2 table")
 }
