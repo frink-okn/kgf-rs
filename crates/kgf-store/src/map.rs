@@ -40,12 +40,12 @@
 //!
 //! # Specs and views
 //!
-//! A **spec** ([`PackedSpec`], [`BitmapSpec`]) is a validated description of
-//! where a region is and what shape it has: offsets, lengths, widths, and the
-//! arithmetic derived from them. Building one is fallible and happens **once,
-//! at open**, where the file path is in hand for the error message. A **view**
-//! ([`PackedArray`], [`BitmapView`]) is a spec projected onto a mapping, and
-//! projecting is infallible.
+//! A **spec** ([`PackedSpec`], [`BitmapSpec`], [`BytesSpec`]) is a validated
+//! description of where a region is and what shape it has: offsets, lengths,
+//! widths, and the arithmetic derived from them. Building one is fallible and
+//! happens **once, at open**, where the file path is in hand for the error
+//! message. A **view** ([`PackedArray`], [`BitmapView`], a `&[u8]`) is a spec
+//! projected onto a mapping, and projecting is infallible.
 //!
 //! The split exists because a [`Store`](crate::store::Store) owns its
 //! [`Mapping`]s and so cannot also hold views of them — that would be a
@@ -65,7 +65,8 @@
 //! Projections run from a region's offset to the end of the file rather than to
 //! the end of the region, which costs nothing and hands every view whatever
 //! trailing slack the file has — so the widened read path above stays live
-//! without any caller having to know it exists.
+//! without any caller having to know it exists. [`BytesSpec`] is the exception,
+//! because a PFC string buffer's last block is delimited by the buffer's end.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -92,12 +93,13 @@ fn next_mapping_id() -> MappingId {
 
 /// Bytes needed to hold `len` entries of `width` bits.
 ///
-/// Returns an error rather than overflowing: `len` comes from a file header, and
-/// a corrupt one should be rejected rather than wrapped around.
+/// The rounding rule belongs to the formats, so it comes from hdtc rather than
+/// being restated here; only the error vocabulary is ours. Errors rather than
+/// overflowing, because `len` comes from a file header and a corrupt one should
+/// be rejected rather than wrapped around.
 fn packed_bytes(len: u64, width: u8) -> Result<u64> {
-    len.checked_mul(u64::from(width))
-        .map(|bits| bits.div_ceil(8))
-        .ok_or_else(|| Error::Region(format!("{len} entries of {width} bits overflows u64")))
+    hdtc::format::packed_len(len, width)
+        .map_err(|e| Error::Region(format!("{len} entries of {width} bits: {e}")))
 }
 
 /// A whole file mapped read-only for the lifetime of a bundle version.
@@ -169,6 +171,16 @@ impl Mapping {
     /// Specs validate their own extent, so a projection needs only a start.
     fn from(&self, offset: u64) -> &[u8] {
         &self.mmap[offset as usize..]
+    }
+
+    /// Exactly `length` bytes from `offset`.
+    ///
+    /// For the one region whose *end* is load-bearing: a PFC string buffer's
+    /// last block is delimited by the buffer's end, not by a following offset.
+    /// Everything else projects with [`from`](Self::from) and takes its trailing
+    /// slack.
+    fn exact(&self, offset: u64, length: u64) -> &[u8] {
+        &self.mmap[offset as usize..(offset + length) as usize]
     }
 
     /// A sub-slice of the mapping, checked against its length.
@@ -434,6 +446,68 @@ impl BitmapSpec {
             bytes: mapping.from(self.offset),
             bits: self.bits,
         }
+    }
+}
+
+/// Where an opaque byte region lives, validated once.
+///
+/// The other specs describe regions with an element structure this module
+/// understands. This one describes bytes whose interpretation belongs to a
+/// caller — the PFC string buffers, whose front-coded blocks [`crate::dict`]
+/// decodes — so that locating and bounds-checking them still happens at open,
+/// with the path in hand, rather than per query.
+#[derive(Debug, Clone, Copy)]
+pub struct BytesSpec {
+    mapping: MappingId,
+    offset: u64,
+    length: u64,
+}
+
+impl BytesSpec {
+    /// Validate `length` bytes at `offset` within `mapping`.
+    pub fn new(mapping: &Mapping, offset: u64, length: u64) -> Result<Self> {
+        let end = offset.checked_add(length).ok_or_else(|| {
+            Error::Region(format!(
+                "region at {offset} of {length} bytes overflows u64"
+            ))
+        })?;
+        if end > mapping.byte_len() {
+            return Err(Error::Region(format!(
+                "{length} bytes at {offset} run past the end of {} ({} bytes)",
+                mapping.path().display(),
+                mapping.byte_len()
+            )));
+        }
+        Ok(Self {
+            mapping: mapping.id(),
+            offset,
+            length,
+        })
+    }
+
+    /// Length in bytes.
+    pub fn len(&self) -> u64 {
+        self.length
+    }
+
+    /// Whether the region is empty.
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// Project onto the mapping this spec was validated against. Panics if
+    /// given a different one — see [`PackedSpec::view`].
+    ///
+    /// Unlike the other projections this one ends where the region does: the
+    /// bytes are self-delimiting only up to that end.
+    pub fn view<'a>(&self, mapping: &'a Mapping) -> &'a [u8] {
+        assert_eq!(
+            self.mapping,
+            mapping.id(),
+            "byte spec projected onto {}, which is not the file it was validated against",
+            mapping.path().display()
+        );
+        mapping.exact(self.offset, self.length)
     }
 }
 

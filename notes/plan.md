@@ -38,15 +38,14 @@ own test; it is the one the general formula would index one past the end for.
 A directory builder lives in `#[cfg(test)]` so the properties can be checked without
 a bundle.
 
-### 3. `hdt::HdtLayout` — locate sections in a mapped `data.hdt`
+### 3. `hdt::HdtLayout` — locate sections in a mapped `data.hdt` ✅
 
 Walk the global control info, the header, the dictionary's four PFC sections, and the
 triples' `ArrayY`/`BitmapY`/`ArrayZ`/`BitmapZ`, recording offsets and shapes.
 
 **This is a preamble walk, not a scan.** Every section states its own size, so
 locating all of them costs about a dozen small reads — well under a kilobyte, a dozen
-pages — and touches no payload. Use `hdtc::format`'s *skip* forms
-(`skip_log_array_section`, `skip_bitmap_section`) and the PFC preamble.
+pages — and touches no payload.
 
 **Do not call hdtc's materializing readers here.** `LogArrayReader::read_from` and
 `PfcSectionHeader::read_from` read their whole payload into a `Vec` and verify CRCs.
@@ -55,12 +54,26 @@ dictionary's block-offset array alone is ~1.3 M entries. If hdtc offers only a
 materializing form for something we need, add a preamble-only variant *to hdtc*
 rather than reimplementing the parse here (doc 20 §20.4).
 
-*Verified by* building a fixture with hdtc and asserting the offsets and shapes agree
-with what hdtc itself reports.
+**What landed.** The walk itself is now hdtc's, because it had to be: hdtc's `skip_*`
+forms report where a *section* starts, and a mapped reader needs where the *payload*
+starts, which cannot be derived without restating preamble layouts here. So hdtc's
+façade grew `scan_bitmap_section`, `scan_log_array_section`, `scan_pfc_section`, and
+the whole-file `scan_hdt_sections`, all preamble-only and all reporting payload
+offsets; `HdtLayout::parse` calls the last of these and turns each located region into
+a `PackedSpec`/`BitmapSpec`/`BytesSpec` validated against the mapping. Ubergraph
+(2.5 GB, 606 M triples) maps in 88 µs and parses in 2.5 ms.
+
+*Verified by* building a fixture with hdtc and asserting the layout agrees with what
+hdtc recorded about the same file in `data.hdt.perm` — triple count, the three id-space
+sizes, and the bit lengths its SPO directories say they index — plus: every region
+projects and reads in range, `BitmapY` has one set bit per subject and `BitmapZ` one
+per (subject, predicate) pair, and a non-HDT or truncated file is refused by name.
 
 ### 4. `dict` — PFC random access
 
-`locate`, `extract`, `prefix_bounds`, and the role/shared-section arithmetic.
+`locate`, `extract`, `prefix_bounds`, and the role/shared-section arithmetic, over the
+`PfcLayout`s unit 3 already located (term count, block size, the block-offset
+`PackedSpec`, and the string buffer's `BytesSpec`).
 
 Standard HDT already supports all of this: each section is lexicographically sorted in
 blocks of `block_size` (16 by default), preceded by a `LogArray` of block offsets with
@@ -158,6 +171,34 @@ Not done, and deliberately: caching the rank directories' sentinel *value* at
 bind time. It would make `count()` free, but it faults a directory page during
 open, and rapid startup is worth more than one load.
 
+
+**The walk over `data.hdt` lives in hdtc, not here.** Composing it from hdtc's section
+primitives looked like the doc 20 §20.4 reading, but a mapped reader needs each
+*payload's* offset and the `skip_*` forms report only the *section's*, so composing
+here would have meant restating "one type byte, a VByte, a CRC8" in this crate — the
+drift risk docs 17–18 are about. `hdtc::format::scan_hdt_sections` is the fix §20.4
+already prescribes for a missing preamble-only form, and it collapsed hdtc's own second
+copy of the walk (in its permutation builder) onto the same code.
+
+**Counts come from the structures, not the header.** `triples()` is `ArrayZ`'s entry
+count and `DictCounts` comes from the four PFC preambles. The header agrees in a
+well-formed file, and hdtc's builders check that it does — but the header is the one
+part of an HDT a rewrite may change, which is why identity digests start past it, and
+reading it would mean an N-Triples parser on the open path.
+
+**`BytesSpec` joined the spec family** for the PFC string buffers: bytes whose
+interpretation belongs to `dict`, but whose extent should still be validated at open
+with the path in hand. Unlike the other projections it ends where the region does,
+because a buffer's last block is delimited by the buffer's end.
+
+**`hdt::ForeignBitmap` is gone.** It expressed "this bitmap's directory is in another
+file", which `RankedSpec::view(bitmap, directory)` already says precisely.
+
+**Fixtures are built by running the `hdtc` binary**, from `$KGF_HDTC` or the sibling
+checkout's `target/`, into a temp dir — doc 20 §20.9's golden bundle, so the bytes under
+test are a producer's output rather than this crate's guess at the format. A missing
+binary panics with the command to run rather than skipping, since a silently skipped
+fixture leaves every differential test passing vacuously.
 
 **Element reads go through `u128` uniformly** rather than splitting a `u64` path for
 widths ≤ 57. One code path covers `0..=64` and is correct by construction; the split

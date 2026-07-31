@@ -27,10 +27,17 @@
 //! permutations' `ArrayZ` payloads interchangeable. Callers should not
 //! open-code that arithmetic — [`Dictionary`] owns it.
 
-use crate::error::Result;
+use std::num::NonZeroU64;
+
+use crate::error::{Error, Result};
+use crate::map::{BytesSpec, Mapping, PackedSpec};
 use crate::{Role, TermId};
 
-/// Section sizes, as recorded in the HDT header.
+/// Section sizes, taken from the four PFC sections' own preambles.
+///
+/// Not from the HDT header: the header is the one part of an HDT that a rewrite
+/// may change (which is why identity digests start past it), while each section
+/// declares its own term count as a structural fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DictCounts {
     /// Terms appearing as both subject and object.
@@ -59,6 +66,187 @@ impl DictCounts {
     /// spaces coincide.
     pub fn same_term(&self, subject: TermId, object: TermId) -> bool {
         subject == object && subject.0 >= 1 && subject.0 <= self.shared
+    }
+
+    /// Establish the invariant that makes [`len`](Self::len)'s additions total.
+    fn validate_role_lengths(&self) -> Result<()> {
+        self.shared.checked_add(self.subjects).ok_or_else(|| {
+            Error::Region(format!(
+                "subject count overflows u64: {} shared + {} subject-only terms",
+                self.shared, self.subjects
+            ))
+        })?;
+        self.shared.checked_add(self.objects).ok_or_else(|| {
+            Error::Region(format!(
+                "object count overflows u64: {} shared + {} object-only terms",
+                self.shared, self.objects
+            ))
+        })?;
+        Ok(())
+    }
+}
+
+/// One of `dictionaryFour`'s four PFC sections.
+///
+/// A section, not a [`Role`]: the subject and object id spaces each span *two*
+/// sections, and which one an id falls in is the arithmetic [`Dictionary`] owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    /// Terms occurring as both subject and object. Ids `1..=shared` in both
+    /// spaces, which is what makes the permutations' `ArrayZ` payloads
+    /// interchangeable.
+    Shared,
+    /// Terms occurring only as subjects.
+    Subjects,
+    /// Predicates.
+    Predicates,
+    /// Terms occurring only as objects.
+    Objects,
+}
+
+/// Where one PFC section's parts are, validated at open.
+///
+/// The block-offset array is a [`PackedSpec`] mapped in place rather than a
+/// materialized `Vec`: on a large dictionary it runs to millions of entries, and
+/// reading it at open is the cost doc 20 §20.4 forbids.
+#[derive(Debug, Clone, Copy)]
+pub struct PfcLayout {
+    terms: u64,
+    block_size: NonZeroU64,
+    block_offsets: PackedSpec,
+    buffer: BytesSpec,
+}
+
+impl PfcLayout {
+    /// Validate a scanned PFC section against the mapping it was scanned from.
+    ///
+    /// The scan is hdtc's ([`hdtc::format::scan_pfc_section`], reached through
+    /// [`crate::hdt::HdtLayout::parse`]); this turns its offsets into specs, so
+    /// a section that does not fit its file is refused here rather than at the
+    /// ten-thousandth request.
+    pub fn locate(mapping: &Mapping, section: &hdtc::format::PfcSection) -> Result<Self> {
+        let block_offsets = PackedSpec::new(
+            mapping,
+            section.offsets.data_start,
+            section.offsets.num_entries,
+            section.offsets.bits_per_entry,
+        )?;
+        let buffer = BytesSpec::new(mapping, section.buffer_start, section.buffer_length)?;
+
+        // Every id lookup divides by the block size, so it is held as a type
+        // that cannot be zero rather than checked at each division. hdtc's scan
+        // rejects zero already; this is where that becomes a static fact.
+        let block_size = NonZeroU64::new(section.block_size)
+            .ok_or_else(|| Error::Region("a PFC section declares block size 0".to_owned()))?;
+
+        Ok(Self {
+            terms: section.string_count,
+            block_size,
+            block_offsets,
+            buffer,
+        })
+    }
+
+    /// Terms in the section; ids within it run `1..=terms()`.
+    pub fn terms(&self) -> u64 {
+        self.terms
+    }
+
+    /// Terms per block. Only a block's first term is stored uncompressed.
+    pub fn block_size(&self) -> NonZeroU64 {
+        self.block_size
+    }
+
+    /// Blocks in the section. The offset array holds one entry per block plus a
+    /// sentinel, so this is one less than its length.
+    pub fn blocks(&self) -> u64 {
+        self.block_offsets.len().saturating_sub(1)
+    }
+
+    /// Block start offsets into [`buffer`](Self::buffer), with a sentinel entry
+    /// holding the buffer's length.
+    pub fn block_offsets(&self) -> &PackedSpec {
+        &self.block_offsets
+    }
+
+    /// The front-coded string buffer.
+    pub fn buffer(&self) -> &BytesSpec {
+        &self.buffer
+    }
+}
+
+/// The four PFC sections of a mapped `data.hdt`, located at open.
+#[derive(Debug, Clone)]
+pub struct DictionaryLayout {
+    counts: DictCounts,
+    shared: PfcLayout,
+    subjects: PfcLayout,
+    predicates: PfcLayout,
+    objects: PfcLayout,
+}
+
+impl DictionaryLayout {
+    /// Assemble the four located sections, deriving and validating their counts.
+    pub fn new(
+        shared: PfcLayout,
+        subjects: PfcLayout,
+        predicates: PfcLayout,
+        objects: PfcLayout,
+    ) -> Result<Self> {
+        let counts = DictCounts {
+            shared: shared.terms(),
+            subjects: subjects.terms(),
+            objects: objects.terms(),
+            predicates: predicates.terms(),
+        };
+        counts.validate_role_lengths()?;
+
+        Ok(Self {
+            counts,
+            shared,
+            subjects,
+            predicates,
+            objects,
+        })
+    }
+
+    /// Section sizes.
+    pub fn counts(&self) -> &DictCounts {
+        &self.counts
+    }
+
+    /// One section's layout.
+    pub fn section(&self, section: Section) -> &PfcLayout {
+        match section {
+            Section::Shared => &self.shared,
+            Section::Subjects => &self.subjects,
+            Section::Predicates => &self.predicates,
+            Section::Objects => &self.objects,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overflowing_role_lengths_are_rejected() {
+        let subject_overflow = DictCounts {
+            shared: u64::MAX,
+            subjects: 1,
+            objects: 0,
+            predicates: 0,
+        };
+        assert!(subject_overflow.validate_role_lengths().is_err());
+
+        let object_overflow = DictCounts {
+            shared: u64::MAX,
+            subjects: 0,
+            objects: 1,
+            predicates: 0,
+        };
+        assert!(object_overflow.validate_role_lengths().is_err());
     }
 }
 

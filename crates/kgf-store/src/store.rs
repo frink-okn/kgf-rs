@@ -82,7 +82,7 @@ impl Store {
 
     /// Total triples in the bundle.
     pub fn triples(&self) -> u64 {
-        todo!("read from the HDT header parsed at open")
+        todo!("from the HDT layout parsed at open — one ArrayZ entry per triple")
     }
 
     /// Resolve a pattern. `O(log N)`; enumerates nothing.
