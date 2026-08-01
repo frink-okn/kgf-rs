@@ -90,10 +90,17 @@ struct ContiguousPlan<'a> {
 #[derive(Debug, Clone)]
 struct SubjectObjectPlan<'a> {
     route: SubjectObjectRoute,
+    probe: SubjectObjectProbe,
     triples: BitmapTriples<'a>,
     y_range: Range<u64>,
     subject: u64,
     object: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjectObjectProbe {
+    Linear,
+    Binary,
 }
 
 impl<'a> Selection<'a> {
@@ -301,22 +308,23 @@ fn subject_object(perms: &Permutations, subject: u64, object: u64) -> Selection<
     let object_y = ops.level2_range(object);
     let object_degree = range_len(&z_span(ops, object_y.clone()));
 
-    let plan = if subject_degree <= object_degree {
-        SubjectObjectPlan {
-            route: SubjectObjectRoute::ViaSubject,
-            triples: spo,
-            y_range: subject_y,
-            subject,
-            object,
-        }
+    let (route, triples, y_range, endpoint_degree) = if subject_degree <= object_degree {
+        (
+            SubjectObjectRoute::ViaSubject,
+            spo,
+            subject_y,
+            subject_degree,
+        )
     } else {
-        SubjectObjectPlan {
-            route: SubjectObjectRoute::ViaObject,
-            triples: ops,
-            y_range: object_y,
-            subject,
-            object,
-        }
+        (SubjectObjectRoute::ViaObject, ops, object_y, object_degree)
+    };
+    let plan = SubjectObjectPlan {
+        route,
+        probe: subject_object_probe(endpoint_degree, triples.level3_width()),
+        triples,
+        y_range,
+        subject,
+        object,
     };
     Selection {
         plan: SelectionPlan::SubjectObject(plan),
@@ -371,7 +379,7 @@ fn subject_object_hit(plan: &SubjectObjectPlan<'_>, y_position: u64) -> Option<I
         SubjectObjectRoute::ViaObject => plan.subject,
     };
     let z_range = plan.triples.level3_range(y_position);
-    contains_level3(plan.triples, z_range, target).then_some(IdTriple {
+    contains_level3(plan.triples, z_range, target, plan.probe).then_some(IdTriple {
         subject: plan.subject,
         predicate,
         object: plan.object,
@@ -379,15 +387,27 @@ fn subject_object_hit(plan: &SubjectObjectPlan<'_>, y_position: u64) -> Option<I
 }
 
 // Two conventional 4 KiB pages. This is a performance choice inside the same
-// bounded probe: larger groups binary-search instead of scanning with degree.
+// bounded probe: a larger endpoint binary-searches every predicate group.
 const LINEAR_PROBE_BITS: u128 = 2 * 4096 * 8;
 
-fn contains_level3(triples: BitmapTriples<'_>, mut range: Range<u64>, target: u64) -> bool {
-    let packed_bits = u128::from(range_len(&range)) * u128::from(triples.level3_width());
+fn subject_object_probe(endpoint_degree: u64, width: u8) -> SubjectObjectProbe {
+    let packed_bits = u128::from(endpoint_degree) * u128::from(width);
     if packed_bits <= LINEAR_PROBE_BITS {
-        range.any(|position| triples.level3_at(position) == target)
+        SubjectObjectProbe::Linear
     } else {
-        triples.find_level3(range, target).is_some()
+        SubjectObjectProbe::Binary
+    }
+}
+
+fn contains_level3(
+    triples: BitmapTriples<'_>,
+    mut range: Range<u64>,
+    target: u64,
+    probe: SubjectObjectProbe,
+) -> bool {
+    match probe {
+        SubjectObjectProbe::Linear => range.any(|position| triples.level3_at(position) == target),
+        SubjectObjectProbe::Binary => triples.find_level3(range, target).is_some(),
     }
 }
 
@@ -760,6 +780,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_large_endpoint_binary_searches_even_when_each_predicate_group_is_small() {
+        use std::fmt::Write;
+
+        const DEGREE: usize = 5100;
+        const GROUP_SIZE: usize = 51;
+
+        let mut source = String::new();
+        for index in 0..DEGREE {
+            let object = if index == 0 {
+                "http://example.org/hub".to_owned()
+            } else {
+                format!("http://example.org/o/{index}")
+            };
+            writeln!(
+                source,
+                "<http://example.org/s> <http://example.org/p/{}> <{object}> .",
+                index / GROUP_SIZE
+            )
+            .unwrap();
+        }
+        for index in 0..DEGREE - 1 {
+            writeln!(
+                source,
+                "<http://example.org/t/{index}> <http://example.org/incoming> <http://example.org/hub> ."
+            )
+            .unwrap();
+        }
+
+        let fixture = Fixture::build(&source);
+        let permutations =
+            Permutations::open(fixture.map_hdt(), fixture.map_perm()).expect("open permutations");
+        let dictionary = permutations
+            .hdt_layout()
+            .dictionary()
+            .view(permutations.hdt_mapping());
+        let subject = id(&dictionary, Role::Subject, b"http://example.org/s");
+        let object = id(&dictionary, Role::Object, b"http://example.org/hub");
+        let selection = resolve(
+            &permutations,
+            IdPattern {
+                subject: Some(subject),
+                predicate: None,
+                object: Some(object),
+            },
+        )
+        .unwrap();
+
+        let SelectionPlan::SubjectObject(plan) = &selection.plan else {
+            panic!("s ? o must resolve to its bounded group plan");
+        };
+        assert_eq!(plan.route, SubjectObjectRoute::ViaSubject);
+        assert_eq!(plan.probe, SubjectObjectProbe::Binary);
+        assert!(
+            plan.y_range.clone().all(|y_position| {
+                let group = plan.triples.level3_range(y_position);
+                u128::from(range_len(&group)) * u128::from(plan.triples.level3_width())
+                    <= LINEAR_PROBE_BITS
+            }),
+            "the regression requires every individual group to fit the linear threshold"
+        );
+        assert_eq!(selection.count().value, 1);
+        assert_eq!(selection.page(0, usize::MAX).count(), 1);
     }
 
     fn options(maximum: u64) -> Vec<Option<u64>> {

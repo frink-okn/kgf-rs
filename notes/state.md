@@ -28,7 +28,7 @@ classified open errors in `48f90f3` that preserve binding-error semantics.
 
 ## What is built
 
-Seven of eight units from `notes/plan.md`, all complete with tests. 44 tests, ~3 s,
+Seven of eight units from `notes/plan.md`, all complete with tests. 45 tests, ~3 s,
 clean under `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and
 `cargo doc` with no warnings.
 
@@ -253,15 +253,16 @@ descent. Counts are exact; paging and `at` materialize ids directly from mapped 
 
 Contiguous cursors are result offsets. `s ? o` instead resumes after the last predicate
 id returned, which is stable across its SPO and OPS routes. The route probes the lower
-degree endpoint; groups occupying at most two packed pages scan linearly, while larger
-groups binary-search. Count and random access share that bounded probe because this is
-the one non-contiguous pattern. Doc 03's `sample` cost row and doc 20 §20.5's indicative
-`at` comment still need to state that existing §20.2.1 exception explicitly.
+degree endpoint; when that endpoint's complete packed range occupies at most two pages
+its groups scan linearly, otherwise every group binary-searches. Count and random
+access share that bounded probe because this is the one non-contiguous pattern. Docs
+03 and 20 state the exception explicitly and require `/sample` to enumerate this tiny
+predicate result once instead of calling `at` repeatedly.
 
 All valid bound/unbound combinations in the golden graph are checked at adversarial
 page sizes and every resume position. All eight representative shapes also agree with
 hdtc's independent search path. Predicate/object count sums and POS/OPS pair counts
-also close independently. There are 44 tests after this unit.
+also close independently. There are 45 tests after this unit.
 
 ## Next
 
