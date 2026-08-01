@@ -15,7 +15,7 @@ impl Rng {
     }
 
     /// The next value.
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -279,7 +279,10 @@ const PERM: &str = crate::store::artifact::PERM;
 /// Locate the `hdtc` binary: `$KGF_HDTC` if set, else the sibling checkout's
 /// build. hdtc is a path dependency of this crate, so its checkout is where
 /// `CLAUDE.md` says the three siblings are.
-fn hdtc_binary() -> std::path::PathBuf {
+///
+/// Public because tests in other crates build bundles too, and a second copy of
+/// this search is a second thing to fix when the layout moves.
+pub fn hdtc_binary() -> std::path::PathBuf {
     if let Some(path) = std::env::var_os("KGF_HDTC") {
         return std::path::PathBuf::from(path);
     }

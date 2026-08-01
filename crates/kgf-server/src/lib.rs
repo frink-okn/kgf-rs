@@ -18,7 +18,10 @@
 //!
 //! # Status
 //!
-//! Skeleton. Nothing is wired yet.
+//! [`cursor`] is implemented (`notes/plan.md` unit 10). The term layer, the
+//! response envelope, and the routes are units 11–14; [`serve`] is still
+//! `todo!()`, which is the convention here rather than an oversight — an
+//! unimplemented path panics rather than returning a plausible wrong answer.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]

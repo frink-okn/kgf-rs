@@ -488,7 +488,7 @@ mod tests {
             let keep = match ones_in_64 {
                 0 => false,
                 64 => true,
-                n => rng.next() % 64 < u64::from(n),
+                n => rng.next_u64() % 64 < u64::from(n),
             };
             if keep {
                 bytes[(bit / 8) as usize] |= 1 << (bit % 8);

@@ -123,7 +123,7 @@ impl PublishedBundle {
         &self.dir
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn for_test(dir: &Path) -> Self {
         // SAFETY: test fixtures call this only after publishing all artifacts
         // and leave them untouched until every derived store is dropped.
@@ -163,7 +163,7 @@ impl PublishedRoot {
         &self.root
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn for_test(root: &Path) -> Self {
         // SAFETY: catalog fixtures call this only after publishing all bundle
         // artifacts and do not mutate their bytes while stores are live.
@@ -294,7 +294,7 @@ pub(crate) fn open_published(bundle: &PublishedBundle, path: &Path) -> Result<Ma
     unsafe { Mapping::open(path) }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub(crate) fn map_fixture(path: &Path) -> Mapping {
     // SAFETY: callers write a fixture in a temporary directory and leave it
     // untouched for the returned mapping's lifetime.
@@ -760,7 +760,7 @@ mod tests {
         let mut rng = Rng::new(seed);
         let mask = if width == 0 { 0 } else { (1u128 << width) - 1 };
         (0..count)
-            .map(|_| (u128::from(rng.next()) & mask) as u64)
+            .map(|_| (u128::from(rng.next_u64()) & mask) as u64)
             .collect()
     }
 
@@ -869,7 +869,7 @@ mod tests {
         ] {
             let mut bytes = vec![0u8; bits.div_ceil(8) as usize];
             for byte in bytes.iter_mut() {
-                *byte = rng.next() as u8;
+                *byte = rng.next_u64() as u8;
             }
             // The format requires unused tail bits to be zero.
             if bits % 8 != 0 {

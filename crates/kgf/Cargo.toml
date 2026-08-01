@@ -22,3 +22,6 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# `testing::hdtc_binary`, so the integration test does not carry its own copy
+# of where the sibling checkout lives.
+kgf-store = { workspace = true, features = ["testing"] }

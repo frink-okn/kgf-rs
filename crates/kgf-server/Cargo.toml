@@ -12,3 +12,10 @@ kgf-store.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+base64.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+# The hdtc-built golden bundles, so cursor resumption is checked against real
+# enumerations rather than a hand-written stand-in (doc 20 §20.9).
+kgf-store = { workspace = true, features = ["testing"] }

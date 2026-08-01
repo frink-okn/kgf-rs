@@ -17,8 +17,15 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–9 are complete; each carries a **What landed** section written after the fact,
-which is where a unit's plan and its outcome are reconciled. Units 10–14 have none yet.
+Units 1–10 are complete; each carries a **What landed** section written after the fact,
+which is where a unit's plan and its outcome are reconciled. Units 11–14 have none yet.
+
+**Nothing here is frozen.** Doc 20 §20.7 and §20.8 speak of formats being stable from
+the first release; no release has happened, and the service is expected to run for a
+long time before one does. Treat those statements as intent rather than as a freeze:
+pick the sensible design, write down where it can move and why, and keep going. What
+must not drift meanwhile is the enumeration order doc 20 §20.2's table fixes, because
+that is what every position means.
 
 ## Units
 
@@ -307,7 +314,7 @@ files is *not* the answer — doc 04 §4.1 and doc 20 §20.8 both make
 index should nonetheless be checksummed, given doc 04 §4.3 wants the digest usable for
 mirror verification, is a question for the design docs.
 
-### 10. `cursor` — the token codec
+### 10. `cursor` — the token codec ✅
 
 Encode and decode doc 20 §20.7's token: version byte, content-digest prefix, operation
 id, canonical-request hash, permutation, position, and the reserved `binding_index` and
@@ -349,6 +356,43 @@ suffix, at adversarial page sizes. Plus round-trip over the field space, and rej
 of a tampered token, a foreign digest, and a foreign request hash — all as
 `stale_cursor`, undifferentiated, so a client learns nothing about data it did not
 query.
+
+**What landed.** A 29-byte fixed layout — version, operation, position space, flags,
+digest prefix, request hash, position, and the two optional trailers — in URL-safe
+base64 without padding, so an M1 token is 39 characters. `CanonicalRequest` sorts its
+parameters and length-prefixes every key and value, so no two distinct parameter sets
+hash alike. `CursorBinding` bundles digest, operation, and request hash into one value
+that `decode` checks in full, because three separate arguments is three chances for a
+handler to check two of them.
+
+Two corrections to the skeleton, both from writing the resume property down:
+
+- **`CursorPermutation` became `PositionSpace`, with a fourth variant.** The old type
+  recorded which permutation a position indexed and said a mismatch was `stale_cursor`
+  — but for `s ? o` the position is a *predicate id*, and the planner is free to switch
+  routes between pages (doc 20 §20.2.1), so comparing the route would reject a
+  legitimate resume. What a token needs to record is the space the number lives in, and
+  `Predicate` is a fourth such space rather than a permutation. Wire values 1–3 are
+  unchanged.
+- **`/describe`'s phase needs no field.** `direction=both` is out-triples (`s ? ?`, SPO)
+  then in-triples (`? ? o`, OPS), which land in different spaces, so the token already
+  says which half it stopped in.
+
+`Operation` omits `/sample`, which draws `n` members and never pages, and includes
+`Count`, which only issues a token for M2's budgeted scanning counts — enumerated now
+so nothing else takes the value.
+
+A forged position is safe rather than merely unlikely: `Selection::page` clamps past the
+end and yields an empty page. A handler should still reject a position beyond the
+selection's count as `stale_cursor`, since an empty page reads as the end of results,
+and that check needs the store so it belongs to unit 14.
+
+The unit also made `kgf_store::testing` available behind a `testing` feature. The golden
+bundles were `#[cfg(test)]`-private, and this is the third place to need them — a
+second copy of the build recipe is exactly the drift doc 20 §20.9 warns about. `kgf`'s
+integration test dropped its duplicate of the hdtc search as a result.
+
+There are 89 tests after this unit.
 
 ### 11. `term` — syntax in, syntax out
 

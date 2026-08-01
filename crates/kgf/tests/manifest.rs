@@ -7,10 +7,11 @@
 //! [`Store::open`](kgf_store::Store::open) accepts, and that the manifest stops
 //! agreeing the moment the artifacts move underneath it.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use kgf_store::manifest::Manifest;
+use kgf_store::testing::hdtc_binary;
 use kgf_store::{OpenOptions, Store};
 
 const SOURCE: &str = concat!(
@@ -304,29 +305,4 @@ fn kgf(args: &[&str]) -> Run {
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         status: output.status,
     }
-}
-
-/// Locate the `hdtc` binary the same way `kgf-store`'s fixtures do: `$KGF_HDTC`
-/// if set, else the sibling checkout's build.
-fn hdtc_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("KGF_HDTC") {
-        return PathBuf::from(path);
-    }
-    let hdtc = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../hdtc")
-        .canonicalize()
-        .expect("../hdtc sibling checkout");
-    for profile in ["release", "debug"] {
-        let candidate = hdtc.join("target").join(profile).join("hdtc");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    panic!(
-        "no hdtc binary under {}; build it with \
-         `cargo build --release --manifest-path {}/Cargo.toml`, \
-         or set KGF_HDTC",
-        hdtc.join("target").display(),
-        hdtc.display()
-    );
 }

@@ -53,8 +53,11 @@ pub mod perm;
 pub mod rank;
 pub mod store;
 
-#[cfg(test)]
-mod testing;
+// Golden-bundle fixtures. Behind a feature rather than `cfg(test)` because
+// `kgf-server` and the `kgf` binary need the same hdtc-built bundles, and a
+// second copy of the build recipe is the drift doc 20 §20.9 warns about.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use catalog::Catalog;
 pub use error::{Error, Result};

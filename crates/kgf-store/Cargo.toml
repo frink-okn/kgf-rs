@@ -15,6 +15,13 @@ memmap2.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile = { version = "3", optional = true }
+
+[features]
+# Exposes `kgf_store::testing`: the hdtc-built golden bundles (doc 20 §20.9).
+# Dependents enable it in `dev-dependencies` only — it is test support, not a
+# runtime surface.
+testing = ["dep:tempfile"]
 
 [dev-dependencies]
 tempfile = "3"
