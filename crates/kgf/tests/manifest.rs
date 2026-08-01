@@ -29,6 +29,16 @@ const GROWN_SOURCE: &str = concat!(
     "<http://example.org/carol> <http://example.org/name> \"Carol\" .\n",
 );
 
+/// [`SOURCE`] with one literal edited: every count is identical and every
+/// artifact byte is not. Counts are a weak witness for a rebuild, which is why
+/// `--check` also compares checksums.
+const RETITLED_SOURCE: &str = concat!(
+    "<http://example.org/alice> <http://example.org/name> \"Alicia\" .\n",
+    "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .\n",
+    "<http://example.org/bob> <http://example.org/name> \"Bob\" .\n",
+    "<http://example.org/bob> <http://example.org/knows> <http://example.org/alice> .\n",
+);
+
 #[test]
 fn a_hand_assembled_bundle_becomes_servable_and_stays_honest() {
     let root = tempfile::tempdir().unwrap();
@@ -99,6 +109,114 @@ fn a_hand_assembled_bundle_becomes_servable_and_stays_honest() {
     // Descriptive fields survive a regeneration; the digest tracks the bytes.
     assert_eq!(regenerated.prefixes["ex"], "http://example.org/");
     assert_ne!(regenerated.content_digest, manifest.content_digest);
+}
+
+#[test]
+fn a_rebuild_that_preserves_every_count_still_fails_the_check() {
+    let root = tempfile::tempdir().unwrap();
+    let bundle = root.path().join("demo-kg").join("2026-08-01");
+    std::fs::create_dir_all(&bundle).unwrap();
+    build_artifacts(&bundle, SOURCE);
+    kgf(&["manifest", path(&bundle)]).success();
+
+    let before = Manifest::read(&bundle).unwrap();
+
+    // Edit one literal: same triples, same id-space sizes, different bytes.
+    std::fs::remove_file(bundle.join("data.hdt")).unwrap();
+    std::fs::remove_file(bundle.join("data.hdt.perm")).unwrap();
+    build_artifacts(&bundle, RETITLED_SOURCE);
+
+    let facts_are_unchanged = kgf(&["manifest", path(&bundle), "--check"]);
+    let error = facts_are_unchanged.failure();
+    // Counts cannot catch this; the checksums must.
+    assert!(error.contains("sha256"), "{error}");
+    assert!(error.contains("kgf manifest"), "{error}");
+
+    kgf(&["manifest", path(&bundle)]).success();
+    let after = Manifest::read(&bundle).unwrap();
+    assert_eq!(after.counts, before.counts, "the counts really are equal");
+    assert_ne!(after.content_digest, before.content_digest);
+}
+
+#[test]
+fn a_hand_edited_content_digest_is_caught() {
+    let root = tempfile::tempdir().unwrap();
+    let bundle = root.path().join("demo-kg").join("2026-08-01");
+    std::fs::create_dir_all(&bundle).unwrap();
+    build_artifacts(&bundle, SOURCE);
+    kgf(&["manifest", path(&bundle)]).success();
+
+    // The one case per-artifact checksums miss, since nothing on disk moved.
+    let manifest_path = bundle.join("manifest.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    document["content_digest"] = serde_json::json!("sha256:0000");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&document).unwrap(),
+    )
+    .unwrap();
+
+    let error = kgf(&["manifest", path(&bundle), "--check"]).failure();
+    assert!(error.contains("content_digest"), "{error}");
+}
+
+#[test]
+fn regeneration_preserves_fields_this_build_does_not_model() {
+    let root = tempfile::tempdir().unwrap();
+    let bundle = root.path().join("demo-kg").join("2026-08-01");
+    std::fs::create_dir_all(&bundle).unwrap();
+    build_artifacts(&bundle, SOURCE);
+    kgf(&["manifest", path(&bundle)]).success();
+
+    // Doc 04 §4.3 fields with no producer yet, added by hand as someone would.
+    let manifest_path = bundle.join("manifest.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    document["source"] =
+        serde_json::json!({"format": "n-triples", "url": "https://example.org/d.nt"});
+    document["components"] = serde_json::json!([{"id": "canonical", "role": "source"}]);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&document).unwrap(),
+    )
+    .unwrap();
+
+    std::fs::remove_file(bundle.join("data.hdt")).unwrap();
+    std::fs::remove_file(bundle.join("data.hdt.perm")).unwrap();
+    build_artifacts(&bundle, GROWN_SOURCE);
+    kgf(&["manifest", path(&bundle)]).success();
+
+    let rewritten: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(rewritten["source"], document["source"]);
+    assert_eq!(rewritten["components"], document["components"]);
+    assert_eq!(rewritten["counts"]["triples"], 5);
+}
+
+#[test]
+fn a_manifest_from_a_newer_build_is_refused_rather_than_downgraded() {
+    let root = tempfile::tempdir().unwrap();
+    let bundle = root.path().join("demo-kg").join("2026-08-01");
+    std::fs::create_dir_all(&bundle).unwrap();
+    build_artifacts(&bundle, SOURCE);
+    kgf(&["manifest", path(&bundle)]).success();
+
+    let manifest_path = bundle.join("manifest.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    document["formats"]["manifest"] = serde_json::json!("2");
+    let newer = serde_json::to_vec_pretty(&document).unwrap();
+    std::fs::write(&manifest_path, &newer).unwrap();
+
+    let error = kgf(&["manifest", path(&bundle)]).failure();
+    assert!(error.contains("format 2"), "{error}");
+    // Refusing to read it and then rewriting it anyway would be incoherent.
+    assert_eq!(
+        std::fs::read(&manifest_path).unwrap(),
+        newer,
+        "a manifest this build cannot read must not be overwritten"
+    );
 }
 
 /// Open the bundle through the read layer.

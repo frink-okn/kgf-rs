@@ -58,7 +58,7 @@ mod testing;
 
 pub use catalog::Catalog;
 pub use error::{Error, Result};
-pub use manifest::{BundleFacts, Capability, Manifest};
+pub use manifest::{BundleFacts, Capability, Manifest, ManifestDocument};
 pub use map::{PublishedBundle, PublishedRoot};
 pub use store::{OpenOptions, Store};
 

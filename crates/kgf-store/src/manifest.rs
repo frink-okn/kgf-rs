@@ -32,7 +32,7 @@
 //! that a manifest still describes the bytes beside it.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -124,12 +124,19 @@ impl BundleFacts {
     ///
     /// Constructing the [`PublishedBundle`] capability is where the caller
     /// accepts doc 04 §4.6's immutability obligation, exactly as for the store.
+    ///
+    /// Every check [`Store::open`](crate::store::Store::open) makes is made
+    /// here except the manifest's existence, so that a bundle this describes is
+    /// a bundle that opens. Describing one that then refuses to open would be
+    /// worse than describing nothing.
     pub fn read(bundle: &PublishedBundle) -> Result<Self> {
         let artifacts = ArtifactSet::resolve(bundle.path())?;
 
         let hdt = open_published(bundle, &artifacts.hdt)?;
         let perm = open_published(bundle, &artifacts.perm)?;
         let perms = Permutations::open(hdt, perm)?;
+
+        artifacts.verify_graph_index()?;
 
         Ok(Self {
             triples: perms.triples(),
@@ -201,6 +208,20 @@ fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
 }
 
 /// The artifact file names present, in the order doc 04 §4.1 lists them.
+///
+/// **This list must grow with every sidecar.** Doc 04 §4.1 reserves `text/`,
+/// `labels/`, `ranges/`, `closures/`, `reif/`, `geo/`, `vectors/`, `filters/`,
+/// and `stats/`, none of which has a producer yet; an artifact absent from here
+/// is absent from the manifest's checksums and therefore from
+/// `content_digest`. Adding a sidecar without adding it here silently narrows a
+/// version's identity.
+///
+/// Files a bundle may carry that are deliberately *not* artifacts of this list
+/// are a separate matter: `data.hdt.index.v1-1` is optional and never read
+/// (doc 04 §4.1, doc 20 §20.8), so a bundle carrying one is conforming and must
+/// not be refused. Whether it should nonetheless be checksummed — doc 04 §4.3
+/// wants `content_digest` usable for mirror verification, which argues yes — is
+/// an open question for the design docs, not something to settle here.
 fn artifact_names_for(artifacts: &ArtifactSet) -> Vec<&'static str> {
     let mut names = vec![artifact::HDT, artifact::PERM];
     if artifacts.graphs.is_some() {
@@ -341,38 +362,32 @@ pub struct Manifest {
 
 impl Manifest {
     /// Read and parse `manifest.json` from a bundle directory.
+    ///
+    /// For readers. A *writer* wants [`ManifestDocument::read`], which also
+    /// keeps the fields this build does not model.
     pub fn read(bundle_dir: &Path) -> Result<Self> {
-        let path = bundle_dir.join(artifact::MANIFEST);
-        let bytes = std::fs::read(&path)?;
-        let manifest: Self =
-            serde_json::from_slice(&bytes).map_err(|source| Error::ManifestSyntax {
-                path: path.clone(),
-                detail: source.to_string(),
-            })?;
-
-        if manifest.formats.manifest != MANIFEST_FORMAT {
-            return Err(Error::UnsupportedManifestFormat {
-                path,
-                found: manifest.formats.manifest,
-                supported: MANIFEST_FORMAT.to_owned(),
-            });
-        }
-        Ok(manifest)
+        ManifestDocument::read(bundle_dir)?
+            .ok_or_else(|| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "{} not found",
+                        bundle_dir.join(artifact::MANIFEST).display()
+                    ),
+                ))
+            })?
+            .into_parsed()
     }
 
     /// Serialize to the canonical on-disk bytes: two-space indent, trailing
     /// newline.
     ///
-    /// One place decides this so that regeneration is byte-stable and a manifest
-    /// can be diffed across versions.
+    /// For a bundle whose manifest is being written for the first time. Once one
+    /// exists, [`ManifestDocument::rewrite_with`] is the way to replace it,
+    /// because this drops anything the document held that [`Manifest`] does not
+    /// model.
     pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
-        let mut bytes =
-            serde_json::to_vec_pretty(self).map_err(|source| Error::ManifestSyntax {
-                path: artifact::MANIFEST.into(),
-                detail: source.to_string(),
-            })?;
-        bytes.push(b'\n');
-        Ok(bytes)
+        canonical_bytes(self, Path::new(artifact::MANIFEST))
     }
 
     /// Whether this bundle declares `capability`.
@@ -417,6 +432,149 @@ impl Manifest {
         }
         Ok(())
     }
+}
+
+/// A `manifest.json` as it exists on disk: the parsed form when there is one,
+/// and always the raw JSON object.
+///
+/// Rewriting a manifest is not the same operation as reading one. A writer that
+/// deserializes into [`Manifest`] and serializes back **deletes every field this
+/// build does not model** — doc 04 §4.3's `source` and `components`, a
+/// capability's configuration body, anything a newer builder added. That is
+/// silent data loss in a file whose whole job is to be the record.
+///
+/// So the raw object is kept alongside the parse, and
+/// [`rewrite_with`](Self::rewrite_with) merges derived fields over it. The
+/// parse is allowed to fail: a bundle's first manifest is often a `{}`
+/// placeholder, and refusing to write over one would defeat the purpose. What
+/// is *not* allowed to fail quietly is a document declaring a schema this build
+/// does not read — overwriting a newer manifest with an older one loses more
+/// than it repairs, so that is refused at [`read`](Self::read).
+#[derive(Debug, Clone)]
+pub struct ManifestDocument {
+    path: PathBuf,
+    raw: serde_json::Map<String, serde_json::Value>,
+    parsed: std::result::Result<Manifest, String>,
+}
+
+impl ManifestDocument {
+    /// Read the document, or `Ok(None)` if the bundle has no manifest yet.
+    ///
+    /// Fails on JSON that does not parse or is not an object, and on a
+    /// `formats.manifest` this build does not read. Succeeds with an
+    /// unparseable-as-[`Manifest`] document, since `{}` is one.
+    pub fn read(bundle_dir: &Path) -> Result<Option<Self>> {
+        let path = bundle_dir.join(artifact::MANIFEST);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+
+        let document: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|source| Error::ManifestSyntax {
+                path: path.clone(),
+                detail: source.to_string(),
+            })?;
+        let raw = match document {
+            serde_json::Value::Object(raw) => raw,
+            other => {
+                return Err(Error::ManifestSyntax {
+                    path,
+                    detail: format!("expected a JSON object, found {}", kind_of(&other)),
+                });
+            }
+        };
+
+        // Checked against the raw document rather than a parsed one, so that a
+        // future-format manifest is refused even when this build cannot make
+        // sense of the rest of it.
+        if let Some(found) = declared_format(&raw)
+            && found != MANIFEST_FORMAT
+        {
+            return Err(Error::UnsupportedManifestFormat {
+                path,
+                found: found.to_owned(),
+                supported: MANIFEST_FORMAT.to_owned(),
+            });
+        }
+
+        let parsed = serde_json::from_value(serde_json::Value::Object(raw.clone()))
+            .map_err(|source| source.to_string());
+        Ok(Some(Self { path, raw, parsed }))
+    }
+
+    /// The manifest file this was read from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The parsed manifest, if the document is a complete one.
+    pub fn parsed(&self) -> Option<&Manifest> {
+        self.parsed.as_ref().ok()
+    }
+
+    /// The parsed manifest, or why it is not one.
+    pub fn into_parsed(self) -> Result<Manifest> {
+        self.parsed.map_err(|detail| Error::ManifestSyntax {
+            path: self.path,
+            detail,
+        })
+    }
+
+    /// The canonical bytes of this document with `manifest`'s fields applied.
+    ///
+    /// Every key `manifest` serializes replaces the one here; every other key
+    /// survives untouched. The consequence worth knowing is that a field cannot
+    /// be *removed* by regenerating — `--license` can be changed but not
+    /// cleared, which is the right trade for a record that must not silently
+    /// lose what it was given.
+    pub fn rewrite_with(&self, manifest: &Manifest) -> Result<Vec<u8>> {
+        let fresh = serde_json::to_value(manifest).map_err(|source| Error::ManifestSyntax {
+            path: self.path.clone(),
+            detail: source.to_string(),
+        })?;
+        let fresh = fresh.as_object().ok_or_else(|| Error::ManifestSyntax {
+            path: self.path.clone(),
+            detail: "a manifest did not serialize as a JSON object".to_owned(),
+        })?;
+
+        let mut merged = self.raw.clone();
+        for (key, value) in fresh {
+            merged.insert(key.clone(), value.clone());
+        }
+        canonical_bytes(&serde_json::Value::Object(merged), &self.path)
+    }
+}
+
+/// The schema version a raw document declares, if it declares one.
+fn declared_format(raw: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    raw.get("formats")?.get("manifest")?.as_str()
+}
+
+/// A JSON value's type, for an error message.
+fn kind_of(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// The canonical on-disk form: two-space indent, trailing newline.
+///
+/// One place decides this so that regeneration is byte-stable and a manifest can
+/// be diffed across versions.
+fn canonical_bytes<T: Serialize>(value: &T, path: &Path) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(|source| Error::ManifestSyntax {
+        path: path.to_path_buf(),
+        detail: source.to_string(),
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 /// The unit `content_digest` is computed over: one artifact's name and checksum.
@@ -525,6 +683,40 @@ mod tests {
     }
 
     #[test]
+    fn a_bundle_that_would_not_open_is_not_described() {
+        // The invariant: every check `Store::open` makes, `BundleFacts::read`
+        // makes too, apart from the manifest's existence. Without it
+        // `kgf manifest` writes a manifest declaring `graphs` for a bundle that
+        // then refuses to open.
+        let first = Fixture::build_quads(TINY_NQ);
+        let other = Fixture::build_quads(concat!(
+            "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> ",
+            "<http://example.org/g1> .\n",
+            "<http://example.org/extra> <http://example.org/p> <http://example.org/o> ",
+            "<http://example.org/g3> .\n",
+        ));
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("mismatched-graph-index");
+        first.copy_bundle_to(&bundle);
+        std::fs::copy(
+            other.bundle_path().join(artifact::GRAPHS_IDX),
+            bundle.join(artifact::GRAPHS_IDX),
+        )
+        .unwrap();
+
+        let published = published_bundle(&bundle);
+        match BundleFacts::read(&published)
+            .expect_err("a graph index from another HDT must not be described")
+        {
+            Error::ArtifactBindingMismatch { artifact, hdt, .. } => {
+                assert_eq!(artifact, bundle.join(artifact::GRAPHS_IDX));
+                assert_eq!(hdt, bundle.join(artifact::HDT));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
     fn artifact_names_never_include_the_manifest() {
         for fixture in [Fixture::build(TINY_NT), Fixture::build_quads(TINY_NQ)] {
             assert!(
@@ -582,34 +774,129 @@ mod tests {
         assert!(!parsed.declares(Capability::Search));
     }
 
-    #[test]
-    fn unknown_fields_survive_a_newer_writer_but_a_newer_format_does_not() {
-        let dir = tempfile::tempdir().unwrap();
-        let write = |json: serde_json::Value| {
-            std::fs::write(
-                dir.path().join(artifact::MANIFEST),
-                serde_json::to_vec(&json).unwrap(),
-            )
-            .unwrap();
-        };
+    fn write_document(dir: &Path, json: &serde_json::Value) {
+        std::fs::write(
+            dir.join(artifact::MANIFEST),
+            serde_json::to_vec(json).unwrap(),
+        )
+        .unwrap();
+    }
 
-        let mut json = serde_json::to_value(sample_manifest(Counts {
+    fn sample_counts() -> Counts {
+        Counts {
             triples: 8,
             subjects: 4,
             predicates: 3,
             objects: 6,
-        }))
-        .unwrap();
+        }
+    }
+
+    #[test]
+    fn unknown_fields_survive_a_newer_writer_but_a_newer_format_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut json = serde_json::to_value(sample_manifest(sample_counts())).unwrap();
         json["some_field_from_the_future"] = serde_json::json!({"a": 1});
-        write(json.clone());
+        write_document(dir.path(), &json);
         assert_eq!(Manifest::read(dir.path()).unwrap().counts.triples, 8);
 
         json["formats"]["manifest"] = serde_json::json!("2");
-        write(json);
+        write_document(dir.path(), &json);
         assert!(matches!(
             Manifest::read(dir.path()),
             Err(Error::UnsupportedManifestFormat { found, .. }) if found == "2"
         ));
+    }
+
+    #[test]
+    fn a_document_is_readable_when_the_manifest_in_it_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // No manifest at all is not an error for a writer; it is the first run.
+        assert!(ManifestDocument::read(dir.path()).unwrap().is_none());
+
+        // The placeholder a bundle starts with: valid JSON, not a manifest.
+        write_document(dir.path(), &serde_json::json!({}));
+        let document = ManifestDocument::read(dir.path()).unwrap().unwrap();
+        assert!(document.parsed().is_none());
+        assert!(matches!(
+            document.into_parsed(),
+            Err(Error::ManifestSyntax { .. })
+        ));
+
+        // A future schema is refused even though the rest is unreadable, because
+        // the alternative is overwriting it with an older document.
+        write_document(
+            dir.path(),
+            &serde_json::json!({"formats": {"manifest": "2"}}),
+        );
+        assert!(matches!(
+            ManifestDocument::read(dir.path()),
+            Err(Error::UnsupportedManifestFormat { found, .. }) if found == "2"
+        ));
+
+        // Not JSON, and JSON that is not an object, are both refused rather than
+        // silently replaced.
+        std::fs::write(dir.path().join(artifact::MANIFEST), b"{not json").unwrap();
+        assert!(matches!(
+            ManifestDocument::read(dir.path()),
+            Err(Error::ManifestSyntax { .. })
+        ));
+        write_document(dir.path(), &serde_json::json!([1, 2, 3]));
+        let error = ManifestDocument::read(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("found an array"), "{error}");
+    }
+
+    #[test]
+    fn rewriting_replaces_modeled_fields_and_keeps_everything_else() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A document carrying doc 04 §4.3 fields this build does not model, plus
+        // one from a newer writer.
+        let mut json = serde_json::to_value(sample_manifest(sample_counts())).unwrap();
+        json["source"] = serde_json::json!({"format": "n-triples", "sha256": "abc"});
+        json["components"] = serde_json::json!([{"id": "canonical", "role": "source"}]);
+        json["something_newer"] = serde_json::json!(["a", "b"]);
+        write_document(dir.path(), &json);
+
+        let document = ManifestDocument::read(dir.path()).unwrap().unwrap();
+        let mut updated = document.parsed().unwrap().clone();
+        updated.counts.triples = 9;
+        updated.content_digest = "sha256:new".to_owned();
+
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&document.rewrite_with(&updated).unwrap()).unwrap();
+
+        // Modeled fields come from the new manifest.
+        assert_eq!(rewritten["counts"]["triples"], 9);
+        assert_eq!(rewritten["content_digest"], "sha256:new");
+        // Everything else is exactly as it was.
+        assert_eq!(rewritten["source"], json["source"]);
+        assert_eq!(rewritten["components"], json["components"]);
+        assert_eq!(rewritten["something_newer"], json["something_newer"]);
+
+        // And the result is still a manifest, in canonical form.
+        let bytes = document.rewrite_with(&updated).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        assert_eq!(
+            serde_json::from_slice::<Manifest>(&bytes).unwrap().counts,
+            updated.counts
+        );
+    }
+
+    #[test]
+    fn rewriting_a_placeholder_produces_a_whole_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        write_document(dir.path(), &serde_json::json!({}));
+
+        let document = ManifestDocument::read(dir.path()).unwrap().unwrap();
+        let bytes = document
+            .rewrite_with(&sample_manifest(sample_counts()))
+            .unwrap();
+
+        let parsed: Manifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.counts, sample_counts());
+        assert_eq!(parsed.id, "tiny");
     }
 
     #[test]

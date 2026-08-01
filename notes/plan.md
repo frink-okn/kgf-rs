@@ -237,9 +237,10 @@ Three decisions worth naming:
   from `data.hdt` and `data.hdt.perm` alone, and keeping the parse out is what keeps
   the store testable headless against fixtures carrying a `{}` placeholder.
 - **`BundleFacts::read` is the one path that opens artifacts without a manifest**,
-  because it is what produces one; requiring a manifest there is circular. Both it and
-  `Store::open` resolve artifacts through the same `ArtifactSet`, so the required-set
-  policy has one implementation.
+  because it is what produces one; requiring a manifest there is circular. It makes
+  every check `Store::open` makes apart from that one — both resolve artifacts through
+  the same `ArtifactSet` and share its graph-index binding check — so a bundle
+  `kgf manifest` describes is a bundle that opens.
 - **Checksums stay out of the read layer.** `content_digest_preimage` fixes the Merkle
   recipe — artifacts sorted by name, `{name}  {sha256}\n`, hashed, prefixed `sha256:` —
   and returns the preimage rather than the digest, so `kgf-store` never hashes a file.
@@ -256,14 +257,43 @@ cannot acquire them without acquiring an artifact.
 `created` dates the bundle, not the file, so it carries forward while the digest is
 unchanged. Regeneration over unchanged artifacts is therefore byte-identical.
 
+**Two things a review caught, both about the difference between reading and rewriting.**
+
+`--check` compared only counts, and counts are a weak witness for a rebuild: editing
+one literal leaves all four identical — and, as it happens, the file length too — while
+rewriting every byte, so a stale `content_digest` passed. The store-side
+`verify_against` stays counts-only, since full digests are off the open path by design
+(doc 20 §20.6); the CLI, which already hashes every artifact to *write* a manifest, now
+hashes them to *check* one, and also compares the capability and artifact sets that no
+count reflects.
+
+Rewriting through `Manifest` alone deletes every field this build does not model —
+`source`, `components`, a capability's configuration body, anything a newer builder
+added. `ManifestDocument` keeps the raw JSON beside the parse and merges derived fields
+over it, so unmodeled keys survive and only modeled ones are replaced. The parse is
+allowed to fail, because `{}` is a bundle's first manifest; what is not allowed is
+silently overwriting a document declaring a schema this build cannot read, which is now
+refused before anything is written.
+
 *Verified by* an end-to-end integration test over an hdtc-built bundle: artifacts alone
 are refused by `Store::open` naming `kgf manifest`; the generated manifest makes the
 bundle servable and agrees with the store's own counts; identity is inferred from the
 `{dataset}/{version}` layout; regeneration is byte-stable and carries descriptive
 fields; and rebuilding the artifacts makes `--check` fail naming `counts.triples` and
-the repair command. Plus unit tests for the capability rule, the digest preimage,
-manifest round-tripping, forward compatibility, and RFC 3339 formatting. There are 76
-tests after this unit.
+the repair command. Separate cases cover a rebuild that preserves every count, a
+hand-edited `content_digest`, unmodeled fields surviving a rewrite, and a
+newer-schema manifest being refused rather than downgraded. Plus unit tests for the
+capability rule, the digest preimage, manifest round-tripping, document reading when
+the manifest in it does not parse, the graph-index refusal, and RFC 3339 formatting.
+There are 84 tests after this unit.
+
+**Still open, and recorded rather than fixed:** `artifact_names_for` knows only the
+four artifacts that have producers, while doc 04 §4.1 reserves nine more. Each new
+sidecar must be added there or it falls out of `content_digest`. Rejecting unknown
+files is *not* the answer — doc 04 §4.1 and doc 20 §20.8 both make
+`data.hdt.index.v1-1` a conforming artifact that no server reads — but whether that
+index should nonetheless be checksummed, given doc 04 §4.3 wants the digest usable for
+mirror verification, is a question for the design docs.
 
 ## Testing spine
 

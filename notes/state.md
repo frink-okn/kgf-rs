@@ -28,7 +28,7 @@ classified open errors in `48f90f3` that preserve binding-error semantics.
 
 ## What is built
 
-All nine units from `notes/plan.md`, complete with tests. 76 tests, ~8 s,
+All nine units from `notes/plan.md`, complete with tests. 84 tests, ~9 s,
 clean under `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and
 `cargo doc` with no warnings.
 
@@ -316,15 +316,40 @@ touching artifacts; a stale manifest names the field that disagrees and the comm
 that repairs it.
 
 `Store::open` still does not parse the manifest — it requires the file and stops — so
-the store stays testable headless and the 71 `kgf-store` tests keep their `{}`
-placeholder. The parse is `Manifest::read`, for the server to call. Counts are the
-cross-check because they are free to obtain; checksums are not verified at open, since
-that is a full read of every artifact and belongs to publish and `kgf verify`
-(doc 20 §20.6).
+the store stays testable headless and the `kgf-store` tests keep their `{}`
+placeholder. The parse is `Manifest::read`, for the server to call.
+
+**Where verification happens is split, deliberately.** `Manifest::verify_against` is
+store-side and compares counts only, because full digests are off the open path by
+design (doc 20 §20.6). That is too weak on its own: editing one literal leaves all four
+counts identical — the file length too, in the case that found this — and rewrites
+every byte. So `kgf manifest --check` additionally recomputes every checksum and the
+content digest, and compares the capability and artifact sets. The CLI already hashes
+everything to write a manifest; hashing to check one costs nothing new and is not on
+any latency path.
+
+**Rewriting is not reading.** `ManifestDocument` holds the raw JSON beside the parse so
+a regeneration preserves fields this build does not model — `source`, `components`, a
+capability's configuration body, anything newer. An unparseable document is still
+writable (`{}` is every bundle's first manifest), but one declaring a schema this build
+cannot read is refused before anything is written, since overwriting a newer manifest
+with an older one loses more than it repairs.
+
+**`BundleFacts::read` makes every check `Store::open` makes** except the manifest's
+existence, sharing `ArtifactSet` and its graph-index binding check. A manifest
+describing a bundle that then refuses to open would be worse than describing nothing.
 
 **The one place in KGF that reads whole artifacts is the binary.** `kgf-store` never
 hashes a file: `content_digest_preimage` fixes the Merkle recipe and returns the
 preimage, and the binary hashes it. `kgf build` must reproduce that recipe.
+
+**One gap left open on purpose.** `artifact_names_for` knows the four artifacts that
+have producers; doc 04 §4.1 reserves nine more (`text/`, `labels/`, `ranges/`,
+`closures/`, `reif/`, `geo/`, `vectors/`, `filters/`, `stats/`). Each must be added
+there when it lands or it falls out of `content_digest`. Refusing unknown files is not
+the fix — `data.hdt.index.v1-1` is a conforming artifact no server reads (doc 04 §4.1,
+doc 20 §20.8) — but whether it should still be checksummed, since doc 04 §4.3 wants the
+digest usable for mirror verification, is a question for `../kgf`.
 
 ## Next
 

@@ -21,14 +21,14 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use kgf_store::manifest::{
-    ArtifactDigest, ArtifactEntry, BundleFacts, Formats, Manifest, Publisher,
-    content_digest_preimage,
+    ArtifactDigest, ArtifactEntry, BundleFacts, Capability, Formats, Manifest, ManifestDocument,
+    Publisher, content_digest_preimage,
 };
 use sha2::{Digest, Sha256};
 
@@ -101,24 +101,37 @@ pub fn run(args: Args) -> Result<()> {
 
     if args.check {
         let manifest = Manifest::read(&dir)?;
+        // Counts first: they are free, and they are what catches a rebuild that
+        // changed the data. Then the bytes, which catch a rebuild that did not.
         manifest.verify_against(&facts, &dir)?;
+        verify_described_artifacts(&manifest, &dir, &facts)?;
         println!(
-            "{}: manifest agrees with its artifacts ({} triples)",
+            "{}: manifest agrees with its artifacts ({} triples, {})",
             dir.display(),
-            facts.triples()
+            facts.triples(),
+            manifest.content_digest,
         );
         return Ok(());
     }
 
     // Any manifest already here supplies defaults, so regenerating after a
-    // rebuild needs no flags. A placeholder that does not parse is not an error:
-    // supplying one is how a bundle gets its first real manifest.
-    let previous = Manifest::read(&dir).ok();
-    let manifest = build(&args, &dir, &facts, previous.as_ref())?;
+    // rebuild needs no flags, and its unmodeled fields survive the rewrite. A
+    // placeholder that does not parse is not an error: supplying one is how a
+    // bundle gets its first real manifest.
+    let document = ManifestDocument::read(&dir)?;
+    let manifest = build(
+        &args,
+        &dir,
+        &facts,
+        document.as_ref().and_then(ManifestDocument::parsed),
+    )?;
 
+    let bytes = match &document {
+        Some(document) => document.rewrite_with(&manifest)?,
+        None => manifest.to_json_bytes()?,
+    };
     let path = dir.join("manifest.json");
-    std::fs::write(&path, manifest.to_json_bytes()?)
-        .with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
 
     println!(
         "{}: wrote manifest for {}/{} ({} triples, {})",
@@ -146,6 +159,89 @@ pub fn run(args: Args) -> Result<()> {
 fn read_facts(dir: &Path) -> Result<BundleFacts> {
     let bundle = unsafe { kgf_store::PublishedBundle::new(dir) };
     Ok(BundleFacts::read(&bundle)?)
+}
+
+/// Check that the manifest describes the artifacts *byte for byte*, not merely
+/// in cardinality.
+///
+/// `Manifest::verify_against` compares counts, which is all the read layer can
+/// afford — full digests are off the open path by design (doc 20 §20.6). But
+/// counts are a weak witness for a rebuild: editing one literal leaves all four
+/// unchanged and rewrites every artifact, so a counts-only check passes a
+/// manifest whose `content_digest` is stale. That digest is a version's
+/// canonical identity — ETags and cursor binding are derived from it — so a
+/// build-side command that already hashes every artifact to *write* one should
+/// hash them to *check* one.
+///
+/// Two comparisons cover it. The capability and artifact sets catch a sidecar
+/// added or removed since the manifest was written, which no count reflects.
+/// The per-artifact checksums catch changed bytes, and the recomputed digest
+/// catches the remaining case of a hand-edited `content_digest`.
+fn verify_described_artifacts(manifest: &Manifest, dir: &Path, facts: &BundleFacts) -> Result<()> {
+    let remedy = format!("kgf manifest {}", dir.display());
+
+    let declared: BTreeSet<&str> = manifest.capabilities.keys().map(String::as_str).collect();
+    let supported: BTreeSet<&str> = facts.capabilities().map(Capability::as_str).collect();
+    if declared != supported {
+        bail!(
+            "manifest {} declares capabilities [{}], but the artifacts support [{}]; \
+             regenerate it with `{remedy}`",
+            manifest_path(dir).display(),
+            join(&declared),
+            join(&supported),
+        );
+    }
+
+    let computed = checksum_artifacts(dir, facts)?;
+    let listed: BTreeSet<&str> = manifest.artifacts.keys().map(String::as_str).collect();
+    let present: BTreeSet<&str> = computed.iter().map(|(name, _)| name.as_str()).collect();
+    if listed != present {
+        bail!(
+            "manifest {} lists artifacts [{}], but the bundle contains [{}]; \
+             regenerate it with `{remedy}`",
+            manifest_path(dir).display(),
+            join(&listed),
+            join(&present),
+        );
+    }
+
+    for (name, actual) in &computed {
+        let recorded = manifest
+            .artifacts
+            .get(name)
+            .expect("artifact sets were just compared");
+        if recorded != actual {
+            bail!(
+                "manifest {} records {name} as {} bytes, sha256 {}, but it is {} bytes, \
+                 sha256 {}; regenerate it with `{remedy}`",
+                manifest_path(dir).display(),
+                recorded.bytes,
+                recorded.sha256,
+                actual.bytes,
+                actual.sha256,
+            );
+        }
+    }
+
+    let digest = content_digest(&computed);
+    if manifest.content_digest != digest {
+        bail!(
+            "manifest {} records content_digest {} but its artifacts hash to {}; \
+             regenerate it with `{remedy}`",
+            manifest_path(dir).display(),
+            manifest.content_digest,
+            digest,
+        );
+    }
+    Ok(())
+}
+
+fn manifest_path(dir: &Path) -> PathBuf {
+    dir.join("manifest.json")
+}
+
+fn join(names: &BTreeSet<&str>) -> String {
+    names.iter().copied().collect::<Vec<_>>().join(", ")
 }
 
 /// Assemble the manifest from derived facts, supplied identity, and whatever the

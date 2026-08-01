@@ -78,40 +78,12 @@ impl Store {
         // manifest generator uses on a bundle that does not have one yet.
         require_file(dir, artifact::MANIFEST, "kgf manifest")?;
         let artifacts = ArtifactSet::resolve(dir)?;
-        let hdt_path = artifacts.hdt.clone();
 
         let hdt = open_published(bundle, &artifacts.hdt)?;
         let perm = open_published(bundle, &artifacts.perm)?;
         let perms = Permutations::open(hdt, perm)?;
 
-        if let Some(graph_index_path) = artifacts.graph_index {
-            // `verify_binding` rather than `open`: graph scoping is a later
-            // milestone, so what open owes a bundle today is a refusal when its
-            // index does not belong to this HDT (doc 20 §20.8). Opening the
-            // index would additionally build its two per-query layer readers —
-            // a file handle each — and then drop them here.
-            hdtc::format::GraphIndex::verify_binding(&graph_index_path, &hdt_path).map_err(
-                |error| match error {
-                    GraphIndexOpenError::Binding { source } => Error::ArtifactBindingMismatch {
-                        artifact: graph_index_path.clone(),
-                        hdt: hdt_path.clone(),
-                        detail: format!("{source:#}"),
-                    },
-                    GraphIndexOpenError::Index { source } => Error::Format(source.context(
-                        format!("opening graph index {}", graph_index_path.display()),
-                    )),
-                    GraphIndexOpenError::Source { source } => Error::Format(
-                        source.context(format!("validating source HDT {}", hdt_path.display())),
-                    ),
-                    GraphIndexOpenError::Sidecar { source } => {
-                        Error::Format(source.context(format!(
-                            "opening graph sidecar {}",
-                            dir.join(artifact::GRAPHS).display()
-                        )))
-                    }
-                },
-            )?;
-        }
+        artifacts.verify_graph_index()?;
 
         Ok(Self {
             bundle: bundle.clone(),
@@ -208,6 +180,43 @@ impl ArtifactSet {
             perm,
             graphs,
             graph_index,
+        })
+    }
+
+    /// Refuse a graph index that does not belong to this HDT.
+    ///
+    /// `verify_binding` rather than `open`: graph scoping is a later milestone,
+    /// so what open owes a bundle today is a refusal when its index does not
+    /// bind (doc 20 §20.8). Opening the index would additionally build its two
+    /// per-query layer readers — a file handle each — and then drop them.
+    ///
+    /// Shared with [`crate::manifest::BundleFacts::read`] so that the two paths
+    /// cannot disagree about whether a bundle is sound. A manifest describing a
+    /// bundle that then refuses to open would be worse than useless.
+    pub(crate) fn verify_graph_index(&self) -> Result<()> {
+        let Some(index) = &self.graph_index else {
+            return Ok(());
+        };
+        hdtc::format::GraphIndex::verify_binding(index, &self.hdt).map_err(|error| match error {
+            GraphIndexOpenError::Binding { source } => Error::ArtifactBindingMismatch {
+                artifact: index.clone(),
+                hdt: self.hdt.clone(),
+                detail: format!("{source:#}"),
+            },
+            GraphIndexOpenError::Index { source } => {
+                Error::Format(source.context(format!("opening graph index {}", index.display())))
+            }
+            GraphIndexOpenError::Source { source } => Error::Format(
+                source.context(format!("validating source HDT {}", self.hdt.display())),
+            ),
+            GraphIndexOpenError::Sidecar { source } => {
+                let graphs = self
+                    .graphs
+                    .as_deref()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from(artifact::GRAPHS));
+                Error::Format(source.context(format!("opening graph sidecar {}", graphs.display())))
+            }
         })
     }
 }
