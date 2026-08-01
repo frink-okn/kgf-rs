@@ -156,12 +156,18 @@ impl Completeness {
     ///
     /// The only truncation M1 emits.
     pub fn page_limit(next: CursorToken) -> Self {
-        Self::interrupted(TruncationReason::PageLimit, next)
+        Self(State::Truncated {
+            reason: TruncationReason::PageLimit,
+            next: Some(next),
+        })
     }
 
     /// A scan stopped on a budget, resumable from `next` (M2).
     pub fn budget_exhausted(reason: BudgetReason, next: CursorToken) -> Self {
-        Self::interrupted(reason.into(), next)
+        Self(State::Truncated {
+            reason: reason.into(),
+            next: Some(next),
+        })
     }
 
     /// A star cell exceeded its values cap (M2). Nothing to resume.
@@ -180,12 +186,11 @@ impl Completeness {
         })
     }
 
-    fn interrupted(reason: TruncationReason, next: CursorToken) -> Self {
-        Self(State::Truncated {
-            reason,
-            next: Some(next),
-        })
-    }
+    // No shared `interrupted(reason, next)` helper: it would take an
+    // unrestricted `TruncationReason`, which is the signature this unit's
+    // review removed from the public constructor. Two four-line bodies are
+    // cheaper than a private path that can rebuild the state the type exists
+    // to forbid.
 
     /// Whether this is the whole answer.
     pub fn is_complete(&self) -> bool {
@@ -214,18 +219,20 @@ impl Completeness {
     /// has. Emitted for every format, including JSON: a client should not have
     /// to parse a body to learn whether it is complete, and an intermediary
     /// cannot.
-    pub fn headers(&self) -> Vec<(&'static str, String)> {
-        let mut headers = vec![(
-            "KGF-Complete",
-            if self.is_complete() { "true" } else { "false" }.to_owned(),
-        )];
-        if let Some(reason) = self.truncation_reason() {
-            headers.push(("KGF-Truncation-Reason", reason.as_str().to_owned()));
-        }
-        if let Some(next) = self.next_cursor() {
-            headers.push(("KGF-Next-Cursor", next.to_owned()));
-        }
-        headers
+    /// Borrowed and allocation-free: every value is either a literal or already
+    /// owned by this `Completeness`, and this runs once per response.
+    pub fn headers(&self) -> impl Iterator<Item = (&'static str, &str)> + '_ {
+        [
+            Some((
+                "KGF-Complete",
+                if self.is_complete() { "true" } else { "false" },
+            )),
+            self.truncation_reason()
+                .map(|reason| ("KGF-Truncation-Reason", reason.as_str())),
+            self.next_cursor().map(|next| ("KGF-Next-Cursor", next)),
+        ]
+        .into_iter()
+        .flatten()
     }
 }
 
@@ -252,35 +259,116 @@ impl Serialize for Completeness {
 
 /// How many rows match, and how well the server knows (doc 03 §3.4.1).
 ///
-/// Two states rather than a `value` beside an `exact` flag, because the `min`
-/// lower bound §3.6 attaches to an interrupted count is meaningless on an exact
-/// one — an exact count *is* its own bound.
+/// Opaque for [`Completeness`]'s reason: the pieces §3.4.1 and §3.4.4 attach to
+/// a count constrain each other, and a struct of public fields cannot say so.
+/// An exact count takes no lower bound, because it *is* its own bound; a lower
+/// bound cannot exceed the estimate it bounds; and `distinct_objects` is exact
+/// even on a response whose `value` is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cardinality {
-    /// Known exactly, which for a plain pattern costs O(log N) from HDT and is
-    /// what M1 always reports.
+pub struct Cardinality(Count);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Count {
     Exact(u64),
-    /// An estimate, as text and range constraints give (§3.4.1), optionally
-    /// with a lower bound established before a scan was interrupted (§3.4.4).
     Estimated {
-        /// The estimate.
         value: u64,
-        /// A count actually reached, when a scan got that far.
         min: Option<u64>,
+        distinct_objects: Option<u64>,
     },
 }
 
 impl Cardinality {
+    /// A count known exactly — O(log N) from HDT for a plain pattern, which is
+    /// every count M1 reports.
+    pub fn exact(value: u64) -> Self {
+        Self(Count::Exact(value))
+    }
+
+    /// An estimate, as text and range constraints give (§3.4.1).
+    pub fn estimated(value: u64) -> Self {
+        Self(Count::Estimated {
+            value,
+            min: None,
+            distinct_objects: None,
+        })
+    }
+
+    /// Record a count actually reached before a scan was interrupted (§3.4.4).
+    ///
+    /// Raises `value` to `min` when the scan overshot the estimate. The two
+    /// numbers come from different computations — one counted, one guessed — so
+    /// a scan that got to 50 under an estimate of 10 is not a contradiction to
+    /// report but an estimate that has been proven too low. Emitting the pair
+    /// as given would tell a client "at least 50, about 10", which is not a
+    /// statement about anything.
+    ///
+    /// # Panics
+    ///
+    /// Panics on an exact count, which has no scan to interrupt and whose value
+    /// is already its own lower bound.
+    pub fn at_least(self, min: u64) -> Self {
+        match self.0 {
+            Count::Exact(_) => panic!("an exact count is already its own lower bound"),
+            Count::Estimated {
+                value,
+                distinct_objects,
+                ..
+            } => Self(Count::Estimated {
+                value: value.max(min),
+                min: Some(min),
+                distinct_objects,
+            }),
+        }
+    }
+
+    /// Record the exact number of distinct matching objects (§3.4.1).
+    ///
+    /// A range reports two quantities at once: `value` stays an estimate,
+    /// because summing occurrences over the slice is O(slice), while the count
+    /// of distinct objects is exact from two binary searches or a popcount.
+    ///
+    /// # Panics
+    ///
+    /// Panics on an exact count, where the distinction does not arise.
+    pub fn over_distinct_objects(self, distinct_objects: u64) -> Self {
+        match self.0 {
+            Count::Exact(_) => panic!("an exact count does not carry a separate object count"),
+            Count::Estimated { value, min, .. } => Self(Count::Estimated {
+                value,
+                min,
+                distinct_objects: Some(distinct_objects),
+            }),
+        }
+    }
+
     /// The reported count.
     pub fn value(self) -> u64 {
-        match self {
-            Self::Exact(value) | Self::Estimated { value, .. } => value,
+        match self.0 {
+            Count::Exact(value) | Count::Estimated { value, .. } => value,
         }
     }
 
     /// Whether the count is exact.
     pub fn is_exact(self) -> bool {
-        matches!(self, Self::Exact(_))
+        matches!(self.0, Count::Exact(_))
+    }
+
+    /// The lower bound a scan established, if it was interrupted.
+    pub fn min(self) -> Option<u64> {
+        match self.0 {
+            Count::Exact(_) => None,
+            Count::Estimated { min, .. } => min,
+        }
+    }
+
+    /// The exact count of distinct matching objects, if this is a range.
+    pub fn distinct_objects(self) -> Option<u64> {
+        match self.0 {
+            Count::Exact(_) => None,
+            Count::Estimated {
+                distinct_objects, ..
+            } => distinct_objects,
+        }
     }
 }
 
@@ -289,8 +377,11 @@ impl Serialize for Cardinality {
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("value", &self.value())?;
         map.serialize_entry("exact", &self.is_exact())?;
-        if let Self::Estimated { min: Some(min), .. } = self {
-            map.serialize_entry("min", min)?;
+        if let Some(min) = self.min() {
+            map.serialize_entry("min", &min)?;
+        }
+        if let Some(distinct_objects) = self.distinct_objects() {
+            map.serialize_entry("distinct_objects", &distinct_objects)?;
         }
         map.end()
     }
@@ -301,6 +392,10 @@ impl Serialize for Cardinality {
 // ---------------------------------------------------------------------------
 
 /// The media type an error response carries (RFC 9457 §3).
+///
+/// Fixed by the RFC rather than chosen, and kept here rather than deferred to
+/// its first caller in unit 13 so that the `Content-Type` of an error and the
+/// document [`Problem`] serializes are decided in one place.
 pub const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 
 /// A machine-readable error code (doc 03 §3.6.1).
@@ -329,24 +424,43 @@ pub enum ErrorCode {
     NotAcceptable,
     /// A request body's media type is not supported (`Accept-Query`, §3.6).
     UnsupportedMediaType,
+    /// The caller's rate-limit bucket is empty (§3.6).
+    RateLimited,
     /// The bundle does not offer what the request needs (§3.4, §3.7).
     CapabilityNotAvailable,
+    /// The server failed. Not the client's mistake, and still coded, so a
+    /// client never has to fall back to reading statuses (§3.6.1).
+    InternalError,
 }
 
 impl ErrorCode {
+    /// This code's row of §3.6.1: wire token, status, and the status's reason
+    /// phrase.
+    ///
+    /// One match over the enum rather than three, and in particular the phrase
+    /// is *not* derived by matching on the status: that would check
+    /// exhaustiveness over `u16` instead of over the variants, so a new code
+    /// with a new status would compile and then panic while serializing the
+    /// error response it was added for.
+    const fn row(self) -> (&'static str, u16, &'static str) {
+        match self {
+            Self::BadTermSyntax => ("bad_term_syntax", 400, "Bad Request"),
+            Self::MalformedRequest => ("malformed_request", 400, "Bad Request"),
+            Self::CapExceeded => ("cap_exceeded", 400, "Bad Request"),
+            Self::StaleCursor => ("stale_cursor", 400, "Bad Request"),
+            Self::UnsupportedFormat => ("unsupported_format", 400, "Bad Request"),
+            Self::NotFound => ("not_found", 404, "Not Found"),
+            Self::NotAcceptable => ("not_acceptable", 406, "Not Acceptable"),
+            Self::UnsupportedMediaType => ("unsupported_media_type", 415, "Unsupported Media Type"),
+            Self::RateLimited => ("rate_limited", 429, "Too Many Requests"),
+            Self::InternalError => ("internal_error", 500, "Internal Server Error"),
+            Self::CapabilityNotAvailable => ("capability_not_available", 501, "Not Implemented"),
+        }
+    }
+
     /// The token that goes in the problem document's `code`.
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::BadTermSyntax => "bad_term_syntax",
-            Self::MalformedRequest => "malformed_request",
-            Self::CapExceeded => "cap_exceeded",
-            Self::StaleCursor => "stale_cursor",
-            Self::UnsupportedFormat => "unsupported_format",
-            Self::NotFound => "not_found",
-            Self::NotAcceptable => "not_acceptable",
-            Self::UnsupportedMediaType => "unsupported_media_type",
-            Self::CapabilityNotAvailable => "capability_not_available",
-        }
+        self.row().0
     }
 
     /// The HTTP status this code is reported with (§3.6.1).
@@ -356,17 +470,7 @@ impl ErrorCode {
     /// because the request is well formed and the same request against a bundle
     /// that does publish it succeeds — the shortfall is the server's.
     pub fn status(self) -> u16 {
-        match self {
-            Self::BadTermSyntax
-            | Self::MalformedRequest
-            | Self::CapExceeded
-            | Self::StaleCursor
-            | Self::UnsupportedFormat => 400,
-            Self::NotFound => 404,
-            Self::NotAcceptable => 406,
-            Self::UnsupportedMediaType => 415,
-            Self::CapabilityNotAvailable => 501,
-        }
+        self.row().1
     }
 
     /// RFC 9457's `title`: the status's reason phrase.
@@ -376,14 +480,7 @@ impl ErrorCode {
     /// also be a conformance bug, and it is not needed: `code` is what §3.6
     /// tells agents to read, and `detail` is what tells a human what happened.
     pub fn title(self) -> &'static str {
-        match self.status() {
-            400 => "Bad Request",
-            404 => "Not Found",
-            406 => "Not Acceptable",
-            415 => "Unsupported Media Type",
-            501 => "Not Implemented",
-            status => unreachable!("no reason phrase for status {status}"),
-        }
+        self.row().2
     }
 }
 
@@ -449,12 +546,40 @@ impl Serialize for Problem {
     }
 }
 
+impl std::fmt::Display for Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code.as_str(), self.detail)
+    }
+}
+
+/// A `Problem` is the crate's error currency — the [`From`] impls below let a
+/// handler write `?` — so it carries the traits an error is expected to have,
+/// or it cannot be logged through `tracing`'s `Display` bindings or wrapped by
+/// `anyhow`. There is no `source`: `detail` has already absorbed the message of
+/// whatever it was converted from, and keeping the original would put the same
+/// text in a response body and an error chain that can drift apart.
+impl std::error::Error for Problem {}
+
 impl From<crate::term::TermSyntaxError> for Problem {
     /// Every way a term can be malformed is one code on the wire (§3.6), with
     /// the variant's message as `detail` — which is why those messages name the
     /// offending token and the remedy rather than restating the code.
     fn from(error: crate::term::TermSyntaxError) -> Self {
         Self::new(ErrorCode::BadTermSyntax, error.to_string())
+    }
+}
+
+impl From<crate::cursor::StaleCursor> for Problem {
+    /// Every way a token can be rejected is this one code, deliberately, and
+    /// the `detail` stays as uninformative as the error itself: distinguishing
+    /// "wrong version" from "wrong request" would tell a client something about
+    /// data it did not query.
+    fn from(_: crate::cursor::StaleCursor) -> Self {
+        Self::new(
+            ErrorCode::StaleCursor,
+            "this cursor does not belong to this version, operation and request; \
+             start the enumeration again from its first page",
+        )
     }
 }
 
@@ -528,8 +653,17 @@ mod tests {
         // as agreement between the two renderings rather than as two expected
         // outputs, so neither can drift on its own.
         for completeness in every_shape() {
-            let headers: std::collections::HashMap<_, _> =
-                completeness.headers().into_iter().collect();
+            let emitted: Vec<_> = completeness.headers().collect();
+            let headers: std::collections::HashMap<_, _> = emitted.iter().copied().collect();
+            // Collecting into a map would hide a repeated name, and a response
+            // carrying one header twice with different values is resolved
+            // arbitrarily by whatever reads it.
+            assert_eq!(
+                emitted.len(),
+                headers.len(),
+                "no header name may be emitted twice: {emitted:?}"
+            );
+
             let body = serde_json::to_value(&completeness).expect("serialize");
 
             assert_eq!(
@@ -541,17 +675,60 @@ mod tests {
                 "KGF-Complete must agree with `complete`"
             );
             assert_eq!(
-                headers.get("KGF-Truncation-Reason").map(String::as_str),
+                headers.get("KGF-Truncation-Reason").copied(),
                 body.get("truncation_reason")
                     .and_then(|value| value.as_str()),
                 "the reason must appear in both channels or neither"
             );
             assert_eq!(
-                headers.get("KGF-Next-Cursor").map(String::as_str),
+                headers.get("KGF-Next-Cursor").copied(),
                 body["next"].as_str(),
                 "the cursor must appear in both channels or neither"
             );
+
+            // Every value must survive being put in a header: `KGF-Next-Cursor`
+            // is why `CursorToken` exists, and this is the assertion that keeps
+            // that guarantee honest for the other two as well.
+            for (name, value) in &emitted {
+                assert!(
+                    value
+                        .bytes()
+                        .all(|byte| (0x20..0x7f).contains(&byte) || byte == b'\t'),
+                    "{name} carries a value no HTTP header may hold: {value:?}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn completeness_flattens_into_an_envelope() {
+        // The `Serialize` impl documents itself as being for `#[serde(flatten)]`,
+        // which routes through a different serializer than a standalone
+        // `to_value`. Unit 14 flattens this into every operation's envelope, so
+        // the promise is pinned where it is made rather than discovered there.
+        #[derive(serde::Serialize)]
+        struct Envelope {
+            rows: Vec<u8>,
+            #[serde(flatten)]
+            completeness: Completeness,
+        }
+
+        let flattened = serde_json::to_value(Envelope {
+            rows: vec![],
+            completeness: Completeness::page_limit(token()),
+        })
+        .expect("flatten");
+
+        assert_eq!(flattened["complete"], serde_json::json!(false));
+        assert_eq!(
+            flattened["truncation_reason"],
+            serde_json::json!("page_limit")
+        );
+        assert_eq!(flattened["next"], serde_json::json!(token().as_str()));
+        assert!(
+            flattened.get("completeness").is_none(),
+            "the fields must merge into the envelope, not nest under it"
+        );
     }
 
     #[test]
@@ -604,28 +781,49 @@ mod tests {
 
     #[test]
     fn a_cardinality_reports_how_well_it_is_known() {
+        let json = |cardinality: Cardinality| serde_json::to_string(&cardinality).unwrap();
+
+        assert_eq!(json(Cardinality::exact(17)), r#"{"value":17,"exact":true}"#);
         assert_eq!(
-            serde_json::to_string(&Cardinality::Exact(17)).unwrap(),
-            r#"{"value":17,"exact":true}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&Cardinality::Estimated {
-                value: 17,
-                min: None
-            })
-            .unwrap(),
+            json(Cardinality::estimated(17)),
             r#"{"value":17,"exact":false}"#
         );
         // §3.4.4's interrupted count: the estimate, plus what was actually
         // reached before the budget ran out.
         assert_eq!(
-            serde_json::to_string(&Cardinality::Estimated {
-                value: 40,
-                min: Some(31)
-            })
-            .unwrap(),
+            json(Cardinality::estimated(40).at_least(31)),
             r#"{"value":40,"exact":false,"min":31}"#
         );
+        // §3.4.1's range: `value` stays an estimate because summing occurrences
+        // over the slice is O(slice), while the distinct-object count is exact
+        // from two binary searches. One response, two qualities of knowledge.
+        assert_eq!(
+            json(Cardinality::estimated(900).over_distinct_objects(120)),
+            r#"{"value":900,"exact":false,"distinct_objects":120}"#
+        );
+    }
+
+    #[test]
+    fn a_lower_bound_cannot_sit_above_the_estimate_it_bounds() {
+        // The two numbers come from different computations — one counted, one
+        // guessed — so a scan that reached 50 under an estimate of 10 has
+        // disproved the estimate. Reporting the pair as given would say "at
+        // least 50, about 10", which states nothing.
+        let overshot = Cardinality::estimated(10).at_least(50);
+        assert_eq!(overshot.value(), 50);
+        assert_eq!(overshot.min(), Some(50));
+        assert_eq!(
+            serde_json::to_string(&overshot).unwrap(),
+            r#"{"value":50,"exact":false,"min":50}"#
+        );
+
+        // An estimate the scan did not reach is left alone.
+        let undershot = Cardinality::estimated(80).at_least(31);
+        assert_eq!(undershot.value(), 80);
+        assert_eq!(undershot.min(), Some(31));
+
+        // An exact count has no scan to interrupt and is already its own bound.
+        assert!(std::panic::catch_unwind(|| Cardinality::exact(17).at_least(5)).is_err());
     }
 
     #[test]

@@ -550,13 +550,24 @@ A resume cursor is a `CursorToken`, which only `Cursor::encode` mints, so a trun
 response cannot carry an empty continuation or one containing CR/LF — `KGF-Next-Cursor`
 puts it in a header, where that is injection rather than a typo.
 
+`Cardinality` is opaque for the same reason as `Completeness`, and for a sharper one
+than it first looked: §3.4.4's lower bound and the estimate it bounds come from
+*different computations*, so nothing but a constructor stops a scan that reached 50
+from reporting "at least 50, about 10". `at_least` raises the estimate instead —
+a counted number disproves a guessed one. And §3.4.1's `distinct_objects` is a third
+quantity, exact on a response whose `value` is not, so the type carries it rather than
+being reopened when M2's ranges arrive.
+
 Errors are RFC 9457, and the code table went into doc 03 as **§3.6.1** rather than being
 invented here; see question 15. One code, one status, which is why failing content
-negotiation is three codes rather than one code carrying a status. `TermSyntaxError`
-converts straight through, its message becoming `detail`, which is why unit 11's
-messages name the token and the remedy.
+negotiation is three codes rather than one code carrying a status, and why
+`ErrorCode`'s token, status and reason phrase come from a single match over the enum —
+deriving the phrase from the status would check exhaustiveness over `u16` and panic
+while rendering the error response a new code was added for. `TermSyntaxError` and
+`StaleCursor` both convert straight through, their messages becoming `detail`, which is
+why unit 11's messages name the token and the remedy.
 
-There are 114 tests after this unit.
+There are 116 tests after this unit.
 
 ### 13. The HTTP skeleton
 
@@ -831,7 +842,14 @@ following the code.
     shortfall is the server's. And **`type` is `about:blank` with the status reason phrase
     as `title`**, which RFC 9457 §4.2.1 requires of that pairing — a KGF-specific title
     would be a conformance bug, and minting `https://…/problems/{code}` URIs would claim
-    a namespace nothing serves. Decided and landed in unit 12.
+    a namespace nothing serves.
+
+    The table's first draft said 429 and 5xx carry no code, which left the server unable
+    to answer a rate limit or its own failure as `problem+json` at all — §3.6 requires
+    RFC 9457 for errors, and a type deriving its status from a code cannot express a
+    codeless one. `rate_limited` and `internal_error` close that, and earn their codes:
+    they tell a client the one thing the status leaves ambiguous, whether retrying the
+    identical request is worth anything. Decided and landed in unit 12.
 
 ## Not in this plan
 
