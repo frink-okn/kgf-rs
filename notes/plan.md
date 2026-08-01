@@ -17,8 +17,8 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–10 are complete; each carries a **What landed** section written after the fact,
-which is where a unit's plan and its outcome are reconciled. Units 11–14 have none yet.
+Units 1–13 are complete; each carries a **What landed** section written after the fact,
+which is where a unit's plan and its outcome are reconciled. Unit 14 has none yet.
 
 **Nothing here is frozen.** Doc 20 §20.7 and §20.8 speak of formats being stable from
 the first release; no release has happened, and the service is expected to run for a
@@ -569,7 +569,7 @@ why unit 11's messages name the token and the remedy.
 
 There are 116 tests after this unit.
 
-### 13. The HTTP skeleton
+### 13. The HTTP skeleton ✅
 
 The stack decision, the catalog wired to routes, doc 03 §3.2's URL structure, the
 `latest` 307/308 (method-preserving — a 302 could rewrite a body-carrying QUERY to
@@ -594,6 +594,108 @@ hold an `Arc<Store>` and call synchronous store methods on a blocking pool
 `ETag` varying by `Accept`, an unknown dataset and an unknown version answering
 distinctly, and a bundle whose open fails answering as a problem document rather than a
 panic.
+
+**What landed.**
+
+**The stack is axum 0.8 on hyper and tokio, and QUERY was settled by spike before
+anything was built on it.** hyper's parser accepts the extension method, axum's router
+carries it, and a `MethodRouter` fallback receives it with the name intact and an
+`Allow` header supplied. So every route is mounted with that fallback, answering
+`method_not_allowed` — which is *also* where M2's QUERY handler goes, rather than a
+different kind of route. The test sends `QUERY /… HTTP/1.1` onto a `TcpStream` by hand,
+because every HTTP client is itself a stack that might normalize the method away.
+
+That closed the trap this unit existed for: M1 has no body-carrying route, so a stack
+that could not express RFC 10008 would have looked fine until M2.
+
+**Doc 03 §3.6.1 gained `method_not_allowed` (405)**, for the reason `rate_limited` and
+`internal_error` were added in unit 12 — the table claims *every* error response
+carries a code, and a 405 is one any server must produce. It earns its row twice over
+here: a client's first question of an unfamiliar deployment is whether a resource takes
+QUERY, and an empty 405 does not answer it.
+
+**Every route answers JSON *and* HTML at one URL** — the LDF/QPF affordance, on
+`Accept` alone with no user-agent sniffing and no second URL space. It falls out of RFC
+9110 §12.5.1 plus one decision: JSON is offered first and ties go to the first offer,
+so a browser's exact `text/html` beats its own trailing `*/*;q=0.8` while `curl`, a
+library and an agent all tie at `*/*` and get data. The machine-readable form is the
+default rather than the exception, which is the right way round for doc 01's argument.
+
+Three consequences worth recording. Negotiation had to be *implemented*: nothing in
+this stack parses `Accept` — not axum, not `tower-http`, and the `headers` crate stops
+short of a type for it — so §12.5.1's rule that the most specific range decides
+*before* its `q` applies is written out and tested, since reading it the other way
+makes `*/*;q=0.1, application/json;q=0` serve JSON. `ETag` being
+representation-specific stopped being a formality: without the `.json`/`.html` suffix a
+shared cache would answer an agent from the page, and `Vary: Accept` alone would not
+stop it, because the tags would be equal. And errors negotiate too, through a
+`Problem` that converts into a response carrying *itself* and one middleware that
+renders it — so a handler's error, an extractor's rejection, the router's 404 and a
+method fallback's 405 are one rendering, and none of them is the one that forgets
+`Vary` or answers a browser with raw JSON.
+
+`html::Page` is a builder rather than a template, and escaping is structural: every
+method that takes caller data escapes it, and the only markup in the output is
+`&'static str` this crate wrote. The data on these pages is a published bundle's own
+manifest and dictionary, so a dataset whose title contains a `<script>` tag is an
+ordinary case. The test that asserts it caught a real bug on the first run — an `&`
+written raw into an `href` while the URL around it was escaped, which is exactly the
+slip a template invites.
+
+**`current` is derived, because there is nothing to read it from.** Doc 04 §4.3 puts it
+in the dataset descriptor, calls that document mutable and host-independent, and
+nothing in the toolchain writes one; a deployment is a directory of bundles. So `/` and
+`/{dataset}` are derived at startup from the bundle manifests, which carry every field
+they need. `current` is the greatest release under **one** total order — by `created`,
+then by version label — not by label alone, because doc 03 §3.2 permits "a content hash
+prefix" and hash labels have no order, and a `latest` redirecting to an arbitrary
+version is worse than one that does not exist. The comparison is over parsed instants,
+not the strings: RFC 3339 spells one instant several ways and two of them sort wrongly
+(a `+01:00` offset, and a fractional second, where `…:00.5Z` sorts *before* `…:00Z`).
+Question 16 asks whether the host should supply the descriptor instead.
+
+**`/manifest` opens the bundle.** The bytes are already in memory, so this is not how
+they are fetched — it is so that a version which cannot be served is never described as
+though it can. A client reads `capabilities` here and issues what it finds; advertising
+`sample` for a bundle missing `data.hdt.perm` moves the failure to the query. Opening
+is singleflighted and cached, so it costs one open per version for the life of the
+process, and it is what gives this unit a real blocking boundary to test. An open
+failure is `internal_error` 500 — the request is well formed and the shortfall is the
+deployment's — with the classified store error and its `hdtc` remedy going to the log,
+not to a public client whose response would otherwise name paths on the server's disk.
+
+**Startup is strict.** A manifest that does not parse, carries a digest that is not a
+digest, or declares a version other than its own directory stops the server naming the
+path. Dropping that version and serving the rest is the degraded mode doc 20 §20.8
+refuses: a silently missing version answers 404 for data that is on disk.
+
+**The workspace acquired its second `unsafe`, and it maps nothing.** `Config` takes a
+`PublishedRoot` rather than a path, because `kgf-server` is a library that can be
+embedded and a safe `&Path` entry point there would make the mmap immutability promise
+on an unknown caller's behalf — the exact unsoundness unit 10's review closed in
+`testing`. But someone must make it, and `PublishedBundle::new`/`PublishedRoot::new`
+are `pub unsafe` precisely so that someone is outside `kgf-store`. It is
+`kgf::serve::published_root`, which canonicalizes the path and cites doc 04 §4.6. That
+required `kgf` to grow a lib target beside its bin — which also lets the end-to-end
+test drive a real listener without a subprocess — and it is a change to CLAUDE.md's
+rule, recorded there rather than made quietly.
+
+Two smaller things the layers took on because unit 14 needs them and they are policy
+rather than plumbing. A repeated query parameter is `malformed_request`, since
+`?limit=10&limit=99999` has no defensible resolution and server, proxy and client URL
+builder each pick a different one. And percent-decoding is strict where the ecosystem
+is lossy: `form_urlencoded` and everything on it, including axum's own `Query`, decode
+with `decode_utf8_lossy` and pass a malformed escape through, and a term parameter that
+lost a byte to U+FFFD is a *different term* that resolves, misses, and is answered "no
+rows". The decoding itself is `percent-encoding`'s and the media-range grammar is
+`mime`'s; both were already in axum's tree.
+
+Not built, deliberately: `/{dataset}/v/{version}` as a landing page. It would be a
+useful thing to browse to, and doc 03 §3.2 does not define it, so inventing URL space
+is not this unit's call — the dataset page links straight to `/manifest`, which is
+specified and does the job.
+
+There are 159 tests after this unit.
 
 ### 14. The four query operations
 
@@ -850,6 +952,38 @@ following the code.
     codeless one. `rate_limited` and `internal_error` close that, and earn their codes:
     they tell a client the one thing the status leaves ambiguous, whether retrying the
     identical request is worth anything. Decided and landed in unit 12.
+16. **Where does `current` come from, if not the bundle manifests?** Doc 04 §4.3 puts
+    `current` and the release history in the *dataset descriptor*, and calls it mutable
+    and host-independent — but nothing in the toolchain writes one, and a deployment is
+    a directory of bundles. This server therefore derives `/{dataset}` from the
+    manifests and takes `current` as the greatest `created`, which works and is
+    testable, but it is the server guessing at the operator's intent: an operator who
+    wants to publish a new version *without* making it current cannot say so, and one
+    who re-releases an old version cannot promote it.
+
+    The derivation also cannot reach the fields that are not in a bundle manifest at
+    all — `preservation`, `authoritative_namespaces`, and doc 19 §19.1's predicate role
+    declarations, which §4.3 calls "the federation's cheapest machine-actionable schema
+    documentation". Those are absent from what this server publishes today.
+
+    So: should a host supply a dataset descriptor file (and `kgf` grow a command to
+    write one), with derivation as the unconfigured default? That is two sources for
+    one document, which the one-implementation rule is suspicious of — but the two
+    answer different questions, and only one of them can carry an operator's intent.
+    Surfaced in unit 13.
+17. **Should `/{dataset}/v/{version}` be a resource?** §3.2 defines the prefix but not
+    the URL, so a browser that trims a path lands on a 404 and an agent has no
+    per-version index. It would be the natural page to list the operations a version
+    supports, which is exactly what its manifest's `capabilities` says. Not invented
+    here; worth one line in §3.2 either way. Surfaced in unit 13.
+18. **Is a `latest` redirect's `Location` allowed to be relative?** §3.2 says 307/308
+    and nothing about the target's form. This server sends an absolute-path reference
+    (`/{dataset}/v/{version}/…`), which RFC 9110 permits and which is the only form a
+    server behind an unknown proxy can produce correctly — it is not told its own
+    public origin. Same question for the `url` field of a derived dataset descriptor,
+    where doc 04 §4.3's example shows an absolute URL. Worth stating, since a client
+    resolving one against the request URI gets the right answer and a client expecting
+    an absolute URL does not. Surfaced in unit 13.
 
 ## Not in this plan
 

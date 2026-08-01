@@ -422,6 +422,14 @@ pub enum ErrorCode {
     NotFound,
     /// No representation satisfies `Accept`.
     NotAcceptable,
+    /// The method is not one this resource takes (§3.6.1).
+    ///
+    /// Unavoidable rather than chosen: any HTTP server must answer a POST to a
+    /// read-only resource, and §3.6.1 requires every error response to carry a
+    /// code. What makes it worth having is the other direction — a client
+    /// probing whether this server speaks RFC 10008 QUERY gets a coded answer
+    /// with an `Allow` header rather than an empty 405.
+    MethodNotAllowed,
     /// A request body's media type is not supported (`Accept-Query`, §3.6).
     UnsupportedMediaType,
     /// The caller's rate-limit bucket is empty (§3.6).
@@ -434,6 +442,27 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    /// Every code, in §3.6.1's order.
+    ///
+    /// Exists so the test that transcribes that table can prove it transcribed
+    /// *all* of it. Without it the test passes by covering the codes someone
+    /// remembered, which is how `rate_limited` and `internal_error` sat
+    /// unchecked between the commit that added them and the one that noticed.
+    pub const ALL: &'static [ErrorCode] = &[
+        Self::BadTermSyntax,
+        Self::MalformedRequest,
+        Self::CapExceeded,
+        Self::StaleCursor,
+        Self::UnsupportedFormat,
+        Self::NotFound,
+        Self::MethodNotAllowed,
+        Self::NotAcceptable,
+        Self::UnsupportedMediaType,
+        Self::RateLimited,
+        Self::InternalError,
+        Self::CapabilityNotAvailable,
+    ];
+
     /// This code's row of §3.6.1: wire token, status, and the status's reason
     /// phrase.
     ///
@@ -450,6 +479,7 @@ impl ErrorCode {
             Self::StaleCursor => ("stale_cursor", 400, "Bad Request"),
             Self::UnsupportedFormat => ("unsupported_format", 400, "Bad Request"),
             Self::NotFound => ("not_found", 404, "Not Found"),
+            Self::MethodNotAllowed => ("method_not_allowed", 405, "Method Not Allowed"),
             Self::NotAcceptable => ("not_acceptable", 406, "Not Acceptable"),
             Self::UnsupportedMediaType => ("unsupported_media_type", 415, "Unsupported Media Type"),
             Self::RateLimited => ("rate_limited", 429, "Too Many Requests"),
@@ -580,6 +610,39 @@ impl From<crate::cursor::StaleCursor> for Problem {
             "this cursor does not belong to this version, operation and request; \
              start the enumeration again from its first page",
         )
+    }
+}
+
+impl crate::html::Resource for Problem {
+    /// The RFC 9457 document.
+    fn to_json(&self) -> Vec<u8> {
+        crate::html::json_body(self)
+    }
+
+    /// The same failure, for someone who arrived in a browser.
+    ///
+    /// Worth having rather than letting a person read raw JSON: doc 03 §3.6
+    /// calls error messages agent UX, and the human case is the same argument.
+    /// `detail` already names the offending value and the remedy, so the page
+    /// is mostly a frame around it.
+    fn to_html(&self) -> String {
+        use crate::html::{Page, Value};
+
+        let mut page = Page::new(self.code.title()).crumb("kgf", Some("/".to_owned()));
+        page.paragraph(&self.detail);
+        page.fields(&[
+            ("code", Value::Code(self.code.as_str())),
+            ("status", Value::Number(u64::from(self.code.status()))),
+            (
+                "instance",
+                self.instance.as_deref().map_or(Value::Absent, Value::Code),
+            ),
+        ]);
+        page.note(
+            "This is an RFC 9457 problem document. The machine-readable form, which carries the \
+             same code, is what a client should branch on.",
+        );
+        page.render()
     }
 }
 
@@ -861,18 +924,29 @@ mod tests {
             (ErrorCode::StaleCursor, "stale_cursor", 400),
             (ErrorCode::UnsupportedFormat, "unsupported_format", 400),
             (ErrorCode::NotFound, "not_found", 404),
+            (ErrorCode::MethodNotAllowed, "method_not_allowed", 405),
             (ErrorCode::NotAcceptable, "not_acceptable", 406),
             (
                 ErrorCode::UnsupportedMediaType,
                 "unsupported_media_type",
                 415,
             ),
+            (ErrorCode::RateLimited, "rate_limited", 429),
+            (ErrorCode::InternalError, "internal_error", 500),
             (
                 ErrorCode::CapabilityNotAvailable,
                 "capability_not_available",
                 501,
             ),
         ];
+
+        // The transcription must cover the whole enum, or a code added without
+        // a row here is a code no test compares against the spec.
+        assert_eq!(
+            table.map(|(code, _, _)| code).as_slice(),
+            ErrorCode::ALL,
+            "every variant must appear, in §3.6.1's order"
+        );
 
         let mut seen = std::collections::HashSet::new();
         for (code, name, status) in table {

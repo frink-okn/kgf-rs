@@ -241,8 +241,13 @@ impl Fixture {
     }
 
     /// Copy the fixture's required and present optional artifacts into a bundle.
-    #[cfg(test)]
-    pub(crate) fn copy_bundle_to(&self, destination: &std::path::Path) {
+    ///
+    /// Public, unlike the path accessors beside it, and safely so: this *writes*
+    /// to a directory the caller already owns rather than handing out a path to
+    /// bytes this fixture has mapped. An out-of-crate test that needs a catalog
+    /// — a whole `{root}/{dataset}/{version}` tree — has no other way to build
+    /// one from a golden bundle.
+    pub fn copy_bundle_to(&self, destination: &std::path::Path) {
         std::fs::create_dir_all(destination).expect("create fixture bundle directory");
         for name in [MANIFEST, HDT, PERM, GRAPHS, GRAPHS_IDX] {
             if !self.dir.path().join(name).exists() {
@@ -298,9 +303,7 @@ impl Fixture {
 }
 
 const HDT: &str = crate::store::artifact::HDT;
-#[cfg(test)]
 const GRAPHS: &str = crate::store::artifact::GRAPHS;
-#[cfg(test)]
 const GRAPHS_IDX: &str = crate::store::artifact::GRAPHS_IDX;
 const MANIFEST: &str = crate::store::artifact::MANIFEST;
 const PERM: &str = crate::store::artifact::PERM;

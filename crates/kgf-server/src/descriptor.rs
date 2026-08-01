@@ -1,0 +1,538 @@
+//! The three documents that describe a deployment, and the bundle manifest.
+//!
+//! Doc 04 §4.3 splits them by mutability — the service descriptor at `/` is
+//! host-specific, the dataset descriptor at `/{dataset}` is the logical
+//! dataset's release history, and the bundle manifest at
+//! `/{dataset}/v/{version}/manifest` is immutable and checksum-identified. Doc
+//! 03 §3.1 principle 4 makes the set of them the whole of self-description: a
+//! client that fetches them knows the capabilities, caps, prefixes and versions
+//! without being told anything out of band.
+//!
+//! Each is a [`Resource`], so each has a JSON form and a page, and the compiler
+//! will not let one ship without the other.
+//!
+//! # The manifest is served as published
+//!
+//! [`BundleManifest`]'s JSON is the *bytes on disk*, not a re-serialization of
+//! the parse. Doc 04 §4.3's manifest grows over time and a bundle may have been
+//! written by a newer builder; round-tripping it through this build's
+//! [`Manifest`] would silently drop `source`, `components`, a capability's
+//! configuration body — everything doc 04 defines that unit 9's writer does not
+//! yet model. It is also what makes the served document byte-identical to the
+//! one the `content_digest` was taken over. The parse is used for the page and
+//! for the ETag, where a structured view is what is wanted.
+
+use kgf_store::manifest::{Manifest, Publisher};
+use serde::Serialize;
+
+use crate::html::{Page, Resource, SITE, Value, json_body};
+use crate::representation::ContentDigest;
+use crate::service::{Dataset, Service};
+use crate::url;
+
+/// The KGF protocol version this server speaks (doc 04 §4.3).
+pub const PROTOCOL_VERSION: &str = "1";
+
+// ---------------------------------------------------------------------------
+// `/` — the service descriptor
+// ---------------------------------------------------------------------------
+
+/// This deployment: what it hosts and the limits it applies (doc 04 §4.3).
+///
+/// The caps and budgets published here are the same values the operations
+/// enforce — one [`Config`](crate::Config), read by both — rather than a
+/// documented number beside a separate constant. Doc 03 §3.1 principle 1 tells
+/// clients to read them instead of assuming, which only works if reading them
+/// is reading the truth.
+#[derive(Debug, Serialize)]
+pub struct ServiceDescriptor<'a> {
+    datasets: Vec<&'a str>,
+    caps: &'a crate::Caps,
+    budgets: &'a crate::Budgets,
+    implementation: Implementation,
+}
+
+/// Which build and protocol answered.
+#[derive(Debug, Serialize)]
+pub struct Implementation {
+    kgf: &'static str,
+    protocol: &'static str,
+}
+
+impl<'a> ServiceDescriptor<'a> {
+    /// Describe a running service.
+    pub fn of(service: &'a Service) -> Self {
+        Self {
+            datasets: service.datasets().names().collect(),
+            caps: &service.config().caps,
+            budgets: &service.config().budgets,
+            implementation: Implementation {
+                kgf: env!("CARGO_PKG_VERSION"),
+                protocol: PROTOCOL_VERSION,
+            },
+        }
+    }
+}
+
+impl Resource for ServiceDescriptor<'_> {
+    fn to_json(&self) -> Vec<u8> {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let mut page = Page::new(SITE).crumb("kgf", None);
+        page.paragraph(
+            "A bounded-cost query interface over published RDF bundles. Every URL below \
+             answers JSON to anything that does not ask for HTML.",
+        );
+
+        page.section("Datasets");
+        if self.datasets.is_empty() {
+            page.note("This server hosts no datasets.");
+        } else {
+            let rows: Vec<_> = self
+                .datasets
+                .iter()
+                .map(|name| vec![Value::self_link(url::dataset(name), name)])
+                .collect();
+            page.table(&["Dataset"], &rows);
+        }
+
+        page.section("Caps");
+        page.note(
+            "The largest values a request may ask for. A request above a cap is refused with \
+             code cap_exceeded rather than silently reduced (doc 03 §3.5).",
+        );
+        page.fields(&[
+            ("max_limit", Value::Number(u64::from(self.caps.max_limit))),
+            (
+                "max_bindings",
+                Value::Number(u64::from(self.caps.max_bindings)),
+            ),
+            (
+                "max_star_subjects",
+                Value::Number(u64::from(self.caps.max_star_subjects)),
+            ),
+            (
+                "max_star_width",
+                Value::Number(u64::from(self.caps.max_star_width)),
+            ),
+        ]);
+
+        page.section("Budgets");
+        page.note(
+            "Limits on the work a single response may cost. Exhausting one is never an error: \
+             the response says complete: false and carries a cursor.",
+        );
+        page.fields(&[
+            (
+                "max_output_rows",
+                Value::Number(self.budgets.max_output_rows),
+            ),
+            (
+                "max_output_terms",
+                Value::Number(self.budgets.max_output_terms),
+            ),
+            (
+                "max_response_bytes",
+                Value::Number(self.budgets.max_response_bytes),
+            ),
+            (
+                "max_request_bytes",
+                Value::Number(self.budgets.max_request_bytes),
+            ),
+            ("max_term_bytes", Value::Number(self.budgets.max_term_bytes)),
+            (
+                "candidate_budget",
+                Value::Number(self.budgets.candidate_budget),
+            ),
+            ("time_budget_ms", Value::Number(self.budgets.time_budget_ms)),
+        ]);
+
+        page.section("Implementation");
+        page.fields(&[
+            ("kgf", Value::Code(self.implementation.kgf)),
+            ("protocol", Value::Code(self.implementation.protocol)),
+        ]);
+
+        page.canonical("/".to_owned()).render()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `/{dataset}` — the dataset descriptor
+// ---------------------------------------------------------------------------
+
+/// One logical dataset and its release history (doc 04 §4.3).
+#[derive(Debug, Serialize)]
+pub struct DatasetDescriptor<'a> {
+    id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dataset_iri: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    publisher: Option<&'a Publisher>,
+    current: &'a str,
+    releases: Vec<ReleaseEntry<'a>>,
+}
+
+/// One row of a dataset descriptor's release history.
+#[derive(Debug, Serialize)]
+pub struct ReleaseEntry<'a> {
+    version: &'a str,
+    content_digest: &'a str,
+    /// Where the bundle is served, as a path relative to this origin.
+    ///
+    /// Doc 04 §4.3's example shows an absolute URL. This server is not told its
+    /// own public origin — it may be behind any number of proxies — and a
+    /// relative reference resolves against the request URI to the same place,
+    /// so it says what it knows rather than guessing at a hostname.
+    url: String,
+}
+
+impl<'a> DatasetDescriptor<'a> {
+    /// Describe one dataset.
+    pub fn of(name: &'a str, dataset: &'a Dataset) -> Self {
+        Self {
+            id: name,
+            dataset_iri: dataset.dataset_iri(),
+            title: dataset.title(),
+            description: dataset.description(),
+            publisher: dataset.publisher(),
+            current: dataset.current(),
+            releases: dataset
+                .releases()
+                .map(|(version, release)| ReleaseEntry {
+                    version,
+                    content_digest: release.digest().as_str(),
+                    url: url::bundle_base(name, version),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl Resource for DatasetDescriptor<'_> {
+    fn to_json(&self) -> Vec<u8> {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let mut page = Page::new(self.title.unwrap_or(self.id))
+            .crumb("kgf", Some("/".to_owned()))
+            .crumb(self.id, None);
+
+        if let Some(description) = self.description {
+            page.paragraph(description);
+        }
+        page.fields(&[
+            ("id", Value::Code(self.id)),
+            (
+                "dataset_iri",
+                self.dataset_iri.map_or(Value::Absent, Value::Code),
+            ),
+            (
+                "publisher",
+                self.publisher
+                    .map_or(Value::Absent, |publisher| Value::Text(&publisher.name)),
+            ),
+            (
+                "current",
+                Value::self_link(
+                    url::operation(self.id, self.current, "manifest"),
+                    self.current,
+                ),
+            ),
+        ]);
+
+        page.section("Releases");
+        page.note(
+            "A version URL is immutable: the bytes it serves cannot change while it exists, \
+             which is why they are cached for a year.",
+        );
+        let rows: Vec<_> = self
+            .releases
+            .iter()
+            .map(|release| {
+                vec![
+                    Value::self_link(
+                        url::operation(self.id, release.version, "manifest"),
+                        release.version,
+                    ),
+                    if release.version == self.current {
+                        Value::Text("current")
+                    } else {
+                        Value::Absent
+                    },
+                    Value::Code(release.content_digest),
+                ]
+            })
+            .collect();
+        page.table(&["Version", "", "Content digest"], &rows);
+
+        page.canonical(url::dataset(self.id)).render()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `/{dataset}/v/{version}/manifest` — the bundle manifest
+// ---------------------------------------------------------------------------
+
+/// A bundle's published manifest (doc 03 §3.4.10, doc 04 §4.3).
+#[derive(Debug)]
+pub struct BundleManifest {
+    dataset: String,
+    version: String,
+    digest: ContentDigest,
+    published: std::sync::Arc<[u8]>,
+    parsed: std::sync::Arc<Manifest>,
+}
+
+impl BundleManifest {
+    /// Pair the bytes as published with the parse the page is rendered from.
+    pub fn new(
+        dataset: &str,
+        version: &str,
+        digest: ContentDigest,
+        published: std::sync::Arc<[u8]>,
+        parsed: std::sync::Arc<Manifest>,
+    ) -> Self {
+        Self {
+            dataset: dataset.to_owned(),
+            version: version.to_owned(),
+            digest,
+            published,
+            parsed,
+        }
+    }
+
+    /// This version's canonical identity, for the response's `ETag`.
+    pub fn digest(&self) -> &ContentDigest {
+        &self.digest
+    }
+}
+
+impl Resource for BundleManifest {
+    /// The bytes as published, so nothing this build does not model is lost and
+    /// the response is the document the `content_digest` covers.
+    fn to_json(&self) -> Vec<u8> {
+        self.published.to_vec()
+    }
+
+    fn to_html(&self) -> String {
+        let manifest = &self.parsed;
+        let mut page = Page::new(format!("{} — {}", self.dataset, self.version))
+            .crumb("kgf", Some("/".to_owned()))
+            .crumb(&self.dataset, Some(url::dataset(&self.dataset)))
+            .crumb(&self.version, None);
+
+        if let Some(description) = &manifest.description {
+            page.paragraph(description);
+        }
+
+        page.section("Identity");
+        page.fields(&[
+            ("id", Value::Code(&manifest.id)),
+            ("version", Value::Code(&manifest.version)),
+            ("content_digest", Value::Code(&manifest.content_digest)),
+            (
+                "dataset_iri",
+                manifest
+                    .dataset_iri
+                    .as_deref()
+                    .map_or(Value::Absent, Value::Code),
+            ),
+            (
+                "created",
+                manifest
+                    .created
+                    .as_deref()
+                    .map_or(Value::Absent, Value::Code),
+            ),
+            (
+                "license",
+                manifest
+                    .license
+                    .as_deref()
+                    .map_or(Value::Absent, Value::Text),
+            ),
+            (
+                "publisher",
+                manifest
+                    .publisher
+                    .as_ref()
+                    .map_or(Value::Absent, |publisher| Value::Text(&publisher.name)),
+            ),
+            (
+                "previous_version",
+                manifest
+                    .previous_version
+                    .as_deref()
+                    .map_or(Value::Absent, |previous| {
+                        Value::self_link(
+                            url::operation(&self.dataset, previous, "manifest"),
+                            previous,
+                        )
+                    }),
+            ),
+        ]);
+
+        page.section("Counts");
+        page.note(
+            "Subjects and objects are id-space sizes: each counts the shared section once, so \
+             they overlap and do not sum to a distinct-term total.",
+        );
+        page.fields(&[
+            ("triples", Value::Number(manifest.counts.triples)),
+            ("subjects", Value::Number(manifest.counts.subjects)),
+            ("predicates", Value::Number(manifest.counts.predicates)),
+            ("objects", Value::Number(manifest.counts.objects)),
+        ]);
+
+        page.section("Capabilities");
+        page.note(
+            "What this bundle can answer beyond the mandatory core, determined by which sidecar \
+             artifacts were built (doc 03 §3.4).",
+        );
+        if manifest.capabilities.is_empty() {
+            page.note("None declared.");
+        } else {
+            let rows: Vec<_> = manifest
+                .capabilities
+                .keys()
+                .map(|capability| vec![Value::Code(capability)])
+                .collect();
+            page.table(&["Capability"], &rows);
+        }
+
+        page.section("Prefixes");
+        page.note(
+            "The CURIE prefixes this bundle's parameters accept. An IRI is written in angle \
+             brackets; a bare token is a CURIE, and its prefix must be one of these (doc 03 §3.3).",
+        );
+        if manifest.prefixes.is_empty() {
+            page.note("None declared.");
+        } else {
+            let rows: Vec<_> = manifest
+                .prefixes
+                .iter()
+                .map(|(prefix, expansion)| {
+                    vec![
+                        Value::Code(prefix.as_str()),
+                        Value::Code(expansion.as_str()),
+                    ]
+                })
+                .collect();
+            page.table(&["Prefix", "Expands to"], &rows);
+        }
+
+        page.section("Artifacts");
+        let rows: Vec<_> = manifest
+            .artifacts
+            .iter()
+            .map(|(name, entry)| {
+                vec![
+                    Value::Code(name.as_str()),
+                    Value::Number(entry.bytes),
+                    Value::Code(&entry.sha256),
+                ]
+            })
+            .collect();
+        page.table(&["Artifact", "Bytes", "SHA-256"], &rows);
+
+        page.canonical(url::operation(&self.dataset, &self.version, "manifest"))
+            .render()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kgf_store::manifest::{ArtifactEntry, Counts, Formats};
+    use std::collections::BTreeMap;
+
+    fn manifest() -> Manifest {
+        Manifest {
+            id: "tox".to_owned(),
+            dataset_iri: Some("https://okn.example/id/tox".to_owned()),
+            version: "2026-06-01".to_owned(),
+            content_digest: "sha256:0123456789abcdef0123456789abcdef".to_owned(),
+            created: Some("2026-06-01T14:03:22Z".to_owned()),
+            formats: Formats::default(),
+            title: Some("Tox".to_owned()),
+            description: Some("A test bundle".to_owned()),
+            license: None,
+            homepage: None,
+            publisher: Some(Publisher {
+                name: "OKN".to_owned(),
+                contact: None,
+            }),
+            counts: Counts {
+                triples: 606_342_307,
+                subjects: 3,
+                predicates: 4,
+                objects: 6,
+            },
+            capabilities: BTreeMap::from([("sample".to_owned(), serde_json::json!({}))]),
+            prefixes: BTreeMap::from([(
+                "rdfs".to_owned(),
+                "http://www.w3.org/2000/01/rdf-schema#".to_owned(),
+            )]),
+            artifacts: BTreeMap::from([(
+                "data.hdt".to_owned(),
+                ArtifactEntry {
+                    bytes: 912,
+                    sha256: "abc123".to_owned(),
+                },
+            )]),
+            previous_version: Some("2026-03-01".to_owned()),
+        }
+    }
+
+    fn bundle_manifest(published: &str) -> BundleManifest {
+        let parsed = manifest();
+        BundleManifest::new(
+            "tox",
+            "2026-06-01",
+            ContentDigest::parse(&parsed.content_digest).unwrap(),
+            published.as_bytes().into(),
+            std::sync::Arc::new(parsed),
+        )
+    }
+
+    #[test]
+    fn the_manifest_is_served_exactly_as_published() {
+        // A newer builder's fields must survive being served, and the bytes
+        // must stay the ones the content digest was taken over. Re-serializing
+        // this build's `Manifest` would drop the unmodeled key below.
+        let published = "{\n  \"id\": \"tox\",\n  \"source\": {\"url\": \"https://x\"}\n}\n";
+        let resource = bundle_manifest(published);
+        assert_eq!(resource.to_json(), published.as_bytes());
+        assert!(
+            String::from_utf8(resource.to_json())
+                .unwrap()
+                .contains("source")
+        );
+    }
+
+    #[test]
+    fn the_manifest_page_shows_what_a_client_needs_to_query_the_bundle() {
+        let page = bundle_manifest("{}").to_html();
+        // Identity, so a cursor or a mirror check can be reasoned about.
+        assert!(page.contains("sha256:0123456789abcdef0123456789abcdef"));
+        // Counts, grouped for reading.
+        assert!(page.contains("606\u{202f}342\u{202f}307"));
+        // Capabilities and prefixes: the two things §3.3 and §3.4 make a
+        // request's validity depend on.
+        assert!(page.contains("sample"));
+        assert!(page.contains("http://www.w3.org/2000/01/rdf-schema#"));
+        // Navigation up to the dataset, and across to the previous release.
+        assert!(page.contains("href=\"/tox\""));
+        assert!(page.contains("href=\"/tox/v/2026-03-01/manifest\""));
+        // And back out to the machine-readable form.
+        assert!(page.contains("href=\"/tox/v/2026-06-01/manifest?format=json\""));
+    }
+}

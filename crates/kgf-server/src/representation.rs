@@ -1,0 +1,600 @@
+//! Which serialization a response carries, and how it may be cached.
+//!
+//! Two things doc 03 ties together and this module keeps together: one URL
+//! serves many formats (§3.1), so the choice of format is part of the response's
+//! identity — which is why §3.6 makes `ETag` representation-specific and pairs
+//! it with `Vary: Accept`. An `ETag` that ignored the representation would let a
+//! cache answer a CSV request from a JSON entry.
+//!
+//! Nothing here touches HTTP machinery; it takes header *values* as strings and
+//! returns values to send. That keeps the negotiation rules testable without a
+//! request, and it is why the `Accept` grammar below is implemented rather than
+//! approximated: serving JSON to a client that asked for `text/csv` is a silent
+//! wrong answer of exactly the kind this project refuses, and "does the header
+//! contain `json`" is how that happens.
+//!
+//! # Two representations, and why the order matters
+//!
+//! Every route answers JSON *and* HTML, and which one a client gets is decided
+//! by `Accept` alone — no user-agent sniffing, no separate `/html` URL space.
+//! It works because the two clients ask differently: a browser navigating sends
+//! `text/html` at `q=1` with `*/*;q=0.8` behind it, while `curl`, a library, and
+//! an agent send `*/*` or nothing.
+//!
+//! So the rule falls out of RFC 9110 §12.5.1 plus one decision — **JSON is
+//! listed first, and ties go to the first offer**. A browser's exact `text/html`
+//! beats its own `*/*;q=0.8`, and everything else ties at `*/*` and takes JSON.
+//! That is the LDF/QPF behaviour (a page in the browser, data from `curl`) with
+//! the machine-readable form as the default rather than the exception, which is
+//! the right way round for an API doc 01 argues should be agent-friendly.
+//!
+//! The CSV/Parquet/Arrow/RDF serializations arrive with M2. Because the choice
+//! is an enum, adding one is a change the compiler routes through every place a
+//! format is named — including every resource's HTML rendering, which is why
+//! [`Resource`](crate::html::Resource) exists rather than a match per handler.
+
+use mime::Mime;
+
+use crate::envelope::{ErrorCode, Problem};
+
+/// A serialization this server can produce.
+///
+/// Declaration order is the server's own preference, which RFC 9110 §12.5.1
+/// leaves to it: [`negotiate`] breaks ties by taking the earliest variant, so
+/// `Accept: */*` is answered with JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Representation {
+    /// KGF's own JSON envelope (doc 03 §3.4.1), and the manifest as published.
+    Json,
+    /// A page, for reading the same resource in a browser.
+    Html,
+}
+
+impl Representation {
+    /// Every representation, in the server's preference order.
+    pub const ALL: &'static [Representation] = &[Representation::Json, Representation::Html];
+
+    /// The media type `Accept` names it by, without parameters.
+    pub fn media_type(self) -> &'static str {
+        match self {
+            Self::Json => "application/json",
+            Self::Html => "text/html",
+        }
+    }
+
+    /// The same, parsed, for matching against a request's media ranges.
+    fn mime(self) -> Mime {
+        match self {
+            Self::Json => mime::APPLICATION_JSON,
+            Self::Html => mime::TEXT_HTML,
+        }
+    }
+
+    /// The full `Content-Type`, parameters included.
+    ///
+    /// JSON needs none — RFC 8259 fixes UTF-8 and defines no `charset`
+    /// parameter — while `text/html` without one is decoded by a browser's
+    /// guess, which for a page containing a Turkish IRI is a wrong guess.
+    pub fn content_type(self) -> &'static str {
+        match self {
+            Self::Json => "application/json",
+            Self::Html => "text/html; charset=utf-8",
+        }
+    }
+
+    /// The token `format=` names it by (doc 03 §3.1).
+    ///
+    /// Also the discriminator in an [`ETag`], which is why it must be stable and
+    /// header-safe: changing it silently invalidates every cached entry, and a
+    /// token containing a quote would produce an unparseable `ETag`.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Html => "html",
+        }
+    }
+
+    /// The representation `format=token` names, if this server has it.
+    fn from_token(token: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.token() == token)
+    }
+
+    /// The representation to render an error in.
+    ///
+    /// Separate from [`negotiate`] because it cannot fail: a request whose
+    /// `Accept` nothing satisfies still has to be told so, and answering a
+    /// negotiation failure with another negotiation failure is a loop. So this
+    /// takes the client's preference where there is one and JSON otherwise —
+    /// which is also what RFC 9457 expects, since `application/problem+json` is
+    /// the media type it defines.
+    pub fn for_problem(format: Option<&str>, accept: Option<&str>) -> Self {
+        negotiate(format, accept, Self::ALL).unwrap_or(Self::Json)
+    }
+}
+
+/// Choose the representation to answer with (doc 03 §3.1).
+///
+/// `offered` is the operation's own list, most-preferred first; `/manifest`
+/// offers JSON alone, while unit 14's operations will offer several.
+///
+/// **`format=` wins outright when present.** It is the client naming a
+/// serialization, not expressing a preference, and §3.6.1 gives the two failures
+/// different codes and statuses — `unsupported_format` 400 for a `format=` this
+/// operation does not offer, `not_acceptable` 406 for an `Accept` nothing
+/// satisfies — which only makes sense if they are evaluated separately. So a
+/// request with both gets `format=`, and an `Accept` that contradicts it is
+/// ignored rather than turned into a 406 the client cannot act on.
+///
+/// An absent or empty `Accept` is `*/*`, per RFC 9110 §12.5.1.
+pub fn negotiate(
+    format: Option<&str>,
+    accept: Option<&str>,
+    offered: &[Representation],
+) -> Result<Representation, Problem> {
+    debug_assert!(!offered.is_empty(), "an operation must offer a format");
+
+    if let Some(format) = format {
+        return Representation::from_token(format)
+            .filter(|representation| offered.contains(representation))
+            .ok_or_else(|| {
+                Problem::new(
+                    ErrorCode::UnsupportedFormat,
+                    format!(
+                        "format={format} is not a serialization this operation offers; it offers {}",
+                        tokens(offered)
+                    ),
+                )
+            });
+    }
+
+    let accept = accept.unwrap_or("*/*").trim();
+    let ranges = parse_accept(if accept.is_empty() { "*/*" } else { accept });
+
+    // Best acceptable, ties to the server's preference: `max_by_key` keeps the
+    // *last* maximum, so the list is walked in reverse to keep the first.
+    offered
+        .iter()
+        .rev()
+        .filter_map(|representation| {
+            acceptability(&ranges, &representation.mime()).map(|quality| (quality, *representation))
+        })
+        .max_by_key(|(quality, _)| *quality)
+        .map(|(_, representation)| representation)
+        .ok_or_else(|| {
+            Problem::new(
+                ErrorCode::NotAcceptable,
+                format!(
+                    "no representation satisfies Accept: {accept}; this operation offers {}",
+                    media_types(offered)
+                ),
+            )
+        })
+}
+
+fn tokens(offered: &[Representation]) -> String {
+    join(offered.iter().map(|representation| representation.token()))
+}
+
+fn media_types(offered: &[Representation]) -> String {
+    join(
+        offered
+            .iter()
+            .map(|representation| representation.media_type()),
+    )
+}
+
+fn join<'a>(items: impl Iterator<Item = &'a str>) -> String {
+    items.collect::<Vec<_>>().join(", ")
+}
+
+/// One media range from an `Accept` header.
+///
+/// The media type is parsed by the `mime` crate, which already owns RFC 9110
+/// §8.3's grammar — case folding, whitespace, quoted parameter values. What is
+/// *not* in any library in this stack is everything below: neither axum nor
+/// `tower-http` parses `Accept` at all, and the `headers` crate stops short of
+/// a type for it, so the selection rule is written here against RFC 9110
+/// §12.5.1 and tested against it.
+struct MediaRange {
+    mime: Mime,
+    /// Quality scaled to thousandths, so ranges compare as integers: `q` has at
+    /// most three decimal digits (RFC 9110 §12.4.2), and floats would make the
+    /// ordering below depend on rounding.
+    quality: u32,
+}
+
+impl MediaRange {
+    /// How specifically this range names `media_type`, or `None` if it does not.
+    ///
+    /// RFC 9110 §12.5.1: the most specific matching range decides, and only then
+    /// does its `q` apply. Getting this backwards makes `Accept: */*;q=0.1,
+    /// application/json;q=0` serve JSON at q=0.1 rather than refusing.
+    fn specificity(&self, media_type: &Mime) -> Option<u8> {
+        match (self.mime.type_(), self.mime.subtype()) {
+            (mime::STAR, mime::STAR) => Some(0),
+            (type_, mime::STAR) if type_ == media_type.type_() => Some(1),
+            (type_, subtype) if type_ == media_type.type_() && subtype == media_type.subtype() => {
+                Some(2)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn parse_accept(header: &str) -> Vec<MediaRange> {
+    header
+        .split(',')
+        .filter_map(|entry| {
+            let mime: Mime = entry.trim().parse().ok()?;
+            let quality = mime
+                .get_param("q")
+                // An unparseable `q` is an ignored parameter, not a rejection
+                // (RFC 9110 §12.4.2), which for the default 1 means the range
+                // still applies.
+                .and_then(|quality| quality_thousandths(quality.as_str()))
+                .unwrap_or(1000);
+            Some(MediaRange { mime, quality })
+        })
+        .collect()
+}
+
+/// `q=0.812` as 812. Rejects anything outside RFC 9110 §12.4.2's grammar rather
+/// than clamping, so `q=9` is an ignored parameter rather than a huge weight.
+fn quality_thousandths(value: &str) -> Option<u32> {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if fraction.len() > 3 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let scaled = match whole {
+        "0" => 0,
+        "1" => 1000,
+        _ => return None,
+    };
+    let fraction: u32 = format!("{fraction:0<3}").parse().ok()?;
+    (scaled + fraction <= 1000).then_some(scaled + fraction)
+}
+
+/// The quality `media_type` is acceptable at, or `None` if it is not acceptable
+/// at all — which includes an explicit `q=0`, RFC 9110's way of excluding a type.
+fn acceptability(ranges: &[MediaRange], media_type: &Mime) -> Option<u32> {
+    let best = ranges
+        .iter()
+        .filter_map(|range| Some((range.specificity(media_type)?, range.quality)))
+        .max_by_key(|(specificity, _)| *specificity)?;
+    (best.1 > 0).then_some(best.1)
+}
+
+// ---------------------------------------------------------------------------
+// Caching
+// ---------------------------------------------------------------------------
+
+/// How long a response may be reused (doc 03 §3.6).
+///
+/// Three policies, because the URL space has exactly three kinds of resource: a
+/// versioned bundle URL, whose bytes cannot change while the version exists
+/// (doc 04 §4.6); a mutable document — the descriptors and the `latest`
+/// redirect — which is a snapshot of something that moves; and an error, which
+/// describes this attempt rather than a resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePolicy {
+    /// A versioned GET. §3.6: "versioned GETs immutable".
+    Immutable,
+    /// A document that can change under the same URL. §3.6 fixes `max-age=300`
+    /// for the `latest` redirect; the descriptors take the same window because
+    /// they change on the same event — a new version being published.
+    Mutable,
+    /// A problem document. Caching one would answer a later, different request
+    /// with this attempt's failure.
+    Uncacheable,
+}
+
+impl CachePolicy {
+    /// The `Cache-Control` value.
+    pub fn header_value(self) -> &'static str {
+        match self {
+            // 31 536 000 = 365 days, the maximum §3.6 names.
+            Self::Immutable => "public, max-age=31536000, immutable",
+            Self::Mutable => "public, max-age=300",
+            Self::Uncacheable => "no-store",
+        }
+    }
+}
+
+/// An entity tag over a bundle version and the representation served.
+///
+/// Doc 03 §3.6 makes the ETag the artifact checksum and requires it to be
+/// representation-specific. Both halves are load-bearing and neither is
+/// sufficient: the digest alone would let a cache serve a CSV entry to a JSON
+/// request, and the representation alone would not change when the data does.
+///
+/// This is a *strong* validator, and it may be, because a versioned URL plus a
+/// representation determines the bytes exactly: the bundle is immutable, and
+/// every operation is a deterministic function of it (doc 03 §3.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ETag(String);
+
+impl ETag {
+    /// The tag for `digest`'s bundle rendered as `representation`.
+    pub fn of(digest: &ContentDigest, representation: Representation) -> Self {
+        Self(format!(
+            "\"{}.{}\"",
+            digest.as_str(),
+            representation.token()
+        ))
+    }
+
+    /// The header value, quotes included.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether an `If-None-Match` header selects this tag (RFC 9110 §13.1.2).
+    ///
+    /// The comparison is weak, as that section requires of `If-None-Match`: a
+    /// `W/` prefix on either side is ignored. Ours is never weak, so only the
+    /// client's is stripped.
+    pub fn is_selected_by(&self, if_none_match: &str) -> bool {
+        let if_none_match = if_none_match.trim();
+        if if_none_match == "*" {
+            return true;
+        }
+        if_none_match
+            .split(',')
+            .map(|candidate| candidate.trim())
+            .map(|candidate| candidate.strip_prefix("W/").unwrap_or(candidate))
+            .any(|candidate| candidate == self.0)
+    }
+}
+
+/// A bundle version's canonical identity: `sha256:` and lowercase hex
+/// (doc 04 §4.3).
+///
+/// Parsed rather than carried as a string because it is put in an `ETag`, and a
+/// header value has a grammar: a digest containing a quote or a control
+/// character would produce a tag no cache can parse, and one containing CR/LF
+/// would be header injection from a file on disk. Checking the shape once, at
+/// the point a manifest is read, is cheaper than remembering to escape it at
+/// every use — and a manifest whose digest is not a digest is a broken manifest
+/// worth refusing outright.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContentDigest(String);
+
+impl ContentDigest {
+    /// Parse `{algorithm}:{lowercase hex}`.
+    ///
+    /// The algorithm is not restricted to `sha256`: doc 04 §4.3 prefixes the
+    /// digest with its algorithm precisely so it can change, and nothing here
+    /// recomputes it — this layer only carries and compares it.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (algorithm, hex) = text.split_once(':')?;
+        let named = !algorithm.is_empty()
+            && algorithm
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+        let hexadecimal = hex.len() >= 16
+            && hex.len().is_multiple_of(2)
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        (named && hexadecimal).then(|| Self(text.to_owned()))
+    }
+
+    /// The digest as written in the manifest, algorithm prefix included.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BOTH: &[Representation] = Representation::ALL;
+    const JSON: &[Representation] = &[Representation::Json];
+
+    /// What a browser sends on a top-level navigation.
+    const BROWSER: &str =
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+
+    fn digest() -> ContentDigest {
+        ContentDigest::parse(
+            "sha256:1f0e3dad99908345f7439f8ffabdffc4de5f7439f8ffabdffc41f0e3dad99908",
+        )
+        .expect("a well-formed digest")
+    }
+
+    #[test]
+    fn an_absent_accept_takes_the_operations_first_offer() {
+        assert_eq!(negotiate(None, None, JSON), Ok(Representation::Json));
+        assert_eq!(negotiate(None, Some(""), JSON), Ok(Representation::Json));
+        assert_eq!(negotiate(None, Some("*/*"), JSON), Ok(Representation::Json));
+    }
+
+    #[test]
+    fn a_browser_gets_the_page_and_everything_else_gets_the_data() {
+        // The whole of the HTML story's routing, and it is `Accept` alone: no
+        // user-agent sniffing and no second URL space. A browser's exact
+        // `text/html` outranks its own trailing `*/*;q=0.8`; `curl`, a library
+        // and an agent all tie at `*/*` and fall to the first offer.
+        assert_eq!(
+            negotiate(None, Some(BROWSER), BOTH),
+            Ok(Representation::Html)
+        );
+        assert_eq!(negotiate(None, Some("*/*"), BOTH), Ok(Representation::Json));
+        assert_eq!(negotiate(None, None, BOTH), Ok(Representation::Json));
+        assert_eq!(
+            negotiate(None, Some("application/json"), BOTH),
+            Ok(Representation::Json)
+        );
+        assert_eq!(
+            negotiate(None, Some("text/html"), BOTH),
+            Ok(Representation::Html)
+        );
+
+        // And either can be pinned explicitly, which is what a "view as JSON"
+        // link on the page is.
+        assert_eq!(
+            negotiate(Some("html"), Some("application/json"), BOTH),
+            Ok(Representation::Html)
+        );
+        assert_eq!(
+            negotiate(Some("json"), Some(BROWSER), BOTH),
+            Ok(Representation::Json)
+        );
+    }
+
+    #[test]
+    fn an_error_is_always_renderable() {
+        // A negotiation failure still has to be reported, and reporting it with
+        // another negotiation failure is a loop.
+        assert_eq!(
+            Representation::for_problem(None, Some("text/csv")),
+            Representation::Json
+        );
+        assert_eq!(
+            Representation::for_problem(Some("parquet"), None),
+            Representation::Json
+        );
+        // A browser that mistypes a URL should still get a page.
+        assert_eq!(
+            Representation::for_problem(None, Some(BROWSER)),
+            Representation::Html
+        );
+    }
+
+    #[test]
+    fn accept_is_matched_by_the_grammar_and_not_by_substring() {
+        // The bug this exists to prevent: a client asking for CSV and getting
+        // JSON because the header "mentions json somewhere".
+        assert_eq!(
+            negotiate(None, Some("application/json"), JSON),
+            Ok(Representation::Json)
+        );
+        assert_eq!(
+            negotiate(None, Some("application/*"), JSON),
+            Ok(Representation::Json)
+        );
+        // A subtype that merely contains the token is a different media type.
+        let refused = negotiate(None, Some("application/json-seq"), JSON).unwrap_err();
+        assert_eq!(refused.code(), ErrorCode::NotAcceptable);
+        assert_eq!(refused.status(), 406);
+
+        assert_eq!(
+            negotiate(None, Some("text/csv"), JSON).unwrap_err().code(),
+            ErrorCode::NotAcceptable
+        );
+    }
+
+    #[test]
+    fn the_most_specific_range_decides_before_its_quality_does() {
+        // RFC 9110 §12.5.1. Read the other way round — highest `q` first —
+        // this header would serve JSON, because `*/*` matches it at 0.1.
+        assert_eq!(
+            negotiate(None, Some("*/*;q=0.1, application/json;q=0"), JSON)
+                .unwrap_err()
+                .code(),
+            ErrorCode::NotAcceptable,
+            "an explicit q=0 excludes the type the wildcard would have allowed"
+        );
+        assert_eq!(
+            negotiate(None, Some("application/json;q=0.2, */*;q=0"), JSON),
+            Ok(Representation::Json),
+            "and the exclusion runs the other way too"
+        );
+    }
+
+    #[test]
+    fn a_quality_outside_the_grammar_is_an_ignored_parameter() {
+        // RFC 9110 §12.4.2 gives `q` at most three decimals in 0..=1. Anything
+        // else is malformed, and a malformed parameter is dropped — which is
+        // not the same as dropping the range that carried it.
+        assert_eq!(quality_thousandths("0.812"), Some(812));
+        assert_eq!(quality_thousandths("1"), Some(1000));
+        assert_eq!(quality_thousandths("0.5"), Some(500));
+        assert_eq!(quality_thousandths("1.000"), Some(1000));
+        assert_eq!(quality_thousandths("1.001"), None);
+        assert_eq!(quality_thousandths("0.1234"), None);
+        assert_eq!(quality_thousandths("9"), None);
+        assert_eq!(quality_thousandths("x"), None);
+
+        assert_eq!(
+            negotiate(None, Some("application/json;q=nonsense"), JSON),
+            Ok(Representation::Json)
+        );
+    }
+
+    #[test]
+    fn format_decides_alone_when_it_is_present() {
+        // The two failures are different codes with different statuses and
+        // different remedies (§3.6.1), which is only coherent if `format=` and
+        // `Accept` are evaluated separately rather than intersected.
+        assert_eq!(
+            negotiate(Some("json"), Some("text/csv"), JSON),
+            Ok(Representation::Json)
+        );
+
+        let refused = negotiate(Some("csv"), Some("*/*"), JSON).unwrap_err();
+        assert_eq!(refused.code(), ErrorCode::UnsupportedFormat);
+        assert_eq!(refused.status(), 400);
+        let detail = serde_json::to_value(&refused).unwrap();
+        assert!(
+            detail["detail"].as_str().unwrap().contains("json"),
+            "the detail must name what the operation does offer: {detail}"
+        );
+    }
+
+    #[test]
+    fn an_etag_changes_with_the_data_and_with_the_representation() {
+        let tag = ETag::of(&digest(), Representation::Json);
+        assert!(tag.as_str().starts_with('"') && tag.as_str().ends_with('"'));
+        assert!(tag.as_str().contains(digest().as_str()));
+        assert!(tag.as_str().contains(Representation::Json.token()));
+
+        let other = ContentDigest::parse("sha256:0000000000000000abcdef0123456789").unwrap();
+        assert_ne!(tag, ETag::of(&other, Representation::Json));
+
+        // The half §3.6 asks for by name. Without it a shared cache holding the
+        // page could answer an agent's `Accept: application/json` from it, and
+        // `Vary: Accept` alone would not stop that — the tags would be equal.
+        assert_ne!(tag, ETag::of(&digest(), Representation::Html));
+    }
+
+    #[test]
+    fn if_none_match_compares_weakly_and_across_a_list() {
+        let tag = ETag::of(&digest(), Representation::Json);
+        let value = tag.as_str().to_owned();
+
+        assert!(tag.is_selected_by("*"));
+        assert!(tag.is_selected_by(&value));
+        assert!(tag.is_selected_by(&format!("W/{value}")));
+        assert!(tag.is_selected_by(&format!("\"other\", {value}, W/\"third\"")));
+        assert!(!tag.is_selected_by("\"other\""));
+        assert!(!tag.is_selected_by(""));
+    }
+
+    #[test]
+    fn a_digest_that_could_not_go_in_a_header_is_not_a_digest() {
+        assert!(ContentDigest::parse("sha256:0123456789abcdef").is_some());
+        // The reason this is parsed at all: these reach an `ETag` otherwise.
+        assert!(ContentDigest::parse("sha256:0123456789abcdef\"").is_none());
+        assert!(ContentDigest::parse("sha256:0123456789ab\r\nX-Evil: 1").is_none());
+        // And the ordinary malformations.
+        assert!(ContentDigest::parse("0123456789abcdef").is_none());
+        assert!(ContentDigest::parse("sha256:").is_none());
+        assert!(ContentDigest::parse("sha256:0123ABCDEF456789").is_none());
+        assert!(ContentDigest::parse("sha256:0123456789abcde").is_none());
+    }
+
+    #[test]
+    fn the_cache_policies_are_the_ones_doc_03_names() {
+        assert_eq!(
+            CachePolicy::Immutable.header_value(),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(CachePolicy::Mutable.header_value(), "public, max-age=300");
+        assert_eq!(CachePolicy::Uncacheable.header_value(), "no-store");
+    }
+}

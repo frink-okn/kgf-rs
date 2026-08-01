@@ -31,14 +31,19 @@ Source/
 | `kgf-server` | The HTTP API (doc 03) over `kgf-store`: caps, budgets, cursors, formats. |
 | `kgf` | The binary. `kgf manifest` now, `kgf serve` next; `kgf build` when `kgf-build` lands. |
 
-**Status: the query core is built; the HTTP surface is not.** `kgf-store` implements
-doc 20's read layer in full — mapped bundles, dictionary, all eight patterns with exact
-counts and positional paging, the lazy catalog, and the bundle manifest — and
-`kgf manifest` describes a hand-assembled bundle so it is servable. `kgf-server` has its
-three pure layers — `cursor` (tokens), `term` (doc 03 §3.3 syntax in, term objects out,
-the per-request cache) and `envelope` (§3.6's completeness vocabulary and RFC 9457
-errors) — and nothing else: the routes and `serve` are still real signatures and doc
-comments over `todo!()` bodies.
+**Status: the query core is built and the server answers; the four query operations
+are not written.** `kgf-store` implements doc 20's read layer in full — mapped bundles,
+dictionary, all eight patterns with exact counts and positional paging, the lazy
+catalog, and the bundle manifest. `kgf-server` has its pure layers — `cursor` (tokens),
+`term` (doc 03 §3.3 syntax in, term objects out, the per-request cache), `envelope`
+(§3.6's completeness vocabulary and RFC 9457 errors), `representation` (negotiation,
+caching, ETags) and `html` — over a real axum listener serving doc 03 §3.2's URL space:
+`/`, `/{dataset}`, the `latest` redirect and `/manifest`. `kgf serve` runs it. What is
+missing is `/fragment`, `/count`, `/describe` and `/sample` (unit 14).
+
+**Every route answers JSON and HTML at one URL**, chosen by `Accept` — a page in a
+browser, data from `curl` — so a new route implements `html::Resource` or it does not
+compile.
 
 `todo!()` is a convention, not laziness — an unimplemented path panics rather than
 returning a plausible wrong answer. Do not replace one with a stub that returns a
@@ -66,9 +71,21 @@ afterwards, so where the two disagree about what exists, `plan.md` and the code 
 ### The one reviewed exception to `unsafe`
 
 `kgf-store::map` maps files and hands out `&[u8]`. It is the *only* module permitted
-to write `unsafe`; every other crate and module carries `#![deny(unsafe_code)]`, and
-`map` carries the single `#[allow]`. This is doc 20 §20.9's obligation — the mapping
-surface stays small and audited, and everything above it is safe code over slices.
+to write the `unsafe` that **maps**; every other crate and module carries
+`#![deny(unsafe_code)]`, and `map` carries the `#[allow]`. This is doc 20 §20.9's
+obligation — the mapping surface stays small and audited, and everything above it is
+safe code over slices.
+
+**There is exactly one other `unsafe` in the workspace, and it maps nothing.**
+`PublishedBundle::new` and `PublishedRoot::new` are `pub unsafe` precisely so the
+immutability promise is made from *outside* `kgf-store`, by the layer that can know
+it: a library cannot establish that a directory will not be rewritten, and a
+deployment can. That layer is `kgf::serve::published_root`, which carries the
+workspace's second `#[allow(unsafe_code)]` and a SAFETY comment citing doc 04 §4.6.
+`kgf-server` stays `deny(unsafe_code)` and takes a `PublishedRoot` in its `Config`
+rather than a path, because it is a library that can be embedded and must not make the
+promise on an unknown caller's behalf. A third site is a design change to surface, not
+a convenience.
 
 The soundness argument is written down in that module and must stay true: mapping a
 file is unsound in general, because another process can truncate it under a live

@@ -1,17 +1,10 @@
 //! The `kgf` binary: `kgf serve` and `kgf manifest` today, `kgf build` once
 //! `kgf-build` exists.
 //!
-//! This crate stays thin. It is separate from `kgf-server` because it will
-//! eventually drive both the server and the build pipeline, and reaching
-//! `kgf-build` from inside the server crate would point the dependency
-//! backwards.
+//! Argument parsing and logging setup only; every command's body is in the
+//! library beside this (`kgf::manifest`, `kgf::serve`).
 
 #![deny(unsafe_code)]
-
-mod manifest;
-
-use std::net::SocketAddr;
-use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -32,31 +25,35 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Serve bundles over the KGF HTTP API.
-    Serve(ServeArgs),
+    Serve(kgf::serve::Args),
 
     /// Write a bundle's manifest.json from its artifacts.
     ///
     /// A stand-in for the manifest step of `kgf build`, for bundles assembled
     /// by hand with `hdtc create --perm`.
-    Manifest(manifest::Args),
-}
-
-#[derive(Debug, clap::Args)]
-struct ServeArgs {
-    /// Directory of bundles, laid out as {root}/{dataset}/{version}.
-    #[arg(long)]
-    bundle_root: PathBuf,
-
-    /// Address to bind.
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    bind: SocketAddr,
+    Manifest(kgf::manifest::Args),
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Serve(_args) => {
-            todo!("run kgf_server::serve on an async runtime once doc 03's routes exist")
+        Command::Serve(args) => {
+            install_logging();
+            kgf::serve::run(args)
         }
-        Command::Manifest(args) => manifest::run(args),
+        // Deliberately unlogged: a CLI that describes a bundle reports through
+        // its exit status and its own output, and a `tracing` line on stderr
+        // would be noise in a build script.
+        Command::Manifest(args) => kgf::manifest::run(args),
     }
+}
+
+/// Structured logs on stderr, filtered by `RUST_LOG` (default `info`).
+fn install_logging() {
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }

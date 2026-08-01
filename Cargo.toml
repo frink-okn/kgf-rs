@@ -28,6 +28,19 @@ sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 
+# The HTTP stack (unit 13). axum is doc 20 §20.4's suggestion and survives the
+# QUERY spike: hyper parses an extension method and axum routes it, so RFC
+# 10008 is expressible rather than something M2 discovers is impossible.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "original-uri"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+# Already in axum's tree; named directly because this crate uses them for the
+# two things doc 03 leaves to RFC 3986 and RFC 9110 — percent-encoding, and
+# parsing the media ranges in an `Accept` header.
+mime = "0.3"
+percent-encoding = "2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
 [profile.release]
 lto = true
 codegen-units = 1

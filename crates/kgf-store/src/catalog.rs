@@ -104,6 +104,17 @@ impl Catalog {
         self.entries.keys().cloned().collect()
     }
 
+    /// The directory a scanned version was found in.
+    ///
+    /// For the non-artifact files beside the artifacts — `manifest.json` above
+    /// all, which a server reads to describe a bundle it has not opened. It
+    /// hands out the path the scan recorded rather than one composed from a
+    /// caller's strings, so a dataset or version name arriving from a URL can
+    /// never reach the filesystem.
+    pub fn bundle_dir(&self, id: &BundleId) -> Result<&Path> {
+        Ok(self.entry(id)?.bundle.path())
+    }
+
     /// Get a bundle, opening it if this is its first request.
     ///
     /// A singleflight guard means concurrent first requests for the same
