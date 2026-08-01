@@ -24,6 +24,21 @@
 /// Version byte prefixing every token.
 pub const TOKEN_VERSION: u8 = 1;
 
+/// A token that does not address this data and this request.
+///
+/// Lives here rather than in `kgf_store`: a cursor is HTTP-facing state, and
+/// the crate boundary exists to keep that vocabulary out of storage code (doc
+/// 20 §20.4). The store has no notion of a token to go stale — it enumerates
+/// from a position it is handed.
+///
+/// Every way a token can be rejected is this one condition, deliberately: a
+/// malformed token, a token for another bundle version, and a token for another
+/// request are all answered `stale_cursor` (doc 03 §3.6) rather than
+/// distinguished, so that a client learns nothing about data it did not query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("stale cursor")]
+pub struct StaleCursor;
+
 /// The permutation a token's `position` indexes.
 ///
 /// Carried explicitly rather than re-derived from the request, because
@@ -91,7 +106,7 @@ impl Cursor {
     }
 
     /// Decode a token, rejecting anything not addressed to this data and request.
-    pub fn decode(_token: &str, _digest: &[u8], _request_hash: &[u8]) -> Option<Self> {
+    pub fn decode(_token: &str, _digest: &[u8], _request_hash: &[u8]) -> Result<Self, StaleCursor> {
         todo!("decode, then compare digest prefix and request hash")
     }
 }

@@ -63,14 +63,6 @@ impl DictCounts {
         }
     }
 
-    /// Whether a subject and an object id denote the same term.
-    ///
-    /// True exactly when both fall in the shared section, where the two id
-    /// spaces coincide.
-    pub fn same_term(&self, subject: TermId, object: TermId) -> bool {
-        subject == object && subject.0 >= 1 && subject.0 <= self.shared
-    }
-
     /// Establish the invariant that makes [`len`](Self::len)'s additions total.
     fn validate_role_lengths(&self) -> Result<()> {
         let subjects = self.shared.checked_add(self.subjects).ok_or_else(|| {
