@@ -700,11 +700,11 @@ following the code.
    softening it to "mirrors the shape of", since a client that takes it literally will
    write a parser that never matches. The code follows the examples; `format=srj` will
    be a second serialization in unit 14, not a rename of this one. Found in unit 11.
-10. **§3.3 must require angle brackets on IRIs. Decided, not open — doc 03 needs the
-    edit.** As written, §3.3 accepts a bare IRI alongside a CURIE and disambiguates by
-    guessing: "a token parses as a CURIE only when its prefix is declared in the manifest
-    prefix map; otherwise as an IRI". A syntax that admits both forms without a delimiter
-    has to guess, and no guess is right:
+10. **§3.3 requires angle brackets on IRIs. Resolved — `../kgf` 47d1574.** §3.3 used to
+    accept a bare IRI alongside a CURIE and disambiguate by guessing: "a token parses as
+    a CURIE only when its prefix is declared in the manifest prefix map; otherwise as an
+    IRI". A syntax that admits both forms without a delimiter has to guess, and no guess
+    is right:
 
     - The same string denotes different terms at different endpoints, since the reading
       depends on the manifest of the bundle it was sent to. `dc:title` is a CURIE at one
@@ -717,13 +717,15 @@ following the code.
       undeclared is answered as the IRI `foaf:name` — "no such term", for a request whose
       real problem was a typo.
 
-    The fix is Turtle's and SPARQL's, and it is what `kgf-server` implements: `<http://…>`
-    is an IRI, `p:local` is a CURIE whose prefix must be declared, and an undeclared
-    prefix is `bad_term_syntax` naming both remedies. This also applies to `^^datatype`,
-    the other slot taking either form. Cost: `%3C`/`%3E` in a GET URL, on top of the
-    escaping §3.3 already requires — cheap for removing every case above. §3.3's own
-    examples and its "datasets should not declare prefixes that collide with URI schemes"
-    sentence both need rewriting; the latter can simply go. Decided in unit 11.
+    The fix is Turtle's and SPARQL's, and it is what §3.3 now says and `kgf-server`
+    implements: `<http://…>` is an IRI, `p:local` is a CURIE whose prefix must be
+    declared, and an undeclared prefix is `bad_term_syntax` naming both remedies. It
+    applies to `^^datatype`, the other slot taking either form. Cost: `%3C`/`%3E` in a
+    GET URL, on top of the escaping §3.3 already requires — cheap for removing every case
+    above. §3.4's examples were almost all CURIEs and were unaffected; the collision
+    advice is gone, since brackets remove the hazard rather than warn about it, and
+    `/terms?prefix=` is called out as a byte prefix rather than a term so it stays bare.
+    Decided and landed in unit 11.
 11. **Are literals escaped in request syntax?** §3.3 gives `"Diabetes mellitus"@en` and
     never says what a quote inside a value looks like. HDT stores values raw and finds
     the closing quote from the end (`hdtc/docs/text-index-format.md` §3.1), and matching

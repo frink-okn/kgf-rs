@@ -16,8 +16,8 @@
 //! | response | `{"type": "iri", "value": "http://…"}` | this crate (§3.4.1) |
 //!
 //! Request syntax abbreviates through the manifest's prefix map, and brackets
-//! an IRI so that neither form can be read as the other — see [`Term::parse`],
-//! which deviates from §3.3 as written. Dictionary syntax never abbreviates,
+//! an IRI so that neither form can be read as the other (§3.3, and see
+//! [`Term::parse`]). Dictionary syntax never abbreviates,
 //! and brackets a datatype but not a term. Conflating the two is the bug that
 //! returns an empty page for data that is present, so the conversions are
 //! explicit and the dictionary side is
@@ -266,20 +266,15 @@ impl<'a> Term<'a> {
     ///
     /// **An IRI is bracketed**: `<http://example.org/a>`, never bare. A bare
     /// token containing `:` is a CURIE and nothing else, and its prefix must be
-    /// declared. This is Turtle's and SPARQL's rule and it is not optional
-    /// decoration — a parameter that accepts both forms without a delimiter has
-    /// to guess, and every guessing rule is wrong for some dataset. Doc 03
-    /// §3.3's own rule ("a token parses as a CURIE only when its prefix is
-    /// declared; otherwise as an IRI") makes a term's meaning depend on the
-    /// manifest of the bundle it is sent to, so the same string denotes
-    /// different things at different endpoints, and a bundle declaring `http:`
-    /// has IRIs that no request can name at all.
+    /// declared or the term is refused. This is Turtle's and SPARQL's rule, and
+    /// it is not optional decoration — a parameter accepting both forms without
+    /// a delimiter has to guess, and no guess is right. §3.3 said the opposite
+    /// until this unit; `notes/plan.md` decision 10 records why it changed, of
+    /// which the sharpest case is that an undeclared prefix would otherwise
+    /// become a URI scheme, answering a typo with "no such term".
     ///
-    /// This deviates from §3.3 as written; see `notes/plan.md`, "Questions for
-    /// `../kgf`", which records it as a decision for the doc rather than an
-    /// implementation liberty.
-    ///
-    /// A leading `_:` is a blank node, also unmentioned by §3.3.
+    /// A leading `_:` is a blank node, which §3.3 still does not mention — see
+    /// `notes/plan.md`, "Questions for `../kgf`".
     pub fn parse(text: &'a str, prefixes: &PrefixMap) -> Result<Self, TermSyntaxError> {
         if text.is_empty() {
             return Err(TermSyntaxError::Empty);
