@@ -376,10 +376,12 @@ overstate what `digest_prefix` does.
 `/sample`. A deployment at the end of unit 14 serves useful traffic and cannot claim
 the profile.
 
-Outbound spec questions accumulated across all nine units are collected under
-**Questions for `../kgf`** in `notes/plan.md`, including the two long-standing ones
-(doc 20 §20.4's stale io-primitives bullet, and `hdtc create` not defaulting to
-`--perm`).
+Outbound spec questions — from the nine units built and from planning the five ahead —
+are collected under **Questions for `../kgf`** in `notes/plan.md`, including the two
+long-standing ones (doc 20 §20.4's stale io-primitives bullet, and `hdtc create` not
+defaulting to `--perm`). Two of them block nothing but should be settled before unit 10
+writes a token format: what the "canonical request" a cursor binds to actually includes,
+and whether cursor portability across mirrors is a goal.
 
 One item that is neither: hdtc still has three private copies of the section walk —
 `hdt/reader.rs::open_hdt`, `hdt/input_adapter.rs`, and `index/mod.rs`'s own `skip_*`

@@ -526,10 +526,11 @@ picking without measurement is guessing. Revisit with the §20.6 cold-start numb
 
 ## Questions for `../kgf`
 
-Things implementation surfaced that the design documents own. Collected here because
-they are outbound — each is resolved by an edit in another repo, not by code here — and
-because scattered through prose they get lost. CLAUDE.md's rule applies: when code and
-spec disagree, say which is wrong rather than silently following the code.
+Things implementing or planning against the design surfaced that the design documents
+own. Collected here because they are outbound — each is resolved by an edit in another
+repo, not by code here — and because scattered through prose they get lost. CLAUDE.md's
+rule applies: when code and spec disagree, say which is wrong rather than silently
+following the code.
 
 1. **Doc 20 §20.4's io-primitives bullet is out of date.** It still describes hdtc's
    `skip_*` forms as what locates sections. It sanctioned the change that replaced them
@@ -559,6 +560,31 @@ spec disagree, say which is wrong rather than silently following the code.
    makes it required. Either `kgf build` always passes the flag or hdtc's default
    changes. Unresolved since unit 5; `testing::Fixture` and every hand-assembly recipe
    pass it explicitly.
+7. **What is in the "canonical request" a cursor binds to?** Doc 03 §3.6 says
+   "(dataset content digest, operation, canonical request)" and never enumerates the
+   third. The pattern parameters must be in it — that binding is the whole reason a
+   token beats a bare offset. `limit` must *not* be: a client should be able to change
+   page size mid-paging, and a position does not depend on it. Nor should `format`,
+   which selects a serialization of the same result set.
+
+   Left to each implementation this is harmless, because a token is opaque and
+   server-local. It stops being harmless if a client is meant to resume against a
+   **mirror** serving the same bundle — which §3.6's digest binding and doc 04 §4.3's
+   "mirror verification" both gesture at — since two independent servers must then
+   canonicalize and hash identically. Worth deciding whether cursor portability across
+   mirrors is a goal, and if so specifying the canonicalization rather than the
+   properties. Surfaced planning unit 10.
+8. **Should doc 03 specify `Link: rel="next"`?** §3.6 fixes `next` in the JSON envelope
+   and `KGF-Next-Cursor` as a header; RFC 8288 appears nowhere in the docs. On GET
+   routes a complete next-page URL is constructible, and `Link: rel="next"` is the
+   conventional affordance that generic HTTP clients, crawlers, and libraries follow
+   without knowing anything about KGF — a real win for the agent-friendliness doc 01
+   argues for.
+
+   It cannot be the *only* mechanism: a QUERY follow-up is a body, not a URL, so the
+   bare token stays canonical and the two would coexist. The question is whether doc 03
+   specifies it, so clients may rely on it, or leaves it a per-server extra. Surfaced
+   planning units 10 and 13.
 
 ## Not in this plan
 
