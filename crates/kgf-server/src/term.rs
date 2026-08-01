@@ -40,8 +40,9 @@
 //! The two errors are not symmetric. Rejecting wrongly loses data permanently;
 //! accepting wrongly costs a less specific answer — "no rows" instead of "that
 //! is not an IRI" — for a request that was going to match nothing anyway. So
-//! the only refusals here are shapes the dictionary cannot hold at all: an
-//! unmatched bracket, an empty `<>`, and a bracket inside the IRI.
+//! the only refusals are shapes that cannot denote an IRI the dictionary holds:
+//! an unmatched bracket, an empty `<>`, a bracket inside the IRI, and `<_:x>`,
+//! which the dictionary can only have written as a blank node.
 //!
 //! What is worth having instead is a *diagnostic*: a bound position whose term
 //! is absent makes the answer provably empty, and saying which position that
@@ -121,15 +122,11 @@ impl<'a> Literal<'a> {
     /// there are no rows — true of the string it sent, false of the term it
     /// meant, and indistinguishable from an honest empty answer.
     pub fn tagged(value: impl Into<Cow<'a, str>>, language: impl Into<Cow<'a, str>>) -> Self {
-        let language = match language.into() {
-            Cow::Borrowed(tag) if tag.bytes().any(|byte| byte.is_ascii_uppercase()) => {
-                Cow::Owned(tag.to_ascii_lowercase())
-            }
-            Cow::Owned(mut tag) => {
-                tag.make_ascii_lowercase();
-                Cow::Owned(tag)
-            }
-            borrowed => borrowed,
+        let language = language.into();
+        let language = if language.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            Cow::Owned(language.to_ascii_lowercase())
+        } else {
+            language
         };
         Self {
             value: value.into(),
@@ -180,6 +177,13 @@ pub struct PrefixMap(BTreeMap<String, String>);
 
 impl PrefixMap {
     /// The prefixes a bundle declares.
+    ///
+    /// **Bundle-scoped, not request-scoped.** This copies the manifest's map,
+    /// which is cheap once per open and wasteful once per request; a bundle
+    /// declaring the fifty-odd prefixes an OKN graph typically does would
+    /// allocate a hundred strings per request to read something that cannot
+    /// change while the bundle is mapped. Build it beside the `Store` and share
+    /// it.
     pub fn from_manifest(manifest: &Manifest) -> Self {
         Self(manifest.prefixes.clone())
     }
@@ -187,11 +191,6 @@ impl PrefixMap {
     /// The namespace `prefix` is declared to stand for.
     pub fn namespace(&self, prefix: &str) -> Option<&str> {
         self.0.get(prefix).map(String::as_str)
-    }
-
-    /// Whether any prefix is declared.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 }
 
@@ -238,10 +237,13 @@ pub enum TermSyntaxError {
         prefix: String,
     },
 
-    /// One bracket, or a bracket inside the IRI.
+    /// One bracket, or a bracket inside the IRI. The message stays neutral
+    /// about which form was intended, because a token can arrive here either
+    /// as a half-bracketed IRI (`<http://x/a`) or as a CURIE that picked up a
+    /// stray `>` (`ex:a>`), and guessing wrong sends the client the wrong way.
     #[error(
-        "`{token}` has an unmatched `<` or `>`; an IRI is wholly bracketed, \
-         as `<http://example.org/a>`"
+        "`{token}` is not wholly bracketed; an IRI is written `<http://example.org/a>`, \
+         and a CURIE has no brackets at all"
     )]
     UnbalancedIri {
         /// The offending token.
@@ -251,6 +253,22 @@ pub enum TermSyntaxError {
     /// `<>`. Turtle would read it as the base IRI; a request has no base.
     #[error("`<>` is empty; a request has no base IRI to resolve it against")]
     EmptyIri,
+
+    /// `<_:x>`: a blank node wearing an IRI's brackets.
+    #[error("`{token}` brackets a blank node; write it unbracketed, as `_:{label}`")]
+    BracketedBlankNode {
+        /// The offending token.
+        token: String,
+        /// The label inside.
+        label: String,
+    },
+
+    /// `"a"^^` with nothing after it.
+    #[error("`{token}` has an empty datatype after `^^`")]
+    EmptyDatatype {
+        /// The offending token.
+        token: String,
+    },
 
     /// A literal with no closing quote.
     #[error(
@@ -340,6 +358,28 @@ impl<'a> Term<'a> {
     /// The split is [hdtc's](hdtc::format::parse_literal) — the same code that
     /// decided what to index — rather than a second reading of
     /// `docs/text-index-format.md` §3.1.
+    ///
+    /// # The result is canonical, not verbatim
+    ///
+    /// This goes through the same normalizing constructors as parsed input, so
+    /// a stored `"x"@EN` reads back as `@en` and a stored
+    /// `"a"^^<…XMLSchema#string>` reads back as plain. That is deliberate:
+    /// every response carries one spelling of a term, whichever bundle answered.
+    /// Doc 05's federated clients compare terms across endpoints, and a bundle
+    /// that spelled a language tag differently would look like it held a
+    /// different term rather than the same one — the comparison silently fails
+    /// instead of erroring.
+    ///
+    /// It costs an assumption, worth stating because nothing here enforces it:
+    /// **a bundle's dictionary is expected to hold canonical terms.** hdtc's
+    /// parsers fold on ingest, so bundles built the documented way do. One that
+    /// does not — a dictionary literally holding `"x"@EN` — has a term that is
+    /// reported as `@en` and cannot then be fetched by that name, because
+    /// [`to_dictionary`](Term::to_dictionary) canonicalizes on the way back in
+    /// too. Serving it verbatim instead would trade that for incoherent output
+    /// across a federation, which is worse and harder to notice. Detecting it
+    /// is an offline job for `kgf manifest --check`, which can afford the
+    /// `O(dictionary)` scan that `Store::open` cannot (doc 20 §20.6).
     pub fn from_dictionary(term: &'a str) -> Self {
         match parse_literal(term.as_bytes()) {
             Some(literal) => {
@@ -393,26 +433,6 @@ impl<'a> Term<'a> {
     ) -> kgf_store::Result<Option<TermId>> {
         dictionary.locate(role, self.to_dictionary().as_bytes())
     }
-
-    /// Give up the borrow, so the term can outlive the text it was read from.
-    pub fn into_owned(self) -> Term<'static> {
-        match self {
-            Term::Iri(iri) => Term::Iri(Cow::Owned(iri.into_owned())),
-            Term::BlankNode(label) => Term::BlankNode(Cow::Owned(label.into_owned())),
-            Term::Literal(literal) => Term::Literal(Literal {
-                value: Cow::Owned(literal.value.into_owned()),
-                kind: match literal.kind {
-                    LiteralKind::Plain => LiteralKind::Plain,
-                    LiteralKind::Language(language) => {
-                        LiteralKind::Language(Cow::Owned(language.into_owned()))
-                    }
-                    LiteralKind::Datatype(datatype) => {
-                        LiteralKind::Datatype(Cow::Owned(datatype.into_owned()))
-                    }
-                },
-            }),
-        }
-    }
 }
 
 /// Parse a bracketed IRI or a CURIE, the pair a datatype also takes.
@@ -443,6 +463,17 @@ fn parse_iri_syntax<'a>(
         // inside means the brackets do not delimit what the client thought.
         if iri.contains(['<', '>']) {
             return Err(unbalanced());
+        }
+        // `_:x` is how the dictionary spells a blank node, and it cannot also
+        // spell an IRI — the format has one encoding for both, so accepting
+        // `<_:x>` would answer an IRI request with a blank node. No IRI is lost
+        // by refusing: `_` cannot begin a scheme (RFC 3986 §3.1), and the term
+        // is reachable under the spelling that does denote it.
+        if let Some(label) = iri.strip_prefix("_:") {
+            return Err(TermSyntaxError::BracketedBlankNode {
+                token: text.to_owned(),
+                label: label.to_owned(),
+            });
         }
         return Ok(Cow::Borrowed(iri));
     }
@@ -491,6 +522,11 @@ fn parse_literal_syntax<'a>(
         return Ok(Literal::tagged(value, language));
     }
     if let Some(datatype) = suffix.strip_prefix("^^") {
+        if datatype.is_empty() {
+            return Err(TermSyntaxError::EmptyDatatype {
+                token: text.to_owned(),
+            });
+        }
         return Ok(Literal::typed(value, parse_iri_syntax(datatype, prefixes)?));
     }
     Err(TermSyntaxError::LiteralSuffix {
@@ -548,6 +584,11 @@ impl<'a> Term<'a> {
     /// No prefix map: the term object is the form responses use, where IRIs are
     /// always full, and §3.3 offers it as the way out of escaping and ambiguity.
     /// Re-admitting CURIEs here would put the ambiguity back.
+    ///
+    /// Every key must be one this understands. Ignoring the rest is what turns
+    /// a SPARQL Results JSON object — `xml:lang` rather than `lang` — into a
+    /// *different term* that resolves and answers, rather than into an error;
+    /// §3.4.1's claim of SRJ compatibility guarantees clients will send them.
     pub fn from_json(value: &'a serde_json::Value) -> Result<Self, TermSyntaxError> {
         let malformed = |detail: &str| TermSyntaxError::MalformedTermObject {
             detail: detail.to_owned(),
@@ -565,7 +606,36 @@ impl<'a> Term<'a> {
 
         let kind = string("type")?.ok_or_else(|| malformed("no `type`"))?;
         let value = string("value")?.ok_or_else(|| malformed("no `value`"))?;
+
+        // A term object is closed. The two SRJ spellings get their own remedy,
+        // since a client sending them is not confused, just reading the other
+        // spec (see `notes/plan.md`, question 9).
+        let permitted: &[&str] = match kind {
+            "literal" => &["type", "value", "lang", "datatype"],
+            _ => &["type", "value"],
+        };
+        if let Some(unknown) = object.keys().find(|key| !permitted.contains(&key.as_str())) {
+            return Err(match unknown.as_str() {
+                "xml:lang" => {
+                    malformed("`xml:lang` is SPARQL Results JSON; this form spells it `lang`")
+                }
+                "uri" => malformed("`uri` is SPARQL Results JSON; this form spells the type `iri`"),
+                other if kind == "literal" => {
+                    malformed(&format!("`{other}` is not a key of a literal term object"))
+                }
+                other => malformed(&format!(
+                    "`{other}` is not a key of an `{kind}` term object"
+                )),
+            });
+        }
+
         match kind {
+            // The label is bare, as this crate and SRJ both write it. `_:b1`
+            // would encode to `_:_:b1`, and cannot simply be stripped: a
+            // dictionary may hold a blank node whose label really is `_:b1`.
+            "bnode" if value.starts_with("_:") => {
+                Err(malformed("a `bnode` value is the bare label, without `_:`"))
+            }
             "iri" => Ok(Term::Iri(Cow::Borrowed(value))),
             "bnode" => Ok(Term::BlankNode(Cow::Borrowed(value))),
             "literal" => match (string("lang")?, string("datatype")?) {
@@ -593,13 +663,28 @@ pub enum DictionaryTermError {
     Read(#[from] kgf_store::Error),
 
     /// A stored term is not UTF-8, so the bundle is not serving RDF.
-    #[error("{role:?} term {id} is not valid UTF-8; the bundle's dictionary is corrupt")]
+    #[error(
+        "{} term {id} is not valid UTF-8; the bundle's dictionary is corrupt",
+        role_name(*role)
+    )]
     NotUtf8 {
         /// Which id space.
         role: Role,
         /// The offending id.
         id: u64,
     },
+}
+
+/// A role as it should read in a message.
+///
+/// Not `{role:?}`: that would make operator-visible text a function of the
+/// variant names in another crate, so renaming one silently rewords this.
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::Subject => "subject",
+        Role::Predicate => "predicate",
+        Role::Object => "object",
+    }
 }
 
 /// Terms already materialized while answering one request.
@@ -615,6 +700,16 @@ pub enum DictionaryTermError {
 ///
 /// UTF-8 is validated once per distinct term as it enters, which is what lets
 /// [`Term::from_dictionary`] be infallible.
+///
+/// # Not `Send`
+///
+/// The `Rc` makes the whole cache thread-local, so a cache must be created and
+/// dropped **inside** the blocking closure that does the request's store work,
+/// never built outside and moved in — `spawn_blocking` requires `Send`. That is
+/// the intended shape anyway (a request's terms belong to that request), and
+/// the alternative costs an atomic increment per row on the hot path to buy a
+/// sharing nobody wants. Recorded because otherwise it is discovered as a
+/// compile error in unit 13 and "fixed" by reaching for `Arc`.
 #[derive(Debug, Default)]
 pub struct TermCache {
     entries: HashMap<(Role, u64), Rc<str>>,
@@ -962,6 +1057,33 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_term_is_reported_in_canonical_form() {
+        // Reading the dictionary canonicalizes rather than echoing bytes, so
+        // one term has one spelling in a response whichever bundle answered —
+        // doc 05's clients compare terms across endpoints. hdtc-built bundles
+        // are already canonical, so this is checked directly rather than
+        // through a fixture, which cannot produce the non-canonical input.
+        let folded = Term::from_dictionary("\"x\"@EN");
+        assert_eq!(folded, Term::Literal(Literal::tagged("x", "en")));
+        assert_eq!(
+            serde_json::to_string(&folded).unwrap(),
+            r#"{"type":"literal","value":"x","lang":"en"}"#
+        );
+
+        let implicit = Term::from_dictionary("\"a\"^^<http://www.w3.org/2001/XMLSchema#string>");
+        assert_eq!(implicit, Term::Literal(Literal::plain("a")));
+        assert_eq!(
+            serde_json::to_string(&implicit).unwrap(),
+            r#"{"type":"literal","value":"a"}"#
+        );
+
+        // The cost, stated so it is a decision and not a surprise: a bundle
+        // holding non-canonical terms has terms it cannot be asked for.
+        assert_eq!(folded.to_dictionary(), "\"x\"@en");
+        assert_eq!(implicit.to_dictionary(), "\"a\"");
+    }
+
+    #[test]
     fn the_two_spellings_of_a_plain_literal_are_one_term() {
         let prefixes = prefixes(&[("xsd", "http://www.w3.org/2001/XMLSchema#")]);
         let implicit = Term::parse("\"a\"", &prefixes).unwrap();
@@ -973,7 +1095,7 @@ mod tests {
     #[test]
     fn malformed_input_is_an_error_rather_than_a_plausible_term() {
         let prefixes = prefixes(&[("ex", "http://example.org/")]);
-        let cases: [(&str, TermSyntaxError); 10] = [
+        let cases: [(&str, TermSyntaxError); 11] = [
             ("", TermSyntaxError::Empty),
             (
                 "alice",
@@ -1023,6 +1145,14 @@ mod tests {
                 TermSyntaxError::LiteralSuffix {
                     token: "\"a\"!en".to_owned(),
                     suffix: "!en".to_owned(),
+                },
+            ),
+            // Names the datatype rather than reporting an empty token, which
+            // told an agent nothing about which part of the term was missing.
+            (
+                "\"42\"^^",
+                TermSyntaxError::EmptyDatatype {
+                    token: "\"42\"^^".to_owned(),
                 },
             ),
         ];
@@ -1084,6 +1214,56 @@ mod tests {
         for case in &cases {
             assert!(Term::from_json(case).is_err(), "{case} should be refused");
         }
+    }
+
+    #[test]
+    fn a_term_object_key_that_is_not_understood_is_refused() {
+        // The dangerous case is not a typo, it is a client reading SPARQL
+        // Results JSON: dropping `xml:lang` silently yields a *plain* literal,
+        // which resolves and answers with rows for a different term.
+        let srj = serde_json::json!({"type": "literal", "value": "Alice", "xml:lang": "en"});
+        let error = Term::from_json(&srj).expect_err("SRJ spelling must not be read as plain");
+        assert!(
+            error.to_string().contains("`lang`"),
+            "the message must name the spelling to use, got: {error}"
+        );
+
+        for case in [
+            serde_json::json!({"type": "literal", "value": "a", "langauge": "en"}),
+            serde_json::json!({"type": "iri", "value": "http://x/a", "lang": "en"}),
+            serde_json::json!({"type": "bnode", "value": "b1", "datatype": "http://x"}),
+        ] {
+            assert!(
+                Term::from_json(&case).is_err(),
+                "{case} carries a key it should not"
+            );
+        }
+
+        // A label already wearing its prefix is refused rather than stripped:
+        // a dictionary may hold a blank node whose label really is `_:b1`.
+        assert!(Term::from_json(&serde_json::json!({"type": "bnode", "value": "_:b1"})).is_err());
+        assert_eq!(
+            Term::from_json(&serde_json::json!({"type": "bnode", "value": "b1"})).unwrap(),
+            Term::BlankNode(Cow::Borrowed("b1"))
+        );
+    }
+
+    #[test]
+    fn a_bracketed_blank_node_is_refused_rather_than_resolved() {
+        // `<_:b1>` would encode to `_:b1` and locate the blank node, answering
+        // an IRI request with a term of another kind. The dictionary has one
+        // encoding for both, so the only fix is to refuse the spelling that
+        // cannot mean what it says.
+        let error = Term::parse("<_:b1>", &PrefixMap::default())
+            .expect_err("a bracketed blank node must not resolve as an IRI");
+        assert!(
+            error.to_string().contains("_:b1"),
+            "the message must name the unbracketed form, got: {error}"
+        );
+        assert_eq!(
+            Term::parse("_:b1", &PrefixMap::default()).unwrap(),
+            Term::BlankNode(Cow::Borrowed("b1"))
+        );
     }
 
     #[test]

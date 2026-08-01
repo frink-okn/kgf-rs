@@ -349,12 +349,42 @@ fn publisher(args: &Args, previous: Option<&Manifest>) -> Option<Publisher> {
     })
 }
 
+/// Prefixes every bundle declares unless it says otherwise.
+///
+/// Doc 03 §3.3 makes a CURIE resolvable only against a declared prefix, and an
+/// undeclared one an error — so a bundle declaring nothing accepts no CURIE at
+/// all, and even §3.4's own examples (`p=rdfs:label`, `o.ge="100.0"^^xsd:double`)
+/// fail against it. These four are not a guess about the data: they are fixed by
+/// the W3C specs that define RDF itself, so declaring them asserts nothing about
+/// the dataset that is not already true everywhere.
+///
+/// Deliberately short. A curated vocabulary list (`skos`, `dcterms`, `foaf`, …)
+/// would be this tool guessing at the dataset's subject matter, and getting a
+/// prefix wrong is worse than omitting it: the manifest is the contract a client
+/// reads to know what it may send.
+const WELL_KNOWN_PREFIXES: [(&str, &str); 4] = [
+    ("owl", "http://www.w3.org/2002/07/owl#"),
+    ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+    ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
+    ("xsd", "http://www.w3.org/2001/XMLSchema#"),
+];
+
 fn prefixes(args: &Args, previous: Option<&Manifest>) -> Result<BTreeMap<String, String>> {
+    // Seeded first so an explicit binding, or one carried forward from a
+    // manifest that chose differently, overrides rather than collides.
+    let mut prefixes: BTreeMap<String, String> = WELL_KNOWN_PREFIXES
+        .iter()
+        .map(|(prefix, namespace)| ((*prefix).to_owned(), (*namespace).to_owned()))
+        .collect();
+
     if args.prefixes.is_empty() {
-        return Ok(previous.map(|m| m.prefixes.clone()).unwrap_or_default());
+        if let Some(previous) = previous {
+            prefixes.extend(previous.prefixes.clone());
+        }
+        return Ok(prefixes);
     }
 
-    let mut prefixes = BTreeMap::new();
+    let mut declared = BTreeMap::new();
     for binding in &args.prefixes {
         let (prefix, expansion) = binding
             .split_once('=')
@@ -362,10 +392,11 @@ fn prefixes(args: &Args, previous: Option<&Manifest>) -> Result<BTreeMap<String,
         if prefix.is_empty() || expansion.is_empty() {
             bail!("--prefix {binding} has an empty prefix or expansion");
         }
-        if let Some(existing) = prefixes.insert(prefix.to_owned(), expansion.to_owned()) {
+        if let Some(existing) = declared.insert(prefix.to_owned(), expansion.to_owned()) {
             bail!("--prefix {prefix} given twice ({existing} and {expansion})");
         }
     }
+    prefixes.extend(declared);
     Ok(prefixes)
 }
 
@@ -494,9 +525,9 @@ mod tests {
         assert_eq!(hex(&[0x00, 0x0f, 0xff]), "000fff");
     }
 
-    #[test]
-    fn prefix_bindings_parse_or_say_why_not() {
-        let args = |bindings: &[&str]| Args {
+    /// `kgf manifest` invoked with only `--prefix` bindings.
+    fn args(bindings: &[&str]) -> Args {
+        Args {
             bundle: PathBuf::new(),
             check: false,
             id: None,
@@ -510,24 +541,12 @@ mod tests {
             publisher_contact: None,
             previous_version: None,
             prefixes: bindings.iter().map(|s| (*s).to_owned()).collect(),
-        };
-
-        let parsed = prefixes(&args(&["ex=http://example.org/"]), None).unwrap();
-        assert_eq!(parsed["ex"], "http://example.org/");
-
-        // An expansion containing '=' splits at the first one only.
-        let parsed = prefixes(&args(&["q=http://example.org/?a=b"]), None).unwrap();
-        assert_eq!(parsed["q"], "http://example.org/?a=b");
-
-        assert!(prefixes(&args(&["nope"]), None).is_err());
-        assert!(prefixes(&args(&["=http://example.org/"]), None).is_err());
-        assert!(prefixes(&args(&["ex="]), None).is_err());
-        assert!(prefixes(&args(&["ex=a", "ex=b"]), None).is_err());
+        }
     }
 
-    #[test]
-    fn no_prefix_flags_keeps_the_current_map() {
-        let mut previous = Manifest {
+    /// A manifest carrying nothing but a prefix map.
+    fn manifest_with(prefixes: BTreeMap<String, String>) -> Manifest {
+        Manifest {
             id: "d".to_owned(),
             dataset_iri: None,
             version: "v".to_owned(),
@@ -546,29 +565,64 @@ mod tests {
                 objects: 0,
             },
             capabilities: BTreeMap::new(),
-            prefixes: BTreeMap::new(),
+            prefixes,
             artifacts: BTreeMap::new(),
             previous_version: None,
-        };
-        previous
-            .prefixes
-            .insert("ex".to_owned(), "http://example.org/".to_owned());
+        }
+    }
 
-        let args = Args {
-            bundle: PathBuf::new(),
-            check: false,
-            id: None,
-            version: None,
-            dataset_iri: None,
-            title: None,
-            description: None,
-            license: None,
-            homepage: None,
-            publisher: None,
-            publisher_contact: None,
-            previous_version: None,
-            prefixes: Vec::new(),
-        };
-        assert_eq!(prefixes(&args, Some(&previous)).unwrap(), previous.prefixes);
+    #[test]
+    fn prefix_bindings_parse_or_say_why_not() {
+        let parsed = prefixes(&args(&["ex=http://example.org/"]), None).unwrap();
+        assert_eq!(parsed["ex"], "http://example.org/");
+
+        // An expansion containing '=' splits at the first one only.
+        let parsed = prefixes(&args(&["q=http://example.org/?a=b"]), None).unwrap();
+        assert_eq!(parsed["q"], "http://example.org/?a=b");
+
+        assert!(prefixes(&args(&["nope"]), None).is_err());
+        assert!(prefixes(&args(&["=http://example.org/"]), None).is_err());
+        assert!(prefixes(&args(&["ex="]), None).is_err());
+        assert!(prefixes(&args(&["ex=a", "ex=b"]), None).is_err());
+    }
+
+    #[test]
+    fn no_prefix_flags_keeps_the_current_map() {
+        let previous = manifest_with(BTreeMap::from([(
+            "ex".to_owned(),
+            "http://example.org/".to_owned(),
+        )]));
+
+        let carried = prefixes(&args(&[]), Some(&previous)).unwrap();
+        for (prefix, namespace) in &previous.prefixes {
+            assert_eq!(carried.get(prefix), Some(namespace), "carried {prefix}");
+        }
+        for (prefix, namespace) in WELL_KNOWN_PREFIXES {
+            assert_eq!(carried.get(prefix).map(String::as_str), Some(namespace));
+        }
+    }
+
+    #[test]
+    fn the_well_known_prefixes_are_declared_and_overridable() {
+        // Without these a freshly described bundle accepts no CURIE at all,
+        // since doc 03 §3.3 resolves one only against a declared prefix.
+        let fresh = prefixes(&args(&[]), None).unwrap();
+        assert_eq!(
+            fresh.get("xsd").map(String::as_str),
+            Some("http://www.w3.org/2001/XMLSchema#")
+        );
+
+        // Seeded, not imposed: a dataset that means something else by `xsd`
+        // says so and is believed.
+        let overridden = prefixes(&args(&["xsd=http://example.org/xsd#"]), None).unwrap();
+        assert_eq!(
+            overridden.get("xsd").map(String::as_str),
+            Some("http://example.org/xsd#")
+        );
+        assert!(overridden.contains_key("rdfs"), "the rest still stand");
+
+        // Idempotent, so regenerating a manifest does not keep changing it.
+        let carried = manifest_with(fresh.clone());
+        assert_eq!(prefixes(&args(&[]), Some(&carried)).unwrap(), fresh);
     }
 }

@@ -463,6 +463,29 @@ round-trips out through a response and back into a request unchanged. And `_:lab
 **blank node** before the CURIE rule sees it, which no sentence in §3.3 covers but every
 other reading of which makes blank nodes unaskable.
 
+**Terms are canonical on the way out as well as in.** A stored `"x"@EN` is reported as
+`@en` and a stored `"a"^^xsd:string` as plain, because a response should carry one
+spelling of a term whichever bundle answered: doc 05's federated clients compare terms
+across endpoints, and two spellings of one term read as two terms, failing silently
+rather than erroring. The cost is an assumption worth stating — **a bundle's dictionary
+is expected to hold canonical terms**, which hdtc's parsers guarantee for bundles built
+the documented way. One that does not has a term reported under a name it cannot then be
+fetched by. Detecting that is an offline `O(dictionary)` scan, so it belongs to
+`kgf manifest --check` rather than to `Store::open` (doc 20 §20.6).
+
+`kgf manifest` now seeds `rdf`, `rdfs`, `owl` and `xsd` into the prefix map, overridable
+and idempotent. Requiring brackets made an undeclared prefix an error, and the default
+map was empty, so a freshly described bundle accepted no CURIE at all — including doc
+03 §3.4's own `p=rdfs:label` and `o.ge="100.0"^^xsd:double`. The four are fixed by the
+specs that define RDF, so declaring them asserts nothing about the dataset; a longer
+curated list would be this tool guessing at subject matter, and the manifest is the
+contract a client reads to know what it may send.
+
+A term object is **closed**: an unrecognized key is refused rather than ignored. Ignoring
+`xml:lang` turns a SPARQL Results JSON literal into a plain one — a different term that
+resolves and answers — and §3.4.1's claim of SRJ compatibility guarantees clients send
+it, so `xml:lang` and `uri` get messages naming the spelling to use instead.
+
 `TermCache` keys on (role, id), not id: the shared section gives a subject and an object
 the same id for the same string, but the role-only sections do not, and a cache that
 forgot the role would answer confidently from the wrong section. It hands out `Rc<str>`
@@ -474,7 +497,7 @@ Terms serialize through `serde::Serialize` straight into the writer rather than 
 building a `serde_json::Value`: a page is `limit` rows of up to three terms, and a map
 allocated per term is a map allocated per term.
 
-There are 100 tests after this unit.
+There are 105 tests after this unit.
 
 ### 12. `envelope` — completeness and errors
 
