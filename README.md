@@ -44,7 +44,8 @@ its manifest; a bundle missing a required artifact is refused at open with a
 message naming what to build.
 
 Concretely: `data.hdt.perm` is required and never derived at open; the HDT-FoQ
-index is never read; `data.hdt.graphs` without `data.hdt.graphs.idx` is refused.
+index is never read; `data.hdt.graphs` and `data.hdt.graphs.idx` must either both
+be present or both be absent.
 Every fallback doubles the surface that has to be tested and measured for a
 bounded-cost guarantee, and it is the fallback that gets neither.
 

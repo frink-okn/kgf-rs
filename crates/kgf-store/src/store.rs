@@ -16,7 +16,7 @@ use hdtc::format::GraphIndexOpenError;
 
 use crate::dict::Dictionary;
 use crate::error::{Error, Result};
-use crate::map::open_published;
+use crate::map::{PublishedBundle, open_published};
 use crate::pattern::{IdPattern, Selection};
 use crate::perm::Permutations;
 
@@ -34,7 +34,8 @@ pub mod artifact {
     pub const GRAPHS_IDX: &str = "data.hdt.graphs.idx";
 }
 
-/// Open-time options, reserved for options that preserve header-only opening.
+/// Open-time options, reserved for options that preserve bounded,
+/// size-independent opening.
 ///
 /// Full digest and checksum verification deliberately does not belong here: it
 /// runs at publish/registry ingest and through `kgf verify` (doc 20 §20.6).
@@ -51,26 +52,27 @@ pub struct OpenOptions {}
 /// and needs no synchronisation.
 #[derive(Debug)]
 pub struct Store {
-    dir: PathBuf,
+    bundle: PublishedBundle,
     perms: Permutations,
 }
 
 impl Store {
-    /// Open the bundle version rooted at `dir`.
+    /// Open a bundle version whose immutability has been established.
     ///
-    /// Maps files and parses headers — **no payload pages are scanned**, because
-    /// rank directories are persisted rather than derived. Cheap binding checks
-    /// (suffix lengths, triple counts, dictionary counts) run for every sidecar;
-    /// full digests and CRCs stay on the publish/`kgf verify` path.
+    /// Maps files, parses headers, and performs a bounded number of metadata and
+    /// rank-sentinel reads independent of bundle size. It does not scan payload
+    /// regions, rebuild indexes, or compute full digests and CRCs.
     ///
-    /// Fails if a required artifact is missing, or if `data.hdt.graphs` is
-    /// present without `data.hdt.graphs.idx`. There is no degraded mode: the
-    /// error names the command that produces what is missing (doc 20 §20.8).
+    /// Fails if a required artifact is missing, or if exactly one of
+    /// `data.hdt.graphs` and `data.hdt.graphs.idx` is present. There is no
+    /// degraded mode: the error names the command that produces a missing
+    /// required artifact (doc 20 §20.8).
     ///
-    /// Published bundle versions are immutable (doc 04 §4.6). Callers must not
-    /// modify or truncate this directory while the returned store is alive; that
-    /// environmental guarantee is the soundness condition for its read-only maps.
-    pub fn open(dir: &Path, _opts: OpenOptions) -> Result<Self> {
+    /// Constructing [`PublishedBundle`] is where the caller acknowledges doc 04
+    /// §4.6's external immutability requirement. This method is safe because it
+    /// cannot be called with an unqualified path.
+    pub fn open(bundle: &PublishedBundle, _opts: OpenOptions) -> Result<Self> {
+        let dir = bundle.path();
         require_file(dir, artifact::MANIFEST, "kgf build")?;
         let hdt_path = require_file(dir, artifact::HDT, "kgf build")?;
         let perm_path = require_file(
@@ -79,18 +81,30 @@ impl Store {
             format!("hdtc perm {}", hdt_path.display()),
         )?;
 
-        let graph_index_path = if optional_file(dir, artifact::GRAPHS)?.is_some() {
-            Some(require_file(
-                dir,
-                artifact::GRAPHS_IDX,
-                format!("hdtc graphs-index {}", hdt_path.display()),
-            )?)
-        } else {
-            None
+        let graphs_path = optional_file(dir, artifact::GRAPHS)?;
+        let graph_index_path = optional_file(dir, artifact::GRAPHS_IDX)?;
+        match (&graphs_path, &graph_index_path) {
+            (Some(_), None) => {
+                return Err(Error::MissingRequiredArtifact {
+                    bundle: dir.to_path_buf(),
+                    artifact: artifact::GRAPHS_IDX.to_owned(),
+                    remedy: format!("hdtc graphs-index {}", hdt_path.display()),
+                });
+            }
+            (None, Some(index)) => {
+                return Err(Error::Malformed {
+                    artifact: index.clone(),
+                    detail: format!(
+                        "graph index is present without its required parent {}",
+                        dir.join(artifact::GRAPHS).display()
+                    ),
+                });
+            }
+            _ => {}
         };
 
-        let hdt = open_published(&hdt_path)?;
-        let perm = open_published(&perm_path)?;
+        let hdt = open_published(bundle, &hdt_path)?;
+        let perm = open_published(bundle, &perm_path)?;
         let perms = Permutations::open(hdt, perm)?;
 
         if let Some(graph_index_path) = graph_index_path {
@@ -123,14 +137,14 @@ impl Store {
         }
 
         Ok(Self {
-            dir: dir.to_path_buf(),
+            bundle: bundle.clone(),
             perms,
         })
     }
 
     /// The immutable bundle-version directory backing this store.
     pub fn bundle_dir(&self) -> &Path {
-        &self.dir
+        self.bundle.path()
     }
 
     /// The dictionary.
@@ -189,12 +203,13 @@ fn optional_file(dir: &Path, name: &str) -> Result<Option<PathBuf>> {
 mod tests {
     use super::*;
     use crate::pattern::IdPattern;
-    use crate::testing::{Fixture, TINY_NT};
+    use crate::testing::{Fixture, TINY_NT, published_bundle};
 
     #[test]
     fn a_complete_bundle_opens_and_answers_through_the_store() {
         let fixture = Fixture::build(TINY_NT);
-        let store = Store::open(fixture.bundle_path(), OpenOptions::default()).unwrap();
+        let bundle = published_bundle(fixture.bundle_path());
+        let store = Store::open(&bundle, OpenOptions::default()).unwrap();
 
         assert_eq!(store.bundle_dir(), fixture.bundle_path());
         assert_eq!(store.triples(), 8);
@@ -223,7 +238,8 @@ mod tests {
             let bundle = root.path().join(missing.replace('.', "-"));
             fixture.copy_bundle_to(&bundle);
             std::fs::remove_file(bundle.join(missing)).unwrap();
-            match Store::open(&bundle, OpenOptions::default()).expect_err("must refuse bundle") {
+            let published = published_bundle(&bundle);
+            match Store::open(&published, OpenOptions::default()).expect_err("must refuse bundle") {
                 Error::MissingRequiredArtifact {
                     bundle: actual_bundle,
                     artifact,
@@ -240,7 +256,9 @@ mod tests {
         let bundle = root.path().join("graphs-without-index");
         fixture.copy_bundle_to(&bundle);
         std::fs::write(bundle.join(artifact::GRAPHS), b"present").unwrap();
-        match Store::open(&bundle, OpenOptions::default()).expect_err("must require graph index") {
+        let published = published_bundle(&bundle);
+        match Store::open(&published, OpenOptions::default()).expect_err("must require graph index")
+        {
             Error::MissingRequiredArtifact {
                 artifact: actual_artifact,
                 remedy,
@@ -248,6 +266,20 @@ mod tests {
             } => {
                 assert_eq!(actual_artifact, artifact::GRAPHS_IDX);
                 assert!(remedy.starts_with("hdtc graphs-index"), "{remedy}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let bundle = root.path().join("index-without-graphs");
+        fixture.copy_bundle_to(&bundle);
+        std::fs::write(bundle.join(artifact::GRAPHS_IDX), b"orphan").unwrap();
+        let published = published_bundle(&bundle);
+        match Store::open(&published, OpenOptions::default())
+            .expect_err("must reject a graph index without its sidecar parent")
+        {
+            Error::Malformed { artifact, detail } => {
+                assert_eq!(artifact, bundle.join(artifact::GRAPHS_IDX));
+                assert!(detail.contains(artifact::GRAPHS), "{detail}");
             }
             other => panic!("unexpected error: {other}"),
         }
@@ -264,8 +296,9 @@ mod tests {
         fixture.copy_bundle_to(&bundle);
         std::fs::copy(other.perm_path(), bundle.join(artifact::PERM)).unwrap();
 
+        let published = published_bundle(&bundle);
         assert!(matches!(
-            Store::open(&bundle, OpenOptions::default()),
+            Store::open(&published, OpenOptions::default()),
             Err(Error::ArtifactBindingMismatch { .. })
         ));
     }
@@ -291,7 +324,8 @@ mod tests {
         )
         .unwrap();
 
-        match Store::open(&bundle, OpenOptions::default())
+        let published = published_bundle(&bundle);
+        match Store::open(&published, OpenOptions::default())
             .expect_err("a graph index from another HDT must not bind")
         {
             Error::ArtifactBindingMismatch { artifact, hdt, .. } => {

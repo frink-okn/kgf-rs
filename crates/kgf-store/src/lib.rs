@@ -8,12 +8,12 @@
 //!
 //! # The three things worth knowing before reading further
 //!
-//! **Open is free.** Opening a bundle maps files and parses headers — no data
-//! pages are touched, because rank directories are *persisted* in `data.hdt.perm`
-//! rather than rebuilt (doc 20 §20.3). An open-but-idle bundle costs address
-//! space, not memory, which is what makes lazy multi-tenant serving work: dozens
-//! of datasets and historical versions resident on one VM, with the page cache
-//! holding whatever is hot across all of them.
+//! **Open has bounded, size-independent I/O.** Opening maps files, parses
+//! headers, and reads a fixed number of rank-directory sentinels. It never scans
+//! payloads, rebuilds indexes, hashes whole files, or materializes structures
+//! proportional to bundle size (doc 20 §20.3). An open-but-idle bundle therefore
+//! costs address space plus a small fixed metadata working set, which is what
+//! makes lazy multi-tenant serving work.
 //!
 //! **Id-space in, id-space through, strings at the edges.** Every operation
 //! resolves terms to ids once at the boundary, runs entirely over ids, and
@@ -22,8 +22,8 @@
 //!
 //! **One implementation per operation.** There is no fallback path for a missing
 //! or superseded index (doc 20 §20.8). A bundle without `data.hdt.perm` is
-//! refused at open; `.hdt.index.v1-1` is never read; `data.hdt.graphs` without
-//! `data.hdt.graphs.idx` is refused. What looks like a fallback in [`pattern`] —
+//! refused at open; `.hdt.index.v1-1` is never read; `data.hdt.graphs` and
+//! `data.hdt.graphs.idx` must occur together. What looks like a fallback in [`pattern`] —
 //! `s ? o` probing whichever endpoint is smaller — is one algorithm making a
 //! cost decision, and both routes emit in the same order and resume from the
 //! same cursor.
@@ -57,6 +57,7 @@ mod testing;
 
 pub use catalog::Catalog;
 pub use error::{Error, Result};
+pub use map::{PublishedBundle, PublishedRoot};
 pub use store::{OpenOptions, Store};
 
 /// A term identifier in one of HDT's role-scoped id spaces.

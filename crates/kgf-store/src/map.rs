@@ -12,14 +12,15 @@
 //! §4.6). Versions are written once under a fresh directory and never edited in
 //! place; an update is a new version and a new catalog entry. On top of that,
 //! [`crate::store::Store::open`] checks each sidecar's binding to its HDT before
-//! any region is read, so a swapped file is caught rather than mapped.
+//! any query view is exposed, so mismatched artifacts are refused at open.
 //!
 //! That is a *project* invariant, though, not one this crate can enforce.
-//! [`Mapping::open`] therefore stays unsafe for general callers. The safe public
-//! [`Store`](crate::store::Store) surface enters through the crate-private
-//! `open_published` boundary below, whose one unsafe block records the stronger
-//! premise that its path is a published bundle version. Everything above that
-//! boundary is safe code over `&[u8]`.
+//! [`Mapping::open`] therefore stays unsafe for general callers. The public
+//! [`PublishedBundle`] and [`PublishedRoot`] capabilities make that premise
+//! explicit: constructing one is unsafe, while opening stores and catalog
+//! entries through an already-established capability is safe. The
+//! crate-private `open_published` boundary below contains the only production
+//! unsafe block. Everything above it is safe code over `&[u8]`.
 //!
 //! # One element reader; the difference is framing
 //!
@@ -89,6 +90,96 @@ pub struct MappingId(u64);
 fn next_mapping_id() -> MappingId {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     MappingId(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A bundle directory whose artifacts are immutable while any derived store lives.
+///
+/// This is the capability that makes [`Store::open`](crate::store::Store::open)
+/// safe: a path alone cannot prove the external-file invariant required by a
+/// file-backed mapping, while possession of this value records that the caller
+/// established it once.
+#[derive(Debug, Clone)]
+pub struct PublishedBundle {
+    dir: PathBuf,
+}
+
+impl PublishedBundle {
+    /// Assert that `dir` is a published, immutable bundle version.
+    ///
+    /// # Safety
+    ///
+    /// From construction until this capability and every derived
+    /// [`Store`](crate::store::Store) have been dropped, `dir` must keep resolving
+    /// to the same directory, its artifact entries and symlinks must not be
+    /// replaced, and the target files must not be modified or truncated.
+    pub unsafe fn new(dir: &Path) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    /// The bundle-version directory.
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(dir: &Path) -> Self {
+        // SAFETY: test fixtures call this only after publishing all artifacts
+        // and leave them untouched until every derived store is dropped.
+        unsafe { Self::new(dir) }
+    }
+}
+
+/// A catalog root whose bundle versions satisfy [`PublishedBundle`]'s invariant.
+///
+/// One root capability can safely derive capabilities for the version
+/// directories discovered beneath it, so the catalog acknowledges the mmap
+/// safety obligation once at configuration time rather than once per request.
+#[derive(Debug, Clone)]
+pub struct PublishedRoot {
+    root: PathBuf,
+}
+
+impl PublishedRoot {
+    /// Assert that every bundle version served beneath `root` is published and
+    /// immutable.
+    ///
+    /// # Safety
+    ///
+    /// From construction until this capability and every derived store have
+    /// been dropped, every discovered bundle path must keep resolving to the
+    /// same directory, its artifact entries and symlinks must not be replaced,
+    /// and the target files must not be modified or truncated. Adding unrelated
+    /// entries beneath `root` is allowed.
+    pub unsafe fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// The catalog root directory.
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(root: &Path) -> Self {
+        // SAFETY: catalog fixtures call this only after publishing all bundle
+        // artifacts and do not mutate their bytes while stores are live.
+        unsafe { Self::new(root) }
+    }
+
+    /// Derive the capability for a version found beneath this root.
+    pub(crate) fn bundle(&self, dir: PathBuf) -> PublishedBundle {
+        assert!(
+            dir.starts_with(&self.root),
+            "catalog bundle {} is outside published root {}",
+            dir.display(),
+            self.root.display()
+        );
+        PublishedBundle { dir }
+    }
 }
 
 /// Bytes needed to hold `len` entries of `width` bits.
@@ -190,11 +281,24 @@ impl Mapping {
 /// callers of the safe store API name a bundle version, and doc 04 §4.6 makes
 /// immutability part of what a published version means. Keeping the one unsafe
 /// acknowledgement here preserves this module as the complete audited surface.
-pub(crate) fn open_published(path: &Path) -> Result<Mapping> {
-    // SAFETY: Store calls this only for artifacts in a published bundle version.
-    // Such a version is immutable for the lifetime of every Store opened from it
-    // (doc 04 §4.6), satisfying Mapping::open's external-file obligation.
+pub(crate) fn open_published(bundle: &PublishedBundle, path: &Path) -> Result<Mapping> {
+    assert_eq!(
+        path.parent(),
+        Some(bundle.path()),
+        "mapped artifact {} is not directly inside published bundle {}",
+        path.display(),
+        bundle.path().display()
+    );
+    // SAFETY: constructing `bundle` established that every artifact reachable
+    // through this directory remains immutable for the mapping's lifetime.
     unsafe { Mapping::open(path) }
+}
+
+#[cfg(test)]
+pub(crate) fn map_fixture(path: &Path) -> Mapping {
+    // SAFETY: callers write a fixture in a temporary directory and leave it
+    // untouched for the returned mapping's lifetime.
+    unsafe { Mapping::open(path) }.expect("map fixture")
 }
 
 /// Where a packed array lives and what shape it has, validated once.

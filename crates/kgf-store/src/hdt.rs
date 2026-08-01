@@ -158,8 +158,8 @@ pub struct HdtLayout {
 impl HdtLayout {
     /// Walk a mapped HDT and record where everything is.
     ///
-    /// Preambles only: **no payload byte is read**, which is what makes opening
-    /// a bundle free of the HDT's size (doc 20 §20.1). The walk itself is
+    /// Preambles only: **no payload byte is read**, which keeps this part of
+    /// opening independent of the HDT's size (doc 20 §20.1). The walk itself is
     /// hdtc's — one implementation of "where is `BitmapY`" for the builder and
     /// every reader — and this adds what a mapped reader needs on top: each
     /// located region becomes a spec validated against `mapping`, so a file that
@@ -220,7 +220,7 @@ impl HdtLayout {
                 )?;
 
                 // Every dictionary term occurs in the triples. These inequalities
-                // and empty-together checks are the header-only part of that fact:
+                // and empty-together checks are the size-independent part of that fact:
                 // subjects and predicates occur in pairs; objects occur in triples.
                 // `TriplesLayout::new` already checked pairs against triples.
                 let counts = dictionary.counts();

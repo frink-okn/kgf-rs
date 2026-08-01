@@ -245,8 +245,9 @@ The reason is not speed. Without the split, every query would re-validate and
 `.expect()`, so a malformed bundle would panic on some later request instead of
 being refused by `Store::open` with a path and a remedy — which contradicts doc
 20 §20.8 and this crate's "shapes validated once" rule. Building a spec reads no
-payload, so open stays header-only, and the ~30 checks per bundle replace 8–16
-per query forever. A projection running from the region's offset to end-of-file
+payload, so that validation is bounded independently of bundle size, and the ~30
+checks per bundle replace 8–16 per query forever. A projection running from the
+region's offset to end-of-file
 also hands each view its trailing slack for free, keeping the widened read path
 live without a caller ever naming a slack constant.
 

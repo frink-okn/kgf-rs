@@ -24,10 +24,11 @@
 //! are deployment notes, not design constraints.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use crate::error::{Error, Result};
+use crate::map::{PublishedBundle, PublishedRoot};
 use crate::store::{OpenOptions, Store};
 
 /// A dataset and version, the catalog's key.
@@ -42,14 +43,14 @@ pub struct BundleId {
 /// The set of known bundles, opened on demand.
 #[derive(Debug)]
 pub struct Catalog {
-    root: PathBuf,
+    root: PublishedRoot,
     opts: OpenOptions,
     entries: BTreeMap<BundleId, CatalogEntry>,
 }
 
 #[derive(Debug)]
 struct CatalogEntry {
-    path: PathBuf,
+    bundle: PublishedBundle,
     state: Mutex<EntryState>,
     ready: Condvar,
 }
@@ -64,9 +65,12 @@ enum EntryState {
 
 impl Catalog {
     /// Scan `root` for `{dataset}/{version}/` directories without opening any.
-    pub fn scan(root: &Path, opts: OpenOptions) -> Result<Self> {
+    ///
+    /// The [`PublishedRoot`] capability records the external immutability
+    /// invariant required by every file-backed mapping the catalog may open.
+    pub fn scan(root: PublishedRoot, opts: OpenOptions) -> Result<Self> {
         let mut entries = BTreeMap::new();
-        for dataset_entry in directory_entries(root)? {
+        for dataset_entry in directory_entries(root.path())? {
             let dataset = directory_name(&dataset_entry)?;
             for version_entry in directory_entries(&dataset_entry.path())? {
                 let version = directory_name(&version_entry)?;
@@ -76,7 +80,7 @@ impl Catalog {
                         version,
                     },
                     CatalogEntry {
-                        path: version_entry.path(),
+                        bundle: root.bundle(version_entry.path()),
                         state: Mutex::new(EntryState::Closed),
                         ready: Condvar::new(),
                     },
@@ -84,7 +88,7 @@ impl Catalog {
             }
         }
         Ok(Self {
-            root: root.to_path_buf(),
+            root,
             opts,
             entries,
         })
@@ -92,7 +96,7 @@ impl Catalog {
 
     /// The directory whose dataset/version children were scanned.
     pub fn root(&self) -> &Path {
-        &self.root
+        self.root.path()
     }
 
     /// Every known bundle, whether open or not.
@@ -115,7 +119,7 @@ impl Catalog {
 
     fn get_with<F>(&self, id: &BundleId, open: F) -> Result<Arc<Store>>
     where
-        F: Fn(&Path, OpenOptions) -> Result<Store>,
+        F: Fn(&PublishedBundle, OpenOptions) -> Result<Store>,
     {
         let entry = self.entry(id)?;
         loop {
@@ -136,7 +140,7 @@ impl Catalog {
                     let mut claim = OpenClaim::begin(entry, &mut state);
                     drop(state);
 
-                    return match open(&entry.path, self.opts) {
+                    return match open(&entry.bundle, self.opts) {
                         Ok(store) => {
                             let store = Arc::new(store);
                             claim.settle(EntryState::Open(Arc::clone(&store)));
@@ -280,7 +284,7 @@ fn lock(entry: &CatalogEntry) -> MutexGuard<'_, EntryState> {
 
 fn bundle_open_error(entry: &CatalogEntry, source: Arc<Error>) -> Error {
     Error::BundleOpen {
-        bundle: entry.path.clone(),
+        bundle: entry.bundle.path().to_path_buf(),
         source,
     }
 }
@@ -289,7 +293,7 @@ fn bundle_open_error(entry: &CatalogEntry, source: Arc<Error>) -> Error {
 mod tests {
     use super::*;
     use crate::pattern::IdPattern;
-    use crate::testing::{Fixture, TINY_NT};
+    use crate::testing::{Fixture, TINY_NT, published_root};
     use std::sync::Barrier;
 
     #[test]
@@ -301,7 +305,7 @@ mod tests {
         std::fs::create_dir_all(root.path().join("zeta/1")).unwrap();
         std::fs::write(root.path().join("not-a-dataset"), b"ignored").unwrap();
 
-        let catalog = Catalog::scan(root.path(), OpenOptions::default()).unwrap();
+        let catalog = Catalog::scan(published_root(root.path()), OpenOptions::default()).unwrap();
         assert_eq!(catalog.root(), root.path());
         assert_eq!(
             catalog.ids(),
@@ -343,7 +347,8 @@ mod tests {
         let fixture = Fixture::build(TINY_NT);
         let root = tempfile::tempdir().unwrap();
         fixture.copy_bundle_to(&root.path().join("dataset/version"));
-        let catalog = Arc::new(Catalog::scan(root.path(), OpenOptions::default()).unwrap());
+        let catalog =
+            Arc::new(Catalog::scan(published_root(root.path()), OpenOptions::default()).unwrap());
         let bundle = id("dataset", "version");
         let barrier = Arc::new(Barrier::new(THREADS));
 
@@ -375,16 +380,16 @@ mod tests {
         let fixture = Fixture::build(TINY_NT);
         let root = tempfile::tempdir().unwrap();
         fixture.copy_bundle_to(&root.path().join("dataset/version"));
-        let catalog = Catalog::scan(root.path(), OpenOptions::default()).unwrap();
+        let catalog = Catalog::scan(published_root(root.path()), OpenOptions::default()).unwrap();
         let bundle = id("dataset", "version");
         let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let open = |path: &Path, opts| {
+        let open = |bundle: &PublishedBundle, opts| {
             if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 Err(Error::Io(std::io::Error::other(
                     "temporary descriptor pressure",
                 )))
             } else {
-                Store::open(path, opts)
+                Store::open(bundle, opts)
             }
         };
 
@@ -415,12 +420,12 @@ mod tests {
         fixture.copy_bundle_to(&bundle);
         std::fs::write(bundle.join(crate::store::artifact::PERM), [0u8; 100]).unwrap();
 
-        let catalog = Catalog::scan(root.path(), OpenOptions::default()).unwrap();
+        let catalog = Catalog::scan(published_root(root.path()), OpenOptions::default()).unwrap();
         let id = id("dataset", "version");
         let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let open = |path: &Path, opts| {
+        let open = |published: &PublishedBundle, opts| {
             attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Store::open(path, opts)
+            Store::open(published, opts)
         };
 
         let first = catalog.get_with(&id, open).expect_err("must refuse");
@@ -444,15 +449,19 @@ mod tests {
         let fixture = Fixture::build(TINY_NT);
         let root = tempfile::tempdir().unwrap();
         fixture.copy_bundle_to(&root.path().join("dataset/version"));
-        let catalog = Arc::new(Catalog::scan(root.path(), OpenOptions::default()).unwrap());
+        let catalog =
+            Arc::new(Catalog::scan(published_root(root.path()), OpenOptions::default()).unwrap());
         let bundle = id("dataset", "version");
 
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            catalog.get_with(&bundle, |_: &Path, _: OpenOptions| -> Result<Store> {
-                panic!("an unimplemented open path panics by convention")
-            })
+            catalog.get_with(
+                &bundle,
+                |_: &PublishedBundle, _: OpenOptions| -> Result<Store> {
+                    panic!("an unimplemented open path panics by convention")
+                },
+            )
         }));
         std::panic::set_hook(hook);
         assert!(panicked.is_err(), "the panic must reach the caller");
@@ -488,7 +497,7 @@ mod tests {
             &root.path().join("dataset/dangling"),
         );
 
-        let catalog = Catalog::scan(root.path(), OpenOptions::default()).unwrap();
+        let catalog = Catalog::scan(published_root(root.path()), OpenOptions::default()).unwrap();
         assert_eq!(catalog.ids(), vec![id("dataset", "current")]);
         assert_eq!(catalog.get(&id("dataset", "current")).unwrap().triples(), 8);
     }
@@ -508,7 +517,7 @@ mod tests {
         let fixture = Fixture::build(TINY_NT);
         let root = tempfile::tempdir().unwrap();
         fixture.copy_bundle_to(&root.path().join("dataset/version"));
-        let catalog = Catalog::scan(root.path(), OpenOptions::default()).unwrap();
+        let catalog = Catalog::scan(published_root(root.path()), OpenOptions::default()).unwrap();
         let bundle = id("dataset", "version");
 
         let in_flight = catalog.get(&bundle).unwrap();
@@ -534,7 +543,8 @@ mod tests {
         for index in 0..BUNDLES {
             fixture.copy_bundle_to(&root.path().join(format!("dataset-{index}/version")));
         }
-        let catalog = Arc::new(Catalog::scan(root.path(), OpenOptions::default()).unwrap());
+        let catalog =
+            Arc::new(Catalog::scan(published_root(root.path()), OpenOptions::default()).unwrap());
         let ids = Arc::new(catalog.ids());
         let barrier = Arc::new(Barrier::new(THREADS));
 

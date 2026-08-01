@@ -59,8 +59,11 @@ surface stays small and audited, and everything above it is safe code over slice
 The soundness argument is written down in that module and must stay true: mapping a
 file is unsound in general, because another process can truncate it under a live
 slice. KGF relies on **published bundle versions being immutable** (doc 04 §4.6) plus
-the binding checks `Store::open` runs before any region is read. Anything that maps a
-file outside that guarantee does not belong in this crate.
+the binding checks `Store::open` runs before any query view is exposed. The unsafe
+constructors for `PublishedBundle` and `PublishedRoot` are where callers acknowledge
+that external immutability guarantee; safe store and catalog APIs require those
+capabilities rather than accepting arbitrary paths. Anything that maps a file outside
+that guarantee does not belong in this crate.
 
 ## Rules that are design decisions, not style
 
@@ -72,8 +75,8 @@ quietly.
    what an operation needs or that operation is absent from its manifest; a bundle
    missing a required artifact is refused at open with a message naming what to build.
    Concretely: `data.hdt.perm` is required and never derived at open, the HDT-FoQ
-   index is never read, and `data.hdt.graphs` without `data.hdt.graphs.idx` is
-   refused. If a fallback looks tempting, the answer is to build the artifact.
+   index is never read, and `data.hdt.graphs` and `data.hdt.graphs.idx` must occur
+   together. If a fallback looks tempting, the answer is to build the artifact.
    *Not* covered by this rule: one algorithm choosing between equivalent routes on
    cost — `s ? o` probing whichever endpoint is smaller emits in the same order from
    either route and resumes from the same cursor.

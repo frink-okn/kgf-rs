@@ -186,8 +186,9 @@ impl Permutations {
     /// the dictionary — sufficient to keep `level2_range` in range.
     ///
     /// Three `u64` loads: every rank directory already stores its population
-    /// count as its sentinel entry, so this stays a header-only open. That is
-    /// what makes it worth doing here rather than leaving to `kgf verify`.
+    /// count as its sentinel entry. This is bounded, size-independent open-time
+    /// I/O, rather than a payload scan; it prevents a malformed bundle from
+    /// moving its failure into a request.
     /// Payload CRCs are deliberately off the open path (doc 20 §20.6), so
     /// without this check a bundle whose directory disagrees with the
     /// dictionary opens cleanly and then panics inside a request.

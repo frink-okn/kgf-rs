@@ -58,7 +58,8 @@ be a self-referential struct. So the crate splits *validated shape* from *projec
 - A **spec** (`PackedSpec`, `BitmapSpec`, `BytesSpec`, `RankedSpec`) is validated
   offsets, lengths, widths, and derived arithmetic. Plain `Copy` data, `Send + Sync` by
   construction. Built **once at open**, where the file path is in hand for the error
-  message. Building one reads **no payload byte**, so open stays header-only.
+  message. Building one reads **no payload byte**, so this validation remains bounded
+  independently of bundle size.
 - A **view** (`PackedArray`, `BitmapView`, a `&[u8]`, `RankedBitmap`) is a spec projected
   onto a mapping. Projection is **infallible** — a bounds compare and a slice.
 
@@ -136,8 +137,9 @@ here (doc 20 §20.4 says so explicitly).
 **Locating sections in an HDT is a preamble walk, not a scan** — every section declares
 its own size, so the whole walk is about a dozen small reads. Measured on Ubergraph
 (2 504 078 921 bytes, N = 606 342 307): **map 88 µs, parse 2.5 ms**, which is the dozen
-page faults and nothing else. "Open is free" holds for `data.hdt` as well as the
-sidecar.
+page faults and nothing else. HDT section discovery therefore has fixed metadata I/O;
+the complete store open additionally reads a fixed number of rank sentinels and still
+does no size-dependent scan.
 
 **The HDT header is not a source of truth.** `triples()` is `ArrayZ`'s entry count and
 `DictCounts` comes from the four PFC preambles, because a header rewrite may change the
@@ -269,16 +271,17 @@ also close independently. There are 45 tests after this unit.
 ## Unit 8: store and lazy catalog
 
 `Store::open` now enforces doc 04's bundle boundary: `manifest.json`, `data.hdt`, and
-`data.hdt.perm` are required, and a graphs sidecar requires its graph index. Missing
-artifacts name `kgf build`, `hdtc perm`, or `hdtc graphs-index`; malformed and
-cross-HDT sidecars keep their classified context. Full digests and CRCs remain off
-the latency-sensitive open path as doc 20 §20.6 requires. `OpenOptions` is a reserved
+`data.hdt.perm` are required, and the graphs sidecar and its graph index must occur
+together. Missing artifacts name `kgf build`, `hdtc perm`, or `hdtc graphs-index`;
+malformed and cross-HDT sidecars keep their classified context. Full digests and CRCs
+remain off the latency-sensitive open path as doc 20 §20.6 requires. `OpenOptions` is a reserved
 empty type rather than carrying the earlier, contradictory checksum flag.
 
 The store maps through `map::open_published`, keeping the production unsafe block in
-the one audited module while making the published-version immutability premise
-explicit. It owns the two core mappings and validated specs; every read remains an
-immutable projection with no cache, lock, or interior mutability.
+the one audited module. Public `PublishedBundle`/`PublishedRoot` capabilities make the
+published-version immutability premise explicit before safe store or catalog APIs can
+map anything. It owns the capability, two core mappings, and validated specs; every
+read remains an immutable projection with no cache, lock, or interior mutability.
 
 `Catalog::scan` records UTF-8 `{dataset}/{version}` directories in deterministic order
 and opens nothing. Entry-local state provides singleflight on both successful and

@@ -51,8 +51,8 @@ use crate::map::{BitmapSpec, BitmapView, Mapping, PackedArray, PackedSpec};
 /// [`view`](RankedSpec::view) takes both files rather than one.
 ///
 /// Building a spec reads no payload — only the sizes the headers already
-/// declared — so binding every directory in a bundle stays part of a
-/// header-only open.
+/// declared — so binding every directory remains bounded, size-independent
+/// open-time work.
 #[derive(Debug, Clone, Copy)]
 pub struct RankedSpec {
     bitmap: BitmapSpec,
