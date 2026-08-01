@@ -94,8 +94,13 @@ impl Store {
         let perms = Permutations::open(hdt, perm)?;
 
         if let Some(graph_index_path) = graph_index_path {
-            hdtc::format::GraphIndex::open(&graph_index_path, &hdt_path).map_err(|error| {
-                match error {
+            // `verify_binding` rather than `open`: graph scoping is a later
+            // milestone, so what open owes a bundle today is a refusal when its
+            // index does not belong to this HDT (doc 20 §20.8). Opening the
+            // index would additionally build its two per-query layer readers —
+            // a file handle each — and then drop them here.
+            hdtc::format::GraphIndex::verify_binding(&graph_index_path, &hdt_path).map_err(
+                |error| match error {
                     GraphIndexOpenError::Binding { source } => Error::ArtifactBindingMismatch {
                         artifact: graph_index_path.clone(),
                         hdt: hdt_path.clone(),
@@ -113,8 +118,8 @@ impl Store {
                             dir.join(artifact::GRAPHS).display()
                         )))
                     }
-                }
-            })?;
+                },
+            )?;
         }
 
         Ok(Self {
