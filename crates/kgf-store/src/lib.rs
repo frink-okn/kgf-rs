@@ -30,9 +30,10 @@
 //!
 //! # Status
 //!
-//! Skeleton. The module boundaries and the public shape are settled; the bodies
-//! are not written. Every unimplemented entry point says so with `todo!()`
-//! rather than returning a plausible wrong answer.
+//! The mapped query core is implemented: immutable store opening, dictionary and
+//! permutation traversal, all eight triple patterns, and the lazy multi-tenant
+//! catalog. Composed optional-sidecar operations and the HTTP layer are later
+//! milestones in their owning modules/crates.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]

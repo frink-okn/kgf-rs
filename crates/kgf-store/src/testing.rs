@@ -175,8 +175,23 @@ impl Fixture {
             "hdtc create failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        std::fs::write(dir.path().join(MANIFEST), b"{}\n").expect("write fixture manifest");
 
         Self { dir }
+    }
+
+    /// Root of this complete minimal bundle.
+    pub fn bundle_path(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+
+    /// Copy the fixture's required artifacts into a catalog bundle directory.
+    pub fn copy_bundle_to(&self, destination: &std::path::Path) {
+        std::fs::create_dir_all(destination).expect("create fixture bundle directory");
+        for name in [MANIFEST, HDT, PERM] {
+            std::fs::copy(self.dir.path().join(name), destination.join(name))
+                .unwrap_or_else(|error| panic!("copy fixture artifact {name}: {error}"));
+        }
     }
 
     /// Path of `data.hdt`.
@@ -224,6 +239,7 @@ impl Fixture {
 }
 
 const HDT: &str = crate::store::artifact::HDT;
+const MANIFEST: &str = crate::store::artifact::MANIFEST;
 const PERM: &str = crate::store::artifact::PERM;
 
 /// Locate the `hdtc` binary: `$KGF_HDTC` if set, else the sibling checkout's

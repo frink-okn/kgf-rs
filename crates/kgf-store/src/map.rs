@@ -14,12 +14,12 @@
 //! [`crate::store::Store::open`] checks each sidecar's binding to its HDT before
 //! any region is read, so a swapped file is caught rather than mapped.
 //!
-//! That is a *project* invariant, though, not one this crate can enforce — so
-//! [`Mapping::open`] is an `unsafe fn` and the obligation is stated where a
-//! caller has to acknowledge it. Wrapping it in a safe function whose docs asked
-//! callers to be careful would be exactly the unsound pattern `memmap2` marks
-//! `unsafe` to avoid. Everything above `Mapping::open` is safe code over
-//! `&[u8]`.
+//! That is a *project* invariant, though, not one this crate can enforce.
+//! [`Mapping::open`] therefore stays unsafe for general callers. The safe public
+//! [`Store`](crate::store::Store) surface enters through the crate-private
+//! `open_published` boundary below, whose one unsafe block records the stronger
+//! premise that its path is a published bundle version. Everything above that
+//! boundary is safe code over `&[u8]`.
 //!
 //! # One element reader; the difference is framing
 //!
@@ -206,6 +206,19 @@ impl Mapping {
         }
         Ok(&self.mmap[offset as usize..end as usize])
     }
+}
+
+/// Map one artifact from a published, immutable bundle version.
+///
+/// This is the crate-private boundary used by [`Store`](crate::store::Store):
+/// callers of the safe store API name a bundle version, and doc 04 §4.6 makes
+/// immutability part of what a published version means. Keeping the one unsafe
+/// acknowledgement here preserves this module as the complete audited surface.
+pub(crate) fn open_published(path: &Path) -> Result<Mapping> {
+    // SAFETY: Store calls this only for artifacts in a published bundle version.
+    // Such a version is immutable for the lifetime of every Store opened from it
+    // (doc 04 §4.6), satisfying Mapping::open's external-file obligation.
+    unsafe { Mapping::open(path) }
 }
 
 /// Where a packed array lives and what shape it has, validated once.

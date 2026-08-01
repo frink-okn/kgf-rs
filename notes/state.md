@@ -1,4 +1,4 @@
-# Where kgf-rs stands — 2026-07-31 (unit 7 landed)
+# Where kgf-rs stands — 2026-07-31 (unit 8 landed)
 
 A point-in-time handoff. `CLAUDE.md` has the conventions and the design rules,
 `notes/plan.md` has the route and the recorded decisions, `../kgf/docs/20-read-layer.md`
@@ -18,8 +18,8 @@ All three are Jim's. hdtc is github.com/frink-okn/hdtc; kgf-rs has **no remote y
 
 | repo | branch | status |
 |---|---|---|
-| `kgf-rs` | `main` | no remote; units 1–7 implemented |
-| `kgf` | `main` | 2 commits ahead of `origin/main` |
+| `kgf-rs` | `main` | no remote; units 1–8 implemented |
+| `kgf` | `main` | 1 commit ahead of `origin/main` |
 | `hdtc` | `lib` | unit 3 is `0a31692`; unit 5 is `8cba61c` plus review fix `48f90f3` |
 
 **kgf-rs depends on hdtc through `48f90f3`.** Unit 3's scan forms are in `0a31692`;
@@ -28,7 +28,7 @@ classified open errors in `48f90f3` that preserve binding-error semantics.
 
 ## What is built
 
-Seven of eight units from `notes/plan.md`, all complete with tests. 45 tests, ~3 s,
+All eight units from `notes/plan.md`, complete with tests. 53 tests, ~5 s,
 clean under `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and
 `cargo doc` with no warnings.
 
@@ -40,9 +40,11 @@ clean under `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, an
 | `dict.rs` | **done** — mapped PFC `locate`/`extract`/`prefix_bounds`, role/shared arithmetic |
 | `perm.rs` | **done** — mapped POS/OPS and cross-file SPO rank binding; shared `BitmapTriples` projections |
 | `pattern.rs` | **done** — eight patterns, exact counts, positional paging/`at`, dual-route `s ? o` |
+| `store.rs` | **done** — required-artifact policy, immutable mapped store, cheap sidecar binding |
+| `catalog.rs` | **done** — lazy sorted catalog, singleflight opens, cached failures, Arc eviction |
 | `testing.rs` | shared test support (`Rng`, `bit`, golden ids/bundle, independent hdtc search) |
-| `error.rs` | complete enough to build on |
-| everything else | skeleton: real signatures and doc comments, `todo!()` bodies |
+| `error.rs` | **done for the query core** — structural, binding, lookup, and lazy-open context |
+| `kgf-server`, `kgf` binary | skeleton: real signatures and doc comments, `todo!()` bodies |
 
 `todo!()` is a convention here, not an oversight: an unimplemented path panics rather
 than returning a plausible wrong answer. Do not replace one with a default-returning
@@ -264,10 +266,37 @@ page sizes and every resume position. All eight representative shapes also agree
 hdtc's independent search path. Predicate/object count sums and POS/OPS pair counts
 also close independently. There are 45 tests after this unit.
 
+## Unit 8: store and lazy catalog
+
+`Store::open` now enforces doc 04's bundle boundary: `manifest.json`, `data.hdt`, and
+`data.hdt.perm` are required, and a graphs sidecar requires its graph index. Missing
+artifacts name `kgf build`, `hdtc perm`, or `hdtc graphs-index`; malformed and
+cross-HDT sidecars keep their classified context. Full digests and CRCs remain off
+the latency-sensitive open path as doc 20 §20.6 requires. `OpenOptions` is a reserved
+empty type rather than carrying the earlier, contradictory checksum flag.
+
+The store maps through `map::open_published`, keeping the production unsafe block in
+the one audited module while making the published-version immutability premise
+explicit. It owns the two core mappings and validated specs; every read remains an
+immutable projection with no cache, lock, or interior mutability.
+
+`Catalog::scan` records UTF-8 `{dataset}/{version}` directories in deterministic order
+and opens nothing. Entry-local state provides singleflight on both successful and
+failed opens; failures retain their classified `Store::open` source because published
+versions cannot repair themselves in place. `evict` resets the entry, prevents an
+older in-progress open from recaching itself, and drops only the catalog's `Arc`.
+
+Tests cover the required-artifact matrix, cross-HDT refusal, lazy discovery, unknown
+ids, shared first-open identity, cached failures, eviction with an in-flight clone,
+and 8 threads over 6 bundles for 80 mixed-pattern iterations under concurrent
+eviction. The local 6.6 GiB four-artifact Ubergraph bundle opened in about 12 ms and
+reported 606,342,307 triples. There are 53 tests after this unit.
+
 ## Next
 
-Unit 8, `store` and `catalog`: required-artifact checks, immutable store opening, lazy
-singleflight catalog entries, and concurrent eviction by dropping the final `Arc`.
+The eight-unit `kgf-store` query-core plan is complete. The next implementation
+milestone is M1's HTTP surface in `kgf-server`: cursor tokens, `/fragment`, `/count`,
+`/describe`, `/sample`, and `/manifest` over the catalog and immutable stores.
 
 Two smaller unit-3 follow-ups remain:
 

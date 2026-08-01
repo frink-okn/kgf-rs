@@ -193,14 +193,29 @@ position yields exactly the suffix. Predicate- and object-rooted count sums clos
 N, and `? p o` agrees between POS and OPS. There are 45 `kgf-store` tests after this
 unit.
 
-### 8. `store` and `catalog`
+### 8. `store` and `catalog` ✅
 
 Required-artifact checks with errors that name the command to run, cheap binding
 verification, `Arc<Store>`, lazy open with a singleflight guard, eviction by dropping
 the `Arc`.
 
-*Verified by* opening `ubergraph2` and by an N-threads × M-bundles stress under
-eviction.
+**What landed.** `Store::open` requires the manifest, HDT, and permutation sidecar,
+requires and cheaply binds `data.hdt.graphs.idx` whenever the graphs sidecar is
+present, maps through the module's single audited unsafe boundary, and preserves
+classified hdtc binding failures. Full checksums remain on the publish/`kgf verify`
+path; the stale open-time checksum flag was removed rather than ignored.
+
+`Catalog::scan` records sorted dataset/version directories without opening them.
+Each immutable entry moves through `Closed`, `Opening`, `Open(Arc<Store>)`, or a
+cached classified failure. First access is singleflight on success and failure;
+eviction resets any state to `Closed`, cannot let a superseded opener repopulate the
+entry, and drops only the catalog's `Arc`, so in-flight clones remain valid.
+
+*Verified by* opening the local four-artifact `ubergraph2` bundle in 12 ms and reading
+its 606,342,307-triple structural count; required-artifact and cross-HDT binding
+failures; concurrent first access sharing one `Arc`; eviction/reopen while an old
+clone stays live; and 8 threads × 6 bundles × 80 mixed-pattern iterations under
+concurrent eviction. There are 53 `kgf-store` tests after this unit.
 
 ## Testing spine
 

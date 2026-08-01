@@ -6,6 +6,7 @@
 //! naming what to build, because there is no degraded mode to fall into.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Result alias for store operations.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -63,6 +64,32 @@ pub enum Error {
         id: u64,
         /// The largest valid id in that role.
         maximum: u64,
+    },
+
+    /// A catalog lookup named no scanned dataset/version directory.
+    #[error("unknown bundle {dataset}/{version}")]
+    UnknownBundle {
+        /// Dataset identifier from the lookup.
+        dataset: String,
+        /// Version identifier from the lookup.
+        version: String,
+    },
+
+    /// A dataset or version directory name cannot be represented by the API.
+    #[error("bundle path is not valid UTF-8: {path}")]
+    NonUtf8BundlePath {
+        /// The directory whose final component is not UTF-8.
+        path: PathBuf,
+    },
+
+    /// A lazily opened catalog entry failed; concurrent waiters share `source`.
+    #[error("opening bundle {bundle}: {source}")]
+    BundleOpen {
+        /// The scanned bundle directory.
+        bundle: PathBuf,
+        /// The classified store-open failure cached for this immutable version.
+        #[source]
+        source: Arc<Error>,
     },
 
     /// A cursor was issued against different data or a different request.
