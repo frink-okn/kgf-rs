@@ -23,6 +23,31 @@
 //! explicit and the dictionary side is
 //! [hdtc's](hdtc::format::encode_literal) rather than ours.
 //!
+//! # IRIs are not validated, deliberately
+//!
+//! A bracketed IRI is taken as given: `<relative>`, `<//example.org/a>` and
+//! `<http://example.org/a b>` are all accepted, resolved against the dictionary,
+//! and answered with whatever is there. This looks like a missing check and is
+//! not one.
+//!
+//! The dictionary is the authority on what terms exist, and it holds all three.
+//! hdtc's parsers accept them — verified, not assumed — so a bundle really can
+//! contain an IRI that no validator would pass, and every OKN-scale graph
+//! contains some. Refusing such a term at the edge would make data that is
+//! present unreachable, with no way for a client to ask for it: the same
+//! failure that requiring brackets (§3.3) was introduced to remove.
+//!
+//! The two errors are not symmetric. Rejecting wrongly loses data permanently;
+//! accepting wrongly costs a less specific answer — "no rows" instead of "that
+//! is not an IRI" — for a request that was going to match nothing anyway. So
+//! the only refusals here are shapes the dictionary cannot hold at all: an
+//! unmatched bracket, an empty `<>`, and a bracket inside the IRI.
+//!
+//! What is worth having instead is a *diagnostic*: a bound position whose term
+//! is absent makes the answer provably empty, and saying which position that
+//! was is more useful than a syntax error would have been. That belongs to the
+//! envelope, unit 12.
+//!
 //! # Percent-encoding is not handled here
 //!
 //! Doc 03 §3.3 requires IRIs in GET URLs to be percent-encoded, but decoding
@@ -88,10 +113,27 @@ impl<'a> Literal<'a> {
     }
 
     /// A language-tagged literal.
+    ///
+    /// The tag is lowercased, for the reason [`Literal::typed`] folds
+    /// `xsd:string`: BCP 47 tags are case-insensitive, so `@EN` and `@en` are
+    /// one term, and the dictionary holds only the folded form (the RDF parsers
+    /// fold on ingest). Without this a client asking for `"Alice"@EN` is told
+    /// there are no rows — true of the string it sent, false of the term it
+    /// meant, and indistinguishable from an honest empty answer.
     pub fn tagged(value: impl Into<Cow<'a, str>>, language: impl Into<Cow<'a, str>>) -> Self {
+        let language = match language.into() {
+            Cow::Borrowed(tag) if tag.bytes().any(|byte| byte.is_ascii_uppercase()) => {
+                Cow::Owned(tag.to_ascii_lowercase())
+            }
+            Cow::Owned(mut tag) => {
+                tag.make_ascii_lowercase();
+                Cow::Owned(tag)
+            }
+            borrowed => borrowed,
+        };
         Self {
             value: value.into(),
-            kind: LiteralKind::Language(language.into()),
+            kind: LiteralKind::Language(language),
         }
     }
 
@@ -198,8 +240,8 @@ pub enum TermSyntaxError {
 
     /// One bracket, or a bracket inside the IRI.
     #[error(
-        "`{token}` has an unmatched `<` or `>`; write an IRI either bare \
-         (`http://example.org/a`) or wholly bracketed (`<http://example.org/a>`)"
+        "`{token}` has an unmatched `<` or `>`; an IRI is wholly bracketed, \
+         as `<http://example.org/a>`"
     )]
     UnbalancedIri {
         /// The offending token.
@@ -880,6 +922,42 @@ mod tests {
         assert_eq!(
             Term::parse("\"\"", &prefixes).unwrap(),
             Term::Literal(Literal::plain(""))
+        );
+    }
+
+    #[test]
+    fn a_language_tag_finds_its_term_whatever_case_it_arrives_in() {
+        // The fixture holds `"Alice"@en`. BCP 47 is case-insensitive and the
+        // builders fold on ingest, so every spelling below is the same term and
+        // must reach the same id. Getting this wrong returns zero rows for data
+        // that is present, which is why it is checked against a real dictionary
+        // rather than against `to_dictionary` alone.
+        let golden = Golden::build(TINY_NT);
+        let dictionary = golden.dictionary();
+        let prefixes = PrefixMap::default();
+
+        let canonical = Term::parse("\"Alice\"@en", &prefixes).unwrap();
+        let expected = canonical
+            .locate(&dictionary, Role::Object)
+            .expect("locate")
+            .expect("the fixture holds \"Alice\"@en");
+
+        for spelling in ["\"Alice\"@EN", "\"Alice\"@En", "\"Alice\"@eN"] {
+            let term = Term::parse(spelling, &prefixes).unwrap();
+            assert_eq!(term, canonical, "{spelling} is the same term as @en");
+            assert_eq!(
+                term.locate(&dictionary, Role::Object).expect("locate"),
+                Some(expected),
+                "{spelling} must reach the same id"
+            );
+        }
+
+        // Subtags fold too, and a tag that is already lowercase is untouched.
+        assert_eq!(
+            Term::parse("\"x\"@en-GB", &prefixes)
+                .unwrap()
+                .to_dictionary(),
+            "\"x\"@en-gb"
         );
     }
 
