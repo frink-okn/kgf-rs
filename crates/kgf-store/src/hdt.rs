@@ -310,6 +310,17 @@ impl<'a> BitmapTriples<'a> {
         }
     }
 
+    /// Level-1 keys in this permutation; ids run `1..=level1_count()`.
+    ///
+    /// One `u64` load: level 1 is implicit, so the count is the number of groups
+    /// `BitmapY` closes, which its rank directory already carries as the
+    /// population count. [`crate::perm::Permutations::open`] checks it against
+    /// the dictionary so that [`level2_range`](Self::level2_range) cannot be
+    /// reached out of range by a valid request.
+    pub fn level1_count(&self) -> u64 {
+        self.bitmap_y.count()
+    }
+
     /// The half-open `ArrayY` range holding level-1 key `first`'s level-2 values.
     ///
     /// Two select operations. `first` is 1-based, as HDT ids are.
@@ -318,7 +329,7 @@ impl<'a> BitmapTriples<'a> {
     ///
     /// Panics if `first` is not a level-1 key in this permutation.
     pub fn level2_range(&self, first: u64) -> Range<u64> {
-        let level1_count = self.bitmap_y.count();
+        let level1_count = self.level1_count();
         assert!(
             first != 0 && first <= level1_count,
             "level-1 key {first} out of range for {level1_count} keys"

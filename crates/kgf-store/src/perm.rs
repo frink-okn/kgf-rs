@@ -24,6 +24,7 @@ use hdtc::format::{
     PermutationSectionKind,
 };
 
+use crate::Role;
 use crate::error::{Error, Result};
 use crate::hdt::{BitmapTriples, HdtLayout, TriplesLayout};
 use crate::map::{BitmapSpec, Mapping, PackedSpec};
@@ -163,7 +164,7 @@ impl Permutations {
         let spo = PermutationSpec::spo(&index, &sidecar, *hdt_layout.spo())?;
         let triples = index.header().triples;
 
-        Ok(Self {
+        let permutations = Self {
             hdt,
             sidecar,
             hdt_layout,
@@ -171,7 +172,48 @@ impl Permutations {
             pos,
             ops,
             spo,
-        })
+        };
+        permutations.check_level1_key_spaces()?;
+        Ok(permutations)
+    }
+
+    /// Check that each permutation closes exactly as many level-1 groups as the
+    /// dictionary has terms in that role.
+    ///
+    /// Level 1 is implicit, so this is the one relationship between a
+    /// permutation's *payload* and the dictionary beside it, and it is what
+    /// makes [`crate::pattern::resolve`]'s id validation — which bounds ids by
+    /// the dictionary — sufficient to keep `level2_range` in range.
+    ///
+    /// Three `u64` loads: every rank directory already stores its population
+    /// count as its sentinel entry, so this stays a header-only open. That is
+    /// what makes it worth doing here rather than leaving to `kgf verify`.
+    /// Payload CRCs are deliberately off the open path (doc 20 §20.6), so
+    /// without this check a bundle whose directory disagrees with the
+    /// dictionary opens cleanly and then panics inside a request.
+    fn check_level1_key_spaces(&self) -> Result<()> {
+        let counts = self.hdt_layout.dictionary().counts();
+        for (role, keys, artifact) in [
+            (Role::Subject, self.spo().level1_count(), self.hdt.path()),
+            (
+                Role::Predicate,
+                self.pos().level1_count(),
+                self.sidecar.path(),
+            ),
+            (Role::Object, self.ops().level1_count(), self.sidecar.path()),
+        ] {
+            let terms = counts.len(role);
+            if keys != terms {
+                return Err(Error::Malformed {
+                    artifact: artifact.to_path_buf(),
+                    detail: format!(
+                        "level-1 bitmap closes {keys} groups, but the dictionary has \
+                         {terms} terms in the {role:?} id space"
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The POS permutation: predicate → objects → subjects.
@@ -397,6 +439,49 @@ mod tests {
             .expect_err("truncated sidecar must be refused");
         assert!(error.to_string().contains("data.hdt.perm"), "{error:#}");
         assert!(matches!(error, Error::Format(_)));
+    }
+
+    #[test]
+    fn a_directory_that_disagrees_with_the_dictionary_is_refused_at_open() {
+        // Payload CRCs are off the open path (doc 20 §20.6), so a directory
+        // that no longer describes its bitmap opens cleanly unless something
+        // cheap catches it. Overwriting POS's superrank sentinel — the entry
+        // `count()` reads — is exactly that case: without the check the bundle
+        // opens and `resolve(? p ?)` panics inside `level2_range` on the last
+        // predicate id.
+        let fixture = Fixture::build(TINY_NT);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("data.hdt.perm");
+        let mut bytes = std::fs::read(fixture.perm_path()).unwrap();
+
+        let index = PermutationIndex::open(&fixture.perm_path(), &fixture.hdt_path()).unwrap();
+        let sentinel = {
+            let section_type =
+                PermutationComponent::Pos.section_type(PermutationSectionKind::BitmapYSuperrank);
+            let section = index
+                .sections()
+                .iter()
+                .find(|section| section.section_type == section_type)
+                .expect("POS superrank section");
+            (section.offset + (section.entry_count - 1) * 8) as usize
+        };
+        let predicates = index.header().predicates;
+        bytes[sentinel..sentinel + 8].copy_from_slice(&(predicates + 1).to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = Permutations::open(fixture.map_hdt(), map_fixture(&path))
+            .expect_err("a directory that miscounts its keys must be refused");
+        match error {
+            Error::Malformed { artifact, detail } => {
+                assert_eq!(artifact, path);
+                assert!(detail.contains("Predicate id space"), "{detail}");
+                assert!(
+                    detail.contains(&format!("closes {} groups", predicates + 1)),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected a malformed-artifact error, got {other:#}"),
+        }
     }
 
     #[test]
