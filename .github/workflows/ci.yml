@@ -1,0 +1,63 @@
+# The golden-bundle tests are differential: hdtc builds the fixtures and
+# `hdtc search` answers them independently (doc 20 §20.9). That only means
+# anything if the hdtc under test is the current one, so CI checks out the
+# sibling repo and builds it here rather than trusting a developer's stale
+# `../hdtc/target`. The layout matches what `Cargo.toml`'s `path = "../hdtc"`
+# and `testing::hdtc_binary` expect: the two checkouts side by side.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out kgf-rs
+        uses: actions/checkout@v4
+        with:
+          path: kgf-rs
+
+      - name: Check out hdtc
+        uses: actions/checkout@v4
+        with:
+          repository: frink-okn/hdtc
+          path: hdtc
+
+      - name: Install the toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            kgf-rs
+            hdtc
+
+      # Release, because every fixture in the suite shells out to this binary
+      # to build a bundle; a debug hdtc dominates the run time.
+      - name: Build the hdtc binary
+        working-directory: hdtc
+        run: cargo build --release --bin hdtc
+
+      - name: cargo fmt
+        working-directory: kgf-rs
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        working-directory: kgf-rs
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        working-directory: kgf-rs
+        env:
+          KGF_HDTC: ${{ github.workspace }}/hdtc/target/release/hdtc
+        run: cargo test
