@@ -499,7 +499,7 @@ allocated per term is a map allocated per term.
 
 There are 105 tests after this unit.
 
-### 12. `envelope` — completeness and errors
+### 12. `envelope` — completeness and errors ✅
 
 Doc 03 §3.6's uniform vocabulary: `complete`, `truncation_reason`, `next`, `cardinality`
 with its `exact` flag, and the `KGF-Complete` / `KGF-Truncation-Reason` /
@@ -519,6 +519,41 @@ vocabulary now so the type cannot grow a stringly-typed escape hatch later.
 *Verified by* a property over every M1 operation: a response is either `complete: true`
 with no `next`, or `complete: false` with a `truncation_reason` and a resumable `next`
 — never any other combination — and the headers agree with the body in every format.
+
+**What landed.** The property above is not asserted on the way out, it is the only thing
+the type can express. `Completeness` is opaque, and its constructors are the whole API:
+`complete()` takes no cursor, `page_limit(next)` requires one, `cell_overflow()` and
+`partial_failure()` refuse one. "Incomplete with no reason" and "complete with a next
+page" are unconstructible rather than untested, which is the right shape for a rule doc
+03 §3.6 states as a prohibition.
+
+Writing it that way turned up a distinction the plan's sentence glosses: **not every
+truncation resumes.** The four interruption reasons stop an enumeration, which has a
+position to continue from; `cell_overflow` and `partial_failure` describe a result that
+is already as complete as it will get. A client that paged on those would ask for the
+same cell, get the same overflow, and loop. So `TruncationReason::resumes()` derives
+that from the reason rather than tracking it alongside, and the constructors' arity
+enforces it — `budget_exhausted` is the one that takes a reason as a value, and it
+asserts, because it is the only hole through which a non-resuming reason could acquire
+a cursor.
+
+The headers are checked as *agreement with the body* rather than against expected
+strings, so neither rendering can drift alone. That is the test the CSV/Parquet
+obligation actually needs: those formats carry `complete` only in the header, and a
+mismatch there is a protocol violation no body assertion would catch.
+
+`Cardinality` is `Exact(n)` or `Estimated { value, min }` rather than a value beside an
+`exact` flag, because §3.6's `min` lower bound is meaningless on an exact count — an
+exact count is its own bound.
+
+Errors are RFC 9457 with `type: about:blank`; `ErrorCode` is closed and carries its own
+`title` and status. Everything a client got wrong is 400 except
+`capability_not_available`, which is **501** — the request is well formed and would work
+against a bundle offering the capability, so it is the server that cannot, not the
+client that erred. `TermSyntaxError` converts straight through, its message becoming
+`detail`, which is why unit 11's messages name the token and the remedy.
+
+There are 113 tests after this unit.
 
 ### 13. The HTTP skeleton
 
@@ -768,6 +803,28 @@ following the code.
     object's `value` as a full IRI and does not consult the prefix map. The opposite
     reading would put the ambiguity back into the form that exists to escape it, but
     §3.3 does not say. Found in unit 11.
+14. **Is `truncation_reason` present-and-null on a complete response?** §3.4.1's example
+    shows `"complete": true, "next": null` — `next` present as null — and omits
+    `truncation_reason` entirely, while §3.6 lists both as things "JSON envelopes carry".
+    This implementation follows the example: `next` always present, `truncation_reason`
+    only when there is one. That asymmetry is awkward for a typed client, which now has
+    one nullable field and one optional one for the same condition; either rule is fine,
+    but §3.6 should state it rather than leave it to be read off an example. Two more
+    §3.6 fields, `scanned` and `returned`, are called "optional" without saying optional
+    *when* — presumably present on budgeted scans and absent otherwise, which is M2's
+    problem but the same sentence. Found in unit 12.
+15. **The error-code set is open-ended, which defeats its purpose.** §3.6 gives
+    `capability_not_available`, `cap_exceeded`, `bad_term_syntax` and an ellipsis, plus
+    `stale_cursor` elsewhere in the section. An agent can only "self-correct" against a
+    set it knows, so the list should be closed and normative. M1 additionally needs
+    `malformed_request`, `unsupported_format` and `not_found`, named here on that
+    reasoning; doc 03 should adopt, rename or replace them rather than let each
+    implementation invent its own. Two smaller pieces of the same question: §3.6 gives no
+    HTTP status per code — this implementation sends 400 for everything except
+    `capability_not_available` (**501**, since the request is well formed and another
+    bundle would answer it) and `not_found` (404) — and RFC 9457's `type` is
+    `about:blank` here because minting a problem-type URI means claiming a URL space the
+    project does not own yet. Found in unit 12.
 
 ## Not in this plan
 

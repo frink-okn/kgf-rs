@@ -35,9 +35,10 @@ Source/
 doc 20's read layer in full — mapped bundles, dictionary, all eight patterns with exact
 counts and positional paging, the lazy catalog, and the bundle manifest — and
 `kgf manifest` describes a hand-assembled bundle so it is servable. `kgf-server` has its
-two pure layers — `cursor` (tokens) and `term` (doc 03 §3.3 syntax in, term objects out,
-the per-request cache) — and nothing else: the envelope, the routes, and `serve` are
-still real signatures and doc comments over `todo!()` bodies.
+three pure layers — `cursor` (tokens), `term` (doc 03 §3.3 syntax in, term objects out,
+the per-request cache) and `envelope` (§3.6's completeness vocabulary and RFC 9457
+errors) — and nothing else: the routes and `serve` are still real signatures and doc
+comments over `todo!()` bodies.
 
 `todo!()` is a convention, not laziness — an unimplemented path panics rather than
 returning a plausible wrong answer. Do not replace one with a stub that returns a

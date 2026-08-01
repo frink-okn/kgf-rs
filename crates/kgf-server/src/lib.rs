@@ -18,15 +18,16 @@
 //!
 //! # Status
 //!
-//! [`cursor`] and [`term`] are implemented (`notes/plan.md` units 10–11). The
-//! response envelope and the routes are units 12–14; [`serve`] is still
-//! `todo!()`, which is the convention here rather than an oversight — an
-//! unimplemented path panics rather than returning a plausible wrong answer.
+//! [`cursor`], [`term`] and [`envelope`] are implemented (`notes/plan.md` units
+//! 10–12). The routes are units 13–14; [`serve`] is still `todo!()`, which is
+//! the convention here rather than an oversight — an unimplemented path panics
+//! rather than returning a plausible wrong answer.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod cursor;
+pub mod envelope;
 pub mod term;
 
 /// Server configuration.
