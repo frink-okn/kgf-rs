@@ -82,12 +82,13 @@ pub enum Error {
         path: PathBuf,
     },
 
-    /// A lazily opened catalog entry failed; concurrent waiters share `source`.
+    /// A lazily opened catalog entry failed. Deterministic failures retain the
+    /// same `source` until eviction; transient I/O failures may be retried.
     #[error("opening bundle {bundle}: {source}")]
     BundleOpen {
         /// The scanned bundle directory.
         bundle: PathBuf,
-        /// The classified store-open failure cached for this immutable version.
+        /// The classified store-open failure for this version.
         #[source]
         source: Arc<Error>,
     },

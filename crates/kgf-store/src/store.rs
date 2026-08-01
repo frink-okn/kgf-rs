@@ -12,6 +12,8 @@
 
 use std::path::{Path, PathBuf};
 
+use hdtc::format::GraphIndexOpenError;
+
 use crate::dict::Dictionary;
 use crate::error::{Error, Result};
 use crate::map::open_published;
@@ -92,11 +94,26 @@ impl Store {
         let perms = Permutations::open(hdt, perm)?;
 
         if let Some(graph_index_path) = graph_index_path {
-            hdtc::format::GraphIndex::open(&graph_index_path, &hdt_path).map_err(|source| {
-                Error::Format(source.context(format!(
-                    "opening graph index {}",
-                    graph_index_path.display()
-                )))
+            hdtc::format::GraphIndex::open(&graph_index_path, &hdt_path).map_err(|error| {
+                match error {
+                    GraphIndexOpenError::Binding { source } => Error::ArtifactBindingMismatch {
+                        artifact: graph_index_path.clone(),
+                        hdt: hdt_path.clone(),
+                        detail: format!("{source:#}"),
+                    },
+                    GraphIndexOpenError::Index { source } => Error::Format(source.context(
+                        format!("opening graph index {}", graph_index_path.display()),
+                    )),
+                    GraphIndexOpenError::Source { source } => Error::Format(
+                        source.context(format!("validating source HDT {}", hdt_path.display())),
+                    ),
+                    GraphIndexOpenError::Sidecar { source } => {
+                        Error::Format(source.context(format!(
+                            "opening graph sidecar {}",
+                            dir.join(artifact::GRAPHS).display()
+                        )))
+                    }
+                }
             })?;
         }
 
@@ -246,6 +263,38 @@ mod tests {
             Store::open(&bundle, OpenOptions::default()),
             Err(Error::ArtifactBindingMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn store_open_preserves_graph_index_binding_errors() {
+        let first = Fixture::build_quads(concat!(
+            "<http://example.org/s> <http://example.org/p> <http://example.org/o> ",
+            "<http://example.org/g> .\n",
+        ));
+        let other = Fixture::build_quads(concat!(
+            "<http://example.org/s> <http://example.org/p> <http://example.org/o> ",
+            "<http://example.org/g> .\n",
+            "<http://example.org/extra> <http://example.org/p> <http://example.org/o> ",
+            "<http://example.org/other-graph> .\n",
+        ));
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("mismatched-graph-index");
+        first.copy_bundle_to(&bundle);
+        std::fs::copy(
+            other.bundle_path().join(artifact::GRAPHS_IDX),
+            bundle.join(artifact::GRAPHS_IDX),
+        )
+        .unwrap();
+
+        match Store::open(&bundle, OpenOptions::default())
+            .expect_err("a graph index from another HDT must not bind")
+        {
+            Error::ArtifactBindingMismatch { artifact, hdt, .. } => {
+                assert_eq!(artifact, bundle.join(artifact::GRAPHS_IDX));
+                assert_eq!(hdt, bundle.join(artifact::HDT));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

@@ -151,23 +151,38 @@ impl Fixture {
     /// built: a fixture that silently skipped would leave every differential
     /// test in this crate passing vacuously.
     pub fn build(source: &str) -> Self {
+        Self::build_with(source, false)
+    }
+
+    /// Build a quad bundle with its graph sidecar and graph index.
+    pub fn build_quads(source: &str) -> Self {
+        Self::build_with(source, true)
+    }
+
+    fn build_with(source: &str, graphs: bool) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
-        let input = dir.path().join("input.nt");
+        let input = dir
+            .path()
+            .join(if graphs { "input.nq" } else { "input.nt" });
         std::fs::write(&input, source).expect("write fixture source");
 
         let hdtc = hdtc_binary();
-        let output = std::process::Command::new(&hdtc)
-            .args([
-                "create",
-                input.to_str().unwrap(),
-                "-o",
-                dir.path().join(HDT).to_str().unwrap(),
-                "--temp-dir",
-                dir.path().join("work").to_str().unwrap(),
-                "--memory-limit",
-                "64M",
-                "--perm",
-            ])
+        let mut command = std::process::Command::new(&hdtc);
+        command.args([
+            "create",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join(HDT).to_str().unwrap(),
+            "--temp-dir",
+            dir.path().join("work").to_str().unwrap(),
+            "--memory-limit",
+            "64M",
+            "--perm",
+        ]);
+        if graphs {
+            command.args(["--mode", "quads", "--graphs-index"]);
+        }
+        let output = command
             .output()
             .unwrap_or_else(|e| panic!("run {}: {e}", hdtc.display()));
         assert!(
@@ -185,10 +200,13 @@ impl Fixture {
         self.dir.path()
     }
 
-    /// Copy the fixture's required artifacts into a catalog bundle directory.
+    /// Copy the fixture's required and present optional artifacts into a bundle.
     pub fn copy_bundle_to(&self, destination: &std::path::Path) {
         std::fs::create_dir_all(destination).expect("create fixture bundle directory");
-        for name in [MANIFEST, HDT, PERM] {
+        for name in [MANIFEST, HDT, PERM, GRAPHS, GRAPHS_IDX] {
+            if !self.dir.path().join(name).exists() {
+                continue;
+            }
             std::fs::copy(self.dir.path().join(name), destination.join(name))
                 .unwrap_or_else(|error| panic!("copy fixture artifact {name}: {error}"));
         }
@@ -239,6 +257,8 @@ impl Fixture {
 }
 
 const HDT: &str = crate::store::artifact::HDT;
+const GRAPHS: &str = crate::store::artifact::GRAPHS;
+const GRAPHS_IDX: &str = crate::store::artifact::GRAPHS_IDX;
 const MANIFEST: &str = crate::store::artifact::MANIFEST;
 const PERM: &str = crate::store::artifact::PERM;
 

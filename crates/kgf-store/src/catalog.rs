@@ -103,10 +103,19 @@ impl Catalog {
     /// Get a bundle, opening it if this is its first request.
     ///
     /// A singleflight guard means concurrent first requests for the same
-    /// version open it once rather than N times. A failed open is cached with
-    /// its classified source until eviction: published versions are immutable,
-    /// so retrying the same files on every request cannot repair the failure.
+    /// version open it once rather than N times. Deterministic failures are
+    /// cached with their classified source until eviction: published versions
+    /// are immutable, so retrying the same files cannot repair them. Failures
+    /// rooted in OS I/O are not cached because descriptor pressure and similar
+    /// process conditions can recover without changing the bundle.
     pub fn get(&self, id: &BundleId) -> Result<Arc<Store>> {
+        self.get_with(id, Store::open)
+    }
+
+    fn get_with<F>(&self, id: &BundleId, open: F) -> Result<Arc<Store>>
+    where
+        F: Fn(&Path, OpenOptions) -> Result<Store>,
+    {
         let entry = self.entry(id)?;
         loop {
             let mut state = lock(entry);
@@ -127,7 +136,7 @@ impl Catalog {
                     *state = EntryState::Opening(Arc::clone(&token));
                     drop(state);
 
-                    let opened = Store::open(&entry.path, self.opts).map(Arc::new);
+                    let opened = open(&entry.path, self.opts).map(Arc::new);
                     let mut state = lock(entry);
                     let is_current = matches!(
                         &*state,
@@ -144,7 +153,11 @@ impl Catalog {
                         Err(error) => {
                             let error = Arc::new(error);
                             if is_current {
-                                *state = EntryState::Failed(Arc::clone(&error));
+                                *state = if has_io_cause(&error) {
+                                    EntryState::Closed
+                                } else {
+                                    EntryState::Failed(Arc::clone(&error))
+                                };
                                 entry.ready.notify_all();
                             }
                             return Err(bundle_open_error(entry, error));
@@ -202,6 +215,16 @@ fn bundle_open_error(entry: &CatalogEntry, source: Arc<Error>) -> Error {
     Error::BundleOpen {
         bundle: entry.path.clone(),
         source,
+    }
+}
+
+fn has_io_cause(error: &Error) -> bool {
+    match error {
+        Error::Io(_) => true,
+        Error::Format(source) => source
+            .chain()
+            .any(|cause| cause.downcast_ref::<std::io::Error>().is_some()),
+        _ => false,
     }
 }
 
@@ -288,6 +311,39 @@ mod tests {
                 .iter()
                 .all(|store| Arc::ptr_eq(&stores[0], store))
         );
+    }
+
+    #[test]
+    fn transient_open_failures_can_be_retried() {
+        let fixture = Fixture::build(TINY_NT);
+        let root = tempfile::tempdir().unwrap();
+        fixture.copy_bundle_to(&root.path().join("dataset/version"));
+        let catalog = Catalog::scan(root.path(), OpenOptions::default()).unwrap();
+        let bundle = id("dataset", "version");
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let open = |path: &Path, opts| {
+            if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err(Error::Io(std::io::Error::other(
+                    "temporary descriptor pressure",
+                )))
+            } else {
+                Store::open(path, opts)
+            }
+        };
+
+        let first = catalog
+            .get_with(&bundle, open)
+            .expect_err("the injected I/O failure must escape");
+        assert!(matches!(
+            first,
+            Error::BundleOpen { source, .. } if matches!(&*source, Error::Io(_))
+        ));
+
+        let store = catalog
+            .get_with(&bundle, open)
+            .expect("a later request must retry transient failures");
+        assert_eq!(store.triples(), 8);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
