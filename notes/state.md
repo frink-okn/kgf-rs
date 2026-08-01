@@ -1,9 +1,13 @@
 # Where kgf-rs stands — 2026-08-01 (unit 9 landed)
 
 A point-in-time handoff. `CLAUDE.md` has the conventions and the design rules,
-`notes/plan.md` has the route and the recorded decisions, `../kgf/docs/20-read-layer.md`
-is the spec. This file is the part that lives in neither: what is actually built, what
-was learned building it, and what is deliberately left open.
+`notes/plan.md` has the unit-by-unit route through M1 plus the decisions and the open
+questions for the design docs, `../kgf/docs/20-read-layer.md` is the spec. This file is
+the part that lives in none of them: what is actually built, what was learned building
+it, and what is deliberately left open.
+
+Written at a point in time and not maintained afterwards — where it and `plan.md`
+disagree about what exists, `plan.md` and the code win.
 
 ## The three repositories
 
@@ -353,33 +357,31 @@ digest usable for mirror verification, is a question for `../kgf`.
 
 ## Next
 
-`kgf-store` is complete for M1. The next milestone is M1's HTTP surface in
-`kgf-server`: cursor tokens, `/fragment`, `/count`, `/describe`, `/sample`, and
-`/manifest` over the catalog and immutable stores.
+`kgf-store` is complete for M1. What remains is M1's HTTP surface, planned as units
+10–14 in `notes/plan.md`: the cursor codec, term syntax, the response envelope, the HTTP
+skeleton, and the four query operations. That file has the ordering and the reasoning;
+this section records only what a fresh session should know before opening it.
 
-Two things to settle before handlers get written:
+**The stack is unchosen** — no `tokio`, `axum`, or `hyper` in the workspace. Unit 13
+decides it, and the trap is deferring: M1 has no body-carrying route, so a stack that
+cannot express HTTP QUERY looks fine until bindings QUERY arrives in M2.
 
-- **The HTTP stack is unchosen.** No `tokio`, `axum`, or `hyper` in the workspace yet.
-  Doc 03 §3.1 makes HTTP QUERY (RFC 10008) canonical with POST as a permanent fallback,
-  and extension-method routing is where general-purpose routers get awkward — worth a
-  spike before committing.
-- **The cursor codec is the natural first unit**: pure, no I/O, and the store side that
-  makes doc 20 §20.9's "resume at every position yields exactly the suffix" assertable
-  is already built and tested. Note that its `digest_prefix` does less than the doc
-  comments imply — versioned URLs are immutable (doc 04 §4.6), so a well-behaved client
-  paging a `/v/{version}/` URL cannot drift. The load-bearing parts are `request_hash`
-  (nothing else pins the *request*), and positions that are not scalar offsets at all:
-  `s ? o` resumes on a predicate id, bindings QUERY on an (input row, offset) pair, and
-  budgeted scans on a scan position plus an accumulated lower bound.
+**Start with unit 10, the cursor codec.** Pure, no I/O, and the store side that makes
+doc 20 §20.9's "resume at every position yields exactly the suffix" assertable is
+already built and tested. Read that unit before the module's own doc comments, which
+overstate what `digest_prefix` does.
 
-Two smaller unit-3 follow-ups remain:
+**M1 is not core-profile conformance.** Doc 20 §20.8's M1 omits bindings QUERY,
+`/void`, and `/summary` — all mandatory in doc 03 §3.1 — and includes the optional
+`/sample`. A deployment at the end of unit 14 serves useful traffic and cannot claim
+the profile.
 
-- `../kgf` doc 20 §20.4's io-primitives bullet still describes hdtc's `skip_*` forms as
-  what locates sections. It sanctioned the change that replaced them ("Where hdtc offers
-  only a materializing form, the fix is a preamble-only variant in hdtc"), but the bullet
-  is now an understatement of the façade; worth a sentence naming the scan forms and
-  `scan_hdt_sections`.
-- hdtc still has three further private copies of the section walk —
-  `hdt/reader.rs::open_hdt`, `hdt/input_adapter.rs`, and `index/mod.rs`'s own `skip_*`
-  trio. None are on KGF's path, so unit 3 left them alone; consolidating them onto the
-  scan forms is hdtc hygiene, not KGF work.
+Outbound spec questions accumulated across all nine units are collected under
+**Questions for `../kgf`** in `notes/plan.md`, including the two long-standing ones
+(doc 20 §20.4's stale io-primitives bullet, and `hdtc create` not defaulting to
+`--perm`).
+
+One item that is neither: hdtc still has three private copies of the section walk —
+`hdt/reader.rs::open_hdt`, `hdt/input_adapter.rs`, and `index/mod.rs`'s own `skip_*`
+trio. None are on KGF's path, so unit 3 left them alone; consolidating them onto the
+scan forms is hdtc hygiene, not KGF work.

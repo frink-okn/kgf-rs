@@ -41,8 +41,11 @@ still a skeleton: real signatures and doc comments over `todo!()` bodies.
 returning a plausible wrong answer. Do not replace one with a stub that returns a
 default.
 
-`notes/plan.md` has the route and the recorded decisions; `notes/state.md` is the
-point-in-time handoff. Both are kept current, so read them before planning work.
+**`notes/plan.md` is the implementation route** — units 1–14 through doc 20 §20.8's M1,
+the decisions each one had to make, and the **Questions for `../kgf`** that
+implementation surfaced. It is kept current; read it before planning work.
+`notes/state.md` is a point-in-time handoff, written at a moment and not maintained
+afterwards, so where the two disagree about what exists, `plan.md` and the code win.
 
 ## Project Preferences
 

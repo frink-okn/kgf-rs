@@ -1,12 +1,24 @@
-# kgf-store implementation plan
+# kgf-rs implementation plan
 
-The route from the current skeleton to a working query core: mapped `data.hdt` +
-`data.hdt.perm`, all eight patterns at doc 20 §20.2's bounds, exact counts, stable
-positional cursors. Spec references are to `../kgf/docs`.
+The route to doc 20 §20.8's **M1**: mapped `data.hdt` + `data.hdt.perm`, all eight
+patterns at doc 20 §20.2's bounds, exact counts, stable positional cursors, and the
+HTTP surface over them. Spec references are to `../kgf/docs`.
 
 Ordered so that every unit is verifiable when it lands rather than at the end. The
 first two touch nothing external — no hdtc, no files, no I/O — which is where the
-bit-twiddling everything else trusts belongs.
+bit-twiddling everything else trusts belongs. Units 10–12 have the same property on the
+server side: cursor tokens, term syntax, and the response envelope are all pure, and
+all testable against the golden bundle before a socket exists.
+
+**This is the implementation route, not the design and not the project roadmap.** The
+design is `../kgf` docs 01–20 and governs; doc 07 is the project roadmap across all of
+KGF; doc 20 §20.8 fixes the milestones. What lives here is the order in which this repo
+builds them and what each unit had to decide. `notes/state.md` is the point-in-time
+handoff — what is built, what was learned. When this file and a design document
+disagree, that is a bug in one of them.
+
+Units 1–9 are complete; each carries a **What landed** section written after the fact,
+which is where a unit's plan and its outcome are reconciled. Units 10–14 have none yet.
 
 ## Units
 
@@ -295,6 +307,140 @@ files is *not* the answer — doc 04 §4.1 and doc 20 §20.8 both make
 index should nonetheless be checksummed, given doc 04 §4.3 wants the digest usable for
 mirror verification, is a question for the design docs.
 
+### 10. `cursor` — the token codec
+
+Encode and decode doc 20 §20.7's token: version byte, content-digest prefix, operation
+id, canonical-request hash, permutation, position, and the reserved `binding_index` and
+`scan_position`. Plus the canonicalization the request hash is taken over — doc 03 §3.6
+makes a canonical form normative so that content-keyed caching hits, and for M1's GET
+routes that is the normalized query string.
+
+Pure: no I/O, no store, no HTTP. It lands before anything that needs it because the
+store side that makes its central property assertable is already built and tested.
+
+**What the token is actually for**, since the module's doc comments currently overstate
+one part. For the six contiguous patterns a position *is* a result offset —
+`Selection::page(from, limit)` takes exactly that — so the token is packaging. It earns
+its place on three other counts:
+
+- **Positions that are not offsets.** `s ? o` resumes on the last predicate id returned
+  (route-independent, doc 20 §20.2.1); bindings QUERY resumes on an (input row, offset)
+  pair; a budgeted scan resumes on a scan position plus an accumulated lower bound.
+  Only the first is M1, but doc 20 §20.7 fixes the token format from the first release,
+  so the room must exist now.
+- **`request_hash`.** A versioned URL pins the *data*; nothing pins the *request*. Two
+  requests differing only in a bound `s` are the same path with the same offset, and an
+  offset would silently page into a different result set.
+- **Opacity.** Published offsets become a contract clients index into, and random access
+  has a different cost profile from paging — `Selection::at` for `s ? o` walks the
+  bounded probe, which is why doc 03 §3.4.7 forbids `/sample` from calling it per
+  sample.
+
+`digest_prefix` is the weakest of the four and should be documented as such rather than
+as the reason: doc 04 §4.6 makes versioned URLs immutable, so a client paging
+`/v/{version}/` cannot drift. What it still catches is a client that rebuilds page-2
+URLs from `/latest/`, and a resume against a mirror serving different bytes under the
+same label — which doc 04 §4.3 names as a use of `content_digest`, and doc 05 §5.1
+assumes away.
+
+*Verified by* doc 20 §20.9's cursor properties, differentially against the store:
+resuming at every position of every pattern over the golden bundle yields exactly the
+suffix, at adversarial page sizes. Plus round-trip over the field space, and rejection
+of a tampered token, a foreign digest, and a foreign request hash — all as
+`stale_cursor`, undifferentiated, so a client learns nothing about data it did not
+query.
+
+### 11. `term` — syntax in, syntax out
+
+Doc 03 §3.3 parsing (bare and percent-encoded IRIs, CURIEs against the manifest prefix
+map, quoted literals with `@lang` and `^^datatype`, the JSON term-object form) and
+SPARQL Results JSON serialization of the term shapes rows carry.
+
+This is the boundary doc 20 §20.5 names: resolve to ids once on the way in, run over
+ids, materialize strings only while serializing. The per-request term cache belongs
+here too — a page of results repeats predicates and IRIs constantly, and `Store` is
+forbidden a cache precisely so this layer can have one without a lock.
+
+Still no HTTP.
+
+*Verified by* round-tripping every term in the golden bundle through parse → `locate` →
+`extract` → serialize; CURIE resolution against a generated manifest's prefix map,
+including a prefix that collides with a URI scheme (doc 03 §3.3 says the manifest wins
+only for declared prefixes); and malformed input producing `bad_term_syntax` rather
+than a plausible term.
+
+### 12. `envelope` — completeness and errors
+
+Doc 03 §3.6's uniform vocabulary: `complete`, `truncation_reason`, `next`, `cardinality`
+with its `exact` flag, and the `KGF-Complete` / `KGF-Truncation-Reason` /
+`KGF-Next-Cursor` headers that carry the same metadata for formats whose bodies cannot.
+Errors are RFC 9457 `application/problem+json` with a machine-readable `code`.
+
+Its own unit rather than a detail of the routes, for two reasons. Doc 20 §20.8 requires
+envelopes to follow doc 03 **from day one** — there is no phase where responses are
+shaped approximately. And the body/header duplication is a correctness obligation, not
+formatting: silent truncation is prohibited, so a CSV response that loses `complete`
+is a protocol violation rather than a cosmetic gap.
+
+M1 emits `page_limit` truncation only. The budget reasons (`time_budget`,
+`candidate_budget`, `response_bytes`) are M2 machinery, but they are part of the closed
+vocabulary now so the type cannot grow a stringly-typed escape hatch later.
+
+*Verified by* a property over every M1 operation: a response is either `complete: true`
+with no `next`, or `complete: false` with a `truncation_reason` and a resumable `next`
+— never any other combination — and the headers agree with the body in every format.
+
+### 13. The HTTP skeleton
+
+The stack decision, the catalog wired to routes, doc 03 §3.2's URL structure, the
+`latest` 307/308 (method-preserving — a 302 could rewrite a body-carrying QUERY to
+GET), `Cache-Control` and representation-specific `ETag` with `Vary: Accept`, the
+blocking-pool boundary, and `/manifest` as the one endpoint that proves the path end to
+end.
+
+**The decision this unit makes is the stack.** Nothing is chosen: no `tokio`, `axum`, or
+`hyper` in the workspace. Doc 03 §3.1 makes HTTP QUERY (RFC 10008) canonical with POST
+a permanent first-class fallback, and extension-method routing is where general-purpose
+routers get awkward. M1 has no body-carrying route — bindings QUERY is M2 — so this
+could be deferred, and that is exactly the trap: choosing a stack that cannot express
+QUERY and discovering it when M2 arrives. Settle it with a spike here.
+
+The blocking boundary is not incidental. A page fault stalls a thread, so a cold mmap
+read on the async reactor converts one slow request into a stalled server. Handlers
+hold an `Arc<Store>` and call synchronous store methods on a blocking pool
+(doc 20 §20.4).
+
+*Verified by* serving the golden bundles over a real listener: version resolution,
+`latest` redirect preserving method, immutable caching headers on versioned GETs,
+`ETag` varying by `Accept`, an unknown dataset and an unknown version answering
+distinctly, and a bundle whose open fails answering as a problem document rather than a
+panic.
+
+### 14. The four query operations
+
+`/fragment` (GET), `/count`, `/describe`, `/sample`, over units 10–13.
+
+Each is thin by then: parse terms to ids, resolve a `Selection`, page it, serialize.
+`/describe` is two enumerations (`out` and `in`) behind one envelope. `/sample` must
+enumerate `s ? o`'s bounded predicate result once and sample that request-local set
+rather than calling `at` per sample — doc 03 §3.4.7 states the exception and doc 20
+§20.2.1 is why.
+
+*Verified by* differential comparison against the store's own answers for every pattern
+shape (the store is already differential against `hdtc search`, so this checks the HTTP
+layer rather than re-checking the query core), exhaustive paging at adversarial page
+sizes through real cursors, and `cardinality` matching enumerated length.
+
+### What M1 is not
+
+**M1 is a strict subset of doc 03 §3.1's mandatory core profile.** That profile is
+`fragment` *including QUERY-with-bindings*, `count`, `describe`, and the description
+surface `manifest` + `void` + `summary`. Doc 20 §20.8's M1 omits bindings QUERY,
+`/void`, and `/summary`, and adds `/sample`, which is an optional capability. So a
+deployment at the end of unit 14 answers useful traffic but **cannot claim core-profile
+conformance** — that arrives with M2. Worth stating because "the mandatory operations"
+and "M1" read like the same set and are not.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
@@ -378,8 +524,49 @@ those follow a profile. This is the innermost read in the system, so it will get
 other — bindings joins want `RANDOM`, full-page enumeration wants readahead — and
 picking without measurement is guessing. Revisit with the §20.6 cold-start numbers.
 
+## Questions for `../kgf`
+
+Things implementation surfaced that the design documents own. Collected here because
+they are outbound — each is resolved by an edit in another repo, not by code here — and
+because scattered through prose they get lost. CLAUDE.md's rule applies: when code and
+spec disagree, say which is wrong rather than silently following the code.
+
+1. **Doc 20 §20.4's io-primitives bullet is out of date.** It still describes hdtc's
+   `skip_*` forms as what locates sections. It sanctioned the change that replaced them
+   ("Where hdtc offers only a materializing form, the fix is a preamble-only variant in
+   hdtc"), but the bullet now understates the façade; worth a sentence naming the scan
+   forms and `scan_hdt_sections`.
+2. **Doc 20 §20.5's `Range<TermId>` cannot represent every role prefix.** `dictionaryFour`
+   concatenates two independently sorted sections, so a subject or object prefix may
+   occupy two disjoint id ranges. The code follows the format (`PrefixBounds` returns up
+   to two); the single-range sketch is the bug. Found in unit 4.
+3. **Does `data.hdt.index.v1-1` belong in `content_digest`?** Doc 04 §4.1 lists it as a
+   conforming optional artifact and doc 20 §20.8 says no server reads it, so it must not
+   be refused — but doc 04 §4.3 wants the digest usable for mirror verification, which
+   argues every byte a bundle ships should be covered. Today `kgf manifest` excludes it.
+   Found in unit 9's review.
+4. **Doc 20 §20.7 overstates what a cursor's digest prefix does.** "No-loss/no-duplication
+   follows from positional resume against immutable data" is right, but doc 04 §4.6
+   already makes versioned URLs immutable, so a client paging `/v/{version}/` cannot
+   drift and the digest is not what saves it. The load-bearing parts are `request_hash`
+   and the positions that are not scalar offsets. Worth rebalancing the paragraph so the
+   next implementer does not infer the wrong priority. See unit 10.
+5. **Is M1 being a strict subset of the mandatory core profile intended?** Doc 20 §20.8's
+   M1 omits bindings QUERY, `/void`, and `/summary`, all mandatory in doc 03 §3.1, and
+   includes `/sample`, which is optional. Almost certainly deliberate — a milestone is
+   not a conformance claim — but the two lists read as though they should match.
+6. **`hdtc create` does not emit `.perm` unless passed `--perm`,** while doc 04 §4.1
+   makes it required. Either `kgf build` always passes the flag or hdtc's default
+   changes. Unresolved since unit 5; `testing::Fixture` and every hand-assembly recipe
+   pass it explicitly.
+
 ## Not in this plan
 
 Composed operations (`/search`, `/labels`, ranges, star, key resolution), graph
-scoping, and everything gated on a sidecar beyond `.perm`. Those are doc 20 §20.8's
-M2 and M3, and they compose through the `Store` this plan builds.
+scoping, bindings QUERY, and everything gated on a sidecar beyond `.perm`. Those are
+doc 20 §20.8's M2 and M3, and they compose through the `Store` and the envelope,
+cursor, and term layers this plan builds.
+
+`kgf build` is also absent, deliberately. Bundles are assembled with
+`hdtc create --perm` and described with `kgf manifest` (unit 9) until the server work
+is far enough along to say what the build pipeline owes it.
