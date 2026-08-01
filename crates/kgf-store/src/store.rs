@@ -73,41 +73,18 @@ impl Store {
     /// cannot be called with an unqualified path.
     pub fn open(bundle: &PublishedBundle, _opts: OpenOptions) -> Result<Self> {
         let dir = bundle.path();
-        require_file(dir, artifact::MANIFEST, "kgf build")?;
-        let hdt_path = require_file(dir, artifact::HDT, "kgf build")?;
-        let perm_path = require_file(
-            dir,
-            artifact::PERM,
-            format!("hdtc perm {}", hdt_path.display()),
-        )?;
+        // The manifest is what makes an artifact set a *bundle* (doc 04 §4.1),
+        // so it is required here and not by `ArtifactSet::resolve`, which the
+        // manifest generator uses on a bundle that does not have one yet.
+        require_file(dir, artifact::MANIFEST, "kgf manifest")?;
+        let artifacts = ArtifactSet::resolve(dir)?;
+        let hdt_path = artifacts.hdt.clone();
 
-        let graphs_path = optional_file(dir, artifact::GRAPHS)?;
-        let graph_index_path = optional_file(dir, artifact::GRAPHS_IDX)?;
-        match (&graphs_path, &graph_index_path) {
-            (Some(_), None) => {
-                return Err(Error::MissingRequiredArtifact {
-                    bundle: dir.to_path_buf(),
-                    artifact: artifact::GRAPHS_IDX.to_owned(),
-                    remedy: format!("hdtc graphs-index {}", hdt_path.display()),
-                });
-            }
-            (None, Some(index)) => {
-                return Err(Error::Malformed {
-                    artifact: index.clone(),
-                    detail: format!(
-                        "graph index is present without its required parent {}",
-                        dir.join(artifact::GRAPHS).display()
-                    ),
-                });
-            }
-            _ => {}
-        };
-
-        let hdt = open_published(bundle, &hdt_path)?;
-        let perm = open_published(bundle, &perm_path)?;
+        let hdt = open_published(bundle, &artifacts.hdt)?;
+        let perm = open_published(bundle, &artifacts.perm)?;
         let perms = Permutations::open(hdt, perm)?;
 
-        if let Some(graph_index_path) = graph_index_path {
+        if let Some(graph_index_path) = artifacts.graph_index {
             // `verify_binding` rather than `open`: graph scoping is a later
             // milestone, so what open owes a bundle today is a refusal when its
             // index does not belong to this HDT (doc 20 §20.8). Opening the
@@ -177,6 +154,64 @@ impl Store {
     }
 }
 
+/// The artifact paths a bundle directory provides, resolved and checked against
+/// doc 04 §4.1's required set.
+///
+/// Deliberately says nothing about `manifest.json`. A bundle needs one to be
+/// servable, but [`crate::manifest`] reads these same artifacts in order to
+/// *produce* that manifest, and demanding one there would be circular. Resolving
+/// the set is therefore separate from the check that a set is a complete bundle,
+/// which is [`Store::open`]'s first line.
+#[derive(Debug, Clone)]
+pub(crate) struct ArtifactSet {
+    pub(crate) hdt: PathBuf,
+    pub(crate) perm: PathBuf,
+    pub(crate) graphs: Option<PathBuf>,
+    pub(crate) graph_index: Option<PathBuf>,
+}
+
+impl ArtifactSet {
+    /// Resolve `dir`'s artifacts, requiring the ones with no fallback.
+    ///
+    /// The graph sidecar and its index must occur together: an index without
+    /// its parent is malformed, and a parent without its index would leave the
+    /// three index-side patterns to a per-candidate probe this crate does not
+    /// implement (doc 20 §20.7, §20.8).
+    pub(crate) fn resolve(dir: &Path) -> Result<Self> {
+        let hdt = require_file(dir, artifact::HDT, "kgf build")?;
+        let perm = require_file(dir, artifact::PERM, format!("hdtc perm {}", hdt.display()))?;
+
+        let graphs = optional_file(dir, artifact::GRAPHS)?;
+        let graph_index = optional_file(dir, artifact::GRAPHS_IDX)?;
+        match (&graphs, &graph_index) {
+            (Some(_), None) => {
+                return Err(Error::MissingRequiredArtifact {
+                    bundle: dir.to_path_buf(),
+                    artifact: artifact::GRAPHS_IDX.to_owned(),
+                    remedy: format!("hdtc graphs-index {}", hdt.display()),
+                });
+            }
+            (None, Some(index)) => {
+                return Err(Error::Malformed {
+                    artifact: index.clone(),
+                    detail: format!(
+                        "graph index is present without its required parent {}",
+                        dir.join(artifact::GRAPHS).display()
+                    ),
+                });
+            }
+            _ => {}
+        }
+
+        Ok(Self {
+            hdt,
+            perm,
+            graphs,
+            graph_index,
+        })
+    }
+}
+
 fn require_file(dir: &Path, name: &str, remedy: impl Into<String>) -> Result<PathBuf> {
     optional_file(dir, name)?.ok_or_else(|| Error::MissingRequiredArtifact {
         bundle: dir.to_path_buf(),
@@ -229,7 +264,10 @@ mod tests {
         let fixture = Fixture::build(TINY_NT);
         let root = tempfile::tempdir().unwrap();
         let cases = [
-            (artifact::MANIFEST, "kgf build"),
+            // The manifest names `kgf manifest` rather than `kgf build`: it is
+            // the one required artifact that can be produced for a bundle whose
+            // data is already built, which is what makes hand-assembly work.
+            (artifact::MANIFEST, "kgf manifest"),
             (artifact::HDT, "kgf build"),
             (artifact::PERM, "hdtc perm"),
         ];

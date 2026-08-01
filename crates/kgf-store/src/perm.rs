@@ -244,6 +244,15 @@ impl Permutations {
         self.triples
     }
 
+    /// The dictionary's per-role term counts, from the four PFC preambles.
+    ///
+    /// Public because a manifest records these (doc 04 §4.3) and
+    /// [`crate::manifest::BundleFacts`] must reach them without a `Store`, which
+    /// would require the manifest it is being used to write.
+    pub fn dict_counts(&self) -> &crate::dict::DictCounts {
+        self.hdt_layout.dictionary().counts()
+    }
+
     /// The host HDT mapping, for dictionary projections owned by `Store`.
     pub(crate) fn hdt_mapping(&self) -> &Mapping {
         &self.hdt

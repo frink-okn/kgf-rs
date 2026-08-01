@@ -217,6 +217,54 @@ failures; concurrent first access sharing one `Arc`; eviction/reopen while an ol
 clone stays live; and 8 threads × 6 bundles × 80 mixed-pattern iterations under
 concurrent eviction. There are 53 `kgf-store` tests after this unit.
 
+### 9. `manifest` — bundle identity, and `kgf manifest` ✅
+
+Not in the original eight: the query core does not need a manifest, but every M1
+endpoint does — `prefixes` for CURIE syntax in parameters (doc 03 §3.3), `id`/`version`
+for the response envelope, `capabilities` for routing, `content_digest` for ETags and
+cursor binding, `counts` for `/void` and `/summary`. Deferring `kgf build` means those
+have to come from somewhere, and hand-writing them is not it.
+
+**What landed.** `kgf_store::manifest` owns doc 04 §4.3's document: `Manifest` parses
+and serializes it, `BundleFacts::read` recovers the structural half from the artifacts,
+and `Manifest::verify_against` proves a manifest still describes the bytes beside it.
+`kgf manifest` writes one for a bundle assembled with `hdtc create --perm`.
+
+Three decisions worth naming:
+
+- **`Store::open` still does not parse the manifest.** It requires the file to exist —
+  a directory without one is not a bundle — and stops there. The query core answers
+  from `data.hdt` and `data.hdt.perm` alone, and keeping the parse out is what keeps
+  the store testable headless against fixtures carrying a `{}` placeholder.
+- **`BundleFacts::read` is the one path that opens artifacts without a manifest**,
+  because it is what produces one; requiring a manifest there is circular. Both it and
+  `Store::open` resolve artifacts through the same `ArtifactSet`, so the required-set
+  policy has one implementation.
+- **Checksums stay out of the read layer.** `content_digest_preimage` fixes the Merkle
+  recipe — artifacts sorted by name, `{name}  {sha256}\n`, hashed, prefixed `sha256:` —
+  and returns the preimage rather than the digest, so `kgf-store` never hashes a file.
+  The one place that reads whole artifacts is the binary, which is where doc 20 §20.6
+  puts full digests.
+
+Derived: counts, capabilities, sizes, checksums, `content_digest`. Asked for: identity
+and description, re-read from any manifest already present, so regenerating after a
+rebuild is `kgf manifest <dir>` with no flags. Capabilities are artifact-determined —
+`star`, `sample`, `terms`, `export` need only the required artifacts; `graphs` needs
+the sidecar pair; `search`, `range`, and `closure` are never guessed at, since a bundle
+cannot acquire them without acquiring an artifact.
+
+`created` dates the bundle, not the file, so it carries forward while the digest is
+unchanged. Regeneration over unchanged artifacts is therefore byte-identical.
+
+*Verified by* an end-to-end integration test over an hdtc-built bundle: artifacts alone
+are refused by `Store::open` naming `kgf manifest`; the generated manifest makes the
+bundle servable and agrees with the store's own counts; identity is inferred from the
+`{dataset}/{version}` layout; regeneration is byte-stable and carries descriptive
+fields; and rebuilding the artifacts makes `--check` fail naming `counts.triples` and
+the repair command. Plus unit tests for the capability rule, the digest preimage,
+manifest round-tripping, forward compatibility, and RFC 3339 formatting. There are 76
+tests after this unit.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that

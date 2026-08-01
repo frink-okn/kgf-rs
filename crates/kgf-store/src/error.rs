@@ -93,6 +93,51 @@ pub enum Error {
         source: Arc<Error>,
     },
 
+    /// A manifest is not JSON, or not the shape doc 04 §4.3 fixes.
+    #[error("manifest {path} is not a readable bundle manifest: {detail}")]
+    ManifestSyntax {
+        /// The manifest file.
+        path: PathBuf,
+        /// What the parser objected to.
+        detail: String,
+    },
+
+    /// A manifest declares a schema version this build does not read.
+    ///
+    /// Refused rather than parsed best-effort: `formats.manifest` exists so a
+    /// reader can tell "fields I don't know about" (fine, and ignored) from
+    /// "fields whose meaning changed" (not fine, and undetectable field by
+    /// field).
+    #[error(
+        "manifest {path} declares manifest format {found}, but this build reads format {supported}"
+    )]
+    UnsupportedManifestFormat {
+        /// The manifest file.
+        path: PathBuf,
+        /// The version it declares.
+        found: String,
+        /// The version this build understands.
+        supported: String,
+    },
+
+    /// A manifest no longer describes the artifacts beside it.
+    #[error(
+        "manifest {path} records {field} = {recorded}, but the artifacts contain {actual}; \
+         regenerate it with `{remedy}`"
+    )]
+    ManifestDisagreement {
+        /// The manifest file.
+        path: PathBuf,
+        /// The field that disagrees, in dotted form.
+        field: String,
+        /// What the manifest claims.
+        recorded: u64,
+        /// What the artifacts actually contain.
+        actual: u64,
+        /// The command that rewrites the manifest.
+        remedy: String,
+    },
+
     /// Anything the OS refused.
     #[error(transparent)]
     Io(#[from] std::io::Error),

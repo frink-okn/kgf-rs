@@ -1,4 +1,4 @@
-# Where kgf-rs stands — 2026-07-31 (unit 8 landed)
+# Where kgf-rs stands — 2026-08-01 (unit 9 landed)
 
 A point-in-time handoff. `CLAUDE.md` has the conventions and the design rules,
 `notes/plan.md` has the route and the recorded decisions, `../kgf/docs/20-read-layer.md`
@@ -28,7 +28,7 @@ classified open errors in `48f90f3` that preserve binding-error semantics.
 
 ## What is built
 
-All eight units from `notes/plan.md`, complete with tests. 53 tests, ~5 s,
+All nine units from `notes/plan.md`, complete with tests. 76 tests, ~8 s,
 clean under `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and
 `cargo doc` with no warnings.
 
@@ -43,8 +43,10 @@ clean under `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, an
 | `store.rs` | **done** — required-artifact policy, immutable mapped store, cheap sidecar binding |
 | `catalog.rs` | **done** — lazy sorted catalog, singleflight opens, cached failures, Arc eviction |
 | `testing.rs` | shared test support (`Rng`, `bit`, golden ids/bundle, independent hdtc search) |
-| `error.rs` | **done for the query core** — structural, binding, lookup, and lazy-open context |
-| `kgf-server`, `kgf` binary | skeleton: real signatures and doc comments, `todo!()` bodies |
+| `manifest.rs` | **done** — doc 04 §4.3 parse/serialize, `BundleFacts`, counts cross-check |
+| `error.rs` | **done for the query core** — structural, binding, lookup, lazy-open, manifest context |
+| `kgf` binary | `kgf manifest` implemented; `kgf serve` is `todo!()` behind a real CLI |
+| `kgf-server` | skeleton: real signatures and doc comments, `todo!()` bodies |
 
 `todo!()` is a convention here, not an oversight: an unimplemented path panics rather
 than returning a plausible wrong answer. Do not replace one with a default-returning
@@ -295,11 +297,55 @@ and 8 threads over 6 bundles for 80 mixed-pattern iterations under concurrent
 eviction. The local 6.6 GiB four-artifact Ubergraph bundle opened in about 12 ms and
 reported 606,342,307 triples. There are 53 tests after this unit.
 
+## Unit 9: the bundle manifest
+
+`kgf_store::manifest` owns doc 04 §4.3's document; `kgf manifest` writes one for a
+bundle assembled by hand. This unblocks server work without `kgf build`: bundles are
+now built with `hdtc create --perm` and described with `kgf manifest`.
+
+```sh
+hdtc create input.nt -o bundles/demo-kg/2026-08-01/data.hdt --perm
+kgf manifest bundles/demo-kg/2026-08-01 --prefix ex=http://example.org/
+kgf manifest bundles/demo-kg/2026-08-01 --check
+```
+
+`--id` and `--version` default to the `{dataset}/{version}` path components the catalog
+already requires, and every descriptive field is re-read from the manifest already
+present, so regenerating after a rebuild takes no flags. `--check` is what to run after
+touching artifacts; a stale manifest names the field that disagrees and the command
+that repairs it.
+
+`Store::open` still does not parse the manifest — it requires the file and stops — so
+the store stays testable headless and the 71 `kgf-store` tests keep their `{}`
+placeholder. The parse is `Manifest::read`, for the server to call. Counts are the
+cross-check because they are free to obtain; checksums are not verified at open, since
+that is a full read of every artifact and belongs to publish and `kgf verify`
+(doc 20 §20.6).
+
+**The one place in KGF that reads whole artifacts is the binary.** `kgf-store` never
+hashes a file: `content_digest_preimage` fixes the Merkle recipe and returns the
+preimage, and the binary hashes it. `kgf build` must reproduce that recipe.
+
 ## Next
 
-The eight-unit `kgf-store` query-core plan is complete. The next implementation
-milestone is M1's HTTP surface in `kgf-server`: cursor tokens, `/fragment`, `/count`,
-`/describe`, `/sample`, and `/manifest` over the catalog and immutable stores.
+`kgf-store` is complete for M1. The next milestone is M1's HTTP surface in
+`kgf-server`: cursor tokens, `/fragment`, `/count`, `/describe`, `/sample`, and
+`/manifest` over the catalog and immutable stores.
+
+Two things to settle before handlers get written:
+
+- **The HTTP stack is unchosen.** No `tokio`, `axum`, or `hyper` in the workspace yet.
+  Doc 03 §3.1 makes HTTP QUERY (RFC 10008) canonical with POST as a permanent fallback,
+  and extension-method routing is where general-purpose routers get awkward — worth a
+  spike before committing.
+- **The cursor codec is the natural first unit**: pure, no I/O, and the store side that
+  makes doc 20 §20.9's "resume at every position yields exactly the suffix" assertable
+  is already built and tested. Note that its `digest_prefix` does less than the doc
+  comments imply — versioned URLs are immutable (doc 04 §4.6), so a well-behaved client
+  paging a `/v/{version}/` URL cannot drift. The load-bearing parts are `request_hash`
+  (nothing else pins the *request*), and positions that are not scalar offsets at all:
+  `s ? o` resumes on a predicate id, bindings QUERY on an (input row, offset) pair, and
+  budgeted scans on a scan position plus an accumulated lower bound.
 
 Two smaller unit-3 follow-ups remain:
 

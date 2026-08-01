@@ -609,6 +609,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashbrown"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
 name = "hdtc"
 version = "1.2.0-beta.1"
 dependencies = [
@@ -657,6 +663,16 @@ name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
+
+[[package]]
+name = "indexmap"
+version = "2.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
+dependencies = [
+ "equivalent",
+ "hashbrown 0.17.1",
+]
 
 [[package]]
 name = "indicatif"
@@ -733,8 +749,12 @@ name = "kgf"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "kgf-server",
  "kgf-store",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "tracing",
 ]
 
@@ -755,6 +775,8 @@ dependencies = [
  "anyhow",
  "hdtc",
  "memmap2",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",
@@ -1284,6 +1306,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",

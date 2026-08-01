@@ -47,6 +47,7 @@ pub mod catalog;
 pub mod dict;
 pub mod error;
 pub mod hdt;
+pub mod manifest;
 pub mod pattern;
 pub mod perm;
 pub mod rank;
@@ -57,6 +58,7 @@ mod testing;
 
 pub use catalog::Catalog;
 pub use error::{Error, Result};
+pub use manifest::{BundleFacts, Capability, Manifest};
 pub use map::{PublishedBundle, PublishedRoot};
 pub use store::{OpenOptions, Store};
 

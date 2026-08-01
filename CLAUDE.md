@@ -29,12 +29,20 @@ Source/
 |---|---|
 | `kgf-store` | The memory-mapped read layer (doc 20). No HTTP, no async, no locks on the read path. |
 | `kgf-server` | The HTTP API (doc 03) over `kgf-store`: caps, budgets, cursors, formats. |
-| `kgf` | The binary. `kgf serve` now; `kgf build` when `kgf-build` lands. |
+| `kgf` | The binary. `kgf manifest` now, `kgf serve` next; `kgf build` when `kgf-build` lands. |
 
-**Status: skeleton.** Module boundaries and public shapes are settled; most bodies are
-`todo!()`. That is a convention, not laziness — an unimplemented path panics rather
-than returning a plausible wrong answer. Do not replace a `todo!()` with a stub that
-returns a default.
+**Status: the query core is built; the HTTP surface is not.** `kgf-store` implements
+doc 20's read layer in full — mapped bundles, dictionary, all eight patterns with exact
+counts and positional paging, the lazy catalog, and the bundle manifest — and
+`kgf manifest` describes a hand-assembled bundle so it is servable. `kgf-server` is
+still a skeleton: real signatures and doc comments over `todo!()` bodies.
+
+`todo!()` is a convention, not laziness — an unimplemented path panics rather than
+returning a plausible wrong answer. Do not replace one with a stub that returns a
+default.
+
+`notes/plan.md` has the route and the recorded decisions; `notes/state.md` is the
+point-in-time handoff. Both are kept current, so read them before planning work.
 
 ## Project Preferences
 

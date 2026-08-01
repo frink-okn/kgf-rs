@@ -68,6 +68,19 @@ pub const TINY_NT: &str = concat!(
     "_:b1 <http://example.org/type> <http://example.org/Thing> .\n",
 );
 
+/// A minimal quad fixture, for the cases that need the optional graph pair.
+///
+/// Two graphs with one shared triple, so the sidecar has something to
+/// distinguish rather than a single layer covering everything.
+pub const TINY_NQ: &str = concat!(
+    "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> ",
+    "<http://example.org/g1> .\n",
+    "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> ",
+    "<http://example.org/g2> .\n",
+    "<http://example.org/bob> <http://example.org/name> \"Bob\" ",
+    "<http://example.org/g2> .\n",
+);
+
 /// The golden fixture's triples in role-scoped id space.
 ///
 /// Dictionary lookup is independent of BitmapTriples traversal, so this is an
