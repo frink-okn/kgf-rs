@@ -182,30 +182,6 @@ impl Mapping {
     fn exact(&self, offset: u64, length: u64) -> &[u8] {
         &self.mmap[offset as usize..(offset + length) as usize]
     }
-
-    /// A sub-slice of the mapping, checked against its length.
-    ///
-    /// For one-off reads during a header walk. Repeatedly-read regions should
-    /// go through a [`PackedSpec`] or [`BitmapSpec`] instead.
-    ///
-    /// Regions are located by a section directory or a preamble walk, both of
-    /// which come from the file itself, so a range that does not fit means the
-    /// file is lying about its own shape.
-    pub fn region(&self, offset: u64, length: u64) -> Result<&[u8]> {
-        let end = offset.checked_add(length).ok_or_else(|| {
-            Error::Region(format!(
-                "region at {offset} of {length} bytes overflows u64"
-            ))
-        })?;
-        let total = self.mmap.len() as u64;
-        if end > total {
-            return Err(Error::Region(format!(
-                "region [{offset}, {end}) runs past the end of {} ({total} bytes)",
-                self.path.display()
-            )));
-        }
-        Ok(&self.mmap[offset as usize..end as usize])
-    }
 }
 
 /// Map one artifact from a published, immutable bundle version.
@@ -576,7 +552,14 @@ impl<'a> BitmapView<'a> {
     /// one file is why this type exists. `rank` supplies the bounded starting
     /// point from its directories and owns no bit layout of its own.
     pub fn select_from(&self, start: u64, k: u64) -> Option<u64> {
-        debug_assert_eq!(start % 8, 0, "scans start on a byte boundary");
+        // Once per `select1`, not once per element, so it is checked in every
+        // build rather than only in debug: `rank` derives `start` from block
+        // widths read out of a file header, and an unaligned start would make
+        // the scan below begin at the containing byte and return a position off
+        // by up to seven — a wrong answer where this type promises a panic.
+        // `rank::directory_shape` rejects such widths at bind time; this is the
+        // local statement of what that check buys.
+        assert_eq!(start % 8, 0, "scans start on a byte boundary");
         let mut remaining = k;
         let mut position = start;
 

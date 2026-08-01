@@ -58,10 +58,7 @@ pub struct RankedSpec {
     bitmap: BitmapSpec,
     superrank: PackedSpec,
     subrank: PackedSpec,
-    superblock_bits: u64,
-    subblock_bits: u64,
-    sentinel: u64,
-    subs_per_super: u64,
+    geometry: Geometry,
 }
 
 impl RankedSpec {
@@ -77,24 +74,18 @@ impl RankedSpec {
         superblock_bits: u32,
         subblock_bits: u32,
     ) -> Result<Self> {
-        let superblock_bits = u64::from(superblock_bits);
-        let subblock_bits = u64::from(subblock_bits);
-        let bits = bitmap.len();
-        let (want_super, want_sub) = directory_shape(bits, superblock_bits, subblock_bits)?;
-
-        check_directory(superrank.len(), want_super, "superrank", bits)?;
-        check_directory(subrank.len(), want_sub, "subrank", bits)?;
-        check_width(&superrank, SUPERRANK_WIDTH, "superrank")?;
-        check_width(&subrank, SUBRANK_WIDTH, "subrank")?;
-
+        let geometry = Geometry::new(
+            bitmap.len(),
+            ArrayShape::of(&superrank),
+            ArrayShape::of(&subrank),
+            superblock_bits,
+            subblock_bits,
+        )?;
         Ok(Self {
             bitmap,
             superrank,
             subrank,
-            superblock_bits,
-            subblock_bits,
-            sentinel: want_super.saturating_sub(1),
-            subs_per_super: superblock_bits / subblock_bits,
+            geometry,
         })
     }
 
@@ -105,11 +96,76 @@ impl RankedSpec {
             bitmap: self.bitmap.view(bitmap),
             superrank: self.superrank.view(directory),
             subrank: self.subrank.view(directory),
-            superblock_bits: self.superblock_bits,
-            subblock_bits: self.subblock_bits,
-            sentinel: self.sentinel,
-            subs_per_super: self.subs_per_super,
+            geometry: self.geometry,
         }
+    }
+}
+
+/// The length and element width of a directory array, from either side of the
+/// spec/view split.
+///
+/// Exists so the validation below is written once. Both constructors describe
+/// the same structure; only one of them is on the path a `Store` takes, and a
+/// second copy of these rules would be the copy no production request runs.
+#[derive(Debug, Clone, Copy)]
+struct ArrayShape {
+    len: u64,
+    width: u8,
+}
+
+impl ArrayShape {
+    fn of(array: &PackedSpec) -> Self {
+        Self {
+            len: array.len(),
+            width: array.width(),
+        }
+    }
+
+    fn of_view(array: &PackedArray<'_>) -> Self {
+        Self {
+            len: array.len(),
+            width: array.width(),
+        }
+    }
+}
+
+/// Block widths and the arithmetic derived from them, validated once against a
+/// bitmap length and its two directory arrays.
+#[derive(Debug, Clone, Copy)]
+struct Geometry {
+    superblock_bits: u64,
+    subblock_bits: u64,
+    /// Index of the sentinel superrank entry, i.e. `superrank.len() - 1`.
+    /// Pure arithmetic fixed at bind time; reading its *value* is deliberately
+    /// left to `count()` so that binding touches no payload page.
+    sentinel: u64,
+    /// Subblocks per superblock.
+    subs_per_super: u64,
+}
+
+impl Geometry {
+    fn new(
+        bits: u64,
+        superrank: ArrayShape,
+        subrank: ArrayShape,
+        superblock_bits: u32,
+        subblock_bits: u32,
+    ) -> Result<Self> {
+        let superblock_bits = u64::from(superblock_bits);
+        let subblock_bits = u64::from(subblock_bits);
+        let (want_super, want_sub) = directory_shape(bits, superblock_bits, subblock_bits)?;
+
+        check_directory(superrank.len, want_super, "superrank", bits)?;
+        check_directory(subrank.len, want_sub, "subrank", bits)?;
+        check_width(superrank, SUPERRANK_WIDTH, "superrank")?;
+        check_width(subrank, SUBRANK_WIDTH, "subrank")?;
+
+        Ok(Self {
+            superblock_bits,
+            subblock_bits,
+            sentinel: want_super.saturating_sub(1),
+            subs_per_super: superblock_bits / subblock_bits,
+        })
     }
 }
 
@@ -126,25 +182,13 @@ const SUBRANK_WIDTH: u8 = 16;
 /// Empty arrays are exempt: an empty dataset stores no directory at all
 /// (`permutation-index-format.md` §6.2), and an absent section declares no
 /// width.
-fn check_width(array: &PackedSpec, want: u8, name: &str) -> Result<()> {
-    if array.is_empty() || array.width() == want {
+fn check_width(array: ArrayShape, want: u8, name: &str) -> Result<()> {
+    if array.len == 0 || array.width == want {
         Ok(())
     } else {
         Err(Error::Region(format!(
             "{name} is {} bits per entry, expected {want}",
-            array.width()
-        )))
-    }
-}
-
-/// The same check over an already-projected view.
-fn check_view_width(array: &PackedArray<'_>, want: u8, name: &str) -> Result<()> {
-    if array.is_empty() || array.width() == want {
-        Ok(())
-    } else {
-        Err(Error::Region(format!(
-            "{name} is {} bits per entry, expected {want}",
-            array.width()
+            array.width
         )))
     }
 }
@@ -156,6 +200,16 @@ fn directory_shape(bits: u64, superblock_bits: u64, subblock_bits: u64) -> Resul
         return Err(Error::Region(
             "rank directory block widths must be non-zero".to_owned(),
         ));
+    }
+    // `select1` hands the bitmap a subblock boundary as a scan start, and
+    // scanning starts on a byte. The widths come out of the sidecar header, so
+    // this is validated here rather than assumed: a width that is not a whole
+    // number of bytes would otherwise be a silently wrong select position in a
+    // release build, where the scan's own precondition is not checked.
+    if !subblock_bits.is_multiple_of(8) {
+        return Err(Error::Region(format!(
+            "subblock width {subblock_bits} is not a whole number of bytes"
+        )));
     }
     if !superblock_bits.is_multiple_of(subblock_bits) {
         return Err(Error::Region(format!(
@@ -191,21 +245,16 @@ pub struct RankedBitmap<'a> {
     bitmap: BitmapView<'a>,
     superrank: PackedArray<'a>,
     subrank: PackedArray<'a>,
-    superblock_bits: u64,
-    subblock_bits: u64,
-    /// Index of the sentinel superrank entry, i.e. `superrank.len() - 1`.
-    /// Pure arithmetic fixed at bind time; reading its *value* is deliberately
-    /// left to `count()` so that binding touches no payload page.
-    sentinel: u64,
-    /// Subblocks per superblock.
-    subs_per_super: u64,
+    geometry: Geometry,
 }
 
 impl<'a> RankedBitmap<'a> {
     /// Bind already-projected views.
     ///
     /// The form for callers that already hold views; anything reached from a
-    /// `Store` should bind a [`RankedSpec`] at open instead.
+    /// `Store` should bind a [`RankedSpec`] at open instead. Both go through
+    /// the same private geometry validation, so there is one statement of what
+    /// a well-shaped directory is rather than one per constructor.
     pub fn new(
         bitmap: BitmapView<'a>,
         superrank: PackedArray<'a>,
@@ -213,24 +262,18 @@ impl<'a> RankedBitmap<'a> {
         superblock_bits: u32,
         subblock_bits: u32,
     ) -> Result<Self> {
-        let superblock_bits = u64::from(superblock_bits);
-        let subblock_bits = u64::from(subblock_bits);
-        let bits = bitmap.len();
-        let (want_super, want_sub) = directory_shape(bits, superblock_bits, subblock_bits)?;
-
-        check_directory(superrank.len(), want_super, "superrank", bits)?;
-        check_directory(subrank.len(), want_sub, "subrank", bits)?;
-        check_view_width(&superrank, SUPERRANK_WIDTH, "superrank")?;
-        check_view_width(&subrank, SUBRANK_WIDTH, "subrank")?;
-
+        let geometry = Geometry::new(
+            bitmap.len(),
+            ArrayShape::of_view(&superrank),
+            ArrayShape::of_view(&subrank),
+            superblock_bits,
+            subblock_bits,
+        )?;
         Ok(Self {
             bitmap,
             superrank,
             subrank,
-            superblock_bits,
-            subblock_bits,
-            sentinel: want_super.saturating_sub(1),
-            subs_per_super: superblock_bits / subblock_bits,
+            geometry,
         })
     }
 
@@ -254,7 +297,7 @@ impl<'a> RankedBitmap<'a> {
         if self.bitmap.is_empty() {
             return 0;
         }
-        self.superrank.get(self.sentinel)
+        self.superrank.get(self.geometry.sentinel)
     }
 
     /// Set bits strictly before `position`.
@@ -278,13 +321,13 @@ impl<'a> RankedBitmap<'a> {
             return self.count();
         }
 
-        let superblock = position / self.superblock_bits;
-        let subblock = position / self.subblock_bits;
+        let superblock = position / self.geometry.superblock_bits;
+        let subblock = position / self.geometry.subblock_bits;
         self.superrank.get(superblock)
             + self.subrank.get(subblock)
             + self
                 .bitmap
-                .count_ones_in(subblock * self.subblock_bits..position)
+                .count_ones_in(subblock * self.geometry.subblock_bits..position)
     }
 
     /// Position of the `i`-th set bit, zero-based.
@@ -296,21 +339,22 @@ impl<'a> RankedBitmap<'a> {
 
         // The last superblock whose prefix count has not yet passed `i`. The
         // sentinel entry holds `total`, so it is never selected.
-        let superblock = last_index_not_above(&self.superrank, 0, self.sentinel, i);
+        let superblock = last_index_not_above(&self.superrank, 0, self.geometry.sentinel, i);
         let base = self.superrank.get(superblock);
 
         // Within that superblock, the last subblock whose prefix count has not
         // passed `i`. The first subblock of a superblock always holds zero, so
         // the search always has a valid answer.
-        let first_sub = superblock * self.subs_per_super;
-        let last_sub = ((superblock + 1) * self.subs_per_super).min(self.subrank.len()) - 1;
+        let first_sub = superblock * self.geometry.subs_per_super;
+        let last_sub =
+            ((superblock + 1) * self.geometry.subs_per_super).min(self.subrank.len()) - 1;
         let subblock = last_index_not_above(&self.subrank, first_sub, last_sub, i - base);
 
         // Everything above located a bounded starting point; finding the bit
         // within it belongs to the bitmap, which owns bit order.
         let seen = base + self.subrank.get(subblock);
         self.bitmap
-            .select_from(subblock * self.subblock_bits, i - seen)
+            .select_from(subblock * self.geometry.subblock_bits, i - seen)
             .unwrap_or_else(|| panic!("directory claims {total} set bits but the bitmap has fewer"))
     }
 }
@@ -665,5 +709,30 @@ mod tests {
             PackedArray::new(&directory.superrank, bits / u64::from(SUPER) + 1, 64).unwrap();
         assert!(RankedBitmap::new(bitmap, full_super, sub, 1000, 512).is_err());
         assert!(RankedBitmap::new(bitmap, full_super, sub, 4096, 0).is_err());
+    }
+
+    #[test]
+    fn a_subblock_width_that_is_not_a_whole_number_of_bytes_is_rejected() {
+        // `select1` hands a subblock boundary to the bitmap as a scan start,
+        // and scans start on a byte. 4 divides 4096, so the nesting check would
+        // pass it; without the byte check a release build would scan from the
+        // containing byte and return positions off by up to seven.
+        let bits = 8192u64;
+        let bytes = make_bitmap(bits, 32, 3);
+        let directory = build_directory(&bytes, bits);
+        let bitmap = BitmapView::new(&bytes, bits).unwrap();
+        let superrank =
+            PackedArray::new(&directory.superrank, bits / u64::from(SUPER) + 1, 64).unwrap();
+        let subrank = PackedArray::new(&directory.subrank, bits / u64::from(SUB), 16).unwrap();
+
+        let error = RankedBitmap::new(bitmap, superrank, subrank, SUPER, 4)
+            .expect_err("a sub-byte subblock width must be refused");
+        assert!(
+            error.to_string().contains("whole number of bytes"),
+            "{error}"
+        );
+
+        // The widths version 1 actually writes are accepted.
+        assert!(RankedBitmap::new(bitmap, superrank, subrank, SUPER, SUB).is_ok());
     }
 }
