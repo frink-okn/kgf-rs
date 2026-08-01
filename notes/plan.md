@@ -442,14 +442,26 @@ so a client asking for `"a"^^xsd:string` must be answered from the term stored a
 `Literal::typed` folds it at construction, which is also what lets `==` mean "the same
 RDF term".
 
-Three parsing decisions doc 03 §3.3 does not settle, all recorded as questions below.
-Literals are **unescaped**, so the closing quote is the last one and `"a "b" c"` is one
-literal — the same rule hdtc reads the dictionary by, and the only one under which a
-term round-trips out through a response and back into a request unchanged. A
-**bracketed** IRI is refused rather than quietly accepted, so there is one spelling and
-the other says so. And `_:label` is a **blank node** before the CURIE rule sees it,
-which no sentence in §3.3 covers but every other reading of which makes blank nodes
-unaskable.
+**An IRI is bracketed and a CURIE is not** — `<http://x/a>` against `ex:a` — and neither
+form can be read as the other. This is a deliberate departure from §3.3 as written, made
+during the unit and recorded as decision 10 below rather than as a liberty. §3.3 accepts
+a bare IRI and resolves the ambiguity by guessing: "a token parses as a CURIE only when
+its prefix is declared in the manifest prefix map; otherwise as an IRI". Three things
+follow from that guess, and all of them are bad. The same string denotes different terms
+at different endpoints, because the answer depends on the manifest it is sent to. A
+bundle that declares `http:` — which §3.3 can only advise against — has IRIs no request
+can name. And a CURIE whose prefix is simply misspelled becomes an IRI whose scheme is
+the typo, so the server answers "no such term" for a request that was malformed. Under
+brackets none of those exist: an undeclared prefix is an error naming the two fixes, and
+declaring `http:` stops being a hazard at all. It costs `%3C`/`%3E` in a GET URL, on top
+of the escaping §3.3 already requires.
+
+Two more parsing decisions §3.3 does not settle, recorded as questions below. Literals
+are **unescaped**, so the closing quote is the last one and `"a "b" c"` is one literal —
+the same rule hdtc reads the dictionary by, and the only one under which a term
+round-trips out through a response and back into a request unchanged. And `_:label` is a
+**blank node** before the CURIE rule sees it, which no sentence in §3.3 covers but every
+other reading of which makes blank nodes unaskable.
 
 `TermCache` keys on (role, id), not id: the shared section gives a subject and an object
 the same id for the same string, but the role-only sections do not, and a cache that
@@ -688,21 +700,44 @@ following the code.
    softening it to "mirrors the shape of", since a client that takes it literally will
    write a parser that never matches. The code follows the examples; `format=srj` will
    be a second serialization in unit 14, not a rename of this one. Found in unit 11.
-10. **Are literals escaped in request syntax?** §3.3 gives `"Diabetes mellitus"@en` and
+10. **§3.3 must require angle brackets on IRIs. Decided, not open — doc 03 needs the
+    edit.** As written, §3.3 accepts a bare IRI alongside a CURIE and disambiguates by
+    guessing: "a token parses as a CURIE only when its prefix is declared in the manifest
+    prefix map; otherwise as an IRI". A syntax that admits both forms without a delimiter
+    has to guess, and no guess is right:
+
+    - The same string denotes different terms at different endpoints, since the reading
+      depends on the manifest of the bundle it was sent to. `dc:title` is a CURIE at one
+      KG and the IRI `dc:title` at the next — and federated clients (doc 05) send the
+      same pattern to many.
+    - A bundle declaring a prefix that collides with a scheme has IRIs no request can
+      name. §3.3 can only advise against declaring one; the advice does not help a client
+      facing a bundle that already did.
+    - A misspelled prefix silently becomes a URI scheme. `foaf:name` with `foaf`
+      undeclared is answered as the IRI `foaf:name` — "no such term", for a request whose
+      real problem was a typo.
+
+    The fix is Turtle's and SPARQL's, and it is what `kgf-server` implements: `<http://…>`
+    is an IRI, `p:local` is a CURIE whose prefix must be declared, and an undeclared
+    prefix is `bad_term_syntax` naming both remedies. This also applies to `^^datatype`,
+    the other slot taking either form. Cost: `%3C`/`%3E` in a GET URL, on top of the
+    escaping §3.3 already requires — cheap for removing every case above. §3.3's own
+    examples and its "datasets should not declare prefixes that collide with URI schemes"
+    sentence both need rewriting; the latter can simply go. Decided in unit 11.
+11. **Are literals escaped in request syntax?** §3.3 gives `"Diabetes mellitus"@en` and
     never says what a quote inside a value looks like. HDT stores values raw and finds
     the closing quote from the end (`hdtc/docs/text-index-format.md` §3.1), and matching
     that is the only rule under which a term can be copied out of a response and pasted
     back into a request. But it means `\"` is two literal characters, which will surprise
-    anyone arriving from N-Triples, so it should be stated rather than inferred. Also
-    unspecified: whether `<http://…>` and `^^<http://…>` are accepted. This
-    implementation refuses both with an error naming the fix. Found in unit 11.
-11. **Blank nodes are absent from §3.3.** The dictionary stores them, `/fragment` returns
+    anyone arriving from N-Triples, so it should be stated rather than inferred. Found in
+    unit 11.
+12. **Blank nodes are absent from §3.3.** The dictionary stores them, `/fragment` returns
     them, and doc 09 §9 discusses them as reifiers — but the term syntax section lists
     IRIs, literals and variables only, so `_:b1` would parse as an IRI under the letter
     of the rules. Treating a leading `_:` as a blank node is the only reading that lets a
     client ask about a term the server just returned. Worth one line in §3.3. Found in
     unit 11.
-12. **Does the JSON term-object form expand CURIEs?** §3.3 offers it as "the canonical
+13. **Does the JSON term-object form expand CURIEs?** §3.3 offers it as "the canonical
     form for terms that are awkward to escape", and it is described as the form "as in
     response rows", where IRIs are always full — so this implementation treats a term
     object's `value` as a full IRI and does not consult the prefix map. The opposite

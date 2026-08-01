@@ -11,15 +11,17 @@
 //!
 //! | syntax | example | who writes it |
 //! |---|---|---|
-//! | request | `mondo:0005015`, `"42"^^xsd:integer` | clients (§3.3) |
+//! | request | `mondo:0005015`, `<http://…>`, `"42"^^xsd:integer` | clients (§3.3) |
 //! | dictionary | `http://…/MONDO_0005015`, `"42"^^<http://…#integer>` | hdtc |
 //! | response | `{"type": "iri", "value": "http://…"}` | this crate (§3.4.1) |
 //!
-//! Request syntax abbreviates through the manifest's prefix map and writes a
-//! datatype the same way — `^^xsd:integer`. Dictionary syntax never abbreviates
-//! and always brackets a datatype. Conflating them is the bug that returns an
-//! empty page for data that is present, so the conversions are explicit and the
-//! dictionary side is [hdtc's](hdtc::format::encode_literal) rather than ours.
+//! Request syntax abbreviates through the manifest's prefix map, and brackets
+//! an IRI so that neither form can be read as the other — see [`Term::parse`],
+//! which deviates from §3.3 as written. Dictionary syntax never abbreviates,
+//! and brackets a datatype but not a term. Conflating the two is the bug that
+//! returns an empty page for data that is present, so the conversions are
+//! explicit and the dictionary side is
+//! [hdtc's](hdtc::format::encode_literal) rather than ours.
 //!
 //! # Percent-encoding is not handled here
 //!
@@ -170,23 +172,43 @@ pub enum TermSyntaxError {
     #[error("empty term; omit the parameter entirely to leave the position unbound")]
     Empty,
 
-    /// Doc 03 §3.3: "Unquoted values with `:` are IRIs; anything else is a 400."
+    /// Not a literal, not bracketed, and with no `:` to make it a CURIE.
     #[error(
-        "`{token}` is neither a quoted literal nor an IRI: an unquoted term needs a `:`, \
-         either a URI scheme or a prefix declared in this bundle's manifest"
+        "`{token}` is not a term: write an IRI in angle brackets (`<http://example.org/a>`), \
+         a CURIE against a prefix this bundle declares (`ex:a`), or a quoted literal"
     )]
     NotIriOrLiteral {
         /// The offending token.
         token: String,
     },
 
-    /// N-Triples habit. Rejected rather than accepted quietly, so that one
-    /// spelling of an IRI is right and the other says so.
-    #[error("`{token}` is bracketed; write the IRI bare, without `<` and `>`")]
-    BracketedIri {
+    /// A CURIE whose prefix this bundle does not declare — which is also what a
+    /// bare IRI looks like, so the message names that far more likely mistake
+    /// first.
+    #[error(
+        "`{token}` is a CURIE against the undeclared prefix `{prefix}`; if it is an IRI, \
+         bracket it as `<{token}>`, otherwise use a prefix this bundle's manifest declares"
+    )]
+    UndeclaredPrefix {
+        /// The offending token.
+        token: String,
+        /// The prefix that is not declared.
+        prefix: String,
+    },
+
+    /// One bracket, or a bracket inside the IRI.
+    #[error(
+        "`{token}` has an unmatched `<` or `>`; write an IRI either bare \
+         (`http://example.org/a`) or wholly bracketed (`<http://example.org/a>`)"
+    )]
+    UnbalancedIri {
         /// The offending token.
         token: String,
     },
+
+    /// `<>`. Turtle would read it as the base IRI; a request has no base.
+    #[error("`<>` is empty; a request has no base IRI to resolve it against")]
+    EmptyIri,
 
     /// A literal with no closing quote.
     #[error(
@@ -240,11 +262,24 @@ impl<'a> Term<'a> {
     /// Parse doc 03 §3.3 request syntax.
     ///
     /// `text` must already be percent-decoded — exactly once; see the module
-    /// documentation. Whether a token is a CURIE is decided only by whether its
-    /// prefix is declared: §3.3 says a dataset should not declare a prefix that
-    /// collides with a URI scheme, but if it does, the declaration wins and
-    /// `http:…` expands. That is deliberate — the alternative is a term whose
-    /// meaning depends on a list of schemes we would have to keep.
+    /// documentation.
+    ///
+    /// **An IRI is bracketed**: `<http://example.org/a>`, never bare. A bare
+    /// token containing `:` is a CURIE and nothing else, and its prefix must be
+    /// declared. This is Turtle's and SPARQL's rule and it is not optional
+    /// decoration — a parameter that accepts both forms without a delimiter has
+    /// to guess, and every guessing rule is wrong for some dataset. Doc 03
+    /// §3.3's own rule ("a token parses as a CURIE only when its prefix is
+    /// declared; otherwise as an IRI") makes a term's meaning depend on the
+    /// manifest of the bundle it is sent to, so the same string denotes
+    /// different things at different endpoints, and a bundle declaring `http:`
+    /// has IRIs that no request can name at all.
+    ///
+    /// This deviates from §3.3 as written; see `notes/plan.md`, "Questions for
+    /// `../kgf`", which records it as a decision for the doc rather than an
+    /// implementation liberty.
+    ///
+    /// A leading `_:` is a blank node, also unmentioned by §3.3.
     pub fn parse(text: &'a str, prefixes: &PrefixMap) -> Result<Self, TermSyntaxError> {
         if text.is_empty() {
             return Err(TermSyntaxError::Empty);
@@ -343,15 +378,36 @@ impl<'a> Term<'a> {
     }
 }
 
-/// Parse an IRI or a CURIE, the form a datatype also takes.
+/// Parse a bracketed IRI or a CURIE, the pair a datatype also takes.
+///
+/// Brackets are **required** on an IRI, exactly as in Turtle and SPARQL, and
+/// exactly because both forms are accepted here: a syntax that admits IRIs and
+/// CURIEs without a delimiter has to guess which it was handed, and there is no
+/// rule that guesses right. Bracketing is the delimiter, so nothing is
+/// inferred — `<http://x/a>` is an IRI, `p:a` is a CURIE, and each fails
+/// loudly rather than becoming the other.
 fn parse_iri_syntax<'a>(
     text: &'a str,
     prefixes: &PrefixMap,
 ) -> Result<Cow<'a, str>, TermSyntaxError> {
     if text.starts_with('<') || text.ends_with('>') {
-        return Err(TermSyntaxError::BracketedIri {
+        let unbalanced = || TermSyntaxError::UnbalancedIri {
             token: text.to_owned(),
-        });
+        };
+        let iri = text
+            .strip_prefix('<')
+            .ok_or_else(unbalanced)?
+            .strip_suffix('>')
+            .ok_or_else(unbalanced)?;
+        if iri.is_empty() {
+            return Err(TermSyntaxError::EmptyIri);
+        }
+        // `<` and `>` are not IRI characters (RFC 3987 §2.2), so either one
+        // inside means the brackets do not delimit what the client thought.
+        if iri.contains(['<', '>']) {
+            return Err(unbalanced());
+        }
+        return Ok(Cow::Borrowed(iri));
     }
     let Some((prefix, local)) = text.split_once(':') else {
         return Err(TermSyntaxError::NotIriOrLiteral {
@@ -360,7 +416,10 @@ fn parse_iri_syntax<'a>(
     };
     match prefixes.namespace(prefix) {
         Some(namespace) => Ok(Cow::Owned(format!("{namespace}{local}"))),
-        None => Ok(Cow::Borrowed(text)),
+        None => Err(TermSyntaxError::UndeclaredPrefix {
+            token: text.to_owned(),
+            prefix: prefix.to_owned(),
+        }),
     }
 }
 
@@ -615,7 +674,7 @@ mod tests {
     /// independently.
     fn as_request_syntax(term: &Term<'_>) -> String {
         match term {
-            Term::Iri(iri) => iri.to_string(),
+            Term::Iri(iri) => format!("<{iri}>"),
             Term::BlankNode(label) => format!("_:{label}"),
             Term::Literal(literal) => match literal.kind() {
                 LiteralKind::Plain => format!("\"{}\"", literal.value()),
@@ -623,9 +682,28 @@ mod tests {
                     format!("\"{}\"@{}", literal.value(), language)
                 }
                 LiteralKind::Datatype(datatype) => {
-                    format!("\"{}\"^^{}", literal.value(), datatype)
+                    format!("\"{}\"^^<{}>", literal.value(), datatype)
                 }
             },
+        }
+    }
+
+    /// The same term written with a CURIE wherever `namespace` covers it.
+    ///
+    /// The other spelling of the same thing, so that the round trip proves both
+    /// forms name one term rather than only that brackets survive.
+    fn as_curie_syntax(term: &Term<'_>, prefix: &str, namespace: &str) -> Option<String> {
+        match term {
+            Term::Iri(iri) => iri
+                .strip_prefix(namespace)
+                .map(|local| format!("{prefix}:{local}")),
+            Term::Literal(literal) => match literal.kind() {
+                LiteralKind::Datatype(datatype) => datatype
+                    .strip_prefix(namespace)
+                    .map(|local| format!("\"{}\"^^{prefix}:{local}", literal.value())),
+                _ => None,
+            },
+            Term::BlankNode(_) => None,
         }
     }
 
@@ -651,12 +729,11 @@ mod tests {
         let golden = Golden::build(TINY_NT);
         let dictionary = golden.dictionary();
 
-        // The fixture's datatype IRI is spelled in full, so no prefix map is
-        // needed to round-trip it; declaring one anyway proves expansion does
-        // not disturb terms that do not use it.
-        let prefixes = prefixes(&[("ex", "http://example.org/")]);
+        let (prefix, namespace) = ("ex", "http://example.org/");
+        let prefixes = prefixes(&[(prefix, namespace)]);
 
         let (mut iris, mut bnodes, mut plain, mut tagged, mut typed) = (0, 0, 0, 0, 0);
+        let mut curies = 0;
         for (role, id, stored) in every_term(&dictionary) {
             let term = Term::from_dictionary(&stored);
             match &term {
@@ -674,6 +751,15 @@ mod tests {
             let reparsed = Term::parse(&request, &prefixes)
                 .unwrap_or_else(|error| panic!("{request} does not parse back: {error}"));
             assert_eq!(reparsed, term, "request syntax round trip for {stored}");
+
+            // The CURIE spelling of the same term must name the same term, in
+            // the datatype position as well as the term position.
+            if let Some(curie) = as_curie_syntax(&term, prefix, namespace) {
+                curies += 1;
+                let from_curie = Term::parse(&curie, &prefixes)
+                    .unwrap_or_else(|error| panic!("{curie} does not parse: {error}"));
+                assert_eq!(from_curie, term, "CURIE spelling of {stored}");
+            }
 
             // Out to the client and back through the JSON term object.
             let json = serde_json::to_value(&term).expect("serialize term");
@@ -693,9 +779,10 @@ mod tests {
         }
 
         assert!(
-            iris > 0 && bnodes > 0 && plain > 0 && tagged > 0 && typed > 0,
+            iris > 0 && bnodes > 0 && plain > 0 && tagged > 0 && typed > 0 && curies > 0,
             "the fixture must cover every term shape, saw \
-             {iris} IRIs, {bnodes} blank nodes, {plain}/{tagged}/{typed} literals"
+             {iris} IRIs, {bnodes} blank nodes, {plain}/{tagged}/{typed} literals, \
+             {curies} CURIE spellings"
         );
     }
 
@@ -716,31 +803,47 @@ mod tests {
                 "http://purl.obolibrary.org/obo/MONDO_0005015"
             ))
         );
-        // Undeclared prefix: an IRI, not an error and not an expansion.
+        // An undeclared prefix is refused. It must not become an IRI whose
+        // scheme is `wat`, which is the reading that makes an unresolvable
+        // CURIE quietly denote something — a term the bundle does not contain
+        // and the client did not ask for.
         assert_eq!(
-            Term::parse("wat:0005015", &prefixes).unwrap(),
-            Term::Iri(Cow::Borrowed("wat:0005015"))
+            Term::parse("wat:0005015", &prefixes),
+            Err(TermSyntaxError::UndeclaredPrefix {
+                token: "wat:0005015".to_owned(),
+                prefix: "wat".to_owned(),
+            })
         );
-        // A full IRI is left alone, because `http` is not declared.
+        // Which applies to a bare IRI too: it is a CURIE against `http`.
+        assert!(matches!(
+            Term::parse("http://example.org/alice", &prefixes),
+            Err(TermSyntaxError::UndeclaredPrefix { .. })
+        ));
+        // Bracketed, it is an IRI, and no expansion applies.
         assert_eq!(
-            Term::parse("http://example.org/alice", &prefixes).unwrap(),
+            Term::parse("<http://example.org/alice>", &prefixes).unwrap(),
             Term::Iri(Cow::Borrowed("http://example.org/alice"))
         );
     }
 
     #[test]
-    fn a_prefix_that_collides_with_a_scheme_still_wins() {
-        // §3.3 says datasets *should not* declare such a prefix — advice, not a
-        // rule the server enforces, and the sentence that decides the case is
-        // "a token parses as a CURIE only when its prefix is declared". So the
-        // manifest wins, and the alternative would be a term whose meaning
-        // depends on a list of URI schemes we would have to maintain.
+    fn a_prefix_named_for_a_scheme_is_no_longer_a_hazard() {
+        // §3.3 advises datasets not to declare a prefix that collides with a
+        // URI scheme, because under its rule the declaration would capture
+        // every IRI using that scheme. Requiring brackets removes the hazard
+        // rather than warning about it: the two forms cannot be confused, so
+        // both spellings stay available and mean different things.
         let prefixes = prefixes(&[("http", "http://example.org/broken#")]);
+
         assert_eq!(
-            Term::parse("http://example.org/alice", &prefixes).unwrap(),
-            Term::Iri(Cow::Owned(
-                "http://example.org/broken#//example.org/alice".to_owned()
-            ))
+            Term::parse("http:alice", &prefixes).unwrap(),
+            Term::Iri(Cow::Owned("http://example.org/broken#alice".to_owned())),
+            "the CURIE expands, as declared"
+        );
+        assert_eq!(
+            Term::parse("<http://example.org/alice>", &prefixes).unwrap(),
+            Term::Iri(Cow::Borrowed("http://example.org/alice")),
+            "and the IRI is untouched by the collision"
         );
     }
 
@@ -752,13 +855,24 @@ mod tests {
             Term::parse("\"Diabetes mellitus\"@en", &prefixes).unwrap(),
             Term::Literal(Literal::tagged("Diabetes mellitus", "en"))
         );
-        assert_eq!(
-            Term::parse("\"42\"^^xsd:integer", &prefixes).unwrap(),
-            Term::Literal(Literal::typed(
-                "42",
-                "http://www.w3.org/2001/XMLSchema#integer"
-            ))
-        );
+        // A datatype takes both forms, on the same terms as any other IRI slot.
+        for spelling in [
+            "\"42\"^^xsd:integer",
+            "\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+        ] {
+            assert_eq!(
+                Term::parse(spelling, &prefixes).unwrap(),
+                Term::Literal(Literal::typed(
+                    "42",
+                    "http://www.w3.org/2001/XMLSchema#integer"
+                )),
+                "parsing {spelling}"
+            );
+        }
+        assert!(matches!(
+            Term::parse("\"42\"^^nope:integer", &prefixes),
+            Err(TermSyntaxError::UndeclaredPrefix { .. })
+        ));
         assert_eq!(
             Term::parse("\"plain\"", &prefixes).unwrap(),
             Term::Literal(Literal::plain("plain"))
@@ -786,7 +900,7 @@ mod tests {
     #[test]
     fn malformed_input_is_an_error_rather_than_a_plausible_term() {
         let prefixes = prefixes(&[("ex", "http://example.org/")]);
-        let cases: [(&str, TermSyntaxError); 7] = [
+        let cases: [(&str, TermSyntaxError); 10] = [
             ("", TermSyntaxError::Empty),
             (
                 "alice",
@@ -794,10 +908,23 @@ mod tests {
                     token: "alice".to_owned(),
                 },
             ),
+            ("<>", TermSyntaxError::EmptyIri),
             (
-                "<http://example.org/alice>",
-                TermSyntaxError::BracketedIri {
-                    token: "<http://example.org/alice>".to_owned(),
+                "<http://example.org/alice",
+                TermSyntaxError::UnbalancedIri {
+                    token: "<http://example.org/alice".to_owned(),
+                },
+            ),
+            (
+                "http://example.org/alice>",
+                TermSyntaxError::UnbalancedIri {
+                    token: "http://example.org/alice>".to_owned(),
+                },
+            ),
+            (
+                "<http://example.org/a<b>",
+                TermSyntaxError::UnbalancedIri {
+                    token: "<http://example.org/a<b>".to_owned(),
                 },
             ),
             (
@@ -834,14 +961,14 @@ mod tests {
             );
         }
 
-        // A bracketed datatype is caught too, rather than becoming a datatype
-        // IRI with brackets in it that silently matches nothing.
+        // The bracket rules reach the datatype position too, which is the other
+        // place an IRI or a CURIE may appear.
         assert!(matches!(
             Term::parse(
-                "\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+                "\"42\"^^<http://www.w3.org/2001/XMLSchema#integer",
                 &prefixes
             ),
-            Err(TermSyntaxError::BracketedIri { .. })
+            Err(TermSyntaxError::UnbalancedIri { .. })
         ));
     }
 
@@ -945,7 +1072,7 @@ mod tests {
         let golden = Golden::build(TINY_NT);
         let dictionary = golden.dictionary();
 
-        let term = Term::parse("http://example.org/nobody", &PrefixMap::default()).unwrap();
+        let term = Term::parse("<http://example.org/nobody>", &PrefixMap::default()).unwrap();
         assert_eq!(term.locate(&dictionary, Role::Subject).unwrap(), None);
     }
 }
