@@ -404,11 +404,11 @@ soundness argument; outside it they would not be.
 
 There are 89 tests after this unit.
 
-### 11. `term` — syntax in, syntax out
+### 11. `term` — syntax in, syntax out ✅
 
 Doc 03 §3.3 parsing (bare and percent-encoded IRIs, CURIEs against the manifest prefix
 map, quoted literals with `@lang` and `^^datatype`, the JSON term-object form) and
-SPARQL Results JSON serialization of the term shapes rows carry.
+serialization of the term shapes rows carry.
 
 This is the boundary doc 20 §20.5 names: resolve to ids once on the way in, run over
 ids, materialize strings only while serializing. The per-request term cache belongs
@@ -422,6 +422,47 @@ Still no HTTP.
 including a prefix that collides with a URI scheme (doc 03 §3.3 says the manifest wins
 only for declared prefixes); and malformed input producing `bad_term_syntax` rather
 than a plausible term.
+
+**What landed.** `Term` is the pivot between *three* syntaxes, which the unit's heading
+elides into two. Request syntax abbreviates through the prefix map and writes a datatype
+bare (`^^xsd:integer`); dictionary syntax never abbreviates and always brackets it
+(`^^<http://…#integer>`); response syntax is the term object. Conflating the first two
+is the bug that answers "no rows" for data that is present — `locate` simply misses —
+and no checksum or test of the store catches it, so the conversions are separate methods
+and the round trip is asserted against a real dictionary rather than against itself.
+
+That made the dictionary spelling an hdtc question, not ours. The façade already
+published the reading direction through the text analyzer's rules but not the writing
+one, so **`hdtc::format` gained `encode_literal` and `XSD_STRING`** beside
+`parse_literal`, hdtc's own RDF parser now delegates to it instead of formatting terms
+itself, and its format contract test checks both directions against the bytes a built
+dictionary actually holds. This is the drift `../kgf` docs 17–18 warn about, in its
+quietest form: the subtle rule is not the brackets but that `xsd:string` is *dropped*,
+so a client asking for `"a"^^xsd:string` must be answered from the term stored as `"a"`.
+`Literal::typed` folds it at construction, which is also what lets `==` mean "the same
+RDF term".
+
+Three parsing decisions doc 03 §3.3 does not settle, all recorded as questions below.
+Literals are **unescaped**, so the closing quote is the last one and `"a "b" c"` is one
+literal — the same rule hdtc reads the dictionary by, and the only one under which a
+term round-trips out through a response and back into a request unchanged. A
+**bracketed** IRI is refused rather than quietly accepted, so there is one spelling and
+the other says so. And `_:label` is a **blank node** before the CURIE rule sees it,
+which no sentence in §3.3 covers but every other reading of which makes blank nodes
+unaskable.
+
+`TermCache` keys on (role, id), not id: the shared section gives a subject and an object
+the same id for the same string, but the role-only sections do not, and a cache that
+forgot the role would answer confidently from the wrong section. It hands out `Rc<str>`
+rather than a borrow so the three terms of a row can be alive at once while the cache
+stays usable for the next row, and it validates UTF-8 once per distinct term, which is
+what lets `Term::from_dictionary` be infallible.
+
+Terms serialize through `serde::Serialize` straight into the writer rather than by
+building a `serde_json::Value`: a page is `limit` rows of up to three terms, and a map
+allocated per term is a map allocated per term.
+
+There are 100 tests after this unit.
 
 ### 12. `envelope` — completeness and errors
 
@@ -639,6 +680,34 @@ following the code.
    bare token stays canonical and the two would coexist. The question is whether doc 03
    specifies it, so clients may rely on it, or leaves it a per-server extra. Surfaced
    planning units 10 and 13.
+9. **Doc 03 §3.4.1 does not describe SPARQL Results JSON, though it says it does.** The
+   example rows use `{"type": "iri"}` and `"lang"`; SRJ spells those `"uri"` and
+   `"xml:lang"`. Both cannot be true, and the format list settles which is meant —
+   `srj` is offered *alongside* `json`, so `json` is KGF's own envelope and the
+   sentence "term encoding matches SPARQL Results JSON" is the loose one. Worth
+   softening it to "mirrors the shape of", since a client that takes it literally will
+   write a parser that never matches. The code follows the examples; `format=srj` will
+   be a second serialization in unit 14, not a rename of this one. Found in unit 11.
+10. **Are literals escaped in request syntax?** §3.3 gives `"Diabetes mellitus"@en` and
+    never says what a quote inside a value looks like. HDT stores values raw and finds
+    the closing quote from the end (`hdtc/docs/text-index-format.md` §3.1), and matching
+    that is the only rule under which a term can be copied out of a response and pasted
+    back into a request. But it means `\"` is two literal characters, which will surprise
+    anyone arriving from N-Triples, so it should be stated rather than inferred. Also
+    unspecified: whether `<http://…>` and `^^<http://…>` are accepted. This
+    implementation refuses both with an error naming the fix. Found in unit 11.
+11. **Blank nodes are absent from §3.3.** The dictionary stores them, `/fragment` returns
+    them, and doc 09 §9 discusses them as reifiers — but the term syntax section lists
+    IRIs, literals and variables only, so `_:b1` would parse as an IRI under the letter
+    of the rules. Treating a leading `_:` as a blank node is the only reading that lets a
+    client ask about a term the server just returned. Worth one line in §3.3. Found in
+    unit 11.
+12. **Does the JSON term-object form expand CURIEs?** §3.3 offers it as "the canonical
+    form for terms that are awkward to escape", and it is described as the form "as in
+    response rows", where IRIs are always full — so this implementation treats a term
+    object's `value` as a full IRI and does not consult the prefix map. The opposite
+    reading would put the ambiguity back into the form that exists to escape it, but
+    §3.3 does not say. Found in unit 11.
 
 ## Not in this plan
 

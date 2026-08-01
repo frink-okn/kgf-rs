@@ -34,8 +34,10 @@ Source/
 **Status: the query core is built; the HTTP surface is not.** `kgf-store` implements
 doc 20's read layer in full — mapped bundles, dictionary, all eight patterns with exact
 counts and positional paging, the lazy catalog, and the bundle manifest — and
-`kgf manifest` describes a hand-assembled bundle so it is servable. `kgf-server` is
-still a skeleton: real signatures and doc comments over `todo!()` bodies.
+`kgf manifest` describes a hand-assembled bundle so it is servable. `kgf-server` has its
+two pure layers — `cursor` (tokens) and `term` (doc 03 §3.3 syntax in, term objects out,
+the per-request cache) — and nothing else: the envelope, the routes, and `serve` are
+still real signatures and doc comments over `todo!()` bodies.
 
 `todo!()` is a convention, not laziness — an unimplemented path panics rather than
 returning a plausible wrong answer. Do not replace one with a stub that returns a
@@ -115,6 +117,8 @@ quietly.
 
 `hdtc` (`../hdtc`, github.com/frink-okn/hdtc) owns every byte format a bundle
 contains. We depend on **`hdtc::format`** — a curated façade, not its module tree.
+Both `kgf-store` (section framing, identity, sidecar directories) and `kgf-server`
+(how a term is spelled in the dictionary) depend on it.
 
 The division is *format knowledge from hdtc, access code here*. hdtc's readers seek a
 `File` with bounded memory because it builds at 10⁸–10¹¹ triples on a small machine;

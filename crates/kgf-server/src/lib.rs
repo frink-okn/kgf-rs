@@ -18,8 +18,8 @@
 //!
 //! # Status
 //!
-//! [`cursor`] is implemented (`notes/plan.md` unit 10). The term layer, the
-//! response envelope, and the routes are units 11–14; [`serve`] is still
+//! [`cursor`] and [`term`] are implemented (`notes/plan.md` units 10–11). The
+//! response envelope and the routes are units 12–14; [`serve`] is still
 //! `todo!()`, which is the convention here rather than an oversight — an
 //! unimplemented path panics rather than returning a plausible wrong answer.
 
@@ -27,6 +27,7 @@
 #![warn(missing_docs)]
 
 pub mod cursor;
+pub mod term;
 
 /// Server configuration.
 #[derive(Debug, Clone)]

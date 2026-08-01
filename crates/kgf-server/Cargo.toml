@@ -9,10 +9,17 @@ repository.workspace = true
 
 [dependencies]
 kgf-store.workspace = true
+# `hdtc::format::{encode_literal, parse_literal}`: how a term is spelled once it
+# is in the dictionary. Resolving a request term to an id happens here, at the
+# boundary doc 20 §20.5 names, so this is where that spelling has to be right —
+# and getting it wrong loses rows silently rather than failing.
+hdtc.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]

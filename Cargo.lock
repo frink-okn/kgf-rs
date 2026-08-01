@@ -764,7 +764,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "hdtc",
  "kgf-store",
+ "serde",
+ "serde_json",
  "sha2",
  "thiserror",
  "tracing",
