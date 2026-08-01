@@ -306,6 +306,32 @@ impl BundleBinding {
     }
 }
 
+/// A token this server produced, ready to hand to a client.
+///
+/// Only [`Cursor::encode`] builds one, so it is always non-empty URL-safe
+/// base64 — safe in a query string and safe as a header value, which matters
+/// because `KGF-Next-Cursor` (doc 03 §3.6) puts it in one. An arbitrary string
+/// there could be empty, giving a client a continuation that continues nothing,
+/// or could carry CR/LF, which is header injection.
+///
+/// Client-supplied tokens are *not* this type: [`Cursor::decode`] takes a plain
+/// `&str`, because untrusted input has no invariant to preserve.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CursorToken(String);
+
+impl CursorToken {
+    /// The token text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CursorToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// A decoded cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cursor {
@@ -360,7 +386,7 @@ impl Cursor {
     /// bytes and 39 characters for an M1 token. Varints would save about five
     /// bytes and cost a parser that has to be right about every length; a token
     /// this short is not worth it.
-    pub fn encode(&self) -> String {
+    pub fn encode(&self) -> CursorToken {
         let mut bytes = Vec::with_capacity(FIXED_LEN + 12);
         bytes.push(TOKEN_VERSION);
         bytes.extend_from_slice(&self.operation.as_u16().to_le_bytes());
@@ -375,7 +401,7 @@ impl Cursor {
         if let Some(scan_position) = self.scan_position {
             bytes.extend_from_slice(&scan_position.to_le_bytes());
         }
-        URL_SAFE_NO_PAD.encode(bytes)
+        CursorToken(URL_SAFE_NO_PAD.encode(bytes))
     }
 
     /// Decode a token, rejecting anything not addressed to this data, this
@@ -506,22 +532,28 @@ mod tests {
     #[test]
     fn a_token_round_trips_through_every_field() {
         let cursor = sample();
-        assert_eq!(Cursor::decode(&cursor.encode(), &binding()), Ok(cursor));
+        assert_eq!(
+            Cursor::decode(cursor.encode().as_str(), &binding()),
+            Ok(cursor)
+        );
 
         // The M2 trailers are carried, not merely tolerated.
         let mut full = sample();
         full.binding_index = Some(7);
         full.scan_position = Some(u64::MAX);
-        let decoded = Cursor::decode(&full.encode(), &binding()).unwrap();
+        let decoded = Cursor::decode(full.encode().as_str(), &binding()).unwrap();
         assert_eq!(decoded, full);
         assert_eq!(decoded.binding_index, Some(7));
         assert_eq!(decoded.scan_position, Some(u64::MAX));
 
-        // An M1 token is short enough to sit in a URL without comment.
-        assert_eq!(sample().encode().len(), 39);
+        // An M1 token is short enough to sit in a URL without comment, and its
+        // alphabet is what makes `CursorToken` safe in a `KGF-Next-Cursor`
+        // header as well as in a query string.
+        let token = sample().encode();
+        assert_eq!(token.as_str().len(), 39);
         assert!(
-            sample()
-                .encode()
+            token
+                .as_str()
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         );
@@ -531,9 +563,9 @@ mod tests {
     fn every_rejection_is_the_same_rejection() {
         let token = sample().encode();
         let binding = binding();
-        assert!(Cursor::decode(&token, &binding).is_ok());
+        assert!(Cursor::decode(token.as_str(), &binding).is_ok());
 
-        let mut raw = URL_SAFE_NO_PAD.decode(&token).unwrap();
+        let mut raw = URL_SAFE_NO_PAD.decode(token.as_str()).unwrap();
         let reencode = |bytes: &[u8]| URL_SAFE_NO_PAD.encode(bytes);
 
         // Malformed in every way the format can be malformed.
@@ -554,7 +586,7 @@ mod tests {
 
         for token in bad {
             assert_eq!(
-                Cursor::decode(&token, &binding),
+                Cursor::decode(token.as_str(), &binding),
                 Err(StaleCursor),
                 "token {token:?} should be stale"
             );
@@ -577,7 +609,7 @@ mod tests {
                     .with("s", "ex:a"),
             ),
         ] {
-            assert_eq!(Cursor::decode(&token, &wrong), Err(StaleCursor));
+            assert_eq!(Cursor::decode(token.as_str(), &wrong), Err(StaleCursor));
         }
     }
 
@@ -685,7 +717,7 @@ mod tests {
                         let position = resume_position(space, &all, stop);
                         let token = Cursor::at(&binding, space, position).encode();
 
-                        let decoded = Cursor::decode(&token, &binding)
+                        let decoded = Cursor::decode(token.as_str(), &binding)
                             .expect("a token this request just issued");
                         assert_eq!(decoded.space, space);
                         assert_eq!(decoded.position, position);

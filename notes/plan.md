@@ -546,14 +546,17 @@ mismatch there is a protocol violation no body assertion would catch.
 `exact` flag, because §3.6's `min` lower bound is meaningless on an exact count — an
 exact count is its own bound.
 
-Errors are RFC 9457 with `type: about:blank`; `ErrorCode` is closed and carries its own
-`title` and status. Everything a client got wrong is 400 except
-`capability_not_available`, which is **501** — the request is well formed and would work
-against a bundle offering the capability, so it is the server that cannot, not the
-client that erred. `TermSyntaxError` converts straight through, its message becoming
-`detail`, which is why unit 11's messages name the token and the remedy.
+A resume cursor is a `CursorToken`, which only `Cursor::encode` mints, so a truncated
+response cannot carry an empty continuation or one containing CR/LF — `KGF-Next-Cursor`
+puts it in a header, where that is injection rather than a typo.
 
-There are 113 tests after this unit.
+Errors are RFC 9457, and the code table went into doc 03 as **§3.6.1** rather than being
+invented here; see question 15. One code, one status, which is why failing content
+negotiation is three codes rather than one code carrying a status. `TermSyntaxError`
+converts straight through, its message becoming `detail`, which is why unit 11's
+messages name the token and the remedy.
+
+There are 114 tests after this unit.
 
 ### 13. The HTTP skeleton
 
@@ -813,18 +816,22 @@ following the code.
     §3.6 fields, `scanned` and `returned`, are called "optional" without saying optional
     *when* — presumably present on budgeted scans and absent otherwise, which is M2's
     problem but the same sentence. Found in unit 12.
-15. **The error-code set is open-ended, which defeats its purpose.** §3.6 gives
-    `capability_not_available`, `cap_exceeded`, `bad_term_syntax` and an ellipsis, plus
-    `stale_cursor` elsewhere in the section. An agent can only "self-correct" against a
-    set it knows, so the list should be closed and normative. M1 additionally needs
-    `malformed_request`, `unsupported_format` and `not_found`, named here on that
-    reasoning; doc 03 should adopt, rename or replace them rather than let each
-    implementation invent its own. Two smaller pieces of the same question: §3.6 gives no
-    HTTP status per code — this implementation sends 400 for everything except
-    `capability_not_available` (**501**, since the request is well formed and another
-    bundle would answer it) and `not_found` (404) — and RFC 9457's `type` is
-    `about:blank` here because minting a problem-type URI means claiming a URL space the
-    project does not own yet. Found in unit 12.
+15. **The error-code set is closed. Resolved — `../kgf` §3.6.1.** §3.6 used to give
+    `capability_not_available`, `cap_exceeded`, `bad_term_syntax` and an ellipsis, which
+    defeats the point: an agent can only self-correct against a vocabulary it knows in
+    advance. §3.6.1 is now a normative table of nine codes with a status and a client
+    remedy each, and `kgf-server` has a test that transcribes it.
+
+    Three decisions inside it. **One code, one status** — a condition needing a different
+    status is a different code, which is why failing content negotiation is three codes
+    (`unsupported_format` 400 for `format=`, `not_acceptable` 406 for `Accept`,
+    `unsupported_media_type` 415 for a request body) rather than one carrying a status
+    beside it. **`capability_not_available` is 501**, not 4xx: the request is well formed
+    and the identical request against a bundle publishing the capability succeeds, so the
+    shortfall is the server's. And **`type` is `about:blank` with the status reason phrase
+    as `title`**, which RFC 9457 §4.2.1 requires of that pairing — a KGF-specific title
+    would be a conformance bug, and minting `https://…/problems/{code}` URIs would claim
+    a namespace nothing serves. Decided and landed in unit 12.
 
 ## Not in this plan
 

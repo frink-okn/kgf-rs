@@ -17,7 +17,16 @@
 //! decision: a page that stopped at the limit has somewhere to continue from, a
 //! star cell that overflowed does not. So the constructors take a cursor exactly
 //! when the reason has one, and [`TruncationReason::resumes`] is derived from
-//! the same fact rather than tracked beside it.
+//! the same fact rather than tracked beside it. [`BudgetReason`] exists so that
+//! the one constructor taking a reason as a value can only be given a resuming
+//! one — the compiler decides it, not an assertion.
+//!
+//! The cursor is a [`CursorToken`], which only [`Cursor::encode`] mints. An
+//! arbitrary string would let a truncated response carry an empty continuation,
+//! or one containing CR/LF, which `KGF-Next-Cursor` would turn into header
+//! injection.
+//!
+//! [`Cursor::encode`]: crate::cursor::Cursor::encode
 //!
 //! # Both channels, always
 //!
@@ -36,6 +45,7 @@
 //! does not have — but the vocabulary is closed *now*, so the type cannot later
 //! grow a stringly-typed escape hatch for a reason someone forgot to add.
 
+use crate::cursor::CursorToken;
 use serde::ser::{Serialize, SerializeMap, Serializer};
 
 // ---------------------------------------------------------------------------
@@ -92,6 +102,33 @@ impl TruncationReason {
     }
 }
 
+/// A budget whose exhaustion stopped a scan (M2).
+///
+/// The subset of [`TruncationReason`] that a budgeted operation can report, so
+/// that "this reason resumes" is checked by the compiler at the call site
+/// instead of asserted inside the constructor. Without it,
+/// [`Completeness::budget_exhausted`] is the one place a non-resuming reason
+/// could acquire a cursor, and a client paging on `cell_overflow` never stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BudgetReason {
+    /// A time budget expired mid-scan.
+    Time,
+    /// A candidate budget was spent before the scan finished.
+    Candidate,
+    /// The response reached its byte budget.
+    ResponseBytes,
+}
+
+impl From<BudgetReason> for TruncationReason {
+    fn from(reason: BudgetReason) -> Self {
+        match reason {
+            BudgetReason::Time => Self::TimeBudget,
+            BudgetReason::Candidate => Self::CandidateBudget,
+            BudgetReason::ResponseBytes => Self::ResponseBytes,
+        }
+    }
+}
+
 /// Whether a response is the whole answer, and if not, why not.
 ///
 /// Opaque on purpose: the constructors are the only way to build one, and each
@@ -105,7 +142,7 @@ enum State {
     Complete,
     Truncated {
         reason: TruncationReason,
-        next: Option<String>,
+        next: Option<CursorToken>,
     },
 }
 
@@ -118,26 +155,13 @@ impl Completeness {
     /// The page filled at `limit`; `next` resumes after the last row returned.
     ///
     /// The only truncation M1 emits.
-    pub fn page_limit(next: impl Into<String>) -> Self {
+    pub fn page_limit(next: CursorToken) -> Self {
         Self::interrupted(TruncationReason::PageLimit, next)
     }
 
     /// A scan stopped on a budget, resumable from `next` (M2).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `reason` is not one of the budget reasons. Taking
-    /// [`TruncationReason`] rather than three constructors keeps the budget
-    /// machinery in M2 one call site; the check is here so it cannot become the
-    /// hole through which `cell_overflow` acquires a cursor a client would page
-    /// on forever.
-    pub fn budget_exhausted(reason: TruncationReason, next: impl Into<String>) -> Self {
-        assert!(
-            reason.resumes() && reason != TruncationReason::PageLimit,
-            "{} is not a budget reason",
-            reason.as_str()
-        );
-        Self::interrupted(reason, next)
+    pub fn budget_exhausted(reason: BudgetReason, next: CursorToken) -> Self {
+        Self::interrupted(reason.into(), next)
     }
 
     /// A star cell exceeded its values cap (M2). Nothing to resume.
@@ -156,10 +180,10 @@ impl Completeness {
         })
     }
 
-    fn interrupted(reason: TruncationReason, next: impl Into<String>) -> Self {
+    fn interrupted(reason: TruncationReason, next: CursorToken) -> Self {
         Self(State::Truncated {
             reason,
-            next: Some(next.into()),
+            next: Some(next),
         })
     }
 
@@ -180,7 +204,7 @@ impl Completeness {
     pub fn next_cursor(&self) -> Option<&str> {
         match &self.0 {
             State::Complete => None,
-            State::Truncated { next, .. } => next.as_deref(),
+            State::Truncated { next, .. } => next.as_ref().map(CursorToken::as_str),
         }
     }
 
@@ -279,27 +303,34 @@ impl Serialize for Cardinality {
 /// The media type an error response carries (RFC 9457 §3).
 pub const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 
-/// A machine-readable error code (doc 03 §3.6).
+/// A machine-readable error code (doc 03 §3.6.1).
 ///
-/// §3.6 gives four and an ellipsis. The rest are named here because M1 needs
-/// them and an agent cannot "self-correct" against a set it has to discover —
-/// `notes/plan.md` question 15 asks doc 03 to close the list.
+/// Closed, and one code is one status: a condition that needs a different
+/// status is a different code, not the same code carrying a status beside it.
+/// That is what lets a client branch on `code` alone and lets §3.6.1 be a
+/// table — `unsupported_format`, `not_acceptable` and `unsupported_media_type`
+/// are three ways to fail content negotiation with three remedies, and merging
+/// them would leave an agent unable to tell which applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
     /// A term parameter is not a term (§3.3).
     BadTermSyntax,
-    /// A cursor is for a different version, operation or request (§3.6).
-    StaleCursor,
+    /// A parameter is missing, repeated, or unparseable.
+    MalformedRequest,
     /// A parameter exceeds a published cap (§3.5).
     CapExceeded,
-    /// The bundle does not offer what the request needs (§3.4, §3.7).
-    CapabilityNotAvailable,
-    /// A request parameter is missing, repeated, or unparseable.
-    MalformedRequest,
-    /// The requested serialization is not one this operation offers (§3.4.1).
+    /// A cursor is for a different version, operation or request (§3.6).
+    StaleCursor,
+    /// `format=` names a serialization this operation does not offer (§3.4.1).
     UnsupportedFormat,
     /// No such dataset or version.
     NotFound,
+    /// No representation satisfies `Accept`.
+    NotAcceptable,
+    /// A request body's media type is not supported (`Accept-Query`, §3.6).
+    UnsupportedMediaType,
+    /// The bundle does not offer what the request needs (§3.4, §3.7).
+    CapabilityNotAvailable,
 }
 
 impl ErrorCode {
@@ -307,53 +338,63 @@ impl ErrorCode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::BadTermSyntax => "bad_term_syntax",
-            Self::StaleCursor => "stale_cursor",
-            Self::CapExceeded => "cap_exceeded",
-            Self::CapabilityNotAvailable => "capability_not_available",
             Self::MalformedRequest => "malformed_request",
+            Self::CapExceeded => "cap_exceeded",
+            Self::StaleCursor => "stale_cursor",
             Self::UnsupportedFormat => "unsupported_format",
             Self::NotFound => "not_found",
+            Self::NotAcceptable => "not_acceptable",
+            Self::UnsupportedMediaType => "unsupported_media_type",
+            Self::CapabilityNotAvailable => "capability_not_available",
         }
     }
 
-    /// RFC 9457's `title`: the same for every occurrence of a code, with the
-    /// specifics left to `detail`.
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::BadTermSyntax => "Malformed term",
-            Self::StaleCursor => "Cursor does not apply here",
-            Self::CapExceeded => "Request exceeds a published cap",
-            Self::CapabilityNotAvailable => "Capability not available",
-            Self::MalformedRequest => "Malformed request",
-            Self::UnsupportedFormat => "Unsupported format",
-            Self::NotFound => "Not found",
-        }
-    }
-
-    /// The HTTP status this code is reported with.
+    /// The HTTP status this code is reported with (§3.6.1).
     ///
-    /// Every client mistake is a 400 except the two that are not mistakes: a
-    /// bundle that does not offer a capability answers 501, because the request
-    /// is well-formed and would work against a bundle that does.
+    /// Every client mistake is 400 except the ones that are not mistakes of
+    /// that kind: a bundle that does not publish a capability answers **501**,
+    /// because the request is well formed and the same request against a bundle
+    /// that does publish it succeeds — the shortfall is the server's.
     pub fn status(self) -> u16 {
         match self {
             Self::BadTermSyntax
-            | Self::StaleCursor
-            | Self::CapExceeded
             | Self::MalformedRequest
+            | Self::CapExceeded
+            | Self::StaleCursor
             | Self::UnsupportedFormat => 400,
             Self::NotFound => 404,
+            Self::NotAcceptable => 406,
+            Self::UnsupportedMediaType => 415,
             Self::CapabilityNotAvailable => 501,
+        }
+    }
+
+    /// RFC 9457's `title`: the status's reason phrase.
+    ///
+    /// §4.2.1 requires this when `type` is `about:blank`, which it is here (see
+    /// [`Problem`]). A KGF-specific phrase would be more informative and would
+    /// also be a conformance bug, and it is not needed: `code` is what §3.6
+    /// tells agents to read, and `detail` is what tells a human what happened.
+    pub fn title(self) -> &'static str {
+        match self.status() {
+            400 => "Bad Request",
+            404 => "Not Found",
+            406 => "Not Acceptable",
+            415 => "Unsupported Media Type",
+            501 => "Not Implemented",
+            status => unreachable!("no reason phrase for status {status}"),
         }
     }
 }
 
 /// An RFC 9457 problem document.
 ///
-/// `type` is `about:blank`, which RFC 9457 §4.2.1 makes the value for a problem
-/// with no dereferenceable type URI. Minting one would mean minting a URL space
-/// this project does not yet own; `code` is what §3.6 says agents read anyway.
-/// See `notes/plan.md` question 15.
+/// `type` is `about:blank`, RFC 9457 §4.2.1's value for a problem with no
+/// dereferenceable type URI, and `title` is therefore the status reason phrase
+/// that section requires alongside it. Minting `https://…/problems/{code}`
+/// URIs would claim a namespace nothing currently serves, and §4.2.1 asks a
+/// type URI to document itself when dereferenced. Doc 03 §3.6.1 records both
+/// the choice and the way out of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Problem {
     code: ErrorCode,
@@ -420,15 +461,34 @@ impl From<crate::term::TermSyntaxError> for Problem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cursor::{
+        BundleBinding, CanonicalRequest, Cursor, CursorBinding, Operation, PositionSpace,
+    };
+
+    /// A real encoded cursor, not a stand-in.
+    ///
+    /// Going through `Cursor::encode` is the point: it is the only thing that
+    /// makes a [`CursorToken`], so this also checks the two units compose, and
+    /// the header assertions below run against a token of the shape clients
+    /// actually receive rather than a hand-written word.
+    fn token() -> CursorToken {
+        let bundle = BundleBinding::from_content_digest(
+            "sha256:1f0e3dad99908345f7439f8ffabdffc4de5f7439f8ffabdffc41f0e3dad99908",
+        )
+        .expect("a well-formed digest");
+        let request = CanonicalRequest::new(Operation::Fragment).with("p", "rdfs:label");
+        let binding = CursorBinding::new(&bundle, &request);
+        Cursor::at(&binding, PositionSpace::Spo, 100).encode()
+    }
 
     /// Every shape a response's completeness can take.
     fn every_shape() -> Vec<Completeness> {
         vec![
             Completeness::complete(),
-            Completeness::page_limit("TOKEN"),
-            Completeness::budget_exhausted(TruncationReason::TimeBudget, "TOKEN"),
-            Completeness::budget_exhausted(TruncationReason::CandidateBudget, "TOKEN"),
-            Completeness::budget_exhausted(TruncationReason::ResponseBytes, "TOKEN"),
+            Completeness::page_limit(token()),
+            Completeness::budget_exhausted(BudgetReason::Time, token()),
+            Completeness::budget_exhausted(BudgetReason::Candidate, token()),
+            Completeness::budget_exhausted(BudgetReason::ResponseBytes, token()),
             Completeness::cell_overflow(),
             Completeness::partial_failure(),
         ]
@@ -500,9 +560,10 @@ mod tests {
             serde_json::to_string(&Completeness::complete()).unwrap(),
             r#"{"complete":true,"next":null}"#
         );
+        let token = token();
         assert_eq!(
-            serde_json::to_string(&Completeness::page_limit("abc")).unwrap(),
-            r#"{"complete":false,"truncation_reason":"page_limit","next":"abc"}"#
+            serde_json::to_string(&Completeness::page_limit(token.clone())).unwrap(),
+            format!(r#"{{"complete":false,"truncation_reason":"page_limit","next":"{token}"}}"#)
         );
         assert_eq!(
             serde_json::to_string(&Completeness::cell_overflow()).unwrap(),
@@ -514,17 +575,30 @@ mod tests {
     fn a_reason_that_cannot_resume_cannot_be_given_a_cursor() {
         // The loop this prevents: a client that pages on `cell_overflow` asks
         // for the same cell again, gets the same overflow, and never stops.
+        // `budget_exhausted` takes a `BudgetReason`, so `cell_overflow` cannot
+        // reach it at all — there is nothing to assert at runtime. What is
+        // worth pinning is that the subset stays a subset: every reason a
+        // budget can produce must be one that resumes, or the constructor
+        // would start handing out cursors that loop.
+        for reason in [
+            BudgetReason::Time,
+            BudgetReason::Candidate,
+            BudgetReason::ResponseBytes,
+        ] {
+            let reason = TruncationReason::from(reason);
+            assert!(reason.resumes(), "{} must resume", reason.as_str());
+            assert_ne!(
+                reason,
+                TruncationReason::PageLimit,
+                "a page limit is not a budget"
+            );
+        }
+
         for reason in [
             TruncationReason::CellOverflow,
             TruncationReason::PartialFailure,
-            TruncationReason::PageLimit,
         ] {
-            assert!(
-                std::panic::catch_unwind(|| Completeness::budget_exhausted(reason, "TOKEN"))
-                    .is_err(),
-                "{} is not a budget reason",
-                reason.as_str()
-            );
+            assert!(!reason.resumes(), "{} must not resume", reason.as_str());
         }
     }
 
@@ -565,8 +639,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&problem).unwrap(),
             serde_json::json!({
+                // RFC 9457 §4.2.1: with `about:blank`, the title is the status
+                // reason phrase. What went wrong lives in `code` and `detail`.
                 "type": "about:blank",
-                "title": "Request exceeds a published cap",
+                "title": "Bad Request",
                 "status": 400,
                 "detail": "limit 50000 exceeds the cap of 10000",
                 "instance": "/v/2026-06-01/fragment?limit=50000",
@@ -576,30 +652,54 @@ mod tests {
     }
 
     #[test]
-    fn every_code_is_distinct_and_carries_a_usable_status() {
-        let codes = [
-            ErrorCode::BadTermSyntax,
-            ErrorCode::StaleCursor,
-            ErrorCode::CapExceeded,
-            ErrorCode::CapabilityNotAvailable,
-            ErrorCode::MalformedRequest,
-            ErrorCode::UnsupportedFormat,
-            ErrorCode::NotFound,
+    fn every_code_matches_doc_03_s_table() {
+        // §3.6.1 is normative and closed, so this is that table transcribed. An
+        // implementation that drifts from it makes agents' self-correction
+        // wrong in a way no other test here would notice.
+        let table = [
+            (ErrorCode::BadTermSyntax, "bad_term_syntax", 400u16),
+            (ErrorCode::MalformedRequest, "malformed_request", 400),
+            (ErrorCode::CapExceeded, "cap_exceeded", 400),
+            (ErrorCode::StaleCursor, "stale_cursor", 400),
+            (ErrorCode::UnsupportedFormat, "unsupported_format", 400),
+            (ErrorCode::NotFound, "not_found", 404),
+            (ErrorCode::NotAcceptable, "not_acceptable", 406),
+            (
+                ErrorCode::UnsupportedMediaType,
+                "unsupported_media_type",
+                415,
+            ),
+            (
+                ErrorCode::CapabilityNotAvailable,
+                "capability_not_available",
+                501,
+            ),
         ];
+
         let mut seen = std::collections::HashSet::new();
-        for code in codes {
+        for (code, name, status) in table {
+            assert_eq!(code.as_str(), name);
+            assert_eq!(code.status(), status, "{name}");
+            assert!(seen.insert(name), "{name} is duplicated");
+            // RFC 9457 §4.2.1's rule for `about:blank`: the title is the
+            // status's reason phrase, never the code or a KGF phrase.
             assert!(
-                seen.insert(code.as_str()),
-                "{} is duplicated",
-                code.as_str()
+                !code.title().is_empty() && code.title() != name,
+                "{name}'s title must be the status reason phrase"
             );
-            assert!(
-                (400..600).contains(&code.status()),
-                "{} must report an error status",
-                code.as_str()
-            );
-            assert!(!code.title().is_empty());
         }
+    }
+
+    #[test]
+    fn negotiation_failures_stay_three_separate_codes() {
+        // One status per code only works if conditions needing different
+        // statuses are different codes. These three read as one situation and
+        // are three different client fixes: change `format=`, relax `Accept`,
+        // or send another request media type.
+        assert_eq!(ErrorCode::UnsupportedFormat.status(), 400);
+        assert_eq!(ErrorCode::NotAcceptable.status(), 406);
+        assert_eq!(ErrorCode::UnsupportedMediaType.status(), 415);
+        assert_eq!(ErrorCode::NotAcceptable.title(), "Not Acceptable");
     }
 
     #[test]
