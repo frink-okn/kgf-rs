@@ -24,10 +24,14 @@ sha2.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
-mime.workspace = true
+mediatype.workspace = true
 percent-encoding.workspace = true
 
 [dev-dependencies]
+# An independent implementation of RFC 9110 §12.5.1, as the oracle for
+# `tests/negotiation.rs`. Not a dependency of the server: its tie-break and its
+# parameter handling differ from ours deliberately, and that file says how.
+headers-accept = "0.3"
 # The hdtc-built golden bundles, so cursor resumption is checked against real
 # enumerations rather than a hand-written stand-in (doc 20 §20.9).
 kgf-store = { workspace = true, features = ["testing"] }

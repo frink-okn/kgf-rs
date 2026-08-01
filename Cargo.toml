@@ -37,7 +37,10 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 # Already in axum's tree; named directly because this crate uses them for the
 # two things doc 03 leaves to RFC 3986 and RFC 9110 — percent-encoding, and
 # parsing the media ranges in an `Accept` header.
-mime = "0.3"
+# `mediatype` and not `mime`: `mime` rejects the optional whitespace RFC 9110
+# §5.6.3 allows around a parameter's `;`, which silently drops a legal media
+# range from an `Accept` header.
+mediatype = "0.21"
 percent-encoding = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

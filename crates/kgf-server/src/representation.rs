@@ -33,7 +33,7 @@
 //! format is named — including every resource's HTML rendering, which is why
 //! [`Resource`](crate::html::Resource) exists rather than a match per handler.
 
-use mime::Mime;
+use mediatype::{MediaType, MediaTypeBuf, ReadParams, names};
 
 use crate::envelope::{ErrorCode, Problem};
 
@@ -63,10 +63,10 @@ impl Representation {
     }
 
     /// The same, parsed, for matching against a request's media ranges.
-    fn mime(self) -> Mime {
+    fn media_range(self) -> MediaType<'static> {
         match self {
-            Self::Json => mime::APPLICATION_JSON,
-            Self::Html => mime::TEXT_HTML,
+            Self::Json => MediaType::new(names::APPLICATION, names::JSON),
+            Self::Html => MediaType::new(names::TEXT, names::HTML),
         }
     }
 
@@ -159,7 +159,8 @@ pub fn negotiate(
         .iter()
         .rev()
         .filter_map(|representation| {
-            acceptability(&ranges, &representation.mime()).map(|quality| (quality, *representation))
+            acceptability(&ranges, &representation.media_range())
+                .map(|quality| (quality, *representation))
         })
         .max_by_key(|(quality, _)| *quality)
         .map(|(_, representation)| representation)
@@ -192,14 +193,19 @@ fn join<'a>(items: impl Iterator<Item = &'a str>) -> String {
 
 /// One media range from an `Accept` header.
 ///
-/// The media type is parsed by the `mime` crate, which already owns RFC 9110
-/// §8.3's grammar — case folding, whitespace, quoted parameter values. What is
-/// *not* in any library in this stack is everything below: neither axum nor
-/// `tower-http` parses `Accept` at all, and the `headers` crate stops short of
-/// a type for it, so the selection rule is written here against RFC 9110
-/// §12.5.1 and tested against it.
+/// The media type is parsed by `mediatype`, which owns RFC 9110 §8.3's grammar
+/// — case folding, the optional whitespace around `;`, quoted parameter values.
+/// `mime` was here first and was wrong for it: `mime` rejects `text/html ;
+/// q=0.5`, which §5.6.3's `OWS ";" OWS` permits, so a legal range was dropped
+/// and the response was negotiated from what remained.
+///
+/// What is *not* in any library in this stack is everything below: neither axum
+/// nor `tower-http` parses `Accept` at all, and the `headers` crate stops short
+/// of a type for it, so the selection rule is written here against RFC 9110
+/// §12.5.1 and checked against an independent implementation in
+/// `tests/negotiation.rs`.
 struct MediaRange {
-    mime: Mime,
+    mime: MediaTypeBuf,
     /// Quality scaled to thousandths, so ranges compare as integers: `q` has at
     /// most three decimal digits (RFC 9110 §12.4.2), and floats would make the
     /// ordering below depend on rounding.
@@ -212,13 +218,15 @@ impl MediaRange {
     /// RFC 9110 §12.5.1: the most specific matching range decides, and only then
     /// does its `q` apply. Getting this backwards makes `Accept: */*;q=0.1,
     /// application/json;q=0` serve JSON at q=0.1 rather than refusing.
-    fn specificity(&self, media_type: &Mime) -> Option<u8> {
-        match (self.mime.type_(), self.mime.subtype()) {
-            (mime::STAR, mime::STAR) => Some(0),
-            (type_, mime::STAR) if type_ == media_type.type_() => Some(1),
-            (type_, subtype) if type_ == media_type.type_() && subtype == media_type.subtype() => {
-                Some(2)
-            }
+    fn specificity(&self, media_type: &MediaType<'_>) -> Option<u8> {
+        let (type_, subtype) = (self.mime.ty(), self.mime.subty());
+        let (any_type, any_subtype) = (type_ == names::_STAR, subtype == names::_STAR);
+        match (any_type, any_subtype) {
+            (true, true) => Some(0),
+            (false, true) if type_ == media_type.ty => Some(1),
+            (false, false) if type_ == media_type.ty && subtype == media_type.subty => Some(2),
+            // `*/json` is not a media range: RFC 9110 §12.5.1's grammar admits
+            // `*/*`, `type/*` and `type/subtype`, and nothing else.
             _ => None,
         }
     }
@@ -228,13 +236,15 @@ fn parse_accept(header: &str) -> Vec<MediaRange> {
     header
         .split(',')
         .filter_map(|entry| {
-            let mime: Mime = entry.trim().parse().ok()?;
+            let mime: MediaTypeBuf = entry.trim().parse().ok()?;
             let quality = mime
-                .get_param("q")
+                .get_param(names::Q)
                 // An unparseable `q` is an ignored parameter, not a rejection
                 // (RFC 9110 §12.4.2), which for the default 1 means the range
                 // still applies.
-                .and_then(|quality| quality_thousandths(quality.as_str()))
+                .and_then(|quality: mediatype::Value<'_>| {
+                    quality_thousandths(&quality.unquoted_str())
+                })
                 .unwrap_or(1000);
             Some(MediaRange { mime, quality })
         })
@@ -259,7 +269,7 @@ fn quality_thousandths(value: &str) -> Option<u32> {
 
 /// The quality `media_type` is acceptable at, or `None` if it is not acceptable
 /// at all — which includes an explicit `q=0`, RFC 9110's way of excluding a type.
-fn acceptability(ranges: &[MediaRange], media_type: &Mime) -> Option<u32> {
+fn acceptability(ranges: &[MediaRange], media_type: &MediaType<'_>) -> Option<u32> {
     let best = ranges
         .iter()
         .filter_map(|range| Some((range.specificity(media_type)?, range.quality)))
