@@ -4,6 +4,29 @@
 //! implementation they check. Sharing between test modules is fine, and worth
 //! doing: every module still to be written wants a deterministic generator and
 //! a way to read a bit out of a byte slice.
+//!
+//! # What the `testing` feature exports
+//!
+//! Soundness is a property of a crate's *public* API, so the feature exports
+//! only what a fixture-driven test in another crate needs: build a golden
+//! bundle, and map or search its bytes. Everything that takes a caller-supplied
+//! path is crate-private.
+//!
+//! That line is not fussiness. A safe function taking `&Path` and returning a
+//! [`Mapping`](crate::map::Mapping) or a publication capability lets safe code
+//! outside this crate map a file it can still truncate — precisely the
+//! obligation [`PublishedBundle::new`](crate::map::PublishedBundle::new) and
+//! [`Mapping::open`](crate::map::Mapping::open) are `unsafe` to record, handed
+//! back for free. Inside the crate the same wrappers are sound, because `map`'s
+//! soundness argument covers this crate's own code and its tests are audited
+//! alongside it; publishing them widened that audit boundary to every future
+//! caller.
+//!
+//! [`Fixture`] stays safe under the same rule: it owns the temporary directory,
+//! and with the path accessors crate-private an external caller has no way to
+//! reach the bytes it has mapped. When an external test needs a `Store` rather
+//! than a `Mapping`, the fixture should grow a method handing out a
+//! `PublishedBundle` for the directory it owns — never the directory.
 
 /// SplitMix64 — a deterministic generator, so a failure reproduces.
 pub struct Rng(u64);
@@ -32,17 +55,19 @@ pub fn bit(bytes: &[u8], index: u64) -> bool {
 }
 
 /// Map a file a test has just written and will not touch again.
-pub fn map_fixture(path: &std::path::Path) -> crate::map::Mapping {
+pub(crate) fn map_fixture(path: &std::path::Path) -> crate::map::Mapping {
     crate::map::map_fixture(path)
 }
 
 /// Assert the publication invariant for a test bundle that is never modified.
-pub fn published_bundle(path: &std::path::Path) -> crate::map::PublishedBundle {
+#[cfg(test)]
+pub(crate) fn published_bundle(path: &std::path::Path) -> crate::map::PublishedBundle {
     crate::map::PublishedBundle::for_test(path)
 }
 
 /// Assert the publication invariant for a test catalog root.
-pub fn published_root(path: &std::path::Path) -> crate::map::PublishedRoot {
+#[cfg(test)]
+pub(crate) fn published_root(path: &std::path::Path) -> crate::map::PublishedRoot {
     crate::map::PublishedRoot::for_test(path)
 }
 
@@ -210,12 +235,14 @@ impl Fixture {
     }
 
     /// Root of this complete minimal bundle.
-    pub fn bundle_path(&self) -> &std::path::Path {
+    #[cfg(test)]
+    pub(crate) fn bundle_path(&self) -> &std::path::Path {
         self.dir.path()
     }
 
     /// Copy the fixture's required and present optional artifacts into a bundle.
-    pub fn copy_bundle_to(&self, destination: &std::path::Path) {
+    #[cfg(test)]
+    pub(crate) fn copy_bundle_to(&self, destination: &std::path::Path) {
         std::fs::create_dir_all(destination).expect("create fixture bundle directory");
         for name in [MANIFEST, HDT, PERM, GRAPHS, GRAPHS_IDX] {
             if !self.dir.path().join(name).exists() {
@@ -227,12 +254,12 @@ impl Fixture {
     }
 
     /// Path of `data.hdt`.
-    pub fn hdt_path(&self) -> std::path::PathBuf {
+    pub(crate) fn hdt_path(&self) -> std::path::PathBuf {
         self.dir.path().join(HDT)
     }
 
     /// Path of `data.hdt.perm`.
-    pub fn perm_path(&self) -> std::path::PathBuf {
+    pub(crate) fn perm_path(&self) -> std::path::PathBuf {
         self.dir.path().join(PERM)
     }
 
@@ -271,7 +298,9 @@ impl Fixture {
 }
 
 const HDT: &str = crate::store::artifact::HDT;
+#[cfg(test)]
 const GRAPHS: &str = crate::store::artifact::GRAPHS;
+#[cfg(test)]
 const GRAPHS_IDX: &str = crate::store::artifact::GRAPHS_IDX;
 const MANIFEST: &str = crate::store::artifact::MANIFEST;
 const PERM: &str = crate::store::artifact::PERM;

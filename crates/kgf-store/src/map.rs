@@ -123,7 +123,10 @@ impl PublishedBundle {
         &self.dir
     }
 
-    #[cfg(any(test, feature = "testing"))]
+    /// Crate-private on purpose: a safe path-taking constructor is a safe way
+    /// to reach undefined behaviour, so it may not escape this crate's own
+    /// audited code (see [`crate::testing`]).
+    #[cfg(test)]
     pub(crate) fn for_test(dir: &Path) -> Self {
         // SAFETY: test fixtures call this only after publishing all artifacts
         // and leave them untouched until every derived store is dropped.
@@ -163,7 +166,8 @@ impl PublishedRoot {
         &self.root
     }
 
-    #[cfg(any(test, feature = "testing"))]
+    /// Crate-private on purpose, for [`PublishedBundle::for_test`]'s reason.
+    #[cfg(test)]
     pub(crate) fn for_test(root: &Path) -> Self {
         // SAFETY: catalog fixtures call this only after publishing all bundle
         // artifacts and do not mutate their bytes while stores are live.

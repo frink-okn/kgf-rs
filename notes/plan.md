@@ -383,14 +383,24 @@ Two corrections to the skeleton, both from writing the resume property down:
 so nothing else takes the value.
 
 A forged position is safe rather than merely unlikely: `Selection::page` clamps past the
-end and yields an empty page. A handler should still reject a position beyond the
-selection's count as `stale_cursor`, since an empty page reads as the end of results,
-and that check needs the store so it belongs to unit 14.
+end and yields an empty page. A handler should still reject a position past the end as
+`stale_cursor`, since an empty page otherwise reads as the end of results, and that check
+needs the store so it belongs to unit 14. The bound is per position space, though, not
+one rule: for the three permutation spaces the position is a result offset and
+`selection.count()` bounds it, while a `Predicate` position is the last predicate id
+returned and is bounded by the predicate id space — a one-row `s ? o` answer resuming at
+predicate 37 is correct, and checking it against a count of 1 would reject a live cursor.
 
 The unit also made `kgf_store::testing` available behind a `testing` feature. The golden
 bundles were `#[cfg(test)]`-private, and this is the third place to need them — a
 second copy of the build recipe is exactly the drift doc 20 §20.9 warns about. `kgf`'s
-integration test dropped its duplicate of the hdtc search as a result.
+integration test dropped its duplicate of the hdtc search as a result. Only the parts an
+out-of-crate test needs are exported: `Fixture`, the fixture graphs, and `hdtc_binary`.
+The safe wrappers over the publication capabilities stay crate-private, because exporting
+a safe `&Path`-taking constructor for a `Mapping` or a `PublishedBundle` hands external
+safe code a way to map a file it can still truncate — the exact obligation those
+constructors are `unsafe` to record. Inside the crate they are covered by `map`'s
+soundness argument; outside it they would not be.
 
 There are 89 tests after this unit.
 

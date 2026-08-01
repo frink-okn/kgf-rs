@@ -322,9 +322,17 @@ pub struct Cursor {
     /// **Not validated against the result set here** — this module has no store.
     /// A forged position is harmless rather than unsound, because
     /// [`Selection::page`](kgf_store::pattern::Selection::page) clamps past the
-    /// end and yields an empty page, but a handler should still reject a
-    /// position beyond the selection's count as `stale_cursor` rather than
-    /// answer an empty page that looks like the end of results.
+    /// end and yields an empty page.
+    ///
+    /// Unit 14 should still reject a position past the end as `stale_cursor`,
+    /// since an empty page otherwise reads as the end of results — but *what*
+    /// the bound is depends on [`space`](Cursor::space), and it is the count in
+    /// only three of the four cases. For the permutation spaces the position is
+    /// a zero-based result offset, bounded by `selection.count()`. For
+    /// [`PositionSpace::Predicate`] it is the last predicate id returned, a
+    /// dictionary id with no relation to the cardinality: a one-row `s ? o`
+    /// answer legitimately resumes at predicate 37. Its bound is the size of
+    /// the predicate id space, and there an empty page really is the end.
     pub position: u64,
     /// Row index, for bindings operations (M2).
     pub binding_index: Option<u32>,
