@@ -106,8 +106,9 @@ impl Catalog {
     /// version open it once rather than N times. Deterministic failures are
     /// cached with their classified source until eviction: published versions
     /// are immutable, so retrying the same files cannot repair them. Failures
-    /// rooted in OS I/O are not cached because descriptor pressure and similar
-    /// process conditions can recover without changing the bundle.
+    /// that say something about this process rather than about the bundle —
+    /// descriptor pressure and the like — are not cached
+    /// ([`Error::is_transient`]).
     pub fn get(&self, id: &BundleId) -> Result<Arc<Store>> {
         self.get_with(id, Store::open)
     }
@@ -132,37 +133,25 @@ impl Catalog {
                     drop(state);
                 }
                 EntryState::Closed => {
-                    let token = Arc::new(());
-                    *state = EntryState::Opening(Arc::clone(&token));
+                    let mut claim = OpenClaim::begin(entry, &mut state);
                     drop(state);
 
-                    let opened = open(&entry.path, self.opts).map(Arc::new);
-                    let mut state = lock(entry);
-                    let is_current = matches!(
-                        &*state,
-                        EntryState::Opening(current) if Arc::ptr_eq(current, &token)
-                    );
-                    match opened {
+                    return match open(&entry.path, self.opts) {
                         Ok(store) => {
-                            if is_current {
-                                *state = EntryState::Open(Arc::clone(&store));
-                                entry.ready.notify_all();
-                            }
-                            return Ok(store);
+                            let store = Arc::new(store);
+                            claim.settle(EntryState::Open(Arc::clone(&store)));
+                            Ok(store)
                         }
                         Err(error) => {
                             let error = Arc::new(error);
-                            if is_current {
-                                *state = if has_io_cause(&error) {
-                                    EntryState::Closed
-                                } else {
-                                    EntryState::Failed(Arc::clone(&error))
-                                };
-                                entry.ready.notify_all();
-                            }
-                            return Err(bundle_open_error(entry, error));
+                            claim.settle(if error.is_transient() {
+                                EntryState::Closed
+                            } else {
+                                EntryState::Failed(Arc::clone(&error))
+                            });
+                            Err(bundle_open_error(entry, error))
                         }
-                    }
+                    };
                 }
             }
         }
@@ -188,16 +177,94 @@ impl Catalog {
     }
 }
 
+/// The right to open one catalog entry, and the obligation to release it.
+///
+/// A claim is held across the `open` call, which deliberately runs without the
+/// entry lock so that one slow open does not block lookups of other bundles.
+/// That leaves a window in which this thread could unwind — `Store::open`
+/// reports failure by `Result`, but an unimplemented path in this crate panics
+/// by convention, and a panic here would otherwise leave the entry `Opening`
+/// with nothing left to publish a result or wake the condvar. Every waiter for
+/// that bundle would then block forever. [`Drop`] closes that window by
+/// returning the entry to `Closed` and notifying.
+struct OpenClaim<'a> {
+    entry: &'a CatalogEntry,
+    token: Arc<()>,
+    settled: bool,
+}
+
+impl<'a> OpenClaim<'a> {
+    /// Claim an entry the caller has found `Closed`, holding its lock.
+    fn begin(entry: &'a CatalogEntry, state: &mut EntryState) -> Self {
+        let token = Arc::new(());
+        *state = EntryState::Opening(Arc::clone(&token));
+        Self {
+            entry,
+            token,
+            settled: false,
+        }
+    }
+
+    /// Publish `next` if this claim still owns the entry, and wake waiters.
+    ///
+    /// A concurrent [`Catalog::evict`] replaces the state, which revokes the
+    /// claim: the opened store then belongs to this caller alone and nothing is
+    /// published. Waiters are notified either way, since they re-examine the
+    /// state they wake to.
+    fn settle(&mut self, next: EntryState) {
+        self.settled = true;
+        let mut state = lock(self.entry);
+        if matches!(&*state, EntryState::Opening(current) if Arc::ptr_eq(current, &self.token)) {
+            *state = next;
+        }
+        drop(state);
+        self.entry.ready.notify_all();
+    }
+}
+
+impl Drop for OpenClaim<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settle(EntryState::Closed);
+        }
+    }
+}
+
+/// The immediate subdirectories of `path`, in whatever order the OS lists them.
+///
+/// Unordered on purpose: every caller funnels these into the [`Catalog`]'s
+/// `BTreeMap`, which imposes the (dataset, version) order that [`Catalog::ids`]
+/// reports. Sorting here would allocate an `OsString` per comparison for an
+/// ordering the map re-derives.
+///
 fn directory_entries(path: &Path) -> Result<Vec<std::fs::DirEntry>> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
-        if entry.file_type()?.is_dir() {
+        if resolves_to_directory(&entry)? {
             entries.push(entry);
         }
     }
-    entries.sort_unstable_by_key(std::fs::DirEntry::file_name);
     Ok(entries)
+}
+
+/// Whether a directory entry resolves to a directory.
+///
+/// Follows symlinks, unlike [`std::fs::DirEntry::file_type`]: a dataset or
+/// version directory published as a symlink is an ordinary deployment shape,
+/// and skipping it silently would leave every request for that bundle answering
+/// `UnknownBundle` with no diagnostic. Artifacts *inside* a bundle already
+/// resolve this way ([`crate::store`]), so this makes the two consistent.
+///
+/// A symlink with no target is not a bundle and is skipped like any other
+/// non-directory. Anything else the OS refuses is reported rather than dropped,
+/// since a permissions problem in a serving root is worth surfacing at startup.
+fn resolves_to_directory(entry: &std::fs::DirEntry) -> Result<bool> {
+    match std::fs::metadata(entry.path()) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn directory_name(entry: &std::fs::DirEntry) -> Result<String> {
@@ -215,16 +282,6 @@ fn bundle_open_error(entry: &CatalogEntry, source: Arc<Error>) -> Error {
     Error::BundleOpen {
         bundle: entry.path.clone(),
         source,
-    }
-}
-
-fn has_io_cause(error: &Error) -> bool {
-    match error {
-        Error::Io(_) => true,
-        Error::Format(source) => source
-            .chain()
-            .any(|cause| cause.downcast_ref::<std::io::Error>().is_some()),
-        _ => false,
     }
 }
 
@@ -344,6 +401,106 @@ mod tests {
             .expect("a later request must retry transient failures");
         assert_eq!(store.triples(), 8);
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_corrupt_artifact_is_cached_even_though_it_fails_through_an_io_error() {
+        // hdtc reads its headers with `read_exact`, so a short artifact fails
+        // with an `io::Error` inside an anyhow chain. Classifying by type would
+        // call that transient and re-open the whole bundle on every request,
+        // forever, for a version that immutability guarantees cannot heal.
+        let fixture = Fixture::build(TINY_NT);
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("dataset/version");
+        fixture.copy_bundle_to(&bundle);
+        std::fs::write(bundle.join(crate::store::artifact::PERM), [0u8; 100]).unwrap();
+
+        let catalog = Catalog::scan(root.path(), OpenOptions::default()).unwrap();
+        let id = id("dataset", "version");
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let open = |path: &Path, opts| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Store::open(path, opts)
+        };
+
+        let first = catalog.get_with(&id, open).expect_err("must refuse");
+        let second = catalog.get_with(&id, open).expect_err("must stay refused");
+        let (Error::BundleOpen { source: first, .. }, Error::BundleOpen { source: second, .. }) =
+            (first, second)
+        else {
+            panic!("catalog failures must preserve their store-open source");
+        };
+        assert!(matches!(&*first, Error::Format(_)), "{first:#}");
+        assert!(!first.is_transient());
+        assert!(Arc::ptr_eq(&first, &second), "the failure must be cached");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_panic_while_opening_does_not_wedge_the_entry() {
+        // `open` runs without the entry lock, so an unwind there would leave
+        // the state `Opening` with nothing left to publish a result or wake the
+        // condvar — every later request for this bundle would block forever.
+        let fixture = Fixture::build(TINY_NT);
+        let root = tempfile::tempdir().unwrap();
+        fixture.copy_bundle_to(&root.path().join("dataset/version"));
+        let catalog = Arc::new(Catalog::scan(root.path(), OpenOptions::default()).unwrap());
+        let bundle = id("dataset", "version");
+
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            catalog.get_with(&bundle, |_: &Path, _: OpenOptions| -> Result<Store> {
+                panic!("an unimplemented open path panics by convention")
+            })
+        }));
+        std::panic::set_hook(hook);
+        assert!(panicked.is_err(), "the panic must reach the caller");
+
+        let entry = catalog.entry(&bundle).unwrap();
+        assert!(
+            matches!(*lock(entry), EntryState::Closed),
+            "an abandoned open must release its claim"
+        );
+
+        // And another thread — which under the old code would have parked on
+        // the condvar forever — opens it.
+        let next = {
+            let catalog = Arc::clone(&catalog);
+            let bundle = bundle.clone();
+            std::thread::spawn(move || catalog.get(&bundle).unwrap().triples())
+        };
+        assert_eq!(next.join().unwrap(), 8);
+    }
+
+    #[test]
+    fn a_symlinked_version_directory_is_scanned() {
+        let fixture = Fixture::build(TINY_NT);
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let published = store.path().join("2026-01");
+        fixture.copy_bundle_to(&published);
+        std::fs::create_dir_all(root.path().join("dataset")).unwrap();
+        symlink(&published, &root.path().join("dataset/current"));
+        // A symlink with no target is not a bundle, and must not abort the scan.
+        symlink(
+            &store.path().join("absent"),
+            &root.path().join("dataset/dangling"),
+        );
+
+        let catalog = Catalog::scan(root.path(), OpenOptions::default()).unwrap();
+        assert_eq!(catalog.ids(), vec![id("dataset", "current")]);
+        assert_eq!(catalog.get(&id("dataset", "current")).unwrap().triples(), 8);
+    }
+
+    #[cfg(unix)]
+    fn symlink(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).expect("create fixture symlink");
+    }
+
+    #[cfg(windows)]
+    fn symlink(target: &Path, link: &Path) {
+        std::os::windows::fs::symlink_dir(target, link).expect("create fixture symlink");
     }
 
     #[test]

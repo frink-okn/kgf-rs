@@ -93,10 +93,6 @@ pub enum Error {
         source: Arc<Error>,
     },
 
-    /// A cursor was issued against different data or a different request.
-    #[error("stale cursor")]
-    StaleCursor,
-
     /// Anything the OS refused.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -104,4 +100,103 @@ pub enum Error {
     /// Anything hdtc's format layer refused.
     #[error(transparent)]
     Format(#[from] anyhow::Error),
+}
+
+impl Error {
+    /// Whether this failure could resolve on its own, without the bundle
+    /// changing.
+    ///
+    /// A published version is immutable (doc 04 §4.6), so a failure about the
+    /// *bytes* — a truncated sidecar, a header that disagrees with its own file
+    /// — can never heal; a caller that caches failures should keep it until the
+    /// entry is evicted. A failure about this process's ability to read at all
+    /// — descriptor pressure, a mount that briefly went away — says nothing
+    /// about the bundle and may be retried.
+    ///
+    /// The distinction cannot be drawn from the error's *type*. hdtc's format
+    /// layer detects truncation with `read_exact`, so an [`Error::Format`]
+    /// chain routinely carries an `io::Error` for a condition that is purely
+    /// about content. It is the [`std::io::ErrorKind`] that separates the two.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Error::Io(source) => !describes_content(source),
+            Error::Format(source) => source
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+                .is_some_and(|source| !describes_content(source)),
+            _ => false,
+        }
+    }
+}
+
+/// Whether an OS error describes what a file contains rather than whether it
+/// could be read at all.
+///
+/// Running off the end of a file its own header said was longer, or refusing
+/// bytes that cannot mean what they must, is a corrupt artifact — not a busy
+/// machine.
+fn describes_content(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn io(kind: std::io::ErrorKind) -> std::io::Error {
+        std::io::Error::new(kind, "test")
+    }
+
+    #[test]
+    fn truncation_is_deterministic_however_it_is_wrapped() {
+        // The case the catalog gets wrong if it classifies by type: a short
+        // artifact fails inside hdtc's `read_exact`, so the anyhow chain
+        // carries an `io::Error` for a condition an immutable bundle cannot
+        // recover from.
+        assert!(!Error::Io(io(std::io::ErrorKind::UnexpectedEof)).is_transient());
+        assert!(!Error::Io(io(std::io::ErrorKind::InvalidData)).is_transient());
+
+        let wrapped = anyhow::Error::new(io(std::io::ErrorKind::UnexpectedEof))
+            .context("reading the section directory")
+            .context("opening permutation index data.hdt.perm");
+        assert!(!Error::Format(wrapped).is_transient());
+    }
+
+    #[test]
+    fn process_conditions_are_retryable_however_they_are_wrapped() {
+        // Descriptor pressure reaches stable Rust as `Other`/`Uncategorized`
+        // rather than a named kind, so the rule is "not about content" rather
+        // than an allow-list of exhaustion kinds.
+        assert!(Error::Io(std::io::Error::other("descriptor pressure")).is_transient());
+        assert!(Error::Io(io(std::io::ErrorKind::PermissionDenied)).is_transient());
+
+        let wrapped = anyhow::Error::new(std::io::Error::other("descriptor pressure"))
+            .context("opening graph index data.hdt.graphs.idx");
+        assert!(Error::Format(wrapped).is_transient());
+    }
+
+    #[test]
+    fn structural_refusals_carry_no_io_cause_and_are_deterministic() {
+        assert!(
+            !Error::Format(anyhow::anyhow!("permutation-index file-size mismatch")).is_transient()
+        );
+        assert!(
+            !Error::Malformed {
+                artifact: PathBuf::from("data.hdt"),
+                detail: "sections end at 10 but the file is 12 bytes".to_owned(),
+            }
+            .is_transient()
+        );
+        assert!(
+            !Error::MissingRequiredArtifact {
+                bundle: PathBuf::from("bundle"),
+                artifact: "data.hdt.perm".to_owned(),
+                remedy: "hdtc perm data.hdt".to_owned(),
+            }
+            .is_transient()
+        );
+    }
 }
