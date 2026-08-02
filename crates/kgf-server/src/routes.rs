@@ -164,7 +164,11 @@ async fn service_descriptor(
         representation,
         &wants,
         CachePolicy::Mutable,
-        Some(etag(service.descriptor_digest(), representation)),
+        Some(etag(
+            service.descriptor_digest(),
+            service.descriptor_digest(),
+            representation,
+        )),
     )
 }
 
@@ -180,7 +184,11 @@ async fn dataset_descriptor(
         representation,
         &wants,
         CachePolicy::Mutable,
-        Some(etag(service.descriptor_digest(), representation)),
+        Some(etag(
+            service.descriptor_digest(),
+            service.descriptor_digest(),
+            representation,
+        )),
     )
 }
 
@@ -196,7 +204,11 @@ async fn bundle_manifest(
     // incomplete is a 500 about the bundle rather than a 400 about the request.
     let representation = wants.representation()?;
     let release = service.datasets().release(&dataset, &version)?;
-    let validator = etag(release.digest(), representation);
+    let validator = etag(
+        release.digest(),
+        service.descriptor_digest(),
+        representation,
+    );
 
     // Ahead of the open, not merely ahead of the body. A revalidation names the
     // exact bytes it already holds, and a versioned URL cannot serve different
@@ -346,7 +358,11 @@ where
     // (doc 04 §4.6), so the URL and the representation fix the response
     // exactly — which is what makes a strong validator honest here and not
     // only on `/manifest`.
-    let validator = etag(release.digest(), representation);
+    let validator = etag(
+        release.digest(),
+        service.descriptor_digest(),
+        representation,
+    );
     if wants.already_has(&validator) {
         return not_modified(CachePolicy::Immutable, validator);
     }

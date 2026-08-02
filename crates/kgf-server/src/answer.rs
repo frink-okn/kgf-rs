@@ -53,10 +53,10 @@ use kgf_store::pattern::{IdPattern, Selection};
 use kgf_store::{IdTriple, Role, Store, TermId};
 
 use crate::cursor::{Cursor, CursorBinding, PositionSpace, StaleCursor};
-use crate::envelope::{Cardinality, Completeness, ErrorCode, Problem};
+use crate::envelope::{BudgetReason, Cardinality, Completeness, ErrorCode, Problem};
 use crate::html::{Crumb, Resource, Value, fields, json_body, note, page, table};
 use crate::representation::Representation;
-use crate::request::{self, BoundTerm, Direction, Pattern, Position};
+use crate::request::{self, BoundTerm, Direction, Pattern, Position, ResponseBytes};
 use crate::term::{Term, TermCache};
 use crate::url::{self, Params};
 
@@ -333,9 +333,12 @@ pub fn fragment(
             absent_terms,
         },
         phases,
-        request.cursor.as_ref(),
-        request.limit,
-        &request.binding,
+        Paging {
+            cursor: request.cursor.as_ref(),
+            limit: request.limit,
+            bytes: request.bytes,
+            binding: &request.binding,
+        },
     )
 }
 
@@ -434,9 +437,12 @@ pub fn describe(
             absent_terms,
         },
         phases,
-        request.cursor.as_ref(),
-        request.limit,
-        &request.binding,
+        Paging {
+            cursor: request.cursor.as_ref(),
+            limit: request.limit,
+            bytes: request.bytes,
+            binding: &request.binding,
+        },
     )
 }
 
@@ -453,10 +459,8 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
     let (count, triples, absent_terms) = match resolve(&dictionary, &request.pattern)? {
         Resolved::Absent(absent) => (0, Vec::new(), absent),
         Resolved::Ids(ids) => {
-            let selection = select(store, ids)?;
-            let count = selection.count().value;
-            let positions = sample_positions(count, u64::from(request.n), request.seed);
-            (count, draw(&selection, &positions), Vec::new())
+            let (count, drawn) = draw(&select(store, ids)?, u64::from(request.n), request.seed);
+            (count, drawn, Vec::new())
         }
     };
 
@@ -471,6 +475,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         })
         .collect();
 
+    let (rows, spent_at) = materialize(&dictionary, &vars, &steps, request.bytes)?;
     Ok(Answer {
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
@@ -480,12 +485,17 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         // 25.
         cardinality: Cardinality::exact(count),
         absent_terms,
-        rows: materialize(&dictionary, &vars, &steps)?,
+        rows,
         vars,
-        // A sample is never truncated: it returns the `n` members it was asked
-        // for, or every member if there are fewer. There is no position to
-        // resume from, which is why §3.4.7's operation has no cursor.
-        completeness: Completeness::complete(),
+        // A sample stops for one reason only. It is not paged, so `n` is what
+        // it returns unless the bundle's own literals spend the byte budget
+        // first — and then it says so, because there is no cursor to offer and
+        // returning fewer members while claiming completeness is the silent
+        // truncation §3.6 prohibits.
+        completeness: match spent_at {
+            None => Completeness::complete(),
+            Some(_) => Completeness::budget_exhausted_without_resume(BudgetReason::ResponseBytes),
+        },
         directed: false,
         target,
     })
@@ -588,31 +598,42 @@ struct Envelope {
     absent_terms: Vec<&'static str>,
 }
 
-/// Build a page of rows out of `phases`, resuming at `cursor`.
+/// Where a page starts, how far it may go, and what a cursor out of it binds to.
+///
+/// One value rather than four parameters because the four are one decision: a
+/// page is cut by whichever of `limit` and `bytes` is reached first, resumed at
+/// `cursor`, and continued by a token `binding` addresses.
+struct Paging<'a> {
+    cursor: Option<&'a Cursor>,
+    limit: u32,
+    bytes: ResponseBytes,
+    binding: &'a CursorBinding,
+}
+
+/// Build a page of rows out of `phases`, resuming where `paging` says.
 fn paged(
     dictionary: &Dictionary<'_>,
     target: Target,
     envelope: Envelope,
     phases: Vec<Phase<'_>>,
-    cursor: Option<&Cursor>,
-    limit: u32,
-    binding: &CursorBinding,
+    paging: Paging<'_>,
 ) -> Result<Answer, Problem> {
+    let Paging {
+        cursor,
+        limit,
+        bytes,
+        binding,
+    } = paging;
     let cardinality = Cardinality::exact(phases.iter().map(|phase| phase.count).sum());
     let predicates = dictionary.counts().len(Role::Predicate);
 
-    // One more than the client asked for. If it arrives there is a next page,
-    // and that row is where it starts.
+    // One more than the page may carry. If it arrives there is a next page, and
+    // that row is where it starts.
     let want = limit as usize + 1;
     let mut steps = walk(&phases, cursor, predicates, want)?;
-
-    let completeness = if steps.len() == want {
-        let next = steps.pop().expect("a page of `want` rows has a last one");
-        Completeness::page_limit(Cursor::at(binding, next.space, next.resume).encode())
-    } else {
-        // The enumeration ran out inside this page, so it is the whole answer.
-        Completeness::complete()
-    };
+    // The row this page cannot carry, kept because it is where the next one
+    // begins rather than merely because it exists.
+    let dropped = (steps.len() == want).then(|| steps.pop()).flatten();
 
     let Envelope {
         echo,
@@ -620,13 +641,34 @@ fn paged(
         directed,
         absent_terms,
     } = envelope;
+
+    // Materializing is where the bytes appear, so it is where the byte budget
+    // applies — before the response exists rather than after, which also bounds
+    // the memory a page can take.
+    let (rows, spent_at) = materialize(dictionary, &vars, &steps, bytes)?;
+
+    // Whichever bound was reached first names the reason and the resume point.
+    // Bytes first, because a page stopped for bytes never reached its row
+    // count and its cursor is the row the bytes ran out on.
+    let completeness = match (spent_at.map(|index| &steps[index]), &dropped) {
+        (Some(next), _) => Completeness::budget_exhausted(
+            BudgetReason::ResponseBytes,
+            Cursor::at(binding, next.space, next.resume).encode(),
+        ),
+        (None, Some(next)) => {
+            Completeness::page_limit(Cursor::at(binding, next.space, next.resume).encode())
+        }
+        // The enumeration ran out inside this page, so it is the whole answer.
+        (None, None) => Completeness::complete(),
+    };
+
     Ok(Answer {
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
         echo,
         cardinality,
         absent_terms,
-        rows: materialize(dictionary, &vars, &steps)?,
+        rows,
         vars,
         completeness,
         directed,
@@ -715,15 +757,38 @@ fn resume_position(cursor: &Cursor, phase: &Phase<'_>, predicates: u64) -> Resul
     within.then_some(cursor.position).ok_or_else(stale)
 }
 
-/// Turn ids into terms, once per distinct term (doc 20 §20.5).
+/// Turn ids into terms, once per distinct term (doc 20 §20.5), within
+/// `max_response_bytes`.
+///
+/// Returns the rows and, if the byte budget stopped it, the index of the first
+/// step *not* included — which is where the next page starts.
+///
+/// # Why the budget lands here
+///
+/// §3.5 publishes `max_response_bytes` and says in the same breath that a row
+/// cap is not a byte cap, "one legal literal can be megabytes" — and bundles
+/// really do hold them, so `limit` alone leaves a response unbounded, which is
+/// the one thing this project exists to prevent. Applying it while rows are
+/// built rather than after they are serialized also bounds what a page costs in
+/// *memory*: the terms are in hand at this point, and a page assembled first
+/// and measured second would have to fit before it could be refused.
+///
+/// The measure is each row's compact JSON, taken through a counting sink so
+/// nothing is allocated to weigh it. That is exact for the serialization
+/// §3.4.1 defines, and conservative for the page, which is not one of §3.4.1's
+/// formats at all. It costs a second serialization pass on the JSON path;
+/// making it one means assembling the body by hand, which is an optimization,
+/// and the house rule is that those follow a profile.
 fn materialize(
     dictionary: &Dictionary<'_>,
     vars: &[Position],
     steps: &[Step],
-) -> Result<Vec<Row>, Problem> {
+    bytes: ResponseBytes,
+) -> Result<(Vec<Row>, Option<usize>), Problem> {
     let mut cache = TermCache::new();
-    let mut rows = Vec::with_capacity(steps.len());
-    for step in steps {
+    let mut rows: Vec<Row> = Vec::with_capacity(steps.len());
+    let mut spent = 0u64;
+    for (index, step) in steps.iter().enumerate() {
         let mut cells = Vec::with_capacity(vars.len());
         for position in vars {
             let text = cache
@@ -735,12 +800,42 @@ fn materialize(
                 .map_err(|error| unreadable("materializing a term", &error))?;
             cells.push((*position, text));
         }
-        rows.push(Row {
+        let row = Row {
             cells,
             direction: step.direction,
-        });
+        };
+
+        spent = spent.saturating_add(serialized_bytes(&row));
+        // Never on the first row of a page. A single term larger than the whole
+        // budget would otherwise produce an empty page whose cursor resumes
+        // exactly where it was issued, and a client paging on it would never
+        // move — one row over a budget beats an enumeration nothing can walk.
+        if spent > bytes.0 && !rows.is_empty() {
+            return Ok((rows, Some(index)));
+        }
+        rows.push(row);
     }
-    Ok(rows)
+    Ok((rows, None))
+}
+
+/// The bytes one row will add to a response, without building them.
+fn serialized_bytes(row: &Row) -> u64 {
+    struct Counter(u64);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter(0);
+    // A row is terms and ASCII punctuation, so the only way this fails is a
+    // `Serialize` impl that errors — and a row's is this module's.
+    serde_json::to_writer(&mut counter, row).expect("a row serializes");
+    counter.0
 }
 
 /// A bundle this server published and cannot read is the server's problem, not
@@ -799,23 +894,34 @@ fn sample_positions(count: u64, n: u64, seed: u64) -> Vec<u64> {
     positions
 }
 
-/// Fetch the drawn members.
-fn draw(selection: &Selection<'_>, positions: &[u64]) -> Vec<IdTriple> {
+/// Draw `n` members, and report how many there were to draw from.
+///
+/// The cardinality comes back with the sample because for `s ? o` the two are
+/// the *same work*: §3.4.7 has the server "run its bounded smaller-endpoint
+/// probe once, hold the resulting predicate-id set in request-local memory, and
+/// sample positions from that set", and `Selection::count` is that probe. Asking
+/// for the count first and the members afterwards runs it twice — which is what
+/// this did until the review caught it, and what doc 20 §20.2.1 budgets exactly
+/// one of.
+///
+/// For the seven contiguous shapes there is nothing to hold: the count is a
+/// range width and `Selection::at` is a rank descent, so each is paid once.
+fn draw(selection: &Selection<'_>, n: u64, seed: u64) -> (u64, Vec<IdTriple>) {
     if selection.subject_object_route().is_some() {
-        // §3.4.7's stated exception. `s ? o` has no contiguous result range, so
-        // `Selection::at` walks the whole bounded endpoint probe — once per
-        // sample, which the section forbids by name. Running the probe once and
-        // indexing the result is the same total work as one enumeration.
         let members: Vec<IdTriple> = selection.page(0, usize::MAX).collect();
-        positions
-            .iter()
-            .filter_map(|position| members.get(*position as usize).copied())
-            .collect()
+        let count = members.len() as u64;
+        let drawn = sample_positions(count, n, seed)
+            .into_iter()
+            .map(|position| members[position as usize])
+            .collect();
+        (count, drawn)
     } else {
-        positions
-            .iter()
-            .map(|position| selection.at(*position))
-            .collect()
+        let count = selection.count().value;
+        let drawn = sample_positions(count, n, seed)
+            .into_iter()
+            .map(|position| selection.at(position))
+            .collect();
+        (count, drawn)
     }
 }
 

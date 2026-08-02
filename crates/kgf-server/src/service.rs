@@ -59,6 +59,13 @@ use crate::term::PrefixMap;
 /// What stops the server from starting.
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
+    /// The caps and budgets this deployment publishes contradict each other.
+    #[error("configuration: {detail}")]
+    Configuration {
+        /// What is inconsistent, and which two numbers disagree.
+        detail: String,
+    },
+
     /// A bundle's `manifest.json` is missing, unreadable, or not what it must
     /// be for the version to be addressable.
     #[error("bundle {dataset}/{version}: {detail}")]
@@ -94,6 +101,13 @@ impl Service {
     /// touched. It is the minimum needed to answer `/` and `/{dataset}` and to
     /// resolve `latest`, all of which must work before any bundle is opened.
     pub fn build(config: Config) -> Result<Self, ServiceError> {
+        // Before the scan: a deployment whose published numbers contradict each
+        // other cannot answer correctly whatever is on disk, and the operator
+        // should hear about it without waiting for a bundle to open.
+        config
+            .limits()
+            .validate()
+            .map_err(|detail| ServiceError::Configuration { detail })?;
         let catalog = Catalog::scan(config.bundle_root.clone(), OpenOptions::default())?;
         let mut manifests = Vec::new();
         for id in catalog.ids() {

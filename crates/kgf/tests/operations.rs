@@ -289,6 +289,99 @@ fn a_sample_draws_real_members_and_draws_them_the_same_way_twice() {
 }
 
 #[test]
+fn a_response_stops_at_the_byte_budget_and_resumes_from_where_it_stopped() {
+    // §3.5's `max_response_bytes`, and the reason it cannot be a cap: "a row
+    // cap is not a byte cap (one legal literal can be megabytes)". `limit`
+    // bounds rows and nothing bounds what a row weighs, so a bundle of long
+    // literals answers a legal request with an illegal response — which is the
+    // bounded-cost thesis failing, not a rounding error.
+    let served = Served::new();
+    let store = served.store();
+
+    // Small enough that two rows of this fixture will not fit.
+    let budgets = Budgets {
+        max_response_bytes: 200,
+        ..Budgets::new()
+    };
+
+    let mut collected = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut reasons = Vec::new();
+    for _ in 0..100 {
+        let query = match &cursor {
+            Some(token) => format!("limit=10000&cursor={token}"),
+            None => "limit=10000".to_owned(),
+        };
+        let answer = served.fragment_within(&store, &query, &budgets);
+        let page = rows(&answer);
+        assert!(!page.is_empty(), "a page must always carry a row");
+        collected.extend(page);
+        if answer["complete"].as_bool().unwrap() {
+            break;
+        }
+        reasons.push(answer["truncation_reason"].as_str().unwrap().to_owned());
+        cursor = Some(answer["next"].as_str().expect("a cursor").to_owned());
+    }
+
+    // The budget did the truncating, not the limit — the request asked for
+    // every row and the cap allowed it.
+    assert!(!reasons.is_empty(), "the budget must have bitten");
+    assert!(
+        reasons.iter().all(|reason| reason == "response_bytes"),
+        "{reasons:?}"
+    );
+    // And paging on that cursor loses and repeats nothing, exactly as a page
+    // limit does.
+    assert_eq!(collected, rows(&served.fragment(&store, "limit=10000")));
+
+    // A budget smaller than a single row still yields that row. The
+    // alternative is an empty page whose cursor resumes where it was issued,
+    // which a client would follow forever.
+    let impossible = Budgets {
+        max_response_bytes: 1,
+        ..Budgets::new()
+    };
+    let answer = served.fragment_within(&store, "limit=10000", &impossible);
+    assert_eq!(rows(&answer).len(), 1);
+    assert_eq!(
+        answer["truncation_reason"],
+        serde_json::json!("response_bytes")
+    );
+    assert!(answer["next"].is_string());
+}
+
+#[test]
+fn a_sample_that_spends_the_byte_budget_says_so_and_offers_no_cursor() {
+    // §3.4.7 draws `n` members and never pages, so there is no position for a
+    // cursor to name — and the budget can still bite, because a bundle may hold
+    // a literal of any size. Returning fewer members and calling it complete
+    // would be the silent truncation §3.6 prohibits, so it reports the reason
+    // with no `next`, the shape `cell_overflow` already uses.
+    let served = Served::new();
+    let store = served.store();
+    let budgets = Budgets {
+        max_response_bytes: 200,
+        ..Budgets::new()
+    };
+
+    let whole = served.sample(&store, "n=10&seed=1");
+    assert_eq!(whole["complete"], serde_json::json!(true));
+
+    let short = served.sample_within(&store, "n=10&seed=1", &budgets);
+    assert!(rows(&short).len() < rows(&whole).len());
+    assert!(!rows(&short).is_empty());
+    assert_eq!(short["complete"], serde_json::json!(false));
+    assert_eq!(
+        short["truncation_reason"],
+        serde_json::json!("response_bytes")
+    );
+    assert_eq!(short["next"], serde_json::json!(null));
+    // The cardinality still describes the set drawn *from*, which is what makes
+    // a short sample interpretable rather than merely small.
+    assert_eq!(short["cardinality"], whole["cardinality"]);
+}
+
+#[test]
 fn an_absent_term_is_an_empty_answer_that_says_which_position() {
     // Unit 11 chose not to reject unusual IRIs at the edge, on the grounds that
     // a diagnostic is worth more than a syntax error. This is the diagnostic.
@@ -423,6 +516,42 @@ impl Served {
             caps: &CAPS,
             budgets: &BUDGETS,
         }
+    }
+
+    /// The same, under budgets a test chose — for the one composite budget that
+    /// no cap bounds and that therefore has to bite at run time.
+    fn within<'a>(&self, budgets: &'a Budgets) -> Limits<'a> {
+        Limits {
+            caps: &CAPS,
+            budgets,
+        }
+    }
+
+    fn fragment_within(&self, store: &Store, query: &str, budgets: &Budgets) -> serde_json::Value {
+        let request = request::Fragment::parse(
+            &params(query),
+            self.within(budgets),
+            self.release().prefixes(),
+            &self.release().binding(),
+        )
+        .expect("a well-formed request");
+        json(
+            answer::fragment(store, self.target("fragment", query), &request).expect("an answer"),
+            Representation::Json,
+        )
+    }
+
+    fn sample_within(&self, store: &Store, query: &str, budgets: &Budgets) -> serde_json::Value {
+        let request = request::Sample::parse(
+            &params(query),
+            self.within(budgets),
+            self.release().prefixes(),
+        )
+        .expect("a well-formed request");
+        json(
+            answer::sample(store, self.target("sample", query), &request).expect("an answer"),
+            Representation::Json,
+        )
     }
 
     fn target(&self, operation: &'static str, query: &str) -> Target {

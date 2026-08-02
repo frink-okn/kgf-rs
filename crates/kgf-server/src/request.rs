@@ -301,6 +301,23 @@ impl Serialize for Direction {
 // The four requests
 // ---------------------------------------------------------------------------
 
+/// The one composite budget a response has to carry with it (§3.5).
+///
+/// The caps bound what a client may *ask for*; the budgets bound what a
+/// response may *cost*, and §3.5 is explicit that the two are not the same
+/// thing — "a row cap is not a byte cap (one legal literal can be megabytes)".
+/// For M1's operations that difference reduces to exactly one number:
+/// [`Limits::validate`] refuses at startup any
+/// deployment whose caps could outrun `max_output_rows` or `max_output_terms`,
+/// so those two are bounded by construction and need no check per request,
+/// while `max_response_bytes` is bounded by nothing a cap can express and is
+/// applied while rows are built ([`crate::answer`]).
+///
+/// Carried on the request because that is what reaches the blocking pool: an
+/// operation running there cannot see the config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseBytes(pub u64);
+
 /// `GET /fragment` — a triple pattern, paged (§3.4.1).
 #[derive(Debug)]
 pub struct Fragment {
@@ -308,6 +325,8 @@ pub struct Fragment {
     pub pattern: Pattern,
     /// Rows this page may carry.
     pub limit: u32,
+    /// Bytes its rows may occupy.
+    pub bytes: ResponseBytes,
     /// Where to resume, if the request carried a cursor.
     pub cursor: Option<Cursor>,
     /// What a cursor this request issues must match.
@@ -324,7 +343,7 @@ impl Fragment {
         prefixes: &PrefixMap,
         bundle: &BundleBinding,
     ) -> Result<Self, Problem> {
-        accept_only(params, "fragment", Self::PARAMETERS)?;
+        accept_only(params, FRAGMENT, Self::PARAMETERS)?;
         let pattern = Pattern::parse(params, limits, prefixes)?;
         let limit = page_size(
             params,
@@ -340,6 +359,7 @@ impl Fragment {
         Ok(Self {
             pattern,
             limit,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
             cursor: resume(params, &binding)?,
             binding,
         })
@@ -365,7 +385,7 @@ impl Count {
         limits: Limits<'_>,
         prefixes: &PrefixMap,
     ) -> Result<Self, Problem> {
-        accept_only(params, "count", Self::PARAMETERS)?;
+        accept_only(params, COUNT, Self::PARAMETERS)?;
         Ok(Self {
             pattern: Pattern::parse(params, limits, prefixes)?,
         })
@@ -381,6 +401,8 @@ pub struct Describe {
     pub direction: Direction,
     /// Rows this page may carry.
     pub limit: u32,
+    /// Bytes its rows may occupy.
+    pub bytes: ResponseBytes,
     /// Where to resume, if the request carried a cursor.
     pub cursor: Option<Cursor>,
     /// What a cursor this request issues must match.
@@ -397,7 +419,7 @@ impl Describe {
         prefixes: &PrefixMap,
         bundle: &BundleBinding,
     ) -> Result<Self, Problem> {
-        accept_only(params, "describe", Self::PARAMETERS)?;
+        accept_only(params, DESCRIBE, Self::PARAMETERS)?;
         let Some(text) = params.get("iri") else {
             return Err(Problem::new(
                 ErrorCode::MalformedRequest,
@@ -428,6 +450,7 @@ impl Describe {
             resource,
             direction,
             limit,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
             cursor: resume(params, &binding)?,
             binding,
         })
@@ -443,6 +466,8 @@ pub struct Sample {
     pub n: u32,
     /// The draw's seed.
     pub seed: u64,
+    /// Bytes the drawn members may occupy.
+    pub bytes: ResponseBytes,
 }
 
 impl Sample {
@@ -456,7 +481,7 @@ impl Sample {
         limits: Limits<'_>,
         prefixes: &PrefixMap,
     ) -> Result<Self, Problem> {
-        accept_only(params, "sample", Self::PARAMETERS)?;
+        accept_only(params, SAMPLE, Self::PARAMETERS)?;
         let pattern = Pattern::parse(params, limits, prefixes)?;
         let n = page_size(
             params,
@@ -469,6 +494,7 @@ impl Sample {
             pattern,
             n,
             seed: seed(params)?,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
         })
     }
 }
@@ -485,17 +511,38 @@ impl Sample {
 /// dataset is a wrong answer that carries no sign of being wrong. §3.6.1 codes
 /// these `capability_not_available` and gives it **501** — the request is well
 /// formed, and the shortfall is the server's.
-const NOT_OFFERED: &[(&str, Option<Capability>)] = &[
-    ("o.text", Some(Capability::Search)),
-    ("o.lang", None),
-    ("o.dt", None),
-    ("o.ge", Some(Capability::Range)),
-    ("o.gt", Some(Capability::Range)),
-    ("o.le", Some(Capability::Range)),
-    ("o.lt", Some(Capability::Range)),
-    ("labels", Some(Capability::Search)),
-    ("g", Some(Capability::Graphs)),
+/// Which operations doc 03 defines each one *for* is the third column, and it
+/// is load-bearing rather than documentation: `g=` on a `/sample` is not a
+/// graph-scoped sample this deployment cannot run, it is a parameter §3.4.7
+/// does not have. Answering that 501 would send an agent to look for a bundle
+/// declaring `graphs`, where the identical request would fail again — and §3.6
+/// makes the remedy the whole point of a code.
+///
+/// The column transcribes: §3.4.1's parameter table for `/fragment`; §3.4.4's
+/// "counts for text/range constraints are estimates", which gives `/count` the
+/// same filters and no `labels` (a count has no rows to label); §3.5's
+/// `labels=true` modifier row for the operations that return rows; and §3.5's
+/// `fragment +g scope` and `count +g scope` rows for `g`.
+const NOT_OFFERED: &[(&str, Option<Capability>, &[&str])] = &[
+    ("o.text", Some(Capability::Search), &[FRAGMENT, COUNT]),
+    ("o.lang", None, &[FRAGMENT, COUNT]),
+    ("o.dt", None, &[FRAGMENT, COUNT]),
+    ("o.ge", Some(Capability::Range), &[FRAGMENT, COUNT]),
+    ("o.gt", Some(Capability::Range), &[FRAGMENT, COUNT]),
+    ("o.le", Some(Capability::Range), &[FRAGMENT, COUNT]),
+    ("o.lt", Some(Capability::Range), &[FRAGMENT, COUNT]),
+    (
+        "labels",
+        Some(Capability::Search),
+        &[FRAGMENT, DESCRIBE, SAMPLE],
+    ),
+    ("g", Some(Capability::Graphs), &[FRAGMENT, COUNT]),
 ];
+
+const FRAGMENT: &str = "fragment";
+const COUNT: &str = "count";
+const DESCRIBE: &str = "describe";
+const SAMPLE: &str = "sample";
 
 /// Refuse anything `operation` does not take.
 fn accept_only(params: &Params, operation: &str, accepted: &[&str]) -> Result<(), Problem> {
@@ -503,9 +550,13 @@ fn accept_only(params: &Params, operation: &str, accepted: &[&str]) -> Result<()
         if accepted.contains(&name) {
             continue;
         }
-        // The more specific answer first: a parameter doc 03 defines and this
-        // deployment cannot honour is not the same mistake as a typo.
-        if let Some((_, capability)) = NOT_OFFERED.iter().find(|(known, _)| *known == name) {
+        // The more specific answer first: a parameter doc 03 defines *for this
+        // operation* and this deployment cannot honour is not the same mistake
+        // as a typo, and the two have different remedies.
+        if let Some((_, capability, _)) = NOT_OFFERED
+            .iter()
+            .find(|(known, _, operations)| *known == name && operations.contains(&operation))
+        {
             return Err(Problem::new(
                 ErrorCode::CapabilityNotAvailable,
                 match capability {
@@ -718,10 +769,86 @@ mod tests {
     }
 
     #[test]
+    fn a_parameter_is_classified_against_the_operation_it_was_sent_to() {
+        // 501 says "another bundle could answer this", so it is only the right
+        // answer where doc 03 defines the parameter for the operation. `g=` is
+        // §3.5's `fragment +g scope` and `count +g scope` and nothing else, so
+        // a graph-scoped `/sample` is not a capability this deployment lacks —
+        // it is a parameter §3.4.7 does not have, and sending an agent to look
+        // for a bundle declaring `graphs` would waste its next request.
+        let scoped = "g=%3Chttp%3A%2F%2Fexample.org%2Fg%3E";
+        assert_eq!(
+            fragment(scoped).unwrap_err().code(),
+            ErrorCode::CapabilityNotAvailable
+        );
+        assert_eq!(
+            Count::parse(&params(scoped), limits(), &prefixes())
+                .unwrap_err()
+                .code(),
+            ErrorCode::CapabilityNotAvailable
+        );
+        assert_eq!(
+            Sample::parse(&params(scoped), limits(), &prefixes())
+                .unwrap_err()
+                .code(),
+            ErrorCode::MalformedRequest,
+            "§3.4.7 defines no graph scoping, so `g` is simply not its parameter"
+        );
+
+        // `labels` runs the other way: §3.5's modifier row is about responses
+        // that carry rows, so a count does not take one.
+        assert_eq!(
+            fragment("labels=true").unwrap_err().code(),
+            ErrorCode::CapabilityNotAvailable
+        );
+        assert_eq!(
+            Sample::parse(&params("labels=true"), limits(), &prefixes())
+                .unwrap_err()
+                .code(),
+            ErrorCode::CapabilityNotAvailable
+        );
+        assert_eq!(
+            Count::parse(&params("labels=true"), limits(), &prefixes())
+                .unwrap_err()
+                .code(),
+            ErrorCode::MalformedRequest,
+            "a count has no rows to label"
+        );
+
+        // And an object filter belongs to the two operations that take a
+        // pattern *and* report on objects.
+        assert_eq!(
+            Count::parse(&params("o.text=atrazine"), limits(), &prefixes())
+                .unwrap_err()
+                .code(),
+            ErrorCode::CapabilityNotAvailable,
+            "§3.4.4 says counts for text constraints are estimates, so it takes one"
+        );
+        assert_eq!(
+            Describe::parse(
+                &params("iri=ex:a&o.text=atrazine"),
+                limits(),
+                &prefixes(),
+                &bundle()
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::MalformedRequest,
+            "§3.4.6 takes a resource, not a pattern"
+        );
+    }
+
+    #[test]
     fn a_page_size_is_bounded_below_as_well_as_above() {
         assert_eq!(fragment("").unwrap().limit, 100);
         assert_eq!(fragment("limit=1").unwrap().limit, 1);
         assert_eq!(fragment("limit=10000").unwrap().limit, 10_000);
+        // And the one composite budget a page has to carry with it, since
+        // nothing a cap can express bounds it (§3.5).
+        assert_eq!(
+            fragment("").unwrap().bytes,
+            ResponseBytes(BUDGETS.max_response_bytes)
+        );
 
         let over = fragment("limit=10001").unwrap_err();
         assert_eq!(over.code(), ErrorCode::CapExceeded);

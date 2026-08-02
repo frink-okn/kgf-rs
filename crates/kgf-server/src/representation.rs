@@ -361,21 +361,39 @@ impl CachePolicy {
     }
 }
 
-/// The entity tag for a bundle version rendered as one representation.
+/// The entity tag for a bundle version rendered as one representation by this
+/// deployment.
 ///
 /// Doc 03 §3.6 makes the ETag the artifact checksum and requires it to be
-/// representation-specific. Both halves are load-bearing and neither is
-/// sufficient: the digest alone would let a cache serve the page to a request
-/// for JSON, and the representation alone would not change when the data does.
+/// representation-specific, and those two are the first and last components
+/// here. The middle one is what §3.6 leaves out and a **strong** validator
+/// cannot: a response's bytes are a function of the data, the *configuration*
+/// and the *code*, not of the data alone.
 ///
-/// A *strong* validator, and it may be, because a versioned URL plus a
-/// representation determines the bytes exactly: the bundle is immutable, and
-/// every operation is a deterministic function of it (doc 03 §3.1). The
-/// comparison against `If-None-Match` is `headers`', which is RFC 9110
+/// The case that makes it necessary is ordinary. `GET /fragment` with no
+/// `limit` returns `caps.default_limit` rows; raise that number and restart,
+/// and the same URL serves different bytes — under an `immutable` policy and a
+/// year of `max-age`, so a client holding the old tag is told 304 for a year.
+/// A rendering change between builds does the same. `deployment` is
+/// [`Service::descriptor_digest`](crate::service::Service::descriptor_digest),
+/// which already covers the caps, the budgets and this crate's version, so
+/// mixing it in closes both. The cost is one revalidation per cached URL after
+/// a deploy, which is the right direction to be wrong in.
+///
+/// The comparison against `If-None-Match` is `headers`', which is RFC 9110
 /// §13.1.2's weak comparison — `*`, a comma list, and a `W/` prefix on the
 /// client's side all handled there rather than here.
-pub fn etag(digest: &ContentDigest, representation: Representation) -> ETag {
-    let tag = format!("\"{}.{}\"", digest.as_str(), representation.token());
+pub fn etag(
+    digest: &ContentDigest,
+    deployment: &ContentDigest,
+    representation: Representation,
+) -> ETag {
+    let tag = format!(
+        "\"{}.{}.{}\"",
+        digest.as_str(),
+        deployment.short(),
+        representation.token()
+    );
     tag.parse().unwrap_or_else(|error| {
         // Unreachable by construction, and worth saying why rather than
         // silently omitting the validator: `ContentDigest` is parsed to
@@ -421,6 +439,20 @@ impl ContentDigest {
     /// The digest as written in the manifest, algorithm prefix included.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The first eight hex digits, for discriminating rather than identifying.
+    ///
+    /// Enough for an [`etag`]'s deployment component, which distinguishes one
+    /// build-and-configuration from another in a cache key. Not a substitute
+    /// for [`as_str`](Self::as_str) anywhere identity matters: a prefix is a
+    /// prefix, and doc 04 §4.3's `content_digest` is the whole thing.
+    pub fn short(&self) -> &str {
+        let hex = self
+            .0
+            .split_once(':')
+            .map_or(self.0.as_str(), |(_, hex)| hex);
+        &hex[..hex.len().min(8)]
     }
 }
 
@@ -613,19 +645,27 @@ mod tests {
     }
 
     #[test]
-    fn an_etag_changes_with_the_data_and_with_the_representation() {
-        let tag = etag(&digest(), Representation::Json);
+    fn an_etag_changes_with_the_data_the_deployment_and_the_representation() {
+        let deployment = ContentDigest::parse("sha256:aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb").unwrap();
+        let tag = etag(&digest(), &deployment, Representation::Json);
         let rendered = format!("{tag:?}");
         assert!(rendered.contains(digest().as_str()));
         assert!(rendered.contains(Representation::Json.token()));
 
         let other = ContentDigest::parse("sha256:0000000000000000abcdef0123456789").unwrap();
-        assert_ne!(tag, etag(&other, Representation::Json));
+        assert_ne!(tag, etag(&other, &deployment, Representation::Json));
 
         // The half §3.6 asks for by name. Without it a shared cache holding the
         // page could answer an agent's `Accept: application/json` from it, and
         // `Vary: Accept` alone would not stop that — the tags would be equal.
-        assert_ne!(tag, etag(&digest(), Representation::Html));
+        assert_ne!(tag, etag(&digest(), &deployment, Representation::Html));
+
+        // And the half §3.6 leaves out. A response is a function of the data,
+        // the configuration *and* the code: `GET /fragment` with no `limit`
+        // returns `default_limit` rows, so raising it changes the bytes at a
+        // URL whose data did not move. Under `immutable` and a year of
+        // `max-age`, a validator that missed that would answer 304 for a year.
+        assert_ne!(tag, etag(&digest(), &other, Representation::Json));
     }
 
     #[test]
@@ -643,7 +683,7 @@ mod tests {
         ] {
             let digest = ContentDigest::parse(text).expect(text);
             for representation in Representation::ALL {
-                let tag = etag(&digest, *representation);
+                let tag = etag(&digest, &digest, *representation);
                 headers::HeaderMapExt::typed_insert(&mut map, tag.clone());
                 assert_eq!(
                     headers::HeaderMapExt::typed_get::<ETag>(&map).as_ref(),

@@ -858,7 +858,38 @@ lists the operations with links to the three that answer without arguments. Doc 
 asks for "normalized parameter ordering documented so caches hit", so the links this
 server builds are sorted and uniformly escaped.
 
-There are 194 tests after this unit.
+**What the unit's review changed.** Four findings were real and one was a question the
+code had answered without recording it.
+
+*Two published budgets were still promises.* `max_response_bytes` is the one composite
+budget no cap can bound — §3.5 pairs it with "one legal literal can be megabytes" — so a
+page of `limit` rows was bounded in rows and unbounded in bytes, on real data, from a
+plain `/fragment`. It is now applied while rows are materialized, which bounds what a
+page costs in memory as well as on the wire, and the row it stops on is the cursor.
+`max_output_rows` and `max_output_terms` went the other way: rather than a per-request
+check that the default configuration can never reach, `Limits::validate` refuses at
+startup any deployment whose caps could outrun them, so the operations skip the check
+because a configuration that reaches it cannot start. That also gave `/sample` a
+truncation it cannot resume, and question 25 above.
+
+*An `ETag` was missing a third of what a response depends on.* `GET /fragment` with no
+`limit` returns `caps.default_limit` rows, so raising that number changes the bytes at a
+URL whose data did not move — under `immutable` and a year of `max-age`. Every validator
+now mixes in `Service::descriptor_digest`, which already covered the caps, the budgets
+and the crate version and was built in unit 13 for exactly this. Using it for the derived
+descriptors and not for the operations was the unit's own inconsistency.
+
+*`/sample` probed `s ? o` twice*, once for the cardinality and once for the members —
+and for that shape `Selection::count` *is* the probe doc 20 §20.2.1 budgets one of. The
+draw now returns both.
+
+*A parameter was classified globally rather than per operation.* `capability_not_available`
+means "another bundle could answer this", so `/sample?g=…` sent an agent to look for a
+bundle declaring `graphs` where the identical request would fail again: §3.4.7 defines no
+graph scoping, so `g` is simply not its parameter. The table now carries the operations
+doc 03 defines each parameter for, which is also where that transcription belongs.
+
+There are 200 tests after this unit.
 
 ### What M1 is not
 
@@ -1173,6 +1204,31 @@ following the code.
     terms this bundle does not hold, per role. Doc 03 has no such field. Worth adding to
     §3.4.1's envelope, since agents self-correcting on a §3.6 vocabulary are exactly who
     benefits. Found in unit 14.
+24. **`/describe` takes a term, not only an IRI.** §3.4.6 names the parameter `iri` and
+    says "the IRI", and `kgf-server` accepts any §3.3 term there — deliberately, and
+    recorded here rather than left as a code comment. A blank node returned in a
+    `/fragment` row must be askable about, or the response has told a client about a
+    resource it cannot follow up on; and a literal is an object like any other, so
+    `describe?iri="Alice"@en` is the in-edges of a term `fragment?o=` already reaches.
+    Refusing them makes part of a bundle unreachable, which is the failure requiring
+    brackets in §3.3 was introduced to remove. Either §3.4.6 should say "term", or the
+    restriction should be stated so implementations agree on it. Found in unit 14's
+    review.
+25. **What does a budget truncation look like where there is nothing to resume?** §3.5
+    says exhausting any budget returns what completed, "marked `complete: false` with a
+    `truncation_reason` and cursor" — but `/sample` draws `n` members and never pages
+    (§3.4.7), so a byte budget stops it with no position for a cursor to name. This
+    server reports the reason with `next: null`, which is the shape `cell_overflow`
+    already uses, because the alternative is returning fewer members and calling the
+    result complete. Worth a sentence in §3.6: the cursor is conditional on the
+    operation having positions, not on the reason. Found in unit 14's review.
+26. **Nothing keeps a deployment's caps inside its own budgets.** §3.5's two tables are
+    independent, so `max_limit` above `max_output_rows` is expressible and means a server
+    publishes a page size it will not honour. `kgf-server` refuses such a configuration
+    at startup rather than truncating at run time, which is doc 20 §20.8's "no degraded
+    mode" applied to configuration — and it is what lets the operations skip the row and
+    term budgets per request. Worth §3.5 stating the relationship it currently implies.
+    Found in unit 14's review.
 
 ## Not in this plan
 

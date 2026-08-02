@@ -13,13 +13,18 @@
 //! offer a next page. Those are not validations run on the way out; there is no
 //! constructor that builds them.
 //!
-//! Whether a truncation *resumes* is a property of the reason, not a separate
-//! decision: a page that stopped at the limit has somewhere to continue from, a
-//! star cell that overflowed does not. So the constructors take a cursor exactly
-//! when the reason has one, and [`TruncationReason::resumes`] is derived from
-//! the same fact rather than tracked beside it. [`BudgetReason`] exists so that
-//! the one constructor taking a reason as a value can only be given a resuming
-//! one — the compiler decides it, not an assertion.
+//! Whether a truncation *may* resume is a property of the reason: a page that
+//! stopped at the limit has somewhere to continue from, a star cell that
+//! overflowed does not, and [`TruncationReason::resumes`] is derived from that
+//! rather than tracked beside it. [`BudgetReason`] exists so that the
+//! constructors taking a reason as a value can only be given a resuming one —
+//! the compiler decides it, not an assertion.
+//!
+//! *May*, not *must*, and the difference is one operation. `/sample` draws `n`
+//! members and never pages (§3.4.7), so a byte budget can stop it while there
+//! is no position for a cursor to name. Its constructor is separate and says so
+//! ([`Completeness::budget_exhausted_without_resume`]), which keeps forgetting
+//! a cursor impossible for the operations that have one.
 //!
 //! The cursor is a [`CursorToken`], which only [`Cursor::encode`] mints. An
 //! arbitrary string would let a truncated response carry an empty continuation,
@@ -40,10 +45,17 @@
 //!
 //! # What M1 emits
 //!
-//! Only [`TruncationReason::PageLimit`]. The budget reasons belong to M2's
-//! interruptible scans and `cell_overflow`/`partial_failure` to operations M1
-//! does not have — but the vocabulary is closed *now*, so the type cannot later
-//! grow a stringly-typed escape hatch for a reason someone forgot to add.
+//! [`TruncationReason::PageLimit`] and [`TruncationReason::ResponseBytes`]. The
+//! second was expected to wait for M2's interruptible scans and does not,
+//! because it is the one composite budget no cap can bound: §3.5 pairs
+//! `max_response_bytes` with the observation that "one legal literal can be
+//! megabytes", so a page of `limit` rows is bounded in rows and unbounded in
+//! bytes, and a plain `/fragment` reaches it on real data.
+//!
+//! `time_budget` and `candidate_budget` do belong to M2's scans, and
+//! `cell_overflow`/`partial_failure` to operations M1 does not have — but the
+//! vocabulary is closed *now*, so the type cannot later grow a stringly-typed
+//! escape hatch for a reason someone forgot to add.
 
 use crate::cursor::CursorToken;
 use serde::ser::{Serialize, SerializeMap, Serializer};
@@ -64,7 +76,7 @@ pub enum TruncationReason {
     TimeBudget,
     /// A candidate budget was spent before the scan finished (M2).
     CandidateBudget,
-    /// The response reached its byte budget (M2).
+    /// The response reached its byte budget.
     ResponseBytes,
     /// One star cell had more values than its cap allows (M2, `/star`).
     CellOverflow,
@@ -85,13 +97,19 @@ impl TruncationReason {
         }
     }
 
-    /// Whether a response stopped for this reason can be continued.
+    /// Whether a response stopped for this reason *may* carry a cursor.
     ///
-    /// The four interruption reasons stop *the enumeration*, which has a
+    /// The four interruption reasons stop an enumeration, which normally has a
     /// position to resume from. The other two describe a result that is already
     /// as complete as it will get: an overflowing star cell has no more values
     /// the caps allow, and a failed fan-out member is not retried by paging. A
-    /// client that pages on those would loop.
+    /// client that pages on those would loop, so they must never carry one.
+    ///
+    /// May, not must. An operation without positions can still exhaust a
+    /// budget — `/sample` draws `n` members and never pages (§3.4.7) — and then
+    /// the reason is honest while the cursor does not exist. So this bounds
+    /// which truncations a cursor is *permitted* on; whether a given response
+    /// has one is [`Completeness`]'s business, and its constructors decide it.
     pub fn resumes(self) -> bool {
         match self {
             Self::PageLimit | Self::TimeBudget | Self::CandidateBudget | Self::ResponseBytes => {
@@ -102,7 +120,7 @@ impl TruncationReason {
     }
 }
 
-/// A budget whose exhaustion stopped a scan (M2).
+/// A budget whose exhaustion stopped an operation.
 ///
 /// The subset of [`TruncationReason`] that a budgeted operation can report, so
 /// that "this reason resumes" is checked by the compiler at the call site
@@ -131,9 +149,10 @@ impl From<BudgetReason> for TruncationReason {
 
 /// Whether a response is the whole answer, and if not, why not.
 ///
-/// Opaque on purpose: the constructors are the only way to build one, and each
-/// takes a resume cursor exactly when its reason has one. There is no way to
-/// express "incomplete, no reason" or "complete, but here is a next page".
+/// Opaque on purpose: the constructors are the only way to build one, and a
+/// cursor comes from the one the operation's own paging picked. There is no way
+/// to express "incomplete, no reason", "complete, but here is a next page", or
+/// a cursor on a reason that cannot be continued from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completeness(State);
 
@@ -152,9 +171,7 @@ impl Completeness {
         Self(State::Complete)
     }
 
-    /// The page filled at `limit`; `next` resumes after the last row returned.
-    ///
-    /// The only truncation M1 emits.
+    /// The page filled at `limit`; `next` returns the row it could not carry.
     pub fn page_limit(next: CursorToken) -> Self {
         Self(State::Truncated {
             reason: TruncationReason::PageLimit,
@@ -162,11 +179,35 @@ impl Completeness {
         })
     }
 
-    /// A scan stopped on a budget, resumable from `next` (M2).
+    /// A scan stopped on a budget, resumable from `next`.
     pub fn budget_exhausted(reason: BudgetReason, next: CursorToken) -> Self {
         Self(State::Truncated {
             reason: reason.into(),
             next: Some(next),
+        })
+    }
+
+    /// A budget stopped an operation that has nowhere to resume from.
+    ///
+    /// One operation is in this position and it is not an oversight: `/sample`
+    /// draws `n` members and never pages (§3.4.7), so it has no position for a
+    /// cursor to name — and it can still spend `max_response_bytes`, because a
+    /// bundle may hold a literal of any size. Reporting it is the alternative
+    /// to returning fewer members than were asked for and calling the result
+    /// complete, which is the silent truncation §3.6 prohibits.
+    ///
+    /// The client's remedy is to ask for less rather than to page, and the wire
+    /// shape it produces — incomplete, a reason, no `next` — is one §3.6
+    /// already defines and clients already handle, since `cell_overflow` and
+    /// `partial_failure` produce it too.
+    ///
+    /// Separate from [`budget_exhausted`](Self::budget_exhausted) so that
+    /// forgetting a cursor stays impossible for the operations that have one:
+    /// the paging constructors still take a token by value.
+    pub fn budget_exhausted_without_resume(reason: BudgetReason) -> Self {
+        Self(State::Truncated {
+            reason: reason.into(),
+            next: None,
         })
     }
 
@@ -739,6 +780,7 @@ mod tests {
             Completeness::budget_exhausted(BudgetReason::Time, token()),
             Completeness::budget_exhausted(BudgetReason::Candidate, token()),
             Completeness::budget_exhausted(BudgetReason::ResponseBytes, token()),
+            Completeness::budget_exhausted_without_resume(BudgetReason::ResponseBytes),
             Completeness::cell_overflow(),
             Completeness::partial_failure(),
         ]
@@ -761,10 +803,15 @@ mod tests {
                 }
                 Some(reason) => {
                     assert!(!completeness.is_complete());
-                    assert_eq!(
-                        completeness.next_cursor().is_some(),
-                        reason.resumes(),
-                        "{} carries a cursor exactly when it resumes",
+                    // One direction, not both. A reason that cannot resume must
+                    // never carry a cursor — that is the loop `cell_overflow`
+                    // would put a client in. A reason that can may still lack
+                    // one, because the operation may have no position to name:
+                    // a `/sample` that spends its byte budget is truncated for
+                    // a resumable reason and has nowhere to resume.
+                    assert!(
+                        completeness.next_cursor().is_none() || reason.resumes(),
+                        "{} must not carry a cursor",
                         reason.as_str()
                     );
                 }
@@ -902,6 +949,18 @@ mod tests {
         ] {
             assert!(!reason.resumes(), "{} must not resume", reason.as_str());
         }
+
+        // The other constructor for a budget: same reason on the wire, no
+        // cursor, for an operation that has no position to resume from. It is
+        // the alternative to a `/sample` that returns fewer members than were
+        // asked for and calls itself complete.
+        let short = Completeness::budget_exhausted_without_resume(BudgetReason::ResponseBytes);
+        assert!(!short.is_complete());
+        assert_eq!(
+            short.truncation_reason(),
+            Some(TruncationReason::ResponseBytes)
+        );
+        assert_eq!(short.next_cursor(), None);
     }
 
     #[test]

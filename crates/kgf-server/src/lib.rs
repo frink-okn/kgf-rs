@@ -166,6 +166,66 @@ pub struct Limits<'a> {
     pub budgets: &'a Budgets,
 }
 
+impl Limits<'_> {
+    /// Refuse a deployment whose caps let a request outrun its own budgets.
+    ///
+    /// Doc 03 §3.5 has caps bound what a client may ask for and budgets bound
+    /// what a response may cost, and it is the operator who has to keep the two
+    /// consistent — nothing in the table does. A `max_limit` above
+    /// `max_output_rows` is a server that publishes a page size it will not
+    /// honour, and the choice then is to truncate silently, to truncate loudly
+    /// on every large request, or to refuse to start. Doc 20 §20.8's "no
+    /// degraded mode" picks the third, and it buys something concrete:
+    /// [`crate::answer`] does not check the row and term budgets per request,
+    /// because a configuration that passes here cannot reach them.
+    ///
+    /// `max_response_bytes` is deliberately not in this list. No cap bounds it
+    /// — §3.5 says so directly, "one legal literal can be megabytes" — so it is
+    /// the one composite budget that has to be applied while a response is
+    /// built.
+    pub fn validate(&self) -> Result<(), String> {
+        // A row of a describe is the widest this milestone serves.
+        const WIDEST_ROW: u64 = 3;
+
+        let rows = |what: &str, cap: u32| {
+            let cap = u64::from(cap);
+            if cap > self.budgets.max_output_rows {
+                return Err(format!(
+                    "caps.{what} is {cap}, over budgets.max_output_rows of {}; \
+                     a request at the cap would exceed a budget this server publishes",
+                    self.budgets.max_output_rows
+                ));
+            }
+            if cap * WIDEST_ROW > self.budgets.max_output_terms {
+                return Err(format!(
+                    "caps.{what} is {cap}, and {cap} rows of {WIDEST_ROW} terms is over \
+                     budgets.max_output_terms of {}",
+                    self.budgets.max_output_terms
+                ));
+            }
+            Ok(())
+        };
+        rows("max_limit", self.caps.max_limit)?;
+        rows("max_sample", self.caps.max_sample)?;
+
+        if self.caps.default_limit > self.caps.max_limit {
+            return Err(format!(
+                "caps.default_limit is {}, over caps.max_limit of {}; \
+                 a request that named no limit would be refused for exceeding one",
+                self.caps.default_limit, self.caps.max_limit
+            ));
+        }
+        if self.caps.max_limit == 0 || self.caps.max_sample == 0 || self.caps.default_limit == 0 {
+            return Err(
+                "caps.max_limit, caps.default_limit and caps.max_sample must be \
+                        at least 1; a page of no rows has no answer that terminates"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// The work one response may cost (doc 03 §3.5's composite budgets).
 ///
 /// Separate from [`Caps`] because cap *products* can still be operationally
@@ -279,4 +339,97 @@ pub async fn shutdown_signal() {
         () = terminate => {}
     }
     tracing::info!("shutting down");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The published numbers, which is all `validate` reads — a `Config` would
+    /// additionally need a capability over a real directory.
+    fn config(caps: &Caps, budgets: &Budgets) -> Limits<'static> {
+        // Leaked so the borrow outlives the call; a test binary's lifetime.
+        Limits {
+            caps: Box::leak(Box::new(*caps)),
+            budgets: Box::leak(Box::new(*budgets)),
+        }
+    }
+
+    #[test]
+    fn the_published_defaults_are_consistent_with_each_other() {
+        assert_eq!(config(&Caps::new(), &Budgets::new()).validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_cap_that_outruns_a_budget_stops_the_server() {
+        // The reason `crate::answer` does not check the row and term budgets
+        // per request: a configuration that reaches them cannot start. §3.5
+        // leaves the two tables independent and doc 20 §20.8 refuses degraded
+        // modes, so the inconsistency is an operator's to fix, loudly.
+        let over_rows = Caps {
+            max_limit: 200_000,
+            ..Caps::new()
+        };
+        let refused = config(&over_rows, &Budgets::new()).validate().unwrap_err();
+        assert!(refused.contains("max_output_rows"), "{refused}");
+
+        // The term budget bites where the row budget would not: a page of
+        // 10 000 describe rows is 30 000 terms, over a 20 000 term budget that
+        // leaves `max_output_rows` untouched.
+        let tight_terms = Budgets {
+            max_output_terms: 20_000,
+            ..Budgets::new()
+        };
+        let refused = config(&Caps::new(), &tight_terms).validate().unwrap_err();
+        assert!(refused.contains("max_output_terms"), "{refused}");
+
+        // A sample is capped separately and checked the same way.
+        let over_sample = Caps {
+            max_sample: 200_000,
+            ..Caps::new()
+        };
+        assert!(config(&over_sample, &Budgets::new()).validate().is_err());
+
+        // A default above its own cap would refuse every request that named no
+        // limit, for exceeding a limit it did not name.
+        let bad_default = Caps {
+            default_limit: 20_000,
+            ..Caps::new()
+        };
+        let refused = config(&bad_default, &Budgets::new())
+            .validate()
+            .unwrap_err();
+        assert!(refused.contains("default_limit"), "{refused}");
+
+        for zero in [
+            Caps {
+                max_limit: 0,
+                ..Caps::new()
+            },
+            Caps {
+                max_sample: 0,
+                ..Caps::new()
+            },
+            Caps {
+                default_limit: 0,
+                ..Caps::new()
+            },
+        ] {
+            assert!(config(&zero, &Budgets::new()).validate().is_err());
+        }
+    }
+
+    #[test]
+    fn max_response_bytes_is_deliberately_not_validated() {
+        // It cannot be. §3.5 says a row cap is not a byte cap because "one
+        // legal literal can be megabytes", so no combination of caps bounds it
+        // and it has to be applied while a response is built. Pinned here so
+        // that adding it to `validate` — which would look like tidiness — has
+        // to argue with this comment first.
+        let tiny = Budgets {
+            max_response_bytes: 1,
+            ..Budgets::new()
+        };
+        assert_eq!(config(&Caps::new(), &tiny).validate(), Ok(()));
+    }
 }

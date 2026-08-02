@@ -586,6 +586,60 @@ fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() 
 }
 
 #[test]
+fn a_validator_moves_when_the_configuration_does() {
+    // The bytes at a URL are a function of the data, the configuration *and*
+    // the code — not the data alone. `GET /fragment` with no `limit` returns
+    // `caps.default_limit` rows, so raising that number changes this response
+    // while the bundle it reads has not moved. Under `immutable` and a year of
+    // `max-age`, a validator that missed it would answer 304 for a year.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+
+    let small = deployment.serve_with(kgf_server::Caps {
+        default_limit: 2,
+        ..kgf_server::Caps::new()
+    });
+    let first = small.get("/tox/v/v1/fragment");
+    first.assert_status(200);
+    let etag = first.header("etag").expect("an operation carries an ETag");
+    assert_eq!(first.json()["rows"].as_array().unwrap().len(), 2);
+    // Its own tag still revalidates, or the validator would be useless.
+    small
+        .request(
+            "GET",
+            "/tox/v/v1/fragment",
+            &[("If-None-Match", etag.as_str())],
+        )
+        .assert_status(304);
+    drop(small);
+
+    // Same bundle, same URL, different published default — and now a different
+    // answer, so it must be a different entity.
+    let larger = deployment.serve_with(kgf_server::Caps {
+        default_limit: 5,
+        ..kgf_server::Caps::new()
+    });
+    let second = larger.get("/tox/v/v1/fragment");
+    assert_eq!(second.json()["rows"].as_array().unwrap().len(), 5);
+    assert_ne!(second.header("etag"), Some(etag.clone()));
+    larger
+        .request(
+            "GET",
+            "/tox/v/v1/fragment",
+            &[("If-None-Match", etag.as_str())],
+        )
+        .assert_status(200);
+
+    // The data half is still in there, which is what doc 03 §3.6 asks for by
+    // name — the deployment component is an addition, not a replacement.
+    let digest = larger.get("/tox/v/v1/manifest").json()["content_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(second.header("etag").unwrap().contains(&digest));
+}
+
+#[test]
 fn an_operation_a_bundle_does_not_declare_is_refused_before_it_is_opened() {
     // §3.4.7 is an optional capability, so a bundle that does not declare it is
     // answered 501 — the request is well formed and the shortfall is what this
@@ -699,10 +753,15 @@ impl Deployment {
     }
 
     fn serve(&self) -> Server {
-        let config = kgf_server::Config::new(
+        self.serve_with(kgf_server::Caps::new())
+    }
+
+    fn serve_with(&self, caps: kgf_server::Caps) -> Server {
+        let mut config = kgf_server::Config::new(
             kgf::serve::published_root(self.root.path()).expect("a published root"),
             "127.0.0.1:0".parse().unwrap(),
         );
+        config.caps = caps;
         let service = Arc::new(Service::build(config).expect("a servable deployment"));
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
