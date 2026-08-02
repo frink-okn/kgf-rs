@@ -259,7 +259,10 @@ async fn fragment(
         "fragment",
         wants,
         |params, limits, release| {
-            request::Fragment::parse(params, limits, release.prefixes(), &release.binding())
+            let request =
+                request::Fragment::parse(params, limits, release.prefixes(), &release.binding())?;
+            declares_search(release, request.pattern.text().is_some())?;
+            Ok(request)
         },
         answer::fragment,
     )
@@ -276,7 +279,11 @@ async fn count(
         BundleId { dataset, version },
         "count",
         wants,
-        |params, limits, release| request::Count::parse(params, limits, release.prefixes()),
+        |params, limits, release| {
+            let request = request::Count::parse(params, limits, release.prefixes())?;
+            declares_search(release, request.pattern.text().is_some())?;
+            Ok(request)
+        },
         answer::count,
     )
     .await
@@ -327,6 +334,22 @@ async fn sample(
         answer::sample,
     )
     .await
+}
+
+/// Refuse `o.text` against a bundle that publishes no text index.
+///
+/// The same gate `/sample` gets, and in the same place: before the open, off
+/// the manifest already in memory. §3.6.1 codes it 501 because the request is
+/// well formed and the identical one against a bundle declaring `search`
+/// succeeds — the shortfall is what this bundle carries.
+fn declares_search(release: &Release, wanted: bool) -> Result<(), Problem> {
+    if wanted && !release.declares(Capability::Search) {
+        return Err(Problem::new(
+            ErrorCode::CapabilityNotAvailable,
+            "`o.text` needs the `search` capability, which this bundle does not declare;              its manifest lists the ones it does",
+        ));
+    }
+    Ok(())
 }
 
 /// The shape every §3.4 operation has.

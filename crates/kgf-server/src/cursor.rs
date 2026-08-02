@@ -142,6 +142,22 @@ pub enum PositionSpace {
     Ops = 3,
     /// The last predicate id returned by an `s ? o` enumeration.
     Predicate = 4,
+    /// Rank in a text query's hit list, with the offset inside one hit's
+    /// statements in [`Cursor::scan_position`].
+    ///
+    /// The one space that is not a position in doc 20 §20.2's enumeration
+    /// order, because a ranked result has none: BM25 orders literals, not
+    /// triples. It resumes safely for the reason the order is stable anyway —
+    /// a published index is immutable and hdtc breaks score ties on ascending
+    /// object id, so re-running a query and skipping is the same enumeration
+    /// every time.
+    ///
+    /// Two numbers rather than one because a hit fans out: an object id
+    /// resolves to every statement carrying that literal, so a page can stop in
+    /// the middle of one. A single flat offset would resume by re-expanding
+    /// every hit before it, which is work proportional to how deep the client
+    /// has paged rather than to the page.
+    TextRank = 5,
 }
 
 impl PositionSpace {
@@ -154,6 +170,11 @@ impl PositionSpace {
     ///
     /// The one place that decides this, so a handler cannot pair a position with
     /// the wrong reading of it.
+    ///
+    /// [`TextRank`](PositionSpace::TextRank) is deliberately unreachable from
+    /// here: a text-filtered request is not one selection but a hit list and a
+    /// selection per hit, so the space is a property of the *operation* rather
+    /// than of anything this function can see.
     pub fn of(selection: &Selection<'_>) -> Self {
         if selection.subject_object_route().is_some() {
             return Self::Predicate;
@@ -171,6 +192,7 @@ impl PositionSpace {
             2 => Some(Self::Pos),
             3 => Some(Self::Ops),
             4 => Some(Self::Predicate),
+            5 => Some(Self::TextRank),
             _ => None,
         }
     }
@@ -377,6 +399,19 @@ impl Cursor {
             position,
             binding_index: None,
             scan_position: None,
+        }
+    }
+
+    /// A cursor resuming a text-filtered enumeration at hit `rank`, `offset`
+    /// statements into that hit.
+    ///
+    /// Separate from [`at`](Cursor::at) because the two numbers are one
+    /// position: a rank without an offset would restart a hit the page was
+    /// halfway through, and an offset without a rank means nothing at all.
+    pub fn at_rank(binding: &CursorBinding, rank: u64, offset: u64) -> Self {
+        Self {
+            scan_position: Some(offset),
+            ..Self::at(binding, PositionSpace::TextRank, rank)
         }
     }
 

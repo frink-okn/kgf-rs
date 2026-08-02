@@ -47,6 +47,7 @@ use maud::html;
 use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
 
+use hdtc::format::{TextQuery, TextSearcher};
 use kgf_store::catalog::BundleId;
 use kgf_store::dict::Dictionary;
 use kgf_store::pattern::{IdPattern, Selection};
@@ -56,7 +57,9 @@ use crate::cursor::{Cursor, CursorBinding, PositionSpace, StaleCursor};
 use crate::envelope::{BudgetReason, Cardinality, Completeness, ErrorCode, Problem};
 use crate::html::{Crumb, Resource, Value, fields, json_body, note, page, table};
 use crate::representation::Representation;
-use crate::request::{self, BoundTerm, Direction, Pattern, Position, ResponseBytes};
+use crate::request::{
+    self, BoundTerm, Candidates, Direction, Pattern, Position, ResponseBytes, TextFilter,
+};
 use crate::term::{Term, TermCache};
 use crate::url::{self, Params};
 
@@ -182,12 +185,16 @@ pub trait Renders {
 /// The key `/describe` reports an edge's side under.
 const DIRECTION: &str = "direction";
 
+/// The key a text-ranked row reports its relevance under (doc 03 §3.4.1).
+const SCORE: &str = "score";
+
 /// One result row: a term per variable, and for `/describe` which side of the
 /// neighborhood it came from.
 #[derive(Debug)]
 pub struct Row {
     cells: Vec<(Position, Rc<str>)>,
     direction: Option<Direction>,
+    score: Option<f32>,
     serialized: u64,
 }
 
@@ -200,6 +207,9 @@ impl Serialize for Row {
         }
         if let Some(direction) = self.direction {
             map.serialize_entry(DIRECTION, &direction)?;
+        }
+        if let Some(score) = self.score {
+            map.serialize_entry(SCORE, &score)?;
         }
         map.end()
     }
@@ -220,7 +230,12 @@ impl Row {
     /// itself takes to render. The risk is drifting from the `Serialize` impl
     /// directly above, which is why the two sit together and why
     /// `a_row_weighs_exactly_what_it_serializes` compares them for every shape.
-    fn new(cells: Vec<(Position, Rc<str>)>, terms: u64, direction: Option<Direction>) -> Self {
+    fn new(
+        cells: Vec<(Position, Rc<str>)>,
+        terms: u64,
+        direction: Option<Direction>,
+        score: Option<f32>,
+    ) -> Self {
         let mut entries = cells.len() as u64;
         let mut serialized = 2 + terms;
         for (position, _) in &cells {
@@ -230,9 +245,19 @@ impl Row {
             entries += 1;
             serialized += quoted_key(DIRECTION) + direction.as_str().len() as u64 + 2;
         }
+        if let Some(score) = score {
+            entries += 1;
+            // The one field that is formatted to be measured. A float's
+            // shortest round-trip form has no length this can compute, and
+            // guessing high would let the budget refuse a page that fits. It is
+            // one small number per row against three term objects, which is the
+            // cost the rest of this arrangement exists to avoid.
+            serialized += quoted_key(SCORE) + serialized_score(score);
+        }
         Self {
             cells,
             direction,
+            score,
             serialized: serialized + entries.saturating_sub(1),
         }
     }
@@ -241,6 +266,17 @@ impl Row {
 /// `"key":` — the key, its quotes, and the colon.
 fn quoted_key(key: &str) -> u64 {
     key.len() as u64 + 3
+}
+
+/// How many bytes `serde_json` writes for this score.
+fn serialized_score(score: f32) -> u64 {
+    serde_json::to_string(&score)
+        .map(|text| text.len() as u64)
+        // Unreachable: a finite `f32` always serializes. A non-finite one is
+        // not JSON at all, and would fail while writing the response rather
+        // than here — so weigh it as something rather than panicking in the
+        // budget check.
+        .unwrap_or(8)
 }
 
 // ---------------------------------------------------------------------------
@@ -361,27 +397,76 @@ pub fn fragment(
     };
     let vars = request.pattern.vars();
 
-    let (phases, absent_terms) = match resolve(&dictionary, &request.pattern)? {
-        Resolved::Absent(absent) => (Vec::new(), absent),
-        Resolved::Ids(ids) => (vec![phase(select(store, ids)?, None)], Vec::new()),
+    let paging = Paging {
+        cursor: request.cursor.as_ref(),
+        limit: request.limit,
+        bytes: request.bytes,
+        binding: &request.binding,
     };
-    paged(
-        &dictionary,
-        target,
-        Envelope {
-            echo,
-            vars,
-            directed: false,
-            absent_terms,
-        },
-        phases,
-        Paging {
-            cursor: request.cursor.as_ref(),
-            limit: request.limit,
-            bytes: request.bytes,
-            binding: &request.binding,
-        },
-    )
+    let envelope = Envelope {
+        echo,
+        vars,
+        directed: false,
+        absent_terms: Vec::new(),
+    };
+
+    match (
+        resolve(&dictionary, &request.pattern)?,
+        request.pattern.text(),
+    ) {
+        (Resolved::Absent(absent), _) => paged(
+            &dictionary,
+            target,
+            Envelope {
+                absent_terms: absent,
+                ..envelope
+            },
+            Vec::new(),
+            paging,
+        ),
+        (Resolved::Ids(ids), None) => paged(
+            &dictionary,
+            target,
+            envelope,
+            vec![phase(select(store, ids)?, None)],
+            paging,
+        ),
+        (Resolved::Ids(ids), Some(filter)) => {
+            let searcher = searcher(store, &target)?;
+            let want = request.limit as usize + 1;
+            let found = ranked(
+                store,
+                searcher,
+                filter,
+                ids,
+                paging.cursor,
+                want,
+                request.candidates,
+            )?;
+            ranked_page(&dictionary, target, envelope, found, paging)
+        }
+    }
+}
+
+/// The bundle's text index, or the 501 that says this one has none.
+///
+/// Reached only when a request carries `o.text`, and only after the handler has
+/// checked the manifest declares `search` — so this is the second half of one
+/// condition rather than a duplicate check: the manifest says what the bundle
+/// promises, and this is the artifact that keeps the promise. A bundle where
+/// they disagree is one that would otherwise panic here.
+fn searcher<'a>(store: &'a Store, target: &Target) -> Result<&'a TextSearcher, Problem> {
+    store.text().ok_or_else(|| {
+        tracing::error!(
+            dataset = %target.id.dataset,
+            version = %target.id.version,
+            "a bundle declaring `search` has no text index",
+        );
+        Problem::new(
+            ErrorCode::CapabilityNotAvailable,
+            "this bundle declares `search` but carries no text index",
+        )
+    })
 }
 
 /// `GET /count` — a pattern's cardinality (§3.4.4).
@@ -391,21 +476,66 @@ pub fn count(
     request: &request::Count,
 ) -> Result<CountAnswer, Problem> {
     let dictionary = store.dict();
-    let (count, absent_terms) = match resolve(&dictionary, &request.pattern)? {
+    let (count, absent_terms) = match (
+        resolve(&dictionary, &request.pattern)?,
+        request.pattern.text(),
+    ) {
         // Exact and free of the enumeration: a range width after bounded
         // descent for seven shapes, and for `s ? o` the same bounded
         // predicate-group probe the enumeration would run (doc 20 §20.2.1).
-        Resolved::Ids(ids) => (select(store, ids)?.count().value, Vec::new()),
-        Resolved::Absent(absent) => (0, absent),
+        (Resolved::Ids(ids), None) => (
+            Cardinality::exact(select(store, ids)?.count().value),
+            Vec::new(),
+        ),
+        (Resolved::Absent(absent), _) => (Cardinality::exact(0), absent),
+        (Resolved::Ids(ids), Some(filter)) => {
+            (text_count(store, &target, filter, ids)?, Vec::new())
+        }
     };
     Ok(CountAnswer {
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
         pattern: request.pattern.clone(),
-        count: Cardinality::exact(count),
+        count,
         absent_terms,
         completeness: Completeness::complete(),
         target,
+    })
+}
+
+/// How many statements a text-constrained pattern matches — an estimate, and
+/// the exact quantity behind it (§3.4.1, §3.4.4).
+///
+/// The index counts *distinct matching literals* without ranking them, which is
+/// `O(postings)` rather than `O(enumeration)`. That number is exactly
+/// `distinct_objects`; the statement count it stands in for is a different
+/// number, because one literal occurs on many subjects and, when the rest of the
+/// pattern is bound, on none that match.
+///
+/// So it is reported as an estimate with the exact figure beside it — and with
+/// a **lower bound only when one is true**: with the rest of the pattern
+/// unbound, every matching literal occurs at least once, so the count is a
+/// floor. With `p` or `s` bound it is neither a floor nor a ceiling, and
+/// claiming `min` would be a claim this server cannot support.
+fn text_count(
+    store: &Store,
+    target: &Target,
+    filter: &TextFilter,
+    ids: IdPattern,
+) -> Result<Cardinality, Problem> {
+    let literals = searcher(store, target)?
+        .count(&TextQuery {
+            text: filter.query().to_owned(),
+            ..TextQuery::default()
+        })
+        .map_err(|error| unreadable("counting text matches", &error))? as u64;
+
+    let estimate = Cardinality::estimated(literals).over_distinct_objects(literals);
+    let unfiltered = ids.subject.is_none() && ids.predicate.is_none();
+    Ok(if unfiltered {
+        estimate.at_least(literals)
+    } else {
+        estimate
     })
 }
 
@@ -513,7 +643,9 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
             // A sample never pages, so nothing reads these.
             space: PositionSpace::Spo,
             resume: 0,
+            scan: None,
             direction: None,
+            score: None,
         })
         .collect();
 
@@ -575,7 +707,161 @@ struct Step {
     triple: IdTriple,
     space: PositionSpace,
     resume: u64,
+    /// The second half of a [`PositionSpace::TextRank`] position: how many of
+    /// this hit's statements come before this row. `None` in every space whose
+    /// position is a single number.
+    scan: Option<u64>,
     direction: Option<Direction>,
+    score: Option<f32>,
+}
+
+impl Step {
+    /// The token that resumes a page at this row.
+    fn cursor(&self, binding: &CursorBinding) -> crate::cursor::CursorToken {
+        match self.scan {
+            Some(offset) => Cursor::at_rank(binding, self.resume, offset),
+            None => Cursor::at(binding, self.space, self.resume),
+        }
+        .encode()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Text
+// ---------------------------------------------------------------------------
+
+/// What one text-filtered page found, and why it stopped looking.
+struct Ranked {
+    steps: Vec<Step>,
+    /// Distinct literals matching the text, exactly (a count, not a ranking).
+    matching_literals: u64,
+    /// The first rank this page did not examine, when the candidates ran out
+    /// before the page filled.
+    ///
+    /// A *rank* rather than a row, and that is the whole of the correctness
+    /// argument. A page only stops inside a hit when it is full, which is the
+    /// other branch — so when the candidates run out instead, every hit that
+    /// was examined was drained, and the next page starts at the next one. The
+    /// alternative, resuming one past the last row returned, has to know what
+    /// "one past" means inside that hit: `s ? ?` with a text constraint
+    /// resolves to `s ? o` per hit, whose positions are predicate ids, so
+    /// adding one lands on whatever predicate happens to be next and re-emits
+    /// the row before it.
+    unexamined: Option<u64>,
+}
+
+/// Enumerate a pattern whose object is constrained by a text query.
+///
+/// The composition doc 19 §19.2.2 is built for: a hit is an object dictionary
+/// id, so each one becomes `IdPattern { .., object: Some(id) }` and resolves
+/// through permutations this store already holds. There is no text-specific
+/// enumeration — only a different way of choosing which objects to enumerate,
+/// and a different order to do it in.
+///
+/// # What bounds it
+///
+/// §3.5 budgets filtered operations on *candidates examined*, independently of
+/// `limit`, because a hit need not contribute a row: `? p ?` with a text
+/// constraint discards every matching literal that does not occur with `p`. So
+/// this asks the index for as many hits as could fill the page — one per row,
+/// the best case — and stops there. If they were not enough, the response is
+/// short and says `candidate_budget` with a cursor, which is progress rather
+/// than failure: the next page resumes past the hits already examined.
+///
+/// Asking for `rank + limit + 1` makes a deep page cost more than a shallow
+/// one, because a top-k index has no cursor and re-ranks from the top. That is
+/// the shape of every ranked search, and `candidate_budget` is what keeps it
+/// from being unbounded.
+fn ranked(
+    store: &Store,
+    searcher: &TextSearcher,
+    filter: &TextFilter,
+    ids: IdPattern,
+    cursor: Option<&Cursor>,
+    want: usize,
+    budget: Candidates,
+) -> Result<Ranked, Problem> {
+    let query = TextQuery {
+        text: filter.query().to_owned(),
+        ..TextQuery::default()
+    };
+    let matching_literals = searcher
+        .count(&query)
+        .map_err(|error| unreadable("counting text matches", &error))?
+        as u64;
+
+    let (from_rank, mut skip) = match cursor {
+        None => (0u64, 0u64),
+        Some(cursor) => {
+            if cursor.space != PositionSpace::TextRank || cursor.binding_index.is_some() {
+                return Err(Problem::from(StaleCursor));
+            }
+            // A rank at or past the end of the hit list was never issued: a
+            // page that reached the end says so rather than handing out a
+            // cursor to nothing.
+            if cursor.position >= matching_literals {
+                return Err(Problem::from(StaleCursor));
+            }
+            (cursor.position, cursor.scan_position.unwrap_or(0))
+        }
+    };
+
+    let ceiling = usize::try_from(budget.0).unwrap_or(usize::MAX);
+    let top_k = (from_rank as usize)
+        .saturating_add(want)
+        .min(ceiling.max(1));
+    let hits = searcher
+        .search(&query, top_k)
+        .map_err(|error| unreadable("searching the text index", &error))?;
+
+    let mut steps = Vec::with_capacity(want.min(hits.len()));
+    for (rank, hit) in hits.iter().enumerate().skip(from_rank as usize) {
+        if steps.len() >= want {
+            break;
+        }
+        let selection = select(
+            store,
+            IdPattern {
+                object: Some(hit.object_id),
+                ..ids
+            },
+        )?;
+        // The position *inside* a hit is a position in that hit's own space,
+        // not a row count: `s ? ?` with a text constraint resolves to `s ? o`,
+        // whose positions are predicate ids (doc 20 §20.2.1). Reusing the same
+        // pairing the pattern walk uses is what keeps the two readings from
+        // drifting — and `s ? ?` + `o.text` is the only shape where they
+        // differ, which is exactly the shape a special case would get wrong.
+        let space = PositionSpace::of(&selection);
+        // `skip` applies to the hit the cursor stopped inside, and no other.
+        let within = std::mem::take(&mut skip);
+        steps.extend(
+            positioned(&selection, space, within)
+                .take(want - steps.len())
+                .map(|(triple, at)| Step {
+                    triple,
+                    space: PositionSpace::TextRank,
+                    resume: rank as u64,
+                    scan: Some(at),
+                    direction: None,
+                    score: Some(hit.score),
+                }),
+        );
+    }
+
+    // The page did not fill, and there are matches this request did not get to
+    // examine. Tested against the *true* match count rather than against
+    // `top_k`: a query whose last candidates contribute no rows — every hit
+    // `p` rejects — fills neither the page nor the hit list, and comparing with
+    // what was asked for would call that a budget exhaustion and hand out a
+    // cursor to an empty page that says the same thing again.
+    let unexamined = (steps.len() < want && (hits.len() as u64) < matching_literals)
+        .then_some(hits.len() as u64);
+    Ok(Ranked {
+        steps,
+        matching_literals,
+        unexamined,
+    })
 }
 
 /// A pattern's ids, or the parameters whose terms the bundle does not hold.
@@ -693,13 +979,10 @@ fn paged(
     // Bytes first, because a page stopped for bytes never reached its row
     // count and its cursor is the row the bytes ran out on.
     let completeness = match (spent_at.map(|index| &steps[index]), &dropped) {
-        (Some(next), _) => Completeness::budget_exhausted(
-            BudgetReason::ResponseBytes,
-            Cursor::at(binding, next.space, next.resume).encode(),
-        ),
-        (None, Some(next)) => {
-            Completeness::page_limit(Cursor::at(binding, next.space, next.resume).encode())
+        (Some(next), _) => {
+            Completeness::budget_exhausted(BudgetReason::ResponseBytes, next.cursor(binding))
         }
+        (None, Some(next)) => Completeness::page_limit(next.cursor(binding)),
         // The enumeration ran out inside this page, so it is the whole answer.
         (None, None) => Completeness::complete(),
     };
@@ -716,6 +999,96 @@ fn paged(
         directed,
         target,
     })
+}
+
+/// Finish a text-filtered page: the same materializing and the same byte
+/// budget, over steps a ranking produced rather than an enumeration.
+///
+/// Split from [`paged`] at exactly the point the two differ. Everything after
+/// the rows exist is shared — the byte budget, the cursor, the envelope — and
+/// what is not shared is where the rows came from and what can be said about
+/// how many there are.
+fn ranked_page(
+    dictionary: &Dictionary<'_>,
+    target: Target,
+    envelope: Envelope,
+    found: Ranked,
+    paging: Paging<'_>,
+) -> Result<Answer, Problem> {
+    let Ranked {
+        mut steps,
+        matching_literals,
+        unexamined,
+    } = found;
+    let dropped = (steps.len() > paging.limit as usize)
+        .then(|| steps.pop())
+        .flatten();
+
+    let Envelope {
+        echo,
+        vars,
+        directed,
+        absent_terms,
+    } = envelope;
+    let (rows, spent_at) = materialize(dictionary, &vars, &steps, paging.bytes)?;
+
+    // Three ways to stop, in the order they bind. Bytes first for the reason
+    // `paged` gives; then the page limit; then the candidate budget, which is
+    // the one that means "there may be more, and finding out costs more than
+    // this request is allowed to spend".
+    let completeness = match (spent_at.map(|index| &steps[index]), &dropped, unexamined) {
+        (Some(next), _, _) => {
+            Completeness::budget_exhausted(BudgetReason::ResponseBytes, next.cursor(paging.binding))
+        }
+        (None, Some(next), _) => Completeness::page_limit(next.cursor(paging.binding)),
+        (None, None, Some(rank)) => Completeness::budget_exhausted(
+            BudgetReason::Candidate,
+            Cursor::at_rank(paging.binding, rank, 0).encode(),
+        ),
+        (None, None, None) => Completeness::complete(),
+    };
+
+    Ok(Answer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        echo,
+        cardinality: text_cardinality(&completeness, &paging, rows.len() as u64, matching_literals),
+        absent_terms,
+        rows,
+        vars,
+        completeness,
+        directed,
+        target,
+    })
+}
+
+/// How many rows a text-filtered pattern matches (§3.4.1).
+///
+/// Three cases, and only one of them is an estimate at all.
+///
+/// A page that started at the beginning and ran out is the whole answer, so the
+/// rows *are* the count and it is exact. Saying "about 4" over five rows a
+/// client can see is worse than useless — it makes every other estimate in the
+/// response harder to believe.
+///
+/// Otherwise the index supplies the exact number of distinct matching
+/// *literals*, which is `distinct_objects` and is a different quantity from the
+/// rows: one literal occurs on many subjects, and when `s` or `p` is bound it
+/// may occur on none that match. So it goes out as the estimate, raised to the
+/// rows already returned — which is a bound the response itself proves, and
+/// keeps `value` from ever being smaller than the array beneath it.
+fn text_cardinality(
+    completeness: &Completeness,
+    paging: &Paging<'_>,
+    rows: u64,
+    matching_literals: u64,
+) -> Cardinality {
+    if completeness.is_complete() && paging.cursor.is_none() {
+        return Cardinality::exact(rows);
+    }
+    Cardinality::estimated(matching_literals)
+        .over_distinct_objects(matching_literals)
+        .at_least(rows)
 }
 
 /// Walk `phases` in order from `cursor`, collecting at most `want` rows.
@@ -747,13 +1120,15 @@ fn walk(
         }
         let remaining = want - steps.len();
         steps.extend(
-            positioned(phase, from)
+            positioned(&phase.selection, phase.space, from)
                 .take(remaining)
                 .map(|(triple, resume)| Step {
                     triple,
                     space: phase.space,
                     resume,
+                    scan: None,
                     direction: phase.direction,
+                    score: None,
                 }),
         );
         from = 0;
@@ -767,14 +1142,18 @@ fn walk(
 /// in: an offset for the three permutation spaces, and for `s ? o` the previous
 /// row's predicate id — route-independent (doc 20 §20.2.1) and strictly
 /// increasing, since one (s, p, o) occurs at most once.
-fn positioned<'a>(phase: &'a Phase<'a>, from: u64) -> impl Iterator<Item = (IdTriple, u64)> + 'a {
+fn positioned<'a>(
+    selection: &'a Selection<'a>,
+    space: PositionSpace,
+    from: u64,
+) -> impl Iterator<Item = (IdTriple, u64)> + 'a {
     let mut resume = from;
     // `usize::MAX` rather than a page size: `Selection::page` is lazy, so the
     // caller's `take` is what bounds the work, and a multi-phase walk cannot
     // know its own bound per phase up front.
-    phase.selection.page(from, usize::MAX).map(move |triple| {
+    selection.page(from, usize::MAX).map(move |triple| {
         let at = resume;
-        resume = match phase.space {
+        resume = match space {
             PositionSpace::Predicate => triple.predicate,
             _ => resume + 1,
         };
@@ -785,8 +1164,9 @@ fn positioned<'a>(phase: &'a Phase<'a>, from: u64) -> impl Iterator<Item = (IdTr
 /// Where a cursor resumes this phase, or `stale_cursor`.
 fn resume_position(cursor: &Cursor, phase: &Phase<'_>, predicates: u64) -> Result<u64, Problem> {
     let stale = || Problem::from(StaleCursor);
-    // M1 issues no token carrying either trailer, so one that does was not
-    // issued by this build's operations.
+    // No M1 operation issues a token carrying either trailer *in this space* —
+    // `scan_position` belongs to `TextRank`, which is not a phase — so one that
+    // does was not issued by the request it arrived on.
     if cursor.binding_index.is_some() || cursor.scan_position.is_some() {
         return Err(stale());
     }
@@ -846,7 +1226,7 @@ fn materialize(
             terms += serialized;
             cells.push((*position, text));
         }
-        let row = Row::new(cells, terms, step.direction);
+        let row = Row::new(cells, terms, step.direction, step.score);
 
         spent = spent.saturating_add(row.serialized);
         // Never on the first row of a page. A single term larger than the whole
@@ -1197,7 +1577,9 @@ mod tests {
         // which is the one place in the byte budget where two pieces of code
         // have to agree about the same bytes. This is that agreement, over
         // every shape a row can take: each width, each term kind, and with and
-        // without `/describe`'s column.
+        // without the two extra columns — `/describe`'s side and `o.text`'s
+        // score, the latter being the field whose length has to be formatted to
+        // be known.
         let terms = [
             "http://example.org/a",
             "_:b1",
@@ -1215,22 +1597,27 @@ mod tests {
         for width in 0..=Position::ALL.len() {
             for term in terms {
                 for direction in [None, Some(Direction::Out), Some(Direction::In)] {
-                    let cells: Vec<(Position, Rc<str>)> = Position::ALL[..width]
-                        .iter()
-                        .map(|position| (*position, Rc::from(term)))
-                        .collect();
-                    // What the cache would have measured for each cell.
-                    let each = serde_json::to_vec(&Term::from_dictionary(term))
-                        .expect("a term serializes")
-                        .len() as u64;
+                    // Scores that format to different lengths, including the
+                    // integral one `serde_json` writes as `14.0` and the long
+                    // decimal a BM25 score actually is.
+                    for score in [None, Some(0.0), Some(14.0), Some(1.0 / 3.0), Some(-0.5)] {
+                        let cells: Vec<(Position, Rc<str>)> = Position::ALL[..width]
+                            .iter()
+                            .map(|position| (*position, Rc::from(term)))
+                            .collect();
+                        // What the cache would have measured for each cell.
+                        let each = serde_json::to_vec(&Term::from_dictionary(term))
+                            .expect("a term serializes")
+                            .len() as u64;
 
-                    let row = Row::new(cells, each * width as u64, direction);
-                    assert_eq!(
-                        row.serialized,
-                        serde_json::to_vec(&row).expect("a row serializes").len() as u64,
-                        "width {width}, {term:?}, {direction:?}"
-                    );
-                    shapes += 1;
+                        let row = Row::new(cells, each * width as u64, direction, score);
+                        assert_eq!(
+                            row.serialized,
+                            serde_json::to_vec(&row).expect("a row serializes").len() as u64,
+                            "width {width}, {term:?}, {direction:?}, {score:?}"
+                        );
+                        shapes += 1;
+                    }
                 }
             }
         }

@@ -43,8 +43,13 @@ in, typed requests out) — over a real axum listener serving doc 03 §3.2's URL
 
 **M1 is not doc 03 §3.1's core profile**, and the two read like the same set. Missing
 from it: bindings QUERY (§3.4.2), `/void` and `/summary`. Present and *not* in it:
-`/sample`, which is an optional capability. So a deployment answers useful traffic and
-cannot yet claim conformance — that arrives with M2 (doc 20 §20.8).
+`/sample` and `o.text`, both optional capabilities. So a deployment answers useful
+traffic and cannot yet claim conformance — that arrives with M2 (doc 20 §20.8).
+
+A bundle carrying `data.hdt.text` (built by `hdtc text`) declares `search` and answers
+`o.text` on `/fragment` and `/count`: a ranked constraint on the object position,
+resolved through the permutations. `/search` itself — entity-level and deduplicated,
+with the doc 19 §19.4 label cascade — is not built.
 
 **Every route answers JSON and HTML at one URL**, chosen by `Accept` — a page in a
 browser, data from `curl` — so a new route implements `html::Resource` or it does not

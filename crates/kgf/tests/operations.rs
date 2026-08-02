@@ -449,6 +449,133 @@ fn every_operation_renders_a_page_as_well_as_json() {
     }
 }
 
+#[test]
+fn a_text_constraint_ranks_literals_and_resolves_them_through_the_permutations() {
+    // Doc 19 §19.2.2's composition: the index returns object dictionary ids,
+    // and the statements come from the permutations the store already has. So
+    // what this checks is that the two halves line up — every row's object is a
+    // literal the query matched, and every statement of a matched literal is
+    // there.
+    let served = Served::with_text();
+    let store = served.store();
+
+    let answer = served.fragment(&store, "o.text=Alice&limit=1000");
+    let matched = rows(&answer);
+    assert!(!matched.is_empty(), "the fixture holds \"Alice\"");
+    assert_eq!(answer["vars"], serde_json::json!(["s", "p", "o"]));
+
+    // §3.4.1 echoes the constraint in the position it constrains.
+    assert_eq!(
+        answer["pattern"],
+        serde_json::json!({"s": null, "p": null, "o": {"text": "Alice"}})
+    );
+
+    // Every row carries a score, and a matching literal's every statement is
+    // present — `"Alice"` is the object of one triple and `"Alice"@en` of
+    // another, so a hit on either brings its own rows and no others.
+    for row in answer["rows"].as_array().unwrap() {
+        assert!(row["score"].is_number(), "a ranked row carries its score");
+        let object = row["o"]["value"].as_str().unwrap();
+        assert!(
+            object.to_ascii_lowercase().contains("alice"),
+            "matched {object}"
+        );
+    }
+
+    // A page that started at the beginning and ran out is the whole answer, so
+    // the count is exact rather than an estimate of what the client can see.
+    assert_eq!(answer["complete"], serde_json::json!(true));
+    assert_eq!(
+        answer["cardinality"],
+        serde_json::json!({"value": matched.len(), "exact": true})
+    );
+
+    // And the rows are exactly the statements of the matched literals, which is
+    // the store's own answer for each of them.
+    let expected: usize = ["\"Alice\"", "\"Alice\"@en"]
+        .iter()
+        .map(|literal| {
+            let query = format!("o={}", kgf_server::url::encode_value(literal));
+            rows(&served.fragment(&store, &query)).len()
+        })
+        .sum();
+    assert_eq!(matched.len(), expected);
+}
+
+#[test]
+fn a_ranked_page_resumes_where_it_stopped_at_every_size() {
+    // The property doc 20 §20.9 asks of every enumeration, over the one whose
+    // position is not an enumeration order at all. Two things make it hard: a
+    // hit fans out, so a page can stop inside one; and `s ? ?` with a text
+    // constraint resolves per hit to `s ? o`, whose positions are predicate
+    // ids rather than offsets. Both shapes are here.
+    let served = Served::with_text();
+    let store = served.store();
+
+    for query in [
+        "o.text=Alice",
+        "o.text=Alice&p=%3Chttp%3A%2F%2Fexample.org%2Flabel%3E",
+        "o.text=Alice&s=%3Chttp%3A%2F%2Fexample.org%2Falice%3E",
+        "o.text=a",
+        "o.text=nosuchword",
+    ] {
+        let whole = rows(&served.fragment(&store, &format!("{query}&limit=1000")));
+        for size in [1usize, 2, 3] {
+            let paged = served.page_through(&store, query, size);
+            assert_eq!(paged, whole, "?{query} at limit={size}");
+        }
+    }
+}
+
+#[test]
+fn a_text_count_is_an_estimate_that_says_what_it_knows_exactly() {
+    // §3.4.1: the count is an estimate and `distinct_objects` beside it is not.
+    // The index counts matching *literals* without ranking them; the rows are
+    // one per occurrence, so the two differ whenever a literal is used twice.
+    let served = Served::with_text();
+    let store = served.store();
+
+    let counted = served.count(&store, "o.text=Alice");
+    let count = &counted["count"];
+    assert_eq!(count["exact"], serde_json::json!(false));
+    assert!(count["distinct_objects"].as_u64().unwrap() > 0);
+    // With the rest of the pattern unbound every matching literal occurs at
+    // least once, so the literal count is a floor and is reported as one.
+    assert_eq!(count["min"], count["distinct_objects"]);
+
+    // With `p` bound it is neither a floor nor a ceiling — a matching literal
+    // may not occur with that predicate at all — so no bound is claimed.
+    let filtered = served.count(
+        &store,
+        "o.text=Alice&p=%3Chttp%3A%2F%2Fexample.org%2Fname%3E",
+    );
+    assert!(filtered["count"].get("min").is_none());
+    assert!(filtered["count"]["distinct_objects"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn o_text_needs_an_index_and_will_not_share_the_object_position() {
+    let served = Served::with_text();
+    let store = served.store();
+
+    // `o` names one term and `o.text` ranks many, so a request carrying both is
+    // asking two incompatible questions rather than narrowing.
+    let refused = served
+        .try_fragment(&store, "o.text=Alice&o=%22Alice%22")
+        .expect_err("o and o.text both constrain the object");
+    assert_eq!(
+        refused.code(),
+        kgf_server::envelope::ErrorCode::MalformedRequest
+    );
+
+    // A bundle with no index declares no `search`, and the store offers no
+    // searcher — one condition, and the manifest is the half read first.
+    let plain = Served::new();
+    assert!(plain.store().text().is_none());
+    assert!(!plain.release().declares(kgf_store::Capability::Search));
+    assert!(served.release().declares(kgf_store::Capability::Search));
+}
+
 // ---------------------------------------------------------------------------
 // A served bundle, and the operations over it
 // ---------------------------------------------------------------------------
@@ -466,9 +593,21 @@ struct Served {
 
 impl Served {
     fn new() -> Self {
+        Self::build(false)
+    }
+
+    /// The same bundle with a full-text index over its literals, so `o.text`
+    /// has something to rank.
+    fn with_text() -> Self {
+        Self::build(true)
+    }
+
+    fn build(text: bool) -> Self {
         let root = tempfile::tempdir().expect("temp dir");
         let bundle = root.path().join(DATASET).join(VERSION);
-        Fixture::build(GRAPH).copy_bundle_to(&bundle);
+        let fixture = Fixture::build(GRAPH);
+        let fixture = if text { fixture.with_text() } else { fixture };
+        fixture.copy_bundle_to(&bundle);
 
         #[derive(Parser)]
         struct Cli {

@@ -172,6 +172,7 @@ pub struct Pattern {
     subject: Option<BoundTerm>,
     predicate: Option<BoundTerm>,
     object: Option<BoundTerm>,
+    text: Option<TextFilter>,
 }
 
 impl Pattern {
@@ -183,7 +184,17 @@ impl Pattern {
                     Some(BoundTerm::parse(position.as_str(), text, limits, prefixes)?);
             }
         }
+        // Part of the pattern rather than beside it, which is how §3.4.1 echoes
+        // it — the constraint sits in the object position it constrains. An
+        // operation that does not offer `o.text` has already refused it in
+        // `accept_only`, so this is unreachable for those.
+        pattern.text = TextFilter::parse(params, &pattern, limits)?;
         Ok(pattern)
+    }
+
+    /// The ranked text constraint on the object, if the request carried one.
+    pub fn text(&self) -> Option<&TextFilter> {
+        self.text.as_ref()
     }
 
     fn slot(&mut self, position: Position) -> &mut Option<BoundTerm> {
@@ -204,6 +215,10 @@ impl Pattern {
     }
 
     /// The positions a row carries: the unbound ones (§3.4.1).
+    ///
+    /// `o.text` leaves the object *unbound* — it ranks candidates rather than
+    /// naming one — so a text-filtered row still reports its object, which is
+    /// the whole point of asking.
     pub fn vars(&self) -> Vec<Position> {
         Position::ALL
             .into_iter()
@@ -219,7 +234,7 @@ impl Pattern {
                 self.bound(position).map(BoundTerm::dictionary),
             );
         }
-        request
+        request.with_opt("o.text", self.text.as_ref().map(TextFilter::query))
     }
 }
 
@@ -229,11 +244,81 @@ impl Serialize for Pattern {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(Position::ALL.len()))?;
         for position in Position::ALL {
-            map.serialize_entry(
-                position.as_str(),
-                &self.bound(position).map(BoundTerm::requested),
-            )?;
+            // §3.4.1: a constrained object echoes as `{"text": "…"}` in the
+            // position it constrains, where a bound one echoes as its term.
+            match (position, &self.text) {
+                (Position::Object, Some(text)) => map.serialize_entry("o", text)?,
+                _ => map.serialize_entry(
+                    position.as_str(),
+                    &self.bound(position).map(BoundTerm::requested),
+                )?,
+            }
         }
+        map.end()
+    }
+}
+
+/// A text constraint on the object position (§3.4.1, doc 19 §19.3).
+///
+/// Ranked rather than filtering: the index orders the *literals* that match,
+/// and the pattern around it decides which of their statements come back. That
+/// is why it is not a fourth position — `o` binds one term and `o.text` names
+/// many, so a request carrying both is asking two incompatible questions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextFilter(String);
+
+impl TextFilter {
+    /// Read `o.text`, if the request carried one.
+    fn parse(
+        params: &Params,
+        pattern: &Pattern,
+        limits: Limits<'_>,
+    ) -> Result<Option<Self>, Problem> {
+        let Some(text) = params.get("o.text") else {
+            return Ok(None);
+        };
+        if let Some(bound) = pattern.bound(Position::Object) {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "`o={}` and `o.text` both constrain the object; bind the term or                      search for it, not both",
+                    reflected(bound.requested())
+                ),
+            ));
+        }
+        if text.is_empty() {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "`o.text` is empty; omit it to leave the object unconstrained",
+            ));
+        }
+        // The same budget a term parameter is held to: this is text a client
+        // sends, and §3.5 caps what one of those may weigh.
+        let max = limits.budgets.max_term_bytes;
+        if text.len() as u64 > max {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "`o.text` is {} bytes, over this server's max_term_bytes of {max}",
+                    text.len()
+                ),
+            ));
+        }
+        Ok(Some(Self(text.to_owned())))
+    }
+
+    /// The query text, as the client sent it.
+    pub fn query(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for TextFilter {
+    /// §3.4.1 echoes the constraint inside the pattern's object position, as
+    /// `{"text": "atrazine"}`.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("text", &self.0)?;
         map.end()
     }
 }
@@ -318,15 +403,29 @@ impl Serialize for Direction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseBytes(pub u64);
 
+/// §3.5's `candidate_budget`: rows or postings a filtered operation may
+/// *examine*, independently of how many it returns.
+///
+/// A separate budget from [`ResponseBytes`] because it bounds a different
+/// thing. A text-filtered pattern examines one ranked literal per candidate and
+/// may keep none of them — `? p ?` discards every match that does not occur
+/// with `p` — so the work has no relation to the page size, and `limit` bounds
+/// nothing. Exhausting it is not an error: §3.5 says the response comes back
+/// short, marked `candidate_budget`, with a cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Candidates(pub u64);
+
 /// `GET /fragment` — a triple pattern, paged (§3.4.1).
 #[derive(Debug)]
 pub struct Fragment {
-    /// The pattern to enumerate.
+    /// The pattern to enumerate, text constraint included.
     pub pattern: Pattern,
     /// Rows this page may carry.
     pub limit: u32,
     /// Bytes its rows may occupy.
     pub bytes: ResponseBytes,
+    /// Candidates a text constraint may examine.
+    pub candidates: Candidates,
     /// Where to resume, if the request carried a cursor.
     pub cursor: Option<Cursor>,
     /// What a cursor this request issues must match.
@@ -334,7 +433,8 @@ pub struct Fragment {
 }
 
 impl Fragment {
-    const PARAMETERS: &'static [&'static str] = &["s", "p", "o", "limit", "cursor", "format"];
+    const PARAMETERS: &'static [&'static str] =
+        &["s", "p", "o", "o.text", "limit", "cursor", "format"];
 
     /// Read the parameters of a `/fragment` request.
     pub fn parse(
@@ -360,6 +460,7 @@ impl Fragment {
             pattern,
             limit,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            candidates: Candidates(limits.budgets.candidate_budget),
             cursor: resume(params, &binding)?,
             binding,
         })
@@ -369,15 +470,17 @@ impl Fragment {
 /// `GET /count` — a cardinality and nothing else (§3.4.4).
 #[derive(Debug)]
 pub struct Count {
-    /// The pattern to count.
+    /// The pattern to count, text constraint included.
     pub pattern: Pattern,
+    /// Candidates a text constraint may examine.
+    pub candidates: Candidates,
 }
 
 impl Count {
     /// No `limit` and no `cursor`: an M1 count is exact and arrives whole.
     /// §3.4.4's budgeted scanning counts, which do resume, are M2 — and
     /// [`Operation::Count`] already reserves the token value they will need.
-    const PARAMETERS: &'static [&'static str] = &["s", "p", "o", "format"];
+    const PARAMETERS: &'static [&'static str] = &["s", "p", "o", "o.text", "format"];
 
     /// Read the parameters of a `/count` request.
     pub fn parse(
@@ -388,6 +491,7 @@ impl Count {
         accept_only(params, COUNT, Self::PARAMETERS)?;
         Ok(Self {
             pattern: Pattern::parse(params, limits, prefixes)?,
+            candidates: Candidates(limits.budgets.candidate_budget),
         })
     }
 }
@@ -524,7 +628,6 @@ impl Sample {
 /// `labels=true` modifier row for the operations that return rows; and §3.5's
 /// `fragment +g scope` and `count +g scope` rows for `g`.
 const NOT_OFFERED: &[(&str, Option<Capability>, &[&str])] = &[
-    ("o.text", Some(Capability::Search), &[FRAGMENT, COUNT]),
     ("o.lang", None, &[FRAGMENT, COUNT]),
     ("o.dt", None, &[FRAGMENT, COUNT]),
     ("o.ge", Some(Capability::Range), &[FRAGMENT, COUNT]),
@@ -739,7 +842,6 @@ mod tests {
         // is not.
         for (query, expected) in [
             ("p=ex:a&g=%3Chttp%3A%2F%2Fexample.org%2Fg%3E", "graphs"),
-            ("o.text=atrazine", "search"),
             ("o.ge=%2242%22", "range"),
             ("labels=true", "search"),
         ] {
@@ -816,14 +918,11 @@ mod tests {
         );
 
         // And an object filter belongs to the two operations that take a
-        // pattern *and* report on objects.
-        assert_eq!(
-            Count::parse(&params("o.text=atrazine"), limits(), &prefixes())
-                .unwrap_err()
-                .code(),
-            ErrorCode::CapabilityNotAvailable,
-            "§3.4.4 says counts for text constraints are estimates, so it takes one"
-        );
+        // pattern *and* report on objects. `o.text` is answered rather than
+        // refused — §3.4.4 says counts for text constraints are estimates,
+        // which is a statement about what a count returns, not whether it takes
+        // one.
+        assert!(Count::parse(&params("o.text=atrazine"), limits(), &prefixes()).is_ok());
         assert_eq!(
             Describe::parse(
                 &params("iri=ex:a&o.text=atrazine"),

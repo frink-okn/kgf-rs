@@ -17,8 +17,9 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–14 are complete, which is all of M1; each carries a **What landed** section
-written after the fact, which is where a unit's plan and its outcome are reconciled.
+Units 1–14 are complete, which is all of M1, and unit 15 begins the work past it; each
+carries a **What landed** section written after the fact, which is where a unit's plan
+and its outcome are reconciled.
 
 **Nothing here is frozen.** Doc 20 §20.7 and §20.8 speak of formats being stable from
 the first release; no release has happened, and the service is expected to run for a
@@ -890,6 +891,78 @@ graph scoping, so `g` is simply not its parameter. The table now carries the ope
 doc 03 defines each parameter for, which is also where that transcription belongs.
 
 There are 200 tests after this unit.
+
+### 15. `o.text` — a ranked object constraint ✅
+
+The first operation past M1, and the smallest correct piece of doc 19's text search:
+`o.text` on `/fragment` and `/count`, gated on the `search` capability.
+
+Chosen over `/search` first because it needs nothing that does not exist. Hits are
+object dictionary ids (doc 19 §19.2.2), so each one is `IdPattern { .., object }` over
+permutations the store already holds — there is no text-specific enumeration, only a
+different way of choosing which objects to enumerate and a different order. `/search`
+needs the §19.4 label cascade and entity-level dedupe on top, and its cost profile is
+what doc 07 §7.5 item 20 lists as unvalidated; `o.text` depends on neither.
+
+*Verified by* exhaustive paging at adversarial sizes over every pattern shape a text
+constraint can wear — including the two hard ones, a hit that fans out across a page
+boundary and `s ? ?`, which resolves per hit to `s ? o` — plus the rows agreeing with
+the store's own answer for each matched literal.
+
+**What landed.** The artifact was the larger half. `data.hdt.text` is the first
+bundle artifact that is a **directory**, because its bytes are Tantivy's rather than
+hdtc's, so `ArtifactSet` learned the shape and `content_digest` learned to cover one
+(doc 04 §4.3, `../kgf` a6e048f). Doc 04 §4.1 had called it `text/`, which is not what
+`hdtc text` writes — the mismatch would have left a bundle built the documented way
+with an index at a path the layout does not list.
+
+**The binding check could not go where the others go.** Every dictionary-derived
+sidecar binds to its HDT, and `.hdt.perm` carries dictionary counts, a triple count
+and a suffix length so `Store::open` refuses a foreign one for the price of a header
+read. A text index records only a SHA-256 over the HDT payload, so checking it is a
+pass over the whole file — the work doc 20 §20.3 keeps off the open path. It moved to
+`kgf manifest`, which already reads every artifact to checksum it. That is a real
+weakening and is written down as one, in the code and in hdtc's own façade doc: the
+server trusts a bundle it was pointed at, and the failure it is trusting against is
+the quiet kind, since an index from another HDT returns ids that resolve to real terms
+in this one.
+
+hdtc grew three read-side additions for it (`verify_text_index_binding`,
+`TextSearcher::manifest`, and the manifest types), each covered by its façade contract
+test — the documented move when something needed is missing, rather than widening a
+module or copying the check.
+
+**A ranked result has no position in doc 20 §20.2's order**, so `PositionSpace` gained
+`TextRank`, the first space that is not an enumeration offset. It resumes safely for
+the reason the ranking is stable at all: a published index is immutable and hdtc
+breaks score ties on ascending object id. It is two numbers — rank, and the offset
+inside that hit — because a hit fans out to every statement carrying its literal, so a
+page can stop in the middle of one; a single flat offset would resume by re-expanding
+every hit before it, which is work proportional to how deep the client has paged.
+
+Three bugs came out of paging the fixture at every size, and two were the same
+mistake in different clothes. Asking "are there more?" against the number of hits
+*requested* rather than the number that *exist* invents a trailing empty page whenever
+the last candidates contribute no rows. And resuming "one past the last row" is
+meaningless in a space whose positions are predicate ids — `s ? ?` with a text
+constraint is exactly that shape, and page two re-emitted a row. The fix is that a
+candidate-budget stop resumes at the next *rank*, which is sound because a page only
+stops inside a hit when it is full, and that is the other branch.
+
+**A complete page reports an exact count.** A text cardinality is an estimate in
+general — the index counts distinct matching *literals*, and the rows are one per
+occurrence — but a page that started at the beginning and ran out has enumerated the
+whole answer, so it says so. The first version reported "about 4" over five rows the
+client could see, which is worse than useless: it makes every other estimate in the
+response harder to believe. Otherwise the literal count goes out as the estimate with
+`distinct_objects` exact beside it, raised to the rows already returned, and `min` is
+claimed only where it is true — with `s` or `p` bound a matching literal may occur on
+nothing that matches, so the count is then neither a floor nor a ceiling.
+
+`o.text` and `o` are refused together rather than intersected: one names a term and
+the other ranks many, so a request carrying both is asking two incompatible questions.
+
+There are 210 tests after this unit.
 
 ### What M1 is not
 
