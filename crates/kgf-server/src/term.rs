@@ -739,8 +739,15 @@ fn role_name(role: Role) -> &'static str {
 /// compile error in unit 13 and "fixed" by reaching for `Arc`.
 #[derive(Debug, Default)]
 pub struct TermCache {
-    entries: HashMap<(Role, u64), Rc<str>>,
+    entries: HashMap<(Role, u64), Entry>,
     scratch: Vec<u8>,
+}
+
+/// A materialized term, and how much room it takes in a response.
+#[derive(Debug, Clone)]
+struct Entry {
+    text: Rc<str>,
+    serialized: u64,
 }
 
 impl TermCache {
@@ -761,16 +768,44 @@ impl TermCache {
         role: Role,
         id: TermId,
     ) -> Result<Rc<str>, DictionaryTermError> {
-        if let Some(term) = self.entries.get(&(role, id.0)) {
-            return Ok(Rc::clone(term));
+        Ok(self.measured(dictionary, role, id)?.0)
+    }
+
+    /// The same term, with the bytes its term object occupies (§3.4.1).
+    ///
+    /// Memoized with the term rather than computed per use, which is the whole
+    /// point of measuring here: doc 03 §3.5's `max_response_bytes` has to be
+    /// weighed once per *row*, and a page repeats terms heavily — `s ? ?` has
+    /// one subject for every row and a predicate shared by most of them. A page
+    /// of 10 000 rows over 500 distinct terms serializes 500 term objects to
+    /// size itself instead of 30 000.
+    ///
+    /// The number is what `serde_json` writes for [`Term`]'s own `Serialize`,
+    /// taken through a counting sink so nothing is allocated to weigh it — so
+    /// it cannot drift from the encoding, because it *is* the encoding.
+    pub fn measured(
+        &mut self,
+        dictionary: &Dictionary<'_>,
+        role: Role,
+        id: TermId,
+    ) -> Result<(Rc<str>, u64), DictionaryTermError> {
+        if let Some(entry) = self.entries.get(&(role, id.0)) {
+            return Ok((Rc::clone(&entry.text), entry.serialized));
         }
         self.scratch.clear();
         let bytes = dictionary.extract(role, id, &mut self.scratch)?;
         let text = std::str::from_utf8(bytes)
             .map_err(|_| DictionaryTermError::NotUtf8 { role, id: id.0 })?;
-        let term: Rc<str> = Rc::from(text);
-        self.entries.insert((role, id.0), Rc::clone(&term));
-        Ok(term)
+        let serialized = serialized_bytes(&Term::from_dictionary(text));
+        let text: Rc<str> = Rc::from(text);
+        self.entries.insert(
+            (role, id.0),
+            Entry {
+                text: Rc::clone(&text),
+                serialized,
+            },
+        );
+        Ok((text, serialized))
     }
 
     /// How many distinct terms have been materialized.
@@ -782,6 +817,26 @@ impl TermCache {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+/// The bytes a term object occupies, without producing them.
+fn serialized_bytes(term: &Term<'_>) -> u64 {
+    struct Counter(u64);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter(0);
+    // A term object is strings and ASCII punctuation, so the only way this
+    // fails is a `Serialize` impl that errors — and a term's is this module's.
+    serde_json::to_writer(&mut counter, term).expect("a term serializes");
+    counter.0
 }
 
 #[cfg(test)]

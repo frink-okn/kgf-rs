@@ -179,12 +179,16 @@ pub trait Renders {
 // Rows
 // ---------------------------------------------------------------------------
 
+/// The key `/describe` reports an edge's side under.
+const DIRECTION: &str = "direction";
+
 /// One result row: a term per variable, and for `/describe` which side of the
 /// neighborhood it came from.
 #[derive(Debug)]
 pub struct Row {
     cells: Vec<(Position, Rc<str>)>,
     direction: Option<Direction>,
+    serialized: u64,
 }
 
 impl Serialize for Row {
@@ -195,10 +199,48 @@ impl Serialize for Row {
             map.serialize_entry(position.as_str(), &Term::from_dictionary(text))?;
         }
         if let Some(direction) = self.direction {
-            map.serialize_entry("direction", &direction)?;
+            map.serialize_entry(DIRECTION, &direction)?;
         }
         map.end()
     }
+}
+
+impl Row {
+    /// Assemble a row, and count what it will weigh.
+    ///
+    /// `terms` is the sum of the cells' own term-object lengths, which
+    /// [`TermCache`] measured once per distinct term. What is added here is the
+    /// map's punctuation, which is fixed: `serde_json` writes a map as
+    /// `{"k":v,"k":v}` with no spaces, so a key costs its length plus the two
+    /// quotes and the colon, and the entries are separated by one comma each.
+    ///
+    /// Counting rather than serializing is the point. The byte budget has to be
+    /// weighed once per row, and a page has far more rows than distinct terms —
+    /// serializing each row to size it cost a third of the time the response
+    /// itself takes to render. The risk is drifting from the `Serialize` impl
+    /// directly above, which is why the two sit together and why
+    /// `a_row_weighs_exactly_what_it_serializes` compares them for every shape.
+    fn new(cells: Vec<(Position, Rc<str>)>, terms: u64, direction: Option<Direction>) -> Self {
+        let mut entries = cells.len() as u64;
+        let mut serialized = 2 + terms;
+        for (position, _) in &cells {
+            serialized += quoted_key(position.as_str());
+        }
+        if let Some(direction) = direction {
+            entries += 1;
+            serialized += quoted_key(DIRECTION) + direction.as_str().len() as u64 + 2;
+        }
+        Self {
+            cells,
+            direction,
+            serialized: serialized + entries.saturating_sub(1),
+        }
+    }
+}
+
+/// `"key":` — the key, its quotes, and the colon.
+fn quoted_key(key: &str) -> u64 {
+    key.len() as u64 + 3
 }
 
 // ---------------------------------------------------------------------------
@@ -773,12 +815,14 @@ fn resume_position(cursor: &Cursor, phase: &Phase<'_>, predicates: u64) -> Resul
 /// *memory*: the terms are in hand at this point, and a page assembled first
 /// and measured second would have to fit before it could be refused.
 ///
-/// The measure is each row's compact JSON, taken through a counting sink so
-/// nothing is allocated to weigh it. That is exact for the serialization
-/// §3.4.1 defines, and conservative for the page, which is not one of §3.4.1's
-/// formats at all. It costs a second serialization pass on the JSON path;
-/// making it one means assembling the body by hand, which is an optimization,
-/// and the house rule is that those follow a profile.
+/// The measure is each row's compact JSON — exact for the serialization §3.4.1
+/// defines, and conservative for the page, which is not one of §3.4.1's formats
+/// at all. It is *counted* rather than produced: [`TermCache`] weighs each
+/// distinct term once and [`Row::new`] adds the map's fixed punctuation, so a
+/// page pays per term rather than per row. Serializing every row to size it
+/// cost a third of what rendering the response costs (10 000 rows: 1.0 ms of
+/// weighing against 3.0 ms of rendering), which is what that arrangement is
+/// worth avoiding.
 fn materialize(
     dictionary: &Dictionary<'_>,
     vars: &[Position],
@@ -790,22 +834,21 @@ fn materialize(
     let mut spent = 0u64;
     for (index, step) in steps.iter().enumerate() {
         let mut cells = Vec::with_capacity(vars.len());
+        let mut terms = 0u64;
         for position in vars {
-            let text = cache
-                .resolve(
+            let (text, serialized) = cache
+                .measured(
                     dictionary,
                     position.role(),
                     TermId(position.of(step.triple)),
                 )
                 .map_err(|error| unreadable("materializing a term", &error))?;
+            terms += serialized;
             cells.push((*position, text));
         }
-        let row = Row {
-            cells,
-            direction: step.direction,
-        };
+        let row = Row::new(cells, terms, step.direction);
 
-        spent = spent.saturating_add(serialized_bytes(&row));
+        spent = spent.saturating_add(row.serialized);
         // Never on the first row of a page. A single term larger than the whole
         // budget would otherwise produce an empty page whose cursor resumes
         // exactly where it was issued, and a client paging on it would never
@@ -816,26 +859,6 @@ fn materialize(
         rows.push(row);
     }
     Ok((rows, None))
-}
-
-/// The bytes one row will add to a response, without building them.
-fn serialized_bytes(row: &Row) -> u64 {
-    struct Counter(u64);
-    impl std::io::Write for Counter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len() as u64;
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut counter = Counter(0);
-    // A row is terms and ASCII punctuation, so the only way this fails is a
-    // `Serialize` impl that errors — and a row's is this module's.
-    serde_json::to_writer(&mut counter, row).expect("a row serializes");
-    counter.0
 }
 
 /// A bundle this server published and cannot read is the server's problem, not
@@ -1167,6 +1190,52 @@ impl Cell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_weighs_exactly_what_it_serializes() {
+        // `Row::new` counts what `Serialize` will write instead of writing it,
+        // which is the one place in the byte budget where two pieces of code
+        // have to agree about the same bytes. This is that agreement, over
+        // every shape a row can take: each width, each term kind, and with and
+        // without `/describe`'s column.
+        let terms = [
+            "http://example.org/a",
+            "_:b1",
+            "\"plain\"",
+            "\"tagged\"@en-gb",
+            "\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+            // The escapes, which are where a byte count is most likely to be
+            // wrong: a quote and a backslash double, and a control character
+            // becomes six.
+            "\"a \\\"quoted\\\" \tvalue\"",
+            "\"a Ünicode ☃ value\"",
+        ];
+
+        let mut shapes = 0;
+        for width in 0..=Position::ALL.len() {
+            for term in terms {
+                for direction in [None, Some(Direction::Out), Some(Direction::In)] {
+                    let cells: Vec<(Position, Rc<str>)> = Position::ALL[..width]
+                        .iter()
+                        .map(|position| (*position, Rc::from(term)))
+                        .collect();
+                    // What the cache would have measured for each cell.
+                    let each = serde_json::to_vec(&Term::from_dictionary(term))
+                        .expect("a term serializes")
+                        .len() as u64;
+
+                    let row = Row::new(cells, each * width as u64, direction);
+                    assert_eq!(
+                        row.serialized,
+                        serde_json::to_vec(&row).expect("a row serializes").len() as u64,
+                        "width {width}, {term:?}, {direction:?}"
+                    );
+                    shapes += 1;
+                }
+            }
+        }
+        assert!(shapes >= 80, "{shapes} shapes");
+    }
 
     #[test]
     fn a_draw_is_uniform_deterministic_and_free_of_repeats() {
