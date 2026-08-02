@@ -697,6 +697,26 @@ wrong for this use (below). `kgf-store`'s rank/select and packed arrays look lik
 same question and are not: `sucds` and `vers` build their own structures in memory,
 while doc 20 §20.1 needs hdtc's *persisted* directories read in place.
 
+**Five things a review found afterwards, all confirmed against a running server before
+being believed.** The two that matter are about *when* work happens, not what it
+computes. `/manifest` negotiated after opening the bundle, so `?format=parquet` against
+a bundle with a missing artifact was a 500 about the bundle rather than a 400 about the
+request — and a request that was never going to be answered opened a cold bundle to
+find out. And `axum::extract::Path` rejects with its own plain-text 400, reachable from
+a URL as ordinary as `/%FF`, which was the one hole in §3.6.1's "every error response
+carries a code" — a rule this repo argued into the spec. Both now go through the same
+`Problem`.
+
+The other three are list-framing, and each was a spurious 406. `HeaderMap::get` reads
+the first `Accept` field line, but RFC 9110 §5.3 lets a sender split a list across
+lines. Splitting on every comma breaks a quoted parameter value (§5.6.4), which is the
+seam this unit owns: `mediatype` parses one range and cannot see the list, and nothing
+in the stack owns the list without also owning the selection. And `jiff` parses ISO
+8601, a superset, so `+25:00` was read as an offset and landed a day earlier — enough
+for a typo in a timestamp to take `current` from the release that should have it, which
+startup is supposed to stop on. The offset is gated in front of jiff now; the calendar
+stays jiff's.
+
 Two smaller things the layers took on because unit 14 needs them and they are policy
 rather than plumbing. A repeated query parameter is `malformed_request`, since
 `?limit=10&limit=99999` has no defensible resolution and server, proxy and client URL
@@ -712,7 +732,7 @@ useful thing to browse to, and doc 03 §3.2 does not define it, so inventing URL
 is not this unit's call — the dataset page links straight to `/manifest`, which is
 specified and does the job.
 
-There are 161 tests after this unit.
+There are 165 tests after this unit.
 
 ### 14. The four query operations
 

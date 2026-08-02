@@ -9,7 +9,7 @@
 //! # Escaping is the templating engine's job
 //!
 //! Markup is written with `maud`, whose `html!` macro escapes every
-//! interpolation and requires [`PreEscaped`](maud::PreEscaped) to opt out.
+//! interpolation and requires [`maud::PreEscaped`] to opt out.
 //! Nothing in this crate concatenates HTML. That matters more than it might
 //! look: the data on these pages is a published bundle's own manifest and
 //! dictionary, so "someone published a dataset whose title contains a

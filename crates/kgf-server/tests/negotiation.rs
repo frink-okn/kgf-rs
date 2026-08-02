@@ -118,4 +118,28 @@ fn where_the_two_differ_it_is_a_decision_and_not_a_bug() {
         assert!(ours(header).is_some(), "{header}");
         assert_eq!(independent(header), None, "{header}");
     }
+
+    // Same rule, reached through a quoted parameter value — which is here
+    // because the *framing* is what was broken. §5.6.4 makes the comma part of
+    // the value, and splitting on it produced two unparseable ranges and a 406.
+    // Both implementations now see one range and two; they still differ on what
+    // to do with its parameter, which is the decision above.
+    assert_eq!(
+        Accept::from_str(r#"text/html;note="a,b", application/json;q=0.1"#)
+            .expect("parses")
+            .media_types()
+            .count(),
+        2,
+        "the oracle reads the quoted comma as part of the value"
+    );
+    assert_eq!(
+        ours(r#"text/html;note="a,b", application/json;q=0.1"#).as_deref(),
+        Some("text/html"),
+        "so must we, or the quoted range is lost and the weaker one wins"
+    );
+    assert_eq!(
+        ours(r#"application/json;note="a,b""#).as_deref(),
+        Some("application/json")
+    );
+    assert_eq!(independent(r#"application/json;note="a,b""#), None);
 }

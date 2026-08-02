@@ -235,8 +235,8 @@ impl MediaRange {
 }
 
 fn parse_accept(header: &str) -> Vec<MediaRange> {
-    header
-        .split(',')
+    split_ranges(header)
+        .into_iter()
         .filter_map(|entry| {
             let mime: MediaTypeBuf = entry.trim().parse().ok()?;
             let quality = mime
@@ -251,6 +251,36 @@ fn parse_accept(header: &str) -> Vec<MediaRange> {
             Some(MediaRange { mime, quality })
         })
         .collect()
+}
+
+/// Split an `Accept` header into its media ranges.
+///
+/// A comma inside a quoted parameter value is not a separator — RFC 9110
+/// §5.6.4 makes `application/json;note="a,b"` one range, and splitting it makes
+/// two unparseable ones, which are dropped, which is a 406 for a request that
+/// named a type this server has.
+///
+/// This is the seam between the two halves of the header: `mediatype` owns the
+/// grammar of one range and cannot see the list, and nothing in this stack owns
+/// the list without also owning the selection. Fifteen lines and an oracle test
+/// is the smaller of those two costs.
+fn split_ranges(header: &str) -> Vec<&str> {
+    let mut ranges = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (index, byte) in header.bytes().enumerate() {
+        match byte {
+            _ if escaped => escaped = false,
+            b'\\' if quoted => escaped = true,
+            b'"' => quoted = !quoted,
+            b',' if !quoted => {
+                ranges.push(&header[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    ranges.push(&header[start..]);
+    ranges
 }
 
 /// `q=0.812` as 812. Rejects anything outside RFC 9110 §12.4.2's grammar rather
@@ -508,6 +538,36 @@ mod tests {
             Ok(Representation::Json),
             "and the exclusion runs the other way too"
         );
+    }
+
+    #[test]
+    fn a_comma_inside_a_quoted_parameter_is_not_a_separator() {
+        // RFC 9110 §5.6.4. Split naively, this becomes two unparseable ranges,
+        // both dropped, and a 406 for a request that named a type we serve.
+        assert_eq!(
+            negotiate(None, Some(r#"application/json;note="a,b""#), BOTH),
+            Ok(Representation::Json)
+        );
+        assert_eq!(
+            negotiate(
+                None,
+                Some(r#"text/html;note="a,b", application/json;q=0.1"#),
+                BOTH
+            ),
+            Ok(Representation::Html),
+            "the quoted range must survive and outrank the one after it"
+        );
+        // An escaped quote inside the value does not end it.
+        assert_eq!(
+            negotiate(None, Some(r#"application/json;note="a\",b""#), BOTH),
+            Ok(Representation::Json)
+        );
+        // An unterminated quote consumes the rest rather than resplitting it.
+        assert_eq!(
+            split_ranges(r#"text/html;note="a, application/json"#).len(),
+            1
+        );
+        assert_eq!(split_ranges("text/html, application/json").len(), 2);
     }
 
     #[test]

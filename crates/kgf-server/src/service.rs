@@ -417,14 +417,35 @@ impl Release {
 /// although it is an hour later, and `…:00.5Z` sorts before `…:00Z` although it
 /// is half a second later.
 ///
-/// It is a little more permissive than RFC 3339 — a space in place of `T`
-/// (which §5.6's note allows anyway), a bare `+01` offset, an offset hour past
-/// 23 — and that costs nothing here. Leniency at the edges of a timestamp
-/// affects which release is `current` only if a manifest is already malformed,
-/// and the alternative was ~90 lines of date parsing and a transcribed calendar
-/// algorithm to be marginally stricter about it.
+/// `jiff` parses ISO 8601, which is a superset, so the offset is gated first.
+/// That is not pedantry: `+25:00` is not an offset, and jiff reads it as one
+/// and lands a day earlier — a manifest with a typo in its timestamp would sort
+/// as a release from the previous day and could take `current` from the version
+/// that should have it. Startup is meant to stop on a manifest like that
+/// (§20.8), so it does. The rest of RFC 3339 — the calendar, the leap day, the
+/// fractional second — stays jiff's, because that is the part worth ninety
+/// lines to get wrong.
 fn parse_rfc3339(text: &str) -> Option<Instant> {
-    text.parse().ok()
+    offset_is_rfc_3339(text).then(|| text.parse().ok())?
+}
+
+/// Whether `text` ends in RFC 3339's `time-offset`: `Z`, or `±HH:MM` in range.
+fn offset_is_rfc_3339(text: &str) -> bool {
+    let two_digits = |text: &str, limit: u8| {
+        text.len() == 2
+            && text.bytes().all(|byte| byte.is_ascii_digit())
+            && text.parse::<u8>().is_ok_and(|value| value <= limit)
+    };
+    match text.as_bytes() {
+        [.., b'Z' | b'z'] => true,
+        // `time-numoffset = ("+" / "-") time-hour ":" time-minute`, and the
+        // two components carry `time-hour`'s and `time-minute`'s own ranges.
+        [.., sign, _, _, b':', _, _] if *sign == b'+' || *sign == b'-' => {
+            let offset = &text[text.len() - 6..];
+            two_digits(&offset[1..3], 23) && two_digits(&offset[4..6], 59)
+        }
+        _ => false,
+    }
 }
 
 use jiff::Timestamp as Instant;
@@ -678,17 +699,28 @@ mod tests {
     }
 
     #[test]
-    fn three_things_looser_than_rfc_3339_are_accepted_anyway() {
-        // Pinned so the leniency is a known property rather than a discovery.
-        // None of it can change which release is current unless a manifest is
-        // already malformed, and being stricter would mean parsing timestamps
-        // by hand — which is what this stopped doing.
+    fn an_offset_that_is_not_an_offset_is_refused() {
+        // The gate in front of jiff, which parses ISO 8601 and would take all
+        // of these. `+25:00` is the one that matters: jiff reads it as a real
+        // offset and lands a day earlier, so a typo in a timestamp could take
+        // `current` from the release that should have it.
         for text in [
-            "2026-06-01 14:03:22Z",      // a space where §5.6's note allows one
-            "2026-06-01T14:03:22+01",    // an offset without its minutes
             "2026-06-01T14:03:22+25:00", // an offset hour past 23
+            "2026-06-01T14:03:22+01:70", // an offset minute past 59
+            "2026-06-01T14:03:22+01",    // an offset without its minutes
+            "2026-06-01T14:03:22+0100",  // an offset without its colon
+            "2026-06-01T14:03:22",       // no offset: the instant is unknown
         ] {
-            assert!(parse_rfc3339(text).is_some(), "{text:?}");
+            assert!(parse_rfc3339(text).is_none(), "{text:?}");
         }
+
+        // Still accepted, and still looser than §5.6's grammar: a space in
+        // place of `T`, which that section's own note allows.
+        assert!(parse_rfc3339("2026-06-01 14:03:22Z").is_some());
+        assert_eq!(
+            parse_rfc3339("2026-06-01T14:03:22+23:59"),
+            parse_rfc3339("2026-05-31T14:04:22Z"),
+            "an offset at the edge of the range is still an offset"
+        );
     }
 }

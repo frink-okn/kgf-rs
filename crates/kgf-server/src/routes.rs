@@ -34,7 +34,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Path, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Request, State};
 use axum::http::header::{ACCEPT, CONTENT_TYPE, LOCATION, VARY};
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
@@ -134,6 +134,7 @@ async fn service_descriptor(
     // digest over "what this host currently serves" to key one on.
     respond(
         &ServiceDescriptor::of(&service),
+        wants.representation()?,
         &wants,
         CachePolicy::Mutable,
         None,
@@ -148,6 +149,7 @@ async fn dataset_descriptor(
     let found = service.datasets().get(&dataset)?;
     respond(
         &DatasetDescriptor::of(&dataset, found),
+        wants.representation()?,
         &wants,
         CachePolicy::Mutable,
         None,
@@ -159,6 +161,12 @@ async fn bundle_manifest(
     Path((dataset, version)): Path<(String, String)>,
     wants: Wants,
 ) -> Result<Response, Problem> {
+    // Both before any work: a request this server cannot answer is refused for
+    // the reason it cannot be answered, and a request that was never going to
+    // be served does not open a cold bundle to find that out. Read the other
+    // way round, `?format=parquet` against a bundle whose artifacts are
+    // incomplete is a 500 about the bundle rather than a 400 about the request.
+    let representation = wants.representation()?;
     let release = service.datasets().release(&dataset, &version)?;
     let resource = BundleManifest::new(
         &dataset,
@@ -181,9 +189,10 @@ async fn bundle_manifest(
 
     respond(
         &resource,
+        representation,
         &wants,
         CachePolicy::Immutable,
-        Some(etag(&digest, wants.representation()?)),
+        Some(etag(&digest, representation)),
     )
 }
 
@@ -237,6 +246,49 @@ fn unreachable_route(path: &str) -> Problem {
 // What the request asked for
 // ---------------------------------------------------------------------------
 
+/// A path capture, rejected as a [`Problem`] like everything else.
+///
+/// `axum::extract::Path` rejects with its own plain-text 400, which is
+/// reachable from a URL as ordinary as `/%FF`: a segment that is not UTF-8 once
+/// decoded. That response has no `code`, no `Vary`, and is never a page, so it
+/// is the one hole in §3.6.1's "every error response carries a code" — and one
+/// this crate argued into the spec. Wrapping the extractor closes it.
+struct Path<T>(T);
+
+impl<S, T> FromRequestParts<S> for Path<T>
+where
+    T: serde::de::DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = Problem;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        use axum::extract::rejection::PathRejection;
+
+        match axum::extract::Path::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Path(captured)) => Ok(Self(captured)),
+            // The client's: a segment that does not decode, or does not fit the
+            // shape the route captures.
+            Err(PathRejection::FailedToDeserializePathParams(error)) => Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!("a path segment could not be read: {error}"),
+            )),
+            // Ours: the route's captures and the handler's parameters disagree,
+            // which is a wiring bug in this file and not a bad request.
+            Err(rejection) => {
+                tracing::error!(%rejection, "a route's path captures do not match its handler");
+                Err(Problem::new(
+                    ErrorCode::InternalError,
+                    "the request could not be routed",
+                ))
+            }
+        }
+    }
+}
+
 /// The negotiation and caching inputs of a request.
 ///
 /// One extractor rather than three, because a handler that took `Accept`
@@ -268,14 +320,9 @@ impl<S: Send + Sync> FromRequestParts<S> for Wants {
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
         let params = Params::parse(parts.uri.query())?;
-        let accept = parts
-            .headers
-            .get(ACCEPT)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
         Ok(Self {
             format: params.get("format").map(str::to_owned),
-            accept,
+            accept: accept_header(&parts.headers),
             // A malformed `If-None-Match` is treated as absent, which RFC 9110
             // §13.1 requires of a precondition a server cannot evaluate: the
             // response is the full one, never a wrong 304.
@@ -288,15 +335,31 @@ impl<S: Send + Sync> FromRequestParts<S> for Wants {
 // Rendering
 // ---------------------------------------------------------------------------
 
+/// The request's `Accept`, however many field lines it arrived on.
+///
+/// RFC 9110 §5.3 lets a sender split a list-valued field across several lines
+/// and requires a recipient to treat them as one comma-separated list.
+/// `HeaderMap::get` returns the first, so reading it alone turns
+/// `Accept: application/xml` + `Accept: text/html` into a 406 for a request
+/// that asked for something this server has.
+fn accept_header(headers: &axum::http::HeaderMap) -> Option<String> {
+    let combined = headers
+        .get_all(ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(", ");
+    (!combined.is_empty()).then_some(combined)
+}
+
 /// Serve a resource in the representation the request asked for.
 fn respond(
     resource: &impl Resource,
+    representation: Representation,
     wants: &Wants,
     cache: CachePolicy,
     etag: Option<ETag>,
 ) -> Result<Response, Problem> {
-    let representation = wants.representation()?;
-
     // Before the body is built, not after: the point of a conditional request
     // is that the server does not spend the work. `precondition_passes` is
     // RFC 9110 §13.1.2's weak comparison, so `*`, a comma list and a `W/`
@@ -387,11 +450,7 @@ async fn render_problems(request: Request, next: Next) -> Response {
     let format = Params::parse(request.uri().query())
         .ok()
         .and_then(|params| params.get("format").map(str::to_owned));
-    let accept = request
-        .headers()
-        .get(ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+    let accept = accept_header(request.headers());
     let instance = request.uri().path().to_owned();
 
     let mut response = next.run(request).await;

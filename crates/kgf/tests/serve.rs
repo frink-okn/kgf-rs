@@ -258,6 +258,76 @@ fn one_url_serves_a_page_to_a_browser_and_data_to_everything_else() {
 }
 
 #[test]
+fn every_error_response_carries_a_code() {
+    // §3.6.1 says every one, which includes the ones an off-the-shelf router
+    // answers on its own. `/%FF` is a path segment that is not UTF-8 once
+    // decoded, and reaches axum's extractor before any handler runs.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    let undecodable = server.get("/%FF");
+    undecodable.assert_status(400);
+    undecodable.assert_header("content-type", "application/problem+json");
+    undecodable.assert_varies_on_accept();
+    assert_eq!(undecodable.json()["code"], "malformed_request");
+
+    // And it negotiates, like every other error.
+    let page = server.request("GET", "/%FF", &[("Accept", "text/html")]);
+    page.assert_header("content-type", "text/html; charset=utf-8");
+}
+
+#[test]
+fn a_request_is_refused_before_it_costs_anything() {
+    // Two things at once: an unanswerable request is refused for the reason it
+    // is unanswerable, and it does not open a cold bundle on the way. The
+    // bundle here cannot be opened at all, so a 400 proves negotiation ran
+    // first — the open would have made it a 500.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    std::fs::remove_file(deployment.bundle("tox", "v1").join("data.hdt.perm")).unwrap();
+    let server = deployment.serve();
+
+    let unsupported = server.get("/tox/v/v1/manifest?format=parquet");
+    unsupported.assert_status(400);
+    assert_eq!(unsupported.json()["code"], "unsupported_format");
+
+    let unacceptable = server.request(
+        "GET",
+        "/tox/v/v1/manifest",
+        &[("Accept", "application/parquet")],
+    );
+    unacceptable.assert_status(406);
+    assert_eq!(unacceptable.json()["code"], "not_acceptable");
+
+    // A request that *is* answerable still reaches the broken bundle.
+    server.get("/tox/v/v1/manifest").assert_status(500);
+}
+
+#[test]
+fn an_accept_split_across_field_lines_is_one_list() {
+    // RFC 9110 §5.3: a sender may split a list-valued field, and a recipient
+    // treats the lines as one comma-separated value. Reading only the first
+    // turns this into a 406 for a request that asked for something we have.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    let split = server.request(
+        "GET",
+        "/tox",
+        &[("Accept", "application/xml"), ("Accept", "text/html")],
+    );
+    split.assert_status(200);
+    split.assert_header("content-type", "text/html; charset=utf-8");
+
+    // The same list on one line, for comparison.
+    server
+        .request("GET", "/tox", &[("Accept", "application/xml, text/html")])
+        .assert_header("content-type", "text/html; charset=utf-8");
+}
+
+#[test]
 fn negotiation_and_parameter_failures_are_told_apart() {
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
