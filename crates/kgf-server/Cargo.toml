@@ -28,6 +28,7 @@ headers.workspace = true
 axum-extra.workspace = true
 mediatype.workspace = true
 maud.workspace = true
+bytes.workspace = true
 jiff.workspace = true
 percent-encoding.workspace = true
 

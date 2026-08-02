@@ -44,10 +44,11 @@ use axum::{Router, middleware};
 use headers::{ETag, HeaderMapExt, IfNoneMatch};
 use kgf_store::catalog::BundleId;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::descriptor::{BundleManifest, DatasetDescriptor, ServiceDescriptor};
-use crate::envelope::{ErrorCode, PROBLEM_MEDIA_TYPE, Problem};
+use crate::envelope::{ErrorCode, PROBLEM_MEDIA_TYPE, Problem, reflected};
 use crate::html::Resource;
 use crate::representation::{CachePolicy, Representation, etag, negotiate};
 use crate::service::Service;
@@ -55,7 +56,8 @@ use crate::url::{self, Params};
 
 /// The KGF routes over a built service.
 pub fn router(service: Arc<Service>) -> Router {
-    let max_request_bytes = service.config().budgets.max_request_bytes;
+    let body_limit =
+        usize::try_from(service.config().budgets.max_request_bytes).unwrap_or(usize::MAX);
 
     Router::new()
         .route("/", read(get(service_descriptor)))
@@ -69,8 +71,22 @@ pub fn router(service: Arc<Service>) -> Router {
             read(get(bundle_manifest)),
         )
         .fallback(no_such_route)
-        .layer(middleware::from_fn(render_problems))
+        // Order matters more than usual here, and reads innermost first.
+        //
+        // `render_problems` must sit *outside* the body limit, or the 413 that
+        // limit produces never reaches the code that gives it a `code` — which
+        // is the whole reason the backstop exists. It must sit *inside* CORS,
+        // because it sets `Vary: Accept` with `insert` and CORS appends its own
+        // afterwards; the other way round would wipe them.
         .layer(TraceLayer::new_for_http())
+        // Two limits, because they catch different things. `RequestBodyLimitLayer`
+        // enforces the published figure on the wire whether or not anything
+        // reads the body, which is what makes `max_request_bytes` true today
+        // rather than a promise. `DefaultBodyLimit` is what a body *extractor*
+        // consults, and M1 has none — it is here for unit 14's QUERY bodies.
+        .layer(RequestBodyLimitLayer::new(body_limit))
+        .layer(DefaultBodyLimit::max(body_limit))
+        .layer(middleware::from_fn(render_problems))
         // §3.6: permissive, because the data is public and browser and WASM
         // clients are a target. `QUERY` is listed explicitly — a preflight that
         // omitted it would leave the canonical method unusable from a browser,
@@ -82,9 +98,6 @@ pub fn router(service: Arc<Service>) -> Router {
                 .allow_methods([Method::GET, Method::HEAD, Method::POST, query_method()])
                 .expose_headers(Any),
         )
-        .layer(DefaultBodyLimit::max(
-            usize::try_from(max_request_bytes).unwrap_or(usize::MAX),
-        ))
         .with_state(service)
 }
 
@@ -106,7 +119,10 @@ fn read(method_router: MethodRouter<Arc<Service>>) -> MethodRouter<Arc<Service>>
 async fn method_not_allowed(method: Method) -> Problem {
     Problem::new(
         ErrorCode::MethodNotAllowed,
-        format!("{method} is not a method this resource takes; see the Allow header"),
+        format!(
+            "{} is not a method this resource takes; see the Allow header",
+            reflected(method.as_str())
+        ),
     )
 }
 
@@ -117,7 +133,7 @@ async fn no_such_route(OriginalUri(uri): OriginalUri) -> Problem {
             "no resource at {}; this server serves / (service descriptor), \
              /{{dataset}}, /{{dataset}}/v/{{version}}/manifest, and the same under \
              /{{dataset}}/latest/",
-            uri.path()
+            reflected(uri.path())
         ),
     )
 }
@@ -130,14 +146,13 @@ async fn service_descriptor(
     State(service): State<Arc<Service>>,
     wants: Wants,
 ) -> Result<Response, Problem> {
-    // No ETag: the descriptor changes when the deployment does, and there is no
-    // digest over "what this host currently serves" to key one on.
+    let representation = wants.representation()?;
     respond(
         &ServiceDescriptor::of(&service),
-        wants.representation()?,
+        representation,
         &wants,
         CachePolicy::Mutable,
-        None,
+        Some(etag(service.descriptor_digest(), representation)),
     )
 }
 
@@ -147,12 +162,13 @@ async fn dataset_descriptor(
     wants: Wants,
 ) -> Result<Response, Problem> {
     let found = service.datasets().get(&dataset)?;
+    let representation = wants.representation()?;
     respond(
         &DatasetDescriptor::of(&dataset, found),
-        wants.representation()?,
+        representation,
         &wants,
         CachePolicy::Mutable,
-        None,
+        Some(etag(service.descriptor_digest(), representation)),
     )
 }
 
@@ -168,14 +184,22 @@ async fn bundle_manifest(
     // incomplete is a 500 about the bundle rather than a 400 about the request.
     let representation = wants.representation()?;
     let release = service.datasets().release(&dataset, &version)?;
+    let validator = etag(release.digest(), representation);
+
+    // Ahead of the open, not merely ahead of the body. A revalidation names the
+    // exact bytes it already holds, and a versioned URL cannot serve different
+    // ones, so there is nothing left to check: opening the bundle first would
+    // make a client's cheapest possible request pay for a cold mmap.
+    if wants.already_has(&validator) {
+        return not_modified(CachePolicy::Immutable, validator);
+    }
+
     let resource = BundleManifest::new(
         &dataset,
         &version,
-        release.digest().clone(),
         release.manifest().bytes(),
         release.manifest().parsed(),
     );
-    let digest = release.digest().clone();
 
     // The manifest itself is already in memory, but a bundle that cannot be
     // opened must not be described as though it can: a client reads
@@ -192,7 +216,7 @@ async fn bundle_manifest(
         representation,
         &wants,
         CachePolicy::Immutable,
-        Some(etag(&digest, representation)),
+        Some(validator),
     )
 }
 
@@ -274,7 +298,10 @@ where
             // shape the route captures.
             Err(PathRejection::FailedToDeserializePathParams(error)) => Err(Problem::new(
                 ErrorCode::MalformedRequest,
-                format!("a path segment could not be read: {error}"),
+                format!(
+                    "a path segment could not be read: {}",
+                    reflected(&error.to_string())
+                ),
             )),
             // Ours: the route's captures and the handler's parameters disagree,
             // which is a wiring bug in this file and not a bad request.
@@ -302,6 +329,20 @@ pub struct Wants {
 }
 
 impl Wants {
+    /// Whether the client already holds this exact entity (RFC 9110 §13.1.2).
+    ///
+    /// `precondition_passes` is `headers`' implementation of that section's
+    /// weak comparison, so `*`, a comma list and a `W/` prefix are its problem
+    /// rather than this crate's. Called twice per conditional request — once by
+    /// a handler wanting to skip work before it starts, once by the responder so
+    /// that a route which forgot to ask still cannot serve a body the client
+    /// has — and it is a header comparison, so twice is free.
+    pub fn already_has(&self, validator: &ETag) -> bool {
+        self.if_none_match
+            .as_ref()
+            .is_some_and(|if_none_match| !if_none_match.precondition_passes(validator))
+    }
+
     /// The representation to answer with, or the negotiation failure.
     pub fn representation(&self) -> Result<Representation, Problem> {
         negotiate(
@@ -322,7 +363,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Wants {
         let params = Params::parse(parts.uri.query())?;
         Ok(Self {
             format: params.get("format").map(str::to_owned),
-            accept: accept_header(&parts.headers),
+            accept: accept_header(&parts.headers)?,
             // A malformed `If-None-Match` is treated as absent, which RFC 9110
             // §13.1 requires of a precondition a server cannot evaluate: the
             // response is the full one, never a wrong 304.
@@ -342,14 +383,25 @@ impl<S: Send + Sync> FromRequestParts<S> for Wants {
 /// `HeaderMap::get` returns the first, so reading it alone turns
 /// `Accept: application/xml` + `Accept: text/html` into a 406 for a request
 /// that asked for something this server has.
-fn accept_header(headers: &axum::http::HeaderMap) -> Option<String> {
-    let combined = headers
-        .get_all(ACCEPT)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .collect::<Vec<_>>()
-        .join(", ");
-    (!combined.is_empty()).then_some(combined)
+///
+/// A line that is not readable as text is an error rather than a line to skip.
+/// Dropping one and negotiating from the rest answers a *different* request
+/// than the client made — the same substitution `url::decode_component` refuses
+/// for a term parameter, and for the same reason: it succeeds, so nobody finds
+/// out.
+fn accept_header(headers: &axum::http::HeaderMap) -> Result<Option<String>, Problem> {
+    let mut lines = Vec::new();
+    for value in headers.get_all(ACCEPT) {
+        lines.push(value.to_str().map_err(|_| {
+            Problem::new(
+                ErrorCode::MalformedRequest,
+                "an Accept header is not readable as text; \
+                 media types and their parameters are ASCII (RFC 9110 §5.6.3)",
+            )
+        })?);
+    }
+    let combined = lines.join(", ");
+    Ok((!combined.is_empty()).then_some(combined))
 }
 
 /// Serve a resource in the representation the request asked for.
@@ -360,38 +412,43 @@ fn respond(
     cache: CachePolicy,
     etag: Option<ETag>,
 ) -> Result<Response, Problem> {
-    // Before the body is built, not after: the point of a conditional request
-    // is that the server does not spend the work. `precondition_passes` is
-    // RFC 9110 §13.1.2's weak comparison, so `*`, a comma list and a `W/`
-    // prefix are handled by `headers` rather than here.
-    if let (Some(etag), Some(if_none_match)) = (&etag, &wants.if_none_match)
-        && !if_none_match.precondition_passes(etag)
+    // The backstop. A handler that can skip real work by checking earlier does
+    // so itself; this is here so that no route can serve a full body to a
+    // client that already holds it just because its handler did not ask.
+    if let Some(validator) = &etag
+        && wants.already_has(validator)
     {
-        return finish(
-            StatusCode::NOT_MODIFIED,
-            representation,
-            Body::empty(),
-            cache,
-            etag.clone().into(),
-        );
+        return not_modified(cache, validator.clone());
     }
 
     let body = match representation {
         Representation::Json => resource.to_json(),
-        Representation::Html => resource.to_html().into_bytes(),
+        Representation::Html => bytes::Bytes::from(resource.to_html()),
     };
     finish(
         StatusCode::OK,
-        representation,
+        Some(representation),
         Body::from(body),
         cache,
         etag,
     )
 }
 
+/// RFC 9110 §15.4.5's 304: no body, and the validator and freshness the
+/// response would have carried.
+fn not_modified(cache: CachePolicy, validator: ETag) -> Result<Response, Problem> {
+    finish(
+        StatusCode::NOT_MODIFIED,
+        None,
+        Body::empty(),
+        cache,
+        Some(validator),
+    )
+}
+
 fn finish(
     status: StatusCode,
-    representation: Representation,
+    representation: Option<Representation>,
     body: Body,
     cache: CachePolicy,
     etag: Option<ETag>,
@@ -401,7 +458,7 @@ fn finish(
         .body(body)
         .expect("a status and a body are a valid response");
     let headers = response.headers_mut();
-    if status != StatusCode::NOT_MODIFIED {
+    if let Some(representation) = representation {
         headers.insert(
             CONTENT_TYPE,
             HeaderValue::from_static(representation.content_type()),
@@ -445,27 +502,49 @@ impl IntoResponse for Problem {
     }
 }
 
-/// Render every [`Problem`] a request produced, in the client's representation.
+/// Render every error response in the client's representation, with a code.
+///
+/// Two jobs, and the second is why this is a layer rather than a helper. A
+/// [`Problem`] a handler or an extractor raised arrives as an empty response
+/// carrying itself, and is rendered here. But a `tower` layer can answer
+/// *before* any of this crate's code runs — the body limit below does — and
+/// §3.6.1 says every error response carries a code, including those. So an
+/// error that arrives unattributed is given a problem from its status rather
+/// than shipped as whatever the layer produced.
 async fn render_problems(request: Request, next: Next) -> Response {
-    let format = Params::parse(request.uri().query())
-        .ok()
-        .and_then(|params| params.get("format").map(str::to_owned));
-    let accept = accept_header(request.headers());
-    let instance = request.uri().path().to_owned();
+    // Cloned, not parsed: both are refcounted buffers, and the parsing they
+    // feed is only needed by the small minority of requests that fail. Doing it
+    // up front cost every successful response a `BTreeMap` and two `String`s.
+    let uri = request.uri().clone();
+    let accept: Vec<_> = request.headers().get_all(ACCEPT).iter().cloned().collect();
 
     let mut response = next.run(request).await;
-    let Some(problem) = response.extensions_mut().remove::<Problem>() else {
-        return response;
+    let problem = match response.extensions_mut().remove::<Problem>() {
+        Some(problem) => problem,
+        None => match unattributed_error(&response) {
+            Some(problem) => problem,
+            None => return response,
+        },
     };
 
-    let problem = problem.about(instance);
+    let format = Params::parse(uri.query())
+        .ok()
+        .and_then(|params| params.get("format").map(str::to_owned));
+    let accept = {
+        let mut headers = axum::http::HeaderMap::new();
+        for value in accept {
+            headers.append(ACCEPT, value);
+        }
+        accept_header(&headers).ok().flatten()
+    };
+    let problem = problem.about_unless_set(reflected(uri.path()));
     let representation = Representation::for_problem(format.as_deref(), accept.as_deref());
     let (content_type, body) = match representation {
         // RFC 9457 §3 names the media type; it is not `application/json`.
         Representation::Json => (PROBLEM_MEDIA_TYPE, problem.to_json()),
         Representation::Html => (
             Representation::Html.content_type(),
-            problem.to_html().into_bytes(),
+            bytes::Bytes::from(problem.to_html()),
         ),
     };
 
@@ -475,6 +554,31 @@ async fn render_problems(request: Request, next: Next) -> Response {
     headers.typed_insert(CachePolicy::Uncacheable.header());
     headers.insert(VARY, HeaderValue::from_static("Accept"));
     response
+}
+
+/// A problem for an error response no handler in this crate produced.
+///
+/// `None` for a success, and for a status this crate cannot attribute — 400 in
+/// particular, which five codes share, so guessing would tell a client the
+/// wrong thing to fix. Anything unattributable is logged, because it means a
+/// layer is answering in a shape §3.6.1 does not cover.
+fn unattributed_error(response: &Response) -> Option<Problem> {
+    let status = response.status();
+    if !status.is_client_error() && !status.is_server_error() {
+        return None;
+    }
+    match ErrorCode::for_unattributed_status(status.as_u16()) {
+        Some(code) => Some(Problem::new(
+            code,
+            status
+                .canonical_reason()
+                .unwrap_or("the request could not be completed"),
+        )),
+        None => {
+            tracing::warn!(%status, "an error response was produced with no code");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

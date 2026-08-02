@@ -31,6 +31,7 @@
 //!
 //! [`Representation`]: crate::representation::Representation
 
+use bytes::Bytes;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 /// What the pages call themselves.
@@ -39,7 +40,11 @@ pub const SITE: &str = "Knowledge Graph Fragments";
 /// A resource this server can serve in every representation it offers.
 pub trait Resource {
     /// The canonical machine-readable form (doc 03 §3.4.1).
-    fn to_json(&self) -> Vec<u8>;
+    ///
+    /// [`Bytes`] rather than `Vec<u8>` so a resource that already holds its
+    /// serialization — the bundle manifest holds the published file — hands it
+    /// on by refcount instead of copying it per request.
+    fn to_json(&self) -> Bytes;
 
     /// The same resource, as a page.
     fn to_html(&self) -> String;
@@ -50,14 +55,14 @@ pub trait Resource {
 /// Pretty-printed: these documents are read by people as often as by programs —
 /// doc 03 §3.1 makes the descriptors the thing a client reads first — and a
 /// `curl` of a one-line 4 KB manifest is not that.
-pub fn json_body(value: &impl serde::Serialize) -> Vec<u8> {
+pub fn json_body(value: &impl serde::Serialize) -> Bytes {
     let mut body = serde_json::to_vec_pretty(value)
         // A descriptor is a tree of owned strings, maps and numbers, so the
         // only way this fails is a `Serialize` impl that errors — none of ours
         // does, and a broken one should be loud rather than served empty.
         .expect("descriptors serialize");
     body.push(b'\n');
-    body
+    Bytes::from(body)
 }
 
 /// One step of the breadcrumb trail. The last has no link: it is this page.

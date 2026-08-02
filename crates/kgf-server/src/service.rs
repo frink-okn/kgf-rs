@@ -42,12 +42,15 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use bytes::Bytes;
+use sha2::{Digest, Sha256};
+
 use kgf_store::catalog::{BundleId, Catalog};
 use kgf_store::manifest::{Manifest, Publisher};
 use kgf_store::store::{OpenOptions, Store, artifact};
 
 use crate::Config;
-use crate::envelope::{ErrorCode, Problem};
+use crate::envelope::{ErrorCode, Problem, reflected};
 use crate::representation::ContentDigest;
 
 /// What stops the server from starting.
@@ -76,6 +79,7 @@ pub struct Service {
     config: Config,
     catalog: Catalog,
     datasets: Datasets,
+    descriptors: ContentDigest,
 }
 
 impl Service {
@@ -100,11 +104,26 @@ impl Service {
             manifests.push((id, manifest));
         }
         let datasets = Datasets::derive(manifests)?;
+        let descriptors = descriptor_digest(&config, &datasets);
         Ok(Self {
             config,
             catalog,
             datasets,
+            descriptors,
         })
+    }
+
+    /// A validator for the mutable descriptors at `/` and `/{dataset}`.
+    ///
+    /// They have no `content_digest` of their own — they are derived, not
+    /// published — but they are *fixed for the life of the process*: the
+    /// catalog is scanned once and the caps come from an immutable [`Config`].
+    /// So one digest over everything they are derived from is an honest strong
+    /// validator, and it changes exactly when a restart picks up new bundles or
+    /// new caps. Without one, a conditional request on a descriptor cannot be
+    /// answered 304 at all, including RFC 9110 §13.1.2's `If-None-Match: *`.
+    pub fn descriptor_digest(&self) -> &ContentDigest {
+        &self.descriptors
     }
 
     /// This deployment's configuration, as published at `/`.
@@ -149,6 +168,46 @@ impl Service {
     }
 }
 
+/// Digest the inputs every derived descriptor is built from.
+///
+/// Not the rendered documents: those differ per dataset and per
+/// representation, and the representation is mixed into the `ETag` separately.
+/// What is hashed is the deployment's identity — its caps, its budgets, and
+/// every `(dataset, version, content_digest)` it serves.
+fn descriptor_digest(config: &Config, datasets: &Datasets) -> ContentDigest {
+    let mut hasher = Sha256::new();
+    // Length-prefixed, so no two different deployments hash alike by having
+    // one field's end look like the next field's start.
+    let mut field = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    field(
+        serde_json::to_vec(&config.caps)
+            .expect("caps serialize")
+            .as_slice(),
+    );
+    field(
+        serde_json::to_vec(&config.budgets)
+            .expect("budgets serialize")
+            .as_slice(),
+    );
+    field(env!("CARGO_PKG_VERSION").as_bytes());
+    for name in datasets.names() {
+        field(name.as_bytes());
+        let dataset = datasets
+            .get(name)
+            .expect("a name this map just yielded is in it");
+        field(dataset.current().as_bytes());
+        for (version, release) in dataset.releases() {
+            field(version.as_bytes());
+            field(release.digest().as_str().as_bytes());
+        }
+    }
+    ContentDigest::parse(&format!("sha256:{:x}", hasher.finalize()))
+        .expect("a sha256 hex digest is a content digest")
+}
+
 /// A bundle's manifest as it was read: the bytes, and the parse of them.
 ///
 /// Both, because they answer different questions. The bytes are what
@@ -157,7 +216,7 @@ impl Service {
 /// the release ordering and the `ETag` are built from.
 #[derive(Debug, Clone)]
 pub struct PublishedManifest {
-    bytes: Arc<[u8]>,
+    bytes: Bytes,
     parsed: Arc<Manifest>,
 }
 
@@ -189,9 +248,15 @@ impl PublishedManifest {
         })
     }
 
-    /// Pair a manifest with its canonical serialization, for tests and for
-    /// callers that already hold a parse.
-    pub fn of(parsed: Manifest) -> Result<Self, String> {
+    /// Pair a manifest with its canonical serialization.
+    ///
+    /// `#[cfg(test)]`: every real path reaches a `PublishedManifest` through
+    /// [`read`](Self::read), and this one substitutes a re-serialization for
+    /// the bytes on disk — which is the one thing the type's own contract says
+    /// must not happen, since a manifest written by a newer builder would lose
+    /// the fields this build cannot model.
+    #[cfg(test)]
+    pub(crate) fn of(parsed: Manifest) -> Result<Self, String> {
         let bytes = parsed.to_json_bytes().map_err(|error| error.to_string())?;
         Ok(Self {
             bytes: bytes.into(),
@@ -200,8 +265,8 @@ impl PublishedManifest {
     }
 
     /// The document as published.
-    pub fn bytes(&self) -> Arc<[u8]> {
-        Arc::clone(&self.bytes)
+    pub fn bytes(&self) -> Bytes {
+        self.bytes.clone()
     }
 
     /// The parse.
@@ -286,7 +351,8 @@ impl Datasets {
             Problem::new(
                 ErrorCode::NotFound,
                 format!(
-                    "this server hosts no dataset named {dataset:?}; GET / lists the {} it does host",
+                    "this server hosts no dataset named {:?}; GET / lists the {} it does host",
+                    reflected(dataset),
                     self.0.len()
                 ),
             )
@@ -305,8 +371,10 @@ impl Datasets {
             Problem::new(
                 ErrorCode::NotFound,
                 format!(
-                    "dataset {dataset:?} has no version {version:?}; \
-                     GET /{dataset} lists its releases"
+                    "dataset {:?} has no version {:?}; GET /{} lists its releases",
+                    reflected(dataset),
+                    reflected(version),
+                    reflected(dataset),
                 ),
             )
         })

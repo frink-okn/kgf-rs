@@ -37,7 +37,7 @@ use headers::{CacheControl, ETag};
 use mediatype::{MediaType, MediaTypeBuf, ReadParams, names};
 use std::time::Duration;
 
-use crate::envelope::{ErrorCode, Problem};
+use crate::envelope::{ErrorCode, Problem, reflected};
 
 /// A serialization this server can produce.
 ///
@@ -145,7 +145,8 @@ pub fn negotiate(
                 Problem::new(
                     ErrorCode::UnsupportedFormat,
                     format!(
-                        "format={format} is not a serialization this operation offers; it offers {}",
+                        "format={} is not a serialization this operation offers; it offers {}",
+                        reflected(format),
                         tokens(offered)
                     ),
                 )
@@ -170,7 +171,8 @@ pub fn negotiate(
             Problem::new(
                 ErrorCode::NotAcceptable,
                 format!(
-                    "no representation satisfies Accept: {accept}; this operation offers {}",
+                    "no representation satisfies Accept: {}; this operation offers {}",
+                    reflected(accept),
                     media_types(offered)
                 ),
             )

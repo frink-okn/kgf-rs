@@ -432,6 +432,8 @@ pub enum ErrorCode {
     MethodNotAllowed,
     /// A request body's media type is not supported (`Accept-Query`, §3.6).
     UnsupportedMediaType,
+    /// A request body exceeds `max_request_bytes` (§3.5).
+    PayloadTooLarge,
     /// The caller's rate-limit bucket is empty (§3.6).
     RateLimited,
     /// The bundle does not offer what the request needs (§3.4, §3.7).
@@ -457,6 +459,7 @@ impl ErrorCode {
         Self::NotFound,
         Self::MethodNotAllowed,
         Self::NotAcceptable,
+        Self::PayloadTooLarge,
         Self::UnsupportedMediaType,
         Self::RateLimited,
         Self::InternalError,
@@ -482,6 +485,7 @@ impl ErrorCode {
             Self::MethodNotAllowed => ("method_not_allowed", 405, "Method Not Allowed"),
             Self::NotAcceptable => ("not_acceptable", 406, "Not Acceptable"),
             Self::UnsupportedMediaType => ("unsupported_media_type", 415, "Unsupported Media Type"),
+            Self::PayloadTooLarge => ("payload_too_large", 413, "Content Too Large"),
             Self::RateLimited => ("rate_limited", 429, "Too Many Requests"),
             Self::InternalError => ("internal_error", 500, "Internal Server Error"),
             Self::CapabilityNotAvailable => ("capability_not_available", 501, "Not Implemented"),
@@ -511,6 +515,46 @@ impl ErrorCode {
     /// tells agents to read, and `detail` is what tells a human what happened.
     pub fn title(self) -> &'static str {
         self.row().2
+    }
+}
+
+impl ErrorCode {
+    /// The code for an error response some other layer produced.
+    ///
+    /// A backstop, not a lookup table: §3.6.1 says *every* error response
+    /// carries a code, and this crate does not raise every error response. A
+    /// `tower` layer can answer before any handler runs — the body limit does —
+    /// and future ones will. Rather than teach the renderer about each, an
+    /// error that arrives with no [`Problem`] attached is given one from its
+    /// status here.
+    ///
+    /// Only statuses this table maps 1:1 are recognised. 400 deliberately is
+    /// not: five codes share it and guessing between them would tell a client
+    /// the wrong thing to fix.
+    pub fn for_unattributed_status(status: u16) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|code| code.status() == status && status != 400)
+    }
+}
+
+/// Cap a client-supplied string before it is quoted back in a `detail`.
+///
+/// Every problem message names the value that caused it, which is what makes
+/// them actionable — and what makes an unauthenticated caller able to choose
+/// how large the response is. An 8 KB dataset name would be echoed into
+/// `detail` and again into `instance`, so the error is larger than the request
+/// that bought it, from routes that do no other work.
+///
+/// Lives here rather than in the router because the messages do: a `detail` is
+/// built wherever the failure is detected, and truncating only at the edge
+/// would mean the one built in `service` or `url` still went out whole.
+pub fn reflected(text: &str) -> String {
+    const LIMIT: usize = 200;
+    match text.char_indices().nth(LIMIT) {
+        None => text.to_owned(),
+        Some((cut, _)) => format!("{}…", &text[..cut]),
     }
 }
 
@@ -547,6 +591,19 @@ impl Problem {
     /// Attach the request URI this problem is about (RFC 9457 `instance`).
     pub fn about(mut self, instance: impl Into<String>) -> Self {
         self.instance = Some(instance.into());
+        self
+    }
+
+    /// Attach `instance` only if nothing more specific was attached already.
+    ///
+    /// The renderer fills this in from the request path for every problem, and
+    /// must not overwrite a handler that pointed at something narrower — a
+    /// bundle version, a cursor — which is what an unconditional
+    /// [`about`](Self::about) there would do silently.
+    pub fn about_unless_set(mut self, instance: impl Into<String>) -> Self {
+        if self.instance.is_none() {
+            self.instance = Some(instance.into());
+        }
         self
     }
 
@@ -615,7 +672,7 @@ impl From<crate::cursor::StaleCursor> for Problem {
 
 impl crate::html::Resource for Problem {
     /// The RFC 9457 document.
-    fn to_json(&self) -> Vec<u8> {
+    fn to_json(&self) -> bytes::Bytes {
         crate::html::json_body(self)
     }
 
@@ -931,6 +988,7 @@ mod tests {
             (ErrorCode::NotFound, "not_found", 404),
             (ErrorCode::MethodNotAllowed, "method_not_allowed", 405),
             (ErrorCode::NotAcceptable, "not_acceptable", 406),
+            (ErrorCode::PayloadTooLarge, "payload_too_large", 413),
             (
                 ErrorCode::UnsupportedMediaType,
                 "unsupported_media_type",
@@ -965,6 +1023,54 @@ mod tests {
                 "{name}'s title must be the status reason phrase"
             );
         }
+    }
+
+    #[test]
+    fn a_status_no_handler_raised_still_finds_a_code() {
+        // The backstop for an error a `tower` layer answered before any of this
+        // crate's code ran — the request-body limit's 413 today.
+        assert_eq!(
+            ErrorCode::for_unattributed_status(413),
+            Some(ErrorCode::PayloadTooLarge)
+        );
+        assert_eq!(
+            ErrorCode::for_unattributed_status(500),
+            Some(ErrorCode::InternalError)
+        );
+        // 400 is shared by five codes, and picking one would tell a client the
+        // wrong thing to fix, so it stays unattributed and is logged instead.
+        assert_eq!(ErrorCode::for_unattributed_status(400), None);
+        assert_eq!(ErrorCode::for_unattributed_status(200), None);
+        assert_eq!(ErrorCode::for_unattributed_status(418), None);
+
+        // Every other status in the table resolves to exactly its own code, or
+        // the backstop would answer with a code meaning something else.
+        for code in ErrorCode::ALL {
+            let status = code.status();
+            if status != 400 {
+                assert_eq!(
+                    ErrorCode::for_unattributed_status(status),
+                    Some(*code),
+                    "{}",
+                    code.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_instance_a_handler_set_survives_the_renderer() {
+        // The renderer fills `instance` from the request path for every
+        // problem, and must not overwrite something narrower.
+        let handler_set = Problem::new(ErrorCode::NotFound, "x")
+            .about("/tox/v/2026-06-01/manifest")
+            .about_unless_set("/tox");
+        let json = serde_json::to_value(&handler_set).unwrap();
+        assert_eq!(json["instance"], "/tox/v/2026-06-01/manifest");
+
+        let filled_in = Problem::new(ErrorCode::NotFound, "x").about_unless_set("/tox");
+        let json = serde_json::to_value(&filled_in).unwrap();
+        assert_eq!(json["instance"], "/tox");
     }
 
     #[test]

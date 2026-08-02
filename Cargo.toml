@@ -33,7 +33,7 @@ base64 = "0.22"
 # 10008 is expressible rather than something M2 discovers is impossible.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "original-uri"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
 # hyperium's typed headers: ETag, If-None-Match's RFC 9110 §13.1.2 comparison,
 # and Cache-Control. Already in axum's tree through axum-extra.
 headers = "0.4"
@@ -48,6 +48,9 @@ mediatype = "0.23"
 # Compile-time HTML. Escapes every interpolation and needs `PreEscaped` to opt
 # out, so no page can lose an escape by being written with `format!`.
 maud = "0.27"
+# Already under hyper. Named directly so a response body can be handed on by
+# refcount rather than copied out of the buffer it is already in.
+bytes = "1"
 percent-encoding = "2"
 # RFC 3339 in, an orderable instant out. `std` only: nothing here needs a time
 # zone database, because the only thing kgf does with a date is sort by it.

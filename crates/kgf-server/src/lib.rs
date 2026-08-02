@@ -130,7 +130,7 @@ pub struct Budgets {
     pub max_output_terms: u64,
     /// Serialized response size, pre-compression.
     pub max_response_bytes: u64,
-    /// Request body size. Enforced today, as the router's body limit.
+    /// Request body size, enforced on the wire by the router.
     pub max_request_bytes: u64,
     /// Any single term or literal, in requests and bindings.
     pub max_term_bytes: u64,
@@ -164,19 +164,26 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         datasets = service.datasets().names().len(),
         "serving",
     );
-    serve_on(listener, service).await
+    serve_on(listener, service, shutdown_signal()).await
 }
 
-/// Serve an already-bound listener.
+/// Serve an already-bound listener until `shutdown` resolves.
 ///
 /// Split from [`serve`] so a caller — a test, or a supervisor handing down a
 /// socket — can bind port 0 and learn the address before traffic starts.
+///
+/// The shutdown trigger is the caller's, and deliberately: `serve` passes
+/// [`shutdown_signal`], which installs process-global Ctrl-C and `SIGTERM`
+/// handlers, and a library entry point must not do that on an embedder's
+/// behalf. It would compete with whatever the host process already has, and it
+/// would leave a caller with no way to stop the server at all.
 pub async fn serve_on(
     listener: tokio::net::TcpListener,
     service: Arc<Service>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     axum::serve(listener, routes::router(service))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())
 }
@@ -185,7 +192,10 @@ pub async fn serve_on(
 ///
 /// Graceful rather than abrupt because a request in flight holds an
 /// `Arc<Store>` over mapped files; letting it finish is both correct and free.
-async fn shutdown_signal() {
+///
+/// Public so that an embedder can opt *in* to the same behaviour by passing it
+/// to [`serve_on`], rather than having it installed for them.
+pub async fn shutdown_signal() {
     let interrupt = async {
         let _ = tokio::signal::ctrl_c().await;
     };

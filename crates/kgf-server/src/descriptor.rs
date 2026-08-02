@@ -26,7 +26,6 @@ use kgf_store::manifest::{Manifest, Publisher};
 use serde::Serialize;
 
 use crate::html::{Crumb, Resource, SITE, Value, fields, json_body, note, page, table};
-use crate::representation::ContentDigest;
 use crate::service::{Dataset, Service};
 use crate::url;
 use maud::html;
@@ -76,7 +75,7 @@ impl<'a> ServiceDescriptor<'a> {
 }
 
 impl Resource for ServiceDescriptor<'_> {
-    fn to_json(&self) -> Vec<u8> {
+    fn to_json(&self) -> bytes::Bytes {
         json_body(self)
     }
 
@@ -211,7 +210,7 @@ impl<'a> DatasetDescriptor<'a> {
 }
 
 impl Resource for DatasetDescriptor<'_> {
-    fn to_json(&self) -> Vec<u8> {
+    fn to_json(&self) -> bytes::Bytes {
         json_body(self)
     }
 
@@ -280,8 +279,7 @@ impl Resource for DatasetDescriptor<'_> {
 pub struct BundleManifest {
     dataset: String,
     version: String,
-    digest: ContentDigest,
-    published: std::sync::Arc<[u8]>,
+    published: bytes::Bytes,
     parsed: std::sync::Arc<Manifest>,
 }
 
@@ -290,30 +288,26 @@ impl BundleManifest {
     pub fn new(
         dataset: &str,
         version: &str,
-        digest: ContentDigest,
-        published: std::sync::Arc<[u8]>,
+        published: bytes::Bytes,
         parsed: std::sync::Arc<Manifest>,
     ) -> Self {
         Self {
             dataset: dataset.to_owned(),
             version: version.to_owned(),
-            digest,
             published,
             parsed,
         }
-    }
-
-    /// This version's canonical identity, for the response's `ETag`.
-    pub fn digest(&self) -> &ContentDigest {
-        &self.digest
     }
 }
 
 impl Resource for BundleManifest {
     /// The bytes as published, so nothing this build does not model is lost and
     /// the response is the document the `content_digest` covers.
-    fn to_json(&self) -> Vec<u8> {
-        self.published.to_vec()
+    ///
+    /// Handed on by refcount: the file was read once at startup and is not
+    /// copied again per request.
+    fn to_json(&self) -> bytes::Bytes {
+        self.published.clone()
     }
 
     fn to_html(&self) -> String {
@@ -480,13 +474,11 @@ mod tests {
     }
 
     fn bundle_manifest(published: &str) -> BundleManifest {
-        let parsed = manifest();
         BundleManifest::new(
             "tox",
             "2026-06-01",
-            ContentDigest::parse(&parsed.content_digest).unwrap(),
-            published.as_bytes().into(),
-            std::sync::Arc::new(parsed),
+            bytes::Bytes::copy_from_slice(published.as_bytes()),
+            std::sync::Arc::new(manifest()),
         )
     }
 
@@ -499,7 +491,7 @@ mod tests {
         let resource = bundle_manifest(published);
         assert_eq!(resource.to_json(), published.as_bytes());
         assert!(
-            String::from_utf8(resource.to_json())
+            String::from_utf8(resource.to_json().to_vec())
                 .unwrap()
                 .contains("source")
         );

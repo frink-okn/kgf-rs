@@ -354,6 +354,113 @@ fn negotiation_and_parameter_failures_are_told_apart() {
 }
 
 #[test]
+fn a_revalidation_does_not_open_the_bundle_it_is_revalidating() {
+    // The cheapest request a client can make must be the cheapest one the
+    // server answers. The bundle here cannot be opened at all, so a 304 is
+    // proof the precondition was evaluated before the open — not merely before
+    // the body, which is where it used to sit.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    let first = server.get("/tox/v/v1/manifest");
+    first.assert_status(200);
+    let etag = first
+        .header("etag")
+        .expect("a versioned GET carries an ETag");
+
+    std::fs::remove_file(deployment.bundle("tox", "v1").join("data.hdt.perm")).unwrap();
+    let server = deployment.serve();
+    server
+        .request(
+            "GET",
+            "/tox/v/v1/manifest",
+            &[("If-None-Match", etag.as_str())],
+        )
+        .assert_status(304);
+    // And the unconditional request against the same bundle still fails, so the
+    // 304 above was not simply a bundle that happens to open.
+    server.get("/tox/v/v1/manifest").assert_status(500);
+}
+
+#[test]
+fn the_descriptors_can_be_revalidated_too() {
+    // They are derived rather than published, but they are fixed for the life
+    // of the process, so they get a validator — without one a conditional
+    // request on them cannot be answered 304 at all.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    for path in ["/", "/tox"] {
+        let first = server.get(path);
+        first.assert_status(200);
+        let etag = first.header("etag").unwrap_or_else(|| panic!("{path}"));
+
+        server
+            .request("GET", path, &[("If-None-Match", etag.as_str())])
+            .assert_status(304);
+        // RFC 9110 §13.1.2's wildcard: the resource exists, so it is unchanged.
+        server
+            .request("GET", path, &[("If-None-Match", "*")])
+            .assert_status(304);
+        // And the validator is representation-specific here too.
+        server
+            .request(
+                "GET",
+                path,
+                &[("Accept", "text/html"), ("If-None-Match", etag.as_str())],
+            )
+            .assert_status(200);
+    }
+}
+
+#[test]
+fn an_error_no_handler_raised_still_carries_a_code() {
+    // The request-body limit answers before any of this crate's code runs.
+    // §3.6.1 says every error response carries a code, which has to include
+    // the ones a `tower` layer produces.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    let oversized = server.request_with_body("POST", "/tox", &[], &vec![b'x'; 2 * 1024 * 1024]);
+    oversized.assert_status(413);
+    oversized.assert_header("content-type", "application/problem+json");
+    assert_eq!(oversized.json()["code"], "payload_too_large");
+}
+
+#[test]
+fn an_accept_header_that_cannot_be_read_is_refused() {
+    // Dropping the unreadable line and negotiating from the rest answers a
+    // different request than the client made, and succeeds while doing it.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    let refused = server.request("GET", "/tox", &[("Accept", "text/\u{e9}html")]);
+    refused.assert_status(400);
+    assert_eq!(refused.json()["code"], "malformed_request");
+}
+
+#[test]
+fn a_long_path_is_not_reflected_whole_into_the_error() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    let long = format!("/{}", "a".repeat(4000));
+    let lost = server.get(&long);
+    lost.assert_status(404);
+    assert!(
+        lost.body.len() < 2000,
+        "an error must not be larger than the request that caused it: {} bytes",
+        lost.body.len()
+    );
+    assert!(lost.json()["instance"].as_str().unwrap().ends_with('…'));
+}
+
+#[test]
 fn a_bundle_that_cannot_be_opened_answers_rather_than_panics() {
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
@@ -476,19 +583,42 @@ impl Deployment {
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
             .expect("bind");
         let address = listener.local_addr().expect("local address");
-        runtime.spawn(kgf_server::serve_on(listener, service));
+
+        // The server stops when this test's `Server` drops, rather than living
+        // until the process does. `serve_on` takes the trigger precisely so a
+        // caller that is not `kgf serve` need not adopt its signal handlers.
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        runtime.spawn(kgf_server::serve_on(listener, service, async move {
+            let _ = stopped.await;
+        }));
 
         Server {
             address,
-            _runtime: runtime,
+            stop: Some(stop),
+            runtime: Some(runtime),
         }
     }
 }
 
 struct Server {
     address: SocketAddr,
-    /// Held so the reactor outlives the requests made against it.
-    _runtime: tokio::runtime::Runtime,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Held so the reactor outlives the requests made against it, and shut down
+    /// with it — a test binary that leaked one runtime per test would carry
+    /// every worker and blocking thread it ever started to the end of the run.
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(runtime) = self.runtime.take() {
+            // Bounded: a request still in flight holds an `Arc<Store>` over
+            // mapped files, and the fixture directory is removed right after
+            // this returns.
+            runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+        }
+    }
 }
 
 impl Server {
@@ -496,8 +626,18 @@ impl Server {
         self.request("GET", target, &[])
     }
 
-    /// Write one request onto a socket, byte for byte, and read the answer.
     fn request(&self, method: &str, target: &str, headers: &[(&str, &str)]) -> Response {
+        self.request_with_body(method, target, headers, &[])
+    }
+
+    /// Write one request onto a socket, byte for byte, and read the answer.
+    fn request_with_body(
+        &self,
+        method: &str,
+        target: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Response {
         let mut stream = TcpStream::connect(self.address).expect("connect");
         let mut request = format!(
             "{method} {target} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
@@ -506,13 +646,26 @@ impl Server {
         for (name, value) in headers {
             request.push_str(&format!("{name}: {value}\r\n"));
         }
-        // Present and zero, so a server expecting a body on QUERY or POST does
+        // Always present, so a server expecting a body on QUERY or POST does
         // not wait for one.
-        request.push_str("Content-Length: 0\r\n\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
         stream.write_all(request.as_bytes()).expect("write");
+        // A server that rejects the body mid-stream closes the connection, and
+        // its response is still worth reading — so a broken pipe here is not a
+        // test failure.
+        let _ = stream.write_all(body);
 
+        // A server that rejects a body mid-stream answers and closes, which on
+        // some platforms surfaces to the sender as a reset rather than an EOF.
+        // What arrived before that is still the response.
         let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).expect("read");
+        match stream.read_to_end(&mut raw) {
+            Ok(_) => {}
+            Err(error) if !raw.is_empty() => {
+                eprintln!("peer closed after answering ({error})");
+            }
+            Err(error) => panic!("read: {error}"),
+        }
         Response::parse(&raw, method)
     }
 }

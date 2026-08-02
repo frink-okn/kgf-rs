@@ -11,7 +11,7 @@
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 
-use crate::envelope::{ErrorCode, Problem};
+use crate::envelope::{ErrorCode, Problem, reflected};
 
 /// RFC 3986 §2.3's `unreserved` set, kept; everything else escaped.
 ///
@@ -84,8 +84,9 @@ impl Params {
                 return Err(Problem::new(
                     ErrorCode::MalformedRequest,
                     format!(
-                        "parameter {name:?} appears more than once; \
-                         send it once, since no KGF parameter takes a list"
+                        "parameter {:?} appears more than once; \
+                         send it once, since no KGF parameter takes a list",
+                        reflected(&name)
                     ),
                 ));
             }
@@ -103,8 +104,9 @@ fn malformed(pair: &str) -> Problem {
     Problem::new(
         ErrorCode::MalformedRequest,
         format!(
-            "query parameter {pair:?} is not valid percent-encoded UTF-8 (RFC 3986 §2.1); \
-             escape `%` as `%25`"
+            "query parameter {:?} is not valid percent-encoded UTF-8 (RFC 3986 §2.1); \
+             escape `%` as `%25`",
+            reflected(pair)
         ),
     )
 }

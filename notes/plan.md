@@ -697,7 +697,40 @@ wrong for this use (below). `kgf-store`'s rank/select and packed arrays look lik
 same question and are not: `sucds` and `vers` build their own structures in memory,
 while doc 20 §20.1 needs hdtc's *persisted* directories read in place.
 
-**Five things a review found afterwards, all confirmed against a running server before
+**A second review found twelve more, and two of them were the first review's findings
+left half-done.** Negotiation had moved ahead of the bundle open; the `If-None-Match`
+check had not, so a revalidation — the cheapest request a client can make — still paid
+a cold mmap. And `max_request_bytes` was published at `/` while `DefaultBodyLimit`,
+the mechanism chosen to enforce it, is consulted only by body *extractors*, of which
+M1 has none: a 900 KB body and a 2 MB one behaved identically. `RequestBodyLimitLayer`
+enforces it on the wire now.
+
+That second one produced the better fix. Its 413 is raised by a `tower` layer before
+any of this crate's code runs, so it arrived with no `code` — the same hole as the
+`Path` rejection, from a different direction. Rather than teach the renderer about
+each such layer, an error response that arrives *unattributed* is now given a problem
+from its status, and 400 is deliberately excluded because five codes share it and
+guessing would tell a client the wrong thing to fix. Getting that to work meant
+putting the renderer outside the body limit and inside CORS, which is the one piece of
+layer ordering in this file that is load-bearing rather than incidental.
+
+The descriptors gained real validators. `If-None-Match: *` on `/` used to answer 200,
+because §13.1.2's wildcard cannot be evaluated without an entity tag and the
+descriptors had none. They are derived rather than published, but they are *fixed for
+the life of the process*, so a digest over the caps, the budgets and every
+`(dataset, version, content_digest)` is an honest strong validator — one that changes
+exactly when a restart picks up new bundles or new caps.
+
+The rest: an `Accept` line that is not readable as text is refused rather than dropped
+and negotiated around; `serve_on` takes its shutdown from the caller rather than
+installing process-global signal handlers from a library, which is also what lets the
+integration tests stop their servers instead of leaking a runtime each; the manifest
+body is handed on by refcount rather than copied per request; the problem renderer
+parses nothing until it has a problem to render; and every message that quotes client
+input truncates it, which a test caught being wrong in `service` rather than in the
+router — a 4000-character path is a dataset name, not a bad route.
+
+**Five things the first review found, all confirmed against a running server before
 being believed.** The two that matter are about *when* work happens, not what it
 computes. `/manifest` negotiated after opening the bundle, so `?format=parquet` against
 a bundle with a missing artifact was a 500 about the bundle rather than a 400 about the
@@ -732,7 +765,7 @@ useful thing to browse to, and doc 03 §3.2 does not define it, so inventing URL
 is not this unit's call — the dataset page links straight to `/manifest`, which is
 specified and does the job.
 
-There are 165 tests after this unit.
+There are 172 tests after this unit.
 
 ### 14. The four query operations
 
