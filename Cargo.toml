@@ -44,7 +44,7 @@ axum-extra = { version = "0.10", default-features = false, features = ["typed-he
 # `mediatype` and not `mime`: `mime` rejects the optional whitespace RFC 9110
 # §5.6.3 allows around a parameter's `;`, which silently drops a legal media
 # range from an `Accept` header.
-mediatype = "0.21"
+mediatype = "0.23"
 # Compile-time HTML. Escapes every interpolation and needs `PreEscaped` to opt
 # out, so no page can lose an escape by being written with `format!`.
 maud = "0.27"

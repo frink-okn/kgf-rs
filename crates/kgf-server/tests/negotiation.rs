@@ -15,8 +15,8 @@ use std::str::FromStr;
 
 use headers_accept::Accept;
 use kgf_server::representation::{Representation, negotiate};
-use mediatype::MediaType;
-use mediatype::names::{APPLICATION, HTML, JSON, TEXT};
+use mediatype_021::MediaType;
+use mediatype_021::names::{APPLICATION, HTML, JSON, TEXT};
 
 /// The same two representations the server offers, in the same order.
 const AVAILABLE: &[MediaType] = &[
