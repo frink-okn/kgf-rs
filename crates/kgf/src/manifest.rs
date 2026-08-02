@@ -30,6 +30,7 @@ use kgf_store::manifest::{
     ArtifactDigest, ArtifactEntry, BundleFacts, Capability, Formats, Manifest, ManifestDocument,
     Publisher, content_digest_preimage,
 };
+use kgf_store::store::artifact;
 use sha2::{Digest, Sha256};
 
 /// Arguments for `kgf manifest`.
@@ -98,6 +99,7 @@ pub fn run(args: Args) -> Result<()> {
         .with_context(|| format!("resolving bundle directory {}", args.bundle.display()))?;
 
     let facts = read_facts(&dir)?;
+    verify_text_binding(&dir)?;
 
     if args.check {
         let manifest = Manifest::read(&dir)?;
@@ -400,6 +402,33 @@ fn prefixes(args: &Args, previous: Option<&Manifest>) -> Result<BTreeMap<String,
     Ok(prefixes)
 }
 
+/// Refuse a text index that was not built from this bundle's `data.hdt`.
+///
+/// **This is the only place the check can happen**, and it is why it happens
+/// here rather than at open. Every other sidecar carries cheap source metadata,
+/// so `Store::open` rejects a foreign one for the price of a header read; a
+/// text index records only a SHA-256 over the HDT payload, and verifying that
+/// is a pass over the whole file — exactly the work doc 20 §20.3 keeps off the
+/// open path. So the server trusts a described bundle, and this is where a
+/// bundle becomes described.
+///
+/// The failure it prevents is the quiet kind: a hit is an object dictionary id,
+/// so an index built from a *different* HDT returns ids that resolve to real
+/// terms in this one, and every row would look well formed.
+fn verify_text_binding(dir: &Path) -> Result<()> {
+    let text = dir.join(artifact::TEXT);
+    if !text.is_dir() {
+        return Ok(());
+    }
+    hdtc::format::verify_text_index_binding(&text, &dir.join(artifact::HDT)).with_context(|| {
+        format!(
+            "{} does not belong to this bundle; rebuild it with `hdtc text {}`",
+            text.display(),
+            dir.join(artifact::HDT).display()
+        )
+    })
+}
+
 /// Size and SHA-256 every artifact the bundle declares.
 ///
 /// The one place in KGF that reads whole artifacts. That is why it is here and
@@ -410,11 +439,74 @@ fn checksum_artifacts(dir: &Path, facts: &BundleFacts) -> Result<Vec<(String, Ar
         .artifact_names()
         .map(|name| {
             let path = dir.join(name);
-            let (bytes, sha256) =
-                sha256_file(&path).with_context(|| format!("checksumming {}", path.display()))?;
+            let (bytes, sha256) = if path.is_dir() {
+                sha256_dir(&path)
+            } else {
+                sha256_file(&path)
+            }
+            .with_context(|| format!("checksumming {}", path.display()))?;
             Ok((name.to_owned(), ArtifactEntry { bytes, sha256 }))
         })
         .collect()
+}
+
+/// Size and digest a directory artifact as one entry (doc 04 §4.3).
+///
+/// `data.hdt.text` is the only one, and it is a directory because its bytes are
+/// Tantivy's. The digest is the same preimage `content_digest` is built from —
+/// `{relative path}  {sha256}\n` per file, sorted by path — applied one level
+/// down, so a directory and the bundle around it are identified by one
+/// construction rather than two.
+///
+/// One entry rather than one per segment file: those names are chosen per
+/// build, so enumerating them would put a key set that changes on every rebuild
+/// into the manifest without adding a fact a mirror can check.
+fn sha256_dir(dir: &Path) -> Result<(u64, String)> {
+    let mut files = Vec::new();
+    let mut bytes = 0u64;
+    for entry in walk(dir)? {
+        let relative = entry
+            .strip_prefix(dir)
+            .expect("a walked path is under the directory it was walked from");
+        let (size, sha256) = sha256_file(&entry)?;
+        bytes += size;
+        files.push(ArtifactDigest {
+            // Slash-separated whatever the platform is, so a bundle built on
+            // one and verified on another agrees with itself.
+            name: relative
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/"),
+            sha256,
+        });
+    }
+    Ok((bytes, hex(&Sha256::digest(content_digest_preimage(&files)))))
+}
+
+/// Every file under `dir`, depth first.
+///
+/// A text index is flat today; walking anyway costs nothing and means a
+/// Tantivy release that nests something does not silently drop it from the
+/// digest — which would be a change to a version's identity that nothing
+/// reports.
+fn walk(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in
+            std::fs::read_dir(&current).with_context(|| format!("reading {}", current.display()))?
+        {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 /// Stream a file through SHA-256, returning its length and lowercase hex digest.

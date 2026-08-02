@@ -1027,6 +1027,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hdtc",
  "kgf-server",
  "kgf-store",
  "serde_json",

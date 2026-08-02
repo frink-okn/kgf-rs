@@ -113,6 +113,62 @@ fn a_hand_assembled_bundle_becomes_servable_and_stays_honest() {
 }
 
 #[test]
+fn a_text_index_is_described_as_one_artifact_and_must_belong_to_its_bundle() {
+    let root = tempfile::tempdir().unwrap();
+    let bundle = root.path().join("tox").join("2026-06-01");
+    std::fs::create_dir_all(&bundle).unwrap();
+    build_artifacts(&bundle, SOURCE);
+    build_text_index(&bundle);
+
+    kgf(&["manifest", path(&bundle)]).success();
+    let manifest = Manifest::read(&bundle).unwrap();
+
+    // One entry for the directory, not one per segment file — those names are
+    // chosen per build (doc 04 §4.3).
+    let text = manifest
+        .artifacts
+        .get("data.hdt.text")
+        .expect("the index is checksummed");
+    assert!(text.bytes > 0);
+    assert!(!manifest.artifacts.keys().any(|name| name.contains('/')));
+
+    // And carrying the index is what declares the capability.
+    assert!(manifest.capabilities.contains_key("search"));
+    kgf(&["manifest", path(&bundle), "--check"]).success();
+
+    // An index built from a *different* HDT is the dangerous case: its hits
+    // are object ids that resolve to real terms in the wrong dictionary, so
+    // every row would look well formed. It is refused where the whole-file
+    // digests are checked, which is here.
+    let other = root.path().join("other").join("v1");
+    std::fs::create_dir_all(&other).unwrap();
+    build_artifacts(&other, GROWN_SOURCE);
+    build_text_index(&other);
+    std::fs::remove_dir_all(bundle.join("data.hdt.text")).unwrap();
+    copy_dir(&other.join("data.hdt.text"), &bundle.join("data.hdt.text"));
+
+    let error = kgf(&["manifest", path(&bundle), "--check"]).failure();
+    assert!(error.contains("binding mismatch"), "{error}");
+    assert!(
+        error.contains("hdtc text"),
+        "the remedy must be named: {error}"
+    );
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+#[test]
 fn a_rebuild_that_preserves_every_count_still_fails_the_check() {
     let root = tempfile::tempdir().unwrap();
     let bundle = root.path().join("demo-kg").join("2026-08-01");
@@ -238,6 +294,19 @@ fn path(path: &Path) -> &str {
 }
 
 /// Run `hdtc create --perm` into `bundle`, as a person assembling one would.
+/// Build a text index over a bundle's HDT, the way `hdtc text` does.
+fn build_text_index(bundle: &Path) {
+    let output = Command::new(hdtc_binary())
+        .args(["text", path(&bundle.join("data.hdt"))])
+        .output()
+        .expect("run hdtc text");
+    assert!(
+        output.status.success(),
+        "hdtc text failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn build_artifacts(bundle: &Path, source: &str) {
     let input = bundle.join("input.nt");
     std::fs::write(&input, source).unwrap();

@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use hdtc::format::GraphIndexOpenError;
+use hdtc::format::{GraphIndexOpenError, TextSearcher};
 
 use crate::dict::Dictionary;
 use crate::error::{Error, Result};
@@ -32,6 +32,13 @@ pub mod artifact {
     pub const GRAPHS: &str = "data.hdt.graphs";
     /// POS/OPS-keyed membership layers. Required whenever [`GRAPHS`] is present.
     pub const GRAPHS_IDX: &str = "data.hdt.graphs.idx";
+    /// Full-text index over the dictionary's literals. Optional; gates `search`.
+    ///
+    /// **A directory, not a file** — the only artifact that is. Its bytes are
+    /// Tantivy's rather than hdtc's (`hdtc/docs/text-index-format.md` §1.1), so
+    /// it is a set of segment files whose names the build chooses. Doc 04 §4.1
+    /// places it and §4.3 says how one entry checksums the whole directory.
+    pub const TEXT: &str = "data.hdt.text";
 }
 
 /// Open-time options, reserved for options that preserve bounded,
@@ -50,10 +57,24 @@ pub struct OpenOptions {}
 /// owns, so holding both would be self-referential. Callers project what they
 /// need for the duration of a query, which costs a bounds compare and a slice
 /// and needs no synchronisation.
-#[derive(Debug)]
 pub struct Store {
     bundle: PublishedBundle,
     perms: Permutations,
+    text: Option<TextSearcher>,
+}
+
+impl std::fmt::Debug for Store {
+    /// Written out rather than derived, because a [`TextSearcher`] is a search
+    /// engine and has no `Debug` — and would be noise if it had one. What is
+    /// worth seeing in a log line is which bundle this is and what it can
+    /// answer.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("bundle", &self.bundle)
+            .field("perms", &self.perms)
+            .field("text", &self.text.is_some())
+            .finish()
+    }
 }
 
 impl Store {
@@ -88,6 +109,7 @@ impl Store {
         Ok(Self {
             bundle: bundle.clone(),
             perms,
+            text: artifacts.open_text()?,
         })
     }
 
@@ -107,6 +129,20 @@ impl Store {
     /// The permutations.
     pub fn perms(&self) -> &Permutations {
         &self.perms
+    }
+
+    /// The full-text index over this bundle's literals, if it published one.
+    ///
+    /// A hit is an **object dictionary id** and nothing else
+    /// (`hdtc/docs/text-index-format.md` §2.1), which is why this composes
+    /// rather than duplicating: turning hits into statements is
+    /// [`resolve`](Store::resolve) with the object bound, over permutations
+    /// this store already holds. There is no text-specific query path here.
+    ///
+    /// `None` when the bundle has no `data.hdt.text`, which is also when its
+    /// manifest declares no `search` capability — one condition, read two ways.
+    pub fn text(&self) -> Option<&TextSearcher> {
+        self.text.as_ref()
     }
 
     /// Total triples in the bundle.
@@ -140,6 +176,7 @@ pub(crate) struct ArtifactSet {
     pub(crate) perm: PathBuf,
     pub(crate) graphs: Option<PathBuf>,
     pub(crate) graph_index: Option<PathBuf>,
+    pub(crate) text: Option<PathBuf>,
 }
 
 impl ArtifactSet {
@@ -180,7 +217,40 @@ impl ArtifactSet {
             perm,
             graphs,
             graph_index,
+            text: optional_dir(dir, artifact::TEXT)?,
         })
+    }
+
+    /// Open the text index, if the bundle published one.
+    ///
+    /// **The binding to `data.hdt` is not checked here, and cannot be.** Every
+    /// other sidecar carries cheap source metadata — `.hdt.perm` has dictionary
+    /// counts, a triple count and a suffix length — so a foreign one is refused
+    /// for the price of a header read. A text index records only a SHA-256 over
+    /// the HDT payload, so verifying it is a pass over the whole file, which
+    /// doc 20 §20.3 keeps off the open path. It is checked where the other
+    /// whole-file digests are, by `kgf manifest` and `kgf verify`, and a bundle
+    /// this server was pointed at is one whose publication it is trusting
+    /// already (doc 04 §4.6).
+    ///
+    /// What *is* established here is that the index opens and its manifest
+    /// parses, so a broken one is refused at open rather than on the first
+    /// query — the same rule the graph index follows.
+    ///
+    /// Opened eagerly, because [`Store`] has no interior mutability by design:
+    /// a lazily-opened searcher would need one, and that is a lock on the read
+    /// path. The cost is file descriptors — Tantivy holds one per segment —
+    /// which is the budget the catalog's module docs already flag.
+    fn open_text(&self) -> Result<Option<TextSearcher>> {
+        let Some(dir) = &self.text else {
+            return Ok(None);
+        };
+        TextSearcher::open(dir)
+            .map(Some)
+            .map_err(|error| Error::Malformed {
+                artifact: dir.clone(),
+                detail: format!("text index could not be opened: {error:#}"),
+            })
     }
 
     /// Refuse a graph index that does not belong to this HDT.
@@ -230,14 +300,31 @@ fn require_file(dir: &Path, name: &str, remedy: impl Into<String>) -> Result<Pat
 }
 
 fn optional_file(dir: &Path, name: &str) -> Result<Option<PathBuf>> {
+    optional(dir, name, false)
+}
+
+/// The one artifact shape that is a directory (doc 04 §4.1): `data.hdt.text`.
+fn optional_dir(dir: &Path, name: &str) -> Result<Option<PathBuf>> {
+    optional(dir, name, true)
+}
+
+fn optional(dir: &Path, name: &str, want_dir: bool) -> Result<Option<PathBuf>> {
     let path = dir.join(name);
     if !path.try_exists()? {
         return Ok(None);
     }
-    if !std::fs::metadata(&path)?.is_file() {
+    let metadata = std::fs::metadata(&path)?;
+    // Checked rather than assumed, because the two shapes fail differently: a
+    // file where a directory belongs is refused here, while an empty directory
+    // where a file belongs would otherwise be mapped as a zero-length artifact.
+    if metadata.is_dir() != want_dir {
         return Err(Error::Malformed {
             artifact: path,
-            detail: "artifact is not a regular file".to_owned(),
+            detail: if want_dir {
+                "artifact is not a directory".to_owned()
+            } else {
+                "artifact is not a regular file".to_owned()
+            },
         });
     }
     Ok(Some(path))
@@ -381,6 +468,85 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn a_text_index_is_opened_with_the_bundle_or_absent_from_it() {
+        // The capability and the artifact are one condition read two ways, so
+        // the store must not offer a searcher a manifest would not declare.
+        let plain = Fixture::build(TINY_NT);
+        let bundle = published_bundle(plain.bundle_path());
+        let store = Store::open(&bundle, OpenOptions::default()).unwrap();
+        assert!(store.text().is_none(), "no artifact, no search");
+
+        let indexed = Fixture::build(TINY_NT).with_text();
+        let bundle = published_bundle(indexed.bundle_path());
+        let store = Store::open(&bundle, OpenOptions::default()).unwrap();
+        let searcher = store.text().expect("the bundle published an index");
+
+        // A hit is an object dictionary id, which is what makes it resolvable
+        // through permutations this store already holds — no text-specific
+        // query path, and no second dictionary.
+        let hits = searcher
+            .search(
+                &hdtc::format::TextQuery {
+                    text: "alice".to_owned(),
+                    ..Default::default()
+                },
+                10,
+            )
+            .expect("search the fixture");
+        assert!(!hits.is_empty(), "the fixture holds \"Alice\"");
+        let objects = store.dict().counts().len(crate::Role::Object);
+        for hit in &hits {
+            assert!(
+                (1..=objects).contains(&hit.object_id),
+                "a hit must name a term in this bundle's object space"
+            );
+            let selection = store
+                .resolve(IdPattern {
+                    subject: None,
+                    predicate: None,
+                    object: Some(hit.object_id),
+                })
+                .expect("an id from this dictionary");
+            assert!(
+                selection.count().value > 0,
+                "an indexed literal occurs in at least one triple"
+            );
+        }
+    }
+
+    #[test]
+    fn a_text_index_that_will_not_open_is_refused_with_the_bundle() {
+        // A present-but-broken optional artifact is refused at open, the same
+        // rule the graph index follows: there is no degraded mode in which a
+        // bundle serves everything except the operation it advertises.
+        let fixture = Fixture::build(TINY_NT).with_text();
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("broken-text");
+        fixture.copy_bundle_to(&bundle);
+        std::fs::write(bundle.join(artifact::TEXT).join("meta.json"), b"not json").unwrap();
+
+        let published = published_bundle(&bundle);
+        match Store::open(&published, OpenOptions::default()).expect_err("must refuse") {
+            Error::Malformed { artifact, detail } => {
+                assert_eq!(artifact, bundle.join(artifact::TEXT));
+                assert!(detail.contains("text index"), "{detail}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        // And a file where the directory belongs is refused by shape, before
+        // anything tries to read it as an index.
+        let bundle = root.path().join("text-is-a-file");
+        Fixture::build(TINY_NT).copy_bundle_to(&bundle);
+        std::fs::write(bundle.join(artifact::TEXT), b"not a directory").unwrap();
+        let published = published_bundle(&bundle);
+        assert!(matches!(
+            Store::open(&published, OpenOptions::default()),
+            Err(Error::Malformed { .. })
+        ));
     }
 
     #[test]

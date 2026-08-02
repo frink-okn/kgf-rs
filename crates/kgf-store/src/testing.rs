@@ -198,6 +198,33 @@ impl Fixture {
         Self::build_with(source, true)
     }
 
+    /// Add a full-text index over this bundle's literals.
+    ///
+    /// A second `hdtc` invocation rather than a flag on the first, because that
+    /// is how a bundle acquires one: `hdtc text` runs over a built HDT, and its
+    /// default output path is the bundle's `data.hdt.text` (doc 04 §4.1). A
+    /// separate step is also what lets a test have the same graph with and
+    /// without `search`, which is what the capability gate needs.
+    #[must_use]
+    pub fn with_text(self) -> Self {
+        let hdtc = hdtc_binary();
+        let output = std::process::Command::new(&hdtc)
+            .arg("text")
+            .arg(self.hdt_path())
+            .output()
+            .unwrap_or_else(|error| panic!("run {} text: {error}", hdtc.display()));
+        assert!(
+            output.status.success(),
+            "hdtc text failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            self.dir.path().join(TEXT).is_dir(),
+            "hdtc text must write {TEXT} beside the HDT"
+        );
+        self
+    }
+
     fn build_with(source: &str, graphs: bool) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let input = dir
@@ -256,6 +283,11 @@ impl Fixture {
             std::fs::copy(self.dir.path().join(name), destination.join(name))
                 .unwrap_or_else(|error| panic!("copy fixture artifact {name}: {error}"));
         }
+        // The one artifact that is a directory (doc 04 §4.1).
+        let text = self.dir.path().join(TEXT);
+        if text.is_dir() {
+            copy_dir(&text, &destination.join(TEXT));
+        }
     }
 
     /// Path of `data.hdt`.
@@ -302,11 +334,26 @@ impl Fixture {
     }
 }
 
+/// Copy a directory artifact, recursively.
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("create fixture artifact directory");
+    for entry in std::fs::read_dir(from).expect("read fixture artifact directory") {
+        let entry = entry.expect("read fixture directory entry");
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy fixture artifact file");
+        }
+    }
+}
+
 const HDT: &str = crate::store::artifact::HDT;
 const GRAPHS: &str = crate::store::artifact::GRAPHS;
 const GRAPHS_IDX: &str = crate::store::artifact::GRAPHS_IDX;
 const MANIFEST: &str = crate::store::artifact::MANIFEST;
 const PERM: &str = crate::store::artifact::PERM;
+const TEXT: &str = crate::store::artifact::TEXT;
 
 /// Locate the `hdtc` binary: `$KGF_HDTC` if set, else the sibling checkout's
 /// build. hdtc is a path dependency of this crate, so its checkout is where

@@ -186,8 +186,8 @@ impl BundleFacts {
 /// Four of doc 03's optional capabilities need nothing beyond the artifacts
 /// every bundle is required to carry: `star` and `sample` are compositions of
 /// triple patterns, `terms` reads the dictionary already in `data.hdt`, and
-/// `export` serves the files themselves. The rest are gated on sidecars — only
-/// the graph pair exists today, and `search`, `range`, and `closure` are
+/// `export` serves the files themselves. The rest are gated on sidecars — the
+/// graph pair and the text index exist today, and `range` and `closure` are
 /// therefore never derived here, since a bundle cannot acquire them without
 /// acquiring an artifact.
 ///
@@ -204,13 +204,16 @@ fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
     if artifacts.graphs.is_some() {
         capabilities.insert(Capability::Graphs);
     }
+    if artifacts.text.is_some() {
+        capabilities.insert(Capability::Search);
+    }
     capabilities
 }
 
 /// The artifact file names present, in the order doc 04 §4.1 lists them.
 ///
-/// **This list must grow with every sidecar.** Doc 04 §4.1 reserves `text/`,
-/// `labels/`, `ranges/`, `closures/`, `reif/`, `geo/`, `vectors/`, `filters/`,
+/// **This list must grow with every sidecar.** Doc 04 §4.1 reserves `labels/`,
+/// `ranges/`, `closures/`, `reif/`, `geo/`, `vectors/`, `filters/`,
 /// and `stats/`, none of which has a producer yet; an artifact absent from here
 /// is absent from the manifest's checksums and therefore from
 /// `content_digest`. Adding a sidecar without adding it here silently narrows a
@@ -229,6 +232,9 @@ fn artifact_names_for(artifacts: &ArtifactSet) -> Vec<&'static str> {
     }
     if artifacts.graph_index.is_some() {
         names.push(artifact::GRAPHS_IDX);
+    }
+    if artifacts.text.is_some() {
+        names.push(artifact::TEXT);
     }
     names
 }
@@ -663,6 +669,22 @@ mod tests {
         assert!(!capabilities.contains(&Capability::Range));
         assert!(!capabilities.contains(&Capability::Closure));
         assert!(!capabilities.contains(&Capability::Graphs));
+    }
+
+    #[test]
+    fn a_text_index_is_what_declares_search() {
+        // The capability and the artifact are the same fact, so `search` is
+        // derived from the bytes rather than configured: a bundle cannot
+        // advertise an operation whose index it does not carry, and one that
+        // carries the index cannot forget to advertise it.
+        let fixture = Fixture::build(TINY_NT).with_text();
+        let facts = facts(&fixture);
+
+        assert!(facts.capabilities().any(|c| c == Capability::Search));
+        // And it joins the checksummed set, so adding an index changes the
+        // version's identity rather than slipping in unrecorded.
+        let names: Vec<_> = facts.artifact_names().collect();
+        assert!(names.contains(&crate::store::artifact::TEXT), "{names:?}");
     }
 
     #[test]
