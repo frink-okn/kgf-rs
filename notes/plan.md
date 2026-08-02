@@ -17,8 +17,8 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–13 are complete; each carries a **What landed** section written after the fact,
-which is where a unit's plan and its outcome are reconciled. Unit 14 has none yet.
+Units 1–14 are complete, which is all of M1; each carries a **What landed** section
+written after the fact, which is where a unit's plan and its outcome are reconciled.
 
 **Nothing here is frozen.** Doc 20 §20.7 and §20.8 speak of formats being stable from
 the first release; no release has happened, and the service is expected to run for a
@@ -767,7 +767,7 @@ specified and does the job.
 
 There are 172 tests after this unit.
 
-### 14. The four query operations
+### 14. The four query operations ✅
 
 `/fragment` (GET), `/count`, `/describe`, `/sample`, over units 10–13.
 
@@ -781,6 +781,84 @@ rather than calling `at` per sample — doc 03 §3.4.7 states the exception and 
 shape (the store is already differential against `hdtc search`, so this checks the HTTP
 layer rather than re-checking the query core), exhaustive paging at adversarial page
 sizes through real cursors, and `cardinality` matching enumerated length.
+
+**What landed.** Two modules, split where the store is: `request` turns §3.4's
+parameters into types and needs no bundle, `answer` executes them against one and
+writes the response. Everything a request can be refused for without opening anything —
+negotiation, terms, caps, cursors — happens in the first, which is what lets a handler
+refuse a bad request and answer a revalidation before it pays for a cold mmap. Both are
+proven against a bundle that *cannot* be opened.
+
+**Serialization runs inside the blocking task.** Doc 20 §20.5 says strings are
+materialized only while serializing, and the term cache that makes that cheap holds
+`Rc<str>` and is deliberately not `Send` — so the whole operation, response body
+included, happens in the task holding the `Store`, and what crosses back is bytes plus
+the completeness metadata the headers repeat. Returning rows of owned `String`s to
+serialize on the reactor would allocate a string per term per row for no reason but to
+move them.
+
+**A page asks for `limit + 1` rows and keeps `limit`.** That is how completeness is
+decided without a second query and without arithmetic that differs per pattern:
+`offset + returned < count` is not available for `s ? o`, whose position is a predicate
+id. The extra row turned out to do a second job that fixed a real bug — a cursor
+records the position resuming **at** a row rather than after it, so the dropped row *is*
+where the next page starts. Recording "after the last kept row" instead made
+`/describe` at `limit=1` mint a cursor at the end of the out-edge enumeration, which the
+bounds check then refused as out of range, with the in-edges unreachable. Caught by
+paging the fixture at every size across the phase boundary.
+
+**Unit 10's deferred check landed, as two rules.** A position past the end is
+`stale_cursor` rather than an empty page that reads as the end of results — bounded by
+the cardinality for the three permutation spaces, and by the predicate id space for
+`s ? o`, where a one-row answer legitimately resumes at predicate 37. A token carrying
+an M2 trailer is stale too, since no M1 operation issues one.
+
+**`/describe` rows carry a `direction` column, which §3.4.6 does not define.** The two
+halves overlap on exactly one triple — `<a> p <a>` is genuinely an out-edge *and* an
+in-edge — and without the column its second appearance reads as a duplicate.
+Deduplicating instead would need `count(t ? t)` to keep `cardinality` equal to the
+enumerated length, which is an `s ? o` probe per request and is not what §3.5's
+"describe | 2 × fragment" budgets. Rows carry all three positions for the same reason:
+under `direction=both` there is no single bound position, and a row shape that changed
+with `direction` would make the wrapper harder to consume than the thing it wraps.
+
+**A cursor binds to terms, not to spellings.** The canonical request hashes each term's
+*dictionary* spelling, so `ex:alice` and `<http://example.org/alice>` are one request
+and a client that changes how it writes a term mid-paging keeps its place. That also
+keeps the binding free of the dictionary, which is what lets a cursor be rejected before
+the bundle opens.
+
+**No parameter is ignored, and the three ways of not knowing one are three answers.**
+A parameter the operation takes is parsed; one doc 03 defines that this deployment
+cannot answer is `capability_not_available` (501) naming the capability; anything else
+is `malformed_request` listing what the operation does take. `g=` is why the rule is
+absolute rather than pragmatic — a request scoped to one named graph, answered from the
+whole dataset, is wrong in a way no client can detect. Two published budgets became
+real in the process: `max_term_bytes` on every term parameter, and `n ≤ 1000` on
+`/sample`.
+
+**`/sample`'s generator is written out rather than taken from a crate.** §3.4.7 makes
+the draw part of the contract — "deterministic for a given seed + version, hence
+cacheable" — and a stream that may change between releases of someone else's crate
+cannot back that. SplitMix64, six lines, with rejection rather than `% bound` because a
+modulo bias over-represents the front of the result set, which is the one thing a sample
+exists not to do. An omitted `seed` is **zero, not random**, for the same reason: a
+response that varied per request would carry a validator on bytes that change.
+
+An empty answer says *why* it is empty. A bound parameter whose term the bundle's
+dictionary does not hold is listed in `absent_terms`, which doc 03 does not define and
+which unit 11 promised when it decided not to reject unusual IRIs at the edge: "no rows
+because that term is not here" and "no rows because nothing matches" are one response
+with two remedies, and only the server can tell them apart.
+
+The pages are browsable rather than merely present. Every term links to the request that
+asks about it — a subject or object to its own `/describe`, a predicate or literal to
+the `/fragment` carrying it — a truncated page offers the next, and the manifest page
+lists the operations with links to the three that answer without arguments. Doc 03 §3.6
+asks for "normalized parameter ordering documented so caches hit", so the links this
+server builds are sorted and uniformly escaped.
+
+There are 194 tests after this unit.
 
 ### What M1 is not
 
@@ -1054,6 +1132,47 @@ following the code.
     where doc 04 §4.3's example shows an absolute URL. Worth stating, since a client
     resolving one against the request URI gets the right answer and a client expecting
     an absolute URL does not. Surfaced in unit 13.
+19. **§3.4.4's example sends `s=` and `o=` for unbound positions,** which §3.3
+    contradicts: "omitted = variable". Both cannot be right, and the example is the one
+    this implementation calls the bug. An empty value is far more likely to be a client
+    whose URL template interpolated a variable it never set than a deliberate wildcard,
+    and reading it as a wildcard answers with the whole dataset — a wrong answer that
+    looks like a right one, where an error was available. `kgf-server` refuses it as
+    `bad_term_syntax` with "omit the parameter entirely" as the remedy. Worth either
+    fixing the example or saying explicitly that an empty value is a variable. Found in
+    unit 14.
+20. **`count` has two shapes in §3.4.4.** The first example is
+    `{"count": 1284211, "exact": true}` — a bare integer with a sibling flag — and the
+    resumable form two paragraphs later is
+    `{"count": {"value": n, "exact": false, "min": n}}`. One field with two shapes is a
+    client-breaking change waiting to happen, and a client cannot tell which it will get
+    without knowing whether the scan finished. This implementation emits the object form
+    always: it matches §3.4.1's `cardinality`, and it is the one that survives M2's
+    arrival. Found in unit 14.
+21. **What does a server return when `limit` is omitted?** §3.5 publishes the ceiling
+    (`limit ≤ 10 000`) and no default, so a client cannot know how large an
+    unparameterized `GET /fragment` is without making one. This server publishes
+    `caps.default_limit` (100) beside the caps and applies it. Either §3.5 should name a
+    default or §3.1's self-description should require servers to publish theirs;
+    inventing a cap field is the smaller of the two, but it is inventing one. Found in
+    unit 14.
+22. **`/describe` rows need a way to say which half they came from.** §3.4.6 defines the
+    operation as two pattern enumerations and does not describe the row shape. The two
+    overlap on exactly one triple — the self-loop `<a> p <a>`, which is genuinely an
+    out-edge and an in-edge — so a row must either be deduplicated or labelled, and
+    deduplication costs an `s ? o` count per request to keep `cardinality` equal to the
+    enumerated length. This server labels: rows carry `s`, `p`, `o` and a `direction` of
+    `out` or `in`, the same kind of extra column §3.4.1 already shows with `score` and
+    §3.4.2 with `binding`. Worth a sentence in §3.4.6 either way. Found in unit 14.
+23. **An empty answer does not say whether the terms exist.** A pattern whose bound term
+    is absent from the dictionary and a pattern that simply matches nothing are the same
+    response — zero rows, `complete: true`, cardinality 0 — with different remedies, and
+    only the server can tell them apart. Unit 11 leaned on this when it decided to accept
+    unusual IRIs rather than reject them at the edge ("a diagnostic is more useful than a
+    syntax error"), so `kgf-server` adds `absent_terms`, listing the parameters whose
+    terms this bundle does not hold, per role. Doc 03 has no such field. Worth adding to
+    §3.4.1's envelope, since agents self-correcting on a §3.6 vocabulary are exactly who
+    benefits. Found in unit 14.
 
 ## Not in this plan
 

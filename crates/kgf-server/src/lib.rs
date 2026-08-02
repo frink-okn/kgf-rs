@@ -28,18 +28,23 @@
 //!
 //! # Status
 //!
-//! Units 10–13 of `notes/plan.md` are implemented: [`cursor`], [`term`],
-//! [`envelope`], and this unit's skeleton — the URL space, `latest`, caching,
-//! content negotiation and `/manifest`. The four query operations are unit 14.
+//! Units 10–14 of `notes/plan.md` are implemented: [`cursor`], [`term`],
+//! [`envelope`], the URL space with `latest`, caching and content negotiation,
+//! and doc 03 §3.4's four read operations — `/fragment`, `/count`, `/describe`
+//! and `/sample` — in [`request`] and [`answer`]. Bindings QUERY, `/void` and
+//! `/summary` are M2, so a deployment answers useful traffic but does not yet
+//! claim §3.1's core profile.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod answer;
 pub mod cursor;
 pub mod descriptor;
 pub mod envelope;
 pub mod html;
 pub mod representation;
+pub mod request;
 pub mod routes;
 pub mod service;
 pub mod term;
@@ -86,6 +91,14 @@ impl Config {
             budgets: Budgets::default(),
         }
     }
+
+    /// The published numbers this deployment reads requests against.
+    pub fn limits(&self) -> Limits<'_> {
+        Limits {
+            caps: &self.caps,
+            budgets: &self.budgets,
+        }
+    }
 }
 
 /// The largest values a request may ask for (doc 03 §3.5).
@@ -97,6 +110,17 @@ impl Config {
 pub struct Caps {
     /// Rows per page.
     pub max_limit: u32,
+    /// Rows per page when a request does not ask for a number.
+    ///
+    /// Not one of doc 03 §3.5's caps, and published beside them because a
+    /// client cannot otherwise know how large `GET /fragment` is: §3.5 fixes
+    /// the ceiling and leaves the default to the server, so the default is
+    /// something a server has to say. Small on purpose — an agent's first
+    /// request to an unfamiliar endpoint should be cheap, and `next` says
+    /// there is more. See `notes/plan.md`, "Questions for `../kgf`".
+    pub default_limit: u32,
+    /// Members drawn by one `/sample` (doc 03 §3.5's `n ≤ 1000`).
+    pub max_sample: u32,
     /// Input rows in a bindings QUERY (M2).
     pub max_bindings: u32,
     /// Subjects in a star request (M2).
@@ -105,15 +129,41 @@ pub struct Caps {
     pub max_star_width: u32,
 }
 
-impl Default for Caps {
-    fn default() -> Self {
+impl Caps {
+    /// Doc 03 §3.5's defaults.
+    ///
+    /// `const` so that a caller — or a test of the parsing these bound — can
+    /// name them without building a [`Config`], which needs a capability over a
+    /// real directory.
+    pub const fn new() -> Self {
         Self {
             max_limit: 10_000,
+            default_limit: 100,
+            max_sample: 1_000,
             max_bindings: 200,
             max_star_subjects: 1_000,
             max_star_width: 32,
         }
     }
+}
+
+impl Default for Caps {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The published numbers a request is read against (doc 03 §3.5).
+///
+/// Borrowed together because they are read together: a term parameter is
+/// checked against a budget and a page size against a cap, and an operation
+/// that saw one without the other would enforce half of what `/` advertises.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits<'a> {
+    /// The largest values a request may ask for.
+    pub caps: &'a Caps,
+    /// The work one response may cost.
+    pub budgets: &'a Budgets,
 }
 
 /// The work one response may cost (doc 03 §3.5's composite budgets).
@@ -140,8 +190,9 @@ pub struct Budgets {
     pub time_budget_ms: u64,
 }
 
-impl Default for Budgets {
-    fn default() -> Self {
+impl Budgets {
+    /// Doc 03 §3.5's suggested defaults.
+    pub const fn new() -> Self {
         Self {
             max_output_rows: 100_000,
             max_output_terms: 1_000_000,
@@ -151,6 +202,12 @@ impl Default for Budgets {
             candidate_budget: 1_000_000,
             time_budget_ms: 2_000,
         }
+    }
+}
+
+impl Default for Budgets {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

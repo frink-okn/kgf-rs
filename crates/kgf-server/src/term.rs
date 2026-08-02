@@ -421,6 +421,33 @@ impl<'a> Term<'a> {
         }
     }
 
+    /// Spell this term the way a request must write it (§3.3), for building a
+    /// link back into this API.
+    ///
+    /// The inverse of [`parse`](Term::parse), and the direction a *page* needs:
+    /// an HTML row links each term to the request that asks about it, so the
+    /// term has to be written in the syntax that parameter takes.
+    ///
+    /// Never abbreviated. A CURIE would be shorter, but it would only parse
+    /// against the bundle that declared the prefix, and a link that stops
+    /// working when copied to another endpoint is worse than a long one. Round
+    /// trips through `parse` for every term shape, which is asserted rather
+    /// than assumed.
+    pub fn to_request(&self) -> String {
+        match self {
+            Term::Iri(iri) => format!("<{iri}>"),
+            Term::BlankNode(label) => format!("_:{label}"),
+            Term::Literal(literal) => match &literal.kind {
+                LiteralKind::Plain => format!("\"{}\"", literal.value),
+                LiteralKind::Language(language) => format!("\"{}\"@{language}", literal.value),
+                // Bracketed, because a bare datatype is read as a CURIE.
+                LiteralKind::Datatype(datatype) => {
+                    format!("\"{}\"^^<{datatype}>", literal.value)
+                }
+            },
+        }
+    }
+
     /// Resolve to an id in `role`'s space, or `None` if the bundle has no such
     /// term in that role.
     ///
@@ -880,6 +907,9 @@ mod tests {
 
             // Out to the client and back through request syntax.
             let request = as_request_syntax(&term);
+            // And the crate's own writer agrees with that independent reading
+            // of §3.3, which is what makes a link on a page a valid request.
+            assert_eq!(term.to_request(), request, "to_request for {stored}");
             let reparsed = Term::parse(&request, &prefixes)
                 .unwrap_or_else(|error| panic!("{request} does not parse back: {error}"));
             assert_eq!(reparsed, term, "request syntax round trip for {stored}");

@@ -36,22 +36,26 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Request, State};
 use axum::http::header::{ACCEPT, CONTENT_TYPE, LOCATION, VARY};
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, any, get};
 use axum::{Router, middleware};
 use headers::{ETag, HeaderMapExt, IfNoneMatch};
+use kgf_store::Capability;
 use kgf_store::catalog::BundleId;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::Limits;
+use crate::answer::{self, Rendered, Renders, Target};
 use crate::descriptor::{BundleManifest, DatasetDescriptor, ServiceDescriptor};
 use crate::envelope::{ErrorCode, PROBLEM_MEDIA_TYPE, Problem, reflected};
 use crate::html::Resource;
 use crate::representation::{CachePolicy, Representation, etag, negotiate};
-use crate::service::Service;
+use crate::request;
+use crate::service::{Release, Service};
 use crate::url::{self, Params};
 
 /// The KGF routes over a built service.
@@ -70,6 +74,14 @@ pub fn router(service: Arc<Service>) -> Router {
             "/{dataset}/v/{version}/manifest",
             read(get(bundle_manifest)),
         )
+        // §3.4's read operations. `/count` and `/fragment` also take a QUERY
+        // body in the full profile; that is bindings (M2), and until it lands
+        // the method fallback answers a coded 405 with `Allow` rather than
+        // pretending the route does not exist.
+        .route("/{dataset}/v/{version}/fragment", read(get(fragment)))
+        .route("/{dataset}/v/{version}/count", read(get(count)))
+        .route("/{dataset}/v/{version}/describe", read(get(describe)))
+        .route("/{dataset}/v/{version}/sample", read(get(sample)))
         .fallback(no_such_route)
         // Order matters more than usual here, and reads innermost first.
         //
@@ -220,6 +232,139 @@ async fn bundle_manifest(
     )
 }
 
+// ---------------------------------------------------------------------------
+// The §3.4 operations
+// ---------------------------------------------------------------------------
+
+async fn fragment(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate(
+        service,
+        BundleId { dataset, version },
+        "fragment",
+        wants,
+        |params, limits, release| {
+            request::Fragment::parse(params, limits, release.prefixes(), &release.binding())
+        },
+        answer::fragment,
+    )
+    .await
+}
+
+async fn count(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate(
+        service,
+        BundleId { dataset, version },
+        "count",
+        wants,
+        |params, limits, release| request::Count::parse(params, limits, release.prefixes()),
+        answer::count,
+    )
+    .await
+}
+
+async fn describe(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate(
+        service,
+        BundleId { dataset, version },
+        "describe",
+        wants,
+        |params, limits, release| {
+            request::Describe::parse(params, limits, release.prefixes(), &release.binding())
+        },
+        answer::describe,
+    )
+    .await
+}
+
+async fn sample(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate(
+        service,
+        BundleId { dataset, version },
+        "sample",
+        wants,
+        |params, limits, release| {
+            // §3.4.7 is an optional capability, so a bundle that does not
+            // declare one is refused rather than served from artifacts it
+            // never promised — and refused *here*, before the open, because
+            // the manifest is already in memory.
+            if !release.declares(Capability::Sample) {
+                return Err(Problem::new(
+                    ErrorCode::CapabilityNotAvailable,
+                    "this bundle does not declare the `sample` capability; \
+                     its manifest lists the ones it does",
+                ));
+            }
+            request::Sample::parse(params, limits, release.prefixes())
+        },
+        answer::sample,
+    )
+    .await
+}
+
+/// The shape every §3.4 operation has.
+///
+/// Read in order, because the order is the decision: negotiate, resolve the
+/// version, read the parameters, evaluate the precondition, and only then open
+/// a bundle. Everything before the open is pure and cheap, so a request that
+/// cannot be answered — or one whose answer the client already holds — never
+/// pays for a cold mmap.
+async fn operate<Q, A, P, E>(
+    service: Arc<Service>,
+    id: BundleId,
+    operation: &'static str,
+    wants: Wants,
+    parse: P,
+    execute: E,
+) -> Result<Response, Problem>
+where
+    Q: Send + 'static,
+    A: Renders,
+    P: FnOnce(&Params, Limits<'_>, &Release) -> Result<Q, Problem>,
+    E: FnOnce(&kgf_store::Store, Target, &Q) -> Result<A, Problem> + Send + 'static,
+{
+    let representation = wants.representation()?;
+    let release = service.datasets().release(&id.dataset, &id.version)?;
+    let request = parse(wants.params(), service.config().limits(), release)?;
+
+    // A versioned operation is a deterministic function of immutable bytes
+    // (doc 04 §4.6), so the URL and the representation fix the response
+    // exactly — which is what makes a strong validator honest here and not
+    // only on `/manifest`.
+    let validator = etag(release.digest(), representation);
+    if wants.already_has(&validator) {
+        return not_modified(CachePolicy::Immutable, validator);
+    }
+
+    let target = Target::new(id, operation, wants.params().clone());
+    let opened = Arc::clone(&service);
+    let rendered = blocking(move || {
+        let store = opened.open(target.id())?;
+        // Serialized in here, not outside: doc 20 §20.5 materializes strings
+        // only while writing them, and the term cache that makes that cheap is
+        // deliberately not `Send`.
+        Ok(execute(&store, target, &request)?.render(representation))
+    })
+    .await?;
+
+    respond_rendered(rendered, representation, CachePolicy::Immutable, validator)
+}
+
 async fn latest_redirect(
     State(service): State<Arc<Service>>,
     Path((dataset, _rest)): Path<(String, String)>,
@@ -323,12 +468,21 @@ where
 /// would be answering a slightly different question than the client asked.
 #[derive(Debug, Clone, Default)]
 pub struct Wants {
-    format: Option<String>,
+    params: Params,
     accept: Option<String>,
     if_none_match: Option<IfNoneMatch>,
 }
 
 impl Wants {
+    /// The request's query parameters, parsed once.
+    ///
+    /// Held rather than re-read per handler: `format=` is a negotiation input
+    /// and the rest are the operation's, and parsing the string twice would
+    /// also mean two chances to disagree about what it said.
+    pub fn params(&self) -> &Params {
+        &self.params
+    }
+
     /// Whether the client already holds this exact entity (RFC 9110 §13.1.2).
     ///
     /// `precondition_passes` is `headers`' implementation of that section's
@@ -346,7 +500,7 @@ impl Wants {
     /// The representation to answer with, or the negotiation failure.
     pub fn representation(&self) -> Result<Representation, Problem> {
         negotiate(
-            self.format.as_deref(),
+            self.params.get("format"),
             self.accept.as_deref(),
             Representation::ALL,
         )
@@ -360,9 +514,8 @@ impl<S: Send + Sync> FromRequestParts<S> for Wants {
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        let params = Params::parse(parts.uri.query())?;
         Ok(Self {
-            format: params.get("format").map(str::to_owned),
+            params: Params::parse(parts.uri.query())?,
             accept: accept_header(&parts.headers)?,
             // A malformed `If-None-Match` is treated as absent, which RFC 9110
             // §13.1 requires of a precondition a server cannot evaluate: the
@@ -432,6 +585,37 @@ fn respond(
         cache,
         etag,
     )
+}
+
+/// Serve a body an operation already rendered.
+///
+/// Separate from [`respond`] because the §3.4 operations serialize inside the
+/// blocking task rather than handing back a [`Resource`] — and because they are
+/// the only responses that carry §3.6's completeness metadata.
+fn respond_rendered(
+    rendered: Rendered,
+    representation: Representation,
+    cache: CachePolicy,
+    validator: ETag,
+) -> Result<Response, Problem> {
+    let mut response = finish(
+        StatusCode::OK,
+        Some(representation),
+        Body::from(rendered.body),
+        cache,
+        Some(validator),
+    )?;
+    // §3.6 requires the same metadata on the headers as in the body, so that a
+    // serialization whose body has nowhere to put it still carries it, and so
+    // an intermediary can read it without parsing a response.
+    let headers = response.headers_mut();
+    for (name, value) in rendered.completeness.headers() {
+        headers.insert(
+            HeaderName::from_bytes(name.as_bytes()).expect("§3.6's field names are field names"),
+            header(value)?,
+        );
+    }
+    Ok(response)
 }
 
 /// RFC 9110 §15.4.5's 304: no body, and the validator and freshness the

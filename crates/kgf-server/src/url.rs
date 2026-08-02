@@ -30,6 +30,15 @@ pub fn encode_segment(segment: &str) -> String {
     utf8_percent_encode(segment, RESERVED_IN_SEGMENT).to_string()
 }
 
+/// Percent-encode one query parameter name or value.
+///
+/// The same conservative set: a query value must escape `&` and `=` to stay one
+/// value, `%` to stay literal, and `+` because [`decode_component`] reads a bare
+/// one as a space. Everything else the set escapes is escaped for free.
+pub fn encode_value(value: &str) -> String {
+    utf8_percent_encode(value, RESERVED_IN_SEGMENT).to_string()
+}
+
 /// The base of a bundle version: `/{dataset}/v/{version}/`.
 pub fn bundle_base(dataset: &str, version: &str) -> String {
     format!(
@@ -97,6 +106,47 @@ impl Params {
     /// One parameter's value.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.0.get(name).map(String::as_str)
+    }
+
+    /// Every parameter name the request carried, in sorted order.
+    pub fn names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
+
+    /// The same parameters with `name` set to `value`, replacing any it had.
+    #[must_use]
+    pub fn with(&self, name: &str, value: &str) -> Self {
+        let mut params = self.0.clone();
+        params.insert(name.to_owned(), value.to_owned());
+        Self(params)
+    }
+
+    /// The same parameters without `name`.
+    #[must_use]
+    pub fn without(&self, name: &str) -> Self {
+        let mut params = self.0.clone();
+        params.remove(name);
+        Self(params)
+    }
+
+    /// Whether the request carried any parameters.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Re-encode as a query string, for a link back into this API.
+    ///
+    /// **Normalized**: names are sorted and every value is escaped by the same
+    /// rule, so two requests that differ only in parameter order produce one
+    /// URL. Doc 03 §3.6 asks for exactly that — "normalized parameter ordering
+    /// documented so caches hit" — and a next-page link is where this server
+    /// gets to choose the spelling.
+    pub fn to_query(&self) -> String {
+        self.0
+            .iter()
+            .map(|(name, value)| format!("{}={}", encode_value(name), encode_value(value)))
+            .collect::<Vec<_>>()
+            .join("&")
     }
 }
 

@@ -422,11 +422,49 @@ impl Resource for BundleManifest {
                     (table(&["Prefix", "Expands to"], &prefixes))
                 }
 
+                h2 { "Operations" }
+                (note(
+                    "Doc 03 §3.4's read operations over this version. Each answers JSON to \
+                     anything that does not ask for HTML, and a versioned answer is immutable."
+                ))
+                (table(&["Operation", "Parameters"], &operations(&self.dataset, &self.version)))
+
                 h2 { "Artifacts" }
                 (table(&["Artifact", "Bytes", "SHA-256"], &artifacts))
             },
         )
     }
+}
+
+/// The operations a browser can reach from a manifest page.
+///
+/// Linked where the operation answers something without arguments, which is
+/// what makes the page a way *into* the data: `/fragment` with no pattern is
+/// the first page of everything, and every term in it links onwards. `/describe`
+/// needs a resource, so it is listed with the parameter it wants rather than
+/// with a link that would 400.
+fn operations<'a>(dataset: &str, version: &str) -> Vec<Vec<Value<'a>>> {
+    [
+        ("fragment", "s, p, o, limit, cursor", true),
+        ("count", "s, p, o", true),
+        ("describe", "iri, direction, limit, cursor", false),
+        ("sample", "s, p, o, n, seed", true),
+    ]
+    .into_iter()
+    .map(|(operation, parameters, browsable)| {
+        vec![
+            if browsable {
+                Value::Link {
+                    href: url::operation(dataset, version, operation),
+                    label: operation,
+                }
+            } else {
+                Value::Code(operation)
+            },
+            Value::Code(parameters),
+        ]
+    })
+    .collect()
 }
 
 #[cfg(test)]
@@ -513,5 +551,13 @@ mod tests {
         assert!(page.contains("href=\"/tox/v/2026-03-01/manifest\""));
         // And back out to the machine-readable form.
         assert!(page.contains("href=\"/tox/v/2026-06-01/manifest?format=json\""));
+        // And onward into the data: a browser needs one link that works with
+        // no arguments, or the API is only reachable by typing URLs.
+        assert!(page.contains("href=\"/tox/v/2026-06-01/fragment\""));
+        assert!(page.contains("href=\"/tox/v/2026-06-01/count\""));
+        // `/describe` is named without a link, because it needs a resource and
+        // a link that 400s is worse than none.
+        assert!(page.contains("describe"));
+        assert!(!page.contains("href=\"/tox/v/2026-06-01/describe\""));
     }
 }

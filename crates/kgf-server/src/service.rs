@@ -45,13 +45,16 @@ use std::sync::Arc;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
+use kgf_store::Capability;
 use kgf_store::catalog::{BundleId, Catalog};
 use kgf_store::manifest::{Manifest, Publisher};
 use kgf_store::store::{OpenOptions, Store, artifact};
 
 use crate::Config;
+use crate::cursor::BundleBinding;
 use crate::envelope::{ErrorCode, Problem, reflected};
 use crate::representation::ContentDigest;
+use crate::term::PrefixMap;
 
 /// What stops the server from starting.
 #[derive(Debug, thiserror::Error)]
@@ -327,6 +330,11 @@ impl Datasets {
                 Release {
                     digest,
                     created,
+                    // Copied once per bundle rather than once per request: a
+                    // manifest cannot change while the version exists, and an
+                    // OKN graph declaring fifty prefixes would otherwise
+                    // allocate a hundred strings to read something fixed.
+                    prefixes: PrefixMap::from_manifest(&manifest),
                     manifest: published,
                 },
             );
@@ -458,6 +466,7 @@ impl Dataset {
 pub struct Release {
     digest: ContentDigest,
     created: Option<Instant>,
+    prefixes: PrefixMap,
     manifest: PublishedManifest,
 }
 
@@ -470,6 +479,26 @@ impl Release {
     /// The manifest as published, and its parse.
     pub fn manifest(&self) -> &PublishedManifest {
         &self.manifest
+    }
+
+    /// The CURIE prefixes this version's parameters accept (doc 03 §3.3).
+    pub fn prefixes(&self) -> &PrefixMap {
+        &self.prefixes
+    }
+
+    /// What a cursor issued against this version must match.
+    ///
+    /// Derived here rather than per request, and infallible: a digest that
+    /// would not parse stopped the server at startup, and one that parses as a
+    /// [`ContentDigest`] has at least eight bytes of hex.
+    pub fn binding(&self) -> BundleBinding {
+        BundleBinding::from_content_digest(self.digest.as_str())
+            .expect("a parsed content digest is a cursor binding")
+    }
+
+    /// Whether this bundle declares `capability` (doc 04 §4.3).
+    pub fn declares(&self, capability: Capability) -> bool {
+        self.manifest.parsed.declares(capability)
     }
 }
 

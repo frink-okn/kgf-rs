@@ -31,15 +31,20 @@ Source/
 | `kgf-server` | The HTTP API (doc 03) over `kgf-store`: caps, budgets, cursors, formats. |
 | `kgf` | The binary. `kgf manifest` now, `kgf serve` next; `kgf build` when `kgf-build` lands. |
 
-**Status: the query core is built and the server answers; the four query operations
-are not written.** `kgf-store` implements doc 20's read layer in full — mapped bundles,
-dictionary, all eight patterns with exact counts and positional paging, the lazy
-catalog, and the bundle manifest. `kgf-server` has its pure layers — `cursor` (tokens),
-`term` (doc 03 §3.3 syntax in, term objects out, the per-request cache), `envelope`
-(§3.6's completeness vocabulary and RFC 9457 errors), `representation` (negotiation,
-caching, ETags) and `html` — over a real axum listener serving doc 03 §3.2's URL space:
-`/`, `/{dataset}`, the `latest` redirect and `/manifest`. `kgf serve` runs it. What is
-missing is `/fragment`, `/count`, `/describe` and `/sample` (unit 14).
+**Status: M1 is built and answers.** `kgf-store` implements doc 20's read layer in
+full — mapped bundles, dictionary, all eight patterns with exact counts and positional
+paging, the lazy catalog, and the bundle manifest. `kgf-server` has its pure layers —
+`cursor` (tokens), `term` (doc 03 §3.3 syntax in, term objects out, the per-request
+cache), `envelope` (§3.6's completeness vocabulary and RFC 9457 errors),
+`representation` (negotiation, caching, ETags), `html`, and `request` (§3.4's parameters
+in, typed requests out) — over a real axum listener serving doc 03 §3.2's URL space:
+`/`, `/{dataset}`, the `latest` redirect, `/manifest`, and the four read operations
+`/fragment`, `/count`, `/describe` and `/sample` in `answer`. `kgf serve` runs it.
+
+**M1 is not doc 03 §3.1's core profile**, and the two read like the same set. Missing
+from it: bindings QUERY (§3.4.2), `/void` and `/summary`. Present and *not* in it:
+`/sample`, which is an optional capability. So a deployment answers useful traffic and
+cannot yet claim conformance — that arrives with M2 (doc 20 §20.8).
 
 **Every route answers JSON and HTML at one URL**, chosen by `Accept` — a page in a
 browser, data from `curl` — so a new route implements `html::Resource` or it does not
@@ -49,9 +54,9 @@ compile.
 returning a plausible wrong answer. Do not replace one with a stub that returns a
 default.
 
-**`notes/plan.md` is the implementation route** — units 1–14 through doc 20 §20.8's M1,
-the decisions each one had to make, and the **Questions for `../kgf`** that
-implementation surfaced. It is kept current; read it before planning work.
+**`notes/plan.md` is the implementation route** — units 1–14, all complete, through
+doc 20 §20.8's M1, the decisions each one had to make, and the **Questions for `../kgf`**
+that implementation surfaced. It is kept current; read it before planning work.
 `notes/state.md` is a point-in-time handoff, written at a moment and not maintained
 afterwards, so where the two disagree about what exists, `plan.md` and the code win.
 

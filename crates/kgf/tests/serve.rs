@@ -515,6 +515,136 @@ fn a_manifest_that_disagrees_with_its_directory_stops_startup() {
     );
 }
 
+#[test]
+fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() {
+    // `operations.rs` checks what the four operations *answer*, headless. What
+    // only a socket can show is the rest of the response: §3.6's metadata in
+    // both channels, an immutable validator on a versioned GET, and a page for
+    // a browser at the same URL.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let base = "/tox/v/2026-06-01";
+
+    let page = server.get(&format!("{base}/fragment?limit=2"));
+    page.assert_status(200);
+    page.assert_header("content-type", "application/json");
+    page.assert_cache_control(&["public", "max-age=31536000", "immutable"]);
+    page.assert_varies_on_accept();
+
+    // The body says it is truncated, and so do the headers — §3.6 requires
+    // both, because a CSV or Parquet body has nowhere to put it.
+    let body = page.json();
+    assert_eq!(body["complete"], serde_json::json!(false));
+    assert_eq!(body["truncation_reason"], "page_limit");
+    page.assert_header("kgf-complete", "false");
+    page.assert_header("kgf-truncation-reason", "page_limit");
+    page.assert_header(
+        "kgf-next-cursor",
+        body["next"].as_str().expect("a cursor in the body"),
+    );
+
+    // A complete response says so in both channels too, and offers nothing to
+    // continue.
+    let whole = server.get(&format!("{base}/count?p=ex:knows"));
+    whole.assert_status(200);
+    whole.assert_header("kgf-complete", "true");
+    assert!(whole.header("kgf-next-cursor").is_none());
+    assert_eq!(
+        whole.json()["count"],
+        serde_json::json!({"value": 2, "exact": true}),
+        "alice and bob know each other"
+    );
+
+    // A versioned operation is a deterministic function of immutable bytes, so
+    // it revalidates like `/manifest` does.
+    let etag = page.header("etag").expect("an operation carries an ETag");
+    server
+        .request(
+            "GET",
+            &format!("{base}/fragment?limit=2"),
+            &[("If-None-Match", etag.as_str())],
+        )
+        .assert_status(304);
+
+    // And the same URL is a page in a browser.
+    let html = server.request(
+        "GET",
+        &format!("{base}/fragment?limit=2"),
+        &[("Accept", "text/html")],
+    );
+    html.assert_header("content-type", "text/html; charset=utf-8");
+    assert!(html.text().contains("Next page"));
+    // The completeness headers ride the page as well, since they are what an
+    // intermediary reads without parsing a body it cannot parse.
+    html.assert_header("kgf-complete", "false");
+
+    // `latest` reaches the operations with the query intact.
+    server
+        .get("/tox/latest/fragment?limit=2")
+        .assert_header("location", "/tox/v/2026-06-01/fragment?limit=2");
+}
+
+#[test]
+fn an_operation_a_bundle_does_not_declare_is_refused_before_it_is_opened() {
+    // §3.4.7 is an optional capability, so a bundle that does not declare it is
+    // answered 501 — the request is well formed and the shortfall is what this
+    // bundle offers, which is exactly what `capability_not_available` says.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    server.get("/tox/v/v1/sample?n=2").assert_status(200);
+
+    // Withdraw it, and only `/sample` changes.
+    let manifest = deployment.bundle("tox", "v1").join("manifest.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    document["capabilities"]
+        .as_object_mut()
+        .unwrap()
+        .remove("sample");
+    std::fs::write(&manifest, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    let server = deployment.serve();
+
+    let refused = server.get("/tox/v/v1/sample?n=2");
+    refused.assert_status(501);
+    assert_eq!(refused.json()["code"], "capability_not_available");
+    server.get("/tox/v/v1/fragment?limit=2").assert_status(200);
+}
+
+#[test]
+fn an_operations_parameters_are_read_before_the_bundle_is_opened() {
+    // The same rule unit 13 established for negotiation, now with parameters:
+    // this bundle cannot be opened at all, so anything but a 500 proves the
+    // refusal came first.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    std::fs::remove_file(deployment.bundle("tox", "v1").join("data.hdt.perm")).unwrap();
+    let server = deployment.serve();
+
+    for (target, code) in [
+        ("/tox/v/v1/fragment?limit=99999", "cap_exceeded"),
+        ("/tox/v/v1/fragment?limt=1", "malformed_request"),
+        ("/tox/v/v1/fragment?s=nope:x", "bad_term_syntax"),
+        ("/tox/v/v1/fragment?cursor=nonsense", "stale_cursor"),
+        (
+            "/tox/v/v1/fragment?g=%3Chttp%3A%2F%2Fx%3E",
+            "capability_not_available",
+        ),
+        ("/tox/v/v1/describe", "malformed_request"),
+    ] {
+        let refused = server.get(target);
+        assert_eq!(refused.json()["code"], code, "{target}");
+        assert_ne!(
+            refused.status, 500,
+            "{target} must not have opened anything"
+        );
+    }
+
+    // And a request that is fine still reaches the broken bundle.
+    server.get("/tox/v/v1/fragment").assert_status(500);
+}
+
 // ---------------------------------------------------------------------------
 // A deployment, and a client that writes its own requests
 // ---------------------------------------------------------------------------
