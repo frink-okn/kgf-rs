@@ -35,6 +35,7 @@
 
 use serde::ser::{Serialize, SerializeMap, Serializer};
 
+use hdtc::format::TextQuery;
 use kgf_store::{Capability, Role};
 
 use crate::Limits;
@@ -311,6 +312,21 @@ impl TextFilter {
     pub fn query(&self) -> &str {
         &self.0
     }
+
+    /// The index query this constraint asks for.
+    ///
+    /// One place rather than one per caller: `/fragment` and `/count` must ask
+    /// the *same* question, and [`TextQuery`] carries knobs — match mode,
+    /// fuzziness, prefix, language ranges — that doc 03 §3.4.5 and doc 19 §19.3
+    /// will expose later. Wiring one of those into the enumeration and
+    /// forgetting the count would report the unfiltered figure for a filtered
+    /// page, which is a wrong number that looks right.
+    pub fn to_query(&self) -> TextQuery {
+        TextQuery {
+            text: self.0.clone(),
+            ..TextQuery::default()
+        }
+    }
 }
 
 impl Serialize for TextFilter {
@@ -414,6 +430,14 @@ pub struct ResponseBytes(pub u64);
 /// short, marked `candidate_budget`, with a cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Candidates(pub u64);
+
+impl Candidates {
+    /// The budget as a count of items, saturating rather than wrapping on a
+    /// target whose `usize` is narrower than the published figure.
+    pub fn ceiling(self) -> usize {
+        usize::try_from(self.0).unwrap_or(usize::MAX)
+    }
+}
 
 /// `GET /fragment` — a triple pattern, paged (§3.4.1).
 #[derive(Debug)]

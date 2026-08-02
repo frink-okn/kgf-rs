@@ -962,7 +962,31 @@ nothing that matches, so the count is then neither a floor nor a ceiling.
 `o.text` and `o` are refused together rather than intersected: one names a term and
 the other ranks many, so a request carrying both is asking two incompatible questions.
 
-There are 210 tests after this unit.
+**What the review then found**, because it is the interesting part. The candidate
+budget was read as a ceiling on the *rank* a request may reach rather than on what one
+request examines, and the two differ exactly when a client pages as deep as the
+budget: the search returns at most `budget` hits, skipping to the resume rank yields
+nothing, and the cursor points at a rank already passed — the same page forever, with
+the rest of the answer unreachable. Proved by lowering the budget to 3 over six
+matching literals and watching ten pages in a row return nothing.
+
+Fixing it exposed why the wrong reading was tempting. A top-k index has no cursor, so
+a page holds a hit list as long as the rank it reached, and *unbounded* paging is
+unbounded memory in one request. The budget now bounds both, in the two ways it has
+to: `from_rank + min(want, budget)` for what one request examines, and a stop at
+`budget` ranks deep that says `candidate_budget` and offers no cursor. Recorded as
+question 26, because doc 03 reads as though a ranked result pages to the end.
+
+Two more. `/count` carried the budget and never read it, so a text count walked every
+posting — the same shape as unit 13's `max_request_bytes`, a figure published and
+enforced nowhere; hdtc grew `count_up_to`, and §3.4.4's budgeted-count shape now
+appears when it fires. And a row's `score` went out with no `match_kind`, which is
+wrong *within* one endpoint before it is wrong across several: hdtc ranks exact
+matches as a class ahead of stemmed ones, so a page held a row scored 0.528 sitting
+below one scored 0.441, and a client sorting by score would have undone the server's
+own ranking.
+
+There are 213 tests after this unit.
 
 ### What M1 is not
 
@@ -1302,6 +1326,56 @@ following the code.
     mode" applied to configuration — and it is what lets the operations skip the row and
     term budgets per request. Worth §3.5 stating the relationship it currently implies.
     Found in unit 14's review.
+
+24. **`match_kind`'s vocabulary and hdtc's classes do not line up.** §3.4.5 names
+    `exact | normalized | prefix | fuzzy`, with `semantic` reserved. hdtc classifies a
+    hit as `Exact` or `Stemmed` and treats prefix and fuzzy as query *modes*
+    (`TextQuery.prefix`, `TextQuery.fuzzy`) rather than as things a hit can be — a
+    fuzzy query's hits are still exact-or-stemmed against the widened term. This
+    server reports §3.4.5's set because that is what a client branches on, mapping
+    `Stemmed` to `normalized`, which is honest but wider than what is being said.
+    Worth deciding which the vocabulary describes: how the *query* was widened, or
+    how the *literal* matched. They are different facts and only one of them is a
+    per-row column. Found in unit 15's review.
+25. **How is a ranked result meant to combine across endpoints?** §3.4.5 says `score`
+    is "not comparable across datasets" and doc 06 §6.2.1 says merging belongs in the
+    client "by `match_kind` class and rank rather than raw score" — but neither says
+    what a client should actually *do* with two pages from two KGs. Rank alone is not
+    enough: the first hit of a graph with three literals and the first of a graph with
+    three million are not equivalent, and interleaving by rank makes a small dataset
+    look as authoritative as a large one on every query.
+
+    The pieces a client would need are not published either. §3.4.5 already notes that
+    collection statistics differ; doc 19 §19.3 adds that under dictionary-level
+    indexing they are over *distinct literals*, so two bundles with different
+    duplication profiles have different denominators for the same corpus. A client
+    could normalize if it had the denominator — the manifest's
+    `capabilities.search` records `indexed_docs`, which is exactly it — but nothing
+    says a client may use it, and nothing says whether the fan-out should weight by
+    it, by `/count` cardinality, or not at all.
+
+    Worth settling in doc 06 rather than doc 03, since it is a client strategy and not
+    a wire format; what doc 03 may owe is one sentence saying which published figure a
+    merger is entitled to normalize against. Raised while reviewing unit 15, and the
+    reason this server now emits `match_kind` beside every `score`: without the class,
+    even *within* one endpoint a client that sorts by score reorders the page, because
+    hdtc ranks exact matches as a class ahead of stemmed ones and a stemmed hit can
+    carry the higher number.
+26. **Is a text-filtered enumeration meant to be pageable to the end?** §3.4.1 says a
+    text constraint "may return partial + cursor" and §3.5 budgets it on candidates
+    examined, which reads as "each request examines at most N, and paging continues".
+    But a top-k index has no cursor: every page re-ranks from the top, so a request
+    holds a hit list as long as the rank it reached, and unlimited paging is unbounded
+    memory in one request — against the rule that makes this project what it is.
+
+    This server therefore pages a ranked result to `candidate_budget` ranks and then
+    stops, with `truncation_reason: candidate_budget` and **no** cursor, which the
+    §3.6 vocabulary already has a shape for. That seems right for a relevance
+    primitive — doc 19 §19.0 calls text search an entity-resolution move, not an
+    enumeration — but it is a limit doc 03 does not mention, and a client cannot
+    discover it from the descriptor. Either §3.5 should publish a paging depth beside
+    the budget, or §3.4.1 should say that a ranked result is a top-k rather than a
+    resumable enumeration. Found in unit 15's review.
 
 ## Not in this plan
 

@@ -576,6 +576,184 @@ fn o_text_needs_an_index_and_will_not_share_the_object_position() {
     assert!(served.release().declares(kgf_store::Capability::Search));
 }
 
+#[test]
+fn a_tight_candidate_budget_pages_to_its_bound_and_then_stops() {
+    // Two promises, and the first is the one that broke. §3.5's budget bounds
+    // what one *request* examines, not how far a client may page. Read the
+    // other way — as a ceiling on the rank a request may reach — paging stops
+    // dead the moment a client arrives at the budget: the search returns at
+    // most `budget` hits, skipping to the resume rank yields nothing, and the
+    // cursor points at a rank already passed, so the client asks forever.
+    //
+    // The second promise is what bounds it instead. A top-k index has no
+    // cursor, so a page holds a hit list as long as the rank it reached; the
+    // budget is therefore also how deep the ranking is pageable, and reaching
+    // that depth ends the enumeration *without* a cursor rather than with one
+    // that goes nowhere.
+    //
+    // Neither shows up at the published default of 1 000 000 over a ten-triple
+    // fixture, which is why this lowers it.
+    let served = Served::with_text();
+    let store = served.store();
+
+    let whole = rows(&served.fragment(&store, "o.text=Alice&limit=1000"));
+    assert!(
+        whole.len() > 1,
+        "the fixture must need more than one page at limit=1"
+    );
+
+    for candidate_budget in [1u64, 2, 3, 1_000] {
+        let budgets = Budgets {
+            candidate_budget,
+            ..Budgets::new()
+        };
+        let limits = Limits {
+            caps: &CAPS,
+            budgets: &budgets,
+        };
+
+        let mut collected = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        let stopped_short = loop {
+            let query = match &cursor {
+                Some(token) => format!("o.text=Alice&limit=1&cursor={token}"),
+                None => "o.text=Alice&limit=1".to_owned(),
+            };
+            let answer = served
+                .try_fragment_within(&store, &query, limits)
+                .unwrap_or_else(|error| panic!("budget {candidate_budget}: {error}"));
+            collected.extend(rows(&answer));
+            pages += 1;
+            assert!(
+                pages < 50,
+                "budget {candidate_budget} never terminated; saw {} of {} rows",
+                collected.len(),
+                whole.len()
+            );
+            if answer["complete"].as_bool().unwrap() {
+                break false;
+            }
+            match answer["next"].as_str() {
+                Some(token) => cursor = Some(token.to_owned()),
+                // The depth bound: it says why it stopped and offers nothing to
+                // continue with, so a client stops too.
+                None => {
+                    assert_eq!(answer["truncation_reason"], "candidate_budget");
+                    break true;
+                }
+            }
+        };
+
+        // Whatever it returned is a prefix of the answer, in order and without
+        // repetition — a bound may cut the enumeration short but must not
+        // reorder or duplicate it.
+        assert_eq!(
+            collected,
+            whole[..collected.len()],
+            "budget {candidate_budget} must return a prefix of the answer"
+        );
+        assert_eq!(
+            stopped_short,
+            collected.len() < whole.len(),
+            "budget {candidate_budget} must say it stopped exactly when it did"
+        );
+        // And a budget with room for the whole ranking reaches all of it.
+        if candidate_budget as usize >= whole.len() {
+            assert_eq!(collected, whole, "budget {candidate_budget}");
+        }
+    }
+}
+
+#[test]
+fn a_count_that_spends_the_candidate_budget_says_so() {
+    // §3.4.4: a count that cannot be finished within its budget reports what it
+    // reached as a lower bound and marks the response, rather than passing a
+    // bounded figure off as the whole number. Without this the budget was a
+    // field the request carried and nothing read.
+    let served = Served::with_text();
+    let store = served.store();
+
+    let whole = served.count(&store, "o.text=Alice");
+    let total = whole["count"]["value"].as_u64().unwrap();
+    assert!(total > 1, "the fixture must match more than one literal");
+    assert_eq!(whole["complete"], serde_json::json!(true));
+    assert!(whole["count"]["distinct_objects"].is_number());
+
+    let budgets = Budgets {
+        candidate_budget: 1,
+        ..Budgets::new()
+    };
+    let limits = Limits {
+        caps: &CAPS,
+        budgets: &budgets,
+    };
+    let request =
+        request::Count::parse(&params("o.text=Alice"), limits, served.release().prefixes())
+            .expect("a well-formed request");
+    let answer =
+        answer::count(&store, served.target("count", "o.text=Alice"), &request).expect("an answer");
+    let counted = json(answer, Representation::Json);
+
+    assert_eq!(counted["count"]["value"], serde_json::json!(1));
+    assert_eq!(counted["count"]["exact"], serde_json::json!(false));
+    assert_eq!(counted["count"]["min"], serde_json::json!(1));
+    // Not `distinct_objects`: §3.4.1 calls that one exact, and a count that
+    // stopped at a budget is a floor rather than a total.
+    assert!(counted["count"].get("distinct_objects").is_none());
+    assert_eq!(counted["complete"], serde_json::json!(false));
+    assert_eq!(counted["truncation_reason"], "candidate_budget");
+    assert_eq!(counted["next"], serde_json::json!(null));
+}
+
+#[test]
+fn a_ranked_row_says_which_class_its_score_belongs_to() {
+    // hdtc ranks exact matches as a class ahead of stemmed ones and its scores
+    // are comparable only within a class, so a stemmed row can carry a higher
+    // number than the exact row above it. Without the class, a client sorting
+    // the page by `score` — which doc 06 §6.2.1 tells federated clients to do —
+    // undoes the ranking the server computed.
+    let served = Served::with_text();
+    let store = served.store();
+
+    let answer = served.fragment(&store, "o.text=Alice&limit=1000");
+    let rows = answer["rows"].as_array().unwrap();
+    assert!(!rows.is_empty());
+
+    let mut classes = std::collections::BTreeSet::new();
+    for row in rows {
+        let kind = row["match_kind"]
+            .as_str()
+            .expect("a ranked row names its class");
+        assert!(
+            matches!(kind, "exact" | "stemmed"),
+            "unexpected class {kind}"
+        );
+        assert!(row["score"].is_number());
+        classes.insert(kind.to_owned());
+    }
+
+    // Exact matches come first as a class, whatever the raw scores say.
+    let ordered: Vec<&str> = rows
+        .iter()
+        .map(|row| row["match_kind"].as_str().unwrap())
+        .collect();
+    let first_stemmed = ordered.iter().position(|kind| *kind != "exact");
+    if let Some(boundary) = first_stemmed {
+        assert!(
+            ordered[boundary..].iter().all(|kind| *kind != "exact"),
+            "a class boundary is crossed once: {ordered:?}"
+        );
+    }
+
+    // And a row with no text constraint carries neither field — there is no
+    // ranking to report.
+    let plain = served.fragment(&store, "limit=1");
+    let row = &plain["rows"].as_array().unwrap()[0];
+    assert!(row.get("score").is_none());
+    assert!(row.get("match_kind").is_none());
+}
+
 // ---------------------------------------------------------------------------
 // A served bundle, and the operations over it
 // ---------------------------------------------------------------------------
@@ -712,9 +890,24 @@ impl Served {
         store: &Store,
         query: &str,
     ) -> Result<serde_json::Value, kgf_server::envelope::Problem> {
+        self.try_fragment_within(store, query, self.limits())
+    }
+
+    /// A `/fragment` read against budgets the caller chose.
+    ///
+    /// The published defaults are far larger than any fixture, so a budget only
+    /// ever fires in a test that lowers it — which is exactly how the
+    /// candidate budget went unexercised while `top_k` capped the absolute
+    /// rank and paging stalled at the ceiling.
+    fn try_fragment_within(
+        &self,
+        store: &Store,
+        query: &str,
+        limits: Limits<'_>,
+    ) -> Result<serde_json::Value, kgf_server::envelope::Problem> {
         let request = request::Fragment::parse(
             &params(query),
-            self.limits(),
+            limits,
             self.release().prefixes(),
             &self.release().binding(),
         )?;
