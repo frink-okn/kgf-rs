@@ -33,7 +33,9 @@
 //! format is named — including every resource's HTML rendering, which is why
 //! [`Resource`](crate::html::Resource) exists rather than a match per handler.
 
+use headers::{CacheControl, ETag};
 use mediatype::{MediaType, MediaTypeBuf, ReadParams, names};
+use std::time::Duration;
 
 use crate::envelope::{ErrorCode, Problem};
 
@@ -288,6 +290,10 @@ fn acceptability(ranges: &[MediaRange], media_type: &MediaType<'_>) -> Option<u3
 /// (doc 04 §4.6); a mutable document — the descriptors and the `latest`
 /// redirect — which is a snapshot of something that moves; and an error, which
 /// describes this attempt rather than a resource.
+///
+/// The header itself is built by the `headers` crate rather than written as a
+/// string, so the directive names and their order are its problem and not this
+/// server's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachePolicy {
     /// A versioned GET. §3.6: "versioned GETs immutable".
@@ -302,61 +308,49 @@ pub enum CachePolicy {
 }
 
 impl CachePolicy {
-    /// The `Cache-Control` value.
-    pub fn header_value(self) -> &'static str {
+    /// A year, the longest `max-age` §3.6 names.
+    const A_YEAR: Duration = Duration::from_secs(31_536_000);
+    /// Long enough that a `latest` redirect is not re-resolved per request,
+    /// short enough that a new release is picked up in minutes (§3.6).
+    const A_WHILE: Duration = Duration::from_secs(300);
+
+    /// The typed `Cache-Control` header this policy sends.
+    pub fn header(self) -> CacheControl {
         match self {
-            // 31 536 000 = 365 days, the maximum §3.6 names.
-            Self::Immutable => "public, max-age=31536000, immutable",
-            Self::Mutable => "public, max-age=300",
-            Self::Uncacheable => "no-store",
+            Self::Immutable => CacheControl::new()
+                .with_public()
+                .with_max_age(Self::A_YEAR)
+                .with_immutable(),
+            Self::Mutable => CacheControl::new()
+                .with_public()
+                .with_max_age(Self::A_WHILE),
+            Self::Uncacheable => CacheControl::new().with_no_store(),
         }
     }
 }
 
-/// An entity tag over a bundle version and the representation served.
+/// The entity tag for a bundle version rendered as one representation.
 ///
 /// Doc 03 §3.6 makes the ETag the artifact checksum and requires it to be
 /// representation-specific. Both halves are load-bearing and neither is
-/// sufficient: the digest alone would let a cache serve a CSV entry to a JSON
-/// request, and the representation alone would not change when the data does.
+/// sufficient: the digest alone would let a cache serve the page to a request
+/// for JSON, and the representation alone would not change when the data does.
 ///
-/// This is a *strong* validator, and it may be, because a versioned URL plus a
+/// A *strong* validator, and it may be, because a versioned URL plus a
 /// representation determines the bytes exactly: the bundle is immutable, and
-/// every operation is a deterministic function of it (doc 03 §3.1).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ETag(String);
-
-impl ETag {
-    /// The tag for `digest`'s bundle rendered as `representation`.
-    pub fn of(digest: &ContentDigest, representation: Representation) -> Self {
-        Self(format!(
-            "\"{}.{}\"",
-            digest.as_str(),
-            representation.token()
-        ))
-    }
-
-    /// The header value, quotes included.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Whether an `If-None-Match` header selects this tag (RFC 9110 §13.1.2).
-    ///
-    /// The comparison is weak, as that section requires of `If-None-Match`: a
-    /// `W/` prefix on either side is ignored. Ours is never weak, so only the
-    /// client's is stripped.
-    pub fn is_selected_by(&self, if_none_match: &str) -> bool {
-        let if_none_match = if_none_match.trim();
-        if if_none_match == "*" {
-            return true;
-        }
-        if_none_match
-            .split(',')
-            .map(|candidate| candidate.trim())
-            .map(|candidate| candidate.strip_prefix("W/").unwrap_or(candidate))
-            .any(|candidate| candidate == self.0)
-    }
+/// every operation is a deterministic function of it (doc 03 §3.1). The
+/// comparison against `If-None-Match` is `headers`', which is RFC 9110
+/// §13.1.2's weak comparison — `*`, a comma list, and a `W/` prefix on the
+/// client's side all handled there rather than here.
+pub fn etag(digest: &ContentDigest, representation: Representation) -> ETag {
+    let tag = format!("\"{}.{}\"", digest.as_str(), representation.token());
+    tag.parse().unwrap_or_else(|error| {
+        // Unreachable by construction, and worth saying why rather than
+        // silently omitting the validator: `ContentDigest` is parsed to
+        // `{algorithm}:{lowercase hex}` and a token is a `&'static str` from
+        // this module, so every byte is `etagc` (RFC 9110 §8.8.3).
+        unreachable!("a digest and a format token are a valid entity tag: {error}")
+    })
 }
 
 /// A bundle version's canonical identity: `sha256:` and lowercase hex
@@ -558,31 +552,45 @@ mod tests {
 
     #[test]
     fn an_etag_changes_with_the_data_and_with_the_representation() {
-        let tag = ETag::of(&digest(), Representation::Json);
-        assert!(tag.as_str().starts_with('"') && tag.as_str().ends_with('"'));
-        assert!(tag.as_str().contains(digest().as_str()));
-        assert!(tag.as_str().contains(Representation::Json.token()));
+        let tag = etag(&digest(), Representation::Json);
+        let rendered = format!("{tag:?}");
+        assert!(rendered.contains(digest().as_str()));
+        assert!(rendered.contains(Representation::Json.token()));
 
         let other = ContentDigest::parse("sha256:0000000000000000abcdef0123456789").unwrap();
-        assert_ne!(tag, ETag::of(&other, Representation::Json));
+        assert_ne!(tag, etag(&other, Representation::Json));
 
         // The half §3.6 asks for by name. Without it a shared cache holding the
         // page could answer an agent's `Accept: application/json` from it, and
         // `Vary: Accept` alone would not stop that — the tags would be equal.
-        assert_ne!(tag, ETag::of(&digest(), Representation::Html));
+        assert_ne!(tag, etag(&digest(), Representation::Html));
     }
 
     #[test]
-    fn if_none_match_compares_weakly_and_across_a_list() {
-        let tag = ETag::of(&digest(), Representation::Json);
-        let value = tag.as_str().to_owned();
-
-        assert!(tag.is_selected_by("*"));
-        assert!(tag.is_selected_by(&value));
-        assert!(tag.is_selected_by(&format!("W/{value}")));
-        assert!(tag.is_selected_by(&format!("\"other\", {value}, W/\"third\"")));
-        assert!(!tag.is_selected_by("\"other\""));
-        assert!(!tag.is_selected_by(""));
+    fn every_digest_and_format_makes_a_sendable_entity_tag() {
+        // `etag` is infallible by construction and says so with `unreachable!`,
+        // which is only honest if the construction really does cover the space:
+        // a `ContentDigest` is `{algorithm}:{lowercase hex}` and a token is one
+        // of this module's own strings, so every byte is RFC 9110 §8.8.3's
+        // `etagc`. Checked here rather than trusted.
+        let mut map = axum::http::HeaderMap::new();
+        for text in [
+            "sha256:0123456789abcdef",
+            "sha512-256:0123456789abcdef0123456789abcdef",
+            "b3:00112233445566778899aabbccddeeff",
+        ] {
+            let digest = ContentDigest::parse(text).expect(text);
+            for representation in Representation::ALL {
+                let tag = etag(&digest, *representation);
+                headers::HeaderMapExt::typed_insert(&mut map, tag.clone());
+                assert_eq!(
+                    headers::HeaderMapExt::typed_get::<ETag>(&map).as_ref(),
+                    Some(&tag),
+                    "{text} as {}",
+                    representation.token()
+                );
+            }
+        }
     }
 
     #[test]
@@ -600,11 +608,17 @@ mod tests {
 
     #[test]
     fn the_cache_policies_are_the_ones_doc_03_names() {
-        assert_eq!(
-            CachePolicy::Immutable.header_value(),
-            "public, max-age=31536000, immutable"
-        );
-        assert_eq!(CachePolicy::Mutable.header_value(), "public, max-age=300");
-        assert_eq!(CachePolicy::Uncacheable.header_value(), "no-store");
+        // Asserted on the directives rather than on the rendered string: the
+        // header is `headers`' to format, and pinning its token order here
+        // would be testing that crate rather than this decision.
+        let immutable = CachePolicy::Immutable.header();
+        assert!(immutable.public() && immutable.immutable());
+        assert_eq!(immutable.max_age(), Some(Duration::from_secs(31_536_000)));
+
+        let mutable = CachePolicy::Mutable.header();
+        assert!(mutable.public() && !mutable.immutable());
+        assert_eq!(mutable.max_age(), Some(Duration::from_secs(300)));
+
+        assert!(CachePolicy::Uncacheable.header().no_store());
     }
 }

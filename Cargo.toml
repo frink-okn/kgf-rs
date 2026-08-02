@@ -34,6 +34,10 @@ base64 = "0.22"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "original-uri"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+# hyperium's typed headers: ETag, If-None-Match's RFC 9110 §13.1.2 comparison,
+# and Cache-Control. Already in axum's tree through axum-extra.
+headers = "0.4"
+axum-extra = { version = "0.10", default-features = false, features = ["typed-header"] }
 # Already in axum's tree; named directly because this crate uses them for the
 # two things doc 03 leaves to RFC 3986 and RFC 9110 — percent-encoding, and
 # parsing the media ranges in an `Accept` header.
@@ -41,7 +45,13 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 # §5.6.3 allows around a parameter's `;`, which silently drops a legal media
 # range from an `Accept` header.
 mediatype = "0.21"
+# Compile-time HTML. Escapes every interpolation and needs `PreEscaped` to opt
+# out, so no page can lose an escape by being written with `format!`.
+maud = "0.27"
 percent-encoding = "2"
+# RFC 3339 in, an orderable instant out. `std` only: nothing here needs a time
+# zone database, because the only thing kgf does with a date is sort by it.
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [profile.release]

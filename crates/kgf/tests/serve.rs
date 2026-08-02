@@ -41,7 +41,7 @@ fn the_url_space_answers_over_a_real_listener() {
     // told to read rather than assume (doc 03 §3.1).
     let root = server.get("/");
     root.assert_status(200);
-    root.assert_header("cache-control", "public, max-age=300");
+    root.assert_cache_control(&["public", "max-age=300"]);
     root.assert_varies_on_accept();
     let descriptor = root.json();
     assert_eq!(descriptor["datasets"], serde_json::json!(["atlas", "tox"]));
@@ -60,7 +60,7 @@ fn the_url_space_answers_over_a_real_listener() {
     let no_dataset = server.get("/nope");
     no_dataset.assert_status(404);
     no_dataset.assert_header("content-type", "application/problem+json");
-    no_dataset.assert_header("cache-control", "no-store");
+    no_dataset.assert_cache_control(&["no-store"]);
     assert_eq!(no_dataset.json()["code"], "not_found");
 
     let no_version = server.get("/tox/v/1999-01-01/manifest");
@@ -85,7 +85,7 @@ fn a_versioned_manifest_is_immutable_cacheable_and_conditional() {
 
     let manifest = server.get("/tox/v/2026-06-01/manifest");
     manifest.assert_status(200);
-    manifest.assert_header("cache-control", "public, max-age=31536000, immutable");
+    manifest.assert_cache_control(&["public", "max-age=31536000", "immutable"]);
     manifest.assert_varies_on_accept();
     manifest.assert_header("content-type", "application/json");
     let digest = manifest.json()["content_digest"]
@@ -143,7 +143,7 @@ fn latest_redirects_to_the_current_version_and_keeps_the_method() {
     // would silently turn a body-carrying QUERY into something else (§3.2).
     redirect.assert_status(307);
     redirect.assert_header("location", "/tox/v/2026-06-01/manifest");
-    redirect.assert_header("cache-control", "public, max-age=300");
+    redirect.assert_cache_control(&["public", "max-age=300"]);
 
     // The query string survives, so a paging URL rebuilt against `latest`
     // arrives at the version with its parameters intact.
@@ -224,8 +224,11 @@ fn one_url_serves_a_page_to_a_browser_and_data_to_everything_else() {
         page.assert_header("content-type", "text/html; charset=utf-8");
         page.assert_varies_on_accept();
         let text = page.text();
+        // Case-insensitive: `<!DOCTYPE html>` and `<!doctype html>` are the
+        // same declaration, and which one the template engine emits is not a
+        // property of this server.
         assert!(
-            text.starts_with("<!doctype html>"),
+            text.to_ascii_lowercase().starts_with("<!doctype html>"),
             "{path} must answer HTML"
         );
         assert!(text.contains("Knowledge Graph Fragments"), "{path}");
@@ -516,6 +519,18 @@ impl Response {
             "unexpected status; body was {:?}",
             String::from_utf8_lossy(&self.body)
         );
+    }
+
+    /// `Cache-Control` is a set of directives, and their order is the header
+    /// library's business rather than this server's.
+    #[track_caller]
+    fn assert_cache_control(&self, expected: &[&str]) {
+        let value = self.header("cache-control").unwrap_or_default();
+        let mut directives: Vec<_> = value.split(',').map(str::trim).collect();
+        let mut expected = expected.to_vec();
+        directives.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(directives, expected, "Cache-Control was {value:?}");
     }
 
     /// `Vary` is a list, and the CORS layer legitimately adds its own tokens to

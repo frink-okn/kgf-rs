@@ -626,23 +626,28 @@ impl crate::html::Resource for Problem {
     /// `detail` already names the offending value and the remedy, so the page
     /// is mostly a frame around it.
     fn to_html(&self) -> String {
-        use crate::html::{Page, Value};
+        use crate::html::{Crumb, Value, fields, note, page};
 
-        let mut page = Page::new(self.code.title()).crumb("kgf", Some("/".to_owned()));
-        page.paragraph(&self.detail);
-        page.fields(&[
-            ("code", Value::Code(self.code.as_str())),
-            ("status", Value::Number(u64::from(self.code.status()))),
-            (
-                "instance",
-                self.instance.as_deref().map_or(Value::Absent, Value::Code),
-            ),
-        ]);
-        page.note(
-            "This is an RFC 9457 problem document. The machine-readable form, which carries the \
-             same code, is what a client should branch on.",
-        );
-        page.render()
+        page(
+            self.code.title(),
+            &[Crumb::to("kgf", "/".to_owned())],
+            None,
+            maud::html! {
+                p { (self.detail) }
+                (fields(&[
+                    ("code", Value::Code(self.code.as_str())),
+                    ("status", Value::Number(u64::from(self.code.status()))),
+                    (
+                        "instance",
+                        self.instance.as_deref().map_or(Value::Absent, Value::Code),
+                    ),
+                ]))
+                (note(
+                    "This is an RFC 9457 problem document. The machine-readable form, which \
+                     carries the same code, is what a client should branch on."
+                ))
+            },
+        )
     }
 }
 

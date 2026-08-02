@@ -35,14 +35,13 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Path, Request, State};
-use axum::http::header::{
-    ACCEPT, CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, VARY,
-};
+use axum::http::header::{ACCEPT, CONTENT_TYPE, LOCATION, VARY};
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, any, get};
 use axum::{Router, middleware};
+use headers::{ETag, HeaderMapExt, IfNoneMatch};
 use kgf_store::catalog::BundleId;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -50,7 +49,7 @@ use tower_http::trace::TraceLayer;
 use crate::descriptor::{BundleManifest, DatasetDescriptor, ServiceDescriptor};
 use crate::envelope::{ErrorCode, PROBLEM_MEDIA_TYPE, Problem};
 use crate::html::Resource;
-use crate::representation::{CachePolicy, ETag, Representation, negotiate};
+use crate::representation::{CachePolicy, Representation, etag, negotiate};
 use crate::service::Service;
 use crate::url::{self, Params};
 
@@ -168,7 +167,7 @@ async fn bundle_manifest(
         release.manifest().bytes(),
         release.manifest().parsed(),
     );
-    let etag = release.digest().clone();
+    let digest = release.digest().clone();
 
     // The manifest itself is already in memory, but a bundle that cannot be
     // opened must not be described as though it can: a client reads
@@ -184,7 +183,7 @@ async fn bundle_manifest(
         &resource,
         &wants,
         CachePolicy::Immutable,
-        Some(ETag::of(&etag, wants.representation()?)),
+        Some(etag(&digest, wants.representation()?)),
     )
 }
 
@@ -224,10 +223,7 @@ async fn latest_redirect(
         .expect("a redirect is a valid response");
     let headers = response.headers_mut();
     headers.insert(LOCATION, header(&location)?);
-    headers.insert(
-        CACHE_CONTROL,
-        HeaderValue::from_static(CachePolicy::Mutable.header_value()),
-    );
+    headers.typed_insert(CachePolicy::Mutable.header());
     Ok(response)
 }
 
@@ -250,7 +246,7 @@ fn unreachable_route(path: &str) -> Problem {
 pub struct Wants {
     format: Option<String>,
     accept: Option<String>,
-    if_none_match: Option<String>,
+    if_none_match: Option<IfNoneMatch>,
 }
 
 impl Wants {
@@ -272,17 +268,18 @@ impl<S: Send + Sync> FromRequestParts<S> for Wants {
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
         let params = Params::parse(parts.uri.query())?;
-        let text = |name| {
-            parts
-                .headers
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned)
-        };
+        let accept = parts
+            .headers
+            .get(ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         Ok(Self {
             format: params.get("format").map(str::to_owned),
-            accept: text(ACCEPT),
-            if_none_match: text(IF_NONE_MATCH),
+            accept,
+            // A malformed `If-None-Match` is treated as absent, which RFC 9110
+            // §13.1 requires of a precondition a server cannot evaluate: the
+            // response is the full one, never a wrong 304.
+            if_none_match: parts.headers.typed_get(),
         })
     }
 }
@@ -301,9 +298,11 @@ fn respond(
     let representation = wants.representation()?;
 
     // Before the body is built, not after: the point of a conditional request
-    // is that the server does not spend the work.
+    // is that the server does not spend the work. `precondition_passes` is
+    // RFC 9110 §13.1.2's weak comparison, so `*`, a comma list and a `W/`
+    // prefix are handled by `headers` rather than here.
     if let (Some(etag), Some(if_none_match)) = (&etag, &wants.if_none_match)
-        && etag.is_selected_by(if_none_match)
+        && !if_none_match.precondition_passes(etag)
     {
         return finish(
             StatusCode::NOT_MODIFIED,
@@ -345,15 +344,12 @@ fn finish(
             HeaderValue::from_static(representation.content_type()),
         );
     }
-    headers.insert(
-        CACHE_CONTROL,
-        HeaderValue::from_static(cache.header_value()),
-    );
+    headers.typed_insert(cache.header());
     // §3.6: one URL serves many formats, so a cache that ignored `Accept` would
     // hand a page to an agent. Always, including on responses with no `ETag`.
     headers.insert(VARY, HeaderValue::from_static("Accept"));
     if let Some(etag) = etag {
-        headers.insert(ETAG, header(etag.as_str())?);
+        headers.typed_insert(etag);
     }
     Ok(response)
 }
@@ -417,10 +413,7 @@ async fn render_problems(request: Request, next: Next) -> Response {
     *response.body_mut() = Body::from(body);
     let headers = response.headers_mut();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-    headers.insert(
-        CACHE_CONTROL,
-        HeaderValue::from_static(CachePolicy::Uncacheable.header_value()),
-    );
+    headers.typed_insert(CachePolicy::Uncacheable.header());
     headers.insert(VARY, HeaderValue::from_static("Accept"));
     response
 }

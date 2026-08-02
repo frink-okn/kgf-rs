@@ -25,10 +25,11 @@
 use kgf_store::manifest::{Manifest, Publisher};
 use serde::Serialize;
 
-use crate::html::{Page, Resource, SITE, Value, json_body};
+use crate::html::{Crumb, Resource, SITE, Value, fields, json_body, note, page, table};
 use crate::representation::ContentDigest;
 use crate::service::{Dataset, Service};
 use crate::url;
+use maud::html;
 
 /// The KGF protocol version this server speaks (doc 04 §4.3).
 pub const PROTOCOL_VERSION: &str = "1";
@@ -80,82 +81,76 @@ impl Resource for ServiceDescriptor<'_> {
     }
 
     fn to_html(&self) -> String {
-        let mut page = Page::new(SITE).crumb("kgf", None);
-        page.paragraph(
-            "A bounded-cost query interface over published RDF bundles. Every URL below \
-             answers JSON to anything that does not ask for HTML.",
-        );
+        page(
+            SITE,
+            &[Crumb::here("kgf")],
+            Some("/"),
+            html! {
+                p {
+                    "A bounded-cost query interface over published RDF bundles. Every URL below \
+                     answers JSON to anything that does not ask for HTML."
+                }
 
-        page.section("Datasets");
-        if self.datasets.is_empty() {
-            page.note("This server hosts no datasets.");
-        } else {
-            let rows: Vec<_> = self
-                .datasets
-                .iter()
-                .map(|name| vec![Value::self_link(url::dataset(name), name)])
-                .collect();
-            page.table(&["Dataset"], &rows);
-        }
+                h2 { "Datasets" }
+                @if self.datasets.is_empty() {
+                    (note("This server hosts no datasets."))
+                } @else {
+                    (table(
+                        &["Dataset"],
+                        &self
+                            .datasets
+                            .iter()
+                            .map(|name| vec![Value::self_link(url::dataset(name), name)])
+                            .collect::<Vec<_>>(),
+                    ))
+                }
 
-        page.section("Caps");
-        page.note(
-            "The largest values a request may ask for. A request above a cap is refused with \
-             code cap_exceeded rather than silently reduced (doc 03 §3.5).",
-        );
-        page.fields(&[
-            ("max_limit", Value::Number(u64::from(self.caps.max_limit))),
-            (
-                "max_bindings",
-                Value::Number(u64::from(self.caps.max_bindings)),
-            ),
-            (
-                "max_star_subjects",
-                Value::Number(u64::from(self.caps.max_star_subjects)),
-            ),
-            (
-                "max_star_width",
-                Value::Number(u64::from(self.caps.max_star_width)),
-            ),
-        ]);
+                h2 { "Caps" }
+                (note(
+                    "The largest values a request may ask for. A request above a cap is refused \
+                     with code cap_exceeded rather than silently reduced (doc 03 §3.5)."
+                ))
+                (fields(&[
+                    ("max_limit", Value::Number(u64::from(self.caps.max_limit))),
+                    ("max_bindings", Value::Number(u64::from(self.caps.max_bindings))),
+                    (
+                        "max_star_subjects",
+                        Value::Number(u64::from(self.caps.max_star_subjects)),
+                    ),
+                    (
+                        "max_star_width",
+                        Value::Number(u64::from(self.caps.max_star_width)),
+                    ),
+                ]))
 
-        page.section("Budgets");
-        page.note(
-            "Limits on the work a single response may cost. Exhausting one is never an error: \
-             the response says complete: false and carries a cursor.",
-        );
-        page.fields(&[
-            (
-                "max_output_rows",
-                Value::Number(self.budgets.max_output_rows),
-            ),
-            (
-                "max_output_terms",
-                Value::Number(self.budgets.max_output_terms),
-            ),
-            (
-                "max_response_bytes",
-                Value::Number(self.budgets.max_response_bytes),
-            ),
-            (
-                "max_request_bytes",
-                Value::Number(self.budgets.max_request_bytes),
-            ),
-            ("max_term_bytes", Value::Number(self.budgets.max_term_bytes)),
-            (
-                "candidate_budget",
-                Value::Number(self.budgets.candidate_budget),
-            ),
-            ("time_budget_ms", Value::Number(self.budgets.time_budget_ms)),
-        ]);
+                h2 { "Budgets" }
+                (note(
+                    "Limits on the work a single response may cost. Exhausting one is never an \
+                     error: the response says complete: false and carries a cursor."
+                ))
+                (fields(&[
+                    ("max_output_rows", Value::Number(self.budgets.max_output_rows)),
+                    ("max_output_terms", Value::Number(self.budgets.max_output_terms)),
+                    (
+                        "max_response_bytes",
+                        Value::Number(self.budgets.max_response_bytes),
+                    ),
+                    (
+                        "max_request_bytes",
+                        Value::Number(self.budgets.max_request_bytes),
+                    ),
+                    ("max_term_bytes", Value::Number(self.budgets.max_term_bytes)),
+                    ("candidate_budget", Value::Number(self.budgets.candidate_budget)),
+                    ("time_budget_ms", Value::Number(self.budgets.time_budget_ms)),
+                ]))
 
-        page.section("Implementation");
-        page.fields(&[
-            ("kgf", Value::Code(self.implementation.kgf)),
-            ("protocol", Value::Code(self.implementation.protocol)),
-        ]);
-
-        page.canonical("/".to_owned()).render()
+                h2 { "Implementation" }
+                (fields(&[
+                    ("kgf", Value::Code(self.implementation.kgf)),
+                    ("protocol", Value::Code(self.implementation.protocol)),
+                ]))
+            },
+        )
     }
 }
 
@@ -221,39 +216,7 @@ impl Resource for DatasetDescriptor<'_> {
     }
 
     fn to_html(&self) -> String {
-        let mut page = Page::new(self.title.unwrap_or(self.id))
-            .crumb("kgf", Some("/".to_owned()))
-            .crumb(self.id, None);
-
-        if let Some(description) = self.description {
-            page.paragraph(description);
-        }
-        page.fields(&[
-            ("id", Value::Code(self.id)),
-            (
-                "dataset_iri",
-                self.dataset_iri.map_or(Value::Absent, Value::Code),
-            ),
-            (
-                "publisher",
-                self.publisher
-                    .map_or(Value::Absent, |publisher| Value::Text(&publisher.name)),
-            ),
-            (
-                "current",
-                Value::self_link(
-                    url::operation(self.id, self.current, "manifest"),
-                    self.current,
-                ),
-            ),
-        ]);
-
-        page.section("Releases");
-        page.note(
-            "A version URL is immutable: the bytes it serves cannot change while it exists, \
-             which is why they are cached for a year.",
-        );
-        let rows: Vec<_> = self
+        let releases: Vec<_> = self
             .releases
             .iter()
             .map(|release| {
@@ -271,9 +234,40 @@ impl Resource for DatasetDescriptor<'_> {
                 ]
             })
             .collect();
-        page.table(&["Version", "", "Content digest"], &rows);
 
-        page.canonical(url::dataset(self.id)).render()
+        page(
+            self.title.unwrap_or(self.id),
+            &[Crumb::to("kgf", "/".to_owned()), Crumb::here(self.id)],
+            Some(&url::dataset(self.id)),
+            html! {
+                @if let Some(description) = self.description {
+                    p { (description) }
+                }
+                (fields(&[
+                    ("id", Value::Code(self.id)),
+                    ("dataset_iri", self.dataset_iri.map_or(Value::Absent, Value::Code)),
+                    (
+                        "publisher",
+                        self.publisher
+                            .map_or(Value::Absent, |publisher| Value::Text(&publisher.name)),
+                    ),
+                    (
+                        "current",
+                        Value::self_link(
+                            url::operation(self.id, self.current, "manifest"),
+                            self.current,
+                        ),
+                    ),
+                ]))
+
+                h2 { "Releases" }
+                (note(
+                    "A version URL is immutable: the bytes it serves cannot change while it \
+                     exists, which is why they are cached for a year."
+                ))
+                (table(&["Version", "", "Content digest"], &releases))
+            },
+        )
     }
 }
 
@@ -324,113 +318,22 @@ impl Resource for BundleManifest {
 
     fn to_html(&self) -> String {
         let manifest = &self.parsed;
-        let mut page = Page::new(format!("{} — {}", self.dataset, self.version))
-            .crumb("kgf", Some("/".to_owned()))
-            .crumb(&self.dataset, Some(url::dataset(&self.dataset)))
-            .crumb(&self.version, None);
-
-        if let Some(description) = &manifest.description {
-            page.paragraph(description);
-        }
-
-        page.section("Identity");
-        page.fields(&[
-            ("id", Value::Code(&manifest.id)),
-            ("version", Value::Code(&manifest.version)),
-            ("content_digest", Value::Code(&manifest.content_digest)),
-            (
-                "dataset_iri",
-                manifest
-                    .dataset_iri
-                    .as_deref()
-                    .map_or(Value::Absent, Value::Code),
-            ),
-            (
-                "created",
-                manifest
-                    .created
-                    .as_deref()
-                    .map_or(Value::Absent, Value::Code),
-            ),
-            (
-                "license",
-                manifest
-                    .license
-                    .as_deref()
-                    .map_or(Value::Absent, Value::Text),
-            ),
-            (
-                "publisher",
-                manifest
-                    .publisher
-                    .as_ref()
-                    .map_or(Value::Absent, |publisher| Value::Text(&publisher.name)),
-            ),
-            (
-                "previous_version",
-                manifest
-                    .previous_version
-                    .as_deref()
-                    .map_or(Value::Absent, |previous| {
-                        Value::self_link(
-                            url::operation(&self.dataset, previous, "manifest"),
-                            previous,
-                        )
-                    }),
-            ),
-        ]);
-
-        page.section("Counts");
-        page.note(
-            "Subjects and objects are id-space sizes: each counts the shared section once, so \
-             they overlap and do not sum to a distinct-term total.",
-        );
-        page.fields(&[
-            ("triples", Value::Number(manifest.counts.triples)),
-            ("subjects", Value::Number(manifest.counts.subjects)),
-            ("predicates", Value::Number(manifest.counts.predicates)),
-            ("objects", Value::Number(manifest.counts.objects)),
-        ]);
-
-        page.section("Capabilities");
-        page.note(
-            "What this bundle can answer beyond the mandatory core, determined by which sidecar \
-             artifacts were built (doc 03 §3.4).",
-        );
-        if manifest.capabilities.is_empty() {
-            page.note("None declared.");
-        } else {
-            let rows: Vec<_> = manifest
-                .capabilities
-                .keys()
-                .map(|capability| vec![Value::Code(capability)])
-                .collect();
-            page.table(&["Capability"], &rows);
-        }
-
-        page.section("Prefixes");
-        page.note(
-            "The CURIE prefixes this bundle's parameters accept. An IRI is written in angle \
-             brackets; a bare token is a CURIE, and its prefix must be one of these (doc 03 §3.3).",
-        );
-        if manifest.prefixes.is_empty() {
-            page.note("None declared.");
-        } else {
-            let rows: Vec<_> = manifest
-                .prefixes
-                .iter()
-                .map(|(prefix, expansion)| {
-                    vec![
-                        Value::Code(prefix.as_str()),
-                        Value::Code(expansion.as_str()),
-                    ]
-                })
-                .collect();
-            page.table(&["Prefix", "Expands to"], &rows);
-        }
-
-        page.section("Artifacts");
-        let rows: Vec<_> = manifest
+        let capabilities: Vec<_> = manifest
+            .capabilities
+            .keys()
+            .map(|capability| vec![Value::Code(capability.as_str())])
+            .collect();
+        let prefixes: Vec<_> = manifest
+            .prefixes
+            .iter()
+            .map(|(prefix, expansion)| {
+                vec![
+                    Value::Code(prefix.as_str()),
+                    Value::Code(expansion.as_str()),
+                ]
+            })
+            .collect();
+        let artifacts: Vec<_> = manifest
             .artifacts
             .iter()
             .map(|(name, entry)| {
@@ -441,10 +344,94 @@ impl Resource for BundleManifest {
                 ]
             })
             .collect();
-        page.table(&["Artifact", "Bytes", "SHA-256"], &rows);
 
-        page.canonical(url::operation(&self.dataset, &self.version, "manifest"))
-            .render()
+        page(
+            &format!("{} — {}", self.dataset, self.version),
+            &[
+                Crumb::to("kgf", "/".to_owned()),
+                Crumb::to(&self.dataset, url::dataset(&self.dataset)),
+                Crumb::here(&self.version),
+            ],
+            Some(&url::operation(&self.dataset, &self.version, "manifest")),
+            html! {
+                @if let Some(description) = &manifest.description {
+                    p { (description) }
+                }
+
+                h2 { "Identity" }
+                (fields(&[
+                    ("id", Value::Code(&manifest.id)),
+                    ("version", Value::Code(&manifest.version)),
+                    ("content_digest", Value::Code(&manifest.content_digest)),
+                    (
+                        "dataset_iri",
+                        manifest.dataset_iri.as_deref().map_or(Value::Absent, Value::Code),
+                    ),
+                    (
+                        "created",
+                        manifest.created.as_deref().map_or(Value::Absent, Value::Code),
+                    ),
+                    (
+                        "license",
+                        manifest.license.as_deref().map_or(Value::Absent, Value::Text),
+                    ),
+                    (
+                        "publisher",
+                        manifest
+                            .publisher
+                            .as_ref()
+                            .map_or(Value::Absent, |publisher| Value::Text(&publisher.name)),
+                    ),
+                    (
+                        "previous_version",
+                        manifest.previous_version.as_deref().map_or(Value::Absent, |previous| {
+                            Value::self_link(
+                                url::operation(&self.dataset, previous, "manifest"),
+                                previous,
+                            )
+                        }),
+                    ),
+                ]))
+
+                h2 { "Counts" }
+                (note(
+                    "Subjects and objects are id-space sizes: each counts the shared section \
+                     once, so they overlap and do not sum to a distinct-term total."
+                ))
+                (fields(&[
+                    ("triples", Value::Number(manifest.counts.triples)),
+                    ("subjects", Value::Number(manifest.counts.subjects)),
+                    ("predicates", Value::Number(manifest.counts.predicates)),
+                    ("objects", Value::Number(manifest.counts.objects)),
+                ]))
+
+                h2 { "Capabilities" }
+                (note(
+                    "What this bundle can answer beyond the mandatory core, determined by which \
+                     sidecar artifacts were built (doc 03 §3.4)."
+                ))
+                @if capabilities.is_empty() {
+                    (note("None declared."))
+                } @else {
+                    (table(&["Capability"], &capabilities))
+                }
+
+                h2 { "Prefixes" }
+                (note(
+                    "The CURIE prefixes this bundle's parameters accept. An IRI is written in \
+                     angle brackets; a bare token is a CURIE, and its prefix must be one of \
+                     these (doc 03 §3.3)."
+                ))
+                @if prefixes.is_empty() {
+                    (note("None declared."))
+                } @else {
+                    (table(&["Prefix", "Expands to"], &prefixes))
+                }
+
+                h2 { "Artifacts" }
+                (table(&["Artifact", "Bytes", "SHA-256"], &artifacts))
+            },
+        )
     }
 }
 

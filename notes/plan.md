@@ -624,8 +624,12 @@ default rather than the exception, which is the right way round for doc 01's arg
 Three consequences worth recording. Negotiation had to be *implemented*: nothing in
 this stack parses `Accept` — not axum, not `tower-http`, and the `headers` crate stops
 short of a type for it — so §12.5.1's rule that the most specific range decides
-*before* its `q` applies is written out and tested, since reading it the other way
-makes `*/*;q=0.1, application/json;q=0` serve JSON. `ETag` being
+*before* its `q` applies is written out and checked against `headers-accept`, an
+independent reading of the same section, as a dev-dependency oracle. That comparison
+found `mime` silently dropping any media range written with the optional whitespace
+§5.6.3 allows around `;`, which made `Accept: text/html ; q=0.5, application/json;q=0.4`
+serve JSON; `mediatype` handles it. Five differences from the oracle remain and each is
+asserted, so none can change by accident. `ETag` being
 representation-specific stopped being a formality: without the `.json`/`.html` suffix a
 shared cache would answer an agent from the page, and `Vary: Accept` alone would not
 stop it, because the tags would be equal. And errors negotiate too, through a
@@ -634,13 +638,15 @@ renders it — so a handler's error, an extractor's rejection, the router's 404 
 method fallback's 405 are one rendering, and none of them is the one that forgets
 `Vary` or answers a browser with raw JSON.
 
-`html::Page` is a builder rather than a template, and escaping is structural: every
-method that takes caller data escapes it, and the only markup in the output is
-`&'static str` this crate wrote. The data on these pages is a published bundle's own
-manifest and dictionary, so a dataset whose title contains a `<script>` tag is an
-ordinary case. The test that asserts it caught a real bug on the first run — an `&`
-written raw into an `href` while the URL around it was escaped, which is exactly the
-slip a template invites.
+Pages are `maud`, whose `html!` escapes every interpolation and needs `PreEscaped` to
+opt out, so nothing in the crate concatenates markup. The data on these pages is a
+published bundle's own manifest and dictionary, so a dataset whose title contains a
+`<script>` tag is an ordinary case. This started as a hand-written builder and its
+escaping test caught a real bug on the first run — an `&` written raw into an `href`
+while the URL around it was escaped, exactly the slip the macro makes unavailable. The
+builder is gone; the test survived the port unchanged, minus one assertion that turned
+out to be testing the builder's belt-and-braces `'` escaping rather than the property
+(`maud` always double-quotes attributes, so an apostrophe cannot end one).
 
 **`current` is derived, because there is nothing to read it from.** Doc 04 §4.3 puts it
 in the dataset descriptor, calls that document mutable and host-independent, and
@@ -680,6 +686,17 @@ required `kgf` to grow a lib target beside its bin — which also lets the end-t
 test drive a real listener without a subprocess — and it is a change to CLAUDE.md's
 rule, recorded there rather than made quietly.
 
+**What is *not* written here.** An audit for reinvention, prompted mid-unit, moved
+three things onto libraries that were already in axum's tree or close to it:
+`percent-encoding` and `mediatype` for RFC 3986 and RFC 9110's grammars, `headers` —
+hyperium's — for `ETag`, `If-None-Match`'s §13.1.2 weak comparison and `Cache-Control`,
+`jiff` for RFC 3339, and `maud` for the pages. That deleted a hand-transcribed calendar
+algorithm, a hand-rolled entity-tag comparison and an HTML escaper. What stayed ours is
+what no library in this stack has (`Accept` selection) or what they get deliberately
+wrong for this use (below). `kgf-store`'s rank/select and packed arrays look like the
+same question and are not: `sucds` and `vers` build their own structures in memory,
+while doc 20 §20.1 needs hdtc's *persisted* directories read in place.
+
 Two smaller things the layers took on because unit 14 needs them and they are policy
 rather than plumbing. A repeated query parameter is `malformed_request`, since
 `?limit=10&limit=99999` has no defensible resolution and server, proxy and client URL
@@ -695,7 +712,7 @@ useful thing to browse to, and doc 03 §3.2 does not define it, so inventing URL
 is not this unit's call — the dataset page links straight to `/manifest`, which is
 specified and does the job.
 
-There are 159 tests after this unit.
+There are 161 tests after this unit.
 
 ### 14. The four query operations
 

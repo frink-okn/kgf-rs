@@ -252,7 +252,7 @@ impl Datasets {
             })?;
             let created = match manifest.created.as_deref() {
                 None => None,
-                Some(text) => Some(Instant::parse_rfc3339(text).ok_or_else(|| {
+                Some(text) => Some(parse_rfc3339(text).ok_or_else(|| {
                     refuse(format!("created {text:?} is not an RFC 3339 timestamp"))
                 })?),
             };
@@ -409,123 +409,25 @@ impl Release {
 // Instants
 // ---------------------------------------------------------------------------
 
-/// A point in time, for putting releases in order.
+/// Parse RFC 3339's `date-time` into an instant that orders correctly.
 ///
-/// Held as seconds from the Unix epoch rather than as the text, because two
-/// RFC 3339 spellings of one instant must compare equal and two instants must
-/// compare in the right order — neither of which the strings do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Instant {
-    seconds: i64,
-    nanoseconds: u32,
-}
-
-impl Instant {
-    /// Parse RFC 3339's `date-time`, in any offset it allows.
-    ///
-    /// Strict: every field is fixed-width and range-checked, and there is no
-    /// tolerance for a missing offset. A `created` that does not parse is a
-    /// broken manifest, and a broken manifest is refused at startup rather than
-    /// silently sorted to the bottom.
-    fn parse_rfc3339(text: &str) -> Option<Self> {
-        let bytes = text.as_bytes();
-        if bytes.len() < 20 {
-            return None;
-        }
-        let number = |range: std::ops::Range<usize>| {
-            bytes[range.clone()]
-                .iter()
-                .all(u8::is_ascii_digit)
-                .then(|| text[range].parse::<i64>().ok())
-                .flatten()
-        };
-        if bytes[4] != b'-' || bytes[7] != b'-' || !bytes[10].eq_ignore_ascii_case(&b'T') {
-            return None;
-        }
-        if bytes[13] != b':' || bytes[16] != b':' {
-            return None;
-        }
-        let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
-        let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
-        if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
-            return None;
-        }
-        // Second 60 is RFC 3339's leap second. Accepted and carried as :60,
-        // which orders correctly against its neighbours; nothing here needs it
-        // to be the same instant as the next day's :00.
-        if hour > 23 || minute > 59 || second > 60 {
-            return None;
-        }
-
-        let mut rest = &text[19..];
-        let mut nanoseconds = 0;
-        if let Some(fraction) = rest.strip_prefix('.') {
-            let digits = fraction
-                .find(|character: char| !character.is_ascii_digit())
-                .unwrap_or(fraction.len());
-            if digits == 0 || digits > 9 {
-                return None;
-            }
-            nanoseconds = format!("{:0<9}", &fraction[..digits]).parse().ok()?;
-            rest = &fraction[digits..];
-        }
-
-        let offset_minutes = match rest.as_bytes() {
-            [b'Z' | b'z'] => 0,
-            [sign @ (b'+' | b'-'), ..] if rest.len() == 6 && rest.as_bytes()[3] == b':' => {
-                let hours = number_in(&rest[1..3])?;
-                let minutes = number_in(&rest[4..6])?;
-                if hours > 23 || minutes > 59 {
-                    return None;
-                }
-                let magnitude = hours * 60 + minutes;
-                if *sign == b'-' { -magnitude } else { magnitude }
-            }
-            _ => return None,
-        };
-
-        let days = days_from_civil(year, month, day);
-        Some(Self {
-            seconds: days * 86_400 + hour * 3600 + minute * 60 + second - offset_minutes * 60,
-            nanoseconds,
-        })
-    }
-}
-
-fn number_in(text: &str) -> Option<i64> {
-    text.bytes()
-        .all(|byte| byte.is_ascii_digit())
-        .then(|| text.parse().ok())
-        .flatten()
-}
-
-fn is_leap_year(year: i64) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
-}
-
-fn days_in_month(year: i64, month: i64) -> i64 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(year) => 29,
-        _ => 28,
-    }
-}
-
-/// Days from 1970-01-01 to `year-month-day`, proleptic Gregorian.
+/// `jiff` rather than the strings, because two spellings of one instant must
+/// compare equal and two instants must compare in the right order, and the text
+/// does neither: `2026-06-01T09:00:00-05:00` sorts before `2026-06-01T13:00:00Z`
+/// although it is an hour later, and `…:00.5Z` sorts before `…:00Z` although it
+/// is half a second later.
 ///
-/// Howard Hinnant's `days_from_civil` (*chrono-Compatible Low-Level Date
-/// Algorithms*), which is exact for every date in range and needs no table. The
-/// alternative — pulling in a date library — would be the larger dependency by
-/// far for the one thing this server does with a date: sort by it.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+/// It is a little more permissive than RFC 3339 — a space in place of `T`
+/// (which §5.6's note allows anyway), a bare `+01` offset, an offset hour past
+/// 23 — and that costs nothing here. Leniency at the edges of a timestamp
+/// affects which release is `current` only if a manifest is already malformed,
+/// and the alternative was ~90 lines of date parsing and a transcribed calendar
+/// algorithm to be marginally stricter about it.
+fn parse_rfc3339(text: &str) -> Option<Instant> {
+    text.parse().ok()
 }
+
+use jiff::Timestamp as Instant;
 
 #[cfg(test)]
 mod tests {
@@ -735,20 +637,23 @@ mod tests {
 
     #[test]
     fn rfc_3339_parses_the_forms_a_manifest_may_carry() {
-        let at = |text: &str| Instant::parse_rfc3339(text).unwrap_or_else(|| panic!("{text}"));
+        let at = |text: &str| parse_rfc3339(text).unwrap_or_else(|| panic!("{text}"));
 
-        assert_eq!(at("1970-01-01T00:00:00Z").seconds, 0);
-        assert_eq!(at("2026-06-01T14:03:22Z").seconds, 1_780_322_602);
+        assert_eq!(at("1970-01-01T00:00:00Z").as_second(), 0);
+        assert_eq!(at("2026-06-01T14:03:22Z").as_second(), 1_780_322_602);
         // The same instant three ways.
         assert_eq!(at("2026-06-01T14:03:22Z"), at("2026-06-01T15:03:22+01:00"));
         assert_eq!(at("2026-06-01T14:03:22Z"), at("2026-06-01T09:03:22-05:00"));
         assert_eq!(at("2026-06-01t14:03:22z"), at("2026-06-01T14:03:22Z"));
         // Fractional seconds order within a second.
         assert!(at("2026-06-01T14:03:22.5Z") > at("2026-06-01T14:03:22Z"));
-        assert_eq!(at("2026-06-01T14:03:22.5Z").nanoseconds, 500_000_000);
+        assert_eq!(
+            at("2026-06-01T14:03:22.5Z").subsec_nanosecond(),
+            500_000_000
+        );
         // Dates before the epoch, and a leap day.
-        assert!(at("1969-12-31T23:59:59Z").seconds < 0);
-        assert!(Instant::parse_rfc3339("2024-02-29T00:00:00Z").is_some());
+        assert!(at("1969-12-31T23:59:59Z").as_second() < 0);
+        assert!(parse_rfc3339("2024-02-29T00:00:00Z").is_some());
     }
 
     #[test]
@@ -757,49 +662,33 @@ mod tests {
             "",
             "2026-06-01",
             "2026-06-01T14:03:22",       // no offset: the instant is unknown
-            "2026-06-01 14:03:22Z",      // RFC 3339's space form is not date-time
             "2026-13-01T00:00:00Z",      // month
             "2026-02-30T00:00:00Z",      // day, in a month that is short
             "2023-02-29T00:00:00Z",      // day, in a year that is not leap
             "2026-06-01T24:00:00Z",      // hour
             "2026-06-01T14:61:22Z",      // minute
             "2026-06-01T14:03:61Z",      // second, one past the leap second
-            "2026-06-01T14:03:22+25:00", // offset hour
             "2026-06-01T14:03:22+0x:00", // offset digits
-            "2026-06-01T14:03:22+01",    // offset shape
             "2026-06-01T14:03:22.Z",     // an empty fraction
             "20x6-06-01T14:03:22Z",
+            "June 2026",
         ] {
-            assert!(
-                Instant::parse_rfc3339(text).is_none(),
-                "{text:?} must not parse"
-            );
+            assert!(parse_rfc3339(text).is_none(), "{text:?} must not parse");
         }
     }
 
     #[test]
-    fn days_from_civil_agrees_with_a_naive_count() {
-        // The one piece of arithmetic here that is a formula rather than a
-        // rule, checked against counting days one at a time across the
-        // century-leap cases the formula exists to get right.
-        let mut days = days_from_civil(1898, 1, 1);
-        let (mut year, mut month, mut day) = (1898_i64, 1_i64, 1_i64);
-        while (year, month, day) < (2106, 1, 1) {
-            assert_eq!(
-                days_from_civil(year, month, day),
-                days,
-                "{year}-{month}-{day}"
-            );
-            days += 1;
-            day += 1;
-            if day > days_in_month(year, month) {
-                day = 1;
-                month += 1;
-            }
-            if month > 12 {
-                month = 1;
-                year += 1;
-            }
+    fn three_things_looser_than_rfc_3339_are_accepted_anyway() {
+        // Pinned so the leniency is a known property rather than a discovery.
+        // None of it can change which release is current unless a manifest is
+        // already malformed, and being stricter would mean parsing timestamps
+        // by hand — which is what this stopped doing.
+        for text in [
+            "2026-06-01 14:03:22Z",      // a space where §5.6's note allows one
+            "2026-06-01T14:03:22+01",    // an offset without its minutes
+            "2026-06-01T14:03:22+25:00", // an offset hour past 23
+        ] {
+            assert!(parse_rfc3339(text).is_some(), "{text:?}");
         }
     }
 }

@@ -6,24 +6,32 @@
 //! alone (see [`crate::representation`]) — a page when a browser navigates to
 //! it, JSON when anything else fetches it, at one URL.
 //!
-//! # Escaping is structural
+//! # Escaping is the templating engine's job
 //!
-//! [`Page`] is a builder, not a template. Nothing writes markup by
-//! interpolation: every method that takes caller data escapes it, and the only
-//! markup in the output comes from `&'static str` tag names this module wrote.
-//! That matters more than it might look — the data on these pages is a bundle's
-//! own dictionary and manifest, so "someone published a dataset whose title
-//! contains a `<script>` tag" is an ordinary case rather than an attack, and a
-//! `format!` with an unescaped `{}` in it is the one bug this design makes
-//! unavailable.
+//! Markup is written with `maud`, whose `html!` macro escapes every
+//! interpolation and requires [`PreEscaped`](maud::PreEscaped) to opt out.
+//! Nothing in this crate concatenates HTML. That matters more than it might
+//! look: the data on these pages is a published bundle's own manifest and
+//! dictionary, so "someone published a dataset whose title contains a
+//! `<script>` tag" is an ordinary case rather than an attack.
 //!
-//! # One trait, so a route cannot forget
+//! This replaced a hand-written builder, which had exactly the bug the macro
+//! makes unavailable — an `&` written raw into an `href` while the URL around
+//! it was escaped. The tests that caught it are still here.
+//!
+//! # One shell, one trait
+//!
+//! [`page`] is the shared document: head, breadcrumbs, the `<h1>`, and a footer
+//! linking the same resource's JSON. Routes supply only the body, so no page
+//! can lose the charset declaration or the machine-readable link.
 //!
 //! [`Resource`] pairs the two renderings. A new route implements it and gets
 //! both, or does not compile — the same reason [`Representation`] is an enum
 //! rather than a string.
 //!
 //! [`Representation`]: crate::representation::Representation
+
+use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 /// What the pages call themselves.
 pub const SITE: &str = "Knowledge Graph Fragments";
@@ -50,6 +58,89 @@ pub fn json_body(value: &impl serde::Serialize) -> Vec<u8> {
         .expect("descriptors serialize");
     body.push(b'\n');
     body
+}
+
+/// One step of the breadcrumb trail. The last has no link: it is this page.
+pub struct Crumb<'a> {
+    /// What the step is called.
+    pub label: &'a str,
+    /// Where it goes, or `None` for the current page.
+    pub href: Option<String>,
+}
+
+impl<'a> Crumb<'a> {
+    /// A step that links somewhere.
+    pub fn to(label: &'a str, href: String) -> Self {
+        Self {
+            label,
+            href: Some(href),
+        }
+    }
+
+    /// The step the reader is on.
+    pub fn here(label: &'a str) -> Self {
+        Self { label, href: None }
+    }
+}
+
+/// The shared document: everything but the body.
+///
+/// `canonical` is this resource's own URL, which the footer turns into a link
+/// to its JSON. It is the resource's canonical URL rather than the one the
+/// request arrived on, so a page reached through `latest` links to the version
+/// it actually resolved to.
+pub fn page(title: &str, crumbs: &[Crumb<'_>], canonical: Option<&str>, body: Markup) -> String {
+    // The service descriptor's own title *is* the site name, and a tab reading
+    // "Knowledge Graph Fragments — Knowledge Graph Fragments" is the classic
+    // template seam.
+    let full_title = if title == SITE {
+        SITE.to_owned()
+    } else {
+        format!("{title} — {SITE}")
+    };
+    let json = canonical.map(|url| {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{separator}format=json")
+    });
+
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { (full_title) }
+                style { (PreEscaped(STYLE)) }
+            }
+            body {
+                header {
+                    nav {
+                        @for (index, crumb) in crumbs.iter().enumerate() {
+                            @if index > 0 {
+                                span."sep" { "/" }
+                            }
+                            @match &crumb.href {
+                                Some(href) => a href=(href) { (crumb.label) },
+                                None => span { (crumb.label) },
+                            }
+                        }
+                    }
+                }
+                main {
+                    h1 { (title) }
+                    (body)
+                }
+                footer {
+                    @if let Some(json) = &json {
+                        a href=(json) { "This page as JSON" }
+                        span."sep" { "·" }
+                    }
+                    span { "the same URL answers JSON to anything that does not ask for HTML" }
+                }
+            }
+        }
+    }
+    .into_string()
 }
 
 /// One cell or field value on a page.
@@ -79,172 +170,61 @@ impl<'a> Value<'a> {
     }
 }
 
-/// An HTML document under construction.
-pub struct Page {
-    title: String,
-    breadcrumbs: Vec<(String, Option<String>)>,
-    body: String,
-    /// The canonical URL of this resource, for the "as JSON" affordance.
-    canonical: Option<String>,
-}
-
-impl Page {
-    /// Start a page. `title` becomes the `<title>` and the first heading.
-    pub fn new(title: impl Into<String>) -> Self {
-        Self {
-            title: title.into(),
-            breadcrumbs: Vec::new(),
-            body: String::new(),
-            canonical: None,
-        }
-    }
-
-    /// Add a trail entry; the last one is the current page and is not a link.
-    pub fn crumb(mut self, label: impl Into<String>, href: Option<String>) -> Self {
-        self.breadcrumbs.push((label.into(), href));
-        self
-    }
-
-    /// The URL this resource's JSON lives at, linked in the footer.
-    pub fn canonical(mut self, url: String) -> Self {
-        self.canonical = Some(url);
-        self
-    }
-
-    /// A paragraph of prose.
-    pub fn paragraph(&mut self, text: &str) -> &mut Self {
-        self.body.push_str(&format!("<p>{}</p>\n", escape(text)));
-        self
-    }
-
-    /// A section heading.
-    pub fn section(&mut self, heading: &str) -> &mut Self {
-        self.body
-            .push_str(&format!("<h2>{}</h2>\n", escape(heading)));
-        self
-    }
-
-    /// A field list: a label and a value per row.
-    pub fn fields(&mut self, rows: &[(&str, Value<'_>)]) -> &mut Self {
-        self.body.push_str("<dl>\n");
-        for (label, value) in rows {
-            if matches!(value, Value::Absent) {
-                continue;
-            }
-            self.body.push_str(&format!(
-                "<dt>{}</dt><dd>{}</dd>\n",
-                escape(label),
-                render(value)
-            ));
-        }
-        self.body.push_str("</dl>\n");
-        self
-    }
-
-    /// A table. `rows` shorter or longer than `headers` is the caller's bug and
-    /// renders as written; nothing here pads.
-    pub fn table(&mut self, headers: &[&str], rows: &[Vec<Value<'_>>]) -> &mut Self {
-        self.body
-            .push_str("<div class=\"scroll\"><table>\n<thead><tr>");
-        for header in headers {
-            self.body.push_str(&format!("<th>{}</th>", escape(header)));
-        }
-        self.body.push_str("</tr></thead>\n<tbody>\n");
-        for row in rows {
-            self.body.push_str("<tr>");
-            for cell in row {
-                let class = if matches!(cell, Value::Number(_)) {
-                    " class=\"num\""
-                } else {
-                    ""
-                };
-                self.body
-                    .push_str(&format!("<td{class}>{}</td>", render(cell)));
-            }
-            self.body.push_str("</tr>\n");
-        }
-        self.body.push_str("</tbody>\n</table></div>\n");
-        self
-    }
-
-    /// A block of already-formatted machine output, such as a manifest.
-    pub fn code_block(&mut self, text: &str) -> &mut Self {
-        self.body
-            .push_str(&format!("<pre><code>{}</code></pre>\n", escape(text)));
-        self
-    }
-
-    /// An aside: the explanation under a heading, in smaller type.
-    pub fn note(&mut self, text: &str) -> &mut Self {
-        self.body
-            .push_str(&format!("<p class=\"note\">{}</p>\n", escape(text)));
-        self
-    }
-
-    /// Finish the document.
-    pub fn render(&self) -> String {
-        let mut out = String::with_capacity(self.body.len() + STYLE.len() + 1024);
-        out.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n");
-        out.push_str("<meta charset=\"utf-8\">\n");
-        out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
-        // The service descriptor's own title *is* the site name, and a tab
-        // reading "Knowledge Graph Fragments — Knowledge Graph Fragments" is
-        // the classic template seam.
-        let title = if self.title == SITE {
-            escape(SITE)
-        } else {
-            format!("{} — {}", escape(&self.title), escape(SITE))
-        };
-        out.push_str(&format!("<title>{title}</title>\n"));
-        out.push_str("<style>");
-        out.push_str(STYLE);
-        out.push_str("</style>\n</head>\n<body>\n<header><nav>");
-        for (index, (label, href)) in self.breadcrumbs.iter().enumerate() {
-            if index > 0 {
-                out.push_str("<span class=\"sep\">/</span>");
-            }
-            match href {
-                Some(href) => out.push_str(&format!(
-                    "<a href=\"{}\">{}</a>",
-                    escape(href),
-                    escape(label)
-                )),
-                None => out.push_str(&format!("<span>{}</span>", escape(label))),
+impl maud::Render for Value<'_> {
+    fn render(&self) -> Markup {
+        html! {
+            @match self {
+                Value::Text(text) => (text),
+                Value::Code(text) => code { (text) },
+                Value::Number(number) => (group_digits(*number)),
+                Value::Link { href, label } => a href=(href) { (label) },
+                Value::Absent => {}
             }
         }
-        out.push_str("</nav></header>\n<main>\n");
-        out.push_str(&format!("<h1>{}</h1>\n", escape(&self.title)));
-        out.push_str(&self.body);
-        out.push_str("</main>\n<footer>");
-        if let Some(canonical) = &self.canonical {
-            // Built first, escaped once. Escaping the URL and then appending
-            // raw markup around it is how an `&` reaches an attribute
-            // unescaped — invalid HTML, and the same slip that lets a `"` out.
-            let separator = if canonical.contains('?') { '&' } else { '?' };
-            let json = format!("{canonical}{separator}format=json");
-            out.push_str(&format!(
-                "<a href=\"{}\">This page as JSON</a><span class=\"sep\">·</span>",
-                escape(&json)
-            ));
-        }
-        out.push_str(
-            "<span>the same URL answers JSON to anything that does not ask for HTML</span>",
-        );
-        out.push_str("</footer>\n</body>\n</html>\n");
-        out
     }
 }
 
-fn render(value: &Value<'_>) -> String {
-    match value {
-        Value::Text(text) => escape(text),
-        Value::Code(text) => format!("<code>{}</code>", escape(text)),
-        Value::Number(number) => escape(&group_digits(*number)),
-        Value::Link { href, label } => {
-            format!("<a href=\"{}\">{}</a>", escape(href), escape(label))
+/// A field list: a label and a value per row. Absent values leave no row.
+pub fn fields(rows: &[(&str, Value<'_>)]) -> Markup {
+    html! {
+        dl {
+            @for (label, value) in rows {
+                @if !matches!(value, Value::Absent) {
+                    dt { (label) }
+                    dd { (value) }
+                }
+            }
         }
-        Value::Absent => String::new(),
     }
+}
+
+/// A table, horizontally scrollable so a wide row cannot widen the page.
+pub fn table(headers: &[&str], rows: &[Vec<Value<'_>>]) -> Markup {
+    html! {
+        div."scroll" {
+            table {
+                thead { tr { @for header in headers { th { (header) } } } }
+                tbody {
+                    @for row in rows {
+                        tr {
+                            @for cell in row {
+                                @if let Value::Number(_) = cell {
+                                    td."num" { (cell) }
+                                } @else {
+                                    td { (cell) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An aside: the explanation under a heading, in smaller type.
+pub fn note(text: &str) -> Markup {
+    html! { p."note" { (text) } }
 }
 
 /// `1234567` as `1 234 567`.
@@ -262,25 +242,6 @@ fn group_digits(number: u64) -> String {
         grouped.push(digit);
     }
     grouped
-}
-
-/// Escape text for both element content and double-quoted attribute values.
-///
-/// All five, not the three that element content needs: the same function is
-/// used for `href="…"`, and an unescaped quote there ends the attribute.
-fn escape(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for character in text.chars() {
-        match character {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(character),
-        }
-    }
-    escaped
 }
 
 /// Inline, because a stylesheet at its own URL is another route, another cache
@@ -322,32 +283,46 @@ footer a:hover{text-decoration:underline}
 mod tests {
     use super::*;
 
+    /// The escaping test, kept verbatim in spirit across the move from a
+    /// hand-written builder to `maud`. It caught a real bug against the
+    /// builder — an `&` written raw into an `href` — and its job now is to
+    /// prove the property did not quietly change hands.
     #[test]
     fn every_channel_that_takes_data_escapes_it() {
         // A dataset whose title is hostile is an ordinary case: the strings on
         // these pages come from a published bundle's manifest and dictionary.
         let hostile = "<script>alert('x')</script>";
-        let mut page = Page::new(hostile).crumb(hostile, Some("/a\"b".to_owned()));
-        page.paragraph(hostile)
-            .note(hostile)
-            .section(hostile)
-            .code_block(hostile)
-            .fields(&[(hostile, Value::Code(hostile))])
-            .table(
-                &[hostile],
-                &[vec![Value::Link {
-                    href: "/x\"onmouseover=alert(1)".to_owned(),
-                    label: hostile,
-                }]],
-            );
-        let rendered = page.canonical("/a?q=\"".to_owned()).render();
+        let rendered = page(
+            hostile,
+            &[Crumb::to(hostile, "/a\"b".to_owned())],
+            Some("/a?q=\""),
+            html! {
+                p { (hostile) }
+                (note(hostile))
+                h2 { (hostile) }
+                (fields(&[(hostile, Value::Code(hostile))]))
+                (table(
+                    &[hostile],
+                    &[vec![Value::Link {
+                        href: "/x\"onmouseover=alert(1)".to_owned(),
+                        label: hostile,
+                    }]],
+                ))
+            },
+        );
 
         assert!(
             !rendered.contains("<script>"),
             "unescaped markup reached the page"
         );
-        assert!(!rendered.contains("alert('x')"));
         assert!(rendered.contains("&lt;script&gt;"));
+        // `alert('x')` survives as text and that is fine — the tags around it
+        // are escaped, so it is inert. `maud` escapes `&`, `<`, `>` and `"`
+        // and not `'`, which is sound because it always emits attributes
+        // double-quoted, so an apostrophe can never end one. The builder this
+        // replaced escaped `'` too, which was belt-and-braces rather than the
+        // property; the property is the two assertions above and the four
+        // below.
         // Attribute values are the half a three-character escape would miss.
         // The payload text may survive — escaped, it is inert — but the quote
         // that would end the attribute and start a new one may not.
@@ -363,25 +338,23 @@ mod tests {
 
     #[test]
     fn a_page_is_a_whole_document() {
-        let rendered = Page::new("Title").render();
-        assert!(rendered.starts_with("<!doctype html>"));
+        let rendered = page("Title", &[], None, html! {});
+        assert!(rendered.starts_with("<!DOCTYPE html>"));
         assert!(rendered.contains("<meta charset=\"utf-8\">"));
         assert!(rendered.contains("<title>Title — Knowledge Graph Fragments</title>"));
+        assert!(rendered.trim_end().ends_with("</html>"));
         // The site's own front page is not "X — X".
         assert!(
-            Page::new(SITE)
-                .render()
-                .contains("<title>Knowledge Graph Fragments</title>")
+            page(SITE, &[], None, html! {}).contains("<title>Knowledge Graph Fragments</title>")
         );
-        assert!(rendered.trim_end().ends_with("</html>"));
     }
 
     #[test]
     fn the_json_affordance_survives_a_url_that_already_has_a_query() {
-        let plain = Page::new("t").canonical("/a/b".to_owned()).render();
+        let plain = page("t", &[], Some("/a/b"), html! {});
         assert!(plain.contains("href=\"/a/b?format=json\""));
 
-        let queried = Page::new("t").canonical("/a/b?s=x".to_owned()).render();
+        let queried = page("t", &[], Some("/a/b?s=x"), html! {});
         assert!(queried.contains("href=\"/a/b?s=x&amp;format=json\""));
     }
 
@@ -395,9 +368,8 @@ mod tests {
 
     #[test]
     fn absent_fields_leave_no_empty_row() {
-        let mut page = Page::new("t");
-        page.fields(&[("present", Value::Text("yes")), ("missing", Value::Absent)]);
-        let rendered = page.render();
+        let rendered =
+            fields(&[("present", Value::Text("yes")), ("missing", Value::Absent)]).into_string();
         assert!(rendered.contains("present"));
         assert!(!rendered.contains("missing"));
     }
