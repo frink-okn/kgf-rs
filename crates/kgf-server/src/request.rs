@@ -36,6 +36,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::ser::{Serialize, SerializeMap, Serializer};
 
 use hdtc::format::TextQuery;
@@ -162,31 +163,42 @@ impl BoundTerm {
         limits: Limits<'_>,
         prefixes: &PrefixMap,
     ) -> Result<Self, Problem> {
-        match value {
-            WireTerm::Text(text) => Self::parse(parameter, &text, limits, prefixes),
-            WireTerm::Object(object) => {
-                let value = serde_json::to_value(object).expect("a term object serializes");
-                let term = Term::from_json(&value).map_err(|error| {
-                    Problem::new(ErrorCode::BadTermSyntax, format!("{parameter}: {error}"))
-                })?;
-                let dictionary = term.to_dictionary().into_owned();
-                let max = limits.budgets.max_term_bytes;
-                if dictionary.len() as u64 > max {
-                    return Err(Problem::new(
-                        ErrorCode::CapExceeded,
-                        format!(
-                            "the term in `{parameter}` is {} bytes in canonical form, over this \
-                             server's max_term_bytes of {max}",
-                            dictionary.len()
-                        ),
-                    ));
+        let value = match value {
+            WireTerm::Text(text) => return Self::parse(parameter, &text, limits, prefixes),
+            WireTerm::Object(fields) => {
+                let mut object = serde_json::Map::new();
+                for (key, value) in fields {
+                    if object.contains_key(&key) {
+                        return Err(Problem::new(
+                            ErrorCode::BadTermSyntax,
+                            format!("{parameter}: term object is malformed: duplicate key `{key}`"),
+                        ));
+                    }
+                    object.insert(key, value);
                 }
-                Ok(Self {
-                    requested: term.to_request(),
-                    dictionary,
-                })
+                serde_json::Value::Object(object)
             }
+            WireTerm::Other(value) => value,
+        };
+        let term = Term::from_json(&value).map_err(|error| {
+            Problem::new(ErrorCode::BadTermSyntax, format!("{parameter}: {error}"))
+        })?;
+        let dictionary = term.to_dictionary().into_owned();
+        let max = limits.budgets.max_term_bytes;
+        if dictionary.len() as u64 > max {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "the term in `{parameter}` is {} bytes in canonical form, over this \
+                     server's max_term_bytes of {max}",
+                    dictionary.len()
+                ),
+            ));
         }
+        Ok(Self {
+            requested: term.to_request(),
+            dictionary,
+        })
     }
 
     /// The term as the request wrote it.
@@ -933,23 +945,94 @@ struct WireBindings {
     rows: Vec<Vec<WireTerm>>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+/// One term cell, kept as JSON until its position is known.
+///
+/// Deserializing directly into the valid term-object shape would reject a
+/// malformed object before [`BoundTerm::parse_body`] can attach `pattern.p` or
+/// `bindings.rows[7][0]` and the specific remedy from [`Term::from_json`]. The
+/// outer body shape is still strict; only a term cell delays interpretation to
+/// the parser that has the context needed for an actionable error.
+#[derive(Debug)]
 enum WireTerm {
     Text(String),
-    Object(WireTermObject),
+    /// Entries rather than a map so duplicate keys survive until the
+    /// contextual parser can reject them by name.
+    Object(Vec<(String, serde_json::Value)>),
+    Other(serde_json::Value),
 }
 
-#[derive(Debug, Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-struct WireTermObject {
-    #[serde(rename = "type")]
-    kind: String,
-    value: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    lang: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    datatype: Option<String>,
+impl<'de> Deserialize<'de> for WireTerm {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(WireTermVisitor)
+    }
+}
+
+struct WireTermVisitor;
+
+impl<'de> Visitor<'de> for WireTermVisitor {
+    type Value = WireTerm;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a compact term string or JSON term object")
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(WireTerm::Text(value))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(WireTerm::Text(value.to_owned()))
+    }
+
+    fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut fields = Vec::with_capacity(entries.size_hint().unwrap_or(0));
+        while let Some(field) = entries.next_entry()? {
+            fields.push(field);
+        }
+        Ok(WireTerm::Object(fields))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+        while let Some(value) = sequence.next_element()? {
+            values.push(value);
+        }
+        Ok(WireTerm::Other(serde_json::Value::Array(values)))
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(WireTerm::Other(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(WireTerm::Other(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(WireTerm::Other(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        let number = serde_json::Number::from_f64(value)
+            .ok_or_else(|| E::custom("a JSON number must be finite"))?;
+        Ok(WireTerm::Other(serde_json::Value::Number(number)))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(WireTerm::Other(serde_json::Value::Null))
+    }
 }
 
 /// `GET /fragment` — a triple pattern, paged (§3.4.1).
@@ -1579,6 +1662,51 @@ mod tests {
                 .code(),
             ErrorCode::CapExceeded
         );
+    }
+
+    #[test]
+    fn malformed_binding_term_objects_keep_their_cell_and_remedy() {
+        for (cell, remedy) in [
+            (serde_json::json!({"type": "iri"}), "no `value`"),
+            (
+                serde_json::json!({
+                    "type": "literal",
+                    "value": "Alice",
+                    "xml:lang": "en"
+                }),
+                "spells it `lang`",
+            ),
+        ] {
+            let body = serde_json::json!({
+                "pattern": {"s": "?s", "p": "ex:p", "o": "?o"},
+                "bindings": {"vars": ["?o"], "rows": [[cell]]}
+            });
+            let error = binding_fragment(&serde_json::to_vec(&body).unwrap()).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::BadTermSyntax);
+            let detail = serde_json::to_value(&error).unwrap()["detail"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(detail.contains("bindings.rows[0][0]"), "{detail}");
+            assert!(detail.contains(remedy), "{detail}");
+            assert!(!detail.contains("untagged enum"), "{detail}");
+        }
+
+        let duplicate = br#"{
+            "pattern":{"s":"?s","p":"ex:p","o":"?o"},
+            "bindings":{
+                "vars":["?o"],
+                "rows":[[{"type":"iri","type":"literal","value":"Alice"}]]
+            }
+        }"#;
+        let error = binding_fragment(duplicate).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::BadTermSyntax);
+        let detail = serde_json::to_value(&error).unwrap()["detail"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(detail.contains("bindings.rows[0][0]"), "{detail}");
+        assert!(detail.contains("duplicate key `type`"), "{detail}");
     }
 
     #[test]

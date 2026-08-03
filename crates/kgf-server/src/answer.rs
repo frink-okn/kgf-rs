@@ -1206,25 +1206,33 @@ fn locate(
 /// Dictionary probes shared by all rows of one binding table.
 struct LookupCache<'a> {
     dictionary: Dictionary<'a>,
-    found: HashMap<(Role, String), Option<u64>>,
+    found: [HashMap<String, Option<u64>>; 3],
 }
 
 impl<'a> LookupCache<'a> {
     fn new(dictionary: Dictionary<'a>) -> Self {
         Self {
             dictionary,
-            found: HashMap::new(),
+            found: std::array::from_fn(|_| HashMap::new()),
         }
     }
 
     fn locate(&mut self, role: Role, term: &BoundTerm) -> Result<Option<u64>, Problem> {
-        let key = (role, term.dictionary().to_owned());
-        if let Some(found) = self.found.get(&key) {
+        let by_term = &mut self.found[role_index(role)];
+        if let Some(found) = by_term.get(term.dictionary()) {
             return Ok(*found);
         }
         let found = locate(&self.dictionary, role, term)?;
-        self.found.insert(key, found);
+        by_term.insert(term.dictionary().to_owned(), found);
         Ok(found)
+    }
+}
+
+fn role_index(role: Role) -> usize {
+    match role {
+        Role::Subject => 0,
+        Role::Predicate => 1,
+        Role::Object => 2,
     }
 }
 
@@ -1828,7 +1836,10 @@ impl Resource for Answer {
                     @if let Some(next) = self.target.next(token) {
                         p { a href=(next) { "Next page →" } }
                     } @else {
-                        (note("Put this cursor in the same JSON request body to fetch the next page."))
+                        p."note" {
+                            "Put cursor " code { (token) }
+                            " in the same JSON request body to fetch the next page."
+                        }
                     }
                 }
             },

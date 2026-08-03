@@ -1015,14 +1015,17 @@ Unix FIFO regression test.
 Doc 03 §3.4.2's mandatory body form on `QUERY|POST /fragment`, plus §3.4.4's
 per-binding count. A body is parsed once into a typed pattern and rectangular binding
 table; compact term strings and JSON term objects converge on the same dictionary
-spelling before execution. Unknown or duplicate JSON fields, unknown variables,
-ragged rows, oversize terms and tables above `max_bindings` are refused rather than
-ignored or shortened.
+spelling before execution. Term cells remain raw JSON until their pattern position or
+binding row/column is known, so malformed objects retain that context and the term
+parser's specific remedy. Unknown or duplicate JSON fields, unknown variables, ragged
+rows, oversize terms and tables above `max_bindings` are refused rather than ignored
+or shortened.
 
 Execution is the composition doc 20 §20.8 describes: each input row resolves to one
 ordinary `IdPattern`, then uses the existing single selection implementation. A
-request-local lookup cache means a repeated term/role pair pays one dictionary probe,
-while all enumeration remains in id space. Rows are walked in input order, `limit` is
+request-local lookup cache means a repeated term/role pair pays one dictionary probe
+and one owned key; cache hits borrow the request term instead of allocating another
+key. All enumeration remains in id space. Rows are walked in input order, `limit` is
 global across the table, cardinality is the exact sum of the resolved selections, and
 each output row carries its zero-based `binding` index. Per-binding `/count` returns
 the same input order as `counts: [{binding, count}, ...]`, with the ordinary
@@ -1045,8 +1048,8 @@ immutable policy and a strong ETag incorporating both the operation and request 
 POST executes the same parsed request under `no-store`. Conditional requests remain
 method-correct despite that cache-policy difference: a matching `If-None-Match` yields
 304 for QUERY and a coded `412 precondition_failed` for POST. A body-addressed HTML
-page does not fabricate a GET continuation link: it tells the reader to put the
-returned token back in the same body.
+page does not fabricate a GET continuation link: it renders the returned token and
+tells the reader to put it back in the same body.
 
 *Verified by* strict-body parser tests; cursor codec coverage with a binding trailer;
 headless fixture tests that page a global limit through duplicate/absent input rows

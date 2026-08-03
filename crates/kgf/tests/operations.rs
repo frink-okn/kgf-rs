@@ -146,6 +146,14 @@ fn bindings_enumerate_in_input_order_page_globally_and_count_per_row() {
         "limit": 1
     });
 
+    let first = served.binding_fragment(&store, &body);
+    let first_cursor = first["next"].as_str().expect("the first page continues");
+    let html = served.binding_fragment_html(&store, &body);
+    assert!(
+        html.contains(&format!("<code>{first_cursor}</code>")),
+        "a body-addressed page must show the cursor its instructions refer to: {html}"
+    );
+
     let mut found = Vec::new();
     loop {
         let page = served.binding_fragment(&store, &body);
@@ -1132,6 +1140,23 @@ impl Served {
     }
 
     fn binding_fragment(&self, store: &Store, body: &serde_json::Value) -> serde_json::Value {
+        let rendered = self.render_binding_fragment(store, body, Representation::Json);
+        serde_json::from_slice(&rendered.body).expect("a bindings fragment serializes as JSON")
+    }
+
+    fn binding_fragment_html(&self, store: &Store, body: &serde_json::Value) -> String {
+        let rendered = self.render_binding_fragment(store, body, Representation::Html);
+        String::from_utf8(rendered.body.to_vec()).expect("a bindings fragment page is UTF-8")
+    }
+
+    fn render_binding_fragment(
+        &self,
+        store: &Store,
+        body: &serde_json::Value,
+        representation: Representation,
+    ) -> kgf_server::answer::Rendered {
+        use kgf_server::answer::Renders;
+
         let encoded = serde_json::to_vec(body).expect("a JSON body");
         let request = request::BindingFragment::parse(
             &params(""),
@@ -1141,20 +1166,18 @@ impl Served {
             &self.release().binding(),
         )
         .expect("a bindings fragment request");
-        json(
-            answer::binding_fragment(
-                store,
-                Target::body(
-                    self.id(),
-                    "fragment",
-                    params(""),
-                    self.release().prefixes().clone(),
-                ),
-                &request,
-            )
-            .expect("a bindings fragment answer"),
-            Representation::Json,
+        answer::binding_fragment(
+            store,
+            Target::body(
+                self.id(),
+                "fragment",
+                params(""),
+                self.release().prefixes().clone(),
+            ),
+            &request,
         )
+        .expect("a bindings fragment answer")
+        .render(representation)
     }
 
     fn binding_count(&self, store: &Store, body: &serde_json::Value) -> serde_json::Value {
