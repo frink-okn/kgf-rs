@@ -1303,11 +1303,27 @@ fn paged(
     let steps = walk(&phases, paging.cursor, predicates, paging.want())?;
     // Exact, and known before the walk: a pattern's cardinality is a range
     // width after bounded descent, so the enumeration is not what produces it.
-    let cardinality = Cardinality::exact(phases.iter().map(|phase| phase.count).sum());
+    let cardinality = exact_cardinality_sum(phases.iter().map(|phase| phase.count))?;
 
     finish(dictionary, target, envelope, steps, paging, None, |_, _| {
         cardinality
     })
+}
+
+/// Sum independently resolved phase cardinalities without letting a valid
+/// request wrap its answer or panic the blocking worker.
+fn exact_cardinality_sum(counts: impl IntoIterator<Item = u64>) -> Result<Cardinality, Problem> {
+    let mut counts = counts.into_iter();
+    let value = counts
+        .try_fold(0u64, |total, count| total.checked_add(count))
+        .ok_or_else(|| {
+            tracing::error!("the sum of binding cardinalities exceeded u64");
+            Problem::new(
+                ErrorCode::InternalError,
+                "the result cardinality exceeds this server's numeric range",
+            )
+        })?;
+    Ok(Cardinality::exact(value))
 }
 
 /// Finish a text-filtered page (§3.4.1).
@@ -2053,6 +2069,17 @@ impl Cell<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binding_cardinalities_cannot_overflow_the_wire_integer() {
+        assert_eq!(
+            exact_cardinality_sum([2, 3]).unwrap().value(),
+            5,
+            "ordinary phase counts still add exactly"
+        );
+        let overflow = exact_cardinality_sum([u64::MAX, 1]).unwrap_err();
+        assert_eq!(overflow.code(), ErrorCode::InternalError);
+    }
 
     #[test]
     fn a_row_weighs_exactly_what_it_serializes() {

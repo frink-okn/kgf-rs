@@ -441,12 +441,14 @@ pub const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 
 /// A machine-readable error code (doc 03 §3.6.1).
 ///
-/// Closed, and one code is one status: a condition that needs a different
+/// Enumerated, and one code is one status: a condition that needs a different
 /// status is a different code, not the same code carrying a status beside it.
 /// That is what lets a client branch on `code` alone and lets §3.6.1 be a
 /// table — `unsupported_format`, `not_acceptable` and `unsupported_media_type`
 /// are three ways to fail content negotiation with three remedies, and merging
-/// them would leave an agent unable to tell which applies.
+/// them would leave an agent unable to tell which applies. Doc 03 permits a
+/// server to add codes for conditions its normative table does not cover;
+/// [`PreconditionFailed`](Self::PreconditionFailed) is such an extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
     /// A term parameter is not a term (§3.3).
@@ -463,6 +465,8 @@ pub enum ErrorCode {
     NotFound,
     /// No representation satisfies `Accept`.
     NotAcceptable,
+    /// `If-None-Match` was false for a method other than GET or HEAD.
+    PreconditionFailed,
     /// The method is not one this resource takes (§3.6.1).
     ///
     /// Unavoidable rather than chosen: any HTTP server must answer a POST to a
@@ -500,6 +504,7 @@ impl ErrorCode {
         Self::NotFound,
         Self::MethodNotAllowed,
         Self::NotAcceptable,
+        Self::PreconditionFailed,
         Self::PayloadTooLarge,
         Self::UnsupportedMediaType,
         Self::RateLimited,
@@ -525,6 +530,7 @@ impl ErrorCode {
             Self::NotFound => ("not_found", 404, "Not Found"),
             Self::MethodNotAllowed => ("method_not_allowed", 405, "Method Not Allowed"),
             Self::NotAcceptable => ("not_acceptable", 406, "Not Acceptable"),
+            Self::PreconditionFailed => ("precondition_failed", 412, "Precondition Failed"),
             Self::UnsupportedMediaType => ("unsupported_media_type", 415, "Unsupported Media Type"),
             Self::PayloadTooLarge => ("payload_too_large", 413, "Content Too Large"),
             Self::RateLimited => ("rate_limited", 429, "Too Many Requests"),
@@ -1034,10 +1040,11 @@ mod tests {
     }
 
     #[test]
-    fn every_code_matches_doc_03_s_table() {
-        // §3.6.1 is normative and closed, so this is that table transcribed. An
-        // implementation that drifts from it makes agents' self-correction
-        // wrong in a way no other test here would notice.
+    fn every_code_has_its_normative_or_extended_wire_mapping() {
+        // §3.6.1 is normative for the codes it names and permits additions for
+        // uncovered conditions. This is its table plus this server's RFC 9110
+        // precondition extension. An implementation that drifts from either
+        // makes agents' self-correction wrong in a way no other test notices.
         let table = [
             (ErrorCode::BadTermSyntax, "bad_term_syntax", 400u16),
             (ErrorCode::MalformedRequest, "malformed_request", 400),
@@ -1047,6 +1054,7 @@ mod tests {
             (ErrorCode::NotFound, "not_found", 404),
             (ErrorCode::MethodNotAllowed, "method_not_allowed", 405),
             (ErrorCode::NotAcceptable, "not_acceptable", 406),
+            (ErrorCode::PreconditionFailed, "precondition_failed", 412),
             (ErrorCode::PayloadTooLarge, "payload_too_large", 413),
             (
                 ErrorCode::UnsupportedMediaType,
@@ -1067,7 +1075,7 @@ mod tests {
         assert_eq!(
             table.map(|(code, _, _)| code).as_slice(),
             ErrorCode::ALL,
-            "every variant must appear, in §3.6.1's order"
+            "every variant must appear, with extensions in status order"
         );
 
         let mut seen = std::collections::HashSet::new();

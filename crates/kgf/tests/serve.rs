@@ -251,25 +251,41 @@ fn bindings_query_and_post_answer_over_the_wire() {
     let post = server.request_with_body(
         "POST",
         path,
-        &[
-            ("Content-Type", "application/json; charset=utf-8"),
-            ("If-None-Match", etag.as_str()),
-        ],
+        &[("Content-Type", "application/json; charset=utf-8")],
         &encoded,
     );
     post.assert_status(200);
     post.assert_cache_control(&["no-store"]);
     assert_eq!(post.json()["rows"][0], query.json()["rows"][0]);
 
+    // Cache policy does not switch off request preconditions. The same
+    // operation has the same representation under QUERY and POST, but RFC
+    // 9110 §13.1.2 requires a false If-None-Match on POST to answer 412 rather
+    // than QUERY's 304.
+    let refused_post = server.request_with_body(
+        "POST",
+        path,
+        &[
+            ("Content-Type", "application/json; charset=utf-8"),
+            ("If-None-Match", etag.as_str()),
+        ],
+        &encoded,
+    );
+    refused_post.assert_status(412);
+    refused_post.assert_cache_control(&["no-store"]);
+    refused_post.assert_header("accept-query", "application/json");
+    assert_eq!(refused_post.json()["code"], "precondition_failed");
+
     let count_body = serde_json::json!({
         "pattern": {"s": "?person", "p": "ex:knows", "o": "?known"},
         "bindings": {"vars": ["?person"], "rows": [["ex:alice"], ["ex:bob"]]}
     });
+    let count_encoded = serde_json::to_vec(&count_body).unwrap();
     let counted = server.request_with_body(
         "QUERY",
         "/tox/v/v1/count",
         &[("Content-Type", "application/json")],
-        &serde_json::to_vec(&count_body).unwrap(),
+        &count_encoded,
     );
     counted.assert_status(200);
     assert_eq!(
@@ -279,6 +295,30 @@ fn bindings_query_and_post_answer_over_the_wire() {
             {"binding": 1, "count": {"value": 1, "exact": true}}
         ])
     );
+
+    // `/fragment` and `/count` both accept this exact body, but produce
+    // different representations. Their strong validators must therefore be
+    // different, and a fragment validator must not suppress a count response.
+    let same_body_fragment = server.request_with_body(
+        "QUERY",
+        path,
+        &[("Content-Type", "application/json")],
+        &count_encoded,
+    );
+    same_body_fragment.assert_status(200);
+    let fragment_etag = same_body_fragment.header("etag").unwrap();
+    assert_ne!(counted.header("etag"), Some(fragment_etag.clone()));
+    server
+        .request_with_body(
+            "QUERY",
+            "/tox/v/v1/count",
+            &[
+                ("Content-Type", "application/json"),
+                ("If-None-Match", fragment_etag.as_str()),
+            ],
+            &count_encoded,
+        )
+        .assert_status(200);
 
     let wrong_type =
         server.request_with_body("QUERY", path, &[("Content-Type", "text/plain")], &encoded);

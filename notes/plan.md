@@ -1041,10 +1041,12 @@ itself.
 the permanent compatibility method. Both require `Content-Type: application/json`,
 both answer JSON or HTML at the same URL, and `/fragment` and `/count` advertise
 `Accept-Query: application/json` on successes and problems. QUERY responses use the
-immutable policy and a strong ETag incorporating the request body; POST executes the
-same parsed request under `no-store`. A body-addressed HTML page does not fabricate a
-GET continuation link: it tells the reader to put the returned token back in the same
-body.
+immutable policy and a strong ETag incorporating both the operation and request body;
+POST executes the same parsed request under `no-store`. Conditional requests remain
+method-correct despite that cache-policy difference: a matching `If-None-Match` yields
+304 for QUERY and a coded `412 precondition_failed` for POST. A body-addressed HTML
+page does not fabricate a GET continuation link: it tells the reader to put the
+returned token back in the same body.
 
 *Verified by* strict-body parser tests; cursor codec coverage with a binding trailer;
 headless fixture tests that page a global limit through duplicate/absent input rows

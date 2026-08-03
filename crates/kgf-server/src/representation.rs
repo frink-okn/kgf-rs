@@ -406,17 +406,26 @@ pub fn etag(
 
 /// A body-addressed operation's strong validator.
 ///
-/// The raw body is included because QUERY has one URL for many entities. Two
-/// JSON spellings of the same semantic request may receive different tags;
-/// that only forgoes a cache hit, while omitting the body would make one tag
-/// claim that different result sets are the same entity.
+/// The operation and raw body are included because QUERY has one URL for many
+/// entities, and the same body shape may be accepted by more than one
+/// operation. Two JSON spellings of the same semantic request may receive
+/// different tags; that only forgoes a cache hit, while omitting either input
+/// would make one tag claim that different result sets are the same entity.
 pub fn etag_for_body(
     digest: &ContentDigest,
     deployment: &ContentDigest,
+    operation: &str,
     representation: Representation,
     body: &[u8],
 ) -> ETag {
-    let request = Sha256::digest(body);
+    let mut request = Sha256::new();
+    let operation_bytes = operation.as_bytes();
+    let operation_length = u64::try_from(operation_bytes.len())
+        .expect("an operation name fits in a u64 on every supported platform");
+    request.update(operation_length.to_be_bytes());
+    request.update(operation_bytes);
+    request.update(body);
+    let request = request.finalize();
     let tag = format!(
         "\"{}.{}.{:x}.{}\"",
         digest.as_str(),
@@ -696,6 +705,7 @@ mod tests {
         let body_tag = etag_for_body(
             &digest(),
             &deployment,
+            "fragment",
             Representation::Json,
             br#"{"pattern":1}"#,
         );
@@ -705,9 +715,21 @@ mod tests {
             etag_for_body(
                 &digest(),
                 &deployment,
+                "fragment",
                 Representation::Json,
                 br#"{"pattern":2}"#,
             )
+        );
+        assert_ne!(
+            body_tag,
+            etag_for_body(
+                &digest(),
+                &deployment,
+                "count",
+                Representation::Json,
+                br#"{"pattern":1}"#,
+            ),
+            "the same body can name different entities at different operations"
         );
     }
 

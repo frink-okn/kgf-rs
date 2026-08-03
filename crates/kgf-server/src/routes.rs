@@ -316,7 +316,7 @@ async fn fragment_bindings_post(
         wants,
         headers,
         body,
-        CachePolicy::Uncacheable,
+        BodyMethod::Post,
     )
     .await
 }
@@ -337,7 +337,7 @@ async fn fragment_fallback(
         wants,
         headers,
         body,
-        CachePolicy::Immutable,
+        BodyMethod::Query,
     )
     .await
 }
@@ -348,7 +348,7 @@ async fn binding_fragment(
     wants: Wants,
     headers: HeaderMap,
     body: bytes::Bytes,
-    cache: CachePolicy,
+    method: BodyMethod,
 ) -> Result<Response, Problem> {
     require_json(&headers)?;
     advertise_query(
@@ -356,7 +356,11 @@ async fn binding_fragment(
             service,
             id,
             "fragment",
-            BodyOperation { wants, body, cache },
+            BodyOperation {
+                wants,
+                body,
+                method,
+            },
             |params, body, limits, release| {
                 request::BindingFragment::parse(
                     params,
@@ -385,7 +389,7 @@ async fn count_bindings_post(
         wants,
         headers,
         body,
-        CachePolicy::Uncacheable,
+        BodyMethod::Post,
     )
     .await
 }
@@ -406,7 +410,7 @@ async fn count_fallback(
         wants,
         headers,
         body,
-        CachePolicy::Immutable,
+        BodyMethod::Query,
     )
     .await
 }
@@ -417,7 +421,7 @@ async fn binding_count(
     wants: Wants,
     headers: HeaderMap,
     body: bytes::Bytes,
-    cache: CachePolicy,
+    method: BodyMethod,
 ) -> Result<Response, Problem> {
     require_json(&headers)?;
     advertise_query(
@@ -425,7 +429,11 @@ async fn binding_count(
             service,
             id,
             "count",
-            BodyOperation { wants, body, cache },
+            BodyOperation {
+                wants,
+                body,
+                method,
+            },
             |params, body, limits, release| {
                 request::BindingCount::parse(params, body, limits, release.prefixes())
             },
@@ -623,11 +631,28 @@ where
 ///
 /// QUERY is immutable like a versioned GET, but its entity identity includes
 /// the body. POST executes the same request as the compatibility method and is
-/// deliberately `no-store`.
+/// deliberately `no-store`. The method is carried explicitly because a failed
+/// `If-None-Match` is 304 for QUERY and 412 for POST; cacheability does not
+/// decide precondition semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyMethod {
+    Query,
+    Post,
+}
+
+impl BodyMethod {
+    const fn cache(self) -> CachePolicy {
+        match self {
+            Self::Query => CachePolicy::Immutable,
+            Self::Post => CachePolicy::Uncacheable,
+        }
+    }
+}
+
 struct BodyOperation {
     wants: Wants,
     body: bytes::Bytes,
-    cache: CachePolicy,
+    method: BodyMethod,
 }
 
 async fn operate_body<Q, A, P, E>(
@@ -644,18 +669,31 @@ where
     P: FnOnce(&Params, &[u8], Limits<'_>, &Release) -> Result<Q, Problem>,
     E: FnOnce(&kgf_store::Store, Target, &Q) -> Result<A, Problem> + Send + 'static,
 {
-    let BodyOperation { wants, body, cache } = submitted;
+    let BodyOperation {
+        wants,
+        body,
+        method,
+    } = submitted;
+    let cache = method.cache();
     let representation = wants.representation()?;
     let release = service.datasets().release(&id.dataset, &id.version)?;
     let request = parse(wants.params(), &body, service.config().limits(), release)?;
     let validator = etag_for_body(
         release.digest(),
         service.descriptor_digest(),
+        operation,
         representation,
         &body,
     );
-    if cache == CachePolicy::Immutable && wants.already_has(&validator) {
-        return not_modified(cache, validator);
+    if wants.already_has(&validator) {
+        return match method {
+            BodyMethod::Query => not_modified(cache, validator),
+            BodyMethod::Post => Err(Problem::new(
+                ErrorCode::PreconditionFailed,
+                "If-None-Match matches the representation this POST would return; remove the \
+                 precondition or submit a request whose representation is not current",
+            )),
+        };
     }
 
     let target = Target::body(
