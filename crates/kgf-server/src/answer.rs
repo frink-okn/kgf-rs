@@ -39,6 +39,7 @@
 //! second against a cardinality would reject a live cursor — a one-row `s ? o`
 //! answer legitimately resumes at predicate 37.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -60,7 +61,7 @@ use crate::representation::Representation;
 use crate::request::{
     self, BoundTerm, Candidates, Direction, Pattern, Position, ResponseBytes, TextFilter,
 };
-use crate::term::{Term, TermCache};
+use crate::term::{PrefixMap, Term, TermCache};
 use crate::url::{self, Params};
 
 // ---------------------------------------------------------------------------
@@ -78,15 +79,18 @@ pub struct Target {
     id: BundleId,
     operation: &'static str,
     params: Params,
+    prefixes: PrefixMap,
 }
 
 impl Target {
-    /// The version and operation a request addressed, with its parameters.
-    pub fn new(id: BundleId, operation: &'static str, params: Params) -> Self {
+    /// The version and operation a request addressed, with its parameters and
+    /// the version's immutable prefix map for human-facing result labels.
+    pub fn new(id: BundleId, operation: &'static str, params: Params, prefixes: PrefixMap) -> Self {
         Self {
             id,
             operation,
             params,
+            prefixes,
         }
     }
 
@@ -1611,11 +1615,11 @@ impl Answer {
     }
 
     /// Every cell of the table, owned, so the [`Value`]s below can borrow it.
-    fn cells(&self) -> Vec<Vec<Cell>> {
+    fn cells(&self) -> Vec<Vec<Cell<'_>>> {
         self.rows
             .iter()
             .map(|row| {
-                let mut cells: Vec<Cell> = row
+                let mut cells: Vec<_> = row
                     .cells
                     .iter()
                     .map(|(position, text)| self.cell(*position, text))
@@ -1624,16 +1628,19 @@ impl Answer {
                     cells.push(Cell {
                         label: direction.as_str().to_owned(),
                         href: None,
+                        full_iri: None,
                     });
                 }
                 if let Some(ranking) = row.ranking {
                     cells.push(Cell {
                         label: ranking.score.to_string(),
                         href: None,
+                        full_iri: None,
                     });
                     cells.push(Cell {
                         label: ranking.kind.to_owned(),
                         href: None,
+                        full_iri: None,
                     });
                 }
                 cells
@@ -1646,17 +1653,19 @@ impl Answer {
     /// This is what makes the page a way *into* the data rather than a dump of
     /// it: a subject or object links to its own neighborhood, a predicate to
     /// every triple using it, a literal to every triple carrying it.
-    fn cell(&self, position: Position, text: &str) -> Cell {
+    fn cell<'a>(&self, position: Position, text: &'a str) -> Cell<'a> {
         let term = Term::from_dictionary(text);
-        let label = term.to_request();
+        let request = term.to_request();
         let href = match (&term, position) {
-            (Term::Literal(_), _) => self.target.ask("fragment", "o", &label),
-            (_, Position::Predicate) => self.target.ask("fragment", "p", &label),
-            _ => self.target.ask("describe", "iri", &label),
+            (Term::Literal(_), _) => self.target.ask("fragment", "o", &request),
+            (_, Position::Predicate) => self.target.ask("fragment", "p", &request),
+            _ => self.target.ask("describe", "iri", &request),
         };
+        let (label, full_iri) = term.into_display(&self.target.prefixes).into_parts();
         Cell {
             label,
             href: Some(href),
+            full_iri,
         }
     }
 }
@@ -1731,17 +1740,19 @@ fn pattern_fields(pattern: &Pattern) -> Vec<(&str, Value<'_>)> {
 }
 
 /// A rendered table cell, held so the borrowed [`Value`] can point at it.
-struct Cell {
+struct Cell<'a> {
     label: String,
     href: Option<String>,
+    full_iri: Option<Cow<'a, str>>,
 }
 
-impl Cell {
+impl Cell<'_> {
     fn value(&self) -> Value<'_> {
         match &self.href {
-            Some(href) => Value::Link {
+            Some(href) => Value::TermLink {
                 href: href.clone(),
                 label: &self.label,
+                full_iri: self.full_iri.as_deref(),
             },
             None => Value::Text(&self.label),
         }

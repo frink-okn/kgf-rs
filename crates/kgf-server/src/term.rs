@@ -64,6 +64,7 @@ use serde::ser::{Serialize, SerializeMap, Serializer};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// An RDF term.
 ///
@@ -168,12 +169,23 @@ impl<'a> Literal<'a> {
 // Request syntax (doc 03 §3.3)
 // ---------------------------------------------------------------------------
 
-/// The manifest's prefix map, used to expand CURIEs in request parameters.
+/// The manifest's prefix map.
 ///
-/// Expansion is one-way. Responses carry IRIs in full (§3.4.1), so there is no
-/// abbreviating direction to keep consistent with this one.
+/// Requests expand CURIEs through the forward map. HTML result pages use the
+/// reverse map to make RDF terms readable; canonical JSON responses still
+/// carry IRIs in full (§3.4.1). Both directions are built once per immutable
+/// bundle release and shared with every request against it.
 #[derive(Debug, Clone, Default)]
-pub struct PrefixMap(BTreeMap<String, String>);
+pub struct PrefixMap(Arc<Prefixes>);
+
+#[derive(Debug, Default)]
+struct Prefixes {
+    by_prefix: BTreeMap<String, String>,
+    /// `(namespace, prefix)`, longest namespace first and then prefix name.
+    ///
+    /// That order makes the first match the deterministic display spelling.
+    by_namespace: Vec<(String, String)>,
+}
 
 impl PrefixMap {
     /// The prefixes a bundle declares.
@@ -185,18 +197,50 @@ impl PrefixMap {
     /// change while the bundle is mapped. Build it beside the `Store` and share
     /// it.
     pub fn from_manifest(manifest: &Manifest) -> Self {
-        Self(manifest.prefixes.clone())
+        Self::from_prefixes(manifest.prefixes.clone())
     }
 
     /// The namespace `prefix` is declared to stand for.
     pub fn namespace(&self, prefix: &str) -> Option<&str> {
-        self.0.get(prefix).map(String::as_str)
+        self.0.by_prefix.get(prefix).map(String::as_str)
+    }
+
+    /// The manifest's preferred display spelling of `iri`, if one applies.
+    ///
+    /// The most specific declaration wins: a namespace covering
+    /// `http://example.org/person/` is preferred to one covering
+    /// `http://example.org/`. Equal namespace declarations choose the prefix
+    /// whose name sorts first, so rendering never depends on insertion order.
+    fn compact_iri(&self, iri: &str) -> Option<String> {
+        self.0.by_namespace.iter().find_map(|(namespace, prefix)| {
+            iri.strip_prefix(namespace)
+                .map(|local| format!("{prefix}:{local}"))
+        })
+    }
+
+    fn from_prefixes(by_prefix: BTreeMap<String, String>) -> Self {
+        let mut by_namespace: Vec<_> = by_prefix
+            .iter()
+            .map(|(prefix, namespace)| (namespace.clone(), prefix.clone()))
+            .collect();
+        by_namespace.sort_by(
+            |(left_namespace, left_prefix), (right_namespace, right_prefix)| {
+                right_namespace
+                    .len()
+                    .cmp(&left_namespace.len())
+                    .then_with(|| left_prefix.cmp(right_prefix))
+            },
+        );
+        Self(Arc::new(Prefixes {
+            by_prefix,
+            by_namespace,
+        }))
     }
 }
 
 impl FromIterator<(String, String)> for PrefixMap {
     fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
-        Self(iter.into_iter().collect())
+        Self::from_prefixes(iter.into_iter().collect())
     }
 }
 
@@ -448,6 +492,50 @@ impl<'a> Term<'a> {
         }
     }
 
+    /// A human-facing spelling for an HTML result cell.
+    ///
+    /// IRIs covered by this release's manifest are shown as CURIEs. The full
+    /// IRI travels beside the label for the page's tooltip, while links keep
+    /// using [`to_request`](Self::to_request) and therefore remain independent
+    /// of any prefix declaration. A typed literal receives the same treatment
+    /// for its datatype IRI; other term shapes are unchanged.
+    pub(crate) fn into_display(self, prefixes: &PrefixMap) -> TermDisplay<'a> {
+        match self {
+            Term::Iri(iri) => {
+                let label = prefixes
+                    .compact_iri(iri.as_ref())
+                    .unwrap_or_else(|| format!("<{iri}>"));
+                TermDisplay {
+                    label,
+                    full_iri: Some(iri),
+                }
+            }
+            Term::BlankNode(label) => TermDisplay {
+                label: format!("_:{label}"),
+                full_iri: None,
+            },
+            Term::Literal(Literal { value, kind }) => match kind {
+                LiteralKind::Plain => TermDisplay {
+                    label: format!("\"{value}\""),
+                    full_iri: None,
+                },
+                LiteralKind::Language(language) => TermDisplay {
+                    label: format!("\"{value}\"@{language}"),
+                    full_iri: None,
+                },
+                LiteralKind::Datatype(datatype) => {
+                    let datatype_label = prefixes
+                        .compact_iri(datatype.as_ref())
+                        .unwrap_or_else(|| format!("<{datatype}>"));
+                    TermDisplay {
+                        label: format!("\"{value}\"^^{datatype_label}"),
+                        full_iri: Some(datatype),
+                    }
+                }
+            },
+        }
+    }
+
     /// Resolve to an id in `role`'s space, or `None` if the bundle has no such
     /// term in that role.
     ///
@@ -459,6 +547,18 @@ impl<'a> Term<'a> {
         role: Role,
     ) -> kgf_store::Result<Option<TermId>> {
         dictionary.locate(role, self.to_dictionary().as_bytes())
+    }
+}
+
+/// The visible spelling of one RDF term and the IRI its tooltip reveals.
+pub(crate) struct TermDisplay<'a> {
+    label: String,
+    full_iri: Option<Cow<'a, str>>,
+}
+
+impl<'a> TermDisplay<'a> {
+    pub(crate) fn into_parts(self) -> (String, Option<Cow<'a, str>>) {
+        (self.label, self.full_iri)
     }
 }
 
@@ -878,6 +978,49 @@ mod tests {
             .iter()
             .map(|(prefix, namespace)| ((*prefix).to_owned(), (*namespace).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn display_compaction_prefers_the_longest_namespace_then_prefix_name() {
+        let prefixes = prefixes(&[
+            ("ex", "http://example.org/"),
+            ("person", "http://example.org/person/"),
+            ("human", "http://example.org/person/"),
+        ]);
+
+        let (label, full_iri) = Term::from_dictionary("http://example.org/person/alice")
+            .into_display(&prefixes)
+            .into_parts();
+        assert_eq!(label, "human:alice");
+        assert_eq!(full_iri.as_deref(), Some("http://example.org/person/alice"));
+
+        let (label, full_iri) = Term::from_dictionary("https://elsewhere.example/alice")
+            .into_display(&prefixes)
+            .into_parts();
+        assert_eq!(label, "<https://elsewhere.example/alice>");
+        assert_eq!(full_iri.as_deref(), Some("https://elsewhere.example/alice"));
+    }
+
+    #[test]
+    fn display_compaction_applies_to_a_literal_datatype() {
+        let prefixes = prefixes(&[("xsd", "http://www.w3.org/2001/XMLSchema#")]);
+        let (label, full_iri) =
+            Term::from_dictionary("\"31\"^^<http://www.w3.org/2001/XMLSchema#integer>")
+                .into_display(&prefixes)
+                .into_parts();
+
+        assert_eq!(label, "\"31\"^^xsd:integer");
+        assert_eq!(
+            full_iri.as_deref(),
+            Some("http://www.w3.org/2001/XMLSchema#integer")
+        );
+    }
+
+    #[test]
+    fn a_prefix_map_clone_shares_its_precomputed_indexes() {
+        let prefixes = prefixes(&[("ex", "http://example.org/")]);
+        let cloned = prefixes.clone();
+        assert!(Arc::ptr_eq(&prefixes.0, &cloned.0));
     }
 
     /// Write a term in doc 03 §3.3 request syntax.

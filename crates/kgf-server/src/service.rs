@@ -691,6 +691,10 @@ mod tests {
         let descriptor = DatasetDescriptor::of("tox", dataset);
         let json: serde_json::Value = serde_json::from_slice(&descriptor.to_json()).unwrap();
         assert_eq!(json["current"], "new");
+        assert!(
+            json.get("latest").is_none(),
+            "doc 04 names the machine-readable field `current`"
+        );
         assert_eq!(json["title"], "Tox as of new");
         assert_eq!(json["dataset_iri"], "https://okn.example/id/tox");
         // Every release is listed, whether or not it is current — a client
@@ -705,11 +709,13 @@ mod tests {
                 .starts_with("sha256:")
         );
 
-        // And the page says the same thing, with the current release marked.
+        // The human page calls the movable selection `latest`, matching its
+        // `/{dataset}/latest/…` URL, while the JSON above keeps doc 04's field.
         let page = descriptor.to_html();
         assert!(page.contains("href=\"/tox/v/new/manifest\""));
         assert!(page.contains("href=\"/tox/v/old/manifest\""));
-        assert!(page.contains("current"));
+        assert_eq!(page.matches(">latest<").count(), 2);
+        assert!(!page.contains(">current<"));
     }
 
     #[test]

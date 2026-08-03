@@ -415,9 +415,11 @@ fn every_operation_renders_a_page_as_well_as_json() {
 
     let page = served.render(&store, "fragment", "limit=2", Representation::Html);
     assert!(page.contains("<h1>fragment — tox 2026-06-01</h1>"));
-    assert!(page.contains("http://example.org/alice"));
+    assert!(page.contains(">ex:alice</a>"));
+    assert!(page.contains("title=\"http://example.org/alice\""));
     // A subject links to its neighborhood and a predicate to its own fragment,
-    // which is what makes the page a way into the data.
+    // which is what makes the page a way into the data. The visible CURIE does
+    // not leak into either target: links retain the portable full IRI spelling.
     assert!(page.contains("/tox/v/2026-06-01/describe?iri=%3Chttp%3A%2F%2Fexample.org%2Falice%3E"));
     assert!(page.contains("/tox/v/2026-06-01/fragment?p=%3Chttp%3A%2F%2Fexample.org%2Fknows%3E"));
     // A truncated page offers the next one.
@@ -447,6 +449,31 @@ fn every_operation_renders_a_page_as_well_as_json() {
         );
         assert!(page.contains(&format!("<h1>{operation} — tox 2026-06-01</h1>")));
     }
+
+    // A datatype IRI is the other IRI-shaped part of an RDF term. It receives
+    // the same display treatment while the literal link remains full syntax.
+    let typed = served.render(
+        &store,
+        "fragment",
+        "s=ex:carol&p=ex:age",
+        Representation::Html,
+    );
+    assert!(typed.contains("&quot;31&quot;^^xsd:integer"));
+    assert!(typed.contains("title=\"http://www.w3.org/2001/XMLSchema#integer\""));
+    assert!(
+        typed
+            .contains("o=%2231%22%5E%5E%3Chttp%3A%2F%2Fwww.w3.org%2F2001%2FXMLSchema%23integer%3E")
+    );
+
+    // The summary is an echo, not a term rendering: it preserves exactly the
+    // spelling the caller supplied even when the manifest offers a CURIE.
+    let echoed = served.render(
+        &store,
+        "count",
+        "p=%3Chttp%3A%2F%2Fexample.org%2Fknows%3E",
+        Representation::Html,
+    );
+    assert!(echoed.contains("<code>&lt;http://example.org/knows&gt;</code>"));
 }
 
 #[test]
@@ -966,7 +993,12 @@ impl Served {
     }
 
     fn target(&self, operation: &'static str, query: &str) -> Target {
-        Target::new(self.id(), operation, params(query))
+        Target::new(
+            self.id(),
+            operation,
+            params(query),
+            self.release().prefixes().clone(),
+        )
     }
 
     fn parse_fragment(&self, query: &str) -> request::Fragment {
@@ -1058,7 +1090,12 @@ impl Served {
     ) -> String {
         use kgf_server::answer::Renders;
 
-        let target = Target::new(self.id(), operation, params(query));
+        let target = Target::new(
+            self.id(),
+            operation,
+            params(query),
+            self.release().prefixes().clone(),
+        );
         let rendered = match operation {
             "fragment" => {
                 let request = request::Fragment::parse(

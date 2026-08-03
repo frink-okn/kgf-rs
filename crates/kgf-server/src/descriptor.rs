@@ -225,7 +225,7 @@ impl Resource for DatasetDescriptor<'_> {
                         release.version,
                     ),
                     if release.version == self.current {
-                        Value::Text("current")
+                        Value::Text("latest")
                     } else {
                         Value::Absent
                     },
@@ -251,7 +251,7 @@ impl Resource for DatasetDescriptor<'_> {
                             .map_or(Value::Absent, |publisher| Value::Text(&publisher.name)),
                     ),
                     (
-                        "current",
+                        "latest",
                         Value::self_link(
                             url::operation(self.id, self.current, "manifest"),
                             self.current,

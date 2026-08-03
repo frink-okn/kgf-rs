@@ -164,6 +164,15 @@ pub enum Value<'a> {
         /// What the link says.
         label: &'a str,
     },
+    /// An RDF term linking deeper into the bundle.
+    TermLink {
+        /// Target, carrying the term's full request spelling.
+        href: String,
+        /// Human-facing spelling, possibly a manifest CURIE.
+        label: &'a str,
+        /// The full IRI revealed by the native browser tooltip.
+        full_iri: Option<&'a str>,
+    },
     /// A field the resource does not carry.
     Absent,
 }
@@ -183,6 +192,12 @@ impl maud::Render for Value<'_> {
                 Value::Code(text) => code { (text) },
                 Value::Number(number) => (group_digits(*number)),
                 Value::Link { href, label } => a href=(href) { (label) },
+                Value::TermLink { href, label, full_iri } => {
+                    @match full_iri {
+                        Some(full_iri) => a href=(href) title=(full_iri) { (label) },
+                        None => a href=(href) { (label) },
+                    }
+                },
                 Value::Absent => {}
             }
         }
@@ -311,6 +326,10 @@ mod tests {
                     &[vec![Value::Link {
                         href: "/x\"onmouseover=alert(1)".to_owned(),
                         label: hostile,
+                    }, Value::TermLink {
+                        href: "/term".to_owned(),
+                        label: hostile,
+                        full_iri: Some(hostile),
                     }]],
                 ))
             },
@@ -333,6 +352,7 @@ mod tests {
         // that would end the attribute and start a new one may not.
         assert!(rendered.contains("/a&quot;b"));
         assert!(rendered.contains("/x&quot;onmouseover=alert(1)"));
+        assert!(rendered.contains("title=\"&lt;script&gt;"));
         assert!(
             !rendered.contains("\" onmouseover") && !rendered.contains("\"onmouseover"),
             "an attribute value broke out of its quotes"

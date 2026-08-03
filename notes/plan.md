@@ -660,6 +660,11 @@ not the strings: RFC 3339 spells one instant several ways and two of them sort w
 (a `+01:00` offset, and a fractional second, where `…:00.5Z` sorts *before* `…:00Z`).
 Question 16 asks whether the host should supply the descriptor instead.
 
+The naming boundary is deliberate: the machine-readable dataset descriptor retains
+doc 04 §4.3's `current` field, while its HTML page labels that same release `latest`,
+matching the movable `/{dataset}/latest/…` URL a person can actually use. Internal
+selection code keeps `current` as the protocol/domain name; no human-facing page does.
+
 **`/manifest` opens the bundle.** The bytes are already in memory, so this is not how
 they are fetched — it is so that a version which cannot be served is never described as
 though it can. A client reads `capabilities` here and issues what it finds; advertising
@@ -858,6 +863,15 @@ the `/fragment` carrying it — a truncated page offers the next, and the manife
 lists the operations with links to the three that answer without arguments. Doc 03 §3.6
 asks for "normalized parameter ordering documented so caches hit", so the links this
 server builds are sorted and uniformly escaped.
+
+Result pages abbreviate IRIs through that exact bundle version's manifest prefix map.
+The longest matching namespace wins, with prefix name as the deterministic tie-break;
+the full IRI remains in a native tooltip and in every generated link. Typed-literal
+datatype IRIs receive the same treatment. This is presentation only: JSON stays in doc
+03 §3.4.1's full-IRI term-object form, request summaries preserve the spelling the
+caller supplied, and the manifest's prefix table continues to show full expansions.
+The reverse prefix order is built once beside the forward request map and shared by all
+requests against the immutable release.
 
 **What the unit's review changed.** Four findings were real and one was a question the
 code had answered without recording it.

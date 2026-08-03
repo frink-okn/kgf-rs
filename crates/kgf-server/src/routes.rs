@@ -391,7 +391,12 @@ where
         return not_modified(CachePolicy::Immutable, validator);
     }
 
-    let target = Target::new(id, operation, wants.params().clone());
+    let target = Target::new(
+        id,
+        operation,
+        wants.params().clone(),
+        release.prefixes().clone(),
+    );
     let opened = Arc::clone(&service);
     let rendered = blocking(move || {
         let store = opened.open(target.id())?;
