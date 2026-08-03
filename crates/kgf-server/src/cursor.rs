@@ -374,7 +374,7 @@ pub struct Cursor {
     /// The operation consuming the cursor validates it in the space it names:
     /// selection cardinality, predicate id space, ranked hit, or hdtc scan.
     pub position: u64,
-    /// Row index, for bindings operations (M2).
+    /// Row index, for bindings operations.
     pub binding_index: Option<u32>,
     /// Secondary position: an offset within a ranked hit, or an accumulated
     /// count for an unranked text scan.
@@ -392,6 +392,19 @@ impl Cursor {
             position,
             binding_index: None,
             scan_position: None,
+        }
+    }
+
+    /// A cursor resuming one input row of a bindings fragment.
+    pub fn at_binding(
+        binding: &CursorBinding,
+        binding_index: u32,
+        space: PositionSpace,
+        position: u64,
+    ) -> Self {
+        Self {
+            binding_index: Some(binding_index),
+            ..Self::at(binding, space, position)
         }
     }
 
@@ -494,11 +507,12 @@ impl Cursor {
         // Optional trailers are not independent state. Each current position
         // space has one exact shape; accepting another lets an edited token
         // silently restart a ranked hit or reinterpret a scan accumulator.
-        let shape_is_valid = binding_index.is_none()
-            && match space {
-                PositionSpace::TextRank | PositionSpace::TextScan => scan_position.is_some(),
-                _ => scan_position.is_none(),
-            };
+        let shape_is_valid = match space {
+            PositionSpace::TextRank | PositionSpace::TextScan => {
+                binding_index.is_none() && scan_position.is_some()
+            }
+            _ => scan_position.is_none(),
+        };
         if !shape_is_valid {
             return Err(StaleCursor);
         }
@@ -586,6 +600,7 @@ mod tests {
         );
 
         for cursor in [
+            Cursor::at_binding(&binding(), u32::MAX, PositionSpace::Predicate, 0),
             Cursor::at_rank(&binding(), 7, u64::MAX),
             Cursor::at_text_scan(&binding(), 42, 1_000),
         ] {

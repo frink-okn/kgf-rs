@@ -14,11 +14,9 @@
 //!
 //! HTTP QUERY (RFC 10008) is canonical for body-carrying reads; POST is a
 //! permanent first-class fallback with identical semantics — the one place this
-//! design ships two paths, because the web does. M1 has no body-carrying route,
-//! but the router dispatches on the method rather than filtering to a fixed set,
-//! so a QUERY reaches a handler today: routes that do not take one answer
-//! `method_not_allowed` with an `Allow` header, which is the proof that the
-//! stack can express the method at all.
+//! design ships two paths, because the web does. `/fragment` and `/count`
+//! dispatch QUERY through the router's custom-method fallback; routes that do
+//! not take it answer `method_not_allowed` with an `Allow` header.
 //!
 //! # One URL, two readers
 //!
@@ -28,12 +26,12 @@
 //!
 //! # Status
 //!
-//! Units 10–14 of `notes/plan.md` are implemented: [`cursor`], [`term`],
+//! Units 10–16 of `notes/plan.md` are implemented: [`cursor`], [`term`],
 //! [`envelope`], the URL space with `latest`, caching and content negotiation,
 //! and doc 03 §3.4's four read operations — `/fragment`, `/count`, `/describe`
-//! and `/sample` — in [`request`] and [`answer`]. Bindings QUERY, `/void` and
-//! `/summary` are M2, so a deployment answers useful traffic but does not yet
-//! claim §3.1's core profile.
+//! and `/sample` — plus bindings QUERY/POST for fragment and count in [`request`]
+//! and [`answer`]. `/void` and `/summary` remain before a deployment can claim
+//! §3.1's core profile.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -121,7 +119,7 @@ pub struct Caps {
     pub default_limit: u32,
     /// Members drawn by one `/sample` (doc 03 §3.5's `n ≤ 1000`).
     pub max_sample: u32,
-    /// Input rows in a bindings QUERY (M2).
+    /// Input rows in a bindings QUERY.
     pub max_bindings: u32,
     /// Subjects in a star request (M2).
     pub max_star_subjects: u32,
@@ -140,7 +138,7 @@ impl Caps {
             max_limit: 10_000,
             default_limit: 100,
             max_sample: 1_000,
-            max_bindings: 200,
+            max_bindings: 1_000,
             max_star_subjects: 1_000,
             max_star_width: 32,
         }
@@ -215,10 +213,14 @@ impl Limits<'_> {
                 self.caps.default_limit, self.caps.max_limit
             ));
         }
-        if self.caps.max_limit == 0 || self.caps.max_sample == 0 || self.caps.default_limit == 0 {
+        if self.caps.max_limit == 0
+            || self.caps.max_sample == 0
+            || self.caps.max_bindings == 0
+            || self.caps.default_limit == 0
+        {
             return Err(
-                "caps.max_limit, caps.default_limit and caps.max_sample must be \
-                        at least 1; a page of no rows has no answer that terminates"
+                "caps.max_limit, caps.default_limit, caps.max_sample and caps.max_bindings must be \
+                 at least 1; a page or binding table with no permitted rows is not usable"
                     .to_owned(),
             );
         }
@@ -414,6 +416,10 @@ mod tests {
             },
             Caps {
                 max_sample: 0,
+                ..Caps::new()
+            },
+            Caps {
+                max_bindings: 0,
                 ..Caps::new()
             },
             Caps {

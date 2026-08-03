@@ -33,6 +33,9 @@
 //! its cursor. It also means the binding needs no dictionary, so a cursor is
 //! validated before the bundle opens.
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::Deserialize;
 use serde::ser::{Serialize, SerializeMap, Serializer};
 
 use hdtc::format::TextQuery;
@@ -150,6 +153,40 @@ impl BoundTerm {
             requested: text.to_owned(),
             dictionary: term.to_dictionary().into_owned(),
         })
+    }
+
+    /// Parse either §3.3's compact string or its JSON term-object form.
+    fn parse_body(
+        parameter: &str,
+        value: WireTerm,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+    ) -> Result<Self, Problem> {
+        match value {
+            WireTerm::Text(text) => Self::parse(parameter, &text, limits, prefixes),
+            WireTerm::Object(object) => {
+                let value = serde_json::to_value(object).expect("a term object serializes");
+                let term = Term::from_json(&value).map_err(|error| {
+                    Problem::new(ErrorCode::BadTermSyntax, format!("{parameter}: {error}"))
+                })?;
+                let dictionary = term.to_dictionary().into_owned();
+                let max = limits.budgets.max_term_bytes;
+                if dictionary.len() as u64 > max {
+                    return Err(Problem::new(
+                        ErrorCode::CapExceeded,
+                        format!(
+                            "the term in `{parameter}` is {} bytes in canonical form, over this \
+                             server's max_term_bytes of {max}",
+                            dictionary.len()
+                        ),
+                    ));
+                }
+                Ok(Self {
+                    requested: term.to_request(),
+                    dictionary,
+                })
+            }
+        }
     }
 
     /// The term as the request wrote it.
@@ -440,6 +477,479 @@ impl Candidates {
     pub fn ceiling(self) -> usize {
         usize::try_from(self.0).unwrap_or(usize::MAX)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bindings bodies
+// ---------------------------------------------------------------------------
+
+/// A variable named in a body-carried triple pattern.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Variable(String);
+
+impl Variable {
+    fn parse(text: &str, where_: &str) -> Result<Self, Problem> {
+        let Some(name) = text.strip_prefix('?') else {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "{where_}={} is not a variable; variables begin with `?`",
+                    reflected(text)
+                ),
+            ));
+        };
+        if name.is_empty() || name.chars().any(char::is_whitespace) {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "{where_}={} is not a variable name; put a non-empty name after `?` and \
+                     do not include whitespace",
+                    reflected(text)
+                ),
+            ));
+        }
+        Ok(Self(text.to_owned()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One position of a body-carried pattern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BindingCell {
+    Variable(Variable),
+    Term(BoundTerm),
+}
+
+/// The explicit pattern in a bindings request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingPattern {
+    cells: [BindingCell; 3],
+}
+
+impl BindingPattern {
+    fn parse(wire: WirePattern, limits: Limits<'_>, prefixes: &PrefixMap) -> Result<Self, Problem> {
+        let mut cells = Vec::with_capacity(3);
+        for (position, value) in Position::ALL.into_iter().zip([wire.s, wire.p, wire.o]) {
+            let parameter = format!("pattern.{}", position.as_str());
+            let cell = match value {
+                WireTerm::Text(text) if text.starts_with('?') => {
+                    BindingCell::Variable(Variable::parse(&text, &parameter)?)
+                }
+                term => {
+                    BindingCell::Term(BoundTerm::parse_body(&parameter, term, limits, prefixes)?)
+                }
+            };
+            cells.push(cell);
+        }
+        let cells: [BindingCell; 3] = cells
+            .try_into()
+            .expect("the three positions produce three cells");
+
+        Ok(Self { cells })
+    }
+
+    fn cell(&self, position: Position) -> &BindingCell {
+        &self.cells[position_index(position)]
+    }
+
+    /// The spelling the body used at `position`, for response echoes.
+    pub fn requested(&self, position: Position) -> &str {
+        match self.cell(position) {
+            BindingCell::Variable(variable) => variable.as_str(),
+            BindingCell::Term(term) => term.requested(),
+        }
+    }
+
+    /// Positions reported in each result row.
+    pub fn vars(&self) -> Vec<Position> {
+        Position::ALL
+            .into_iter()
+            .filter(|position| matches!(self.cell(*position), BindingCell::Variable(_)))
+            .collect()
+    }
+
+    fn variables(&self) -> impl Iterator<Item = &Variable> {
+        self.cells.iter().filter_map(|cell| match cell {
+            BindingCell::Variable(variable) => Some(variable),
+            BindingCell::Term(_) => None,
+        })
+    }
+
+    fn repeated_variables(&self) -> BTreeSet<&Variable> {
+        let mut seen = BTreeSet::new();
+        self.variables()
+            .filter(|variable| !seen.insert(*variable))
+            .collect()
+    }
+
+    fn canonicalize(&self, mut output: String) -> String {
+        for (position, cell) in Position::ALL.into_iter().zip(&self.cells) {
+            push_canonical(&mut output, position.as_str());
+            match cell {
+                BindingCell::Variable(variable) => {
+                    output.push('v');
+                    push_canonical(&mut output, variable.as_str());
+                }
+                BindingCell::Term(term) => {
+                    output.push('t');
+                    push_canonical(&mut output, term.dictionary());
+                }
+            }
+        }
+        output
+    }
+}
+
+impl Serialize for BindingPattern {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(3))?;
+        for position in Position::ALL {
+            match self.cell(position) {
+                BindingCell::Variable(variable) => {
+                    map.serialize_entry(position.as_str(), variable.as_str())?;
+                }
+                BindingCell::Term(term) => {
+                    map.serialize_entry(position.as_str(), term.requested())?;
+                }
+            }
+        }
+        map.end()
+    }
+}
+
+/// One input row paired with the pattern it restricts.
+#[derive(Debug, Clone, Copy)]
+pub struct BindingRow<'a> {
+    index: u32,
+    pattern: &'a BindingPattern,
+    columns: &'a BTreeMap<Variable, usize>,
+    values: &'a [BoundTerm],
+}
+
+impl<'a> BindingRow<'a> {
+    /// Zero-based input-row index reported beside every result.
+    pub fn index(self) -> u32 {
+        self.index
+    }
+
+    /// The term this input row fixes at `position`, or `None` when it remains a variable.
+    pub fn bound(self, position: Position) -> Option<&'a BoundTerm> {
+        match self.pattern.cell(position) {
+            BindingCell::Term(term) => Some(term),
+            BindingCell::Variable(variable) => self
+                .columns
+                .get(variable)
+                .map(|column| &self.values[*column]),
+        }
+    }
+}
+
+/// A parsed binding table, with column names already resolved to positions.
+#[derive(Debug)]
+struct Bindings {
+    columns: BTreeMap<Variable, usize>,
+    variables: Vec<Variable>,
+    rows: Vec<Vec<BoundTerm>>,
+}
+
+impl Bindings {
+    fn parse(
+        wire: WireBindings,
+        pattern: &BindingPattern,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+    ) -> Result<Self, Problem> {
+        if wire.rows.len() > limits.caps.max_bindings as usize {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "bindings.rows has {} rows, over this server's max_bindings of {}",
+                    wire.rows.len(),
+                    limits.caps.max_bindings
+                ),
+            ));
+        }
+
+        let pattern_variables: BTreeSet<_> = pattern.variables().map(Variable::as_str).collect();
+        let mut columns = BTreeMap::new();
+        let mut variables = Vec::with_capacity(wire.vars.len());
+        for (column, text) in wire.vars.iter().enumerate() {
+            let variable = Variable::parse(text, &format!("bindings.vars[{column}]"))?;
+            if !pattern_variables.contains(variable.as_str()) {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    format!(
+                        "bindings.vars[{column}] names {}, which is not a variable in the pattern",
+                        reflected(variable.as_str())
+                    ),
+                ));
+            }
+            if columns.insert(variable.clone(), column).is_some() {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    format!(
+                        "bindings.vars contains {} more than once",
+                        reflected(variable.as_str())
+                    ),
+                ));
+            }
+            variables.push(variable);
+        }
+
+        // `?x p ?x` is bounded when every input row fixes `?x`: it becomes a
+        // ground or singly-variable lookup. Left unbound it is an equality
+        // filter over a non-contiguous enumeration, whose rejected candidates
+        // are not bounded by the result limit.
+        for variable in pattern.repeated_variables() {
+            if !columns.contains_key(variable) {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    format!(
+                        "repeated pattern variable {} must be present in bindings.vars; leaving \
+                         it unbound would require an unbudgeted equality scan",
+                        reflected(variable.as_str())
+                    ),
+                ));
+            }
+        }
+
+        let mut rows = Vec::with_capacity(wire.rows.len());
+        for (row_index, wire_row) in wire.rows.into_iter().enumerate() {
+            if wire_row.len() != variables.len() {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    format!(
+                        "bindings.rows[{row_index}] has {} values for {} variables",
+                        wire_row.len(),
+                        variables.len()
+                    ),
+                ));
+            }
+            let mut row = Vec::with_capacity(wire_row.len());
+            for (column, value) in wire_row.into_iter().enumerate() {
+                row.push(BoundTerm::parse_body(
+                    &format!("bindings.rows[{row_index}][{column}]"),
+                    value,
+                    limits,
+                    prefixes,
+                )?);
+            }
+            rows.push(row);
+        }
+
+        Ok(Self {
+            columns,
+            variables,
+            rows,
+        })
+    }
+
+    fn rows<'a>(&'a self, pattern: &'a BindingPattern) -> impl Iterator<Item = BindingRow<'a>> {
+        self.rows
+            .iter()
+            .enumerate()
+            .map(move |(index, values)| BindingRow {
+                index: u32::try_from(index).expect("max_bindings is a u32"),
+                pattern,
+                columns: &self.columns,
+                values,
+            })
+    }
+
+    fn canonicalize(&self, mut output: String) -> String {
+        push_canonical(&mut output, &self.variables.len().to_string());
+        for variable in &self.variables {
+            push_canonical(&mut output, variable.as_str());
+        }
+        push_canonical(&mut output, &self.rows.len().to_string());
+        for row in &self.rows {
+            for term in row {
+                push_canonical(&mut output, term.dictionary());
+            }
+        }
+        output
+    }
+}
+
+/// `QUERY|POST /fragment` — a pattern restricted by an input binding table.
+#[derive(Debug)]
+pub struct BindingFragment {
+    /// The explicit body pattern.
+    pub pattern: BindingPattern,
+    bindings: Bindings,
+    /// Global result-row limit across the whole input table.
+    pub limit: u32,
+    /// Bytes its rows may occupy.
+    pub bytes: ResponseBytes,
+    /// Where to resume, if the body carried a cursor.
+    pub cursor: Option<Cursor>,
+    /// What a cursor this request issues must match.
+    pub binding: CursorBinding,
+}
+
+impl BindingFragment {
+    /// Parse one strict JSON request body.
+    pub fn parse(
+        params: &Params,
+        body: &[u8],
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        bundle: &BundleBinding,
+    ) -> Result<Self, Problem> {
+        accept_only(params, FRAGMENT, &["format"])?;
+        let wire: WireBindingFragment = parse_body(body)?;
+        let pattern = BindingPattern::parse(wire.pattern, limits, prefixes)?;
+        let bindings = Bindings::parse(wire.bindings, &pattern, limits, prefixes)?;
+        let limit = body_page_size(wire.limit, limits)?;
+        let canonical = bindings.canonicalize(pattern.canonicalize(String::new()));
+        let binding = CursorBinding::new(
+            bundle,
+            &CanonicalRequest::new(Operation::Fragment).with("bindings", &canonical),
+        );
+        let cursor = wire
+            .cursor
+            .as_deref()
+            .map(|token| Cursor::decode(token, &binding).map_err(Problem::from))
+            .transpose()?;
+        Ok(Self {
+            pattern,
+            bindings,
+            limit,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            cursor,
+            binding,
+        })
+    }
+
+    /// Input rows in their contractual enumeration order.
+    pub fn rows(&self) -> impl Iterator<Item = BindingRow<'_>> {
+        self.bindings.rows(&self.pattern)
+    }
+}
+
+/// `QUERY|POST /count` — one exact cardinality per input binding row.
+#[derive(Debug)]
+pub struct BindingCount {
+    /// The explicit body pattern.
+    pub pattern: BindingPattern,
+    bindings: Bindings,
+}
+
+impl BindingCount {
+    /// Parse one strict JSON request body.
+    pub fn parse(
+        params: &Params,
+        body: &[u8],
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+    ) -> Result<Self, Problem> {
+        accept_only(params, COUNT, &["format"])?;
+        let wire: WireBindingCount = parse_body(body)?;
+        let pattern = BindingPattern::parse(wire.pattern, limits, prefixes)?;
+        let bindings = Bindings::parse(wire.bindings, &pattern, limits, prefixes)?;
+        Ok(Self { pattern, bindings })
+    }
+
+    /// Input rows in their contractual enumeration order.
+    pub fn rows(&self) -> impl Iterator<Item = BindingRow<'_>> {
+        self.bindings.rows(&self.pattern)
+    }
+}
+
+fn position_index(position: Position) -> usize {
+    match position {
+        Position::Subject => 0,
+        Position::Predicate => 1,
+        Position::Object => 2,
+    }
+}
+
+fn push_canonical(output: &mut String, value: &str) {
+    use std::fmt::Write as _;
+    write!(output, "{}:", value.len()).expect("writing to a String cannot fail");
+    output.push_str(value);
+}
+
+fn body_page_size(value: Option<u32>, limits: Limits<'_>) -> Result<u32, Problem> {
+    let value = value.unwrap_or(limits.caps.default_limit.min(limits.caps.max_limit));
+    if value == 0 {
+        return Err(Problem::new(
+            ErrorCode::MalformedRequest,
+            "limit=0 asks for nothing back; use QUERY /count for cardinalities",
+        ));
+    }
+    if value > limits.caps.max_limit {
+        return Err(Problem::new(
+            ErrorCode::CapExceeded,
+            format!(
+                "limit={value} is over this server's max_limit of {}",
+                limits.caps.max_limit
+            ),
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_body<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, Problem> {
+    serde_json::from_slice(body).map_err(|error| {
+        Problem::new(
+            ErrorCode::MalformedRequest,
+            format!("the JSON request body is malformed: {error}"),
+        )
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireBindingFragment {
+    pattern: WirePattern,
+    bindings: WireBindings,
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireBindingCount {
+    pattern: WirePattern,
+    bindings: WireBindings,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WirePattern {
+    s: WireTerm,
+    p: WireTerm,
+    o: WireTerm,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireBindings {
+    vars: Vec<String>,
+    rows: Vec<Vec<WireTerm>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WireTerm {
+    Text(String),
+    Object(WireTermObject),
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WireTermObject {
+    #[serde(rename = "type")]
+    kind: String,
+    value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lang: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    datatype: Option<String>,
 }
 
 /// `GET /fragment` — a triple pattern, paged (§3.4.1).
@@ -837,6 +1347,10 @@ mod tests {
         Fragment::parse(&params(query), limits(), &prefixes(), &bundle())
     }
 
+    fn binding_fragment(body: &[u8]) -> Result<BindingFragment, Problem> {
+        BindingFragment::parse(&params(""), body, limits(), &prefixes(), &bundle())
+    }
+
     #[test]
     fn a_pattern_reads_both_spellings_and_echoes_the_one_it_was_sent() {
         let request = fragment("s=ex:alice&p=%3Chttp%3A%2F%2Fexample.org%2Fknows%3E").unwrap();
@@ -1013,6 +1527,85 @@ mod tests {
                 "{query}"
             );
         }
+    }
+
+    #[test]
+    fn a_binding_body_is_strict_typed_and_capped() {
+        let body = serde_json::json!({
+            "pattern": {"s": "?person", "p": "ex:knows", "o": "?known"},
+            "bindings": {
+                "vars": ["?person"],
+                "rows": [[{"type": "iri", "value": "http://example.org/alice"}]]
+            },
+            "limit": 7
+        });
+        let parsed = binding_fragment(&serde_json::to_vec(&body).unwrap()).unwrap();
+        assert_eq!(parsed.limit, 7);
+        let row = parsed.rows().next().unwrap();
+        assert_eq!(row.index(), 0);
+        assert_eq!(
+            row.bound(Position::Subject).unwrap().dictionary(),
+            "http://example.org/alice"
+        );
+        assert_eq!(row.bound(Position::Object), None);
+
+        let unknown = br#"{
+            "pattern":{"s":"?s","p":"ex:p","o":"?o"},
+            "bindings":{"vars":[],"rows":[]},
+            "surprise":true
+        }"#;
+        assert_eq!(
+            binding_fragment(unknown).unwrap_err().code(),
+            ErrorCode::MalformedRequest
+        );
+
+        let duplicate = br#"{
+            "pattern":{"s":"?s","p":"ex:p","o":"?o"},
+            "bindings":{"vars":[],"vars":[],"rows":[]}
+        }"#;
+        assert_eq!(
+            binding_fragment(duplicate).unwrap_err().code(),
+            ErrorCode::MalformedRequest
+        );
+
+        let rows = vec![Vec::<String>::new(); CAPS.max_bindings as usize + 1];
+        let over = serde_json::json!({
+            "pattern": {"s": "?s", "p": "ex:p", "o": "?o"},
+            "bindings": {"vars": [], "rows": rows}
+        });
+        assert_eq!(
+            binding_fragment(&serde_json::to_vec(&over).unwrap())
+                .unwrap_err()
+                .code(),
+            ErrorCode::CapExceeded
+        );
+    }
+
+    #[test]
+    fn binding_variables_must_describe_a_bounded_pattern() {
+        for body in [
+            serde_json::json!({
+                "pattern": {"s": "?s", "p": "ex:p", "o": "?o"},
+                "bindings": {"vars": ["?missing"], "rows": [["ex:a"]]}
+            }),
+            serde_json::json!({
+                "pattern": {"s": "?same", "p": "ex:p", "o": "?same"},
+                "bindings": {"vars": [], "rows": [[]]}
+            }),
+        ] {
+            assert_eq!(
+                binding_fragment(&serde_json::to_vec(&body).unwrap())
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::MalformedRequest
+            );
+        }
+
+        let bounded = serde_json::json!({
+            "pattern": {"s": "?same", "p": "ex:p", "o": "?same"},
+            "bindings": {"vars": ["?same"], "rows": [["ex:a"]]}
+        });
+        assert!(binding_fragment(&serde_json::to_vec(&bounded).unwrap()).is_ok());
     }
 
     #[test]

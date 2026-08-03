@@ -51,6 +51,7 @@ bounded-cost guarantee, and it is the fallback that gets neither.
 
 ## Status
 
-Skeleton. Module boundaries and public shapes are settled; the bodies are not
-written, and every unimplemented entry point says so rather than returning a
-plausible wrong answer.
+The mapped read layer and HTTP server are operational. `kgf serve` answers all eight
+triple-pattern shapes, exact counts, describe, sample, `o.text`, and bindings-restricted
+QUERY/POST fragment and count requests with bounded paging and stable cursors. `/void`
+and `/summary` remain before this implementation can claim doc 03's core profile.

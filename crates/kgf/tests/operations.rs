@@ -134,6 +134,78 @@ fn exhaustive_paging_at_adversarial_sizes_yields_each_row_once() {
 }
 
 #[test]
+fn bindings_enumerate_in_input_order_page_globally_and_count_per_row() {
+    let served = Served::new();
+    let store = served.store();
+    let mut body = serde_json::json!({
+        "pattern": {"s": "?person", "p": "ex:knows", "o": "?known"},
+        "bindings": {
+            "vars": ["?person"],
+            "rows": [["ex:alice"], ["ex:bob"], ["ex:missing"]]
+        },
+        "limit": 1
+    });
+
+    let mut found = Vec::new();
+    loop {
+        let page = served.binding_fragment(&store, &body);
+        assert_eq!(
+            page["cardinality"],
+            serde_json::json!({"value": 3, "exact": true})
+        );
+        for row in page["rows"].as_array().unwrap() {
+            found.push((
+                row["binding"].as_u64().unwrap(),
+                row["o"]["value"].as_str().unwrap().to_owned(),
+            ));
+        }
+        match page["next"].as_str() {
+            Some(cursor) => body["cursor"] = serde_json::json!(cursor),
+            None => break,
+        }
+    }
+    assert_eq!(
+        found,
+        vec![
+            (0, "http://example.org/bob".to_owned()),
+            (0, "http://example.org/carol".to_owned()),
+            (1, "http://example.org/alice".to_owned()),
+        ]
+    );
+
+    let counted = served.binding_count(&store, &body);
+    assert_eq!(
+        counted["counts"],
+        serde_json::json!([
+            {"binding": 0, "count": {"value": 2, "exact": true}},
+            {"binding": 1, "count": {"value": 1, "exact": true}},
+            {"binding": 2, "count": {"value": 0, "exact": true}},
+        ])
+    );
+}
+
+#[test]
+fn a_binding_cursor_can_start_the_first_predicate_of_the_next_row() {
+    let served = Served::new();
+    let store = served.store();
+    let mut body = serde_json::json!({
+        "pattern": {"s": "?s", "p": "?p", "o": "?o"},
+        "bindings": {
+            "vars": ["?s", "?o"],
+            "rows": [["ex:alice", "ex:alice"], ["ex:bob", "ex:alice"]]
+        },
+        "limit": 1
+    });
+    let first = served.binding_fragment(&store, &body);
+    assert_eq!(first["rows"][0]["binding"], 0);
+    body["cursor"] = first["next"].clone();
+    let second = served.binding_fragment(&store, &body);
+    assert_eq!(second["rows"][0]["binding"], 1);
+    assert_eq!(second["rows"][0]["p"]["value"], "http://example.org/knows");
+    assert_eq!(second["complete"], true);
+}
+
+#[test]
 fn a_cursor_past_the_end_is_stale_rather_than_an_empty_last_page() {
     // Unit 10 left this to unit 14 because it needs the store, and it is two
     // rules rather than one: a permutation position is an offset bounded by the
@@ -1057,6 +1129,60 @@ impl Served {
         let answer = answer::count(store, self.target("count", query), &request)
             .unwrap_or_else(|error| panic!("GET /count?{query}: {error}"));
         json(answer, Representation::Json)
+    }
+
+    fn binding_fragment(&self, store: &Store, body: &serde_json::Value) -> serde_json::Value {
+        let encoded = serde_json::to_vec(body).expect("a JSON body");
+        let request = request::BindingFragment::parse(
+            &params(""),
+            &encoded,
+            self.limits(),
+            self.release().prefixes(),
+            &self.release().binding(),
+        )
+        .expect("a bindings fragment request");
+        json(
+            answer::binding_fragment(
+                store,
+                Target::body(
+                    self.id(),
+                    "fragment",
+                    params(""),
+                    self.release().prefixes().clone(),
+                ),
+                &request,
+            )
+            .expect("a bindings fragment answer"),
+            Representation::Json,
+        )
+    }
+
+    fn binding_count(&self, store: &Store, body: &serde_json::Value) -> serde_json::Value {
+        let mut body = body.clone();
+        body.as_object_mut().unwrap().remove("limit");
+        body.as_object_mut().unwrap().remove("cursor");
+        let encoded = serde_json::to_vec(&body).expect("a JSON body");
+        let request = request::BindingCount::parse(
+            &params(""),
+            &encoded,
+            self.limits(),
+            self.release().prefixes(),
+        )
+        .expect("a bindings count request");
+        json(
+            answer::binding_count(
+                store,
+                Target::body(
+                    self.id(),
+                    "count",
+                    params(""),
+                    self.release().prefixes().clone(),
+                ),
+                &request,
+            )
+            .expect("a bindings count answer"),
+            Representation::Json,
+        )
     }
 
     fn describe(&self, store: &Store, query: &str) -> serde_json::Value {

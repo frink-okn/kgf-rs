@@ -29,7 +29,7 @@ Source/
 |---|---|
 | `kgf-store` | The memory-mapped read layer (doc 20). No HTTP, no async, no locks on the read path. |
 | `kgf-server` | The HTTP API (doc 03) over `kgf-store`: caps, budgets, cursors, formats. |
-| `kgf` | The binary. `kgf manifest` now, `kgf serve` next; `kgf build` when `kgf-build` lands. |
+| `kgf` | The binary. `kgf manifest` and `kgf serve` now; `kgf build` when `kgf-build` lands. |
 
 **Status: M1 is built and answers.** `kgf-store` implements doc 20's read layer in
 full — mapped bundles, dictionary, all eight patterns with exact counts and positional
@@ -39,12 +39,14 @@ cache), `envelope` (§3.6's completeness vocabulary and RFC 9457 errors),
 `representation` (negotiation, caching, ETags), `html`, and `request` (§3.4's parameters
 in, typed requests out) — over a real axum listener serving doc 03 §3.2's URL space:
 `/`, `/{dataset}`, the `latest` redirect, `/manifest`, and the four read operations
-`/fragment`, `/count`, `/describe` and `/sample` in `answer`. `kgf serve` runs it.
+`/fragment`, `/count`, `/describe` and `/sample` in `answer`. Bindings-restricted
+QUERY and POST are implemented on `/fragment`, with per-binding QUERY/POST `/count`.
+`kgf serve` runs it.
 
-**M1 is not doc 03 §3.1's core profile**, and the two read like the same set. Missing
-from it: bindings QUERY (§3.4.2), `/void` and `/summary`. Present and *not* in it:
-`/sample` and `o.text`, both optional capabilities. So a deployment answers useful
-traffic and cannot yet claim conformance — that arrives with M2 (doc 20 §20.8).
+**M1 is not doc 03 §3.1's core profile**, and the two read like the same set. Bindings
+QUERY (§3.4.2) is now implemented past M1; `/void` and `/summary` remain missing.
+Present and *not* in M1: `/sample` and `o.text`, both optional capabilities. So a
+deployment answers useful traffic and cannot yet claim conformance.
 
 A bundle carrying `data.hdt.text` (built by `hdtc text`) declares `search` and answers
 `o.text` on `/fragment` and `/count`: a ranked constraint on the object position,
@@ -59,8 +61,8 @@ compile.
 returning a plausible wrong answer. Do not replace one with a stub that returns a
 default.
 
-**`notes/plan.md` is the implementation route** — units 1–14, all complete, through
-doc 20 §20.8's M1, the decisions each one had to make, and the **Questions for `../kgf`**
+**`notes/plan.md` is the implementation route** — units 1–16, all complete, through
+doc 20 §20.8's M1, `o.text`, and bindings, plus the decisions each one had to make and the **Questions for `../kgf`**
 that implementation surfaced. It is kept current; read it before planning work.
 `notes/state.md` is a point-in-time handoff, written at a moment and not maintained
 afterwards, so where the two disagree about what exists, `plan.md` and the code win.

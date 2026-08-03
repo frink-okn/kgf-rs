@@ -46,6 +46,7 @@ fn the_url_space_answers_over_a_real_listener() {
     let descriptor = root.json();
     assert_eq!(descriptor["datasets"], serde_json::json!(["atlas", "tox"]));
     assert_eq!(descriptor["caps"]["max_limit"], 10_000);
+    assert_eq!(descriptor["caps"]["max_bindings"], 1_000);
     assert_eq!(descriptor["implementation"]["protocol"], "1");
 
     // `/{dataset}` — the release history, and which release is current.
@@ -168,12 +169,8 @@ fn latest_redirects_to_the_current_version_and_keeps_the_method() {
 
 #[test]
 fn an_extension_method_reaches_the_router_with_its_name_intact() {
-    // The decision this unit exists to make. M1 has no body-carrying route, so
-    // the only way to know that RFC 10008 is expressible on this stack — rather
-    // than to discover in M2 that it is not — is to send one and see what comes
-    // back. A stack that could not carry the method would answer 400 from the
-    // parser, or normalize it away; a coded 405 naming the method means hyper
-    // parsed it, axum routed it, and the handler slot for it exists.
+    // A resource that does not accept QUERY still has to receive the method
+    // intact in order to name it in its coded 405.
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
     let server = deployment.serve();
@@ -198,6 +195,106 @@ fn an_extension_method_reaches_the_router_with_its_name_intact() {
     head.assert_status(200);
     head.assert_header("content-type", "application/json");
     assert!(head.body.is_empty(), "a HEAD response carries no body");
+}
+
+#[test]
+fn bindings_query_and_post_answer_over_the_wire() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let path = "/tox/v/v1/fragment";
+    let mut body = serde_json::json!({
+        "pattern": {"s": "?person", "p": "ex:knows", "o": "?known"},
+        "bindings": {"vars": ["?person"], "rows": [["ex:alice"], ["ex:bob"]]},
+        "limit": 1
+    });
+    let encoded = serde_json::to_vec(&body).unwrap();
+
+    let query = server.request_with_body(
+        "QUERY",
+        path,
+        &[("Content-Type", "application/json")],
+        &encoded,
+    );
+    query.assert_status(200);
+    query.assert_header("accept-query", "application/json");
+    query.assert_cache_control(&["public", "max-age=31536000", "immutable"]);
+    assert_eq!(query.json()["rows"][0]["binding"], 0);
+    let next = query.json()["next"].as_str().unwrap().to_owned();
+    let etag = query
+        .header("etag")
+        .expect("a QUERY response carries an ETag");
+    let unchanged = server.request_with_body(
+        "QUERY",
+        path,
+        &[
+            ("Content-Type", "application/json"),
+            ("If-None-Match", etag.as_str()),
+        ],
+        &encoded,
+    );
+    unchanged.assert_status(304);
+    unchanged.assert_header("accept-query", "application/json");
+
+    body["cursor"] = serde_json::json!(next);
+    let resumed_body = serde_json::to_vec(&body).unwrap();
+    let resumed = server.request_with_body(
+        "QUERY",
+        path,
+        &[("Content-Type", "application/json")],
+        &resumed_body,
+    );
+    resumed.assert_status(200);
+    assert_eq!(resumed.json()["rows"][0]["binding"], 1);
+    assert_eq!(resumed.json()["complete"], true);
+
+    let post = server.request_with_body(
+        "POST",
+        path,
+        &[
+            ("Content-Type", "application/json; charset=utf-8"),
+            ("If-None-Match", etag.as_str()),
+        ],
+        &encoded,
+    );
+    post.assert_status(200);
+    post.assert_cache_control(&["no-store"]);
+    assert_eq!(post.json()["rows"][0], query.json()["rows"][0]);
+
+    let count_body = serde_json::json!({
+        "pattern": {"s": "?person", "p": "ex:knows", "o": "?known"},
+        "bindings": {"vars": ["?person"], "rows": [["ex:alice"], ["ex:bob"]]}
+    });
+    let counted = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/count",
+        &[("Content-Type", "application/json")],
+        &serde_json::to_vec(&count_body).unwrap(),
+    );
+    counted.assert_status(200);
+    assert_eq!(
+        counted.json()["counts"],
+        serde_json::json!([
+            {"binding": 0, "count": {"value": 1, "exact": true}},
+            {"binding": 1, "count": {"value": 1, "exact": true}}
+        ])
+    );
+
+    let wrong_type =
+        server.request_with_body("QUERY", path, &[("Content-Type", "text/plain")], &encoded);
+    wrong_type.assert_status(415);
+    wrong_type.assert_header("accept-query", "application/json");
+    assert_eq!(wrong_type.json()["code"], "unsupported_media_type");
+
+    server
+        .get(path)
+        .assert_header("accept-query", "application/json");
+    let refused = server.request("PUT", path, &[]);
+    refused.assert_status(405);
+    assert!(refused.header("allow").unwrap().contains("QUERY"));
+    server
+        .request("PUT", &format!("{path}?bad=%"), &[])
+        .assert_status(405);
 }
 
 #[test]

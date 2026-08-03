@@ -29,8 +29,8 @@ clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 
 # The HTTP stack (unit 13). axum is doc 20 §20.4's suggestion and survives the
-# QUERY spike: hyper parses an extension method and axum routes it, so RFC
-# 10008 is expressible rather than something M2 discovers is impossible.
+# QUERY support: hyper parses the extension method and axum routes it through
+# the custom-method fallback used by the body-carrying operations.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "original-uri"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros"] }
 tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }

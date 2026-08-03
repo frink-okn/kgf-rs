@@ -40,7 +40,7 @@
 //! answer legitimately resumes at predicate 37.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use bytes::Bytes;
@@ -59,7 +59,8 @@ use crate::envelope::{BudgetReason, Cardinality, Completeness, ErrorCode, Proble
 use crate::html::{Crumb, Resource, Value, fields, json_body, note, page, table};
 use crate::representation::Representation;
 use crate::request::{
-    self, BoundTerm, Candidates, Direction, Pattern, Position, ResponseBytes, TextFilter,
+    self, BindingPattern, BindingRow, BoundTerm, Candidates, Direction, Pattern, Position,
+    ResponseBytes, TextFilter,
 };
 use crate::term::{PrefixMap, Term, TermCache};
 use crate::url::{self, Params};
@@ -80,6 +81,7 @@ pub struct Target {
     operation: &'static str,
     params: Params,
     prefixes: PrefixMap,
+    body: bool,
 }
 
 impl Target {
@@ -91,6 +93,23 @@ impl Target {
             operation,
             params,
             prefixes,
+            body: false,
+        }
+    }
+
+    /// A body-addressed operation, whose request cannot be reconstructed as a link.
+    pub fn body(
+        id: BundleId,
+        operation: &'static str,
+        params: Params,
+        prefixes: PrefixMap,
+    ) -> Self {
+        Self {
+            id,
+            operation,
+            params,
+            prefixes,
+            body: true,
         }
     }
 
@@ -109,13 +128,13 @@ impl Target {
     /// already carried `format=html` would come back with the parameter twice —
     /// which this server's own parser refuses. Dropping it is also the more
     /// honest reading of "canonical": one resource, several representations.
-    fn canonical(&self) -> String {
-        query(self.base(), &self.params.without("format"))
+    fn canonical(&self) -> Option<String> {
+        (!self.body).then(|| query(self.base(), &self.params.without("format")))
     }
 
     /// The same request, resumed at `token`.
-    fn next(&self, token: &str) -> String {
-        query(self.base(), &self.params.with("cursor", token))
+    fn next(&self, token: &str) -> Option<String> {
+        (!self.body).then(|| query(self.base(), &self.params.with("cursor", token)))
     }
 
     /// A one-parameter request against another operation of the same bundle,
@@ -195,6 +214,9 @@ const SCORE: &str = "score";
 /// The key a text-ranked row reports *how* it matched under (doc 03 §3.4.5).
 const MATCH_KIND: &str = "match_kind";
 
+/// The input-row index carried by a bindings result (§3.4.2).
+const BINDING: &str = "binding";
+
 /// How a text hit matched, in §3.4.5's vocabulary.
 ///
 /// Emitted beside `score` because without it the score is misleading. hdtc
@@ -224,6 +246,7 @@ fn match_kind(kind: hdtc::format::MatchKind) -> &'static str {
 #[derive(Debug)]
 pub struct Row {
     cells: Vec<(Position, Rc<str>)>,
+    binding: Option<u32>,
     direction: Option<Direction>,
     ranking: Option<Ranking>,
     serialized: u64,
@@ -244,6 +267,9 @@ impl Serialize for Row {
     /// §3.4.1's row: one key per variable, each a term object.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
+        if let Some(binding) = self.binding {
+            map.serialize_entry(BINDING, &binding)?;
+        }
         for (position, text) in &self.cells {
             map.serialize_entry(position.as_str(), &Term::from_dictionary(text))?;
         }
@@ -276,11 +302,16 @@ impl Row {
     fn new(
         cells: Vec<(Position, Rc<str>)>,
         terms: u64,
+        binding: Option<u32>,
         direction: Option<Direction>,
         ranking: Option<Ranking>,
     ) -> Self {
         let mut entries = cells.len() as u64;
         let mut serialized = 2 + terms;
+        if let Some(binding) = binding {
+            entries += 1;
+            serialized += quoted_key(BINDING) + binding.to_string().len() as u64;
+        }
         for (position, _) in &cells {
             serialized += quoted_key(position.as_str());
         }
@@ -300,6 +331,7 @@ impl Row {
         }
         Self {
             cells,
+            binding,
             direction,
             ranking,
             serialized: serialized + entries.saturating_sub(1),
@@ -343,6 +375,9 @@ enum Echo {
     Fragment {
         pattern: Pattern,
     },
+    BindingsFragment {
+        pattern: BindingPattern,
+    },
     Describe {
         resource: String,
         direction: Direction,
@@ -380,6 +415,8 @@ pub struct Answer {
     completeness: Completeness,
     #[serde(skip)]
     directed: bool,
+    #[serde(skip)]
+    bindings: bool,
     #[serde(skip)]
     target: Target,
 }
@@ -431,6 +468,39 @@ impl Renders for CountAnswer {
     }
 }
 
+/// One exact count produced for an input binding row.
+#[derive(Debug, Serialize)]
+struct PerBindingCount {
+    binding: u32,
+    count: Cardinality,
+}
+
+/// `QUERY|POST /count`'s per-binding response (§3.4.4).
+#[derive(Debug, Serialize)]
+pub struct BindingCountAnswer {
+    dataset: String,
+    version: String,
+    pattern: BindingPattern,
+    counts: Vec<PerBindingCount>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+}
+
+impl Renders for BindingCountAnswer {
+    fn render(self, representation: Representation) -> Rendered {
+        let body = match representation {
+            Representation::Json => self.to_json(),
+            Representation::Html => Bytes::from(self.to_html()),
+        };
+        Rendered {
+            body,
+            completeness: self.completeness,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The operations
 // ---------------------------------------------------------------------------
@@ -457,6 +527,7 @@ pub fn fragment(
         echo,
         vars,
         directed: false,
+        bindings: false,
         absent_terms: Vec::new(),
     };
 
@@ -566,6 +637,73 @@ pub fn count(
         count,
         absent_terms,
         completeness,
+        target,
+    })
+}
+
+/// `QUERY|POST /fragment` — enumerate one pattern for each input binding row.
+pub fn binding_fragment(
+    store: &Store,
+    target: Target,
+    request: &request::BindingFragment,
+) -> Result<Answer, Problem> {
+    let dictionary = store.dict();
+    let mut cache = LookupCache::new(dictionary);
+    let mut phases = Vec::new();
+    for row in request.rows() {
+        let Some(ids) = resolve_binding(&mut cache, row)? else {
+            continue;
+        };
+        phases.push(binding_phase(select(store, ids)?, row.index()));
+    }
+
+    paged(
+        &dictionary,
+        target,
+        Envelope {
+            echo: Echo::BindingsFragment {
+                pattern: request.pattern.clone(),
+            },
+            vars: request.pattern.vars(),
+            directed: false,
+            bindings: true,
+            absent_terms: Vec::new(),
+        },
+        phases,
+        Paging {
+            cursor: request.cursor.as_ref(),
+            limit: request.limit,
+            bytes: request.bytes,
+            binding: &request.binding,
+        },
+    )
+}
+
+/// `QUERY|POST /count` — one exact count for each input binding row.
+pub fn binding_count(
+    store: &Store,
+    target: Target,
+    request: &request::BindingCount,
+) -> Result<BindingCountAnswer, Problem> {
+    let dictionary = store.dict();
+    let mut cache = LookupCache::new(dictionary);
+    let mut counts = Vec::new();
+    for row in request.rows() {
+        let value = match resolve_binding(&mut cache, row)? {
+            Some(ids) => select(store, ids)?.count().value,
+            None => 0,
+        };
+        counts.push(PerBindingCount {
+            binding: row.index(),
+            count: Cardinality::exact(value),
+        });
+    }
+    Ok(BindingCountAnswer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        pattern: request.pattern.clone(),
+        counts,
+        completeness: Completeness::complete(),
         target,
     })
 }
@@ -706,6 +844,7 @@ pub fn describe(
             // `/fragment` it wraps.
             vars: Position::ALL.to_vec(),
             directed: true,
+            bindings: false,
             absent_terms,
         },
         phases,
@@ -744,6 +883,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
             space: PositionSpace::Spo,
             resume: 0,
             scan: None,
+            binding_index: None,
             direction: None,
             ranking: None,
         })
@@ -771,6 +911,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
             Some(_) => Completeness::budget_exhausted_without_resume(BudgetReason::ResponseBytes),
         },
         directed: false,
+        bindings: false,
         target,
     })
 }
@@ -784,6 +925,7 @@ struct Phase<'a> {
     selection: Selection<'a>,
     space: PositionSpace,
     count: u64,
+    binding_index: Option<u32>,
     direction: Option<Direction>,
 }
 
@@ -792,7 +934,18 @@ fn phase(selection: Selection<'_>, direction: Option<Direction>) -> Phase<'_> {
         space: PositionSpace::of(&selection),
         count: selection.count().value,
         selection,
+        binding_index: None,
         direction,
+    }
+}
+
+fn binding_phase(selection: Selection<'_>, binding_index: u32) -> Phase<'_> {
+    Phase {
+        space: PositionSpace::of(&selection),
+        count: selection.count().value,
+        selection,
+        binding_index: Some(binding_index),
+        direction: None,
     }
 }
 
@@ -811,6 +964,7 @@ struct Step {
     /// this hit's statements come before this row. `None` in every space whose
     /// position is a single number.
     scan: Option<u64>,
+    binding_index: Option<u32>,
     direction: Option<Direction>,
     ranking: Option<Ranking>,
 }
@@ -827,6 +981,12 @@ impl Step {
             PositionSpace::TextRank => {
                 Cursor::at_rank(binding, self.resume, self.scan.unwrap_or(0))
             }
+            space if self.binding_index.is_some() => Cursor::at_binding(
+                binding,
+                self.binding_index.expect("checked above"),
+                space,
+                self.resume,
+            ),
             space => Cursor::at(binding, space, self.resume),
         }
         .encode()
@@ -974,6 +1134,7 @@ fn ranked(
                     space: PositionSpace::TextRank,
                     resume: rank as u64,
                     scan: Some(at),
+                    binding_index: None,
                     direction: None,
                     ranking: Some(Ranking {
                         score: hit.score,
@@ -1042,6 +1203,57 @@ fn locate(
         .map_err(|error| unreadable("looking a term up", &error))
 }
 
+/// Dictionary probes shared by all rows of one binding table.
+struct LookupCache<'a> {
+    dictionary: Dictionary<'a>,
+    found: HashMap<(Role, String), Option<u64>>,
+}
+
+impl<'a> LookupCache<'a> {
+    fn new(dictionary: Dictionary<'a>) -> Self {
+        Self {
+            dictionary,
+            found: HashMap::new(),
+        }
+    }
+
+    fn locate(&mut self, role: Role, term: &BoundTerm) -> Result<Option<u64>, Problem> {
+        let key = (role, term.dictionary().to_owned());
+        if let Some(found) = self.found.get(&key) {
+            return Ok(*found);
+        }
+        let found = locate(&self.dictionary, role, term)?;
+        self.found.insert(key, found);
+        Ok(found)
+    }
+}
+
+/// Resolve one body row entirely into this bundle's role-scoped id spaces.
+fn resolve_binding(
+    cache: &mut LookupCache<'_>,
+    row: BindingRow<'_>,
+) -> Result<Option<IdPattern>, Problem> {
+    let mut ids = IdPattern {
+        subject: None,
+        predicate: None,
+        object: None,
+    };
+    for position in Position::ALL {
+        let Some(term) = row.bound(position) else {
+            continue;
+        };
+        let Some(id) = cache.locate(position.role(), term)? else {
+            return Ok(None);
+        };
+        match position {
+            Position::Subject => ids.subject = Some(id),
+            Position::Predicate => ids.predicate = Some(id),
+            Position::Object => ids.object = Some(id),
+        }
+    }
+    Ok(Some(ids))
+}
+
 fn select(store: &Store, ids: IdPattern) -> Result<Selection<'_>, Problem> {
     // Every id here came out of this bundle's own dictionary, so the only error
     // `resolve` defines — an id outside its role's space — is unreachable.
@@ -1055,6 +1267,7 @@ struct Envelope {
     echo: Echo,
     vars: Vec<Position>,
     directed: bool,
+    bindings: bool,
     absent_terms: Vec<&'static str>,
 }
 
@@ -1164,6 +1377,7 @@ fn finish(
         echo,
         vars,
         directed,
+        bindings,
         absent_terms,
     } = envelope;
 
@@ -1199,6 +1413,7 @@ fn finish(
         vars,
         completeness,
         directed,
+        bindings,
         target,
     })
 }
@@ -1265,7 +1480,9 @@ fn walk(
         Some(cursor) => {
             let index = phases
                 .iter()
-                .position(|phase| phase.space == cursor.space)
+                .position(|phase| {
+                    phase.space == cursor.space && phase.binding_index == cursor.binding_index
+                })
                 .ok_or_else(|| Problem::from(StaleCursor))?;
             (index, resume_position(cursor, &phases[index], predicates)?)
         }
@@ -1285,6 +1502,7 @@ fn walk(
                     space: phase.space,
                     resume,
                     scan: None,
+                    binding_index: phase.binding_index,
                     direction: phase.direction,
                     ranking: None,
                 }),
@@ -1322,16 +1540,21 @@ fn positioned<'a>(
 /// Where a cursor resumes this phase, or `stale_cursor`.
 fn resume_position(cursor: &Cursor, phase: &Phase<'_>, predicates: u64) -> Result<u64, Problem> {
     let stale = || Problem::from(StaleCursor);
-    // No M1 operation issues a token carrying either trailer *in this space* —
-    // `scan_position` belongs to `TextRank`, which is not a phase — so one that
-    // does was not issued by the request it arrived on.
-    if cursor.binding_index.is_some() || cursor.scan_position.is_some() {
+    // A phase's binding trailer must match it exactly; `scan_position` belongs
+    // to text spaces, which are not phases. Any other shape was not issued by
+    // the request it arrived on.
+    if cursor.binding_index != phase.binding_index || cursor.scan_position.is_some() {
         return Err(stale());
     }
     // A position past the end would otherwise page to an empty response, which
     // a client reads as the end of results rather than as a bad token.
     let within = match phase.space {
-        PositionSpace::Predicate => (1..=predicates).contains(&cursor.position),
+        PositionSpace::Predicate => {
+            (1..=predicates).contains(&cursor.position)
+                // At a binding-row boundary there is no previous predicate;
+                // zero is the sentinel for the first result of the new row.
+                || (cursor.position == 0 && phase.binding_index.is_some())
+        }
         _ => cursor.position < phase.count,
     };
     within.then_some(cursor.position).ok_or_else(stale)
@@ -1384,7 +1607,13 @@ fn materialize(
             terms += serialized;
             cells.push((*position, text));
         }
-        let row = Row::new(cells, terms, step.direction, step.ranking);
+        let row = Row::new(
+            cells,
+            terms,
+            step.binding_index,
+            step.direction,
+            step.ranking,
+        );
 
         spent = spent.saturating_add(row.serialized);
         // Never on the first row of a page. A single term larger than the whole
@@ -1542,6 +1771,9 @@ impl Resource for Answer {
             .map(|row| row.iter().map(Cell::value).collect())
             .collect();
         let mut headers: Vec<&str> = self.vars.iter().map(|var| var.as_str()).collect();
+        if self.bindings {
+            headers.insert(0, BINDING);
+        }
         if self.directed {
             headers.push("direction");
         }
@@ -1549,10 +1781,11 @@ impl Resource for Answer {
             headers.extend([SCORE, MATCH_KIND]);
         }
 
+        let canonical = self.target.canonical();
         page(
             &self.target.title(),
             &self.target.crumbs(),
-            Some(&self.target.canonical()),
+            canonical.as_deref(),
             html! {
                 (fields(&self.summary()))
                 @if !self.absent_terms.is_empty() {
@@ -1564,7 +1797,7 @@ impl Resource for Answer {
                 }
 
                 h2 { "Rows" }
-                @if self.vars.is_empty() {
+                @if self.vars.is_empty() && !self.bindings {
                     (note(
                         "Every position is bound, so a row has nothing to report beyond its own \
                          existence; the cardinality above is the answer."
@@ -1576,7 +1809,11 @@ impl Resource for Answer {
                 }
 
                 @if let Some(token) = self.completeness.next_cursor() {
-                    p { a href=(self.target.next(token)) { "Next page →" } }
+                    @if let Some(next) = self.target.next(token) {
+                        p { a href=(next) { "Next page →" } }
+                    } @else {
+                        (note("Put this cursor in the same JSON request body to fetch the next page."))
+                    }
                 }
             },
         )
@@ -1588,6 +1825,7 @@ impl Answer {
     fn summary(&self) -> Vec<(&str, Value<'_>)> {
         let mut summary = match &self.echo {
             Echo::Fragment { pattern } => pattern_fields(pattern),
+            Echo::BindingsFragment { pattern } => binding_pattern_fields(pattern),
             Echo::Describe {
                 resource,
                 direction,
@@ -1619,11 +1857,19 @@ impl Answer {
         self.rows
             .iter()
             .map(|row| {
-                let mut cells: Vec<_> = row
-                    .cells
-                    .iter()
-                    .map(|(position, text)| self.cell(*position, text))
-                    .collect();
+                let mut cells = Vec::new();
+                if let Some(binding) = row.binding {
+                    cells.push(Cell {
+                        label: binding.to_string(),
+                        href: None,
+                        full_iri: None,
+                    });
+                }
+                cells.extend(
+                    row.cells
+                        .iter()
+                        .map(|(position, text)| self.cell(*position, text)),
+                );
                 if let Some(direction) = row.direction {
                     cells.push(Cell {
                         label: direction.as_str().to_owned(),
@@ -1683,10 +1929,11 @@ impl Resource for CountAnswer {
             Value::Text(if self.count.is_exact() { "yes" } else { "no" }),
         ));
 
+        let canonical = self.target.canonical();
         page(
             &self.target.title(),
             &self.target.crumbs(),
-            Some(&self.target.canonical()),
+            canonical.as_deref(),
             html! {
                 (fields(&summary))
                 @if !self.absent_terms.is_empty() {
@@ -1713,7 +1960,44 @@ impl Resource for CountAnswer {
                     )) { "The rows themselves →" }
                 }
                 @if let Some(token) = self.completeness.next_cursor() {
-                    p { a href=(self.target.next(token)) { "Continue counting →" } }
+                    @if let Some(next) = self.target.next(token) {
+                        p { a href=(next) { "Continue counting →" } }
+                    }
+                }
+            },
+        )
+    }
+}
+
+impl Resource for BindingCountAnswer {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let rows: Vec<Vec<Value<'_>>> = self
+            .counts
+            .iter()
+            .map(|item| {
+                vec![
+                    Value::Number(u64::from(item.binding)),
+                    Value::Number(item.count.value()),
+                    Value::Text(if item.count.is_exact() { "yes" } else { "no" }),
+                ]
+            })
+            .collect();
+        let canonical = self.target.canonical();
+        page(
+            &self.target.title(),
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                (fields(&binding_pattern_fields(&self.pattern)))
+                h2 { "Counts" }
+                @if rows.is_empty() {
+                    (note("No input binding rows."))
+                } @else {
+                    (table(&[BINDING, "count", "exact"], &rows))
                 }
             },
         )
@@ -1737,6 +2021,13 @@ fn pattern_fields(pattern: &Pattern) -> Vec<(&str, Value<'_>)> {
         fields.push(("o.text", Value::Code(text.query())));
     }
     fields
+}
+
+fn binding_pattern_fields(pattern: &BindingPattern) -> Vec<(&str, Value<'_>)> {
+    Position::ALL
+        .into_iter()
+        .map(|position| (position.as_str(), Value::Code(pattern.requested(position))))
+        .collect()
 }
 
 /// A rendered table cell, held so the borrowed [`Value`] can point at it.
@@ -1812,22 +2103,25 @@ mod tests {
                         }),
                     ];
                     for score in rankings {
-                        let cells: Vec<(Position, Rc<str>)> = Position::ALL[..width]
-                            .iter()
-                            .map(|position| (*position, Rc::from(term)))
-                            .collect();
-                        // What the cache would have measured for each cell.
-                        let each = serde_json::to_vec(&Term::from_dictionary(term))
-                            .expect("a term serializes")
-                            .len() as u64;
+                        for binding in [None, Some(0), Some(12_345)] {
+                            let cells: Vec<(Position, Rc<str>)> = Position::ALL[..width]
+                                .iter()
+                                .map(|position| (*position, Rc::from(term)))
+                                .collect();
+                            // What the cache would have measured for each cell.
+                            let each = serde_json::to_vec(&Term::from_dictionary(term))
+                                .expect("a term serializes")
+                                .len() as u64;
 
-                        let row = Row::new(cells, each * width as u64, direction, score);
-                        assert_eq!(
-                            row.serialized,
-                            serde_json::to_vec(&row).expect("a row serializes").len() as u64,
-                            "width {width}, {term:?}, {direction:?}, {score:?}"
-                        );
-                        shapes += 1;
+                            let row =
+                                Row::new(cells, each * width as u64, binding, direction, score);
+                            assert_eq!(
+                                row.serialized,
+                                serde_json::to_vec(&row).expect("a row serializes").len() as u64,
+                                "width {width}, {term:?}, {binding:?}, {direction:?}, {score:?}"
+                            );
+                            shapes += 1;
+                        }
                     }
                 }
             }

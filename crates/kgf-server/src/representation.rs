@@ -35,6 +35,7 @@
 
 use headers::{CacheControl, ETag};
 use mediatype::{MediaType, MediaTypeBuf, ReadParams, names};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 use crate::envelope::{ErrorCode, Problem, reflected};
@@ -403,6 +404,31 @@ pub fn etag(
     })
 }
 
+/// A body-addressed operation's strong validator.
+///
+/// The raw body is included because QUERY has one URL for many entities. Two
+/// JSON spellings of the same semantic request may receive different tags;
+/// that only forgoes a cache hit, while omitting the body would make one tag
+/// claim that different result sets are the same entity.
+pub fn etag_for_body(
+    digest: &ContentDigest,
+    deployment: &ContentDigest,
+    representation: Representation,
+    body: &[u8],
+) -> ETag {
+    let request = Sha256::digest(body);
+    let tag = format!(
+        "\"{}.{}.{:x}.{}\"",
+        digest.as_str(),
+        deployment.short(),
+        request,
+        representation.token()
+    );
+    tag.parse().unwrap_or_else(|error| {
+        unreachable!("digests and a format token are a valid entity tag: {error}")
+    })
+}
+
 /// A bundle version's canonical identity: `sha256:` and lowercase hex
 /// (doc 04 §4.3).
 ///
@@ -666,6 +692,23 @@ mod tests {
         // URL whose data did not move. Under `immutable` and a year of
         // `max-age`, a validator that missed that would answer 304 for a year.
         assert_ne!(tag, etag(&digest(), &other, Representation::Json));
+
+        let body_tag = etag_for_body(
+            &digest(),
+            &deployment,
+            Representation::Json,
+            br#"{"pattern":1}"#,
+        );
+        assert_ne!(tag, body_tag);
+        assert_ne!(
+            body_tag,
+            etag_for_body(
+                &digest(),
+                &deployment,
+                Representation::Json,
+                br#"{"pattern":2}"#,
+            )
+        );
     }
 
     #[test]

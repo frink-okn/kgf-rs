@@ -17,7 +17,7 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–14 are complete, which is all of M1, and unit 15 begins the work past it; each
+Units 1–16 are complete: all of M1 plus `o.text` and bindings; each
 carries a **What landed** section written after the fact, which is where a unit's plan
 and its outcome are reconciled.
 
@@ -1010,15 +1010,63 @@ index before describing it. And the directory/file helper introduced for
 regular file. File artifacts once again require `metadata.is_file()`, covered by a
 Unix FIFO regression test.
 
-### What M1 is not
+### 16. Bindings-restricted fragment and count ✅
+
+Doc 03 §3.4.2's mandatory body form on `QUERY|POST /fragment`, plus §3.4.4's
+per-binding count. A body is parsed once into a typed pattern and rectangular binding
+table; compact term strings and JSON term objects converge on the same dictionary
+spelling before execution. Unknown or duplicate JSON fields, unknown variables,
+ragged rows, oversize terms and tables above `max_bindings` are refused rather than
+ignored or shortened.
+
+Execution is the composition doc 20 §20.8 describes: each input row resolves to one
+ordinary `IdPattern`, then uses the existing single selection implementation. A
+request-local lookup cache means a repeated term/role pair pays one dictionary probe,
+while all enumeration remains in id space. Rows are walked in input order, `limit` is
+global across the table, cardinality is the exact sum of the resolved selections, and
+each output row carries its zero-based `binding` index. Per-binding `/count` returns
+the same input order as `counts: [{binding, count}, ...]`, with the ordinary
+cardinality object preserved instead of introducing a third count shape.
+
+The cursor trailer reserved in unit 10 is now live. Its phase key is
+`(binding_index, position_space)`, not space alone, so consecutive input rows may use
+the same permutation without becoming ambiguous. The position still means exactly
+what the underlying selection says it means, including predicate-id resume for
+`s ? o`; zero is admitted only as the sentinel for the first predicate of a new
+binding row. Cursor binding covers the canonical pattern, binding column order and
+all row terms, while deliberately excluding `limit`, representation and the cursor
+itself.
+
+`QUERY` is dispatched through axum's custom-method fallback and POST is registered as
+the permanent compatibility method. Both require `Content-Type: application/json`,
+both answer JSON or HTML at the same URL, and `/fragment` and `/count` advertise
+`Accept-Query: application/json` on successes and problems. QUERY responses use the
+immutable policy and a strong ETag incorporating the request body; POST executes the
+same parsed request under `no-store`. A body-addressed HTML page does not fabricate a
+GET continuation link: it tells the reader to put the returned token back in the same
+body.
+
+*Verified by* strict-body parser tests; cursor codec coverage with a binding trailer;
+headless fixture tests that page a global limit through duplicate/absent input rows
+and cross a binding boundary in predicate space; exact per-binding counts; and a real
+socket test sending literal `QUERY` request lines, resuming them, exercising POST,
+media-type errors, cache policy, `Accept-Query`, and `Allow`.
+
+**The configured default is 1,000 bindings, by explicit project decision.** Doc 03
+§3.4.2 and doc 04 §4.3 still say 200, so the design documents are the stale side of a
+deliberate disagreement rather than an authority silently ignored. The server
+publishes and enforces 1,000 from the same `Caps` value.
+
+### What the implementation still is not
 
 **M1 is a strict subset of doc 03 §3.1's mandatory core profile.** That profile is
 `fragment` *including QUERY-with-bindings*, `count`, `describe`, and the description
 surface `manifest` + `void` + `summary`. Doc 20 §20.8's M1 omits bindings QUERY,
 `/void`, and `/summary`, and adds `/sample`, which is an optional capability. So a
 deployment at the end of unit 14 answers useful traffic but **cannot claim core-profile
-conformance** — that arrives with M2. Worth stating because "the mandatory operations"
-and "M1" read like the same set and are not.
+conformance**. Unit 16 closes the bindings part, leaving `/void` and `/summary` before
+this implementation can make that claim. Worth stating because "the mandatory
+operations" and "M1" read like the same set and are not.
 
 ## Testing spine
 
@@ -1392,11 +1440,33 @@ following the code.
     `truncation_reason: candidate_budget` with no cursor beyond it. `/count` uses the
     separate resumable unranked scan, so enumeration and exact cardinality do not
     force relevance ranking to pretend it has a continuation it cannot supply.
+27. **The bindings default is now 1,000 here and 200 in the design documents.** The
+    implementation follows the explicit decision made before unit 16: up to 1,000
+    independent dictionary/index probes is the intended starting point, with the
+    published cap retaining deployment control. Doc 03 §3.4.2, doc 04 §4.3, the
+    one-pagers and any examples should move together; until they do, their 200 is the
+    stale value. Found in unit 16.
+28. **Doc 03 does not define the per-binding `/count` envelope.** It promises
+    per-binding counts without an example or field names. This implementation uses
+    `counts: [{"binding": i, "count": {"value": n, "exact": true}}, ...]`, retaining
+    the cardinality object already used by fragment and GET count. Specify that shape
+    or another one before independent clients and servers choose incompatible forms.
+29. **Doc 03 says the service descriptor declares QUERY support but gives no field.**
+    Doc 04 §4.3's descriptor example has `datasets`, `caps`, `budgets`, `services` and
+    `implementation`, with no methods/profile member. Endpoints advertise
+    `Accept-Query` as required, but there is no normative descriptor shape this server
+    can emit without inventing one. The two documents need one concrete field.
+30. **Repeated variables need a bounded-shape sentence.** A binding pattern such as
+    `?x ex:p ?x` is a bounded pair of dictionary probes when `?x` is supplied in every
+    input row, and this implementation accepts it. Leaving `?x` unbound requires an
+    equality filter over a non-contiguous enumeration whose rejected candidates are
+    not bounded by result `limit`, so it is refused. Doc 03's "any subset" currently
+    does not distinguish the two.
 
 ## Not in this plan
 
 Composed operations (`/search`, `/labels`, ranges, star, key resolution), graph
-scoping, bindings QUERY, and everything gated on a sidecar beyond `.perm`. Those are
+scoping, and everything gated on a sidecar beyond `.perm`. Those are
 doc 20 §20.8's M2 and M3, and they compose through the `Store` and the envelope,
 cursor, and term layers this plan builds.
 
