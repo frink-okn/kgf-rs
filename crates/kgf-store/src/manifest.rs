@@ -137,6 +137,11 @@ impl BundleFacts {
         let perms = Permutations::open(hdt, perm)?;
 
         artifacts.verify_graph_index()?;
+        // A manifest must not describe an optional capability whose complete
+        // artifact cannot be opened. Reading only hdtc-text.meta would accept
+        // a directory with corrupt Tantivy metadata or segment files, while
+        // Store::open would later refuse the bundle.
+        let _text = artifacts.open_text()?;
 
         Ok(Self {
             triples: perms.triples(),
@@ -733,6 +738,25 @@ mod tests {
             Error::ArtifactBindingMismatch { artifact, hdt, .. } => {
                 assert_eq!(artifact, bundle.join(artifact::GRAPHS_IDX));
                 assert_eq!(hdt, bundle.join(artifact::HDT));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn a_broken_text_index_is_not_described() {
+        let fixture = Fixture::build(TINY_NT).with_text();
+        std::fs::write(
+            fixture.bundle_path().join(artifact::TEXT).join("meta.json"),
+            b"not json",
+        )
+        .unwrap();
+
+        let published = published_bundle(fixture.bundle_path());
+        match BundleFacts::read(&published).expect_err("the complete index must open") {
+            Error::Malformed { artifact, detail } => {
+                assert_eq!(artifact, fixture.bundle_path().join(artifact::TEXT));
+                assert!(detail.contains("text index"), "{detail}");
             }
             other => panic!("unexpected error: {other}"),
         }

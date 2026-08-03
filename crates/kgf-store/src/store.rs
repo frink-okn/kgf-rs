@@ -241,7 +241,7 @@ impl ArtifactSet {
     /// a lazily-opened searcher would need one, and that is a lock on the read
     /// path. The cost is file descriptors — Tantivy holds one per segment —
     /// which is the budget the catalog's module docs already flag.
-    fn open_text(&self) -> Result<Option<TextSearcher>> {
+    pub(crate) fn open_text(&self) -> Result<Option<TextSearcher>> {
         let Some(dir) = &self.text else {
             return Ok(None);
         };
@@ -317,7 +317,12 @@ fn optional(dir: &Path, name: &str, want_dir: bool) -> Result<Option<PathBuf>> {
     // Checked rather than assumed, because the two shapes fail differently: a
     // file where a directory belongs is refused here, while an empty directory
     // where a file belongs would otherwise be mapped as a zero-length artifact.
-    if metadata.is_dir() != want_dir {
+    let shape_matches = if want_dir {
+        metadata.is_dir()
+    } else {
+        metadata.is_file()
+    };
+    if !shape_matches {
         return Err(Error::Malformed {
             artifact: path,
             detail: if want_dir {
@@ -547,6 +552,29 @@ mod tests {
             Store::open(&published, OpenOptions::default()),
             Err(Error::Malformed { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_regular_file_is_not_an_artifact() {
+        let fixture = Fixture::build(TINY_NT);
+        let fifo = fixture.bundle_path().join(artifact::GRAPHS);
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+
+        let published = published_bundle(fixture.bundle_path());
+        match Store::open(&published, OpenOptions::default())
+            .expect_err("a FIFO is not a regular artifact file")
+        {
+            Error::Malformed { artifact, detail } => {
+                assert_eq!(artifact, fifo);
+                assert_eq!(detail, "artifact is not a regular file");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

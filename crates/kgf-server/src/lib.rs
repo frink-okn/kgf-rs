@@ -222,6 +222,12 @@ impl Limits<'_> {
                     .to_owned(),
             );
         }
+        if self.budgets.candidate_budget == 0 {
+            return Err(
+                "budgets.candidate_budget must be at least 1; a zero-width scan cannot advance"
+                    .to_owned(),
+            );
+        }
         Ok(())
     }
 }
@@ -231,7 +237,7 @@ impl Limits<'_> {
 /// Separate from [`Caps`] because cap *products* can still be operationally
 /// large, and a row cap is not a byte cap — one legal literal can be megabytes.
 /// Exhausting a budget is never an error: the response is marked incomplete and
-/// carries a cursor (§3.6).
+/// carries a cursor where the operation has a resumable position (§3.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Budgets {
     /// Rows per response, any operation.
@@ -244,7 +250,7 @@ pub struct Budgets {
     pub max_request_bytes: u64,
     /// Any single term or literal, in requests and bindings.
     pub max_term_bytes: u64,
-    /// Rows or postings *examined* by filtered operations (M2).
+    /// Candidates *examined* by filtered operations.
     pub candidate_budget: u64,
     /// Soft per-request wall clock, in milliseconds (M2).
     pub time_budget_ms: u64,

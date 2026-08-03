@@ -280,7 +280,8 @@ async fn count(
         "count",
         wants,
         |params, limits, release| {
-            let request = request::Count::parse(params, limits, release.prefixes())?;
+            let request =
+                request::Count::parse(params, limits, release.prefixes(), &release.binding())?;
             declares_search(release, request.pattern.text().is_some())?;
             Ok(request)
         },

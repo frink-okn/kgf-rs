@@ -18,8 +18,7 @@
 //!   id returned, because no permutation makes its result contiguous
 //!   ([`PositionSpace::Predicate`]). Bindings QUERY will resume on an (input
 //!   row, offset) pair, and a budgeted scan on a scan position plus an
-//!   accumulated lower bound. Only the first is M1, but the format carries room
-//!   for the others.
+//!   accumulated lower bound.
 //! - **Request binding.** A versioned URL pins the *data*; nothing pins the
 //!   *request*. `?p=rdfs:label&cursor=X` and `?p=rdfs:label&s=ex:a&cursor=X` are
 //!   the same path with the same offset, and a bare offset would silently page
@@ -83,9 +82,8 @@ pub struct StaleCursor;
 /// draws `n` members of a result set and never pages, so it has no position to
 /// resume from (doc 03 §3.4.7).
 ///
-/// **These discriminants are wire values.** `Count` only issues a token for the
-/// budgeted scanning counts of doc 03 §3.4.4, which are M2; it is enumerated
-/// now so its value is not taken by something else later.
+/// **These discriminants are wire values.** `Count` issues a token for the
+/// budgeted text scans of doc 03 §3.4.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum Operation {
@@ -158,6 +156,9 @@ pub enum PositionSpace {
     /// every hit before it, which is work proportional to how deep the client
     /// has paged rather than to the page.
     TextRank = 5,
+    /// Opaque hdtc text-index scan position, with the accumulated statement
+    /// count in [`Cursor::scan_position`].
+    TextScan = 6,
 }
 
 impl PositionSpace {
@@ -171,10 +172,11 @@ impl PositionSpace {
     /// The one place that decides this, so a handler cannot pair a position with
     /// the wrong reading of it.
     ///
-    /// [`TextRank`](PositionSpace::TextRank) is deliberately unreachable from
-    /// here: a text-filtered request is not one selection but a hit list and a
-    /// selection per hit, so the space is a property of the *operation* rather
-    /// than of anything this function can see.
+    /// [`TextRank`](PositionSpace::TextRank) and
+    /// [`TextScan`](PositionSpace::TextScan) are deliberately unreachable from
+    /// here: a text-filtered request is not one selection but an index walk and
+    /// a selection per matching literal, so the space is a property of the
+    /// *operation* rather than of anything this function can see.
     pub fn of(selection: &Selection<'_>) -> Self {
         if selection.subject_object_route().is_some() {
             return Self::Predicate;
@@ -193,6 +195,7 @@ impl PositionSpace {
             3 => Some(Self::Ops),
             4 => Some(Self::Predicate),
             5 => Some(Self::TextRank),
+            6 => Some(Self::TextScan),
             _ => None,
         }
     }
@@ -368,23 +371,13 @@ pub struct Cursor {
     /// Position in the operation's enumeration order.
     ///
     /// **Not validated against the result set here** — this module has no store.
-    /// A forged position is harmless rather than unsound, because
-    /// [`Selection::page`](kgf_store::pattern::Selection::page) clamps past the
-    /// end and yields an empty page.
-    ///
-    /// Unit 14 should still reject a position past the end as `stale_cursor`,
-    /// since an empty page otherwise reads as the end of results — but *what*
-    /// the bound is depends on [`space`](Cursor::space), and it is the count in
-    /// only three of the four cases. For the permutation spaces the position is
-    /// a zero-based result offset, bounded by `selection.count()`. For
-    /// [`PositionSpace::Predicate`] it is the last predicate id returned, a
-    /// dictionary id with no relation to the cardinality: a one-row `s ? o`
-    /// answer legitimately resumes at predicate 37. Its bound is the size of
-    /// the predicate id space, and there an empty page really is the end.
+    /// The operation consuming the cursor validates it in the space it names:
+    /// selection cardinality, predicate id space, ranked hit, or hdtc scan.
     pub position: u64,
     /// Row index, for bindings operations (M2).
     pub binding_index: Option<u32>,
-    /// Scan position, for candidate-budgeted scans (M2).
+    /// Secondary position: an offset within a ranked hit, or an accumulated
+    /// count for an unranked text scan.
     pub scan_position: Option<u64>,
 }
 
@@ -412,6 +405,14 @@ impl Cursor {
         Self {
             scan_position: Some(offset),
             ..Self::at(binding, PositionSpace::TextRank, rank)
+        }
+    }
+
+    /// A resumable unranked text scan and its accumulated statement count.
+    pub fn at_text_scan(binding: &CursorBinding, position: u64, accumulated: u64) -> Self {
+        Self {
+            scan_position: Some(accumulated),
+            ..Self::at(binding, PositionSpace::TextScan, position)
         }
     }
 
@@ -487,6 +488,18 @@ impl Cursor {
             || operation != binding.operation
             || request_hash != binding.request_hash
         {
+            return Err(StaleCursor);
+        }
+
+        // Optional trailers are not independent state. Each current position
+        // space has one exact shape; accepting another lets an edited token
+        // silently restart a ranked hit or reinterpret a scan accumulator.
+        let shape_is_valid = binding_index.is_none()
+            && match space {
+                PositionSpace::TextRank | PositionSpace::TextScan => scan_position.is_some(),
+                _ => scan_position.is_none(),
+            };
+        if !shape_is_valid {
             return Err(StaleCursor);
         }
 
@@ -572,14 +585,30 @@ mod tests {
             Ok(cursor)
         );
 
-        // The M2 trailers are carried, not merely tolerated.
-        let mut full = sample();
-        full.binding_index = Some(7);
-        full.scan_position = Some(u64::MAX);
-        let decoded = Cursor::decode(full.encode().as_str(), &binding()).unwrap();
-        assert_eq!(decoded, full);
-        assert_eq!(decoded.binding_index, Some(7));
-        assert_eq!(decoded.scan_position, Some(u64::MAX));
+        for cursor in [
+            Cursor::at_rank(&binding(), 7, u64::MAX),
+            Cursor::at_text_scan(&binding(), 42, 1_000),
+        ] {
+            assert_eq!(
+                Cursor::decode(cursor.encode().as_str(), &binding()),
+                Ok(cursor)
+            );
+        }
+
+        // A trailer is part of its position space's shape, not an optional
+        // field an edited token may add or remove.
+        let mut unexpected = sample();
+        unexpected.scan_position = Some(7);
+        assert_eq!(
+            Cursor::decode(unexpected.encode().as_str(), &binding()),
+            Err(StaleCursor)
+        );
+        let mut incomplete = Cursor::at_rank(&binding(), 7, 0);
+        incomplete.scan_position = None;
+        assert_eq!(
+            Cursor::decode(incomplete.encode().as_str(), &binding()),
+            Err(StaleCursor)
+        );
 
         // An M1 token is short enough to sit in a URL without comment, and its
         // alphabet is what makes `CursorToken` safe in a `KGF-Next-Cursor`

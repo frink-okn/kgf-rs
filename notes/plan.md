@@ -380,8 +380,7 @@ Two corrections to the skeleton, both from writing the resume property down:
   says which half it stopped in.
 
 `Operation` omits `/sample`, which draws `n` members and never pages, and includes
-`Count`, which only issues a token for M2's budgeted scanning counts — enumerated now
-so nothing else takes the value.
+`Count`, whose value is used by unit 15's budgeted text scans.
 
 A forged position is safe rather than merely unlikely: `Selection::page` clamps past the
 end and yields an empty page. A handler should still reject a position past the end as
@@ -513,30 +512,30 @@ shaped approximately. And the body/header duplication is a correctness obligatio
 formatting: silent truncation is prohibited, so a CSV response that loses `complete`
 is a protocol violation rather than a cosmetic gap.
 
-M1 emits `page_limit` truncation only. The budget reasons (`time_budget`,
-`candidate_budget`, `response_bytes`) are M2 machinery, but they are part of the closed
-vocabulary now so the type cannot grow a stringly-typed escape hatch later.
+M1 now emits `page_limit`, `response_bytes`, and `candidate_budget`; `time_budget` is
+reserved for later interruptible scans. They are part of a closed vocabulary so the
+type cannot grow a stringly-typed escape hatch later.
 
 *Verified by* a property over every M1 operation: a response is either `complete: true`
-with no `next`, or `complete: false` with a `truncation_reason` and a resumable `next`
-— never any other combination — and the headers agree with the body in every format.
+with no `next`, or `complete: false` with a `truncation_reason` and a `next` exactly
+when that operation has a resumable position. The headers agree with the body in every
+format.
 
 **What landed.** The property above is not asserted on the way out, it is the only thing
 the type can express. `Completeness` is opaque, and its constructors are the whole API:
 `complete()` takes no cursor, `page_limit(next)` requires one, `cell_overflow()` and
-`partial_failure()` refuse one. "Incomplete with no reason" and "complete with a next
-page" are unconstructible rather than untested, which is the right shape for a rule doc
-03 §3.6 states as a prohibition.
+`partial_failure()` refuse one, and budget stops have separate constructors with and
+without a position. "Incomplete with no reason" and "complete with a next page" are
+unconstructible rather than untested, which is the right shape for a rule doc 03 §3.6
+states as a prohibition.
 
 Writing it that way turned up a distinction the plan's sentence glosses: **not every
 truncation resumes.** The four interruption reasons stop an enumeration, which has a
-position to continue from; `cell_overflow` and `partial_failure` describe a result that
-is already as complete as it will get. A client that paged on those would ask for the
-same cell, get the same overflow, and loop. So `TruncationReason::resumes()` derives
-that from the reason rather than tracking it alongside, and the constructors' arity
-enforces it — `budget_exhausted` is the one that takes a reason as a value, and it
-asserts, because it is the only hole through which a non-resuming reason could acquire
-a cursor.
+position to continue from; `cell_overflow`, `partial_failure`, a byte-truncated sample,
+and the end of a partial relevance window do not. A client that paged on those would
+either repeat the same stop or pretend a global ordering can resume where it cannot.
+Separate budget constructors make the presence or absence of a position explicit at
+the operation site.
 
 The headers are checked as *agreement with the body* rather than against expected
 strings, so neither rendering can drift alone. That is the test the CSV/Parquet
@@ -812,7 +811,8 @@ paging the fixture at every size across the phase boundary.
 `stale_cursor` rather than an empty page that reads as the end of results — bounded by
 the cardinality for the three permutation spaces, and by the predicate id space for
 `s ? o`, where a one-row answer legitimately resumes at predicate 37. A token carrying
-an M2 trailer is stale too, since no M1 operation issues one.
+an unexpected trailer is stale too. Unit 15 later assigned exact trailer shapes to
+ranked text rows and resumable text counts.
 
 **`/describe` rows carry a `direction` column, which §3.4.6 does not define.** The two
 halves overlap on exactly one triple — `<a> p <a>` is genuinely an out-edge *and* an
@@ -954,39 +954,47 @@ general — the index counts distinct matching *literals*, and the rows are one 
 occurrence — but a page that started at the beginning and ran out has enumerated the
 whole answer, so it says so. The first version reported "about 4" over five rows the
 client could see, which is worse than useless: it makes every other estimate in the
-response harder to believe. Otherwise the literal count goes out as the estimate with
-`distinct_objects` exact beside it, raised to the rows already returned, and `min` is
-claimed only where it is true — with `s` or `p` bound a matching literal may occur on
-nothing that matches, so the count is then neither a floor nor a ceiling.
+response harder to believe. Otherwise an unfiltered request reports the literal count
+as the estimate with `distinct_objects` exact beside it, raised to the rows already
+returned. With `s` or `p` bound a matching literal may occur on nothing that matches,
+so the response uses only the rows it actually produced as its estimate and claims no
+global floor or distinct-object count.
 
 `o.text` and `o` are refused together rather than intersected: one names a term and
 the other ranks many, so a request carrying both is asking two incompatible questions.
 
-**What the review then found**, because it is the interesting part. The candidate
-budget was read as a ceiling on the *rank* a request may reach rather than on what one
-request examines, and the two differ exactly when a client pages as deep as the
-budget: the search returns at most `budget` hits, skipping to the resume rank yields
-nothing, and the cursor points at a rank already passed — the same page forever, with
-the rest of the answer unreachable. Proved by lowering the budget to 3 over six
-matching literals and watching ten pages in a row return nothing.
+**What the review then found**, because it is the interesting part. Tantivy's
+`TopDocs` limit bounded only the retained heap; it did not bound matching documents
+scored, so a common token could spend unbounded work while apparently honouring the
+candidate budget. hdtc now exposes `search_up_to`: score work and retained hits are
+separate bounds, and its outcome says how many matching literal documents were
+examined and whether the scan completed. `o.text` consumes that one outcome rather
+than running a second `count_up_to` pass. A ranked window that spends the budget ends
+with `candidate_budget` and no cursor beyond the window; row cursors within it remain
+the `(rank, within-hit position)` pair above.
 
-Fixing it exposed why the wrong reading was tempting. A top-k index has no cursor, so
-a page holds a hit list as long as the rank it reached, and *unbounded* paging is
-unbounded memory in one request. The budget now bounds both, in the two ways it has
-to: `from_rank + min(want, budget)` for what one request examines, and a stop at
-`budget` ranks deep that says `candidate_budget` and offers no cursor. Recorded as
-question 26, because doc 03 reads as though a ranked result pages to the end.
+`/count` is deliberately a different access path. hdtc's resumable unranked scan
+returns object dictionary ids plus an opaque immutable-index position; the server
+resolves each through the ordinary pattern reader and accumulates its exact statement
+count. A budget stop carries both the scan position and accumulated lower bound in the
+existing token layout, and the final page is exact. That removes the false global text
+count formerly reported for a bound subject or predicate — a predicate on which no
+matching literal occurs now counts exactly zero.
 
-Two more. `/count` carried the budget and never read it, so a text count walked every
-posting — the same shape as unit 13's `max_request_bytes`, a figure published and
-enforced nowhere; hdtc grew `count_up_to`, and §3.4.4's budgeted-count shape now
-appears when it fires. And a row's `score` went out with no `match_kind`, which is
-wrong *within* one endpoint before it is wrong across several: hdtc ranks exact
-matches as a class ahead of stemmed ones, so a page held a row scored 0.528 sitting
-below one scored 0.441, and a client sorting by score would have undone the server's
-own ranking.
+Cursor trailers now have a shape rather than being independently optional: a ranked
+cursor must carry its within-hit position and a text-scan cursor its accumulator.
+Ranked resumption also proves that the named hit and within-hit position produce a
+real row, so an edited offset is stale instead of silently duplicating or skipping a
+page. The HTML representation now echoes `o.text` and renders `score` and
+`match_kind`, the fields JSON already carried.
 
-There are 213 tests after this unit.
+The artifact review found two open-time holes. `BundleFacts::read` opened the hdtc
+text manifest but not the Tantivy index, so `kgf manifest` could publish corrupt
+segment metadata that `Store::open` immediately refused; it now opens the complete
+index before describing it. And the directory/file helper introduced for
+`data.hdt.text` treated every non-directory — including a FIFO or socket — as a
+regular file. File artifacts once again require `metadata.is_file()`, covered by a
+Unix FIFO regression test.
 
 ### What M1 is not
 
@@ -1361,21 +1369,15 @@ following the code.
     even *within* one endpoint a client that sorts by score reorders the page, because
     hdtc ranks exact matches as a class ahead of stemmed ones and a stemmed hit can
     carry the higher number.
-26. **Is a text-filtered enumeration meant to be pageable to the end?** §3.4.1 says a
-    text constraint "may return partial + cursor" and §3.5 budgets it on candidates
-    examined, which reads as "each request examines at most N, and paging continues".
-    But a top-k index has no cursor: every page re-ranks from the top, so a request
-    holds a hit list as long as the rank it reached, and unlimited paging is unbounded
-    memory in one request — against the rule that makes this project what it is.
-
-    This server therefore pages a ranked result to `candidate_budget` ranks and then
-    stops, with `truncation_reason: candidate_budget` and **no** cursor, which the
-    §3.6 vocabulary already has a shape for. That seems right for a relevance
-    primitive — doc 19 §19.0 calls text search an entity-resolution move, not an
-    enumeration — but it is a limit doc 03 does not mention, and a client cannot
-    discover it from the descriptor. Either §3.5 should publish a paging depth beside
-    the budget, or §3.4.1 should say that a ranked result is a top-k rather than a
-    resumable enumeration. Found in unit 15's review.
+26. **Ranked text paging is a bounded window. Resolved — `../kgf` doc 03 §§3.4.1,
+    3.5.** A top-k index has no positional cursor beyond the ranking it retained:
+    recreating arbitrary depth means rescoring and retaining an unbounded prefix.
+    hdtc therefore scores at most `candidate_budget` matching literal documents and
+    reports whether it reached the end. Row cursors page within that deterministic
+    window; if the candidate scan stopped first, its end is
+    `truncation_reason: candidate_budget` with no cursor beyond it. `/count` uses the
+    separate resumable unranked scan, so enumeration and exact cardinality do not
+    force relevance ranking to pretend it has a continuation it cannot supply.
 
 ## Not in this plan
 

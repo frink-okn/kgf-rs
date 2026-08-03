@@ -528,29 +528,77 @@ fn a_ranked_page_resumes_where_it_stopped_at_every_size() {
 }
 
 #[test]
-fn a_text_count_is_an_estimate_that_says_what_it_knows_exactly() {
-    // §3.4.1: the count is an estimate and `distinct_objects` beside it is not.
-    // The index counts matching *literals* without ranking them; the rows are
-    // one per occurrence, so the two differ whenever a literal is used twice.
+fn a_ranked_cursor_must_name_a_real_hit_and_statement_offset() {
+    let served = Served::with_text();
+    let store = served.store();
+    let request = served.parse_fragment("o.text=Alice&limit=1");
+
+    for token in [
+        kgf_server::cursor::Cursor::at_rank(&request.binding, 0, u64::MAX).encode(),
+        kgf_server::cursor::Cursor::at_rank(&request.binding, u64::MAX, 0).encode(),
+    ] {
+        let error = served
+            .try_fragment(&store, &format!("o.text=Alice&limit=1&cursor={token}"))
+            .expect_err("an invented ranked position must be stale");
+        assert_eq!(error.code(), kgf_server::envelope::ErrorCode::StaleCursor);
+    }
+}
+
+#[test]
+fn a_text_page_shows_its_constraint_and_ranking_in_html() {
+    let served = Served::with_text();
+    let store = served.store();
+    let page = served.render(
+        &store,
+        "fragment",
+        "o.text=Alice&limit=10",
+        Representation::Html,
+    );
+
+    for visible in ["o.text", "Alice", "score", "match_kind", "exact"] {
+        assert!(page.contains(visible), "HTML omitted {visible}: {page}");
+    }
+}
+
+#[test]
+fn a_text_count_is_exact_after_pattern_intersection() {
     let served = Served::with_text();
     let store = served.store();
 
     let counted = served.count(&store, "o.text=Alice");
     let count = &counted["count"];
-    assert_eq!(count["exact"], serde_json::json!(false));
-    assert!(count["distinct_objects"].as_u64().unwrap() > 0);
-    // With the rest of the pattern unbound every matching literal occurs at
-    // least once, so the literal count is a floor and is reported as one.
-    assert_eq!(count["min"], count["distinct_objects"]);
+    assert_eq!(count["exact"], serde_json::json!(true));
+    assert_eq!(
+        count["value"].as_u64().unwrap() as usize,
+        rows(&served.fragment(&store, "o.text=Alice&limit=1000")).len()
+    );
 
-    // With `p` bound it is neither a floor nor a ceiling — a matching literal
-    // may not occur with that predicate at all — so no bound is claimed.
+    // The text index returns global matching object IDs, but count intersects
+    // each one with the remaining pattern. A predicate on which those literals
+    // never occur must therefore be exactly zero, not a positive global hit
+    // count presented as an estimate or lower bound.
     let filtered = served.count(
         &store,
-        "o.text=Alice&p=%3Chttp%3A%2F%2Fexample.org%2Fname%3E",
+        "o.text=Alice&p=%3Chttp%3A%2F%2Fexample.org%2Fknows%3E",
     );
-    assert!(filtered["count"].get("min").is_none());
-    assert!(filtered["count"]["distinct_objects"].as_u64().unwrap() > 0);
+    assert_eq!(
+        filtered["count"],
+        serde_json::json!({"value": 0, "exact": true})
+    );
+
+    let budgets = Budgets {
+        candidate_budget: 1,
+        ..Budgets::new()
+    };
+    let partial = served.fragment_within(
+        &store,
+        "o.text=Alice&p=%3Chttp%3A%2F%2Fexample.org%2Fknows%3E&limit=10",
+        &budgets,
+    );
+    assert_eq!(partial["complete"], serde_json::json!(false));
+    assert_eq!(partial["cardinality"]["value"], serde_json::json!(0));
+    assert!(partial["cardinality"].get("min").is_none());
+    assert!(partial["cardinality"].get("distinct_objects").is_none());
 }
 
 #[test]
@@ -645,13 +693,19 @@ fn a_tight_candidate_budget_pages_to_its_bound_and_then_stops() {
             }
         };
 
-        // Whatever it returned is a prefix of the answer, in order and without
-        // repetition — a bound may cut the enumeration short but must not
-        // reorder or duplicate it.
+        // An interrupted score scan ranks only the candidates it examined; an
+        // unexamined literal may enter ahead of them when a larger budget later
+        // establishes the full ranking. The partial window must still contain
+        // only real answer rows and never duplicate one while it pages.
+        assert!(
+            collected.iter().all(|row| whole.contains(row)),
+            "budget {candidate_budget} returned a row outside the full answer"
+        );
+        let unique: std::collections::BTreeSet<_> = collected.iter().collect();
         assert_eq!(
-            collected,
-            whole[..collected.len()],
-            "budget {candidate_budget} must return a prefix of the answer"
+            unique.len(),
+            collected.len(),
+            "budget {candidate_budget} duplicated a row"
         );
         assert_eq!(
             stopped_short,
@@ -666,19 +720,15 @@ fn a_tight_candidate_budget_pages_to_its_bound_and_then_stops() {
 }
 
 #[test]
-fn a_count_that_spends_the_candidate_budget_says_so() {
-    // §3.4.4: a count that cannot be finished within its budget reports what it
-    // reached as a lower bound and marks the response, rather than passing a
-    // bounded figure off as the whole number. Without this the budget was a
-    // field the request carried and nothing read.
+fn a_count_that_spends_the_candidate_budget_resumes_to_the_exact_total() {
     let served = Served::with_text();
     let store = served.store();
 
     let whole = served.count(&store, "o.text=Alice");
     let total = whole["count"]["value"].as_u64().unwrap();
-    assert!(total > 1, "the fixture must match more than one literal");
+    assert!(total > 1, "the fixture must match more than one statement");
     assert_eq!(whole["complete"], serde_json::json!(true));
-    assert!(whole["count"]["distinct_objects"].is_number());
+    assert_eq!(whole["count"]["exact"], serde_json::json!(true));
 
     let budgets = Budgets {
         candidate_budget: 1,
@@ -688,22 +738,66 @@ fn a_count_that_spends_the_candidate_budget_says_so() {
         caps: &CAPS,
         budgets: &budgets,
     };
-    let request =
-        request::Count::parse(&params("o.text=Alice"), limits, served.release().prefixes())
-            .expect("a well-formed request");
-    let answer =
-        answer::count(&store, served.target("count", "o.text=Alice"), &request).expect("an answer");
-    let counted = json(answer, Representation::Json);
+    let initial = request::Count::parse(
+        &params("o.text=Alice"),
+        limits,
+        served.release().prefixes(),
+        &served.release().binding(),
+    )
+    .expect("a well-formed request");
+    let invented = kgf_server::cursor::Cursor::at_text_scan(&initial.binding, u64::MAX, 0).encode();
+    let query = format!("o.text=Alice&cursor={invented}");
+    let request = request::Count::parse(
+        &params(&query),
+        limits,
+        served.release().prefixes(),
+        &served.release().binding(),
+    )
+    .expect("the token has the right request binding");
+    let error = answer::count(&store, served.target("count", &query), &request)
+        .expect_err("a scan position outside the index must be stale");
+    assert_eq!(error.code(), kgf_server::envelope::ErrorCode::StaleCursor);
 
-    assert_eq!(counted["count"]["value"], serde_json::json!(1));
-    assert_eq!(counted["count"]["exact"], serde_json::json!(false));
-    assert_eq!(counted["count"]["min"], serde_json::json!(1));
-    // Not `distinct_objects`: §3.4.1 calls that one exact, and a count that
-    // stopped at a budget is a floor rather than a total.
-    assert!(counted["count"].get("distinct_objects").is_none());
-    assert_eq!(counted["complete"], serde_json::json!(false));
-    assert_eq!(counted["truncation_reason"], "candidate_budget");
-    assert_eq!(counted["next"], serde_json::json!(null));
+    let mut cursor = None;
+    let mut lower_bound = 0;
+    for _ in 0..10 {
+        let query = cursor.as_ref().map_or_else(
+            || "o.text=Alice".to_owned(),
+            |token| format!("o.text=Alice&cursor={token}"),
+        );
+        let request = request::Count::parse(
+            &params(&query),
+            limits,
+            served.release().prefixes(),
+            &served.release().binding(),
+        )
+        .expect("a well-formed request");
+        let answer =
+            answer::count(&store, served.target("count", &query), &request).expect("an answer");
+        let counted = json(answer, Representation::Json);
+        let value = counted["count"]["value"].as_u64().unwrap();
+        assert!(
+            value >= lower_bound,
+            "the accumulated lower bound cannot fall"
+        );
+        lower_bound = value;
+
+        if counted["complete"].as_bool().unwrap() {
+            assert_eq!(counted["count"]["exact"], serde_json::json!(true));
+            assert_eq!(value, total);
+            return;
+        }
+        assert_eq!(counted["count"]["exact"], serde_json::json!(false));
+        assert_eq!(counted["count"]["min"], counted["count"]["value"]);
+        assert_eq!(counted["truncation_reason"], "candidate_budget");
+        cursor = Some(
+            counted["next"]
+                .as_str()
+                .expect("an interrupted count is resumable")
+                .to_owned(),
+        );
+    }
+    panic!("the text count did not finish");
 }
 
 #[test]
@@ -921,9 +1015,13 @@ impl Served {
     }
 
     fn count(&self, store: &Store, query: &str) -> serde_json::Value {
-        let request =
-            request::Count::parse(&params(query), self.limits(), self.release().prefixes())
-                .unwrap_or_else(|error| panic!("GET /count?{query}: {error}"));
+        let request = request::Count::parse(
+            &params(query),
+            self.limits(),
+            self.release().prefixes(),
+            &self.release().binding(),
+        )
+        .unwrap_or_else(|error| panic!("GET /count?{query}: {error}"));
         let answer = answer::count(store, self.target("count", query), &request)
             .unwrap_or_else(|error| panic!("GET /count?{query}: {error}"));
         json(answer, Representation::Json)
@@ -998,9 +1096,13 @@ impl Served {
                     .render(representation)
             }
             "count" => {
-                let request =
-                    request::Count::parse(&params(query), self.limits(), self.release().prefixes())
-                        .expect("a well-formed request");
+                let request = request::Count::parse(
+                    &params(query),
+                    self.limits(),
+                    self.release().prefixes(),
+                    &self.release().binding(),
+                )
+                .expect("a well-formed request");
                 answer::count(store, target, &request)
                     .expect("an answer")
                     .render(representation)

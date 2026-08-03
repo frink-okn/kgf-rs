@@ -47,7 +47,7 @@ use maud::html;
 use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
 
-use hdtc::format::TextSearcher;
+use hdtc::format::{TextScanPosition, TextSearcher};
 use kgf_store::catalog::BundleId;
 use kgf_store::dict::Dictionary;
 use kgf_store::pattern::{IdPattern, Selection};
@@ -396,10 +396,10 @@ impl Renders for Answer {
 /// `GET /count`'s envelope (§3.4.4).
 ///
 /// `count` is an object rather than §3.4.4's first example's bare integer, so
-/// that it is the same shape as §3.4.1's `cardinality` and the same shape M2's
-/// interrupted counts need — those already carry `{"value": n, "exact": false,
-/// "min": n}`, and one field with two shapes is a client-breaking change
-/// waiting to happen. See `notes/plan.md`, "Questions for `../kgf`".
+/// that it is the same shape as §3.4.1's `cardinality` and the shape an
+/// interrupted text count needs: `{"value": n, "exact": false, "min": n}`.
+/// One field with two shapes would be a client-breaking change waiting to
+/// happen. See `notes/plan.md`, "Questions for `../kgf`".
 #[derive(Debug, Serialize)]
 pub struct CountAnswer {
     dataset: String,
@@ -521,6 +521,11 @@ pub fn count(
     request: &request::Count,
 ) -> Result<CountAnswer, Problem> {
     let dictionary = store.dict();
+    if request.cursor.is_some() && request.pattern.text().is_none() {
+        // Parsing enforces this too; keep the operation correct for callers
+        // constructing the public request type directly.
+        return Err(Problem::from(StaleCursor));
+    }
     let (count, completeness, absent_terms) = match (
         resolve(&dictionary, &request.pattern)?,
         request.pattern.text(),
@@ -533,10 +538,20 @@ pub fn count(
             Completeness::complete(),
             Vec::new(),
         ),
+        (Resolved::Absent(_), Some(_)) if request.cursor.is_some() => {
+            return Err(Problem::from(StaleCursor));
+        }
         (Resolved::Absent(absent), _) => (Cardinality::exact(0), Completeness::complete(), absent),
         (Resolved::Ids(ids), Some(filter)) => {
-            let (count, completeness) =
-                text_count(store, &target, filter, ids, request.candidates)?;
+            let (count, completeness) = text_count(
+                store,
+                &target,
+                filter,
+                ids,
+                request.candidates,
+                request.cursor.as_ref(),
+                &request.binding,
+            )?;
             (count, completeness, Vec::new())
         }
     };
@@ -551,56 +566,72 @@ pub fn count(
     })
 }
 
-/// How many statements a text-constrained pattern matches — an estimate, and
-/// the exact quantity behind it (§3.4.1, §3.4.4).
+/// Count statements matching a text-constrained pattern, in resumable batches.
 ///
-/// The index counts *distinct matching literals* without ranking them, which is
-/// `O(postings)` rather than `O(enumeration)`. That number is exactly
-/// `distinct_objects`; the statement count it stands in for is a different
-/// number, because one literal occurs on many subjects and, when the rest of the
-/// pattern is bound, on none that match.
-///
-/// So it is reported as an estimate with the exact figure beside it — and with
-/// a **lower bound only when one is true**: with the rest of the pattern
-/// unbound, every matching literal occurs at least once, so the count is a
-/// floor. With `p` or `s` bound it is neither a floor nor a ceiling, and
-/// claiming `min` would be a claim this server cannot support.
+/// hdtc scans matching object IDs without ranking. Each ID is intersected with
+/// the remaining subject/predicate constraints through the ordinary store
+/// selection, so the accumulated value counts statements rather than global
+/// text hits. The cursor carries both the hdtc scan position and that value.
 fn text_count(
     store: &Store,
     target: &Target,
     filter: &TextFilter,
     ids: IdPattern,
     budget: Candidates,
+    cursor: Option<&Cursor>,
+    binding: &CursorBinding,
 ) -> Result<(Cardinality, Completeness), Problem> {
-    let (literals, saturated) = searcher(store, target)?
-        .count_up_to(&filter.to_query(), budget.0)
-        .map_err(|error| unreadable("counting text matches", &error))?;
+    let (from, mut accumulated) = match cursor {
+        None => (None, 0u64),
+        Some(cursor)
+            if cursor.space == PositionSpace::TextScan
+                && cursor.binding_index.is_none()
+                && cursor.scan_position.is_some() =>
+        {
+            (
+                Some(TextScanPosition::decode(cursor.position)),
+                cursor.scan_position.expect("checked above"),
+            )
+        }
+        Some(_) => return Err(Problem::from(StaleCursor)),
+    };
 
-    if saturated {
-        // §3.4.4's budgeted count, in the shape that section describes: the
-        // accumulated figure as a lower bound, and a response that says it
-        // stopped. Without a cursor, because resuming a count is §3.4.4's other
-        // half and belongs with the scanning counts of M2 — the vocabulary has
-        // the shape for a truncation that cannot resume, and using it beats
-        // reporting a bounded number as though it were the whole one.
-        return Ok((
-            Cardinality::estimated(literals).at_least(literals),
-            Completeness::budget_exhausted_without_resume(BudgetReason::Candidate),
-        ));
+    let page = searcher(store, target)?
+        .scan_matching_objects(&filter.to_query(), from, budget.ceiling())
+        .map_err(|error| {
+            if cursor.is_some() {
+                Problem::from(StaleCursor)
+            } else {
+                unreadable("scanning text matches", &error)
+            }
+        })?;
+
+    for object in page.object_ids {
+        let selection = select(
+            store,
+            IdPattern {
+                object: Some(object),
+                ..ids
+            },
+        )?;
+        accumulated = accumulated
+            .checked_add(selection.count().value)
+            .ok_or_else(|| unreadable("counting text matches", &"statement count overflow"))?;
     }
 
-    let estimate = Cardinality::estimated(literals).over_distinct_objects(literals);
-    // A floor only where one holds: with the rest of the pattern unbound every
-    // matching literal occurs at least once. With `s` or `p` bound it may occur
-    // on nothing that matches, so the count is neither a floor nor a ceiling.
-    let unfiltered = ids.subject.is_none() && ids.predicate.is_none();
+    if page.complete {
+        return Ok((Cardinality::exact(accumulated), Completeness::complete()));
+    }
+
+    let next = page
+        .next
+        .expect("an incomplete hdtc scan carries a continuation");
     Ok((
-        if unfiltered {
-            estimate.at_least(literals)
-        } else {
-            estimate
-        },
-        Completeness::complete(),
+        Cardinality::estimated(accumulated).at_least(accumulated),
+        Completeness::budget_exhausted(
+            BudgetReason::Candidate,
+            Cursor::at_text_scan(binding, next.encode(), accumulated).encode(),
+        ),
     ))
 }
 
@@ -820,6 +851,8 @@ struct Ranked {
     steps: Vec<Step>,
     /// Distinct literals matching the text, and whether the count is complete.
     matching_literals: MatchingLiterals,
+    /// Whether no subject or predicate constraint narrows those literals.
+    unfiltered: bool,
     /// How the candidates ran out, when they ran out before the page filled.
     spent: Option<Spent>,
 }
@@ -828,18 +861,6 @@ struct Ranked {
 /// rows.
 #[derive(Debug, Clone, Copy)]
 enum Spent {
-    /// Resume at this rank.
-    ///
-    /// A *rank* rather than a row, and that is the whole of the correctness
-    /// argument. A page only stops inside a hit when it is full, which is a
-    /// different branch — so when the candidates run out instead, every hit
-    /// that was examined was drained, and the next page starts at the next one.
-    /// The alternative, resuming one past the last row returned, has to know
-    /// what "one past" means inside that hit: `s ? ?` with a text constraint
-    /// resolves to `s ? o` per hit, whose positions are predicate ids, so
-    /// adding one lands on whatever predicate happens to be next and re-emits
-    /// the row before it.
-    At(u64),
     /// As deep into the ranking as this server pages. No cursor: there is
     /// nowhere further to go, and offering one would be a loop.
     Deepest,
@@ -857,16 +878,12 @@ enum Spent {
 ///
 /// §3.5 budgets filtered operations on *candidates examined*, independently of
 /// `limit`, because a hit need not contribute a row: `? p ?` with a text
-/// constraint discards every matching literal that does not occur with `p`. So
-/// this asks the index for as many hits as could fill the page — one per row,
-/// the best case — and stops there. If they were not enough, the response is
-/// short and says `candidate_budget` with a cursor, which is progress rather
-/// than failure: the next page resumes past the hits already examined.
-///
-/// Asking for `rank + limit + 1` makes a deep page cost more than a shallow
-/// one, because a top-k index has no cursor and re-ranks from the top. That is
-/// the shape of every ranked search, and `candidate_budget` is what keeps it
-/// from being unbounded.
+/// constraint discards every matching literal that does not occur with `p`.
+/// The index therefore scores at most `candidate_budget` documents and retains
+/// at most that many hits. Row cursors page within that deterministic window.
+/// If scoring stopped first, the window ends with `candidate_budget` and no
+/// cursor beyond it: resuming a global relevance ranking would require
+/// rescoring and retaining an ever-growing prefix, which is unbounded work.
 fn ranked(
     store: &Store,
     searcher: &TextSearcher,
@@ -882,51 +899,32 @@ fn ranked(
     let (from_rank, mut skip) = match cursor {
         None => (0u64, 0u64),
         Some(cursor) => {
-            if cursor.space != PositionSpace::TextRank || cursor.binding_index.is_some() {
+            if cursor.space != PositionSpace::TextRank
+                || cursor.binding_index.is_some()
+                || cursor.scan_position.is_none()
+            {
                 return Err(Problem::from(StaleCursor));
             }
-            (cursor.position, cursor.scan_position.unwrap_or(0))
+            (
+                cursor.position,
+                cursor.scan_position.expect("checked above"),
+            )
         }
     };
 
     let query = filter.to_query();
-    // §3.5's budget bounds what *this request* examines, so it is added to
-    // where this request starts rather than capping the rank it may reach.
-    // Capping the rank stops paging dead the moment a client reaches the
-    // budget: the search returns at most `ceiling` hits, skipping to
-    // `from_rank` yields nothing, and the cursor points at a rank already
-    // passed — the same page forever, with the rest of the answer unreachable.
-    let examine = want.min(budget.ceiling()).max(1);
-    let top_k = (from_rank as usize).saturating_add(examine);
-
-    // How deep the ranking may be paged, and why there is a limit at all: a
-    // top-k index has no cursor, so every page re-ranks from the top and the
-    // hit list a request holds is as long as the rank it reached. Without a
-    // bound, paging deep enough is unbounded memory in one request — the thing
-    // this project exists not to have. The budget doubles as the depth for want
-    // of a second published number, and it is the right order: a ranked result
-    // is an entity-resolution primitive (doc 19 §19.0), not an enumeration, and
-    // nothing pages a million deep into relevance order.
     if from_rank >= budget.0 {
-        return Ok(Ranked {
-            steps: Vec::new(),
-            matching_literals: MatchingLiterals {
-                counted: from_rank,
-                exact: false,
-            },
-            spent: Some(Spent::Deepest),
-        });
+        return Err(Problem::from(StaleCursor));
     }
 
-    // One hit more than this request will look at, so "are there candidates
-    // left?" is answered by the fetch itself — the same trick the extra row
-    // plays for the page, and exact where comparing against a *bounded* count
-    // would not be, since a saturated count is only a lower bound.
-    let mut hits = searcher
-        .search(&query, top_k.saturating_add(1))
+    // hdtc independently bounds the score work and retained heap. Keeping the
+    // complete candidate window lets a selective subject/predicate constraint
+    // walk past text hits that contribute no rows without pretending `limit`
+    // bounded that work.
+    let found = searcher
+        .search_up_to(&query, budget.ceiling(), budget.0)
         .map_err(|error| unreadable("searching the text index", &error))?;
-    let beyond = hits.len() > top_k;
-    hits.truncate(top_k);
+    let hits = &found.hits;
 
     // A rank past the end of the hit list was never issued: a page that reached
     // the end says so rather than handing out a cursor to nothing. The fetch
@@ -958,6 +956,12 @@ fn ranked(
         let space = PositionSpace::of(&selection);
         // `skip` applies to the hit the cursor stopped inside, and no other.
         let within = std::mem::take(&mut skip);
+        if cursor.is_some()
+            && rank as u64 == from_rank
+            && selection.page(within, 1).next().is_none()
+        {
+            return Err(Problem::from(StaleCursor));
+        }
         steps.extend(
             positioned(&selection, space, within)
                 .take(want - steps.len())
@@ -975,27 +979,15 @@ fn ranked(
         );
     }
 
-    // The page did not fill and candidates remain. `beyond` rather than a
-    // comparison against what was *asked for*: a query whose last candidates
-    // contribute no rows — every hit `p` rejects — fills neither the page nor
-    // the hit list, and reading that as "there is more" hands out a cursor to
-    // an empty page that says the same thing again.
-    let spent = (steps.len() < want && beyond).then_some(Spent::At(hits.len() as u64));
-
-    // How many distinct literals match, for `distinct_objects` — bounded, so a
-    // common token cannot make one request walk millions of postings. A
-    // saturated count is a lower bound rather than the figure §3.4.1 calls
-    // exact, so it comes back as `None` and is reported as a bound instead.
-    let (counted, saturated) = searcher
-        .count_up_to(&query, budget.0)
-        .map_err(|error| unreadable("counting text matches", &error))?;
+    let spent = (steps.len() < want && !found.complete).then_some(Spent::Deepest);
 
     Ok(Ranked {
         steps,
         matching_literals: MatchingLiterals {
-            counted,
-            exact: !saturated,
+            counted: found.examined,
+            exact: found.complete,
         },
+        unfiltered: ids.subject.is_none() && ids.predicate.is_none(),
         spent,
     })
 }
@@ -1117,6 +1109,7 @@ fn ranked_page(
     let Ranked {
         steps,
         matching_literals,
+        unfiltered,
         spent,
     } = found;
     let from_start = paging.cursor.is_none();
@@ -1134,6 +1127,7 @@ fn ranked_page(
                 from_start,
                 rows.len() as u64,
                 matching_literals,
+                unfiltered,
             )
         },
     )
@@ -1184,10 +1178,6 @@ fn finish(
             Completeness::budget_exhausted(BudgetReason::ResponseBytes, next.cursor(paging.binding))
         }
         (None, Some(next), _) => Completeness::page_limit(next.cursor(paging.binding)),
-        (None, None, Some(Spent::At(rank))) => Completeness::budget_exhausted(
-            BudgetReason::Candidate,
-            Cursor::at_rank(paging.binding, rank, 0).encode(),
-        ),
         (None, None, Some(Spent::Deepest)) => {
             Completeness::budget_exhausted_without_resume(BudgetReason::Candidate)
         }
@@ -1218,10 +1208,10 @@ fn finish(
 ///
 /// Otherwise the index supplies the number of distinct matching *literals*,
 /// which is a different quantity from the rows: one literal occurs on many
-/// subjects, and when `s` or `p` is bound it may occur on none that match. It
-/// goes out as the estimate, and as `distinct_objects` when the count reached
-/// the end — §3.4.1 calls that field exact, so a figure that stopped at the
-/// candidate budget is reported as a lower bound instead.
+/// subjects. It goes out as the estimate, and as `distinct_objects` when the
+/// count reached the end, only when `s` and `p` are both unbound. With either
+/// bound, a matching literal may contribute no row, so only the rows actually
+/// produced are reported as the estimate.
 ///
 /// `value` never falls below the rows in the response, which it otherwise
 /// would: one literal on three hundred subjects is a `distinct_objects` of 1
@@ -1235,11 +1225,15 @@ fn text_cardinality(
     from_start: bool,
     rows: u64,
     matching_literals: MatchingLiterals,
+    unfiltered: bool,
 ) -> Cardinality {
     if completeness.is_complete() && from_start {
         return Cardinality::exact(rows);
     }
     let MatchingLiterals { counted, exact } = matching_literals;
+    if !unfiltered {
+        return Cardinality::estimated(rows);
+    }
     let estimate = Cardinality::estimated(counted.max(rows));
     if exact {
         estimate.over_distinct_objects(counted)
@@ -1547,6 +1541,9 @@ impl Resource for Answer {
         if self.directed {
             headers.push("direction");
         }
+        if self.rows.iter().any(|row| row.ranking.is_some()) {
+            headers.extend([SCORE, MATCH_KIND]);
+        }
 
         page(
             &self.target.title(),
@@ -1629,6 +1626,16 @@ impl Answer {
                         href: None,
                     });
                 }
+                if let Some(ranking) = row.ranking {
+                    cells.push(Cell {
+                        label: ranking.score.to_string(),
+                        href: None,
+                    });
+                    cells.push(Cell {
+                        label: ranking.kind.to_owned(),
+                        href: None,
+                    });
+                }
                 cells
             })
             .collect()
@@ -1679,15 +1686,25 @@ impl Resource for CountAnswer {
                         self.absent_terms.join(", ")
                     )))
                 }
-                (note(
-                    "A plain pattern's count is exact and costs a bounded descent rather than an \
-                     enumeration, which is what makes it worth asking before /fragment."
-                ))
+                @if self.pattern.text().is_none() {
+                    (note(
+                        "A plain pattern's count is exact and costs a bounded descent rather than an \
+                         enumeration, which is what makes it worth asking before /fragment."
+                    ))
+                } @else {
+                    (note(
+                        "A text count scans a bounded window of matching literals. Continue from the \
+                         cursor until the count is exact."
+                    ))
+                }
                 p {
                     a href=(query(
                         url::operation(&self.target.id.dataset, &self.target.id.version, "fragment"),
-                        &self.target.params,
+                        &self.target.params.without("cursor"),
                     )) { "The rows themselves →" }
+                }
+                @if let Some(token) = self.completeness.next_cursor() {
+                    p { a href=(self.target.next(token)) { "Continue counting →" } }
                 }
             },
         )
@@ -1696,7 +1713,7 @@ impl Resource for CountAnswer {
 
 /// The three pattern positions, as page fields.
 fn pattern_fields(pattern: &Pattern) -> Vec<(&str, Value<'_>)> {
-    Position::ALL
+    let mut fields: Vec<_> = Position::ALL
         .into_iter()
         .map(|position| {
             (
@@ -1706,7 +1723,11 @@ fn pattern_fields(pattern: &Pattern) -> Vec<(&str, Value<'_>)> {
                     .map_or(Value::Text("(any)"), |term| Value::Code(term.requested())),
             )
         })
-        .collect()
+        .collect();
+    if let Some(text) = pattern.text() {
+        fields.push(("o.text", Value::Code(text.query())));
+    }
+    fields
 }
 
 /// A rendered table cell, held so the borrowed [`Value`] can point at it.

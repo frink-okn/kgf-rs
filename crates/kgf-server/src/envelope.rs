@@ -52,10 +52,10 @@
 //! megabytes", so a page of `limit` rows is bounded in rows and unbounded in
 //! bytes, and a plain `/fragment` reaches it on real data.
 //!
-//! `time_budget` and `candidate_budget` do belong to M2's scans, and
-//! `cell_overflow`/`partial_failure` to operations M1 does not have — but the
-//! vocabulary is closed *now*, so the type cannot later grow a stringly-typed
-//! escape hatch for a reason someone forgot to add.
+//! `candidate_budget` is also emitted by `o.text` scans. `time_budget`,
+//! `cell_overflow`, and `partial_failure` belong to operations M1 does not have
+//! — but the vocabulary is closed *now*, so the type cannot later grow a
+//! stringly-typed escape hatch for a reason someone forgot to add.
 
 use crate::cursor::CursorToken;
 use serde::ser::{Serialize, SerializeMap, Serializer};
@@ -74,7 +74,7 @@ pub enum TruncationReason {
     PageLimit,
     /// A time budget expired mid-scan (M2).
     TimeBudget,
-    /// A candidate budget was spent before the scan finished (M2).
+    /// A candidate budget was spent before the scan finished.
     CandidateBudget,
     /// The response reached its byte budget.
     ResponseBytes,
@@ -189,16 +189,16 @@ impl Completeness {
 
     /// A budget stopped an operation that has nowhere to resume from.
     ///
-    /// One operation is in this position and it is not an oversight: `/sample`
-    /// draws `n` members and never pages (§3.4.7), so it has no position for a
-    /// cursor to name — and it can still spend `max_response_bytes`, because a
-    /// bundle may hold a literal of any size. Reporting it is the alternative
-    /// to returning fewer members than were asked for and calling the result
-    /// complete, which is the silent truncation §3.6 prohibits.
+    /// Two operations are in this position and neither is an oversight.
+    /// `/sample` draws `n` members and never pages (§3.4.7), so a response-byte
+    /// stop has no position to name. A partial relevance window likewise has no
+    /// cursor beyond the candidates it retained: recreating a global rank at
+    /// arbitrary depth would require unbounded scoring and memory. Reporting
+    /// either stop is the alternative to calling a partial result complete,
+    /// which is the silent truncation §3.6 prohibits.
     ///
-    /// The client's remedy is to ask for less rather than to page, and the wire
-    /// shape it produces — incomplete, a reason, no `next` — is one §3.6
-    /// already defines and clients already handle, since `cell_overflow` and
+    /// The wire shape — incomplete, a reason, no `next` — is one §3.6 already
+    /// defines and clients already handle, since `cell_overflow` and
     /// `partial_failure` produce it too.
     ///
     /// Separate from [`budget_exhausted`](Self::budget_exhausted) so that

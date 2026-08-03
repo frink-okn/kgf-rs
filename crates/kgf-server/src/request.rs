@@ -39,7 +39,9 @@ use hdtc::format::TextQuery;
 use kgf_store::{Capability, Role};
 
 use crate::Limits;
-use crate::cursor::{BundleBinding, CanonicalRequest, Cursor, CursorBinding, Operation};
+use crate::cursor::{
+    BundleBinding, CanonicalRequest, Cursor, CursorBinding, Operation, StaleCursor,
+};
 use crate::envelope::{ErrorCode, Problem, reflected};
 use crate::term::{PrefixMap, Term};
 use crate::url::Params;
@@ -427,7 +429,8 @@ pub struct ResponseBytes(pub u64);
 /// may keep none of them — `? p ?` discards every match that does not occur
 /// with `p` — so the work has no relation to the page size, and `limit` bounds
 /// nothing. Exhausting it is not an error: §3.5 says the response comes back
-/// short, marked `candidate_budget`, with a cursor.
+/// short and marked `candidate_budget`, with a cursor when its scan order has a
+/// resumable position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Candidates(pub u64);
 
@@ -498,24 +501,40 @@ pub struct Count {
     pub pattern: Pattern,
     /// Candidates a text constraint may examine.
     pub candidates: Candidates,
+    /// Where to resume a budgeted text scan.
+    pub cursor: Option<Cursor>,
+    /// What a cursor this count issues must match.
+    pub binding: CursorBinding,
 }
 
 impl Count {
-    /// No `limit` and no `cursor`: an M1 count is exact and arrives whole.
-    /// §3.4.4's budgeted scanning counts, which do resume, are M2 — and
-    /// [`Operation::Count`] already reserves the token value they will need.
-    const PARAMETERS: &'static [&'static str] = &["s", "p", "o", "o.text", "format"];
+    /// No `limit`: each request spends at most the published candidate budget.
+    const PARAMETERS: &'static [&'static str] = &["s", "p", "o", "o.text", "cursor", "format"];
 
     /// Read the parameters of a `/count` request.
     pub fn parse(
         params: &Params,
         limits: Limits<'_>,
         prefixes: &PrefixMap,
+        bundle: &BundleBinding,
     ) -> Result<Self, Problem> {
         accept_only(params, COUNT, Self::PARAMETERS)?;
+        let pattern = Pattern::parse(params, limits, prefixes)?;
+        let binding = CursorBinding::new(
+            bundle,
+            &pattern.canonicalize(CanonicalRequest::new(Operation::Count)),
+        );
+        let cursor = resume(params, &binding)?;
+        if cursor.is_some() && pattern.text().is_none() {
+            // Ordinary counts finish in one bounded descent and never issue a
+            // continuation. Accepting one would mean silently ignoring it.
+            return Err(Problem::from(StaleCursor));
+        }
         Ok(Self {
-            pattern: Pattern::parse(params, limits, prefixes)?,
+            pattern,
             candidates: Candidates(limits.budgets.candidate_budget),
+            cursor,
+            binding,
         })
     }
 }
@@ -647,8 +666,8 @@ impl Sample {
 /// makes the remedy the whole point of a code.
 ///
 /// The column transcribes: §3.4.1's parameter table for `/fragment`; §3.4.4's
-/// "counts for text/range constraints are estimates", which gives `/count` the
-/// same filters and no `labels` (a count has no rows to label); §3.5's
+/// filtered counts, which give `/count` the same filters and no `labels` (a
+/// count has no rows to label); §3.5's
 /// `labels=true` modifier row for the operations that return rows; and §3.5's
 /// `fragment +g scope` and `count +g scope` rows for `g`.
 const NOT_OFFERED: &[(&str, Option<Capability>, &[&str])] = &[
@@ -908,7 +927,7 @@ mod tests {
             ErrorCode::CapabilityNotAvailable
         );
         assert_eq!(
-            Count::parse(&params(scoped), limits(), &prefixes())
+            Count::parse(&params(scoped), limits(), &prefixes(), &bundle())
                 .unwrap_err()
                 .code(),
             ErrorCode::CapabilityNotAvailable
@@ -934,7 +953,7 @@ mod tests {
             ErrorCode::CapabilityNotAvailable
         );
         assert_eq!(
-            Count::parse(&params("labels=true"), limits(), &prefixes())
+            Count::parse(&params("labels=true"), limits(), &prefixes(), &bundle())
                 .unwrap_err()
                 .code(),
             ErrorCode::MalformedRequest,
@@ -943,10 +962,9 @@ mod tests {
 
         // And an object filter belongs to the two operations that take a
         // pattern *and* report on objects. `o.text` is answered rather than
-        // refused — §3.4.4 says counts for text constraints are estimates,
-        // which is a statement about what a count returns, not whether it takes
-        // one.
-        assert!(Count::parse(&params("o.text=atrazine"), limits(), &prefixes()).is_ok());
+        // refused — §3.4.4 defines counts for text constraints, so `/count`
+        // accepts the filter even though other operations do not.
+        assert!(Count::parse(&params("o.text=atrazine"), limits(), &prefixes(), &bundle()).is_ok());
         assert_eq!(
             Describe::parse(
                 &params("iri=ex:a&o.text=atrazine"),
@@ -1090,8 +1108,8 @@ mod tests {
     }
 
     #[test]
-    fn a_count_takes_a_pattern_and_nothing_that_pages() {
-        let parse = |query: &str| Count::parse(&params(query), limits(), &prefixes());
+    fn a_count_takes_a_pattern_and_only_a_scan_cursor() {
+        let parse = |query: &str| Count::parse(&params(query), limits(), &prefixes(), &bundle());
 
         assert_eq!(
             parse("p=ex:knows")
@@ -1103,15 +1121,24 @@ mod tests {
                 dictionary: "http://example.org/knows".to_owned(),
             })
         );
-        // M1's counts are exact and arrive whole; §3.4.4's resumable scanning
-        // counts are M2, and this server never issues a token for one.
-        for query in ["limit=10", "cursor=abc"] {
-            assert_eq!(
-                parse(query).unwrap_err().code(),
-                ErrorCode::MalformedRequest,
-                "{query}"
-            );
-        }
+        assert_eq!(
+            parse("limit=10").unwrap_err().code(),
+            ErrorCode::MalformedRequest
+        );
+        assert_eq!(
+            parse("cursor=abc").unwrap_err().code(),
+            ErrorCode::StaleCursor
+        );
+
+        let plain = parse("p=ex:knows").unwrap();
+        let token = Cursor::at_text_scan(&plain.binding, 1, 0).encode();
+        assert_eq!(
+            parse(&format!("p=ex:knows&cursor={token}"))
+                .unwrap_err()
+                .code(),
+            ErrorCode::StaleCursor,
+            "an ordinary count must not silently ignore a well-shaped cursor"
+        );
     }
 
     #[test]

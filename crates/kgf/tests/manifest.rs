@@ -155,6 +155,23 @@ fn a_text_index_is_described_as_one_artifact_and_must_belong_to_its_bundle() {
     );
 }
 
+#[test]
+fn a_manifest_is_not_written_for_a_text_index_tantivy_cannot_open() {
+    let root = tempfile::tempdir().unwrap();
+    let bundle = root.path().join("demo-kg").join("2026-08-01");
+    std::fs::create_dir_all(&bundle).unwrap();
+    build_artifacts(&bundle, SOURCE);
+    build_text_index(&bundle);
+
+    // The hdtc manifest and source binding remain valid; only Tantivy's own
+    // index metadata is broken. Checking merely hdtc-text.meta would therefore
+    // publish a bundle that Store::open immediately refuses.
+    std::fs::write(bundle.join("data.hdt.text").join("meta.json"), b"not json").unwrap();
+    let error = kgf(&["manifest", path(&bundle)]).failure();
+    assert!(error.contains("text index could not be opened"), "{error}");
+    assert!(!bundle.join("manifest.json").exists());
+}
+
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {
