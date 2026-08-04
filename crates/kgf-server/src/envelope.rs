@@ -730,11 +730,13 @@ impl crate::html::Resource for Problem {
     /// `detail` already names the offending value and the remedy, so the page
     /// is mostly a frame around it.
     fn to_html(&self) -> String {
-        use crate::html::{Crumb, Value, fields, note, page};
+        use crate::html::{Value, fields, note, page};
 
+        // No crumbs: the masthead's brand already links back to `/`, which is
+        // the one place every error page can honestly point.
         page(
             self.code.title(),
-            &[Crumb::to("kgf", "/".to_owned())],
+            &[],
             None,
             maud::html! {
                 p { (self.detail) }

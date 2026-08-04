@@ -55,9 +55,11 @@ use kgf_store::pattern::{IdPattern, Selection};
 use kgf_store::{IdTriple, Role, Store, TermId};
 
 use crate::cursor::{Cursor, CursorBinding, PositionSpace, StaleCursor};
-use crate::envelope::{BudgetReason, Cardinality, Completeness, ErrorCode, Problem};
+use crate::envelope::{
+    BudgetReason, Cardinality, Completeness, ErrorCode, Problem, TruncationReason,
+};
 use crate::forms;
-use crate::html::{Crumb, Resource, Value, fields, json_body, note, page, table};
+use crate::html::{Crumb, Resource, TermText, Value, fields, json_body, note, page, results_table};
 use crate::representation::Representation;
 use crate::request::{
     self, BindingPattern, BindingRow, BoundTerm, Candidates, Direction, Pattern, Position,
@@ -164,7 +166,6 @@ impl Target {
 
     fn crumbs(&self) -> Vec<Crumb<'_>> {
         vec![
-            Crumb::to("kgf", "/".to_owned()),
             Crumb::to(&self.id.dataset, url::dataset(&self.id.dataset)),
             // There is no landing page for a version, so the version step goes
             // to the one document doc 03 §3.2 does define for it.
@@ -229,6 +230,24 @@ pub struct Rendered {
 pub trait Renders {
     /// Serialize into `representation`, with the metadata its headers need.
     fn render(self, representation: Representation) -> Rendered;
+
+    /// Resolve display labels for the page's IRIs, before an HTML render.
+    ///
+    /// A no-op for answers that carry no IRI rows and for JSON, whose clients
+    /// hydrate labels themselves through `/labels`. `label_predicates` is the
+    /// release's frozen `label` role cascade, and `cap` bounds the distinct
+    /// terms one page may resolve — the same `max_label_iris` that bounds a
+    /// `/labels` request, so a page never does work a client could not ask
+    /// for. A page over the cap is served unannotated rather than
+    /// half-annotated.
+    fn hydrate_labels(
+        &mut self,
+        _store: &Store,
+        _label_predicates: &[String],
+        _cap: usize,
+    ) -> Result<(), Problem> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -470,6 +489,19 @@ pub struct Answer {
     bindings: bool,
     #[serde(skip)]
     target: Target,
+    /// Display labels for the page's IRIs, resolved only when this answer is
+    /// being rendered as HTML — a reading affordance, never response data.
+    ///
+    /// Keyed by dictionary spelling. Empty for JSON, where a client hydrates
+    /// labels itself through `/labels` (and where a future `labels=true`
+    /// parameter would put them in the envelope — see `notes/plan.md`,
+    /// "Questions for `../kgf`").
+    #[serde(skip)]
+    page_labels: HashMap<String, String>,
+    /// The described term's dictionary spelling, so the page can resolve and
+    /// show its label. `None` for every operation but `/describe`.
+    #[serde(skip)]
+    described: Option<String>,
 }
 
 impl Renders for Answer {
@@ -482,6 +514,72 @@ impl Renders for Answer {
             body,
             completeness: self.completeness,
         }
+    }
+
+    /// One bounded cascade per distinct IRI or blank node on the page — the
+    /// same probe sequence `/labels` runs, against the same frozen role
+    /// profile, bounded by the same cap.
+    fn hydrate_labels(
+        &mut self,
+        store: &Store,
+        label_predicates: &[String],
+        cap: usize,
+    ) -> Result<(), Problem> {
+        if label_predicates.is_empty() {
+            return Ok(());
+        }
+        let mut wanted: Vec<&str> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let named = |text: &str| !text.starts_with('"');
+        for row in &self.rows {
+            for (_, text) in &row.cells {
+                if named(text) && seen.insert(text) {
+                    wanted.push(text);
+                }
+            }
+        }
+        if let Some(described) = &self.described
+            && named(described)
+            && seen.insert(described)
+        {
+            wanted.push(described);
+        }
+        if wanted.is_empty() || wanted.len() > cap {
+            return Ok(());
+        }
+
+        let dictionary = store.dict();
+        let predicates: Vec<u64> = label_predicates
+            .iter()
+            .map(|iri| {
+                dictionary
+                    .locate(Role::Predicate, iri.as_bytes())
+                    .map(|found| found.map(|id| id.0))
+                    .map_err(|error| unreadable("looking a label predicate up", &error))
+            })
+            .filter_map(Result::transpose)
+            .collect::<Result<_, _>>()?;
+        if predicates.is_empty() {
+            return Ok(());
+        }
+
+        let mut cache = TermCache::new();
+        let mut labels = HashMap::new();
+        for text in wanted {
+            let Some(subject) = dictionary
+                .locate(Role::Subject, text.as_bytes())
+                .map_err(|error| unreadable("looking a term up", &error))?
+            else {
+                continue;
+            };
+            if let Some(label) =
+                preferred_label(store, &dictionary, &mut cache, subject.0, &predicates)?
+            {
+                labels.insert(text.to_owned(), label);
+            }
+        }
+        self.page_labels = labels;
+        Ok(())
     }
 }
 
@@ -1433,7 +1531,7 @@ pub fn describe(
         Vec::new()
     };
 
-    paged(
+    let mut answer = paged(
         &dictionary,
         target,
         Envelope {
@@ -1454,7 +1552,9 @@ pub fn describe(
             bytes: request.bytes,
             binding: &request.binding,
         },
-    )
+    )?;
+    answer.described = Some(request.resource.dictionary().to_owned());
+    Ok(answer)
 }
 
 /// `GET /sample` — pseudo-random members of a pattern's results (§3.4.7).
@@ -1513,6 +1613,8 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         directed: false,
         bindings: false,
         target,
+        page_labels: HashMap::new(),
+        described: None,
     })
 }
 
@@ -2039,6 +2141,8 @@ fn finish(
         directed,
         bindings,
         target,
+        page_labels: HashMap::new(),
+        described: None,
     })
 }
 
@@ -2411,6 +2515,12 @@ impl Resource for Answer {
             &self.target.crumbs(),
             canonical.as_deref(),
             html! {
+                @if let Some((resource, label)) = self.described_header() {
+                    div."resource-head" {
+                        span."r-label" { (label) }
+                        code { (resource) }
+                    }
+                }
                 @if let Some(form) = self.target.form() {
                     (form)
                 }
@@ -2422,6 +2532,13 @@ impl Resource for Answer {
                         self.absent_terms.join(", ")
                     )))
                 }
+                @if !self.completeness.is_complete()
+                    && self.completeness.next_cursor().is_none() {
+                    (note(
+                        "This answer stopped at a budget and has no position to resume from; \
+                         what is here is as much as one response allows."
+                    ))
+                }
 
                 h2 { "Rows" }
                 @if self.vars.is_empty() && !self.bindings {
@@ -2432,12 +2549,12 @@ impl Resource for Answer {
                 } @else if rows.is_empty() {
                     (note("No rows."))
                 } @else {
-                    (table(&headers, &rows))
+                    (results_table(&headers, &rows))
                 }
 
                 @if let Some(token) = self.completeness.next_cursor() {
                     @if let Some(next) = self.target.next(token) {
-                        p { a href=(next) { "Next page →" } }
+                        p."pager" { a href=(next) { "Next page →" } }
                     } @else {
                         p."note" {
                             "Put cursor " code { (token) }
@@ -2451,6 +2568,19 @@ impl Resource for Answer {
 }
 
 impl Answer {
+    /// The described resource's label and spelling, for the page's header
+    /// block — present only when `/describe` found one.
+    fn described_header(&self) -> Option<(&str, &str)> {
+        let Echo::Describe { resource, .. } = &self.echo else {
+            return None;
+        };
+        let label = self
+            .described
+            .as_ref()
+            .and_then(|text| self.page_labels.get(text))?;
+        Some((resource, label))
+    }
+
     /// The fields above the table: what was asked, and how much of it came back.
     fn summary(&self) -> Vec<(&str, Value<'_>)> {
         let mut summary = match &self.echo {
@@ -2459,10 +2589,18 @@ impl Answer {
             Echo::Describe {
                 resource,
                 direction,
-            } => vec![
-                ("iri", Value::Code(resource)),
-                ("direction", Value::Text(direction.as_str())),
-            ],
+            } => {
+                let mut fields = vec![("iri", Value::Code(resource))];
+                if let Some(label) = self
+                    .described
+                    .as_ref()
+                    .and_then(|text| self.page_labels.get(text))
+                {
+                    fields.push(("label", Value::Text(label)));
+                }
+                fields.push(("direction", Value::Text(direction.as_str())));
+                fields
+            }
             Echo::Sample { pattern, .. } => pattern_fields(pattern),
         };
         summary.push(("cardinality", Value::Number(self.cardinality.value())));
@@ -2473,11 +2611,7 @@ impl Answer {
         }
         summary.push((
             "complete",
-            Value::Text(if self.completeness.is_complete() {
-                "yes"
-            } else {
-                "no — the page filled"
-            }),
+            Value::Text(completeness_text(&self.completeness)),
         ));
         summary
     }
@@ -2489,35 +2623,15 @@ impl Answer {
             .map(|row| {
                 let mut cells = Vec::new();
                 if let Some(binding) = row.binding {
-                    cells.push(Cell {
-                        label: binding.to_string(),
-                        href: None,
-                        full_iri: None,
-                    });
+                    cells.push(Cell::text(binding.to_string()));
                 }
-                cells.extend(
-                    row.cells
-                        .iter()
-                        .map(|(position, text)| self.cell(*position, text)),
-                );
+                cells.extend(row.cells.iter().map(|(_, text)| self.cell(text)));
                 if let Some(direction) = row.direction {
-                    cells.push(Cell {
-                        label: direction.as_str().to_owned(),
-                        href: None,
-                        full_iri: None,
-                    });
+                    cells.push(Cell::text(direction.as_str().to_owned()));
                 }
                 if let Some(ranking) = row.ranking {
-                    cells.push(Cell {
-                        label: ranking.score.to_string(),
-                        href: None,
-                        full_iri: None,
-                    });
-                    cells.push(Cell {
-                        label: ranking.kind.to_owned(),
-                        href: None,
-                        full_iri: None,
-                    });
+                    cells.push(Cell::text(ranking.score.to_string()));
+                    cells.push(Cell::text(ranking.kind.to_owned()));
                 }
                 cells
             })
@@ -2527,10 +2641,30 @@ impl Answer {
     /// One term, and the request that asks about it.
     ///
     /// This is what makes the page a way *into* the data rather than a dump of
-    /// it: a subject or object links to its own neighborhood, a predicate to
-    /// every triple using it, a literal to every triple carrying it.
-    fn cell<'a>(&self, position: Position, text: &'a str) -> Cell<'a> {
-        term_cell(&self.target, position, text)
+    /// it: a subject, predicate or object links to its own neighborhood, a
+    /// literal to every triple carrying it.
+    fn cell<'a>(&'a self, text: &'a str) -> Cell<'a> {
+        term_cell(
+            &self.target,
+            text,
+            self.page_labels.get(text).map(String::as_str),
+        )
+    }
+}
+
+/// The one line a page says about §3.6's completeness, honestly: the actual
+/// truncation reason rather than a guess at it.
+fn completeness_text(completeness: &Completeness) -> &'static str {
+    match completeness.truncation_reason() {
+        None => "yes",
+        Some(TruncationReason::PageLimit) => "no — the page filled",
+        Some(TruncationReason::TimeBudget) => "no — the time budget expired",
+        Some(TruncationReason::CandidateBudget) => {
+            "no — the candidate budget was spent before the scan finished"
+        }
+        Some(TruncationReason::ResponseBytes) => "no — the response byte budget filled",
+        Some(TruncationReason::CellOverflow) => "no — a cell overflowed its cap",
+        Some(TruncationReason::PartialFailure) => "no — part of the request failed",
     }
 }
 
@@ -2543,18 +2677,18 @@ impl Resource for SearchAnswer {
         let subjects: Vec<_> = self
             .results
             .iter()
-            .map(|result| term_cell(&self.target, Position::Subject, &result.subject))
+            .map(|result| {
+                term_cell(
+                    &self.target,
+                    &result.subject,
+                    result.label.as_ref().and_then(Option::as_deref),
+                )
+            })
             .collect();
         let predicates: Vec<_> = self
             .results
             .iter()
-            .map(|result| {
-                term_cell(
-                    &self.target,
-                    Position::Predicate,
-                    &result.evidence.predicate,
-                )
-            })
+            .map(|result| term_cell(&self.target, &result.evidence.predicate, None))
             .collect();
         let scores: Vec<String> = self
             .results
@@ -2576,30 +2710,16 @@ impl Resource for SearchAnswer {
             .iter()
             .enumerate()
             .map(|(index, result)| {
-                let mut row = vec![subjects[index].value()];
-                if self.labels {
-                    row.push(
-                        result
-                            .label
-                            .as_ref()
-                            .and_then(Option::as_deref)
-                            .map_or(Value::Absent, Value::Text),
-                    );
-                }
-                row.extend([
+                vec![
+                    subjects[index].value(),
                     predicates[index].value(),
                     Value::Text(&literals[index]),
                     Value::Text(result.ranking.kind),
                     Value::Text(&scores[index]),
-                ]);
-                row
+                ]
             })
             .collect();
-        let mut headers = vec!["subject"];
-        if self.labels {
-            headers.push("label");
-        }
-        headers.extend(["predicate", "literal", MATCH_KIND, SCORE]);
+        let headers = ["subject", "predicate", "literal", MATCH_KIND, SCORE];
         let roles = self.roles.join(", ");
         let predicate_scope = self
             .predicates
@@ -2629,13 +2749,19 @@ impl Resource for SearchAnswer {
                     ("roles", if roles.is_empty() { Value::Absent } else { Value::Text(&roles) }),
                     ("predicates", if predicate_scope.is_empty() { Value::Absent } else { Value::Code(&predicate_scope) }),
                     ("returned", Value::Number(returned)),
-                    ("complete", Value::Text(if self.completeness.is_complete() { "yes" } else { "no" })),
+                    ("complete", Value::Text(completeness_text(&self.completeness))),
                 ]))
+                @if !self.completeness.is_complete() {
+                    (note(
+                        "Ranked search retains a bounded candidate window and has no cursor; \
+                         narrow the query or its scopes to see what this response could not carry."
+                    ))
+                }
                 h2 { "Entities" }
                 @if rows.is_empty() {
                     (note("No matching entities."))
                 } @else {
-                    (table(&headers, &rows))
+                    (results_table(&headers, &rows))
                 }
             },
         )
@@ -2666,13 +2792,13 @@ impl Resource for LabelsAnswer {
             html! {
                 (fields(&[
                     ("returned", Value::Number(returned)),
-                    ("complete", Value::Text(if self.completeness.is_complete() { "yes" } else { "no" })),
+                    ("complete", Value::Text(completeness_text(&self.completeness))),
                 ]))
                 h2 { "Labels" }
                 @if rows.is_empty() {
                     (note("No IRIs were submitted."))
                 } @else {
-                    (table(&["iri", "label"], &rows))
+                    (results_table(&["iri", "label"], &rows))
                 }
             },
         )
@@ -2719,7 +2845,7 @@ impl Resource for CountAnswer {
                          cursor until the count is exact."
                     ))
                 }
-                p {
+                p."pager" {
                     a href=(query(
                         url::operation(&self.target.id.dataset, &self.target.id.version, "fragment"),
                         &self.target.params.without("cursor"),
@@ -2727,7 +2853,7 @@ impl Resource for CountAnswer {
                 }
                 @if let Some(token) = self.completeness.next_cursor() {
                     @if let Some(next) = self.target.next(token) {
-                        p { a href=(next) { "Continue counting →" } }
+                        p."pager" { a href=(next) { "Continue counting →" } }
                     }
                 }
             },
@@ -2763,7 +2889,7 @@ impl Resource for BindingCountAnswer {
                 @if rows.is_empty() {
                     (note("No input binding rows."))
                 } @else {
-                    (table(&[BINDING, "count", "exact"], &rows))
+                    (results_table(&[BINDING, "count", "exact"], &rows))
                 }
             },
         )
@@ -2798,17 +2924,23 @@ fn binding_pattern_fields(pattern: &BindingPattern) -> Vec<(&str, Value<'_>)> {
 
 /// Render one RDF term with this release's prefix map and the same drill-down
 /// link semantics on every operation page.
-fn term_cell<'a>(target: &Target, position: Position, text: &'a str) -> Cell<'a> {
+///
+/// A named term — subject, predicate or object alike — links to its own
+/// `/describe` neighborhood; a literal links to every triple carrying it. A
+/// predicate used to link to `/fragment?p=`, but the page a reader wants from
+/// a predicate is what the term *is*, and its usage is one link further.
+fn term_cell<'a>(target: &Target, text: &'a str, annotation: Option<&'a str>) -> Cell<'a> {
     let term = Term::from_dictionary(text);
     let request = term.to_request();
-    let href = match (&term, position) {
-        (Term::Literal(_), _) => target.ask("fragment", "o", &request),
-        (_, Position::Predicate) => target.ask("fragment", "p", &request),
+    let href = match &term {
+        Term::Literal(_) => target.ask("fragment", "o", &request),
         _ => target.ask("describe", "iri", &request),
     };
-    let (label, full_iri) = term.into_display(&target.prefixes).into_parts();
+    let (label, qualifier, full_iri) = term.into_display(&target.prefixes).into_structured();
     Cell {
         label,
+        qualifier,
+        annotation,
         href: Some(href),
         full_iri,
     }
@@ -2817,17 +2949,34 @@ fn term_cell<'a>(target: &Target, position: Position, text: &'a str) -> Cell<'a>
 /// A rendered table cell, held so the borrowed [`Value`] can point at it.
 struct Cell<'a> {
     label: String,
+    qualifier: Option<String>,
+    annotation: Option<&'a str>,
     href: Option<String>,
     full_iri: Option<Cow<'a, str>>,
 }
 
-impl Cell<'_> {
+impl<'a> Cell<'a> {
+    /// A plain unlinked cell: a binding index, a direction, a score.
+    fn text(label: String) -> Self {
+        Self {
+            label,
+            qualifier: None,
+            annotation: None,
+            href: None,
+            full_iri: None,
+        }
+    }
+
     fn value(&self) -> Value<'_> {
         match &self.href {
             Some(href) => Value::TermLink {
                 href: href.clone(),
-                label: &self.label,
-                full_iri: self.full_iri.as_deref(),
+                term: TermText {
+                    primary: &self.label,
+                    qualifier: self.qualifier.as_deref(),
+                    annotation: self.annotation,
+                    full_iri: self.full_iri.as_deref(),
+                },
             },
             None => Value::Text(&self.label),
         }

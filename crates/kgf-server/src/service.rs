@@ -398,6 +398,13 @@ impl Datasets {
         self.0.keys().map(String::as_str)
     }
 
+    /// Every dataset with its name, in the same order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &Dataset)> {
+        self.0
+            .iter()
+            .map(|(name, dataset)| (name.as_str(), dataset))
+    }
+
     /// Look up a dataset, or the 404 that says it is not hosted here.
     pub fn get(&self, dataset: &str) -> Result<&Dataset, Problem> {
         self.0.get(dataset).ok_or_else(|| {
@@ -531,6 +538,21 @@ impl Dataset {
     /// The current release's frozen predicate-role profile.
     pub fn predicate_roles(&self) -> &PredicateRoles {
         self.current_release().predicate_roles()
+    }
+
+    /// The current release's triple count, for the catalog.
+    pub fn triples(&self) -> u64 {
+        self.current_release().manifest.parsed.counts.triples
+    }
+
+    /// The capability names the current release declares, in manifest order.
+    pub fn capabilities(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.current_release()
+            .manifest
+            .parsed
+            .capabilities
+            .keys()
+            .map(String::as_str)
     }
 }
 

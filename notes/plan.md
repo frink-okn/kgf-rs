@@ -1120,6 +1120,55 @@ duplicates and input order; exact row-size oracles and scope-list parser tests; 
 real socket tests for GET search (including truthful HTML scope), literal QUERY labels,
 empty-input HTML, `Accept-Query`, and rejection of the removed `lang` parameter.
 
+### 18. The web UI revamp — a catalog with a workbench ✅
+
+The HTML layer rebuilt around one deliberate voice split: *editorial chrome,
+registry data*. Page titles, dataset names and prose are set in a system serif
+stack over a warm paper palette (dark mode keeps the warmth); tables, term
+cells, chips and stats are monospace-accented, compact, tabular. Catalog pages
+lean editorial, operation pages lean registry, and both come from the single
+inline stylesheet in `html.rs`, still with zero external requests and no
+client framework — the `formdata` normalizer remains the whole of client-side
+JavaScript. Layout is hybrid: prose and field lists hold a 48 rem reading
+column while result tables and card grids break out toward the viewport
+(`results_table` vs `table` in `html.rs`, `main > .wide`).
+
+`/` became a dataset catalog in both representations. The service descriptor's
+`datasets` field now carries `{id, title, description, triples, current,
+capabilities, url}` per dataset — read once at startup from manifests already
+in memory — and the page renders them as cards. A catalog a client can choose
+from needs one round trip; a bare slug list needed one per dataset. Question 34
+records the doc 04 §4.3 divergence.
+
+HTML answers hydrate display labels. When (and only when) the negotiated
+representation is a page, `routes::operate` passes the release's frozen `label`
+cascade into `Renders::hydrate_labels`, and every distinct IRI or blank node on
+the page gets one bounded `preferred_label` cascade — the same probes `/labels`
+runs, capped by the same `max_label_iris` (a page over the cap is served
+unannotated rather than half-annotated). Labels render under the term's CURIE
+in result cells; `/describe` also resolves its target's label into a header
+block and the summary. JSON pays nothing for this and stays byte-identical;
+question 35 records the `labels=true` parameter that would give JSON parity.
+
+Smaller contract changes, each visible in a pinned test: predicate cells link
+to `/describe?iri=` like every other named term, instead of `/fragment?p=`
+(the fragment is one link further, through the describe page's form); a
+literal's `@lang`/`^^datatype` qualifier is set apart from its lexical form
+(`TermDisplay::into_structured`); the `complete` summary line reports the
+actual `truncation_reason` instead of hardcoding "the page filled"; a truncated
+answer with no cursor says so in prose; search's label column became the same
+under-the-term annotation the other pages use; the manifest page carries the
+stat row, capability chips, and copyable `$KGF`-relative curl examples; error
+pages and every crumb trail hang off a masthead brand link that only `page()`
+can spell.
+
+*Verified by* the existing escaping test extended over the new helpers (chips,
+stats, structured term links), the masthead/crumb test, compact-number
+truncation tests, the updated socket tests (catalog JSON shape, search label
+annotation, describe drill-down for predicates, qualifier markup), and a
+headless visual pass over root/dataset/manifest/fragment/describe/search/error
+pages in both color schemes at desktop and phone widths.
+
 ### What the implementation still is not
 
 **M1 is a strict subset of doc 03 §3.1's mandatory core profile.** That profile is
@@ -1550,6 +1599,26 @@ following the code.
     authoring descriptor may still be the input for the *next* snapshot; versioned
     execution must remain frozen. Docs 03, 04 and 19 need to choose and state that
     split together.
+34. **The service descriptor's `datasets` is now a catalog, not a name list.** Doc 04
+    §4.3's example shows `datasets` as bare ids. This server publishes a summary per
+    dataset — `{id, title, description, triples, current, capabilities, url}` — drawn
+    from manifests it has already read at startup, because the front page's job (and a
+    federated client's first question) is *choosing a dataset*, and a name list makes
+    that one round trip per dataset. It is the same self-description argument doc 03
+    §3.1 makes for caps. The docs should either adopt the summary shape or say why the
+    root must stay thin; if adopted, which fields are required and whether
+    `description` may be truncated at the source both need a sentence. Surfaced by the
+    unit 18 web UI revamp.
+35. **Row operations should take `labels=true` so JSON can match the pages.** §3.5's
+    modifier table already prices a `labels=true` row for "operations that return
+    rows", but §3.4.1's envelope never defines where the labels would go, and this
+    implementation currently rejects the parameter on `/fragment`. Meanwhile unit 18's
+    HTML pages hydrate labels server-side (same cascade as `/labels`, bounded by
+    `max_label_iris`) — so the two representations of one URL differ by an affordance
+    JSON clients must fetch separately. The fix is to specify the envelope shape for
+    hydrated labels (a `labels` sibling map keyed by IRI? a per-cell annotation?) and
+    let `labels=true` turn it on for `/fragment`, `/describe` and `/sample`; the HTML
+    pages then become the `labels=true` rendering rather than a special case.
 
 ## Not in this plan
 

@@ -27,7 +27,10 @@ use kgf_store::manifest::{Manifest, Publisher};
 use serde::Serialize;
 
 use crate::forms;
-use crate::html::{Crumb, Resource, SITE, Value, fields, json_body, note, page, table};
+use crate::html::{
+    Crumb, Resource, SITE, Value, chips, compact_number, fields, group_digits, json_body, note,
+    page, stats, table,
+};
 use crate::service::{Dataset, PredicateRoles, Service};
 use crate::url;
 use maud::html;
@@ -46,12 +49,34 @@ pub const PROTOCOL_VERSION: &str = "1";
 /// documented number beside a separate constant. Doc 03 §3.1 principle 1 tells
 /// clients to read them instead of assuming, which only works if reading them
 /// is reading the truth.
+///
+/// `datasets` carries a summary per dataset rather than doc 04 §4.3's bare
+/// name list: title, description, triple count, capabilities and the current
+/// version, all read once at startup from manifests already in memory. A
+/// catalog a client can *choose from* needs one round trip, not one per
+/// dataset — the same argument doc 03 §3.1 makes for self-description.
+/// Recorded as a spec question in `notes/plan.md`, "Questions for `../kgf`".
 #[derive(Debug, Serialize)]
 pub struct ServiceDescriptor<'a> {
-    datasets: Vec<&'a str>,
+    datasets: Vec<DatasetSummary<'a>>,
     caps: &'a crate::Caps,
     budgets: &'a crate::Budgets,
     implementation: Implementation,
+}
+
+/// One dataset's card in the service catalog.
+#[derive(Debug, Serialize)]
+pub struct DatasetSummary<'a> {
+    id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    triples: u64,
+    current: &'a str,
+    capabilities: Vec<&'a str>,
+    /// The dataset descriptor, relative to this origin (see [`ReleaseEntry::url`]).
+    url: String,
 }
 
 /// Which build and protocol answered.
@@ -65,7 +90,19 @@ impl<'a> ServiceDescriptor<'a> {
     /// Describe a running service.
     pub fn of(service: &'a Service) -> Self {
         Self {
-            datasets: service.datasets().names().collect(),
+            datasets: service
+                .datasets()
+                .iter()
+                .map(|(name, dataset)| DatasetSummary {
+                    id: name,
+                    title: dataset.title(),
+                    description: dataset.description(),
+                    triples: dataset.triples(),
+                    current: dataset.current(),
+                    capabilities: dataset.capabilities().collect(),
+                    url: url::dataset(name),
+                })
+                .collect(),
             caps: &service.config().caps,
             budgets: &service.config().budgets,
             implementation: Implementation {
@@ -82,28 +119,66 @@ impl Resource for ServiceDescriptor<'_> {
     }
 
     fn to_html(&self) -> String {
+        let total_triples: u64 = self
+            .datasets
+            .iter()
+            .map(|dataset| dataset.triples)
+            .fold(0, u64::saturating_add);
+
         page(
             SITE,
-            &[Crumb::here("kgf")],
+            &[],
             Some("/"),
             html! {
-                p {
-                    "A bounded-cost query interface over published RDF bundles. Every URL below \
-                     answers JSON to anything that does not ask for HTML."
+                p."lede" {
+                    "Query federated RDF knowledge graphs at bounded cost — from a browser, "
+                    "curl, or an agent, at the same URLs."
                 }
+                (stats(&[
+                    ("datasets", group_digits(self.datasets.len() as u64)),
+                    ("triples", compact_number(total_triples)),
+                    ("protocol", self.implementation.protocol.to_owned()),
+                ]))
 
                 h2 { "Datasets" }
                 @if self.datasets.is_empty() {
                     (note("This server hosts no datasets."))
                 } @else {
-                    (table(
-                        &["Dataset"],
-                        &self
-                            .datasets
-                            .iter()
-                            .map(|name| vec![Value::self_link(url::dataset(name), name)])
-                            .collect::<Vec<_>>(),
-                    ))
+                    ul."cards"."wide" {
+                        @for dataset in &self.datasets {
+                            li."card" {
+                                h3 { a href=(dataset.url) { (dataset.title.unwrap_or(dataset.id)) } }
+                                @if let Some(description) = dataset.description {
+                                    p."card-desc" { (description) }
+                                }
+                                @if !dataset.capabilities.is_empty() {
+                                    (chips(&dataset.capabilities))
+                                }
+                                p."card-meta" {
+                                    strong { (compact_number(dataset.triples)) }
+                                    " triples · " (dataset.current)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                h2 { "Using this service" }
+                p."note" {
+                    "Every dataset page lists its releases; a release's manifest page carries "
+                    "runnable query forms, its prefixes, and its capabilities. The same URLs "
+                    "answer JSON — with " code { "$KGF" } " as this server's base URL:"
+                }
+                pre {
+                    code {
+                        "curl \"$KGF/\"                                # this catalog\n"
+                        @if let Some(first) = self.datasets.first() {
+                            "curl \"$KGF/" (first.id) "\"                        # release history\n"
+                            "curl \"$KGF/" (first.id) "/latest/fragment?limit=25\" # one page of triples"
+                        } @else {
+                            "curl \"$KGF/{dataset}/latest/fragment?limit=25\""
+                        }
+                    }
                 }
 
                 h2 { "Caps" }
@@ -194,6 +269,12 @@ pub struct DatasetDescriptor<'a> {
     predicate_roles: &'a PredicateRoles,
     current: &'a str,
     releases: Vec<ReleaseEntry<'a>>,
+    /// For the page only: the current release's triple count and capability
+    /// chips. The JSON reader takes both from the manifest it will fetch next.
+    #[serde(skip)]
+    triples: u64,
+    #[serde(skip)]
+    capabilities: Vec<&'a str>,
 }
 
 /// One row of a dataset descriptor's release history.
@@ -229,6 +310,8 @@ impl<'a> DatasetDescriptor<'a> {
                     url: url::bundle_base(name, version),
                 })
                 .collect(),
+            triples: dataset.triples(),
+            capabilities: dataset.capabilities().collect(),
         }
     }
 }
@@ -271,11 +354,27 @@ impl Resource for DatasetDescriptor<'_> {
 
         page(
             self.title.unwrap_or(self.id),
-            &[Crumb::to("kgf", "/".to_owned()), Crumb::here(self.id)],
+            &[Crumb::here(self.id)],
             Some(&url::dataset(self.id)),
             html! {
                 @if let Some(description) = self.description {
-                    p { (description) }
+                    p."lede" { (description) }
+                }
+                (stats(&[
+                    ("triples", group_digits(self.triples)),
+                    ("releases", group_digits(self.releases.len() as u64)),
+                ]))
+                @if !self.capabilities.is_empty() {
+                    (chips(&self.capabilities))
+                }
+                p."pager" {
+                    a href=(format!("/{}/latest/fragment", url::encode_segment(self.id))) {
+                        "Browse the data →"
+                    }
+                    " "
+                    a href=(url::operation(self.id, self.current, "manifest")) {
+                        "Latest manifest →"
+                    }
                 }
                 (fields(&[
                     ("id", Value::Code(self.id)),
@@ -354,11 +453,7 @@ impl Resource for BundleManifest {
 
     fn to_html(&self) -> String {
         let manifest = &self.parsed;
-        let capabilities: Vec<_> = manifest
-            .capabilities
-            .keys()
-            .map(|capability| vec![Value::Code(capability.as_str())])
-            .collect();
+        let capabilities: Vec<_> = manifest.capabilities.keys().collect();
         let prefixes: Vec<_> = manifest
             .prefixes
             .iter()
@@ -395,14 +490,49 @@ impl Resource for BundleManifest {
         page(
             &format!("{} — {}", self.dataset, self.version),
             &[
-                Crumb::to("kgf", "/".to_owned()),
                 Crumb::to(&self.dataset, url::dataset(&self.dataset)),
                 Crumb::here(&self.version),
             ],
             Some(&url::operation(&self.dataset, &self.version, "manifest")),
             html! {
                 @if let Some(description) = &manifest.description {
-                    p { (description) }
+                    p."lede" { (description) }
+                }
+                (stats(&[
+                    ("triples", group_digits(manifest.counts.triples)),
+                    ("subjects", group_digits(manifest.counts.subjects)),
+                    ("predicates", group_digits(manifest.counts.predicates)),
+                    ("objects", group_digits(manifest.counts.objects)),
+                ]))
+                (note(
+                    "Subjects and objects are id-space sizes: each counts the shared section \
+                     once, so they overlap and do not sum to a distinct-term total."
+                ))
+                @if !capabilities.is_empty() {
+                    (chips(&capabilities))
+                }
+
+                (forms::manifest_forms(&self.dataset, &self.version, manifest))
+
+                h2 { "Operations" }
+                (note(
+                    "Doc 03 §3.4's read operations over this version. Each answers JSON to \
+                     anything that does not ask for HTML, and a versioned answer is immutable — \
+                     with $KGF as this server's base URL:"
+                ))
+                (table(
+                    &["Operation", "Parameters"],
+                    &operations(&self.dataset, &self.version, manifest),
+                ))
+                pre {
+                    code {
+                        "curl \"$KGF" (url::operation(&self.dataset, &self.version, "fragment"))
+                        "?limit=25\"\n"
+                        "curl \"$KGF" (url::operation(&self.dataset, &self.version, "count"))
+                        "?p=rdf:type\"\n"
+                        "curl \"$KGF" (url::operation(&self.dataset, &self.version, "describe"))
+                        "?iri=<https://example.org/resource>\""
+                    }
                 }
 
                 h2 { "Identity" }
@@ -440,29 +570,6 @@ impl Resource for BundleManifest {
                     ),
                 ]))
 
-                h2 { "Counts" }
-                (note(
-                    "Subjects and objects are id-space sizes: each counts the shared section \
-                     once, so they overlap and do not sum to a distinct-term total."
-                ))
-                (fields(&[
-                    ("triples", Value::Number(manifest.counts.triples)),
-                    ("subjects", Value::Number(manifest.counts.subjects)),
-                    ("predicates", Value::Number(manifest.counts.predicates)),
-                    ("objects", Value::Number(manifest.counts.objects)),
-                ]))
-
-                h2 { "Capabilities" }
-                (note(
-                    "What this bundle can answer beyond the mandatory core, determined by which \
-                     sidecar artifacts were built (doc 03 §3.4)."
-                ))
-                @if capabilities.is_empty() {
-                    (note("None declared."))
-                } @else {
-                    (table(&["Capability"], &capabilities))
-                }
-
                 h2 { "Prefixes" }
                 (note(
                     "The CURIE prefixes this bundle's parameters accept. An IRI is written in \
@@ -485,18 +592,6 @@ impl Resource for BundleManifest {
                 } @else {
                     (table(&["Role", "Predicates (strongest first)"], &predicate_roles))
                 }
-
-                h2 { "Operations" }
-                (note(
-                    "Doc 03 §3.4's read operations over this version. Each answers JSON to \
-                     anything that does not ask for HTML, and a versioned answer is immutable."
-                ))
-                (table(
-                    &["Operation", "Parameters"],
-                    &operations(&self.dataset, &self.version, manifest),
-                ))
-
-                (forms::manifest_forms(&self.dataset, &self.version, manifest))
 
                 h2 { "Artifacts" }
                 (table(&["Artifact", "Bytes", "SHA-256"], &artifacts))

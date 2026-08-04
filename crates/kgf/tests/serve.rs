@@ -45,7 +45,15 @@ fn the_url_space_answers_over_a_real_listener() {
     root.assert_cache_control(&["public", "max-age=300"]);
     root.assert_varies_on_accept();
     let descriptor = root.json();
-    assert_eq!(descriptor["datasets"], serde_json::json!(["atlas", "tox"]));
+    // The catalog: a summary per dataset, so choosing one is one round trip.
+    let datasets = descriptor["datasets"].as_array().unwrap();
+    assert_eq!(datasets.len(), 2);
+    assert_eq!(datasets[0]["id"], "atlas");
+    assert_eq!(datasets[1]["id"], "tox");
+    assert_eq!(datasets[1]["current"], "2026-06-01");
+    assert_eq!(datasets[1]["title"], "tox 2026-06-01");
+    assert!(datasets[1]["triples"].as_u64().unwrap() > 0);
+    assert_eq!(datasets[1]["url"], "/tox");
     assert_eq!(descriptor["caps"]["max_limit"], 10_000);
     assert_eq!(descriptor["caps"]["max_bindings"], 1_000);
     assert_eq!(descriptor["implementation"]["protocol"], "1");
@@ -375,7 +383,13 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
     search_page.assert_status(200);
     search_page.assert_header("content-type", "text/html; charset=utf-8");
     let search_html = search_page.text();
-    assert!(search_html.contains(">ex:alice</a>"), "{search_html}");
+    assert!(search_html.contains(">ex:alice<"), "{search_html}");
+    // `labels` defaults on, and the page sets the resolved label under the
+    // subject term rather than in a column of its own.
+    assert!(
+        search_html.contains("<span class=\"t-label\">Alice</span>"),
+        "{search_html}"
+    );
     assert!(search_html.contains(">ex:name</a>"), "{search_html}");
     assert!(search_html.contains("<dt>predicates</dt>"), "{search_html}");
     assert!(!search_html.contains("all predicates"), "{search_html}");

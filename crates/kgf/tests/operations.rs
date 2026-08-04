@@ -497,11 +497,12 @@ fn every_operation_renders_a_page_as_well_as_json() {
     assert!(page.contains("<h1>fragment — tox 2026-06-01</h1>"));
     assert!(page.contains(">ex:alice</a>"));
     assert!(page.contains("title=\"http://example.org/alice\""));
-    // A subject links to its neighborhood and a predicate to its own fragment,
-    // which is what makes the page a way into the data. The visible CURIE does
-    // not leak into either target: links retain the portable full IRI spelling.
+    // A named term — subject and predicate alike — links to its own
+    // neighborhood, which is what makes the page a way into the data. The
+    // visible CURIE does not leak into the target: links retain the portable
+    // full IRI spelling.
     assert!(page.contains("/tox/v/2026-06-01/describe?iri=%3Chttp%3A%2F%2Fexample.org%2Falice%3E"));
-    assert!(page.contains("/tox/v/2026-06-01/fragment?p=%3Chttp%3A%2F%2Fexample.org%2Fknows%3E"));
+    assert!(page.contains("/tox/v/2026-06-01/describe?iri=%3Chttp%3A%2F%2Fexample.org%2Fknows%3E"));
     // A truncated page offers the next one.
     assert!(page.contains("Next page"));
     assert!(page.contains("cursor="));
@@ -538,7 +539,9 @@ fn every_operation_renders_a_page_as_well_as_json() {
         "s=ex:carol&p=ex:age",
         Representation::Html,
     );
-    assert!(typed.contains("&quot;31&quot;^^xsd:integer"));
+    // The lexical form and its datatype are one term set in two weights: the
+    // qualifier is dim beside the value rather than fused into one string.
+    assert!(typed.contains("&quot;31&quot;<span class=\"t-qual\">^^xsd:integer</span>"));
     assert!(typed.contains("title=\"http://www.w3.org/2001/XMLSchema#integer\""));
     assert!(
         typed

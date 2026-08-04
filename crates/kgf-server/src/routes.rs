@@ -736,17 +736,62 @@ where
         release.prefixes().clone(),
         release.declares(Capability::Search),
     );
+    let labels = PageLabelProfile::for_html(&service, release, representation);
     let opened = Arc::clone(&service);
     let rendered = blocking(move || {
         let store = opened.open(target.id())?;
         // Serialized in here, not outside: doc 20 §20.5 materializes strings
         // only while writing them, and the term cache that makes that cheap is
         // deliberately not `Send`.
-        Ok(execute(&store, target, &request)?.render(representation))
+        let mut answer = execute(&store, target, &request)?;
+        labels.hydrate(&store, &mut answer)?;
+        Ok(answer.render(representation))
     })
     .await?;
 
     respond_rendered(rendered, representation, CachePolicy::Immutable, validator)
+}
+
+/// What an HTML render needs to annotate its IRIs with display labels: the
+/// release's frozen `label` cascade and the cap that bounds the work.
+///
+/// Built only when the negotiated representation is a page. JSON does not pay
+/// for labels it does not carry — a JSON client hydrates through `/labels`,
+/// with the same cascade and the same cap.
+struct PageLabelProfile {
+    predicates: Vec<String>,
+    cap: usize,
+}
+
+impl PageLabelProfile {
+    fn for_html(
+        service: &Service,
+        release: &Release,
+        representation: Representation,
+    ) -> Option<Self> {
+        (representation == Representation::Html).then(|| Self {
+            predicates: release
+                .predicate_roles()
+                .get("label")
+                .map(<[String]>::to_vec)
+                .unwrap_or_default(),
+            cap: usize::try_from(service.config().caps.max_label_iris).unwrap_or(usize::MAX),
+        })
+    }
+}
+
+/// Hydrate an answer's page labels if this request renders a page.
+trait HydrateForPage {
+    fn hydrate(&self, store: &kgf_store::Store, answer: &mut impl Renders) -> Result<(), Problem>;
+}
+
+impl HydrateForPage for Option<PageLabelProfile> {
+    fn hydrate(&self, store: &kgf_store::Store, answer: &mut impl Renders) -> Result<(), Problem> {
+        match self {
+            None => Ok(()),
+            Some(profile) => answer.hydrate_labels(store, &profile.predicates, profile.cap),
+        }
+    }
 }
 
 /// The body-addressed form of an operation.
@@ -824,10 +869,13 @@ where
         wants.params().clone(),
         release.prefixes().clone(),
     );
+    let labels = PageLabelProfile::for_html(&service, release, representation);
     let opened = Arc::clone(&service);
     let rendered = blocking(move || {
         let store = opened.open(target.id())?;
-        Ok(execute(&store, target, &request)?.render(representation))
+        let mut answer = execute(&store, target, &request)?;
+        labels.hydrate(&store, &mut answer)?;
+        Ok(answer.render(representation))
     })
     .await?;
 

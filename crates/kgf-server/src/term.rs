@@ -507,20 +507,24 @@ impl<'a> Term<'a> {
                     .unwrap_or_else(|| format!("<{iri}>"));
                 TermDisplay {
                     label,
+                    qualifier: None,
                     full_iri: Some(iri),
                 }
             }
             Term::BlankNode(label) => TermDisplay {
                 label: format!("_:{label}"),
+                qualifier: None,
                 full_iri: None,
             },
             Term::Literal(Literal { value, kind }) => match kind {
                 LiteralKind::Plain => TermDisplay {
                     label: format!("\"{value}\""),
+                    qualifier: None,
                     full_iri: None,
                 },
                 LiteralKind::Language(language) => TermDisplay {
-                    label: format!("\"{value}\"@{language}"),
+                    label: format!("\"{value}\""),
+                    qualifier: Some(format!("@{language}")),
                     full_iri: None,
                 },
                 LiteralKind::Datatype(datatype) => {
@@ -528,7 +532,8 @@ impl<'a> Term<'a> {
                         .compact_iri(datatype.as_ref())
                         .unwrap_or_else(|| format!("<{datatype}>"));
                     TermDisplay {
-                        label: format!("\"{value}\"^^{datatype_label}"),
+                        label: format!("\"{value}\""),
+                        qualifier: Some(format!("^^{datatype_label}")),
                         full_iri: Some(datatype),
                     }
                 }
@@ -551,14 +556,28 @@ impl<'a> Term<'a> {
 }
 
 /// The visible spelling of one RDF term and the IRI its tooltip reveals.
+///
+/// A literal's `@lang` or `^^datatype` is carried apart from its lexical form
+/// so a page can set it small and dim; [`into_parts`](Self::into_parts) joins
+/// the two back for callers that want the whole spelling as one string.
 pub(crate) struct TermDisplay<'a> {
     label: String,
+    qualifier: Option<String>,
     full_iri: Option<Cow<'a, str>>,
 }
 
 impl<'a> TermDisplay<'a> {
     pub(crate) fn into_parts(self) -> (String, Option<Cow<'a, str>>) {
-        (self.label, self.full_iri)
+        let label = match self.qualifier {
+            Some(qualifier) => format!("{}{qualifier}", self.label),
+            None => self.label,
+        };
+        (label, self.full_iri)
+    }
+
+    /// The spelling with its qualifier apart: `(label, qualifier, full_iri)`.
+    pub(crate) fn into_structured(self) -> (String, Option<String>, Option<Cow<'a, str>>) {
+        (self.label, self.qualifier, self.full_iri)
     }
 }
 
