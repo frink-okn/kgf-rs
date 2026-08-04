@@ -129,6 +129,19 @@ impl Params {
         Self(params)
     }
 
+    /// The same parameters without empty values under any of `names`.
+    ///
+    /// Used to canonicalize optional HTML-form controls after the operation has
+    /// established that those names are meaningful. It is deliberately not part
+    /// of parsing: an empty required value and an empty unknown parameter remain
+    /// errors, and only optional pattern positions define empty as omitted.
+    #[must_use]
+    pub fn without_empty(&self, names: &[&str]) -> Self {
+        let mut params = self.0.clone();
+        params.retain(|name, value| !value.is_empty() || !names.contains(&name.as_str()));
+        Self(params)
+    }
+
     /// Whether the request carried any parameters.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -262,6 +275,15 @@ mod tests {
 
         assert_eq!(Params::parse(None).unwrap().get("s"), None);
         assert_eq!(Params::parse(Some("")).unwrap().get("s"), None);
+    }
+
+    #[test]
+    fn empty_values_are_removed_only_when_the_caller_names_them() {
+        let params = Params::parse(Some("s=&p=ex%3Ap&limit=")).unwrap();
+        let normalized = params.without_empty(&["s", "p", "o"]);
+        assert_eq!(normalized.get("s"), None);
+        assert_eq!(normalized.get("p"), Some("ex:p"));
+        assert_eq!(normalized.get("limit"), Some(""));
     }
 
     #[test]

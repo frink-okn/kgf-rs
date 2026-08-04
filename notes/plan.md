@@ -1393,15 +1393,14 @@ following the code.
     where doc 04 §4.3's example shows an absolute URL. Worth stating, since a client
     resolving one against the request URI gets the right answer and a client expecting
     an absolute URL does not. Surfaced in unit 13.
-19. **§3.4.4's example sends `s=` and `o=` for unbound positions,** which §3.3
-    contradicts: "omitted = variable". Both cannot be right, and the example is the one
-    this implementation calls the bug. An empty value is far more likely to be a client
-    whose URL template interpolated a variable it never set than a deliberate wildcard,
-    and reading it as a wildcard answers with the whole dataset — a wrong answer that
-    looks like a right one, where an error was available. `kgf-server` refuses it as
-    `bad_term_syntax` with "omit the parameter entirely" as the remedy. Worth either
-    fixing the example or saying explicitly that an empty value is a variable. Found in
-    unit 14.
+19. **§3.4.4's example sends `s=` and `o=` for unbound positions,** while §3.3 says
+    "omitted = variable". The implementation originally refused empty positions to catch
+    unset client variables, but that made ordinary HTML GET forms hostile: browsers submit
+    untouched named controls as empty values. Empty has no competing RDF-term meaning —
+    the empty literal is written `""` — so `s=`, `p=` and `o=` now canonicalize to
+    omission on pattern operations. Required values (`iri`, `q`) and non-term controls
+    remain errors when empty. The docs should state the equivalence explicitly. Found in
+    unit 14; corrected when HTML query forms landed.
 20. **`count` has two shapes in §3.4.4.** The first example is
     `{"count": 1284211, "exact": true}` — a bare integer with a sibling flag — and the
     resumable form two paragraphs later is

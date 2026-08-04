@@ -713,7 +713,8 @@ where
 {
     let representation = wants.representation()?;
     let release = service.datasets().release(&id.dataset, &id.version)?;
-    let request = parse(wants.params(), service.config().limits(), release)?;
+    let params = get_operation_params(operation, wants.params());
+    let request = parse(&params, service.config().limits(), release)?;
 
     // A versioned operation is a deterministic function of immutable bytes
     // (doc 04 §4.6), so the URL and the representation fix the response
@@ -728,11 +729,12 @@ where
         return not_modified(CachePolicy::Immutable, validator);
     }
 
-    let target = Target::new(
+    let target = Target::get(
         id,
         operation,
-        wants.params().clone(),
+        params,
         release.prefixes().clone(),
+        release.declares(Capability::Search),
     );
     let opened = Arc::clone(&service);
     let rendered = blocking(move || {
@@ -745,6 +747,21 @@ where
     .await?;
 
     respond_rendered(rendered, representation, CachePolicy::Immutable, validator)
+}
+
+/// Canonical parameters for one GET operation.
+///
+/// Browsers submit every named text control, including untouched optional ones.
+/// For triple patterns, `s=`, `p=` and `o=` are therefore the form spelling of
+/// an unbound position and canonicalize to omission. The operation check is
+/// load-bearing: `s=` on `/describe` is still an unknown parameter rather than
+/// something a generic query parser silently drops.
+fn get_operation_params(operation: &str, params: &Params) -> Params {
+    if matches!(operation, "fragment" | "count" | "sample") {
+        params.without_empty(&["s", "p", "o"])
+    } else {
+        params.clone()
+    }
 }
 
 /// The body-addressed form of an operation.
@@ -1291,5 +1308,19 @@ mod tests {
             response.extensions().get::<Problem>().is_some(),
             "the middleware has nothing to render without it"
         );
+    }
+
+    #[test]
+    fn only_pattern_operations_canonicalize_empty_positions() {
+        let params = Params::parse(Some("s=&p=ex%3Ap&o=&limit=")).unwrap();
+        let pattern = get_operation_params("fragment", &params);
+        assert_eq!(pattern.get("s"), None);
+        assert_eq!(pattern.get("p"), Some("ex:p"));
+        assert_eq!(pattern.get("o"), None);
+        assert_eq!(pattern.get("limit"), Some(""));
+
+        let describe = get_operation_params("describe", &params);
+        assert_eq!(describe.get("s"), Some(""));
+        assert_eq!(describe.get("o"), Some(""));
     }
 }

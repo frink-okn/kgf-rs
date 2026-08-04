@@ -116,6 +116,7 @@ pub fn page(title: &str, crumbs: &[Crumb<'_>], canonical: Option<&str>, body: Ma
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (full_title) }
                 style { (PreEscaped(STYLE)) }
+                script { (PreEscaped(FORM_SCRIPT)) }
             }
             body {
                 header {
@@ -293,11 +294,38 @@ table{border-collapse:collapse;width:100%;font-size:.9375rem}
 th{text-align:left;font-weight:600;color:var(--dim);font-size:.8125rem;text-transform:uppercase;letter-spacing:.03em}
 th,td{padding:.5rem .75rem .5rem 0;border-bottom:1px solid var(--rule);vertical-align:top}
 td.num{text-align:right;font-variant-numeric:tabular-nums}
+.query-form{border:1px solid var(--rule);border-radius:6px;margin:.75rem 0}
+.query-form summary{cursor:pointer;font-weight:600;padding:.7rem 1rem}
+.query-form[open] summary{border-bottom:1px solid var(--rule)}
+.query-form form{padding:1rem}
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(13rem,1fr));gap:.9rem 1rem;margin-bottom:1rem}
+.form-grid>label{display:flex;flex-direction:column;gap:.3rem;min-width:0}
+.control-label,.choice legend{font-size:.875rem;color:var(--dim)}
+.choice{border:0;padding:0;margin:0;min-width:0}
+.choice label{margin-right:1rem}
+input,select,button{font:inherit;color:var(--fg)}
+input[type=text],input[type=number],select{width:100%;min-width:0;padding:.45rem .55rem;border:1px solid var(--rule);border-radius:4px;background:var(--bg)}
+button{border:1px solid var(--accent);border-radius:4px;padding:.45rem .8rem;background:var(--accent);color:var(--bg);cursor:pointer}
+button:hover{filter:brightness(.92)}
 a{color:var(--accent)}
 footer{border-top:1px solid var(--rule);padding-top:1rem;padding-bottom:2rem;font-size:.8125rem;color:var(--dim)}
 footer a{color:var(--accent);text-decoration:none}
 footer a:hover{text-decoration:underline}
 ";
+
+/// Native forms include untouched optional controls as empty values. Preserve
+/// the API's distinction between an omitted optional parameter and an empty
+/// required one by removing blank controls from the browser-built form data.
+///
+/// This is intentionally the whole client-side layer: navigation and response
+/// rendering remain ordinary HTTP, and fixed source contains no interpolated
+/// bundle data.
+const FORM_SCRIPT: &str = "\
+document.addEventListener('formdata',event=>{\
+for(const [name,value] of Array.from(event.formData.entries())){\
+if(typeof value==='string'&&value==='')event.formData.delete(name);\
+}\
+});";
 
 #[cfg(test)]
 mod tests {
@@ -336,8 +364,8 @@ mod tests {
         );
 
         assert!(
-            !rendered.contains("<script>"),
-            "unescaped markup reached the page"
+            !rendered.contains("<script>alert"),
+            "unescaped bundle data reached executable markup"
         );
         assert!(rendered.contains("&lt;script&gt;"));
         // `alert('x')` survives as text and that is fine — the tags around it

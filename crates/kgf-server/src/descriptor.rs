@@ -22,9 +22,11 @@
 //! one the `content_digest` was taken over. The parse is used for the page and
 //! for the ETag, where a structured view is what is wanted.
 
+use kgf_store::Capability;
 use kgf_store::manifest::{Manifest, Publisher};
 use serde::Serialize;
 
+use crate::forms;
 use crate::html::{Crumb, Resource, SITE, Value, fields, json_body, note, page, table};
 use crate::service::{Dataset, PredicateRoles, Service};
 use crate::url;
@@ -111,6 +113,14 @@ impl Resource for ServiceDescriptor<'_> {
                 ))
                 (fields(&[
                     ("max_limit", Value::Number(u64::from(self.caps.max_limit))),
+                    (
+                        "default_limit",
+                        Value::Number(u64::from(self.caps.default_limit)),
+                    ),
+                    (
+                        "max_sample",
+                        Value::Number(u64::from(self.caps.max_sample)),
+                    ),
                     ("max_bindings", Value::Number(u64::from(self.caps.max_bindings))),
                     (
                         "max_star_subjects",
@@ -481,7 +491,12 @@ impl Resource for BundleManifest {
                     "Doc 03 §3.4's read operations over this version. Each answers JSON to \
                      anything that does not ask for HTML, and a versioned answer is immutable."
                 ))
-                (table(&["Operation", "Parameters"], &operations(&self.dataset, &self.version)))
+                (table(
+                    &["Operation", "Parameters"],
+                    &operations(&self.dataset, &self.version, manifest),
+                ))
+
+                (forms::manifest_forms(&self.dataset, &self.version, manifest))
 
                 h2 { "Artifacts" }
                 (table(&["Artifact", "Bytes", "SHA-256"], &artifacts))
@@ -497,30 +512,48 @@ impl Resource for BundleManifest {
 /// the first page of everything, and every term in it links onwards. `/describe`
 /// needs a resource, so it is listed with the parameter it wants rather than
 /// with a link that would 400.
-fn operations<'a>(dataset: &str, version: &str) -> Vec<Vec<Value<'a>>> {
-    [
-        ("fragment", "s, p, o, limit, cursor", true),
-        ("count", "s, p, o", true),
+fn operations(dataset: &str, version: &str, manifest: &Manifest) -> Vec<Vec<Value<'static>>> {
+    let search = manifest.declares(Capability::Search);
+    let pattern_parameters = if search {
+        "s, p, o, o.text, limit, cursor"
+    } else {
+        "s, p, o, limit, cursor"
+    };
+    let count_parameters = if search {
+        "s, p, o, o.text, cursor"
+    } else {
+        "s, p, o"
+    };
+    let mut operations = vec![
+        ("fragment", pattern_parameters, true),
+        ("count", count_parameters, true),
         ("describe", "iri, direction, limit, cursor", false),
-        ("sample", "s, p, o, n, seed", true),
-        ("search", "q, role, predicate, labels, limit", false),
-        ("labels", "QUERY/POST JSON body: iris", false),
-    ]
-    .into_iter()
-    .map(|(operation, parameters, browsable)| {
-        vec![
-            if browsable {
-                Value::Link {
-                    href: url::operation(dataset, version, operation),
-                    label: operation,
-                }
-            } else {
-                Value::Code(operation)
-            },
-            Value::Code(parameters),
-        ]
-    })
-    .collect()
+    ];
+    if manifest.declares(Capability::Sample) {
+        operations.push(("sample", "s, p, o, n, seed", true));
+    }
+    if search {
+        operations.push(("search", "q, role, predicate, labels, limit", false));
+    }
+    if manifest.declares(Capability::Labels) {
+        operations.push(("labels", "QUERY/POST JSON body: iris", false));
+    }
+    operations
+        .into_iter()
+        .map(|(operation, parameters, browsable)| {
+            vec![
+                if browsable {
+                    Value::Link {
+                        href: url::operation(dataset, version, operation),
+                        label: operation,
+                    }
+                } else {
+                    Value::Code(operation)
+                },
+                Value::Code(parameters),
+            ]
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -40,6 +40,7 @@ pub mod answer;
 pub mod cursor;
 pub mod descriptor;
 pub mod envelope;
+mod forms;
 pub mod html;
 pub mod representation;
 pub mod request;

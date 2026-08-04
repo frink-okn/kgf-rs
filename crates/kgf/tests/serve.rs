@@ -804,7 +804,11 @@ fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() 
         &[("Accept", "text/html")],
     );
     html.assert_header("content-type", "text/html; charset=utf-8");
-    assert!(html.text().contains("Next page"));
+    let html_text = html.text();
+    assert!(html_text.contains("Next page"));
+    assert!(html_text.contains("<summary>Fragment</summary>"));
+    assert!(html_text.contains("name=\"limit\" value=\"2\""));
+    assert!(!html_text.contains("name=\"cursor\""));
     // The completeness headers ride the page as well, since they are what an
     // intermediary reads without parsing a body it cannot parse.
     html.assert_header("kgf-complete", "false");
@@ -813,6 +817,35 @@ fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() 
     server
         .get("/tox/latest/fragment?limit=2")
         .assert_header("location", "/tox/v/2026-06-01/fragment?limit=2");
+
+    // A native HTML form submits untouched optional controls as empty. Pattern
+    // positions give that ordinary spelling the same meaning as omission, and
+    // the page's own canonical link drops the empty aliases again.
+    let blank = server.request(
+        "GET",
+        &format!("{base}/fragment?s=&p=ex:knows&o=&limit=2"),
+        &[("Accept", "text/html")],
+    );
+    blank.assert_status(200);
+    let blank_html = blank.text();
+    assert!(blank_html.contains("/fragment?limit=2&amp;p=ex%3Aknows&amp;format=json"));
+    assert!(!blank_html.contains("?limit=2&amp;o="));
+
+    // The manifest is the entry point for required-argument operations such as
+    // describe, so its forms must all point at this exact immutable version.
+    let manifest = server.request(
+        "GET",
+        &format!("{base}/manifest"),
+        &[("Accept", "text/html")],
+    );
+    let manifest_html = manifest.text();
+    for operation in ["fragment", "count", "describe", "sample"] {
+        assert!(
+            manifest_html.contains(&format!("action=\"{base}/{operation}\"")),
+            "manifest omitted the {operation} form"
+        );
+    }
+    assert!(!manifest_html.contains(&format!("action=\"{base}/search\"")));
 }
 
 #[test]

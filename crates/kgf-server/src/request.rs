@@ -236,11 +236,10 @@ impl BoundTerm {
 
 /// A triple pattern, as far as it can be read without a bundle (§3.4.1).
 ///
-/// An omitted parameter is a variable. An *empty* one is not: §3.3 makes
-/// omission the way to leave a position unbound, and a value that arrived empty
-/// is far more likely to be a client that interpolated a variable it never set
-/// than a client asking for everything. See `notes/plan.md`, "Questions for
-/// `../kgf`" — §3.4.4's own example sends `s=&o=`, which this refuses.
+/// An omitted or empty parameter is a variable. Empty is accepted because it is
+/// what an ordinary HTML form sends for an untouched optional control, and no
+/// RDF term has an empty request spelling (`""` is the empty literal). Required
+/// term parameters such as `/describe`'s `iri` remain non-empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pattern {
     subject: Option<BoundTerm>,
@@ -253,7 +252,10 @@ impl Pattern {
     fn parse(params: &Params, limits: Limits<'_>, prefixes: &PrefixMap) -> Result<Self, Problem> {
         let mut pattern = Self::default();
         for position in Position::ALL {
-            if let Some(text) = params.get(position.as_str()) {
+            if let Some(text) = params
+                .get(position.as_str())
+                .filter(|text| !text.is_empty())
+            {
                 *pattern.slot(position) =
                     Some(BoundTerm::parse(position.as_str(), text, limits, prefixes)?);
             }
@@ -2037,19 +2039,17 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_term_is_not_a_variable() {
-        // §3.3 makes omission the way to leave a position unbound, and §3.4.4's
-        // own example contradicts it with `?s=&p=ex:affects&o=`. The example is
-        // the bug: an empty value is far more likely to be an unset variable in
-        // a client's URL template than a deliberate wildcard, and reading it as
-        // a wildcard answers with the whole dataset.
-        let empty = fragment("s=&p=ex:a").unwrap_err();
-        assert_eq!(empty.code(), ErrorCode::BadTermSyntax);
-        let detail = serde_json::to_value(&empty).unwrap();
-        assert!(
-            detail["detail"].as_str().unwrap().contains("omit"),
-            "the message must name the fix: {detail}"
+    fn an_empty_optional_pattern_position_is_a_variable() {
+        let empty = fragment("s=&p=ex:a&o=").unwrap();
+        assert_eq!(empty.pattern.bound(Position::Subject), None);
+        assert_eq!(
+            empty
+                .pattern
+                .bound(Position::Predicate)
+                .map(BoundTerm::dictionary),
+            Some("http://example.org/a")
         );
+        assert_eq!(empty.pattern.bound(Position::Object), None);
     }
 
     #[test]

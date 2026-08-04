@@ -56,6 +56,7 @@ use kgf_store::{IdTriple, Role, Store, TermId};
 
 use crate::cursor::{Cursor, CursorBinding, PositionSpace, StaleCursor};
 use crate::envelope::{BudgetReason, Cardinality, Completeness, ErrorCode, Problem};
+use crate::forms;
 use crate::html::{Crumb, Resource, Value, fields, json_body, note, page, table};
 use crate::representation::Representation;
 use crate::request::{
@@ -82,18 +83,31 @@ pub struct Target {
     params: Params,
     prefixes: PrefixMap,
     body: bool,
+    has_search: bool,
 }
 
 impl Target {
     /// The version and operation a request addressed, with its parameters and
     /// the version's immutable prefix map for human-facing result labels.
     pub fn new(id: BundleId, operation: &'static str, params: Params, prefixes: PrefixMap) -> Self {
+        Self::get(id, operation, params, prefixes, false)
+    }
+
+    /// A GET target with the release capabilities its page may expose.
+    pub(crate) fn get(
+        id: BundleId,
+        operation: &'static str,
+        params: Params,
+        prefixes: PrefixMap,
+        has_search: bool,
+    ) -> Self {
         Self {
             id,
             operation,
             params,
             prefixes,
             body: false,
+            has_search,
         }
     }
 
@@ -110,6 +124,7 @@ impl Target {
             params,
             prefixes,
             body: true,
+            has_search: false,
         }
     }
 
@@ -166,6 +181,21 @@ impl Target {
             "{} — {} {}",
             self.operation, self.id.dataset, self.id.version
         )
+    }
+
+    /// The GET editor for this answer, absent for a body-addressed request.
+    fn form(&self) -> Option<maud::Markup> {
+        if self.body {
+            None
+        } else {
+            forms::operation_form(
+                &self.id.dataset,
+                &self.id.version,
+                self.operation,
+                &self.params,
+                self.has_search,
+            )
+        }
     }
 }
 
@@ -2381,6 +2411,9 @@ impl Resource for Answer {
             &self.target.crumbs(),
             canonical.as_deref(),
             html! {
+                @if let Some(form) = self.target.form() {
+                    (form)
+                }
                 (fields(&self.summary()))
                 @if !self.absent_terms.is_empty() {
                     (note(&format!(
@@ -2587,6 +2620,9 @@ impl Resource for SearchAnswer {
             &self.target.crumbs(),
             canonical.as_deref(),
             html! {
+                @if let Some(form) = self.target.form() {
+                    (form)
+                }
                 (fields(&[
                     ("query", Value::Text(&self.query)),
                     ("scope", if all_predicates { Value::Text("all predicates") } else { Value::Absent }),
@@ -2662,6 +2698,9 @@ impl Resource for CountAnswer {
             &self.target.crumbs(),
             canonical.as_deref(),
             html! {
+                @if let Some(form) = self.target.form() {
+                    (form)
+                }
                 (fields(&summary))
                 @if !self.absent_terms.is_empty() {
                     (note(&format!(
