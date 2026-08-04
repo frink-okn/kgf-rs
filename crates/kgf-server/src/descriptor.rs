@@ -130,121 +130,99 @@ impl Resource for ServiceDescriptor<'_> {
             &[],
             Some("/"),
             html! {
-                p."lede" {
-                    "Query federated RDF knowledge graphs at bounded cost — from a browser, "
-                    "curl, or an agent, at the same URLs."
+                section."overview" {
+                    p."lede" {
+                        "Query federated RDF knowledge graphs at bounded cost — from a browser, "
+                        "curl, or an agent, at the same URLs."
+                    }
+                    (stats(&[
+                        ("datasets", group_digits(self.datasets.len() as u64)),
+                        ("triples", compact_number(total_triples)),
+                        ("protocol", self.implementation.protocol.to_owned()),
+                    ]))
                 }
-                (stats(&[
-                    ("datasets", group_digits(self.datasets.len() as u64)),
-                    ("triples", compact_number(total_triples)),
-                    ("protocol", self.implementation.protocol.to_owned()),
-                ]))
 
-                h2 { "Datasets" }
-                @if self.datasets.is_empty() {
-                    (note("This server hosts no datasets."))
-                } @else {
-                    ul."cards"."wide" {
-                        @for dataset in &self.datasets {
-                            li."card" {
-                                h3 { a href=(dataset.url) { (dataset.title.unwrap_or(dataset.id)) } }
-                                @if let Some(description) = dataset.description {
-                                    p."card-desc" { (description) }
-                                }
-                                @if !dataset.capabilities.is_empty() {
-                                    (chips(&dataset.capabilities))
-                                }
-                                p."card-meta" {
-                                    strong { (compact_number(dataset.triples)) }
-                                    " triples · " (dataset.current)
+                section."section-block" {
+                    div."section-heading" { h2 { "Datasets" } }
+                    @if self.datasets.is_empty() {
+                        (note("This server hosts no datasets."))
+                    } @else {
+                        ul."cards" {
+                            @for dataset in &self.datasets {
+                                li."card" {
+                                    h3 { a href=(dataset.url) { (dataset.title.unwrap_or(dataset.id)) } }
+                                    @if let Some(description) = dataset.description {
+                                        p."card-desc" { (description) }
+                                    }
+                                    @if !dataset.capabilities.is_empty() {
+                                        (chips(&dataset.capabilities))
+                                    }
+                                    p."card-meta" {
+                                        strong { (compact_number(dataset.triples)) }
+                                        " triples · " (dataset.current)
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
-                h2 { "Using this service" }
-                p."note" {
-                    "Every dataset page lists its releases; a release's manifest page carries "
-                    "runnable query forms, its prefixes, and its capabilities. The same URLs "
-                    "answer JSON — with " code { "$KGF" } " as this server's base URL:"
-                }
-                pre {
-                    code {
-                        "curl \"$KGF/\"                                # this catalog\n"
-                        @if let Some(first) = self.datasets.first() {
-                            "curl \"$KGF/" (first.id) "\"                        # release history\n"
-                            "curl \"$KGF/" (first.id) "/latest/fragment?limit=25\" # one page of triples"
-                        } @else {
-                            "curl \"$KGF/{dataset}/latest/fragment?limit=25\""
+                div."dashboard-grid" {
+                    section."panel" {
+                        h2 { "Using this service" }
+                        p."note" {
+                            "Every dataset page lists its releases; a release's manifest page carries "
+                            "runnable query forms, its prefixes, and its capabilities. The same URLs "
+                            "answer JSON — with " code { "$KGF" } " as this server's base URL:"
                         }
+                        pre {
+                            code {
+                                "curl \"$KGF/\"                                # this catalog\n"
+                                @if let Some(first) = self.datasets.first() {
+                                    "curl \"$KGF/" (first.id) "\"                        # release history\n"
+                                    "curl \"$KGF/" (first.id) "/latest/fragment?limit=25\" # one page of triples"
+                                } @else {
+                                    "curl \"$KGF/{dataset}/latest/fragment?limit=25\""
+                                }
+                            }
+                        }
+                        h2 { "Implementation" }
+                        (fields(&[
+                            ("kgf", Value::Code(self.implementation.kgf)),
+                            ("protocol", Value::Code(self.implementation.protocol)),
+                        ]))
+                    }
+                    section."panel" {
+                        h2 { "Request caps" }
+                        (note(
+                            "Requests above these published caps are refused, never silently reduced."
+                        ))
+                        (fields(&[
+                            ("max_limit", Value::Number(u64::from(self.caps.max_limit))),
+                            ("default_limit", Value::Number(u64::from(self.caps.default_limit))),
+                            ("max_sample", Value::Number(u64::from(self.caps.max_sample))),
+                            ("max_bindings", Value::Number(u64::from(self.caps.max_bindings))),
+                            ("max_star_subjects", Value::Number(u64::from(self.caps.max_star_subjects))),
+                            ("max_star_width", Value::Number(u64::from(self.caps.max_star_width))),
+                            ("max_search_predicates", Value::Number(u64::from(self.caps.max_search_predicates))),
+                            ("max_search_results", Value::Number(u64::from(self.caps.max_search_results))),
+                            ("max_label_iris", Value::Number(u64::from(self.caps.max_label_iris))),
+                        ]))
+                        h2 { "Response budgets" }
+                        (note(
+                            "Exhausting a budget produces an explicitly incomplete response with a reason."
+                        ))
+                        (fields(&[
+                            ("max_output_rows", Value::Number(self.budgets.max_output_rows)),
+                            ("max_output_terms", Value::Number(self.budgets.max_output_terms)),
+                            ("max_response_bytes", Value::Number(self.budgets.max_response_bytes)),
+                            ("max_request_bytes", Value::Number(self.budgets.max_request_bytes)),
+                            ("max_term_bytes", Value::Number(self.budgets.max_term_bytes)),
+                            ("candidate_budget", Value::Number(self.budgets.candidate_budget)),
+                            ("time_budget_ms", Value::Number(self.budgets.time_budget_ms)),
+                        ]))
                     }
                 }
-
-                h2 { "Caps" }
-                (note(
-                    "The largest values a request may ask for. A request above a cap is refused \
-                     with code cap_exceeded rather than silently reduced (doc 03 §3.5)."
-                ))
-                (fields(&[
-                    ("max_limit", Value::Number(u64::from(self.caps.max_limit))),
-                    (
-                        "default_limit",
-                        Value::Number(u64::from(self.caps.default_limit)),
-                    ),
-                    (
-                        "max_sample",
-                        Value::Number(u64::from(self.caps.max_sample)),
-                    ),
-                    ("max_bindings", Value::Number(u64::from(self.caps.max_bindings))),
-                    (
-                        "max_star_subjects",
-                        Value::Number(u64::from(self.caps.max_star_subjects)),
-                    ),
-                    (
-                        "max_star_width",
-                        Value::Number(u64::from(self.caps.max_star_width)),
-                    ),
-                    (
-                        "max_search_predicates",
-                        Value::Number(u64::from(self.caps.max_search_predicates)),
-                    ),
-                    (
-                        "max_search_results",
-                        Value::Number(u64::from(self.caps.max_search_results)),
-                    ),
-                    (
-                        "max_label_iris",
-                        Value::Number(u64::from(self.caps.max_label_iris)),
-                    ),
-                ]))
-
-                h2 { "Budgets" }
-                (note(
-                    "Limits on the work a single response may cost. Exhausting one is never an \
-                     error: the response says complete: false and carries a cursor."
-                ))
-                (fields(&[
-                    ("max_output_rows", Value::Number(self.budgets.max_output_rows)),
-                    ("max_output_terms", Value::Number(self.budgets.max_output_terms)),
-                    (
-                        "max_response_bytes",
-                        Value::Number(self.budgets.max_response_bytes),
-                    ),
-                    (
-                        "max_request_bytes",
-                        Value::Number(self.budgets.max_request_bytes),
-                    ),
-                    ("max_term_bytes", Value::Number(self.budgets.max_term_bytes)),
-                    ("candidate_budget", Value::Number(self.budgets.candidate_budget)),
-                    ("time_budget_ms", Value::Number(self.budgets.time_budget_ms)),
-                ]))
-
-                h2 { "Implementation" }
-                (fields(&[
-                    ("kgf", Value::Code(self.implementation.kgf)),
-                    ("protocol", Value::Code(self.implementation.protocol)),
-                ]))
             },
         )
     }
@@ -357,55 +335,60 @@ impl Resource for DatasetDescriptor<'_> {
             &[Crumb::here(self.id)],
             Some(&url::dataset(self.id)),
             html! {
-                @if let Some(description) = self.description {
-                    p."lede" { (description) }
-                }
-                (stats(&[
-                    ("triples", group_digits(self.triples)),
-                    ("releases", group_digits(self.releases.len() as u64)),
-                ]))
-                @if !self.capabilities.is_empty() {
-                    (chips(&self.capabilities))
-                }
-                p."pager" {
-                    a href=(format!("/{}/latest/fragment", url::encode_segment(self.id))) {
-                        "Browse the data →"
+                section."overview" {
+                    @if let Some(description) = self.description {
+                        p."lede" { (description) }
                     }
-                    " "
-                    a href=(url::operation(self.id, self.current, "manifest")) {
-                        "Latest manifest →"
+                    (stats(&[
+                        ("triples", group_digits(self.triples)),
+                        ("releases", group_digits(self.releases.len() as u64)),
+                    ]))
+                    @if !self.capabilities.is_empty() {
+                        (chips(&self.capabilities))
                     }
-                }
-                (fields(&[
-                    ("id", Value::Code(self.id)),
-                    ("dataset_iri", self.dataset_iri.map_or(Value::Absent, Value::Code)),
-                    (
-                        "publisher",
-                        self.publisher
-                            .map_or(Value::Absent, |publisher| Value::Text(&publisher.name)),
-                    ),
-                    (
-                        "latest",
-                        Value::self_link(
-                            url::operation(self.id, self.current, "manifest"),
-                            self.current,
+                    p."pager" {
+                        a href=(format!("/{}/latest/fragment", url::encode_segment(self.id))) {
+                            "Browse the data →"
+                        }
+                        a href=(url::operation(self.id, self.current, "manifest")) {
+                            "Latest manifest →"
+                        }
+                    }
+                    (fields(&[
+                        ("id", Value::Code(self.id)),
+                        ("dataset_iri", self.dataset_iri.map_or(Value::Absent, Value::Code)),
+                        (
+                            "publisher",
+                            self.publisher
+                                .map_or(Value::Absent, |publisher| Value::Text(&publisher.name)),
                         ),
-                    ),
-                ]))
-
-                h2 { "Predicate roles" }
-                (note(
-                    "The current release's immutable role profile. Versioned search and label \
-                     requests use the snapshot in that version's manifest."
-                ))
-                (table(&["Role", "Predicates (strongest first)"], &roles))
-
-                h2 { "Releases" }
-                (note(
-                    "A version URL is immutable: the bytes it serves cannot change while it \
-                     exists, which is why they are cached for a year."
-                ))
-                (table(&["Version", "", "Content digest"], &releases))
+                        (
+                            "latest",
+                            Value::self_link(
+                                url::operation(self.id, self.current, "manifest"),
+                                self.current,
+                            ),
+                        ),
+                    ]))
+                }
+                div."dashboard-grid" {
+                    section."panel" {
+                        h2 { "Releases" }
+                        (note(
+                            "A version URL is immutable: the bytes it serves cannot change while it \
+                             exists, which is why they are cached for a year."
+                        ))
+                        (table(&["Version", "", "Content digest"], &releases))
+                    }
+                    section."panel" {
+                        h2 { "Predicate roles" }
+                        (note(
+                            "The current release's immutable role profile. Versioned search and label \
+                             requests use the snapshot in that version's manifest."
+                        ))
+                        (table(&["Role", "Predicates (strongest first)"], &roles))
+                    }
+                }
             },
         )
     }
@@ -495,106 +478,120 @@ impl Resource for BundleManifest {
             ],
             Some(&url::operation(&self.dataset, &self.version, "manifest")),
             html! {
-                @if let Some(description) = &manifest.description {
-                    p."lede" { (description) }
-                }
-                (stats(&[
-                    ("triples", group_digits(manifest.counts.triples)),
-                    ("subjects", group_digits(manifest.counts.subjects)),
-                    ("predicates", group_digits(manifest.counts.predicates)),
-                    ("objects", group_digits(manifest.counts.objects)),
-                ]))
-                (note(
-                    "Subjects and objects are id-space sizes: each counts the shared section \
-                     once, so they overlap and do not sum to a distinct-term total."
-                ))
-                @if !capabilities.is_empty() {
-                    (chips(&capabilities))
-                }
-
-                (forms::manifest_forms(&self.dataset, &self.version, manifest))
-
-                h2 { "Operations" }
-                (note(
-                    "Doc 03 §3.4's read operations over this version. Each answers JSON to \
-                     anything that does not ask for HTML, and a versioned answer is immutable — \
-                     with $KGF as this server's base URL:"
-                ))
-                (table(
-                    &["Operation", "Parameters"],
-                    &operations(&self.dataset, &self.version, manifest),
-                ))
-                pre {
-                    code {
-                        "curl \"$KGF" (url::operation(&self.dataset, &self.version, "fragment"))
-                        "?limit=25\"\n"
-                        "curl \"$KGF" (url::operation(&self.dataset, &self.version, "count"))
-                        "?p=rdf:type\"\n"
-                        "curl \"$KGF" (url::operation(&self.dataset, &self.version, "describe"))
-                        "?iri=<https://example.org/resource>\""
+                section."overview" {
+                    @if let Some(description) = &manifest.description {
+                        p."lede" { (description) }
+                    }
+                    (stats(&[
+                        ("triples", group_digits(manifest.counts.triples)),
+                        ("subjects", group_digits(manifest.counts.subjects)),
+                        ("predicates", group_digits(manifest.counts.predicates)),
+                        ("objects", group_digits(manifest.counts.objects)),
+                    ]))
+                    (note(
+                        "Subjects and objects are id-space sizes: each counts the shared section \
+                         once, so they overlap and do not sum to a distinct-term total."
+                    ))
+                    @if !capabilities.is_empty() {
+                        (chips(&capabilities))
                     }
                 }
 
-                h2 { "Identity" }
-                (fields(&[
-                    ("id", Value::Code(&manifest.id)),
-                    ("version", Value::Code(&manifest.version)),
-                    ("content_digest", Value::Code(&manifest.content_digest)),
-                    (
-                        "dataset_iri",
-                        manifest.dataset_iri.as_deref().map_or(Value::Absent, Value::Code),
-                    ),
-                    (
-                        "created",
-                        manifest.created.as_deref().map_or(Value::Absent, Value::Code),
-                    ),
-                    (
-                        "license",
-                        manifest.license.as_deref().map_or(Value::Absent, Value::Text),
-                    ),
-                    (
-                        "publisher",
-                        manifest
-                            .publisher
-                            .as_ref()
-                            .map_or(Value::Absent, |publisher| Value::Text(&publisher.name)),
-                    ),
-                    (
-                        "previous_version",
-                        manifest.previous_version.as_deref().map_or(Value::Absent, |previous| {
-                            Value::self_link(
-                                url::operation(&self.dataset, previous, "manifest"),
-                                previous,
-                            )
-                        }),
-                    ),
-                ]))
-
-                h2 { "Prefixes" }
-                (note(
-                    "The CURIE prefixes this bundle's parameters accept. An IRI is written in \
-                     angle brackets; a bare token is a CURIE, and its prefix must be one of \
-                     these (doc 03 §3.3)."
-                ))
-                @if prefixes.is_empty() {
-                    (note("None declared."))
-                } @else {
-                    (table(&["Prefix", "Expands to"], &prefixes))
+                section."workbench" {
+                    (forms::manifest_forms(&self.dataset, &self.version, manifest))
                 }
 
-                h2 { "Predicate roles" }
-                (note(
-                    "The immutable semantic profile used by role-scoped search and preferred \
-                     label resolution for this version."
-                ))
-                @if predicate_roles.is_empty() {
-                    (note("The federation label defaults apply."))
-                } @else {
-                    (table(&["Role", "Predicates (strongest first)"], &predicate_roles))
+                div."dashboard-grid" {
+                    section."panel" {
+                        h2 { "Operations" }
+                        (note(
+                            "Read operations over this immutable version. Each URL answers HTML or JSON \
+                             according to Accept, with $KGF as this server's base URL."
+                        ))
+                        (table(
+                            &["Operation", "Parameters"],
+                            &operations(&self.dataset, &self.version, manifest),
+                        ))
+                        pre {
+                            code {
+                                "curl \"$KGF" (url::operation(&self.dataset, &self.version, "fragment"))
+                                "?limit=25\"\n"
+                                "curl \"$KGF" (url::operation(&self.dataset, &self.version, "count"))
+                                "?p=rdf:type\"\n"
+                                "curl \"$KGF" (url::operation(&self.dataset, &self.version, "describe"))
+                                "?iri=<https://example.org/resource>\""
+                            }
+                        }
+                    }
+                    section."panel" {
+                        h2 { "Identity" }
+                        (fields(&[
+                            ("id", Value::Code(&manifest.id)),
+                            ("version", Value::Code(&manifest.version)),
+                            ("content_digest", Value::Code(&manifest.content_digest)),
+                            (
+                                "dataset_iri",
+                                manifest.dataset_iri.as_deref().map_or(Value::Absent, Value::Code),
+                            ),
+                            (
+                                "created",
+                                manifest.created.as_deref().map_or(Value::Absent, Value::Code),
+                            ),
+                            (
+                                "license",
+                                manifest.license.as_deref().map_or(Value::Absent, Value::Text),
+                            ),
+                            (
+                                "publisher",
+                                manifest
+                                    .publisher
+                                    .as_ref()
+                                    .map_or(Value::Absent, |publisher| Value::Text(&publisher.name)),
+                            ),
+                            (
+                                "previous_version",
+                                manifest.previous_version.as_deref().map_or(Value::Absent, |previous| {
+                                    Value::self_link(
+                                        url::operation(&self.dataset, previous, "manifest"),
+                                        previous,
+                                    )
+                                }),
+                            ),
+                        ]))
+                    }
                 }
 
-                h2 { "Artifacts" }
-                (table(&["Artifact", "Bytes", "SHA-256"], &artifacts))
+                div."dashboard-grid" {
+                    section."panel" {
+                        h2 { "Prefixes" }
+                        (note(
+                            "CURIE prefixes accepted by this bundle's parameters. Bracket full IRIs; \
+                             a bare token must use one of these prefixes."
+                        ))
+                        @if prefixes.is_empty() {
+                            (note("None declared."))
+                        } @else {
+                            (table(&["Prefix", "Expands to"], &prefixes))
+                        }
+                    }
+                    section."panel" {
+                        h2 { "Predicate roles" }
+                        (note(
+                            "The immutable semantic profile used by role-scoped search and preferred \
+                             label resolution for this version."
+                        ))
+                        @if predicate_roles.is_empty() {
+                            (note("The federation label defaults apply."))
+                        } @else {
+                            (table(&["Role", "Predicates (strongest first)"], &predicate_roles))
+                        }
+                    }
+                }
+
+                section."section-block" {
+                    h2 { "Artifacts" }
+                    (table(&["Artifact", "Bytes", "SHA-256"], &artifacts))
+                }
             },
         )
     }
@@ -723,6 +720,11 @@ mod tests {
     #[test]
     fn the_manifest_page_shows_what_a_client_needs_to_query_the_bundle() {
         let page = bundle_manifest("{}").to_html();
+        // The human representation is an application workbench, with the
+        // release summary and query surface distinct from its metadata.
+        assert!(page.contains("class=\"overview\""));
+        assert!(page.contains("class=\"workbench\""));
+        assert!(page.contains("class=\"dashboard-grid\""));
         // Identity, so a cursor or a mirror check can be reasoned about.
         assert!(page.contains("sha256:0123456789abcdef0123456789abcdef"));
         // Counts, grouped for reading.

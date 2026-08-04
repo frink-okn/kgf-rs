@@ -739,19 +739,21 @@ impl crate::html::Resource for Problem {
             &[],
             None,
             maud::html! {
-                p { (self.detail) }
-                (fields(&[
-                    ("code", Value::Code(self.code.as_str())),
-                    ("status", Value::Number(u64::from(self.code.status()))),
-                    (
-                        "instance",
-                        self.instance.as_deref().map_or(Value::Absent, Value::Code),
-                    ),
-                ]))
-                (note(
-                    "This is an RFC 9457 problem document. The machine-readable form, which \
-                     carries the same code, is what a client should branch on."
-                ))
+                section."panel" {
+                    p { (self.detail) }
+                    (fields(&[
+                        ("code", Value::Code(self.code.as_str())),
+                        ("status", Value::Number(u64::from(self.code.status()))),
+                        (
+                            "instance",
+                            self.instance.as_deref().map_or(Value::Absent, Value::Code),
+                        ),
+                    ]))
+                    (note(
+                        "This is an RFC 9457 problem document. The machine-readable form, which \
+                         carries the same code, is what a client should branch on."
+                    ))
+                }
             },
         )
     }

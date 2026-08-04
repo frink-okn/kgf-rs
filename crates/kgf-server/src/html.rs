@@ -6,14 +6,14 @@
 //! alone (see [`crate::representation`]) — a page when a browser navigates to
 //! it, JSON when anything else fetches it, at one URL.
 //!
-//! # Two registers, one voice
+//! # One browser workbench
 //!
-//! The pages speak in two registers on purpose. The *chrome* — masthead,
-//! headings, prose — is editorial: a serif display face, a warm paper palette,
-//! generous rhythm. The *data* — tables, term cells, chips, stats — is a
-//! registry: monospace identifiers, tabular numerals, compact rows. Catalog
-//! pages lean editorial; operation pages lean registry; both come from the one
-//! stylesheet below, so they cannot drift apart.
+//! The browser representation is an application surface, not an editorial
+//! rendering of the JSON. Neutral panels establish the service, dataset, query
+//! and result hierarchy; monospace is reserved for terms and protocol values;
+//! and the content column uses the available viewport instead of making data
+//! tables escape a prose-shaped page. The catalog and operation pages still
+//! share one stylesheet, so the visual language cannot drift between routes.
 //!
 //! # Escaping is the templating engine's job
 //!
@@ -133,9 +133,12 @@ pub fn page(title: &str, crumbs: &[Crumb<'_>], canonical: Option<&str>, body: Ma
                 script { (PreEscaped(FORM_SCRIPT)) }
             }
             body {
-                header {
-                    nav."crumbs" {
-                        a."brand" href="/" { (SITE) }
+                header."app-header" {
+                    nav."crumbs" aria-label="Breadcrumb" {
+                        a."brand" href="/" {
+                            span."brand-mark" aria-hidden="true" { "KGF" }
+                            span."brand-name" { (SITE) }
+                        }
                         @for crumb in crumbs {
                             span."sep" { "/" }
                             @match &crumb.href {
@@ -146,15 +149,22 @@ pub fn page(title: &str, crumbs: &[Crumb<'_>], canonical: Option<&str>, body: Ma
                     }
                 }
                 main {
-                    h1 { (title) }
+                    div."page-heading" {
+                        h1 { (title) }
+                        @if let Some(json) = &json {
+                            a."json-action" href=(json) { "View JSON" }
+                        }
+                    }
                     (body)
                 }
                 footer {
-                    @if let Some(json) = &json {
-                        a href=(json) { "This page as JSON" }
-                        span."sep" { "·" }
+                    div."footer-inner" {
+                        @if let Some(json) = &json {
+                            a href=(json) { "This page as JSON" }
+                            span."sep" { "·" }
+                        }
+                        span { "one URL for people and software, selected by Accept" }
                     }
-                    span { "the same URL answers JSON to anything that does not ask for HTML" }
                 }
             }
         }
@@ -244,7 +254,7 @@ impl maud::Render for Value<'_> {
 /// A field list: a label and a value per row. Absent values leave no row.
 pub fn fields(rows: &[(&str, Value<'_>)]) -> Markup {
     html! {
-        dl {
+        dl."fields" {
             @for (label, value) in rows {
                 @if !matches!(value, Value::Absent) {
                     dt { (label) }
@@ -255,14 +265,14 @@ pub fn fields(rows: &[(&str, Value<'_>)]) -> Markup {
     }
 }
 
-/// A table in the reading column, horizontally scrollable so a wide row
-/// cannot widen the page.
+/// A descriptor table, horizontally scrollable so a wide row cannot widen the
+/// page.
 pub fn table(headers: &[&str], rows: &[Vec<Value<'_>>]) -> Markup {
     table_markup(headers, rows, false)
 }
 
-/// A results table that breaks out of the reading column and takes the
-/// window's width — the registry surface for row data.
+/// A results table using the full workbench width — the primary registry
+/// surface for row data.
 pub fn results_table(headers: &[&str], rows: &[Vec<Value<'_>>]) -> Markup {
     table_markup(headers, rows, true)
 }
@@ -364,118 +374,351 @@ pub fn compact_number(number: u64) -> String {
 }
 
 /// Inline, because a stylesheet at its own URL is another route, another cache
-/// entry and another thing that can 404 while the page still renders. No
-/// webfont for the same reason: the serif and mono stacks below are system
-/// faces, so a page is one request.
-const STYLE: &str = "\
-:root{--bg:#faf7f1;--surface:#fffdf8;--fg:#241f16;--dim:#6e6557;--rule:#e5ddca;--rule-soft:#efe9da;\
---code:#f2ecdd;--chip:#f0e9d8;--accent:#8f3e24;--accent-ink:#fdf9f2;--hover:rgba(36,31,22,.045);\
---serif:\"Iowan Old Style\",\"Palatino Linotype\",Palatino,\"Book Antiqua\",Georgia,serif;\
---sans:ui-sans-serif,system-ui,-apple-system,\"Segoe UI\",Helvetica,Arial,sans-serif;\
---mono:ui-monospace,\"SF Mono\",SFMono-Regular,Menlo,Consolas,\"Liberation Mono\",monospace}
-@media(prefers-color-scheme:dark){:root{--bg:#1b1813;--surface:#221e17;--fg:#eae3d4;--dim:#a49982;\
---rule:#39321f;--rule-soft:#2c261b;--code:#272219;--chip:#2c261b;--accent:#e28e60;--accent-ink:#231508;\
---hover:rgba(234,227,212,.05)}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.65 var(--sans);\
--webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
-header{border-bottom:1px solid var(--rule);background:var(--surface)}
-.crumbs{max-width:102rem;margin:0 auto;padding:.85rem 1.5rem;font-size:.875rem;color:var(--dim);\
-display:flex;flex-wrap:wrap;align-items:baseline}
-.brand{font-family:var(--serif);font-size:1rem;font-weight:600;letter-spacing:.01em;\
-color:var(--fg);text-decoration:none}
-.brand:hover{color:var(--accent)}
-.crumbs a:not(.brand){color:var(--accent);text-decoration:none}
-.crumbs a:not(.brand):hover{text-decoration:underline}
-.crumbs .here{color:var(--fg)}
-.sep{padding:0 .5rem;color:var(--dim)}
-main{display:grid;grid-template-columns:minmax(1.25rem,1fr) minmax(0,48rem) minmax(1.25rem,1fr);\
-align-content:start;padding-top:2.25rem;padding-bottom:4rem}
-main>*{grid-column:2;min-width:0}
-main>.wide{grid-column:1/-1;width:min(100%,102rem);margin:0 auto;padding:0 1.5rem}
-h1{font-family:var(--serif);font-size:clamp(1.7rem,1.3rem + 1.6vw,2.4rem);line-height:1.2;\
-margin:0 0 1.25rem;font-weight:600;letter-spacing:-.01em}
-h2{font-family:var(--sans);font-size:.8125rem;margin:2.75rem 0 .6rem;font-weight:650;\
-letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
-p{margin:0 0 1rem}
-.lede{font-family:var(--serif);font-size:1.2rem;line-height:1.55;color:var(--fg);margin:0 0 1.25rem}
-.note{color:var(--dim);font-size:.875rem}
-a{color:var(--accent)}
-code{font:.875em/1.5 var(--mono);background:var(--code);padding:.1em .35em;border-radius:4px;\
-word-break:break-all}
-pre{background:var(--code);border:1px solid var(--rule-soft);padding:.9rem 1.1rem;border-radius:8px;\
-overflow-x:auto;font-size:.8125rem;line-height:1.6}
-pre code{background:none;padding:0;word-break:normal}
-dl{display:grid;grid-template-columns:minmax(8rem,auto) 1fr;gap:.45rem 1.5rem;margin:0 0 1rem}
-dt{color:var(--dim);font-size:.875rem}
-dd{margin:0;min-width:0;overflow-wrap:anywhere;font-size:.9375rem}
-.scroll{overflow-x:auto;margin:.5rem 0 1rem}
-table{border-collapse:collapse;width:100%;font-size:.875rem}
-th{text-align:left;font-weight:600;color:var(--dim);font-size:.75rem;text-transform:uppercase;\
-letter-spacing:.05em;white-space:nowrap}
-th,td{padding:.5rem 1.25rem .5rem 0;border-bottom:1px solid var(--rule-soft);vertical-align:top}
-thead tr{border-bottom:1px solid var(--rule)}
-tbody tr:hover{background:var(--hover)}
-td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-a.term{font-family:var(--mono);font-size:.8125rem;text-decoration:none;color:var(--accent);\
-display:inline-block;max-width:38rem;overflow-wrap:anywhere}
-a.term:hover{text-decoration:underline}
-.t-qual{color:var(--dim);font-size:.9em;padding-left:.1em}
-.t-label{display:block;font-family:var(--sans);font-size:.8125rem;color:var(--dim);margin-top:.1rem}
-.chips{list-style:none;display:flex;flex-wrap:wrap;gap:.4rem;margin:0 0 1rem;padding:0}
-.chip{font:600 .71875rem/1.6 var(--mono);letter-spacing:.02em;padding:.05em .6em;\
-border:1px solid var(--rule);border-radius:999px;background:var(--chip);color:var(--dim)}
-.stats{display:flex;flex-wrap:wrap;gap:1rem 3rem;margin:.5rem 0 1.25rem}
-.stat{display:flex;flex-direction:column}
-.stat-value{font-size:1.45rem;font-weight:600;line-height:1.3}
-.stat-label{font-size:.8125rem;color:var(--dim)}
-.cards{list-style:none;display:grid;grid-template-columns:repeat(auto-fill,minmax(19rem,1fr));\
-gap:1rem;margin:.75rem auto 1rem;padding:0}
-.card{position:relative;display:flex;flex-direction:column;gap:.4rem;border:1px solid var(--rule);\
-border-radius:10px;background:var(--surface);padding:1.1rem 1.25rem;min-width:0}
-.card:hover{border-color:var(--dim)}
-.card h3{font-family:var(--serif);font-size:1.2rem;font-weight:600;line-height:1.3;margin:0}
-.card h3 a{color:var(--fg);text-decoration:none}
-.card h3 a::after{content:\"\";position:absolute;inset:0}
-.card h3 a:hover{color:var(--accent)}
-.card .card-desc{color:var(--dim);font-size:.875rem;line-height:1.5;margin:0;display:-webkit-box;\
--webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-.card .chips{margin:0}
-.card .card-meta{margin-top:auto;padding-top:.4rem;font-size:.8125rem;color:var(--dim);\
-font-variant-numeric:tabular-nums}
-.card .card-meta strong{color:var(--fg);font-weight:600}
-.pager{margin:1.25rem 0}
-.pager a{display:inline-block;border:1px solid var(--rule);border-radius:8px;padding:.45rem .9rem;\
-text-decoration:none;font-weight:550;font-size:.9375rem;background:var(--surface)}
-.pager a:hover{border-color:var(--accent)}
-.resource-head{margin:0 0 1.5rem}
-.resource-head .r-label{font-family:var(--serif);font-size:1.35rem;font-weight:600;display:block}
-.resource-head code{font-size:.8125rem}
-.query-form{border:1px solid var(--rule);border-radius:10px;margin:.75rem 0;background:var(--surface)}
-.query-form summary{cursor:pointer;font-weight:600;font-size:.9375rem;padding:.7rem 1.1rem;\
-color:var(--fg)}
-.query-form summary:hover{color:var(--accent)}
-.query-form[open] summary{border-bottom:1px solid var(--rule-soft)}
-.query-form form{padding:1.1rem}
-.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(13rem,1fr));gap:.9rem 1rem;\
-margin-bottom:1rem}
-.form-grid>label{display:flex;flex-direction:column;gap:.3rem;min-width:0}
-.control-label,.choice legend{font-size:.8125rem;color:var(--dim)}
-.choice{border:0;padding:0;margin:0;min-width:0}
-.choice label{margin-right:1rem}
-input,select,button{font:inherit;color:var(--fg)}
-input[type=text],input[type=number],select{width:100%;min-width:0;padding:.45rem .6rem;\
-border:1px solid var(--rule);border-radius:6px;background:var(--bg)}
-input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
-input::placeholder{color:var(--dim);opacity:.6}
-button{border:1px solid var(--accent);border-radius:6px;padding:.45rem .95rem;\
-background:var(--accent);color:var(--accent-ink);font-weight:600;cursor:pointer}
-button:hover{filter:brightness(1.08)}
-footer{border-top:1px solid var(--rule);font-size:.8125rem;color:var(--dim)}
-footer{max-width:102rem;margin:0 auto;padding:1rem 1.5rem 2rem}
-footer a{color:var(--accent);text-decoration:none}
-footer a:hover{text-decoration:underline}
-";
+/// entry and another thing that can 404 while the page still renders. System
+/// sans and mono stacks keep the page a single request.
+const STYLE: &str = r#"
+:root {
+  color-scheme: light dark;
+  --bg: #f4f7fb;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --surface-muted: #f8fafc;
+  --fg: #172033;
+  --dim: #657189;
+  --muted: #8a96aa;
+  --rule: #dce3ed;
+  --rule-strong: #c9d3e1;
+  --code: #eef2f7;
+  --chip: #f2edff;
+  --brand: #2f204d;
+  --accent: #6d28d9;
+  --accent-hover: #5b21b6;
+  --accent-soft: #f2eaff;
+  --accent-ink: #ffffff;
+  --hover: #f6f9ff;
+  --shadow: 0 1px 2px rgba(15, 23, 42, .04), 0 8px 24px rgba(15, 23, 42, .05);
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b1220;
+    --surface: #111b2d;
+    --surface-raised: #152136;
+    --surface-muted: #0e1829;
+    --fg: #e6edf7;
+    --dim: #9aa8bd;
+    --muted: #718099;
+    --rule: #27354a;
+    --rule-strong: #36465e;
+    --code: #1a2639;
+    --chip: #2d2149;
+    --brand: #24173d;
+    --accent: #b795ff;
+    --accent-hover: #ccb6ff;
+    --accent-soft: #2b2044;
+    --accent-ink: #081120;
+    --hover: #142238;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .24), 0 10px 28px rgba(0, 0, 0, .16);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.6 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  border-bottom: 1px solid color-mix(in srgb, white 14%, transparent);
+  background: color-mix(in srgb, var(--brand) 96%, transparent);
+  backdrop-filter: blur(12px);
+}
+.crumbs, main, .footer-inner {
+  width: min(calc(100% - 3rem), 82rem);
+  margin-inline: auto;
+}
+.crumbs {
+  min-height: 3.65rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0;
+  font-size: .8125rem;
+  color: rgba(255, 255, 255, .7);
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: .65rem;
+  color: white;
+  font-weight: 650;
+  letter-spacing: -.01em;
+  text-decoration: none;
+}
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: .55rem;
+  border: 1px solid rgba(255, 255, 255, .24);
+  background: rgba(255, 255, 255, .1);
+  color: white;
+  font: 700 .67rem/1 var(--sans);
+  letter-spacing: .07em;
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+.brand:hover .brand-name { color: white; opacity: .82; }
+.crumbs a:not(.brand) { color: rgba(255, 255, 255, .72); text-decoration: none; }
+.crumbs a:not(.brand):hover { color: white; }
+.crumbs .here { color: white; font-weight: 550; }
+.sep { padding: 0 .55rem; color: rgba(255, 255, 255, .38); }
+main { min-height: calc(100vh - 9rem); padding-block: 2.25rem 4.5rem; }
+.page-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+h1 {
+  margin: 0;
+  font-size: clamp(1.75rem, 1.45rem + 1.25vw, 2.45rem);
+  line-height: 1.18;
+  font-weight: 680;
+  letter-spacing: -.035em;
+}
+h2 {
+  margin: 0 0 .45rem;
+  font-size: 1rem;
+  line-height: 1.35;
+  font-weight: 680;
+  letter-spacing: -.01em;
+  color: var(--fg);
+}
+h3 { margin: 0; }
+p { margin: 0 0 1rem; }
+.lede { max-width: 52rem; margin-bottom: 1.4rem; color: var(--dim); font-size: 1.05rem; line-height: 1.65; }
+.note { max-width: 58rem; color: var(--dim); font-size: .875rem; }
+a { color: var(--accent); }
+.json-action, .pager a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.25rem;
+  border: 1px solid var(--rule-strong);
+  border-radius: .55rem;
+  background: var(--surface);
+  color: var(--fg);
+  padding: .38rem .75rem;
+  font-size: .8125rem;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.json-action:hover, .pager a:hover { border-color: var(--accent); color: var(--accent); }
+code {
+  border-radius: .3rem;
+  background: var(--code);
+  padding: .1em .34em;
+  font: .875em/1.5 var(--mono);
+  word-break: break-all;
+}
+pre {
+  overflow-x: auto;
+  margin: .85rem 0 0;
+  border: 1px solid var(--rule);
+  border-radius: .65rem;
+  background: var(--surface-muted);
+  padding: .9rem 1rem;
+  font-size: .8125rem;
+  line-height: 1.6;
+}
+pre code { background: none; padding: 0; word-break: normal; }
+.overview, .panel, .workbench, .answer-summary {
+  border: 1px solid var(--rule);
+  border-radius: .85rem;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+.overview {
+  position: relative;
+  overflow: hidden;
+  margin-bottom: 2rem;
+  padding: 1.5rem 1.6rem;
+  background: linear-gradient(135deg, var(--surface) 0%, var(--surface) 58%, var(--accent-soft) 160%);
+}
+.section-block { margin-top: 2.2rem; }
+.section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-bottom: .85rem; }
+.dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(19rem, .9fr); gap: 1rem; margin-top: 2rem; }
+.panel { min-width: 0; padding: 1.25rem 1.35rem; }
+.panel > h2:not(:first-child) { margin-top: 1.65rem; }
+.fields {
+  display: grid;
+  grid-template-columns: minmax(8.5rem, auto) minmax(0, 1fr);
+  gap: .5rem 1.25rem;
+  margin: 0;
+}
+dt { color: var(--dim); font-size: .8125rem; }
+dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: .9rem; }
+.answer-summary { margin: 1rem 0 1.5rem; padding: 1rem 1.15rem; box-shadow: none; }
+.answer-summary .fields { grid-template-columns: repeat(4, minmax(8rem, 1fr)); gap: .8rem 1.25rem; }
+.answer-summary dt { margin-bottom: -.4rem; }
+.answer-summary dd { font-weight: 550; }
+.answer-summary dt, .answer-summary dd { grid-column: auto; }
+.scroll {
+  overflow-x: auto;
+  margin: .75rem 0 1rem;
+  border: 1px solid var(--rule);
+  border-radius: .75rem;
+  background: var(--surface);
+}
+.scroll.wide { width: 100%; }
+table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: .85rem; }
+th {
+  background: var(--surface-muted);
+  color: var(--dim);
+  font-size: .7rem;
+  font-weight: 700;
+  letter-spacing: .065em;
+  text-align: left;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+th, td { padding: .68rem .85rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr:hover { background: var(--hover); }
+td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+a.term {
+  display: inline-block;
+  max-width: 38rem;
+  color: var(--accent);
+  font: .8rem/1.45 var(--mono);
+  overflow-wrap: anywhere;
+  text-decoration: none;
+}
+a.term:hover { color: var(--accent-hover); text-decoration: underline; text-underline-offset: .18em; }
+.t-qual { padding-left: .1em; color: var(--dim); font-size: .9em; }
+.t-label { display: block; margin-top: .12rem; color: var(--dim); font: .78rem/1.4 var(--sans); }
+.chips { display: flex; flex-wrap: wrap; gap: .38rem; margin: 0 0 1rem; padding: 0; list-style: none; }
+.chip {
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--rule));
+  border-radius: 999px;
+  background: var(--chip);
+  color: var(--accent);
+  padding: .14rem .55rem;
+  font: 650 .68rem/1.45 var(--mono);
+  letter-spacing: .015em;
+}
+.stats { display: flex; flex-wrap: wrap; gap: .8rem 2.75rem; margin: .25rem 0 .25rem; }
+.stat { display: flex; flex-direction: column; min-width: 5rem; }
+.stat-value { color: var(--fg); font-size: 1.35rem; font-weight: 700; line-height: 1.25; letter-spacing: -.025em; }
+.stat-label { color: var(--dim); font-size: .74rem; }
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(21rem, 100%), 1fr));
+  gap: 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.card {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 12rem;
+  flex-direction: column;
+  gap: .65rem;
+  border: 1px solid var(--rule);
+  border-radius: .85rem;
+  background: var(--surface);
+  padding: 1.25rem;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, .035);
+  transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
+}
+.card:hover { border-color: color-mix(in srgb, var(--accent) 46%, var(--rule)); box-shadow: var(--shadow); transform: translateY(-1px); }
+.card h3 { font-size: 1.12rem; font-weight: 680; line-height: 1.35; letter-spacing: -.018em; }
+.card h3 a { color: var(--fg); text-decoration: none; }
+.card h3 a::after { position: absolute; inset: 0; content: ""; }
+.card h3 a:hover { color: var(--accent); }
+.card .card-desc { display: -webkit-box; overflow: hidden; margin: 0; color: var(--dim); font-size: .85rem; line-height: 1.5; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
+.card .chips { position: relative; margin: 0; pointer-events: none; }
+.card .card-meta { margin: auto 0 0; padding-top: .5rem; color: var(--dim); font-size: .78rem; font-variant-numeric: tabular-nums; }
+.card .card-meta strong { color: var(--fg); font-weight: 700; }
+.pager { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1rem 0; }
+.resource-head { margin: 0 0 1rem; }
+.resource-head .r-label { display: block; font-size: 1.2rem; font-weight: 680; }
+.resource-head code { font-size: .78rem; }
+.workbench { margin: 2rem 0; padding: 1.25rem 1.35rem; }
+.query-stack { display: flex; flex-wrap: wrap; gap: .45rem; margin-top: .9rem; }
+.query-form { min-width: 8rem; margin: 0; }
+.query-form summary {
+  cursor: pointer;
+  border: 1px solid var(--rule-strong);
+  border-radius: .5rem;
+  background: var(--surface);
+  color: var(--dim);
+  padding: .42rem .7rem;
+  font-size: .82rem;
+  font-weight: 650;
+  list-style-position: inside;
+}
+.query-form summary:hover { border-color: var(--accent); color: var(--accent); }
+.query-form[open] { order: 10; flex: 1 0 100%; margin-top: .2rem; border: 1px solid var(--rule); border-radius: .7rem; background: var(--surface-muted); }
+.query-form[open] summary { border: 0; border-bottom: 1px solid var(--rule); border-radius: .7rem .7rem 0 0; background: var(--accent-soft); color: var(--accent); }
+.query-form form { padding: 1rem; }
+.query-form form > .note { margin-bottom: .9rem; }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: .85rem 1rem; margin-bottom: 1rem; }
+.form-grid > label { display: flex; min-width: 0; flex-direction: column; gap: .3rem; }
+.control-label, .choice legend { color: var(--dim); font-size: .78rem; font-weight: 550; }
+.choice { min-width: 0; margin: 0; border: 0; padding: 0; }
+.choice label { margin-right: 1rem; }
+input, select, button { color: var(--fg); font: inherit; }
+input[type=text], input[type=number], select {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--rule-strong);
+  border-radius: .48rem;
+  background: var(--surface);
+  padding: .5rem .62rem;
+}
+input:focus-visible, select:focus-visible { border-color: var(--accent); outline: 3px solid color-mix(in srgb, var(--accent) 18%, transparent); }
+input::placeholder { color: var(--muted); opacity: .85; }
+button {
+  border: 1px solid var(--accent);
+  border-radius: .5rem;
+  background: var(--accent);
+  color: var(--accent-ink);
+  padding: .5rem .9rem;
+  font-weight: 650;
+  cursor: pointer;
+}
+button:hover { background: var(--accent-hover); }
+footer { border-top: 1px solid var(--rule); color: var(--dim); font-size: .78rem; }
+.footer-inner { padding-block: 1rem 2rem; }
+footer a { color: var(--accent); text-decoration: none; }
+footer a:hover { text-decoration: underline; }
+@media (max-width: 760px) {
+  .crumbs, main, .footer-inner { width: min(calc(100% - 2rem), 82rem); }
+  .brand-name { display: none; }
+  .crumbs { min-height: 3.25rem; }
+  .page-heading { align-items: flex-start; flex-direction: column; gap: .75rem; }
+  main { padding-block: 1.5rem 3rem; }
+  .overview, .panel, .workbench { padding: 1rem; }
+  .dashboard-grid { grid-template-columns: 1fr; }
+  .answer-summary .fields, .fields { grid-template-columns: 1fr; gap: .12rem; }
+  .answer-summary dd, dd { margin-bottom: .55rem; }
+  .stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .9rem; }
+  .form-grid { grid-template-columns: 1fr; }
+  th, td { padding: .6rem .7rem; }
+}
+"#;
 
 /// Native forms include untouched optional controls as empty values. The
 /// server gives those the same meaning as omission; removing them here is a
@@ -582,6 +825,8 @@ mod tests {
             html! {},
         );
         assert!(rendered.contains("class=\"brand\" href=\"/\""));
+        assert!(rendered.contains("class=\"brand-mark\""));
+        assert!(rendered.contains("class=\"page-heading\""));
         assert!(rendered.contains("href=\"/tox\""));
         assert!(rendered.contains("<span class=\"here\">v1</span>"));
     }

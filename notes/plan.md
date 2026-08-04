@@ -1122,16 +1122,23 @@ empty-input HTML, `Accept-Query`, and rejection of the removed `lang` parameter.
 
 ### 18. The web UI revamp — a catalog with a workbench ✅
 
-The HTML layer rebuilt around one deliberate voice split: *editorial chrome,
-registry data*. Page titles, dataset names and prose are set in a system serif
-stack over a warm paper palette (dark mode keeps the warmth); tables, term
-cells, chips and stats are monospace-accented, compact, tabular. Catalog pages
-lean editorial, operation pages lean registry, and both come from the single
-inline stylesheet in `html.rs`, still with zero external requests and no
-client framework — the `formdata` normalizer remains the whole of client-side
-JavaScript. Layout is hybrid: prose and field lists hold a 48 rem reading
-column while result tables and card grids break out toward the viewport
-(`results_table` vs `table` in `html.rs`, `main > .wide`).
+The HTML layer is a browser workbench rather than an editorial rendering of
+the JSON. A cool neutral canvas, deep-purple product bar, sans typography and
+rounded white panels take a small visual cue from the wider OKN family without
+turning the server into a marketing site; protocol values and RDF terms alone
+carry the monospace register. The same system survives dark mode. Catalog,
+descriptor, manifest and operation pages all come from the single inline
+stylesheet in `html.rs`, still with zero external requests and no client
+framework — the `formdata` normalizer remains the whole of client-side
+JavaScript.
+
+The layout changed with the palette. The shared shell uses an 82 rem
+application canvas with a compact product header, breadcrumb trail, page-level
+JSON action and mobile collapse. Service and dataset summaries are overview
+panels; related descriptor sections pair into dashboard grids; the manifest's
+forms are an operation strip with one expanded editor; query echoes are compact
+summary panels; and row data keeps the full canvas in bordered, scrollable
+tables. There is no privileged narrow reading column for result pages to escape.
 
 `/` became a dataset catalog in both representations. The service descriptor's
 `datasets` field now carries `{id, title, description, triples, current,
@@ -1166,8 +1173,9 @@ can spell.
 stats, structured term links), the masthead/crumb test, compact-number
 truncation tests, the updated socket tests (catalog JSON shape, search label
 annotation, describe drill-down for predicates, qualifier markup), and a
-headless visual pass over root/dataset/manifest/fragment/describe/search/error
-pages in both color schemes at desktop and phone widths.
+browser visual pass over the catalog, manifest workbench and live fragment
+results, with the phone breakpoint kept as a single-column collapse in the
+shared stylesheet.
 
 ### What the implementation still is not
 

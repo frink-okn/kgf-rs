@@ -24,14 +24,16 @@ pub(crate) fn manifest_forms(dataset: &str, version: &str, manifest: &Manifest) 
             "Blank subject, predicate and object fields mean any term. Terms accept the CURIEs "
             "listed above, bracketed IRIs, blank nodes and quoted literals."
         }
-        (fragment(dataset, version, &empty, search, true))
-        (count(dataset, version, &empty, search, false))
-        (describe(dataset, version, &empty, false))
-        @if manifest.declares(Capability::Sample) {
-            (sample(dataset, version, &empty, false))
-        }
-        @if search {
-            (search_form(dataset, version, &empty, false))
+        div."query-stack" {
+            (fragment(dataset, version, &empty, search, true))
+            (count(dataset, version, &empty, search, false))
+            (describe(dataset, version, &empty, false))
+            @if manifest.declares(Capability::Sample) {
+                (sample(dataset, version, &empty, false))
+            }
+            @if search {
+                (search_form(dataset, version, &empty, false))
+            }
         }
     }
 }
@@ -44,14 +46,15 @@ pub(crate) fn operation_form(
     params: &Params,
     has_search: bool,
 ) -> Option<Markup> {
-    match operation {
+    let form = match operation {
         "fragment" => Some(fragment(dataset, version, params, has_search, false)),
         "count" => Some(count(dataset, version, params, has_search, false)),
         "describe" => Some(describe(dataset, version, params, false)),
         "sample" => Some(sample(dataset, version, params, false)),
         "search" => Some(search_form(dataset, version, params, false)),
         _ => None,
-    }
+    }?;
+    Some(html! { div."query-stack" { (form) } })
 }
 
 fn fragment(dataset: &str, version: &str, params: &Params, has_search: bool, open: bool) -> Markup {
@@ -380,6 +383,7 @@ mod tests {
     #[test]
     fn manifest_forms_follow_capabilities() {
         let core = manifest_forms("tox", "v1", &manifest(&[])).into_string();
+        assert!(core.contains("class=\"query-stack\""));
         assert!(core.contains("action=\"/tox/v/v1/fragment\""));
         assert!(core.contains("action=\"/tox/v/v1/count\""));
         assert!(core.contains("action=\"/tox/v/v1/describe\""));

@@ -2522,9 +2522,14 @@ impl Resource for Answer {
                     }
                 }
                 @if let Some(form) = self.target.form() {
-                    (form)
+                    section."workbench" {
+                        h2 { "Query" }
+                        (form)
+                    }
                 }
-                (fields(&self.summary()))
+                div."answer-summary" {
+                    (fields(&self.summary()))
+                }
                 @if !self.absent_terms.is_empty() {
                     (note(&format!(
                         "This bundle's dictionary holds no term for {}. The answer is empty for \
@@ -2540,16 +2545,18 @@ impl Resource for Answer {
                     ))
                 }
 
-                h2 { "Rows" }
-                @if self.vars.is_empty() && !self.bindings {
-                    (note(
-                        "Every position is bound, so a row has nothing to report beyond its own \
-                         existence; the cardinality above is the answer."
-                    ))
-                } @else if rows.is_empty() {
-                    (note("No rows."))
-                } @else {
-                    (results_table(&headers, &rows))
+                section."section-block" {
+                    h2 { "Rows" }
+                    @if self.vars.is_empty() && !self.bindings {
+                        (note(
+                            "Every position is bound, so a row has nothing to report beyond its own \
+                             existence; the cardinality above is the answer."
+                        ))
+                    } @else if rows.is_empty() {
+                        (note("No rows."))
+                    } @else {
+                        (results_table(&headers, &rows))
+                    }
                 }
 
                 @if let Some(token) = self.completeness.next_cursor() {
@@ -2741,27 +2748,34 @@ impl Resource for SearchAnswer {
             canonical.as_deref(),
             html! {
                 @if let Some(form) = self.target.form() {
-                    (form)
+                    section."workbench" {
+                        h2 { "Query" }
+                        (form)
+                    }
                 }
-                (fields(&[
-                    ("query", Value::Text(&self.query)),
-                    ("scope", if all_predicates { Value::Text("all predicates") } else { Value::Absent }),
-                    ("roles", if roles.is_empty() { Value::Absent } else { Value::Text(&roles) }),
-                    ("predicates", if predicate_scope.is_empty() { Value::Absent } else { Value::Code(&predicate_scope) }),
-                    ("returned", Value::Number(returned)),
-                    ("complete", Value::Text(completeness_text(&self.completeness))),
-                ]))
+                div."answer-summary" {
+                    (fields(&[
+                        ("query", Value::Text(&self.query)),
+                        ("scope", if all_predicates { Value::Text("all predicates") } else { Value::Absent }),
+                        ("roles", if roles.is_empty() { Value::Absent } else { Value::Text(&roles) }),
+                        ("predicates", if predicate_scope.is_empty() { Value::Absent } else { Value::Code(&predicate_scope) }),
+                        ("returned", Value::Number(returned)),
+                        ("complete", Value::Text(completeness_text(&self.completeness))),
+                    ]))
+                }
                 @if !self.completeness.is_complete() {
                     (note(
                         "Ranked search retains a bounded candidate window and has no cursor; \
                          narrow the query or its scopes to see what this response could not carry."
                     ))
                 }
-                h2 { "Entities" }
-                @if rows.is_empty() {
-                    (note("No matching entities."))
-                } @else {
-                    (results_table(&headers, &rows))
+                section."section-block" {
+                    h2 { "Entities" }
+                    @if rows.is_empty() {
+                        (note("No matching entities."))
+                    } @else {
+                        (results_table(&headers, &rows))
+                    }
                 }
             },
         )
@@ -2790,15 +2804,19 @@ impl Resource for LabelsAnswer {
             &self.target.crumbs(),
             None,
             html! {
-                (fields(&[
-                    ("returned", Value::Number(returned)),
-                    ("complete", Value::Text(completeness_text(&self.completeness))),
-                ]))
-                h2 { "Labels" }
-                @if rows.is_empty() {
-                    (note("No IRIs were submitted."))
-                } @else {
-                    (results_table(&["iri", "label"], &rows))
+                div."answer-summary" {
+                    (fields(&[
+                        ("returned", Value::Number(returned)),
+                        ("complete", Value::Text(completeness_text(&self.completeness))),
+                    ]))
+                }
+                section."section-block" {
+                    h2 { "Labels" }
+                    @if rows.is_empty() {
+                        (note("No IRIs were submitted."))
+                    } @else {
+                        (results_table(&["iri", "label"], &rows))
+                    }
                 }
             },
         )
@@ -2825,9 +2843,14 @@ impl Resource for CountAnswer {
             canonical.as_deref(),
             html! {
                 @if let Some(form) = self.target.form() {
-                    (form)
+                    section."workbench" {
+                        h2 { "Query" }
+                        (form)
+                    }
                 }
-                (fields(&summary))
+                div."answer-summary" {
+                    (fields(&summary))
+                }
                 @if !self.absent_terms.is_empty() {
                     (note(&format!(
                         "This bundle's dictionary holds no term for {}, so nothing can match.",
@@ -2884,12 +2907,16 @@ impl Resource for BindingCountAnswer {
             &self.target.crumbs(),
             canonical.as_deref(),
             html! {
-                (fields(&binding_pattern_fields(&self.pattern)))
-                h2 { "Counts" }
-                @if rows.is_empty() {
-                    (note("No input binding rows."))
-                } @else {
-                    (results_table(&[BINDING, "count", "exact"], &rows))
+                div."answer-summary" {
+                    (fields(&binding_pattern_fields(&self.pattern)))
+                }
+                section."section-block" {
+                    h2 { "Counts" }
+                    @if rows.is_empty() {
+                        (note("No input binding rows."))
+                    } @else {
+                        (results_table(&[BINDING, "count", "exact"], &rows))
+                    }
                 }
             },
         )
