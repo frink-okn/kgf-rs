@@ -16,6 +16,19 @@ rather than silently following the code. The split is deliberate: a bundle is se
 by anything honouring doc 03, so this repo is *an* implementation, not the definition
 (`../kgf` doc 07 §7.5 item 25).
 
+**But the spec is a working draft, not a settled standard.** Docs 01–20 began as
+blue-sky design and are revised as implementation and real use teach us what the
+architecture actually wants — and the same goes for the KGF-targeted features in
+`../hdtc`. So "govern" means *code must not diverge from the spec silently*, not *the
+spec is always right*: when a disagreement surfaces, the fix can land in the code **or**
+in the spec. Where implementation reveals a better design, propose the spec change —
+record it under `notes/plan.md`'s **Questions for `../kgf`**, or raise it directly
+against the `../kgf` (or `../hdtc`) doc — rather than shoehorning the work into wording
+that no longer fits. And nothing is frozen yet: no first release has happened, so wire
+formats, cursor tokens, the manifest schema, and the HTTP surface all stay revisable.
+Revisable is not undocumented — wherever the decision lands, write down what changed and
+why.
+
 Three sibling checkouts are expected:
 
 ```
