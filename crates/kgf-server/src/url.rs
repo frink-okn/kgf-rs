@@ -131,10 +131,10 @@ impl Params {
 
     /// The same parameters without empty values under any of `names`.
     ///
-    /// Used to canonicalize optional HTML-form controls after the operation has
-    /// established that those names are meaningful. It is deliberately not part
-    /// of parsing: an empty required value and an empty unknown parameter remain
-    /// errors, and only optional pattern positions define empty as omitted.
+    /// Used after a typed GET request has named the controls for which omission
+    /// selects a default. It is deliberately not part of generic parsing: empty
+    /// required, unknown, cursor, representation, and selection parameters must
+    /// remain visible so their own parsers can reject them.
     #[must_use]
     pub fn without_empty(&self, names: &[&str]) -> Self {
         let mut params = self.0.clone();

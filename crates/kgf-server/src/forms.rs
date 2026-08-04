@@ -2,10 +2,10 @@
 //!
 //! These are deliberately ordinary forms: submitting one navigates to the
 //! operation URL and content negotiation returns the result page. There is no
-//! client-side request layer and no hidden `format` parameter. The shared page
-//! shell removes blank optional controls from submitted form data; optional
-//! pattern positions also define empty as unbound for clients that send them
-//! directly, and the router canonicalizes those aliases away.
+//! client-side request layer and no hidden `format` parameter. The server
+//! treats blank optional controls as omitted; the shared page shell also
+//! removes them from submitted form data so JavaScript-capable browsers get a
+//! clean address-bar URL.
 
 use kgf_store::Capability;
 use kgf_store::manifest::Manifest;

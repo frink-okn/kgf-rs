@@ -313,9 +313,10 @@ footer a{color:var(--accent);text-decoration:none}
 footer a:hover{text-decoration:underline}
 ";
 
-/// Native forms include untouched optional controls as empty values. Preserve
-/// the API's distinction between an omitted optional parameter and an empty
-/// required one by removing blank controls from the browser-built form data.
+/// Native forms include untouched optional controls as empty values. The
+/// server gives those the same meaning as omission; removing them here is a
+/// progressive enhancement that also keeps the browser's address-bar URL
+/// canonical. Required controls are never empty after browser validation.
 ///
 /// This is intentionally the whole client-side layer: navigation and response
 /// rendering remain ordinary HTTP, and fixed source contains no interpolated

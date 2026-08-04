@@ -1398,9 +1398,12 @@ following the code.
     unset client variables, but that made ordinary HTML GET forms hostile: browsers submit
     untouched named controls as empty values. Empty has no competing RDF-term meaning —
     the empty literal is written `""` — so `s=`, `p=` and `o=` now canonicalize to
-    omission on pattern operations. Required values (`iri`, `q`) and non-term controls
-    remain errors when empty. The docs should state the equivalence explicitly. Found in
-    unit 14; corrected when HTML query forms landed.
+    omission on pattern operations. The same rule now covers the native forms' other
+    optional free-text and numeric controls (`o.text`, `limit`, `n`, `seed`, `role`, and
+    `predicate`), so their defaults do not depend on JavaScript removing untouched
+    controls. Required values (`iri`, `q`), selections, cursors, formats, and unknown
+    parameters remain errors when empty. The docs should state the equivalence
+    explicitly. Found in unit 14; corrected and generalized when HTML query forms landed.
 20. **`count` has two shapes in §3.4.4.** The first example is
     `{"count": 1284211, "exact": true}` — a bare integer with a sibling flag — and the
     resumable form two paragraphs later is

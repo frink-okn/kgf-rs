@@ -1459,6 +1459,58 @@ impl Sample {
     }
 }
 
+/// Normalize the successful controls of one native GET form.
+///
+/// HTML submits untouched named controls as empty strings. Each request type
+/// owns the decision about which of those controls are genuinely optional, so
+/// the router can apply ordinary form semantics without making empty required,
+/// unknown, cursor, representation, or selection parameters disappear.
+pub(crate) trait GetRequest {
+    /// Remove empty controls whose omission selects this request's default.
+    fn normalize_params(params: &Params) -> Params;
+}
+
+/// Empty triple positions are unbound; `additional` names the operation's
+/// other optional text or number controls.
+fn normalize_pattern_params(params: &Params, additional: &[&str]) -> Params {
+    let mut optional = Position::ALL
+        .into_iter()
+        .map(Position::as_str)
+        .collect::<Vec<_>>();
+    optional.extend_from_slice(additional);
+    params.without_empty(&optional)
+}
+
+impl GetRequest for Fragment {
+    fn normalize_params(params: &Params) -> Params {
+        normalize_pattern_params(params, &["o.text", "limit"])
+    }
+}
+
+impl GetRequest for Count {
+    fn normalize_params(params: &Params) -> Params {
+        normalize_pattern_params(params, &["o.text"])
+    }
+}
+
+impl GetRequest for Describe {
+    fn normalize_params(params: &Params) -> Params {
+        params.without_empty(&["limit"])
+    }
+}
+
+impl GetRequest for Sample {
+    fn normalize_params(params: &Params) -> Params {
+        normalize_pattern_params(params, &["n", "seed"])
+    }
+}
+
+impl GetRequest for Search {
+    fn normalize_params(params: &Params) -> Params {
+        params.without_empty(&["role", "predicate", "limit"])
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared parameter reading
 // ---------------------------------------------------------------------------
@@ -2050,6 +2102,45 @@ mod tests {
             Some("http://example.org/a")
         );
         assert_eq!(empty.pattern.bound(Position::Object), None);
+    }
+
+    #[test]
+    fn each_get_request_owns_its_blank_optional_controls() {
+        let fragment = Fragment::normalize_params(&params(
+            "s=&p=ex:a&o=&o.text=&limit=&cursor=&format=&unknown=",
+        ));
+        for omitted in ["s", "o", "o.text", "limit"] {
+            assert_eq!(fragment.get(omitted), None, "{omitted}");
+        }
+        assert_eq!(fragment.get("p"), Some("ex:a"));
+        for strict in ["cursor", "format", "unknown"] {
+            assert_eq!(fragment.get(strict), Some(""), "{strict}");
+        }
+
+        let count = Count::normalize_params(&params("s=&p=&o=&o.text=&cursor="));
+        for omitted in ["s", "p", "o", "o.text"] {
+            assert_eq!(count.get(omitted), None, "{omitted}");
+        }
+        assert_eq!(count.get("cursor"), Some(""));
+
+        let describe = Describe::normalize_params(&params("iri=&direction=&limit=&cursor="));
+        assert_eq!(describe.get("limit"), None);
+        for strict in ["iri", "direction", "cursor"] {
+            assert_eq!(describe.get(strict), Some(""), "{strict}");
+        }
+
+        let sample = Sample::normalize_params(&params("s=&p=&o=&n=&seed="));
+        for omitted in ["s", "p", "o", "n", "seed"] {
+            assert_eq!(sample.get(omitted), None, "{omitted}");
+        }
+
+        let search = Search::normalize_params(&params("q=&role=&predicate=&labels=&limit="));
+        for omitted in ["role", "predicate", "limit"] {
+            assert_eq!(search.get(omitted), None, "{omitted}");
+        }
+        for strict in ["q", "labels"] {
+            assert_eq!(search.get(strict), Some(""), "{strict}");
+        }
     }
 
     #[test]

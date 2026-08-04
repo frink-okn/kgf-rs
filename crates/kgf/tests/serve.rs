@@ -358,6 +358,15 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
         searched.json()["results"][0]["match"]["predicate"],
         "http://example.org/name"
     );
+    server
+        .get("/tox/v/v1/search?q=Alice&role=&predicate=&labels=true&limit=")
+        .assert_status(200);
+    server
+        .get("/tox/v/v1/search?q=&role=&predicate=&labels=true&limit=")
+        .assert_status(400);
+    server
+        .get("/tox/v/v1/search?q=Alice&labels=&limit=")
+        .assert_status(400);
     let search_page = server.request(
         "GET",
         "/tox/v/v1/search?q=Alice&predicate=ex%3Aname",
@@ -818,18 +827,36 @@ fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() 
         .get("/tox/latest/fragment?limit=2")
         .assert_header("location", "/tox/v/2026-06-01/fragment?limit=2");
 
-    // A native HTML form submits untouched optional controls as empty. Pattern
-    // positions give that ordinary spelling the same meaning as omission, and
-    // the page's own canonical link drops the empty aliases again.
+    // A native HTML form submits untouched optional controls as empty. The
+    // server applies their defaults even without JavaScript, and the page's
+    // own canonical link drops the empty aliases again.
     let blank = server.request(
         "GET",
-        &format!("{base}/fragment?s=&p=ex:knows&o=&limit=2"),
+        &format!("{base}/fragment?s=&p=ex:knows&o=&o.text=&limit="),
         &[("Accept", "text/html")],
     );
     blank.assert_status(200);
     let blank_html = blank.text();
-    assert!(blank_html.contains("/fragment?limit=2&amp;p=ex%3Aknows&amp;format=json"));
-    assert!(!blank_html.contains("?limit=2&amp;o="));
+    assert!(blank_html.contains("/fragment?p=ex%3Aknows&amp;format=json"));
+    assert!(!blank_html.contains("limit="));
+
+    server
+        .get(&format!("{base}/count?s=&p=&o=&o.text="))
+        .assert_status(200);
+    server
+        .get(&format!("{base}/describe?iri=ex:alice&limit="))
+        .assert_status(200);
+    server
+        .get(&format!("{base}/sample?s=&p=&o=&n=&seed="))
+        .assert_status(200);
+
+    // Required and unknown controls are not part of that normalization.
+    server
+        .get(&format!("{base}/describe?iri=&limit="))
+        .assert_status(400);
+    server
+        .get(&format!("{base}/fragment?unknown="))
+        .assert_status(400);
 
     // The manifest is the entry point for required-argument operations such as
     // describe, so its forms must all point at this exact immutable version.
