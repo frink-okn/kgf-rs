@@ -109,6 +109,28 @@ impl<'a> Crumb<'a> {
 /// request arrived on, so a page reached through `latest` links to the version
 /// it actually resolved to.
 pub fn page(title: &str, crumbs: &[Crumb<'_>], canonical: Option<&str>, body: Markup) -> String {
+    page_document(title, None, crumbs, canonical, body)
+}
+
+/// An operation page whose route and release are quiet context above the
+/// page's actual subject.
+pub fn operation_page(
+    title: &str,
+    context: &str,
+    crumbs: &[Crumb<'_>],
+    canonical: Option<&str>,
+    body: Markup,
+) -> String {
+    page_document(title, Some(context), crumbs, canonical, body)
+}
+
+fn page_document(
+    title: &str,
+    context: Option<&str>,
+    crumbs: &[Crumb<'_>],
+    canonical: Option<&str>,
+    body: Markup,
+) -> String {
     // The service descriptor's own title *is* the site name, and a tab reading
     // "Knowledge Graph Fragments — Knowledge Graph Fragments" is the classic
     // template seam.
@@ -150,7 +172,14 @@ pub fn page(title: &str, crumbs: &[Crumb<'_>], canonical: Option<&str>, body: Ma
                 }
                 main {
                     div."page-heading" {
-                        h1 { (title) }
+                        @if let Some(context) = context {
+                            div."page-title" {
+                                p."operation-context" { (context) }
+                                h1 { (title) }
+                            }
+                        } @else {
+                            h1 { (title) }
+                        }
                         @if let Some(json) = &json {
                             a."json-action" href=(json) { "View JSON" }
                         }
@@ -215,6 +244,12 @@ pub enum Value<'a> {
         /// The structured spelling.
         term: TermText<'a>,
     },
+    /// An RDF term that is intentionally not a link — notably the focus term
+    /// repeated in a `/describe` row.
+    Term {
+        /// The structured spelling.
+        term: TermText<'a>,
+    },
     /// A field the resource does not carry.
     Absent,
 }
@@ -245,6 +280,17 @@ impl maud::Render for Value<'_> {
                         }
                     }
                 },
+                Value::Term { term } => {
+                    span."term"."term-static" title=[term.full_iri] {
+                        (term.primary)
+                        @if let Some(qualifier) = term.qualifier {
+                            span."t-qual" { (qualifier) }
+                        }
+                        @if let Some(annotation) = term.annotation {
+                            span."t-label" { (annotation) }
+                        }
+                    }
+                },
                 Value::Absent => {}
             }
         }
@@ -257,8 +303,10 @@ pub fn fields(rows: &[(&str, Value<'_>)]) -> Markup {
         dl."fields" {
             @for (label, value) in rows {
                 @if !matches!(value, Value::Absent) {
-                    dt { (label) }
-                    dd { (value) }
+                    div."field" {
+                        dt { (label) }
+                        dd { (value) }
+                    }
                 }
             }
         }
@@ -561,17 +609,17 @@ pre code { background: none; padding: 0; word-break: normal; }
 .panel > h2:not(:first-child) { margin-top: 1.65rem; }
 .fields {
   display: grid;
-  grid-template-columns: minmax(8.5rem, auto) minmax(0, 1fr);
-  gap: .5rem 1.25rem;
+  gap: .5rem;
   margin: 0;
 }
+.field { display: grid; grid-template-columns: minmax(8.5rem, auto) minmax(0, 1fr); gap: 1.25rem; }
 dt { color: var(--dim); font-size: .8125rem; }
 dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: .9rem; }
-.answer-summary { margin: 1rem 0 1.5rem; padding: 1rem 1.15rem; box-shadow: none; }
-.answer-summary .fields { grid-template-columns: repeat(4, minmax(8rem, 1fr)); gap: .8rem 1.25rem; }
-.answer-summary dt { margin-bottom: -.4rem; }
-.answer-summary dd { font-weight: 550; }
-.answer-summary dt, .answer-summary dd { grid-column: auto; }
+.answer-summary { margin: 0 0 1rem; padding: .9rem 1.05rem; box-shadow: none; }
+.answer-summary .fields { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .8rem 1.25rem; }
+.answer-summary .field { display: block; min-width: 0; }
+.answer-summary dt { margin-bottom: .14rem; font-size: .7rem; font-weight: 650; letter-spacing: .055em; text-transform: uppercase; }
+.answer-summary dd { font-size: .94rem; font-weight: 580; }
 .scroll {
   overflow-x: auto;
   margin: .75rem 0 1rem;
@@ -595,15 +643,18 @@ th, td { padding: .68rem .85rem; border-bottom: 1px solid var(--rule); vertical-
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: var(--hover); }
 td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-a.term {
+a.term, span.term {
   display: inline-block;
   max-width: 38rem;
-  color: var(--accent);
   font: .8rem/1.45 var(--mono);
   overflow-wrap: anywhere;
+}
+a.term {
+  color: var(--accent);
   text-decoration: none;
 }
 a.term:hover { color: var(--accent-hover); text-decoration: underline; text-underline-offset: .18em; }
+span.term-static { color: var(--dim); }
 .t-qual { padding-left: .1em; color: var(--dim); font-size: .9em; }
 .t-label { display: block; margin-top: .12rem; color: var(--dim); font: .78rem/1.4 var(--sans); }
 .chips { display: flex; flex-wrap: wrap; gap: .38rem; margin: 0 0 1rem; padding: 0; list-style: none; }
@@ -652,10 +703,12 @@ a.term:hover { color: var(--accent-hover); text-decoration: underline; text-unde
 .card .card-meta { margin: auto 0 0; padding-top: .5rem; color: var(--dim); font-size: .78rem; font-variant-numeric: tabular-nums; }
 .card .card-meta strong { color: var(--fg); font-weight: 700; }
 .pager { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1rem 0; }
-.resource-head { margin: 0 0 1rem; }
-.resource-head .r-label { display: block; font-size: 1.2rem; font-weight: 680; }
-.resource-head code { font-size: .78rem; }
+.operation-context { margin: 0 0 .3rem; color: var(--dim); font-size: .82rem; }
+.focus-identifier { margin: -1rem 0 1.15rem; }
+.focus-identifier code { font-size: .78rem; }
 .workbench { margin: 2rem 0; padding: 1.25rem 1.35rem; }
+.query-editor { margin: .75rem 0 1.5rem; }
+.query-editor .query-stack { margin-top: 0; }
 .query-stack { display: flex; flex-wrap: wrap; gap: .45rem; margin-top: .9rem; }
 .query-form { min-width: 8rem; margin: 0; }
 .query-form summary {
@@ -712,8 +765,9 @@ footer a:hover { text-decoration: underline; }
   main { padding-block: 1.5rem 3rem; }
   .overview, .panel, .workbench { padding: 1rem; }
   .dashboard-grid { grid-template-columns: 1fr; }
-  .answer-summary .fields, .fields { grid-template-columns: 1fr; gap: .12rem; }
-  .answer-summary dd, dd { margin-bottom: .55rem; }
+  .answer-summary .fields { grid-template-columns: 1fr; gap: .7rem; }
+  .field { grid-template-columns: 1fr; gap: .1rem; }
+  .fields dd { margin-bottom: .55rem; }
   .stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .9rem; }
   .form-grid { grid-template-columns: 1fr; }
   th, td { padding: .6rem .7rem; }
@@ -772,6 +826,13 @@ mod tests {
                             annotation: Some(hostile),
                             full_iri: Some(hostile),
                         },
+                    }, Value::Term {
+                        term: TermText {
+                            primary: hostile,
+                            qualifier: Some(hostile),
+                            annotation: Some(hostile),
+                            full_iri: Some(hostile),
+                        },
                     }]],
                 ))
             },
@@ -814,6 +875,24 @@ mod tests {
         assert!(
             page(SITE, &[], None, html! {}).contains("<title>Knowledge Graph Fragments</title>")
         );
+    }
+
+    #[test]
+    fn operation_context_precedes_the_page_subject() {
+        let rendered = operation_page(
+            "circulating cell",
+            "Describe · ubergraph 2026-05-31",
+            &[],
+            None,
+            html! {},
+        );
+        let context = rendered
+            .find("Describe · ubergraph 2026-05-31")
+            .expect("operation context");
+        let subject = rendered
+            .find("<h1>circulating cell</h1>")
+            .expect("page subject");
+        assert!(context < subject);
     }
 
     #[test]

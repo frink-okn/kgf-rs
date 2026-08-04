@@ -383,6 +383,16 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
     search_page.assert_status(200);
     search_page.assert_header("content-type", "text/html; charset=utf-8");
     let search_html = search_page.text();
+    assert!(search_html.contains("<h1>“Alice”</h1>"), "{search_html}");
+    assert!(search_html.contains("Search · tox v1"), "{search_html}");
+    assert!(
+        search_html.find("Search · tox v1") < search_html.find("<h1>“Alice”</h1>"),
+        "{search_html}"
+    );
+    assert!(
+        search_html.contains("<div class=\"field\"><dt>query</dt><dd>Alice</dd></div>"),
+        "{search_html}"
+    );
     assert!(search_html.contains(">ex:alice<"), "{search_html}");
     // `labels` defaults on, and the page sets the resolved label under the
     // subject term rather than in a column of its own.

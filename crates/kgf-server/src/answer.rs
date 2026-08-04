@@ -59,7 +59,9 @@ use crate::envelope::{
     BudgetReason, Cardinality, Completeness, ErrorCode, Problem, TruncationReason,
 };
 use crate::forms;
-use crate::html::{Crumb, Resource, TermText, Value, fields, json_body, note, page, results_table};
+use crate::html::{
+    Crumb, Resource, TermText, Value, fields, json_body, note, operation_page, page, results_table,
+};
 use crate::representation::Representation;
 use crate::request::{
     self, BindingPattern, BindingRow, BoundTerm, Candidates, Direction, Pattern, Position,
@@ -182,6 +184,31 @@ impl Target {
             "{} — {} {}",
             self.operation, self.id.dataset, self.id.version
         )
+    }
+
+    /// Compact operation and release context shown under a page's actual
+    /// focus. The focus is the term, pattern, or search text; this line keeps
+    /// the route name and version available without letting them become the
+    /// largest thing on the page.
+    fn context(&self) -> String {
+        format!(
+            "{} · {} {}",
+            self.operation_label(),
+            self.id.dataset,
+            self.id.version
+        )
+    }
+
+    fn operation_label(&self) -> &'static str {
+        match self.operation {
+            "fragment" => "Fragment",
+            "count" => "Count",
+            "describe" => "Describe",
+            "sample" => "Sample",
+            "search" => "Search",
+            "labels" => "Labels",
+            operation => operation,
+        }
     }
 
     /// The GET editor for this answer, absent for a body-addressed request.
@@ -531,6 +558,16 @@ impl Renders for Answer {
         let mut wanted: Vec<&str> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
         let named = |text: &str| !text.starts_with('"');
+        if let Echo::Fragment { pattern } | Echo::Sample { pattern, .. } = &self.echo {
+            for position in Position::ALL {
+                if let Some(bound) = pattern.bound(position) {
+                    let text = bound.dictionary();
+                    if named(text) && seen.insert(text) {
+                        wanted.push(text);
+                    }
+                }
+            }
+        }
         for row in &self.rows {
             for (_, text) in &row.cells {
                 if named(text) && seen.insert(text) {
@@ -2498,37 +2535,25 @@ impl Resource for Answer {
             .iter()
             .map(|row| row.iter().map(Cell::value).collect())
             .collect();
-        let mut headers: Vec<&str> = self.vars.iter().map(|var| var.as_str()).collect();
-        if self.bindings {
-            headers.insert(0, BINDING);
-        }
-        if self.directed {
-            headers.push("direction");
-        }
-        if self.rows.iter().any(|row| row.ranking.is_some()) {
-            headers.extend([SCORE, MATCH_KIND]);
-        }
+        let headers = self.headers();
 
         let canonical = self.target.canonical();
-        page(
-            &self.target.title(),
+        let heading = self.page_heading();
+        let context = self.target.context();
+        operation_page(
+            &heading,
+            &context,
             &self.target.crumbs(),
             canonical.as_deref(),
             html! {
-                @if let Some((resource, label)) = self.described_header() {
-                    div."resource-head" {
-                        span."r-label" { (label) }
-                        code { (resource) }
-                    }
-                }
-                @if let Some(form) = self.target.form() {
-                    section."workbench" {
-                        h2 { "Query" }
-                        (form)
-                    }
+                @if let Some(identifier) = self.described_identifier() {
+                    p."focus-identifier" { code { (identifier) } }
                 }
                 div."answer-summary" {
                     (fields(&self.summary()))
+                }
+                @if let Some(form) = self.target.form() {
+                    div."query-editor" { (form) }
                 }
                 @if !self.absent_terms.is_empty() {
                     (note(&format!(
@@ -2546,8 +2571,8 @@ impl Resource for Answer {
                 }
 
                 section."section-block" {
-                    h2 { "Rows" }
-                    @if self.vars.is_empty() && !self.bindings {
+                    h2 { "Triples" }
+                    @if self.vars.is_empty() && !self.bindings && self.fragment_pattern().is_none() {
                         (note(
                             "Every position is bound, so a row has nothing to report beyond its own \
                              existence; the cardinality above is the answer."
@@ -2575,17 +2600,42 @@ impl Resource for Answer {
 }
 
 impl Answer {
-    /// The described resource's label and spelling, for the page's header
-    /// block — present only when `/describe` found one.
-    fn described_header(&self) -> Option<(&str, &str)> {
+    /// The page's actual focus rather than its route name.
+    fn page_heading(&self) -> String {
+        match &self.echo {
+            Echo::Fragment { .. } => "Triple pattern".to_owned(),
+            Echo::BindingsFragment { .. } => "Bound triple pattern".to_owned(),
+            Echo::Describe { resource, .. } => {
+                self.described_label().unwrap_or(resource).to_owned()
+            }
+            Echo::Sample { .. } => "Sample".to_owned(),
+        }
+    }
+
+    fn described_label(&self) -> Option<&str> {
+        let Echo::Describe { .. } = &self.echo else {
+            return None;
+        };
+        self.described
+            .as_ref()
+            .and_then(|text| self.page_labels.get(text))
+            .map(String::as_str)
+    }
+
+    /// When the label is the heading, keep the request spelling immediately
+    /// below it. Without a label the spelling is already the heading.
+    fn described_identifier(&self) -> Option<&str> {
         let Echo::Describe { resource, .. } = &self.echo else {
             return None;
         };
-        let label = self
-            .described
-            .as_ref()
-            .and_then(|text| self.page_labels.get(text))?;
-        Some((resource, label))
+        self.described_label().map(|_| resource.as_str())
+    }
+
+    fn fragment_pattern(&self) -> Option<&Pattern> {
+        match &self.echo {
+            Echo::Fragment { pattern } => Some(pattern),
+            _ => None,
+        }
     }
 
     /// The fields above the table: what was asked, and how much of it came back.
@@ -2593,20 +2643,8 @@ impl Answer {
         let mut summary = match &self.echo {
             Echo::Fragment { pattern } => pattern_fields(pattern),
             Echo::BindingsFragment { pattern } => binding_pattern_fields(pattern),
-            Echo::Describe {
-                resource,
-                direction,
-            } => {
-                let mut fields = vec![("iri", Value::Code(resource))];
-                if let Some(label) = self
-                    .described
-                    .as_ref()
-                    .and_then(|text| self.page_labels.get(text))
-                {
-                    fields.push(("label", Value::Text(label)));
-                }
-                fields.push(("direction", Value::Text(direction.as_str())));
-                fields
+            Echo::Describe { direction, .. } => {
+                vec![("direction", Value::Text(direction.as_str()))]
             }
             Echo::Sample { pattern, .. } => pattern_fields(pattern),
         };
@@ -2623,6 +2661,27 @@ impl Answer {
         summary
     }
 
+    fn headers(&self) -> Vec<&str> {
+        let mut headers: Vec<&str> = if self.fragment_pattern().is_some() {
+            Position::ALL
+                .iter()
+                .map(|position| position.as_str())
+                .collect()
+        } else {
+            self.vars.iter().map(|position| position.as_str()).collect()
+        };
+        if self.bindings {
+            headers.insert(0, BINDING);
+        }
+        if self.directed {
+            headers.push("direction");
+        }
+        if self.rows.iter().any(|row| row.ranking.is_some()) {
+            headers.extend([SCORE, MATCH_KIND]);
+        }
+        headers
+    }
+
     /// Every cell of the table, owned, so the [`Value`]s below can borrow it.
     fn cells(&self) -> Vec<Vec<Cell<'_>>> {
         self.rows
@@ -2632,7 +2691,28 @@ impl Answer {
                 if let Some(binding) = row.binding {
                     cells.push(Cell::text(binding.to_string()));
                 }
-                cells.extend(row.cells.iter().map(|(_, text)| self.cell(text)));
+                if let Some(pattern) = self.fragment_pattern() {
+                    // JSON rows carry variables only. A browser page is a
+                    // table of triples, so merge the request's bound terms
+                    // back into their fixed positions for display.
+                    for position in Position::ALL {
+                        let text =
+                            pattern
+                                .bound(position)
+                                .map(BoundTerm::dictionary)
+                                .or_else(|| {
+                                    row.cells
+                                        .iter()
+                                        .find(|(row_position, _)| *row_position == position)
+                                        .map(|(_, text)| text.as_ref())
+                                });
+                        if let Some(text) = text {
+                            cells.push(self.cell(text));
+                        }
+                    }
+                } else {
+                    cells.extend(row.cells.iter().map(|(_, text)| self.cell(text)));
+                }
                 if let Some(direction) = row.direction {
                     cells.push(Cell::text(direction.as_str().to_owned()));
                 }
@@ -2651,11 +2731,15 @@ impl Answer {
     /// it: a subject, predicate or object links to its own neighborhood, a
     /// literal to every triple carrying it.
     fn cell<'a>(&'a self, text: &'a str) -> Cell<'a> {
-        term_cell(
+        let mut cell = term_cell(
             &self.target,
             text,
             self.page_labels.get(text).map(String::as_str),
-        )
+        );
+        if self.described.as_deref() == Some(text) {
+            cell.href = None;
+        }
+        cell
     }
 }
 
@@ -2742,17 +2826,14 @@ impl Resource for SearchAnswer {
         let all_predicates = self.roles.is_empty() && self.predicates.is_empty();
         let returned = self.results.len() as u64;
         let canonical = self.target.canonical();
-        page(
-            &self.target.title(),
+        let heading = format!("“{}”", self.query);
+        let context = self.target.context();
+        operation_page(
+            &heading,
+            &context,
             &self.target.crumbs(),
             canonical.as_deref(),
             html! {
-                @if let Some(form) = self.target.form() {
-                    section."workbench" {
-                        h2 { "Query" }
-                        (form)
-                    }
-                }
                 div."answer-summary" {
                     (fields(&[
                         ("query", Value::Text(&self.query)),
@@ -2762,6 +2843,9 @@ impl Resource for SearchAnswer {
                         ("returned", Value::Number(returned)),
                         ("complete", Value::Text(completeness_text(&self.completeness))),
                     ]))
+                }
+                @if let Some(form) = self.target.form() {
+                    div."query-editor" { (form) }
                 }
                 @if !self.completeness.is_complete() {
                     (note(
@@ -2837,19 +2921,18 @@ impl Resource for CountAnswer {
         ));
 
         let canonical = self.target.canonical();
-        page(
-            &self.target.title(),
+        let context = self.target.context();
+        operation_page(
+            "Pattern count",
+            &context,
             &self.target.crumbs(),
             canonical.as_deref(),
             html! {
-                @if let Some(form) = self.target.form() {
-                    section."workbench" {
-                        h2 { "Query" }
-                        (form)
-                    }
-                }
                 div."answer-summary" {
                     (fields(&summary))
+                }
+                @if let Some(form) = self.target.form() {
+                    div."query-editor" { (form) }
                 }
                 @if !self.absent_terms.is_empty() {
                     (note(&format!(
@@ -2970,6 +3053,7 @@ fn term_cell<'a>(target: &Target, text: &'a str, annotation: Option<&'a str>) ->
         annotation,
         href: Some(href),
         full_iri,
+        structured: true,
     }
 }
 
@@ -2980,6 +3064,7 @@ struct Cell<'a> {
     annotation: Option<&'a str>,
     href: Option<String>,
     full_iri: Option<Cow<'a, str>>,
+    structured: bool,
 }
 
 impl<'a> Cell<'a> {
@@ -2991,6 +3076,7 @@ impl<'a> Cell<'a> {
             annotation: None,
             href: None,
             full_iri: None,
+            structured: false,
         }
     }
 
@@ -2998,6 +3084,14 @@ impl<'a> Cell<'a> {
         match &self.href {
             Some(href) => Value::TermLink {
                 href: href.clone(),
+                term: TermText {
+                    primary: &self.label,
+                    qualifier: self.qualifier.as_deref(),
+                    annotation: self.annotation,
+                    full_iri: self.full_iri.as_deref(),
+                },
+            },
+            None if self.structured => Value::Term {
                 term: TermText {
                     primary: &self.label,
                     qualifier: self.qualifier.as_deref(),

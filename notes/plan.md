@@ -1137,8 +1137,13 @@ application canvas with a compact product header, breadcrumb trail, page-level
 JSON action and mobile collapse. Service and dataset summaries are overview
 panels; related descriptor sections pair into dashboard grids; the manifest's
 forms are an operation strip with one expanded editor; query echoes are compact
-summary panels; and row data keeps the full canvas in bordered, scrollable
-tables. There is no privileged narrow reading column for result pages to escape.
+summary panels whose label/value units align in a three-column subject/predicate/
+object row when that vocabulary applies; and row data keeps the full canvas in
+bordered, scrollable tables. There is no privileged narrow reading column for
+result pages to escape. Operation pages put the actual subject of the page in
+the headline — the described term or its label, the search text, or the triple
+pattern — while the operation name, dataset and release remain a quieter eyebrow
+above it.
 
 `/` became a dataset catalog in both representations. The service descriptor's
 `datasets` field now carries `{id, title, description, triples, current,
@@ -1153,9 +1158,18 @@ cascade into `Renders::hydrate_labels`, and every distinct IRI or blank node on
 the page gets one bounded `preferred_label` cascade — the same probes `/labels`
 runs, capped by the same `max_label_iris` (a page over the cap is served
 unannotated rather than half-annotated). Labels render under the term's CURIE
-in result cells; `/describe` also resolves its target's label into a header
-block and the summary. JSON pays nothing for this and stays byte-identical;
-question 35 records the `labels=true` parameter that would give JSON parity.
+in result cells; `/describe` also resolves its target's label into the headline
+and leaves its requested identifier directly below it. JSON pays nothing for
+this and stays byte-identical; question 35 records the `labels=true` parameter
+that would give JSON parity.
+
+Fragment pages deliberately show full triples even though fragment JSON rows
+continue to carry only variable bindings: the HTML renderer merges requested
+bound terms back into the `s`, `p`, and `o` columns. This makes every displayed
+IRI available for the same describe drill-down and avoids changing table shape
+as a pattern becomes more specific. On describe pages the focus term is instead
+rendered as a non-link wherever it appears in the triples, so incoming and
+outgoing rows make the other endpoint visually and interactively prominent.
 
 Smaller contract changes, each visible in a pinned test: predicate cells link
 to `/describe?iri=` like every other named term, instead of `/fragment?p=`

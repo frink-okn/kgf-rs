@@ -494,7 +494,9 @@ fn every_operation_renders_a_page_as_well_as_json() {
     let store = served.store();
 
     let page = served.render(&store, "fragment", "limit=2", Representation::Html);
-    assert!(page.contains("<h1>fragment — tox 2026-06-01</h1>"));
+    assert!(page.contains("<h1>Triple pattern</h1>"));
+    assert!(page.contains("Fragment · tox 2026-06-01"));
+    assert!(page.find("Fragment · tox 2026-06-01") < page.find("<h1>Triple pattern</h1>"));
     assert!(page.contains(">ex:alice</a>"));
     assert!(page.contains("title=\"http://example.org/alice\""));
     // A named term — subject and predicate alike — links to its own
@@ -507,29 +509,67 @@ fn every_operation_renders_a_page_as_well_as_json() {
     assert!(page.contains("Next page"));
     assert!(page.contains("cursor="));
 
-    // And the JSON link carries `format` exactly once, whatever the request
-    // asked for — the page's own footer builds it by appending.
+    // A fragment page is a table of triples even though the JSON row carries
+    // variables only. Bound request terms are restored in position, remain
+    // drill-down links, and s/p/o form one aligned row in the request summary.
+    let bound = served.render(
+        &store,
+        "fragment",
+        "s=ex:alice&p=ex:knows&limit=2",
+        Representation::Html,
+    );
+    assert!(bound.contains("<th>s</th><th>p</th><th>o</th>"));
+    assert!(bound.contains(">ex:alice</a>"));
+    assert!(bound.contains(">ex:knows</a>"));
+    assert!(bound.contains(">ex:bob</a>"));
+
+    // Even a fully bound, one-row fragment shows the triple instead of
+    // replacing it with prose about a row that has no variable cells.
+    let fully_bound = served.render(
+        &store,
+        "fragment",
+        "s=ex:alice&p=ex:self&o=ex:alice",
+        Representation::Html,
+    );
+    assert!(fully_bound.contains("<th>s</th><th>p</th><th>o</th>"));
+    assert_eq!(fully_bound.matches(">ex:alice</a>").count(), 2);
+
+    // Both JSON affordances carry one clean selector, whatever the request
+    // asked for — neither appends it to the existing HTML selector.
     let pinned = served.render(
         &store,
         "fragment",
         "limit=2&format=html",
         Representation::Html,
     );
-    assert_eq!(pinned.matches("format=json").count(), 1);
+    assert_eq!(pinned.matches("format=json").count(), 2);
     assert!(!pinned.contains("format=html&amp;format=json"));
 
-    for (operation, query) in [
-        ("count", "p=ex:knows"),
-        ("describe", "iri=ex:alice"),
-        ("sample", "n=2"),
+    for (operation, query, heading, label) in [
+        ("count", "p=ex:knows", "Pattern count", "Count"),
+        ("describe", "iri=ex:alice", "ex:alice", "Describe"),
+        ("sample", "n=2", "Sample", "Sample"),
     ] {
         let page = served.render(&store, operation, query, Representation::Html);
         assert!(
             page.to_ascii_lowercase().starts_with("<!doctype html>"),
             "{operation} must answer a whole document"
         );
-        assert!(page.contains(&format!("<h1>{operation} — tox 2026-06-01</h1>")));
+        assert!(page.contains(&format!("<h1>{heading}</h1>")));
+        assert!(page.contains(&format!("{label} · tox 2026-06-01")));
+        assert!(
+            page.find(&format!("{label} · tox 2026-06-01"))
+                < page.find(&format!("<h1>{heading}</h1>"))
+        );
     }
+
+    // The described term is the page focus, not a link back to the page the
+    // reader is already on. Neighbors remain links, which makes the two ends
+    // of each in/out row visually distinct.
+    let described = served.render(&store, "describe", "iri=ex:alice", Representation::Html);
+    assert!(described.contains("<span class=\"term term-static\""));
+    assert!(!described.contains(">ex:alice</a>"));
+    assert!(described.contains(">ex:bob</a>"));
 
     // A datatype IRI is the other IRI-shaped part of an RDF term. It receives
     // the same display treatment while the literal link remains full syntax.
