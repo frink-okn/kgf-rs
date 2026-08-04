@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use kgf_store::manifest::{
     ArtifactDigest, ArtifactEntry, BundleFacts, Capability, Formats, Manifest, ManifestDocument,
-    Publisher, content_digest_preimage,
+    Publisher, content_digest_preimage, default_predicate_roles,
 };
 use kgf_store::store::artifact;
 use sha2::{Digest, Sha256};
@@ -89,6 +89,15 @@ pub struct Args {
     /// prefix is possible; pass none to keep whatever the current manifest has.
     #[arg(long = "prefix", value_name = "PREFIX=IRI")]
     pub prefixes: Vec<String>,
+
+    /// A predicate-role member, as `role=IRI`. Repeatable and ordered.
+    ///
+    /// Passing any role replaces the complete role map, so removing a stale
+    /// declaration is possible; pass none to retain the current manifest's
+    /// frozen profile. IRIs are written in full because this is the immutable
+    /// snapshot request parsing will rely on, not another layer of aliases.
+    #[arg(long = "role", value_name = "ROLE=IRI")]
+    pub roles: Vec<String>,
 }
 
 /// Run `kgf manifest`.
@@ -318,12 +327,52 @@ fn build(
             .map(|capability| (capability.as_str().to_owned(), serde_json::json!({})))
             .collect(),
         prefixes: prefixes(args, previous)?,
+        predicate_roles: predicate_roles(args, previous)?,
         artifacts: artifacts.into_iter().collect(),
         previous_version: args
             .previous_version
             .clone()
             .or_else(|| previous.and_then(|m| m.previous_version.clone())),
     })
+}
+
+fn predicate_roles(
+    args: &Args,
+    previous: Option<&Manifest>,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    if args.roles.is_empty() {
+        return Ok(previous
+            .map(|manifest| manifest.predicate_roles.clone())
+            .filter(|roles| !roles.is_empty())
+            .unwrap_or_else(default_predicate_roles));
+    }
+
+    let mut roles: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for declaration in &args.roles {
+        let (role, iri) = declaration
+            .split_once('=')
+            .with_context(|| format!("--role {declaration} is not of the form role=IRI"))?;
+        if role.is_empty() || iri.is_empty() {
+            bail!("--role {declaration} has an empty role or IRI");
+        }
+        if !role
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            bail!(
+                "--role {declaration} has an invalid role name; use ASCII letters, digits, `_` or `-`"
+            );
+        }
+        if !iri.contains(':') || iri.bytes().any(|byte| byte.is_ascii_whitespace()) {
+            bail!("--role {declaration} does not contain a full predicate IRI");
+        }
+        let members = roles.entry(role.to_owned()).or_default();
+        if members.iter().any(|member| member == iri) {
+            bail!("--role {declaration} repeats the same predicate IRI");
+        }
+        members.push(iri.to_owned());
+    }
+    Ok(roles)
 }
 
 /// A flag, else what the current manifest said, else a value inferred from the
@@ -633,6 +682,7 @@ mod tests {
             publisher_contact: None,
             previous_version: None,
             prefixes: bindings.iter().map(|s| (*s).to_owned()).collect(),
+            roles: Vec::new(),
         }
     }
 
@@ -658,6 +708,7 @@ mod tests {
             },
             capabilities: BTreeMap::new(),
             prefixes,
+            predicate_roles: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             previous_version: None,
         }
@@ -676,6 +727,33 @@ mod tests {
         assert!(prefixes(&args(&["=http://example.org/"]), None).is_err());
         assert!(prefixes(&args(&["ex="]), None).is_err());
         assert!(prefixes(&args(&["ex=a", "ex=b"]), None).is_err());
+    }
+
+    #[test]
+    fn role_declarations_keep_predicate_order_and_reject_duplicates() {
+        let mut supplied = args(&[]);
+        supplied.roles = vec![
+            "label=http://example.org/preferred".to_owned(),
+            "label=http://example.org/fallback".to_owned(),
+            "synonym=http://example.org/alias".to_owned(),
+        ];
+        let roles = predicate_roles(&supplied, None).unwrap();
+        assert_eq!(
+            roles["label"],
+            [
+                "http://example.org/preferred",
+                "http://example.org/fallback"
+            ]
+        );
+        assert_eq!(roles["synonym"], ["http://example.org/alias"]);
+
+        supplied
+            .roles
+            .push("label=http://example.org/preferred".to_owned());
+        assert!(predicate_roles(&supplied, None).is_err());
+
+        let defaults = predicate_roles(&args(&[]), None).unwrap();
+        assert!(defaults.contains_key("label"));
     }
 
     #[test]

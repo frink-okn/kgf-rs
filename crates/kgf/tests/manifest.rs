@@ -82,7 +82,11 @@ fn a_hand_assembled_bundle_becomes_servable_and_stays_honest() {
     // A core bundle declares only what its artifacts back.
     let mut capabilities: Vec<&str> = manifest.capabilities.keys().map(String::as_str).collect();
     capabilities.sort_unstable();
-    assert_eq!(capabilities, ["export", "sample", "star", "terms"]);
+    assert_eq!(
+        capabilities,
+        ["export", "labels", "sample", "star", "terms"]
+    );
+    assert!(manifest.predicate_roles.contains_key("label"));
 
     kgf(&["manifest", path(&bundle), "--check"]).success();
 

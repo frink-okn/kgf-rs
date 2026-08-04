@@ -1,4 +1,4 @@
-//! What the server sends back: doc 03 §3.4's four operations, executed and
+//! What the server sends back: doc 03 §3.4's read operations, executed and
 //! rendered.
 //!
 //! Each is thin, because units 10–13 did the work: parse terms to ids, resolve
@@ -62,7 +62,7 @@ use crate::request::{
     self, BindingPattern, BindingRow, BoundTerm, Candidates, Direction, Pattern, Position,
     ResponseBytes, TextFilter,
 };
-use crate::term::{PrefixMap, Term, TermCache};
+use crate::term::{LiteralKind, PrefixMap, Term, TermCache};
 use crate::url::{self, Params};
 
 // ---------------------------------------------------------------------------
@@ -193,7 +193,7 @@ pub struct Rendered {
 /// An answer that can be serialized into either representation.
 ///
 /// One trait rather than two inherent methods so that [`crate::routes`] can
-/// have a single shape for all four operations — and so that adding a
+/// have a single shape for all operations — and so that adding a
 /// serialization is a change the compiler routes through every answer, the same
 /// reason [`Resource`] exists.
 pub trait Renders {
@@ -488,6 +488,161 @@ pub struct BindingCountAnswer {
     target: Target,
 }
 
+/// One entity returned by `/search`.
+///
+/// `label` has two optional layers on purpose: the outer one says hydration was
+/// requested, while the inner one says whether this bundle found a label. This
+/// keeps `labels=false` (field absent) distinct from `labels=true` with no label
+/// (explicit `null`).
+#[derive(Debug)]
+struct SearchResult {
+    subject: Rc<str>,
+    label: Option<Option<String>>,
+    evidence: SearchEvidence,
+    ranking: Ranking,
+    serialized: u64,
+}
+
+impl SearchResult {
+    fn new(
+        subject: Rc<str>,
+        label: Option<Option<String>>,
+        predicate: Rc<str>,
+        literal: Rc<str>,
+        ranking: Ranking,
+    ) -> Self {
+        let mut result = Self {
+            subject,
+            label,
+            evidence: SearchEvidence { predicate, literal },
+            ranking,
+            serialized: 0,
+        };
+        result.serialized = serde_json::to_vec(&result)
+            .map(|bytes| bytes.len() as u64)
+            .unwrap_or(u64::MAX);
+        result
+    }
+}
+
+impl Serialize for SearchResult {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("subject", &Term::from_dictionary(&self.subject))?;
+        if let Some(label) = &self.label {
+            map.serialize_entry("label", label)?;
+        }
+        map.serialize_entry("match", &self.evidence)?;
+        map.serialize_entry(MATCH_KIND, self.ranking.kind)?;
+        map.serialize_entry(SCORE, &self.ranking.score)?;
+        map.end()
+    }
+}
+
+/// The statement that caused one subject to enter a search result.
+#[derive(Debug)]
+struct SearchEvidence {
+    predicate: Rc<str>,
+    literal: Rc<str>,
+}
+
+impl Serialize for SearchEvidence {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("predicate", self.predicate.as_ref())?;
+        match Term::from_dictionary(&self.literal) {
+            Term::Literal(literal) => {
+                map.serialize_entry("literal", literal.value())?;
+                match literal.kind() {
+                    LiteralKind::Plain => {}
+                    LiteralKind::Language(language) => {
+                        map.serialize_entry("lang", language.as_ref())?;
+                    }
+                    LiteralKind::Datatype(datatype) => {
+                        map.serialize_entry("datatype", datatype.as_ref())?;
+                    }
+                }
+            }
+            // The exhaustive text index contains literals only. Reaching this
+            // branch means the index and dictionary disagree, and the request
+            // will already have failed while constructing the result.
+            _ => map.serialize_entry("literal", self.literal.as_ref())?,
+        }
+        map.end()
+    }
+}
+
+/// `GET /search`'s entity-level response.
+#[derive(Debug, Serialize)]
+pub struct SearchAnswer {
+    dataset: String,
+    version: String,
+    query: String,
+    roles: Vec<String>,
+    predicates: Vec<String>,
+    labels: bool,
+    results: Vec<SearchResult>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+}
+
+impl Renders for SearchAnswer {
+    fn render(self, representation: Representation) -> Rendered {
+        let body = match representation {
+            Representation::Json => self.to_json(),
+            Representation::Html => Bytes::from(self.to_html()),
+        };
+        Rendered {
+            body,
+            completeness: self.completeness,
+        }
+    }
+}
+
+/// One requested IRI and its preferred label.
+#[derive(Debug)]
+struct LabelResult {
+    iri: String,
+    label: Option<String>,
+    serialized: u64,
+}
+
+impl Serialize for LabelResult {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("iri", &Term::from_dictionary(&self.iri))?;
+        map.serialize_entry("label", &self.label)?;
+        map.end()
+    }
+}
+
+/// `QUERY|POST /labels`'s ordered batch response.
+#[derive(Debug, Serialize)]
+pub struct LabelsAnswer {
+    dataset: String,
+    version: String,
+    labels: Vec<LabelResult>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+}
+
+impl Renders for LabelsAnswer {
+    fn render(self, representation: Representation) -> Rendered {
+        let body = match representation {
+            Representation::Json => self.to_json(),
+            Representation::Html => Bytes::from(self.to_html()),
+        };
+        Rendered {
+            body,
+            completeness: self.completeness,
+        }
+    }
+}
+
 impl Renders for BindingCountAnswer {
     fn render(self, representation: Representation) -> Rendered {
         let body = match representation {
@@ -706,6 +861,338 @@ pub fn binding_count(
         completeness: Completeness::complete(),
         target,
     })
+}
+
+/// `GET /search` — rank matching literals, resolve their RDF occurrences, and
+/// collapse those occurrences to one result per subject.
+pub fn search(
+    store: &Store,
+    target: Target,
+    request: &request::Search,
+) -> Result<SearchAnswer, Problem> {
+    let dictionary = store.dict();
+    let searcher = searcher(store, &target)?;
+    let found = searcher
+        .search_up_to(
+            &request.query.to_query(),
+            request.candidates.ceiling(),
+            request.candidates.0,
+        )
+        .map_err(|error| unreadable("searching the text index", &error))?;
+
+    // An omitted scope means every predicate. An explicit scope whose terms
+    // are all absent means no occurrence can match, not that the scope should
+    // silently widen to every predicate.
+    let scoped = !request.predicates.is_empty();
+    let mut predicate_ids = resolve_predicate_ids(&dictionary, &request.predicates)?;
+    predicate_ids.sort_unstable();
+    predicate_ids.dedup();
+    let label_predicates = resolve_predicate_ids(&dictionary, &request.label_predicates)?;
+
+    let mut results = Vec::with_capacity(request.limit as usize);
+    let mut seen = HashSet::with_capacity(request.limit as usize);
+    let mut cache = TermCache::new();
+    let mut resolution_budget = request.candidates.0;
+    let mut spent_bytes = 0u64;
+    let mut resolution_exhausted = false;
+    let mut response_exhausted = false;
+
+    'hits: for hit in &found.hits {
+        if results.len() >= request.limit as usize {
+            break;
+        }
+        if scoped && predicate_ids.is_empty() {
+            break;
+        }
+
+        let predicates: Cow<'_, [u64]> = if scoped {
+            Cow::Borrowed(&predicate_ids)
+        } else {
+            Cow::Owned(vec![])
+        };
+
+        if predicates.is_empty() && !scoped {
+            if resolution_budget == 0 {
+                resolution_exhausted = true;
+                break;
+            }
+            resolution_budget -= 1; // the OPS selection probe
+            let selection = select(
+                store,
+                IdPattern {
+                    subject: None,
+                    predicate: None,
+                    object: Some(hit.object_id),
+                },
+            )?;
+            let available = selection.count().value;
+            let take = available.min(resolution_budget);
+            for triple in selection.page(0, take as usize) {
+                resolution_budget -= 1;
+                if push_search_result(
+                    store,
+                    &dictionary,
+                    &mut cache,
+                    &mut seen,
+                    &mut results,
+                    &mut spent_bytes,
+                    request,
+                    &label_predicates,
+                    triple,
+                    hit.object_id,
+                    Ranking {
+                        score: hit.score,
+                        kind: match_kind(hit.kind),
+                    },
+                )? {
+                    response_exhausted = true;
+                    break 'hits;
+                }
+                if results.len() >= request.limit as usize {
+                    break 'hits;
+                }
+            }
+            if take < available {
+                resolution_exhausted = true;
+                break;
+            }
+        } else {
+            for predicate in predicates.iter().copied() {
+                if resolution_budget == 0 {
+                    resolution_exhausted = true;
+                    break 'hits;
+                }
+                resolution_budget -= 1; // the predicate-bound selection probe
+                let selection = select(
+                    store,
+                    IdPattern {
+                        subject: None,
+                        predicate: Some(predicate),
+                        object: Some(hit.object_id),
+                    },
+                )?;
+                let available = selection.count().value;
+                let take = available.min(resolution_budget);
+                for triple in selection.page(0, take as usize) {
+                    resolution_budget -= 1;
+                    if push_search_result(
+                        store,
+                        &dictionary,
+                        &mut cache,
+                        &mut seen,
+                        &mut results,
+                        &mut spent_bytes,
+                        request,
+                        &label_predicates,
+                        triple,
+                        hit.object_id,
+                        Ranking {
+                            score: hit.score,
+                            kind: match_kind(hit.kind),
+                        },
+                    )? {
+                        response_exhausted = true;
+                        break 'hits;
+                    }
+                    if results.len() >= request.limit as usize {
+                        break 'hits;
+                    }
+                }
+                if take < available {
+                    resolution_exhausted = true;
+                    break 'hits;
+                }
+            }
+        }
+    }
+
+    let completeness = if response_exhausted {
+        Completeness::budget_exhausted_without_resume(BudgetReason::ResponseBytes)
+    } else if resolution_exhausted || !found.complete {
+        Completeness::budget_exhausted_without_resume(BudgetReason::Candidate)
+    } else {
+        Completeness::complete()
+    };
+
+    Ok(SearchAnswer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        query: request.query.query().to_owned(),
+        roles: request.roles.clone(),
+        predicates: request
+            .predicates
+            .iter()
+            .map(|predicate| predicate.dictionary().to_owned())
+            .collect(),
+        labels: request.labels,
+        results,
+        completeness,
+        target,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_search_result(
+    store: &Store,
+    dictionary: &Dictionary<'_>,
+    cache: &mut TermCache,
+    seen: &mut HashSet<u64>,
+    results: &mut Vec<SearchResult>,
+    spent_bytes: &mut u64,
+    request: &request::Search,
+    label_predicates: &[u64],
+    triple: IdTriple,
+    literal_id: u64,
+    ranking: Ranking,
+) -> Result<bool, Problem> {
+    if !seen.insert(triple.subject) {
+        return Ok(false);
+    }
+
+    let subject = cache
+        .resolve(dictionary, Role::Subject, TermId(triple.subject))
+        .map_err(|error| unreadable("materializing a search subject", &error))?;
+    let predicate = cache
+        .resolve(dictionary, Role::Predicate, TermId(triple.predicate))
+        .map_err(|error| unreadable("materializing a search predicate", &error))?;
+    let literal = cache
+        .resolve(dictionary, Role::Object, TermId(literal_id))
+        .map_err(|error| unreadable("materializing a search literal", &error))?;
+    if !matches!(Term::from_dictionary(&literal), Term::Literal(_)) {
+        return Err(unreadable(
+            "resolving a text hit",
+            &format_args!("object term {literal_id} is not a literal"),
+        ));
+    }
+    let label = if request.labels {
+        Some(preferred_label(
+            store,
+            dictionary,
+            cache,
+            triple.subject,
+            label_predicates,
+        )?)
+    } else {
+        None
+    };
+    let result = SearchResult::new(subject, label, predicate, literal, ranking);
+    let next = spent_bytes.saturating_add(result.serialized);
+    // As for the ordinary page materializer, always allow one row through: an
+    // oversized legal term must not create an empty response that cannot make
+    // progress.
+    if next > request.bytes.0 && !results.is_empty() {
+        seen.remove(&triple.subject);
+        return Ok(true);
+    }
+    *spent_bytes = next;
+    results.push(result);
+    Ok(false)
+}
+
+/// `QUERY|POST /labels` — preserve the submitted IRI order and return one
+/// preferred label or an explicit null for each processed member.
+pub fn labels(
+    store: &Store,
+    target: Target,
+    request: &request::Labels,
+) -> Result<LabelsAnswer, Problem> {
+    let dictionary = store.dict();
+    let label_predicates = resolve_predicate_ids(&dictionary, &request.label_predicates)?;
+    let mut cache = TermCache::new();
+    let mut labels = Vec::with_capacity(request.iris().len());
+    let mut spent = 0u64;
+    let mut exhausted = false;
+
+    for requested in request.iris() {
+        let label = match locate(&dictionary, Role::Subject, requested)? {
+            Some(subject) => {
+                preferred_label(store, &dictionary, &mut cache, subject, &label_predicates)?
+            }
+            None => None,
+        };
+        let mut result = LabelResult {
+            iri: requested.dictionary().to_owned(),
+            label,
+            serialized: 0,
+        };
+        result.serialized = serde_json::to_vec(&result)
+            .map(|bytes| bytes.len() as u64)
+            .unwrap_or(u64::MAX);
+        let next = spent.saturating_add(result.serialized);
+        if next > request.bytes.0 && !labels.is_empty() {
+            exhausted = true;
+            break;
+        }
+        spent = next;
+        labels.push(result);
+    }
+
+    Ok(LabelsAnswer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        labels,
+        completeness: if exhausted {
+            Completeness::budget_exhausted_without_resume(BudgetReason::ResponseBytes)
+        } else {
+            Completeness::complete()
+        },
+        target,
+    })
+}
+
+fn resolve_predicate_ids(
+    dictionary: &Dictionary<'_>,
+    predicates: &[BoundTerm],
+) -> Result<Vec<u64>, Problem> {
+    predicates
+        .iter()
+        .map(|predicate| locate(dictionary, Role::Predicate, predicate))
+        .filter_map(|result| result.transpose())
+        .collect()
+}
+
+/// First predicate in the frozen cascade with a value, then its lowest object
+/// term id. There is intentionally no language axis: this is the release's one
+/// deterministic display label, independent of client locale.
+fn preferred_label(
+    store: &Store,
+    dictionary: &Dictionary<'_>,
+    cache: &mut TermCache,
+    subject: u64,
+    predicates: &[u64],
+) -> Result<Option<String>, Problem> {
+    for predicate in predicates {
+        let selection = select(
+            store,
+            IdPattern {
+                subject: Some(subject),
+                predicate: Some(*predicate),
+                object: None,
+            },
+        )?;
+        let Some(triple) = selection.page(0, 1).next() else {
+            continue;
+        };
+        let text = cache
+            .resolve(dictionary, Role::Object, TermId(triple.object))
+            .map_err(|error| unreadable("materializing a preferred label", &error))?;
+        return match Term::from_dictionary(&text) {
+            Term::Literal(literal) => Ok(Some(literal.value().to_owned())),
+            _ => {
+                tracing::error!(
+                    subject,
+                    predicate,
+                    object = triple.object,
+                    "a declared label predicate has a non-literal value"
+                );
+                Err(Problem::new(
+                    ErrorCode::InternalError,
+                    "the bundle's label profile points to a non-literal value",
+                ))
+            }
+        };
+    }
+    Ok(None)
 }
 
 /// Count statements matching a text-constrained pattern, in resumable batches.
@@ -1927,19 +2414,139 @@ impl Answer {
     /// it: a subject or object links to its own neighborhood, a predicate to
     /// every triple using it, a literal to every triple carrying it.
     fn cell<'a>(&self, position: Position, text: &'a str) -> Cell<'a> {
-        let term = Term::from_dictionary(text);
-        let request = term.to_request();
-        let href = match (&term, position) {
-            (Term::Literal(_), _) => self.target.ask("fragment", "o", &request),
-            (_, Position::Predicate) => self.target.ask("fragment", "p", &request),
-            _ => self.target.ask("describe", "iri", &request),
-        };
-        let (label, full_iri) = term.into_display(&self.target.prefixes).into_parts();
-        Cell {
-            label,
-            href: Some(href),
-            full_iri,
+        term_cell(&self.target, position, text)
+    }
+}
+
+impl Resource for SearchAnswer {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let subjects: Vec<_> = self
+            .results
+            .iter()
+            .map(|result| term_cell(&self.target, Position::Subject, &result.subject))
+            .collect();
+        let predicates: Vec<_> = self
+            .results
+            .iter()
+            .map(|result| {
+                term_cell(
+                    &self.target,
+                    Position::Predicate,
+                    &result.evidence.predicate,
+                )
+            })
+            .collect();
+        let scores: Vec<String> = self
+            .results
+            .iter()
+            .map(|result| result.ranking.score.to_string())
+            .collect();
+        let literals: Vec<String> = self
+            .results
+            .iter()
+            .map(
+                |result| match Term::from_dictionary(&result.evidence.literal) {
+                    Term::Literal(literal) => literal.value().to_owned(),
+                    _ => result.evidence.literal.to_string(),
+                },
+            )
+            .collect();
+        let rows: Vec<Vec<Value<'_>>> = self
+            .results
+            .iter()
+            .enumerate()
+            .map(|(index, result)| {
+                let mut row = vec![subjects[index].value()];
+                if self.labels {
+                    row.push(
+                        result
+                            .label
+                            .as_ref()
+                            .and_then(Option::as_deref)
+                            .map_or(Value::Absent, Value::Text),
+                    );
+                }
+                row.extend([
+                    predicates[index].value(),
+                    Value::Text(&literals[index]),
+                    Value::Text(result.ranking.kind),
+                    Value::Text(&scores[index]),
+                ]);
+                row
+            })
+            .collect();
+        let mut headers = vec!["subject"];
+        if self.labels {
+            headers.push("label");
         }
+        headers.extend(["predicate", "literal", MATCH_KIND, SCORE]);
+        let roles = if self.roles.is_empty() {
+            "(all predicates)".to_owned()
+        } else {
+            self.roles.join(", ")
+        };
+        let returned = self.results.len() as u64;
+        let canonical = self.target.canonical();
+        page(
+            &self.target.title(),
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                (fields(&[
+                    ("query", Value::Text(&self.query)),
+                    ("roles", Value::Text(&roles)),
+                    ("returned", Value::Number(returned)),
+                    ("complete", Value::Text(if self.completeness.is_complete() { "yes" } else { "no" })),
+                ]))
+                h2 { "Entities" }
+                @if rows.is_empty() {
+                    (note("No matching entities."))
+                } @else {
+                    (table(&headers, &rows))
+                }
+            },
+        )
+    }
+}
+
+impl Resource for LabelsAnswer {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let rows: Vec<Vec<Value<'_>>> = self
+            .labels
+            .iter()
+            .map(|result| {
+                vec![
+                    Value::Code(&result.iri),
+                    result.label.as_deref().map_or(Value::Absent, Value::Text),
+                ]
+            })
+            .collect();
+        let returned = self.labels.len() as u64;
+        page(
+            &self.target.title(),
+            &self.target.crumbs(),
+            None,
+            html! {
+                (fields(&[
+                    ("returned", Value::Number(returned)),
+                    ("complete", Value::Text(if self.completeness.is_complete() { "yes" } else { "no" })),
+                ]))
+                h2 { "Labels" }
+                @if rows.is_empty() {
+                    (note("No IRIs were returned within the response budget."))
+                } @else {
+                    (table(&["iri", "label"], &rows))
+                }
+            },
+        )
     }
 }
 
@@ -2055,6 +2662,24 @@ fn binding_pattern_fields(pattern: &BindingPattern) -> Vec<(&str, Value<'_>)> {
         .into_iter()
         .map(|position| (position.as_str(), Value::Code(pattern.requested(position))))
         .collect()
+}
+
+/// Render one RDF term with this release's prefix map and the same drill-down
+/// link semantics on every operation page.
+fn term_cell<'a>(target: &Target, position: Position, text: &'a str) -> Cell<'a> {
+    let term = Term::from_dictionary(text);
+    let request = term.to_request();
+    let href = match (&term, position) {
+        (Term::Literal(_), _) => target.ask("fragment", "o", &request),
+        (_, Position::Predicate) => target.ask("fragment", "p", &request),
+        _ => target.ask("describe", "iri", &request),
+    };
+    let (label, full_iri) = term.into_display(&target.prefixes).into_parts();
+    Cell {
+        label,
+        href: Some(href),
+        full_iri,
+    }
 }
 
 /// A rendered table cell, held so the borrowed [`Value`] can point at it.

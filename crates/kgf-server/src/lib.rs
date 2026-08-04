@@ -125,6 +125,12 @@ pub struct Caps {
     pub max_star_subjects: u32,
     /// Predicates per star subject (M2).
     pub max_star_width: u32,
+    /// Predicate IRIs one search request may select after role expansion.
+    pub max_search_predicates: u32,
+    /// Entity hits one `/search` request may retain.
+    pub max_search_results: u32,
+    /// IRIs one `/labels` request may resolve.
+    pub max_label_iris: u32,
 }
 
 impl Caps {
@@ -141,6 +147,9 @@ impl Caps {
             max_bindings: 1_000,
             max_star_subjects: 1_000,
             max_star_width: 32,
+            max_search_predicates: 128,
+            max_search_results: 1_000,
+            max_label_iris: 10_000,
         }
     }
 }
@@ -205,6 +214,8 @@ impl Limits<'_> {
         };
         rows("max_limit", self.caps.max_limit)?;
         rows("max_sample", self.caps.max_sample)?;
+        rows("max_search_results", self.caps.max_search_results)?;
+        rows("max_label_iris", self.caps.max_label_iris)?;
 
         if self.caps.default_limit > self.caps.max_limit {
             return Err(format!(
@@ -217,10 +228,15 @@ impl Limits<'_> {
             || self.caps.max_sample == 0
             || self.caps.max_bindings == 0
             || self.caps.default_limit == 0
+            || self.caps.max_search_predicates == 0
+            || self.caps.max_search_results == 0
+            || self.caps.max_label_iris == 0
         {
             return Err(
-                "caps.max_limit, caps.default_limit, caps.max_sample and caps.max_bindings must be \
-                 at least 1; a page or binding table with no permitted rows is not usable"
+                "caps.max_limit, caps.default_limit, caps.max_sample, caps.max_bindings, \
+                 caps.max_search_predicates, caps.max_search_results and caps.max_label_iris \
+                 must be at least 1; \
+                 a zero-width operation is not usable"
                     .to_owned(),
             );
         }

@@ -1,10 +1,11 @@
 //! The bundle manifest (doc 04 §4.3).
 //!
 //! The manifest is the immutable half of the three-document split: content
-//! identity, counts, capabilities, and prefixes, all intrinsic to the artifacts.
-//! Runtime caps, rate limits, and mirrors are the *service* descriptor's, and
-//! predicate role declarations are the *dataset* descriptor's, precisely so that
-//! host policy never forces a new data version.
+//! identity, counts, capabilities, and the immutable request profile (prefixes
+//! and predicate roles). Runtime caps, rate limits, and mirrors are the
+//! *service* descriptor's. A server may expose the current profile from its
+//! dataset descriptor, but a versioned route resolves against this snapshot so
+//! its cache-forever meaning cannot change.
 //!
 //! # Why this lives in the read layer
 //!
@@ -52,6 +53,23 @@ pub const BUNDLE_FORMAT: &str = "1";
 /// The HDT format version bundles carry.
 pub const HDT_FORMAT: &str = "1.0";
 
+/// Federation fallback for the role used to name an entity.
+///
+/// Full IRIs rather than CURIEs: this is semantic configuration, while prefix
+/// names are presentation aliases that may differ between releases.
+pub fn default_predicate_roles() -> BTreeMap<String, Vec<String>> {
+    BTreeMap::from([(
+        "label".to_owned(),
+        vec![
+            "http://www.w3.org/2004/02/skos/core#prefLabel".to_owned(),
+            "http://www.w3.org/2000/01/rdf-schema#label".to_owned(),
+            "https://schema.org/name".to_owned(),
+            "http://purl.org/dc/terms/title".to_owned(),
+            "http://xmlns.com/foaf/0.1/name".to_owned(),
+        ],
+    )])
+}
+
 /// An operation family a bundle's artifacts can support (doc 03 §3.4).
 ///
 /// A capability describes the *bundle*, not the deployment: it says the bytes
@@ -77,6 +95,8 @@ pub enum Capability {
     Graphs,
     /// `GET /search` and `o.text`; needs the text sidecar.
     Search,
+    /// `QUERY /labels`; resolved live from the core permutations.
+    Labels,
     /// Typed range bounds on objects; needs the range sidecar.
     Range,
     /// `GET /closure` — transitive expansion; needs the closure sidecar.
@@ -93,6 +113,7 @@ impl Capability {
             Self::Export => "export",
             Self::Graphs => "graphs",
             Self::Search => "search",
+            Self::Labels => "labels",
             Self::Range => "range",
             Self::Closure => "closure",
         }
@@ -205,6 +226,7 @@ fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
         Capability::Sample,
         Capability::Terms,
         Capability::Export,
+        Capability::Labels,
     ]);
     if artifacts.graphs.is_some() {
         capabilities.insert(Capability::Graphs);
@@ -363,6 +385,15 @@ pub struct Manifest {
     /// Prefix map for CURIE syntax in parameters (doc 03 §3.3).
     #[serde(default)]
     pub prefixes: BTreeMap<String, String>,
+    /// Frozen predicate-role profile for this published version.
+    ///
+    /// The dataset descriptor may carry the publisher's current authoring
+    /// profile, but versioned operations must not consult mutable state: doing
+    /// so would let `role=label` change meaning under a cache-forever URL. This
+    /// is the resolved snapshot used by `/search` and `/labels` for this
+    /// release. Values are full predicate IRIs, strongest first.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub predicate_roles: BTreeMap<String, Vec<String>>,
     /// Per-artifact sizes and checksums.
     #[serde(default)]
     pub artifacts: BTreeMap<String, ArtifactEntry>,
@@ -666,7 +697,8 @@ mod tests {
                 Capability::Star,
                 Capability::Sample,
                 Capability::Terms,
-                Capability::Export
+                Capability::Export,
+                Capability::Labels
             ]
         );
         // Sidecar-gated capabilities are never guessed at.
@@ -789,6 +821,7 @@ mod tests {
             counts,
             capabilities: BTreeMap::new(),
             prefixes: BTreeMap::new(),
+            predicate_roles: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             previous_version: None,
         }

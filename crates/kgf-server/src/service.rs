@@ -25,9 +25,11 @@
 //! lets the same instant be written several ways and two of them sort wrongly:
 //! a `+01:00` offset, and a fractional second (`…:00.5Z` sorts before `…:00Z`).
 //!
-//! The fields a host cannot derive — preservation policy, authoritative
-//! namespaces, doc 19 §19.1's predicate role declarations — are simply absent.
-//! That is recorded as a question for `../kgf` rather than guessed at.
+//! The fields a host cannot derive — preservation policy and authoritative
+//! namespaces — are simply absent. Predicate roles are different: versioned
+//! operations need a frozen interpretation profile, so this implementation
+//! publishes the current release's manifest snapshot in the derived dataset
+//! descriptor and uses that same snapshot for its immutable routes.
 //!
 //! # Startup is strict
 //!
@@ -43,11 +45,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use kgf_store::Capability;
 use kgf_store::catalog::{BundleId, Catalog};
-use kgf_store::manifest::{Manifest, Publisher};
+use kgf_store::manifest::{Manifest, Publisher, default_predicate_roles};
 use kgf_store::store::{OpenOptions, Store, artifact};
 
 use crate::Config;
@@ -121,6 +124,7 @@ impl Service {
             manifests.push((id, manifest));
         }
         let datasets = Datasets::derive(manifests)?;
+        datasets.validate_profile_caps(config.caps.max_search_predicates)?;
         let descriptors = descriptor_digest(&config, &datasets);
         Ok(Self {
             config,
@@ -190,7 +194,8 @@ impl Service {
 /// Not the rendered documents: those differ per dataset and per
 /// representation, and the representation is mixed into the `ETag` separately.
 /// What is hashed is the deployment's identity — its caps, its budgets, and
-/// every `(dataset, version, content_digest)` it serves.
+/// every `(dataset, version, publication_digest)` it serves. The latter covers
+/// the immutable request profile as well as the artifact checksum.
 fn descriptor_digest(config: &Config, datasets: &Datasets) -> ContentDigest {
     let mut hasher = Sha256::new();
     // Length-prefixed, so no two different deployments hash alike by having
@@ -235,6 +240,7 @@ fn descriptor_digest(config: &Config, datasets: &Datasets) -> ContentDigest {
 pub struct PublishedManifest {
     bytes: Bytes,
     parsed: Arc<Manifest>,
+    digest: ContentDigest,
 }
 
 impl PublishedManifest {
@@ -259,9 +265,11 @@ impl PublishedManifest {
                 bundle_dir.display()
             )
         })?;
+        let digest = bytes_digest(&bytes);
         Ok(Self {
             bytes: bytes.into(),
             parsed: Arc::new(parsed),
+            digest,
         })
     }
 
@@ -275,9 +283,11 @@ impl PublishedManifest {
     #[cfg(test)]
     pub(crate) fn of(parsed: Manifest) -> Result<Self, String> {
         let bytes = parsed.to_json_bytes().map_err(|error| error.to_string())?;
+        let digest = bytes_digest(&bytes);
         Ok(Self {
             bytes: bytes.into(),
             parsed: Arc::new(parsed),
+            digest,
         })
     }
 
@@ -290,6 +300,21 @@ impl PublishedManifest {
     pub fn parsed(&self) -> Arc<Manifest> {
         Arc::clone(&self.parsed)
     }
+
+    /// Identity of the complete immutable publication profile.
+    ///
+    /// The artifact `content_digest` alone does not cover prefixes or
+    /// predicate roles, both of which change the meaning of versioned
+    /// requests. ETags and cursors therefore bind to the manifest bytes while
+    /// release-history metadata continues to publish the artifact digest.
+    pub fn digest(&self) -> &ContentDigest {
+        &self.digest
+    }
+}
+
+fn bytes_digest(bytes: &[u8]) -> ContentDigest {
+    ContentDigest::parse(&format!("sha256:{:x}", Sha256::digest(bytes)))
+        .expect("a SHA-256 digest is a content digest")
 }
 
 /// Every dataset this deployment hosts.
@@ -332,6 +357,8 @@ impl Datasets {
                     manifest.content_digest
                 ))
             })?;
+            let version_digest = published.digest().clone();
+            let predicate_roles = PredicateRoles::from_manifest(&manifest).map_err(&refuse)?;
             let created = match manifest.created.as_deref() {
                 None => None,
                 Some(text) => Some(parse_rfc3339(text).ok_or_else(|| {
@@ -342,13 +369,15 @@ impl Datasets {
             datasets.entry(id.dataset).or_default().insert(
                 id.version,
                 Release {
-                    digest,
+                    content_digest: digest,
+                    version_digest,
                     created,
                     // Copied once per bundle rather than once per request: a
                     // manifest cannot change while the version exists, and an
                     // OKN graph declaring fifty prefixes would otherwise
                     // allocate a hundred strings to read something fixed.
                     prefixes: PrefixMap::from_manifest(&manifest),
+                    predicate_roles,
                     manifest: published,
                 },
             );
@@ -400,6 +429,29 @@ impl Datasets {
                 ),
             )
         })
+    }
+
+    /// Refuse an immutable label cascade this deployment cannot execute inside
+    /// its published predicate cap. Search can reject a client-selected union,
+    /// but `/labels` always uses the release profile, so letting an oversized
+    /// one start would make every valid labels request fail for server policy.
+    fn validate_profile_caps(&self, max_predicates: u32) -> Result<(), ServiceError> {
+        for (dataset, found) in &self.0 {
+            for (version, release) in &found.releases {
+                let labels = release.predicate_roles.get("label").unwrap_or_default();
+                if labels.len() > max_predicates as usize {
+                    return Err(ServiceError::Manifest {
+                        dataset: dataset.clone(),
+                        version: version.clone(),
+                        detail: format!(
+                            "the label role has {} predicates, over this deployment's max_search_predicates of {max_predicates}",
+                            labels.len()
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -473,21 +525,88 @@ impl Dataset {
     pub fn publisher(&self) -> Option<&Publisher> {
         self.current_release().manifest.parsed.publisher.as_ref()
     }
+
+    /// The current release's frozen predicate-role profile.
+    pub fn predicate_roles(&self) -> &PredicateRoles {
+        self.current_release().predicate_roles()
+    }
+}
+
+/// A release's named predicate groups, expanded to full IRIs.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(transparent)]
+pub struct PredicateRoles(BTreeMap<String, Vec<String>>);
+
+impl PredicateRoles {
+    fn from_manifest(manifest: &Manifest) -> Result<Self, String> {
+        let roles = if manifest.predicate_roles.is_empty() {
+            default_predicate_roles()
+        } else {
+            manifest.predicate_roles.clone()
+        };
+        for (role, predicates) in &roles {
+            if role.is_empty()
+                || !role
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                return Err(format!(
+                    "predicate role {role:?} is not an ASCII name made of letters, digits, `_` or `-`"
+                ));
+            }
+            if predicates.is_empty() {
+                return Err(format!("predicate role {role:?} has no predicate IRIs"));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for iri in predicates {
+                if !iri.contains(':') || iri.bytes().any(|byte| byte.is_ascii_whitespace()) {
+                    return Err(format!(
+                        "predicate role {role:?} contains {iri:?}, which is not a full predicate IRI"
+                    ));
+                }
+                if !seen.insert(iri) {
+                    return Err(format!(
+                        "predicate role {role:?} repeats predicate IRI {iri:?}"
+                    ));
+                }
+            }
+        }
+        Ok(Self(roles))
+    }
+
+    /// Predicates in `role`, strongest first.
+    pub fn get(&self, role: &str) -> Option<&[String]> {
+        self.0.get(role).map(Vec::as_slice)
+    }
+
+    /// Every declared role and its ordered predicates.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &[String])> {
+        self.0
+            .iter()
+            .map(|(role, predicates)| (role.as_str(), predicates.as_slice()))
+    }
 }
 
 /// One published version of a dataset.
 #[derive(Debug)]
 pub struct Release {
-    digest: ContentDigest,
+    content_digest: ContentDigest,
+    version_digest: ContentDigest,
     created: Option<Instant>,
     prefixes: PrefixMap,
+    predicate_roles: PredicateRoles,
     manifest: PublishedManifest,
 }
 
 impl Release {
     /// The version's canonical identity (doc 04 §4.3), and the ETag's data half.
     pub fn digest(&self) -> &ContentDigest {
-        &self.digest
+        &self.version_digest
+    }
+
+    /// Digest of the artifact bytes, as published in release history.
+    pub fn content_digest(&self) -> &ContentDigest {
+        &self.content_digest
     }
 
     /// The manifest as published, and its parse.
@@ -500,13 +619,18 @@ impl Release {
         &self.prefixes
     }
 
+    /// Named predicate groups used by this immutable release.
+    pub fn predicate_roles(&self) -> &PredicateRoles {
+        &self.predicate_roles
+    }
+
     /// What a cursor issued against this version must match.
     ///
     /// Derived here rather than per request, and infallible: a digest that
     /// would not parse stopped the server at startup, and one that parses as a
     /// [`ContentDigest`] has at least eight bytes of hex.
     pub fn binding(&self) -> BundleBinding {
-        BundleBinding::from_content_digest(self.digest.as_str())
+        BundleBinding::from_content_digest(self.version_digest.as_str())
             .expect("a parsed content digest is a cursor binding")
     }
 
@@ -589,6 +713,7 @@ mod tests {
             },
             capabilities: BTreeMap::new(),
             prefixes: BTreeMap::new(),
+            predicate_roles: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             previous_version: None,
         })

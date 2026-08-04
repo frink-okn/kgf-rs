@@ -1062,6 +1062,57 @@ media-type errors, cache policy, `Accept-Query`, and `Allow`.
 deliberate disagreement rather than an authority silently ignored. The server
 publishes and enforces 1,000 from the same `Caps` value.
 
+### 17. Entity search and live label resolution ✅
+
+`GET /search` and `QUERY|POST /labels`, deliberately implementing the July 2026
+design discussion rather than doc 03 §3.4.5 and §3.4.12 verbatim. Search has no
+language parameter. Its scopes are two different parameters with different types:
+`role=label,synonym` expands names from the release profile, while `predicate=` takes
+explicit RDF predicate IRIs; supplying both unions them, and omitting both searches
+every indexed literal. `labels=true|false` controls preferred-label hydration and
+defaults true. Results are entity-level, deduplicated by subject, and retain the
+winning occurrence as `match {predicate, literal, lang|datatype}` evidence beside the
+text index's `match_kind` and score.
+
+Execution composes the existing layers rather than creating a second search store.
+hdtc ranks distinct object-literal ids under `candidate_budget`; each hit resolves
+through OPS or predicate-bound POS selections; subjects deduplicate in request-local
+id space; strings materialize only for retained results. A second bounded resolution
+window charges both selection probes and RDF occurrences for the live
+post-filter/fan-out that doc 19's proposed predicate bitmap would avoid. Exhausting
+either window returns `candidate_budget` without a cursor,
+because rebuilding arbitrary depth in a global relevance order is the same unbounded
+operation unit 15 refused. `limit` is the requested top-k, not a paging boundary.
+
+Label resolution is live over `.perm`, with no label sidecar. The release profile's
+ordered `label` predicates are tried in order; the first predicate with a value wins,
+and its lowest object term id is the deterministic tie-break. There is intentionally
+no locale axis: a version has one stable display label rather than a request-localized
+answer. A declared label predicate producing a non-literal is a publication/profile
+error, surfaced as a server failure rather than hidden by an unbounded scan for a
+later literal. `/labels` preserves input order and duplicates and emits explicit null
+for absent, foreign, or unlabeled IRIs.
+
+Predicate roles now have an immutable execution snapshot in `manifest.json`, written
+by repeatable `kgf manifest --role role=IRI`; the derived dataset descriptor exposes
+the current release's snapshot. This resolves the cache contradiction in the older
+design: mutable authoring metadata may inform the next publication, but an immutable
+version URL cannot let `role=label` change meaning. Prefixes and roles therefore
+participate in the release binding used by ETags and cursors even though the artifact
+`content_digest` remains the release-history checksum. New manifests receive the
+federation label defaults unless the publisher supplies a profile.
+
+No new sidecar was added. The live algorithms have explicit caps
+(`max_search_predicates`, `max_search_results`, `max_label_iris`) and budgets, so the
+first implementation is measurable without committing another byte format. A
+predicate-occurrence bitmap or dense subject-to-label array remains an optimization to
+add only if live profiles show it is needed.
+
+*Verified by* a headless hdtc-text fixture checking explicit predicate scope, role
+expansion, subject deduplication, optional hydration, cascade fallback, explicit nulls,
+duplicates and input order; plus real socket tests for GET search, literal QUERY
+labels, `Accept-Query`, and rejection of the removed `lang` parameter.
+
 ### What the implementation still is not
 
 **M1 is a strict subset of doc 03 §3.1's mandatory core profile.** That profile is
@@ -1312,10 +1363,10 @@ following the code.
     wants to publish a new version *without* making it current cannot say so, and one
     who re-releases an old version cannot promote it.
 
-    The derivation also cannot reach the fields that are not in a bundle manifest at
-    all — `preservation`, `authoritative_namespaces`, and doc 19 §19.1's predicate role
-    declarations, which §4.3 calls "the federation's cheapest machine-actionable schema
-    documentation". Those are absent from what this server publishes today.
+    The derivation still cannot reach `preservation` or `authoritative_namespaces`.
+    Predicate roles are no longer in that category: unit 17 snapshots their execution
+    profile in each bundle manifest and exposes the current release's copy from the
+    derived descriptor, while question 33 records the resulting spec change.
 
     So: should a host supply a dataset descriptor file (and `kgf` grow a command to
     write one), with derivation as the unconfigured default? That is two sources for
@@ -1467,13 +1518,35 @@ following the code.
     equality filter over a non-contiguous enumeration whose rejected candidates are
     not bounded by result `limit`, so it is refused. Doc 03's "any subset" currently
     does not distinguish the two.
+31. **Search scopes should be typed parameters, not an overloaded `fields`.** Doc 03
+    §3.4.5 makes `fields` accept both role names and explicit predicate IRIs, leaving a
+    parser to guess which namespace a token belongs to. This implementation uses
+    `role=` for comma-separated declared roles and `predicate=` for RDF term syntax;
+    both may be present and mean union. It also omits `dedupe=false`: entity-level
+    resolution is the operation's contract, while occurrence-oriented text access is
+    already `/fragment?o.text=`. The spec is the stale side of both choices.
+32. **Labels have no request language.** Doc 03 §3.4.12 and doc 19 §19.4 make language
+    dominate predicate order. The implemented contract has one stable label per
+    release, chosen by predicate order and lowest term id, so neither `/search` nor
+    `/labels` accepts `lang`. Localization can be a distinct future operation if a
+    federation use case needs it; it should not make ordinary display hydration vary
+    by an optional parameter. The spec is intentionally stale here.
+33. **Mutable role declarations conflict with immutable version URLs.** Doc 19 §19.1
+    puts roles only in the mutable dataset descriptor and says a correction takes
+    effect without rebuild. That makes the same cache-forever `/v/{version}/search`
+    URL and role-scoped request acquire new semantics. This implementation snapshots
+    full-IRI role lists in the manifest, exposes the current snapshot in its derived
+    dataset descriptor, and binds ETags/cursors to the manifest bytes. A future mutable
+    authoring descriptor may still be the input for the *next* snapshot; versioned
+    execution must remain frozen. Docs 03, 04 and 19 need to choose and state that
+    split together.
 
 ## Not in this plan
 
-Composed operations (`/search`, `/labels`, ranges, star, key resolution), graph
-scoping, and everything gated on a sidecar beyond `.perm`. Those are
-doc 20 §20.8's M2 and M3, and they compose through the `Store` and the envelope,
-cursor, and term layers this plan builds.
+Remaining composed operations (ranges, star, key resolution), graph scoping, and
+everything requiring a sidecar beyond `.perm` and the existing exhaustive text index.
+Those are doc 20 §20.8's later milestones and compose through the `Store`, envelope,
+cursor, term, and live-profile layers this plan builds.
 
 `kgf build` is also absent, deliberately. Bundles are assembled with
 `hdtc create --perm` and described with `kgf manifest` (unit 9) until the server work

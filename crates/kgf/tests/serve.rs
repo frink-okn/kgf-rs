@@ -19,6 +19,7 @@ use std::sync::Arc;
 use clap::Parser;
 use kgf_server::service::Service;
 use kgf_store::testing::{Fixture, TINY_NT};
+use sha2::{Digest, Sha256};
 
 /// A second fixture graph, so two versions of one dataset differ in content and
 /// therefore in `content_digest`.
@@ -89,17 +90,19 @@ fn a_versioned_manifest_is_immutable_cacheable_and_conditional() {
     manifest.assert_cache_control(&["public", "max-age=31536000", "immutable"]);
     manifest.assert_varies_on_accept();
     manifest.assert_header("content-type", "application/json");
-    let digest = manifest.json()["content_digest"]
-        .as_str()
-        .unwrap()
-        .to_owned();
     assert_eq!(manifest.json()["version"], "2026-06-01");
 
-    // §3.6: the ETag is the artifact checksum *and* is representation-specific.
+    // The ETag covers the complete immutable publication profile, including
+    // prefixes and predicate roles that affect versioned request semantics,
+    // and remains representation-specific.
+    let publication_digest = format!("sha256:{:x}", Sha256::digest(&manifest.body));
     let etag = manifest
         .header("etag")
         .expect("a versioned GET carries an ETag");
-    assert!(etag.contains(&digest), "{etag} must identify the data");
+    assert!(
+        etag.contains(&publication_digest),
+        "{etag} must identify the publication"
+    );
     assert!(etag.contains("json"), "{etag} must identify the format");
 
     // A conditional GET is answered without the body.
@@ -335,6 +338,76 @@ fn bindings_query_and_post_answer_over_the_wire() {
     server
         .request("PUT", &format!("{path}?bad=%"), &[])
         .assert_status(405);
+}
+
+#[test]
+fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
+    let deployment = Deployment::new();
+    deployment.publish_text("tox", "v1", GROWN_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    let searched = server.get("/tox/v/v1/search?q=Alice&predicate=ex%3Aname&labels=true&limit=20");
+    searched.assert_status(200);
+    assert_eq!(searched.json()["results"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        searched.json()["results"][0]["subject"]["value"],
+        "http://example.org/alice"
+    );
+    assert_eq!(searched.json()["results"][0]["label"], "Alice");
+    assert_eq!(
+        searched.json()["results"][0]["match"]["predicate"],
+        "http://example.org/name"
+    );
+    let search_page = server.request(
+        "GET",
+        "/tox/v/v1/search?q=Alice&predicate=ex%3Aname",
+        &[("Accept", "text/html")],
+    );
+    search_page.assert_status(200);
+    search_page.assert_header("content-type", "text/html; charset=utf-8");
+    let search_html = search_page.text();
+    assert!(search_html.contains(">ex:alice</a>"), "{search_html}");
+    assert!(search_html.contains(">ex:name</a>"), "{search_html}");
+
+    // Locale is not part of the operation: labels are the release's stable
+    // display labels rather than a per-request localization service.
+    let with_lang = server.get("/tox/v/v1/search?q=Alice&lang=en");
+    with_lang.assert_status(400);
+    assert_eq!(with_lang.json()["code"], "malformed_request");
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "iris": ["ex:bob", "ex:missing"]
+    }))
+    .unwrap();
+    let labeled = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/labels",
+        &[("Content-Type", "application/json")],
+        &body,
+    );
+    labeled.assert_status(200);
+    assert_eq!(
+        labeled.json()["labels"],
+        serde_json::json!([
+            {"iri": {"type": "iri", "value": "http://example.org/bob"}, "label": "Bob"},
+            {"iri": {"type": "iri", "value": "http://example.org/missing"}, "label": null},
+        ])
+    );
+    assert_eq!(
+        labeled.header("accept-query").as_deref(),
+        Some("application/json")
+    );
+    let labels_page = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/labels",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "text/html"),
+        ],
+        &body,
+    );
+    labels_page.assert_status(200);
+    labels_page.assert_header("content-type", "text/html; charset=utf-8");
 }
 
 #[test]
@@ -654,7 +727,7 @@ fn a_manifest_that_disagrees_with_its_directory_stops_startup() {
 
 #[test]
 fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() {
-    // `operations.rs` checks what the four operations *answer*, headless. What
+    // `operations.rs` checks what the read operations *answer*, headless. What
     // only a socket can show is the rest of the response: §3.6's metadata in
     // both channels, an immutable validator on a versioned GET, and a page for
     // a browser at the same URL.
@@ -767,13 +840,11 @@ fn a_validator_moves_when_the_configuration_does() {
         )
         .assert_status(200);
 
-    // The data half is still in there, which is what doc 03 §3.6 asks for by
-    // name — the deployment component is an addition, not a replacement.
-    let digest = larger.get("/tox/v/v1/manifest").json()["content_digest"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert!(second.header("etag").unwrap().contains(&digest));
+    // The immutable publication half is still in there; the deployment
+    // component is an addition, not a replacement.
+    let manifest = larger.get("/tox/v/v1/manifest");
+    let publication_digest = format!("sha256:{:x}", Sha256::digest(&manifest.body));
+    assert!(second.header("etag").unwrap().contains(&publication_digest));
 }
 
 #[test]
@@ -861,8 +932,25 @@ impl Deployment {
 
     /// Build a bundle with hdtc, describe it with `kgf manifest`, and date it.
     fn publish(&self, dataset: &str, version: &str, source: &str, created: &str) {
+        self.publish_bundle(dataset, version, source, created, false);
+    }
+
+    fn publish_text(&self, dataset: &str, version: &str, source: &str, created: &str) {
+        self.publish_bundle(dataset, version, source, created, true);
+    }
+
+    fn publish_bundle(
+        &self,
+        dataset: &str,
+        version: &str,
+        source: &str,
+        created: &str,
+        text: bool,
+    ) {
         let bundle = self.bundle(dataset, version);
-        Fixture::build(source).copy_bundle_to(&bundle);
+        let fixture = Fixture::build(source);
+        let fixture = if text { fixture.with_text() } else { fixture };
+        fixture.copy_bundle_to(&bundle);
 
         #[derive(Parser)]
         struct Cli {
@@ -876,6 +964,8 @@ impl Deployment {
             &format!("{dataset} {version}"),
             "--prefix",
             "ex=http://example.org/",
+            "--role",
+            "label=http://example.org/name",
         ]);
         kgf::manifest::run(cli.args).expect("describe the bundle");
 

@@ -26,7 +26,7 @@ use kgf_store::manifest::{Manifest, Publisher};
 use serde::Serialize;
 
 use crate::html::{Crumb, Resource, SITE, Value, fields, json_body, note, page, table};
-use crate::service::{Dataset, Service};
+use crate::service::{Dataset, PredicateRoles, Service};
 use crate::url;
 use maud::html;
 
@@ -120,6 +120,18 @@ impl Resource for ServiceDescriptor<'_> {
                         "max_star_width",
                         Value::Number(u64::from(self.caps.max_star_width)),
                     ),
+                    (
+                        "max_search_predicates",
+                        Value::Number(u64::from(self.caps.max_search_predicates)),
+                    ),
+                    (
+                        "max_search_results",
+                        Value::Number(u64::from(self.caps.max_search_results)),
+                    ),
+                    (
+                        "max_label_iris",
+                        Value::Number(u64::from(self.caps.max_label_iris)),
+                    ),
                 ]))
 
                 h2 { "Budgets" }
@@ -169,6 +181,7 @@ pub struct DatasetDescriptor<'a> {
     description: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     publisher: Option<&'a Publisher>,
+    predicate_roles: &'a PredicateRoles,
     current: &'a str,
     releases: Vec<ReleaseEntry<'a>>,
 }
@@ -196,12 +209,13 @@ impl<'a> DatasetDescriptor<'a> {
             title: dataset.title(),
             description: dataset.description(),
             publisher: dataset.publisher(),
+            predicate_roles: dataset.predicate_roles(),
             current: dataset.current(),
             releases: dataset
                 .releases()
                 .map(|(version, release)| ReleaseEntry {
                     version,
-                    content_digest: release.digest().as_str(),
+                    content_digest: release.content_digest().as_str(),
                     url: url::bundle_base(name, version),
                 })
                 .collect(),
@@ -215,6 +229,17 @@ impl Resource for DatasetDescriptor<'_> {
     }
 
     fn to_html(&self) -> String {
+        let role_members: Vec<String> = self
+            .predicate_roles
+            .iter()
+            .map(|(_, predicates)| predicates.join(", "))
+            .collect();
+        let roles: Vec<_> = self
+            .predicate_roles
+            .iter()
+            .zip(&role_members)
+            .map(|((role, _), predicates)| vec![Value::Code(role), Value::Code(predicates)])
+            .collect();
         let releases: Vec<_> = self
             .releases
             .iter()
@@ -259,6 +284,13 @@ impl Resource for DatasetDescriptor<'_> {
                     ),
                 ]))
 
+                h2 { "Predicate roles" }
+                (note(
+                    "The current release's immutable role profile. Versioned search and label \
+                     requests use the snapshot in that version's manifest."
+                ))
+                (table(&["Role", "Predicates (strongest first)"], &roles))
+
                 h2 { "Releases" }
                 (note(
                     "A version URL is immutable: the bytes it serves cannot change while it \
@@ -302,7 +334,7 @@ impl BundleManifest {
 
 impl Resource for BundleManifest {
     /// The bytes as published, so nothing this build does not model is lost and
-    /// the response is the document the `content_digest` covers.
+    /// the response is the exact document its publication ETag covers.
     ///
     /// Handed on by refcount: the file was read once at startup and is not
     /// copied again per request.
@@ -326,6 +358,17 @@ impl Resource for BundleManifest {
                     Value::Code(expansion.as_str()),
                 ]
             })
+            .collect();
+        let role_members: Vec<String> = manifest
+            .predicate_roles
+            .values()
+            .map(|predicates| predicates.join(", "))
+            .collect();
+        let predicate_roles: Vec<_> = manifest
+            .predicate_roles
+            .keys()
+            .zip(&role_members)
+            .map(|(role, predicates)| vec![Value::Code(role), Value::Code(predicates)])
             .collect();
         let artifacts: Vec<_> = manifest
             .artifacts
@@ -422,6 +465,17 @@ impl Resource for BundleManifest {
                     (table(&["Prefix", "Expands to"], &prefixes))
                 }
 
+                h2 { "Predicate roles" }
+                (note(
+                    "The immutable semantic profile used by role-scoped search and preferred \
+                     label resolution for this version."
+                ))
+                @if predicate_roles.is_empty() {
+                    (note("The federation label defaults apply."))
+                } @else {
+                    (table(&["Role", "Predicates (strongest first)"], &predicate_roles))
+                }
+
                 h2 { "Operations" }
                 (note(
                     "Doc 03 §3.4's read operations over this version. Each answers JSON to \
@@ -449,6 +503,8 @@ fn operations<'a>(dataset: &str, version: &str) -> Vec<Vec<Value<'a>>> {
         ("count", "s, p, o", true),
         ("describe", "iri, direction, limit, cursor", false),
         ("sample", "s, p, o, n, seed", true),
+        ("search", "q, role, predicate, labels, limit", false),
+        ("labels", "QUERY/POST JSON body: iris", false),
     ]
     .into_iter()
     .map(|(operation, parameters, browsable)| {
@@ -500,6 +556,7 @@ mod tests {
                 "rdfs".to_owned(),
                 "http://www.w3.org/2000/01/rdf-schema#".to_owned(),
             )]),
+            predicate_roles: BTreeMap::new(),
             artifacts: BTreeMap::from([(
                 "data.hdt".to_owned(),
                 ArtifactEntry {

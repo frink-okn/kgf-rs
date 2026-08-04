@@ -1,4 +1,4 @@
-//! Doc 03 §3.4's four operations, against the store's own answers.
+//! Doc 03 §3.4's read operations, against the store's own answers.
 //!
 //! Headless on purpose. `kgf-store` is already differential against `hdtc
 //! search`, so what is worth checking here is the layer unit 14 added — term
@@ -955,6 +955,54 @@ fn a_ranked_row_says_which_class_its_score_belongs_to() {
     assert!(row.get("match_kind").is_none());
 }
 
+#[test]
+fn labels_preserve_input_order_and_search_returns_one_entity_with_evidence() {
+    let served = Served::with_text();
+    let store = served.store();
+
+    let labels = served.labels(
+        &store,
+        &serde_json::json!({
+            "iris": ["ex:bob", "ex:alice", "ex:missing", "ex:alice"]
+        }),
+    );
+    assert_eq!(
+        labels["labels"],
+        serde_json::json!([
+            {"iri": {"type": "iri", "value": "http://example.org/bob"}, "label": "Bob"},
+            {"iri": {"type": "iri", "value": "http://example.org/alice"}, "label": "Alice"},
+            {"iri": {"type": "iri", "value": "http://example.org/missing"}, "label": null},
+            {"iri": {"type": "iri", "value": "http://example.org/alice"}, "label": "Alice"},
+        ])
+    );
+    assert_eq!(labels["complete"], true);
+
+    let explicit = served.search(
+        &store,
+        "q=Alice&predicate=%3Chttp%3A%2F%2Fexample.org%2Fname%3E&labels=false&limit=20",
+    );
+    assert_eq!(explicit["results"].as_array().unwrap().len(), 1);
+    let alice = &explicit["results"][0];
+    assert_eq!(alice["subject"]["value"], "http://example.org/alice");
+    assert!(alice.get("label").is_none());
+    assert_eq!(alice["match"]["predicate"], "http://example.org/name");
+    assert_eq!(alice["match"]["literal"], "Alice");
+
+    // A role is query-time sugar for its profile predicates. Label hydration
+    // uses that same release profile but remains independently switchable.
+    let role = served.search(&store, "q=Bob&role=label&limit=20");
+    assert_eq!(role["roles"], serde_json::json!(["label"]));
+    assert_eq!(
+        role["results"][0]["subject"]["value"],
+        "http://example.org/bob"
+    );
+    assert_eq!(role["results"][0]["label"], "Bob");
+    assert_eq!(
+        role["results"][0]["match"]["predicate"],
+        "http://example.org/name"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A served bundle, and the operations over it
 // ---------------------------------------------------------------------------
@@ -998,6 +1046,10 @@ impl Served {
             bundle.to_str().unwrap(),
             "--prefix",
             "ex=http://example.org/",
+            "--role",
+            "label=http://example.org/label",
+            "--role",
+            "label=http://example.org/name",
         ]);
         kgf::manifest::run(cli.args).expect("describe the bundle");
 
@@ -1228,6 +1280,45 @@ impl Served {
         let answer = answer::sample(store, self.target("sample", query), &request)
             .unwrap_or_else(|error| panic!("GET /sample?{query}: {error}"));
         json(answer, Representation::Json)
+    }
+
+    fn search(&self, store: &Store, query: &str) -> serde_json::Value {
+        let request = request::Search::parse(
+            &params(query),
+            self.limits(),
+            self.release().prefixes(),
+            self.release().predicate_roles(),
+        )
+        .unwrap_or_else(|error| panic!("GET /search?{query}: {error}"));
+        let answer = answer::search(store, self.target("search", query), &request)
+            .unwrap_or_else(|error| panic!("GET /search?{query}: {error}"));
+        json(answer, Representation::Json)
+    }
+
+    fn labels(&self, store: &Store, body: &serde_json::Value) -> serde_json::Value {
+        let encoded = serde_json::to_vec(body).expect("a JSON body");
+        let request = request::Labels::parse(
+            &params(""),
+            &encoded,
+            self.limits(),
+            self.release().prefixes(),
+            self.release().predicate_roles(),
+        )
+        .expect("a labels request");
+        json(
+            answer::labels(
+                store,
+                Target::body(
+                    self.id(),
+                    "labels",
+                    params(""),
+                    self.release().prefixes().clone(),
+                ),
+                &request,
+            )
+            .expect("a labels answer"),
+            Representation::Json,
+        )
     }
 
     fn render(

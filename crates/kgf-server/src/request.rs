@@ -47,6 +47,7 @@ use crate::cursor::{
     BundleBinding, CanonicalRequest, Cursor, CursorBinding, Operation, StaleCursor,
 };
 use crate::envelope::{ErrorCode, Problem, reflected};
+use crate::service::PredicateRoles;
 use crate::term::{PrefixMap, Term};
 use crate::url::Params;
 
@@ -210,6 +211,27 @@ impl BoundTerm {
     pub fn dictionary(&self) -> &str {
         &self.dictionary
     }
+
+    fn require_iri(self, parameter: &str) -> Result<Self, Problem> {
+        if matches!(Term::from_dictionary(&self.dictionary), Term::Iri(_)) {
+            Ok(self)
+        } else {
+            Err(Problem::new(
+                ErrorCode::BadTermSyntax,
+                format!(
+                    "`{parameter}` takes an IRI, not {}",
+                    reflected(&self.requested)
+                ),
+            ))
+        }
+    }
+
+    fn from_profile_iri(iri: &str) -> Self {
+        Self {
+            requested: format!("<{iri}>"),
+            dictionary: iri.to_owned(),
+        }
+    }
 }
 
 /// A triple pattern, as far as it can be read without a bundle (§3.4.1).
@@ -359,6 +381,32 @@ impl TextFilter {
         Ok(Some(Self(text.to_owned())))
     }
 
+    fn required(params: &Params, name: &str, limits: Limits<'_>) -> Result<Self, Problem> {
+        let Some(text) = params.get(name) else {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!("search needs a non-empty `{name}` text query"),
+            ));
+        };
+        if text.is_empty() {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!("`{name}` is empty; supply text to search for"),
+            ));
+        }
+        let max = limits.budgets.max_term_bytes;
+        if text.len() as u64 > max {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "`{name}` is {} bytes, over this server's max_term_bytes of {max}",
+                    text.len()
+                ),
+            ));
+        }
+        Ok(Self(text.to_owned()))
+    }
+
     /// The query text, as the client sent it.
     pub fn query(&self) -> &str {
         &self.0
@@ -378,6 +426,170 @@ impl TextFilter {
             ..TextQuery::default()
         }
     }
+}
+
+/// `GET /search` — ranked entity resolution over matching literals.
+#[derive(Debug)]
+pub struct Search {
+    /// Text sent to the exhaustive literal index.
+    pub query: TextFilter,
+    /// Role names the request selected, for the response echo.
+    pub roles: Vec<String>,
+    /// Explicit and role-expanded predicate IRIs, deduplicated.
+    pub predicates: Vec<BoundTerm>,
+    /// Ordered predicates used to hydrate the preferred label.
+    pub label_predicates: Vec<BoundTerm>,
+    /// Whether each entity receives its preferred display label.
+    pub labels: bool,
+    /// Entity hits retained from the bounded ranking.
+    pub limit: u32,
+    /// Bytes the result rows may occupy.
+    pub bytes: ResponseBytes,
+    /// Text documents, occurrence probes, and RDF occurrences this request may examine.
+    pub candidates: Candidates,
+}
+
+impl Search {
+    const PARAMETERS: &'static [&'static str] =
+        &["q", "role", "predicate", "labels", "limit", "format"];
+
+    /// Parse one search request against the release's frozen role profile.
+    pub fn parse(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        profile: &PredicateRoles,
+    ) -> Result<Self, Problem> {
+        accept_only(params, SEARCH, Self::PARAMETERS)?;
+        let query = TextFilter::required(params, "q", limits)?;
+
+        let mut roles = Vec::new();
+        let mut predicates = BTreeMap::<String, BoundTerm>::new();
+        if let Some(list) = params.get("role") {
+            for role in comma_list("role", list)? {
+                let members = profile.get(role).ok_or_else(|| {
+                    let available = profile
+                        .iter()
+                        .map(|(name, _)| name)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Problem::new(
+                        ErrorCode::MalformedRequest,
+                        format!(
+                            "role={} is not declared by this release; use one of [{}] or an explicit `predicate`",
+                            reflected(role), available
+                        ),
+                    )
+                })?;
+                if !roles.iter().any(|seen| seen == role) {
+                    roles.push(role.to_owned());
+                }
+                for iri in members {
+                    predicates
+                        .entry(iri.clone())
+                        .or_insert_with(|| BoundTerm::from_profile_iri(iri));
+                }
+            }
+        }
+        if let Some(list) = params.get("predicate") {
+            for text in term_list("predicate", list)? {
+                let predicate = BoundTerm::parse("predicate", text, limits, prefixes)?
+                    .require_iri("predicate")?;
+                predicates
+                    .entry(predicate.dictionary.clone())
+                    .or_insert(predicate);
+            }
+        }
+        if predicates.len() > limits.caps.max_search_predicates as usize {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "the selected roles and predicates expand to {} predicate IRIs, over this server's max_search_predicates of {}",
+                    predicates.len(),
+                    limits.caps.max_search_predicates
+                ),
+            ));
+        }
+
+        Ok(Self {
+            query,
+            roles,
+            predicates: predicates.into_values().collect(),
+            labels: boolean(params, "labels", true)?,
+            label_predicates: profile_terms(profile, "label"),
+            limit: page_size(
+                params,
+                "limit",
+                limits.caps.default_limit,
+                limits.caps.max_search_results,
+                "omit search when no hits are wanted",
+            )?,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            candidates: Candidates(limits.budgets.candidate_budget),
+        })
+    }
+}
+
+/// `QUERY /labels` — one preferred label for each submitted IRI.
+#[derive(Debug)]
+pub struct Labels {
+    iris: Vec<BoundTerm>,
+    /// Ordered predicates in the release's label cascade.
+    pub label_predicates: Vec<BoundTerm>,
+    /// Bytes the result rows may occupy.
+    pub bytes: ResponseBytes,
+}
+
+impl Labels {
+    const PARAMETERS: &'static [&'static str] = &["format"];
+
+    /// Parse the strict JSON body and its compact or term-object IRIs.
+    pub fn parse(
+        params: &Params,
+        body: &[u8],
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        profile: &PredicateRoles,
+    ) -> Result<Self, Problem> {
+        accept_only(params, LABELS, Self::PARAMETERS)?;
+        let wire: WireLabels = parse_body(body)?;
+        if wire.iris.len() > limits.caps.max_label_iris as usize {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "labels received {} IRIs, over this server's max_label_iris of {}",
+                    wire.iris.len(),
+                    limits.caps.max_label_iris
+                ),
+            ));
+        }
+        let mut iris = Vec::with_capacity(wire.iris.len());
+        for (index, iri) in wire.iris.into_iter().enumerate() {
+            iris.push(
+                BoundTerm::parse_body(&format!("iris[{index}]"), iri, limits, prefixes)?
+                    .require_iri(&format!("iris[{index}]"))?,
+            );
+        }
+        Ok(Self {
+            iris,
+            label_predicates: profile_terms(profile, "label"),
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+        })
+    }
+
+    /// Submitted IRIs, in input order.
+    pub fn iris(&self) -> &[BoundTerm] {
+        &self.iris
+    }
+}
+
+fn profile_terms(profile: &PredicateRoles, role: &str) -> Vec<BoundTerm> {
+    profile
+        .get(role)
+        .unwrap_or_default()
+        .iter()
+        .map(|iri| BoundTerm::from_profile_iri(iri))
+        .collect()
 }
 
 impl Serialize for TextFilter {
@@ -932,6 +1144,12 @@ struct WireBindingCount {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct WireLabels {
+    iris: Vec<WireTerm>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WirePattern {
     s: WireTerm,
     p: WireTerm,
@@ -1272,7 +1490,7 @@ const NOT_OFFERED: &[(&str, Option<Capability>, &[&str])] = &[
     ("o.lt", Some(Capability::Range), &[FRAGMENT, COUNT]),
     (
         "labels",
-        Some(Capability::Search),
+        Some(Capability::Labels),
         &[FRAGMENT, DESCRIBE, SAMPLE],
     ),
     ("g", Some(Capability::Graphs), &[FRAGMENT, COUNT]),
@@ -1282,6 +1500,8 @@ const FRAGMENT: &str = "fragment";
 const COUNT: &str = "count";
 const DESCRIBE: &str = "describe";
 const SAMPLE: &str = "sample";
+const SEARCH: &str = "search";
+const LABELS: &str = "labels";
 
 /// Refuse anything `operation` does not take.
 fn accept_only(params: &Params, operation: &str, accepted: &[&str]) -> Result<(), Problem> {
@@ -1359,6 +1579,43 @@ fn page_size(
         ));
     }
     Ok(value)
+}
+
+fn boolean(params: &Params, name: &str, default: bool) -> Result<bool, Problem> {
+    match params.get(name) {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(value) => Err(Problem::new(
+            ErrorCode::MalformedRequest,
+            format!(
+                "{name}={} is not a boolean; use `{name}=true` or `{name}=false`",
+                reflected(value)
+            ),
+        )),
+    }
+}
+
+fn comma_list<'a>(name: &str, value: &'a str) -> Result<Vec<&'a str>, Problem> {
+    let values: Vec<_> = value.split(',').map(str::trim).collect();
+    if values.is_empty() || values.iter().any(|value| value.is_empty()) {
+        return Err(Problem::new(
+            ErrorCode::MalformedRequest,
+            format!("`{name}` is an empty or malformed comma-separated list"),
+        ));
+    }
+    Ok(values)
+}
+
+fn term_list<'a>(name: &str, value: &'a str) -> Result<Vec<&'a str>, Problem> {
+    let values: Vec<_> = value.split_ascii_whitespace().collect();
+    if values.is_empty() {
+        return Err(Problem::new(
+            ErrorCode::MalformedRequest,
+            format!("`{name}` needs at least one IRI"),
+        ));
+    }
+    Ok(values)
 }
 
 /// Read `/sample`'s seed.
@@ -1483,7 +1740,7 @@ mod tests {
         for (query, expected) in [
             ("p=ex:a&g=%3Chttp%3A%2F%2Fexample.org%2Fg%3E", "graphs"),
             ("o.ge=%2242%22", "range"),
-            ("labels=true", "search"),
+            ("labels=true", "labels"),
         ] {
             let refused = fragment(query).unwrap_err();
             assert_eq!(refused.code(), ErrorCode::CapabilityNotAvailable, "{query}");

@@ -4,7 +4,7 @@
 //! know what HTTP is — [`crate::service`] resolves a URL to a release,
 //! [`crate::representation`] chooses a serialization and a cache policy,
 //! [`crate::html`] and [`crate::descriptor`] render. What lives here is the
-//! wiring, and the four things that are genuinely about the protocol: method
+//! wiring, and the things that are genuinely about the protocol: method
 //! dispatch, the redirect, conditional requests, and the blocking boundary.
 //!
 //! # Method dispatch, including QUERY
@@ -84,6 +84,13 @@ pub fn router(service: Arc<Service>) -> Router {
         )
         .route("/{dataset}/v/{version}/describe", read(get(describe)))
         .route("/{dataset}/v/{version}/sample", read(get(sample)))
+        .route("/{dataset}/v/{version}/search", read(get(search)))
+        .route(
+            "/{dataset}/v/{version}/labels",
+            MethodRouter::new()
+                .post(labels_post)
+                .fallback(labels_fallback),
+        )
         .fallback(no_such_route)
         // Order matters more than usual here, and reads innermost first.
         //
@@ -488,7 +495,7 @@ fn require_json(headers: &HeaderMap) -> Result<(), Problem> {
     } else {
         Err(Problem::new(
             ErrorCode::UnsupportedMediaType,
-            "bindings need exactly one Content-Type: application/json header; the supported request media type is also published in Accept-Query",
+            "this body operation needs exactly one Content-Type: application/json header; the supported request media type is also published in Accept-Query",
         ))
     }
 }
@@ -552,6 +559,119 @@ async fn sample(
         answer::sample,
     )
     .await
+}
+
+async fn search(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate(
+        service,
+        BundleId { dataset, version },
+        "search",
+        wants,
+        |params, limits, release| {
+            if !release.declares(Capability::Search) {
+                return Err(Problem::new(
+                    ErrorCode::CapabilityNotAvailable,
+                    "this bundle does not declare the `search` capability; its manifest lists the ones it does",
+                ));
+            }
+            request::Search::parse(
+                params,
+                limits,
+                release.prefixes(),
+                release.predicate_roles(),
+            )
+        },
+        answer::search,
+    )
+    .await
+}
+
+async fn labels_post(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> Result<Response, Problem> {
+    labels_operation(
+        service,
+        BundleId { dataset, version },
+        wants,
+        headers,
+        body,
+        BodyMethod::Post,
+    )
+    .await
+}
+
+async fn labels_fallback(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    request: Request,
+) -> Result<Response, Problem> {
+    let method = request.method().clone();
+    if method != query_method() {
+        let mut response = method_not_allowed_problem(method).into_response();
+        response
+            .headers_mut()
+            .insert(ALLOW, HeaderValue::from_static("POST, QUERY"));
+        add_accept_query(&mut response);
+        return Ok(response);
+    }
+    let (wants, headers, body) = binding_body(request, &service).await?;
+    labels_operation(
+        service,
+        BundleId { dataset, version },
+        wants,
+        headers,
+        body,
+        BodyMethod::Query,
+    )
+    .await
+}
+
+async fn labels_operation(
+    service: Arc<Service>,
+    id: BundleId,
+    wants: Wants,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+    method: BodyMethod,
+) -> Result<Response, Problem> {
+    require_json(&headers)?;
+    advertise_query(
+        operate_body(
+            service,
+            id,
+            "labels",
+            BodyOperation {
+                wants,
+                body,
+                method,
+            },
+            |params, body, limits, release| {
+                if !release.declares(Capability::Labels) {
+                    return Err(Problem::new(
+                        ErrorCode::CapabilityNotAvailable,
+                        "this bundle does not declare the `labels` capability; its manifest lists the ones it does",
+                    ));
+                }
+                request::Labels::parse(
+                    params,
+                    body,
+                    limits,
+                    release.prefixes(),
+                    release.predicate_roles(),
+                )
+            },
+            answer::labels,
+        )
+        .await,
+    )
 }
 
 /// Refuse `o.text` against a bundle that publishes no text index.
