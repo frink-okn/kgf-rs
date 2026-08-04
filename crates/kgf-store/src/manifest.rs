@@ -70,6 +70,32 @@ pub fn default_predicate_roles() -> BTreeMap<String, Vec<String>> {
     )])
 }
 
+/// Validate one full IRI stored in a predicate-role profile.
+///
+/// The declared-prefix check catches the otherwise silent `ex:name` failure:
+/// role profiles are already expanded, so a token whose leading component is
+/// one of the manifest's prefixes is almost certainly a CURIE accidentally
+/// copied into a full-IRI field. Hierarchical IRIs such as `https://…` remain
+/// unambiguous even if a publisher happens to declare an `https` prefix.
+pub fn validate_predicate_role_iri(
+    iri: &str,
+    prefixes: &BTreeMap<String, String>,
+) -> std::result::Result<(), String> {
+    oxiri::Iri::parse(iri).map_err(|error| format!("it is not a valid absolute IRI: {error}"))?;
+    // Guaranteed by `Iri::parse`; keep the invariant explicit at this boundary.
+    let Some((scheme, rest)) = iri.split_once(':') else {
+        return Err("it has no IRI scheme".to_owned());
+    };
+    if let Some(expansion) = prefixes.get(scheme)
+        && !rest.starts_with("//")
+    {
+        return Err(format!(
+            "it looks like the declared CURIE `{iri}`; store its expanded IRI `{expansion}{rest}`"
+        ));
+    }
+    Ok(())
+}
+
 /// An operation family a bundle's artifacts can support (doc 03 §3.4).
 ///
 /// A capability describes the *bundle*, not the deployment: it says the bytes
@@ -658,6 +684,23 @@ pub fn content_digest_preimage(artifacts: &[ArtifactDigest]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::testing::{Fixture, TINY_NQ, TINY_NT, published_bundle};
+
+    #[test]
+    fn predicate_role_iris_are_full_and_not_declared_curies() {
+        let prefixes = BTreeMap::from([
+            ("ex".to_owned(), "http://example.org/".to_owned()),
+            ("https".to_owned(), "http://example.org/scheme/".to_owned()),
+        ]);
+        assert!(validate_predicate_role_iri("http://example.org/name", &prefixes).is_ok());
+        assert!(validate_predicate_role_iri("https://example.org/name", &prefixes).is_ok());
+        assert!(validate_predicate_role_iri("urn:example:name", &prefixes).is_ok());
+        let curie = validate_predicate_role_iri("ex:name", &prefixes).unwrap_err();
+        assert!(curie.contains("http://example.org/name"), "{curie}");
+        assert!(validate_predicate_role_iri("relative", &prefixes).is_err());
+        assert!(validate_predicate_role_iri("http://example.org/a b", &prefixes).is_err());
+        assert!(validate_predicate_role_iri("http://example.org/%zz", &prefixes).is_err());
+        assert!(validate_predicate_role_iri("http://[broken", &prefixes).is_err());
+    }
 
     fn facts(fixture: &Fixture) -> BundleFacts {
         let bundle = published_bundle(fixture.bundle_path());

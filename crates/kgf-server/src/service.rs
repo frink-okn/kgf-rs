@@ -50,7 +50,9 @@ use sha2::{Digest, Sha256};
 
 use kgf_store::Capability;
 use kgf_store::catalog::{BundleId, Catalog};
-use kgf_store::manifest::{Manifest, Publisher, default_predicate_roles};
+use kgf_store::manifest::{
+    Manifest, Publisher, default_predicate_roles, validate_predicate_role_iri,
+};
 use kgf_store::store::{OpenOptions, Store, artifact};
 
 use crate::Config;
@@ -559,11 +561,11 @@ impl PredicateRoles {
             }
             let mut seen = std::collections::BTreeSet::new();
             for iri in predicates {
-                if !iri.contains(':') || iri.bytes().any(|byte| byte.is_ascii_whitespace()) {
-                    return Err(format!(
-                        "predicate role {role:?} contains {iri:?}, which is not a full predicate IRI"
-                    ));
-                }
+                validate_predicate_role_iri(iri, &manifest.prefixes).map_err(|detail| {
+                    format!(
+                        "predicate role {role:?} contains {iri:?}, which is not a full predicate IRI: {detail}"
+                    )
+                })?;
                 if !seen.insert(iri) {
                     return Err(format!(
                         "predicate role {role:?} repeats predicate IRI {iri:?}"

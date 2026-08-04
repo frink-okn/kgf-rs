@@ -27,6 +27,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
+oxiri = "0.2"
 
 # The HTTP stack (unit 13). axum is doc 20 §20.4's suggestion and survives the
 # QUERY support: hyper parses the extension method and axum routes it through

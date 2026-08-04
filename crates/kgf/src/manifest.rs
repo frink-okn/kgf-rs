@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use kgf_store::manifest::{
     ArtifactDigest, ArtifactEntry, BundleFacts, Capability, Formats, Manifest, ManifestDocument,
-    Publisher, content_digest_preimage, default_predicate_roles,
+    Publisher, content_digest_preimage, default_predicate_roles, validate_predicate_role_iri,
 };
 use kgf_store::store::artifact;
 use sha2::{Digest, Sha256};
@@ -293,6 +293,8 @@ fn build(
         _ => None,
     }
     .unwrap_or_else(now_rfc3339);
+    let prefixes = prefixes(args, previous)?;
+    let predicate_roles = predicate_roles(args, previous, &prefixes)?;
 
     Ok(Manifest {
         id,
@@ -326,8 +328,8 @@ fn build(
             .capabilities()
             .map(|capability| (capability.as_str().to_owned(), serde_json::json!({})))
             .collect(),
-        prefixes: prefixes(args, previous)?,
-        predicate_roles: predicate_roles(args, previous)?,
+        prefixes,
+        predicate_roles,
         artifacts: artifacts.into_iter().collect(),
         previous_version: args
             .previous_version
@@ -339,12 +341,23 @@ fn build(
 fn predicate_roles(
     args: &Args,
     previous: Option<&Manifest>,
+    prefixes: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, Vec<String>>> {
     if args.roles.is_empty() {
-        return Ok(previous
+        let roles = previous
             .map(|manifest| manifest.predicate_roles.clone())
             .filter(|roles| !roles.is_empty())
-            .unwrap_or_else(default_predicate_roles));
+            .unwrap_or_else(default_predicate_roles);
+        for (role, members) in &roles {
+            for iri in members {
+                validate_predicate_role_iri(iri, prefixes).map_err(|detail| {
+                    anyhow::anyhow!(
+                        "predicate role {role} does not contain a full predicate IRI {iri:?}: {detail}"
+                    )
+                })?;
+            }
+        }
+        return Ok(roles);
     }
 
     let mut roles: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -363,9 +376,9 @@ fn predicate_roles(
                 "--role {declaration} has an invalid role name; use ASCII letters, digits, `_` or `-`"
             );
         }
-        if !iri.contains(':') || iri.bytes().any(|byte| byte.is_ascii_whitespace()) {
-            bail!("--role {declaration} does not contain a full predicate IRI");
-        }
+        validate_predicate_role_iri(iri, prefixes).map_err(|detail| {
+            anyhow::anyhow!("--role {declaration} does not contain a full predicate IRI: {detail}")
+        })?;
         let members = roles.entry(role.to_owned()).or_default();
         if members.iter().any(|member| member == iri) {
             bail!("--role {declaration} repeats the same predicate IRI");
@@ -737,7 +750,7 @@ mod tests {
             "label=http://example.org/fallback".to_owned(),
             "synonym=http://example.org/alias".to_owned(),
         ];
-        let roles = predicate_roles(&supplied, None).unwrap();
+        let roles = predicate_roles(&supplied, None, &BTreeMap::new()).unwrap();
         assert_eq!(
             roles["label"],
             [
@@ -750,10 +763,16 @@ mod tests {
         supplied
             .roles
             .push("label=http://example.org/preferred".to_owned());
-        assert!(predicate_roles(&supplied, None).is_err());
+        assert!(predicate_roles(&supplied, None, &BTreeMap::new()).is_err());
 
-        let defaults = predicate_roles(&args(&[]), None).unwrap();
+        let defaults = predicate_roles(&args(&[]), None, &BTreeMap::new()).unwrap();
         assert!(defaults.contains_key("label"));
+
+        let mut curie = args(&[]);
+        curie.roles = vec!["label=ex:name".to_owned()];
+        let prefixes = BTreeMap::from([("ex".to_owned(), "http://example.org/".to_owned())]);
+        let error = predicate_roles(&curie, None, &prefixes).unwrap_err();
+        assert!(error.to_string().contains("http://example.org/name"));
     }
 
     #[test]

@@ -1608,14 +1608,43 @@ fn comma_list<'a>(name: &str, value: &'a str) -> Result<Vec<&'a str>, Problem> {
 }
 
 fn term_list<'a>(name: &str, value: &'a str) -> Result<Vec<&'a str>, Problem> {
-    let values: Vec<_> = value.split_ascii_whitespace().collect();
+    // Accept the same comma ergonomics as `role=`, while retaining whitespace
+    // as the natural separator between RDF terms. A comma inside `<…>` belongs
+    // to the IRI and is not a list delimiter.
+    let mut values = Vec::new();
+    let mut in_iri = false;
+    let mut segment_start = 0;
+    for (index, character) in value.char_indices() {
+        match character {
+            '<' => in_iri = true,
+            '>' => in_iri = false,
+            ',' if !in_iri => {
+                let segment = value[segment_start..index].trim();
+                if segment.is_empty() {
+                    return Err(malformed_term_list(name));
+                }
+                values.extend(segment.split_ascii_whitespace());
+                segment_start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let final_segment = value[segment_start..].trim();
+    if final_segment.is_empty() {
+        return Err(malformed_term_list(name));
+    }
+    values.extend(final_segment.split_ascii_whitespace());
     if values.is_empty() {
-        return Err(Problem::new(
-            ErrorCode::MalformedRequest,
-            format!("`{name}` needs at least one IRI"),
-        ));
+        return Err(malformed_term_list(name));
     }
     Ok(values)
+}
+
+fn malformed_term_list(name: &str) -> Problem {
+    Problem::new(
+        ErrorCode::MalformedRequest,
+        format!("`{name}` needs one or more IRIs separated by commas or whitespace"),
+    )
 }
 
 /// Read `/sample`'s seed.
@@ -1660,6 +1689,20 @@ mod tests {
 
     const CAPS: crate::Caps = crate::Caps::new();
     const BUDGETS: crate::Budgets = crate::Budgets::new();
+
+    #[test]
+    fn predicate_lists_accept_commas_and_whitespace_outside_bracketed_iris() {
+        assert_eq!(
+            term_list(
+                "predicate",
+                "ex:first, <http://example.org/with,comma> ex:third"
+            )
+            .unwrap(),
+            ["ex:first", "<http://example.org/with,comma>", "ex:third"]
+        );
+        assert!(term_list("predicate", "ex:first,,ex:third").is_err());
+        assert!(term_list("predicate", " ").is_err());
+    }
 
     /// The published defaults, which is what a client reads at `/`.
     fn limits() -> Limits<'static> {

@@ -1072,6 +1072,7 @@ dependencies = [
  "anyhow",
  "hdtc",
  "memmap2",
+ "oxiri",
  "serde",
  "serde_json",
  "tempfile",

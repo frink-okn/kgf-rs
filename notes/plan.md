@@ -1068,11 +1068,12 @@ publishes and enforces 1,000 from the same `Caps` value.
 design discussion rather than doc 03 §3.4.5 and §3.4.12 verbatim. Search has no
 language parameter. Its scopes are two different parameters with different types:
 `role=label,synonym` expands names from the release profile, while `predicate=` takes
-explicit RDF predicate IRIs; supplying both unions them, and omitting both searches
-every indexed literal. `labels=true|false` controls preferred-label hydration and
-defaults true. Results are entity-level, deduplicated by subject, and retain the
-winning occurrence as `match {predicate, literal, lang|datatype}` evidence beside the
-text index's `match_kind` and score.
+explicit RDF predicate IRIs separated by commas or whitespace (commas inside
+bracketed IRIs are data); supplying both unions them, and omitting both searches every
+indexed literal. `labels=true|false` controls preferred-label hydration and defaults
+true. Results are entity-level, deduplicated by subject, and retain the winning
+occurrence as `match {predicate, literal, lang|datatype}` evidence beside the text
+index's `match_kind` and score.
 
 Execution composes the existing layers rather than creating a second search store.
 hdtc ranks distinct object-literal ids under `candidate_budget`; each hit resolves
@@ -1091,27 +1092,33 @@ no locale axis: a version has one stable display label rather than a request-loc
 answer. A declared label predicate producing a non-literal is a publication/profile
 error, surfaced as a server failure rather than hidden by an unbounded scan for a
 later literal. `/labels` preserves input order and duplicates and emits explicit null
-for absent, foreign, or unlabeled IRIs.
+for absent, foreign, or unlabeled IRIs; repeated inputs reuse the request-local
+resolution rather than probing the same cascade again.
 
 Predicate roles now have an immutable execution snapshot in `manifest.json`, written
 by repeatable `kgf manifest --role role=IRI`; the derived dataset descriptor exposes
-the current release's snapshot. This resolves the cache contradiction in the older
-design: mutable authoring metadata may inform the next publication, but an immutable
-version URL cannot let `role=label` change meaning. Prefixes and roles therefore
-participate in the release binding used by ETags and cursors even though the artifact
-`content_digest` remains the release-history checksum. New manifests receive the
-federation label defaults unless the publisher supplies a profile.
+the current release's snapshot. Role members are full IRIs: authoring and startup
+reject malformed values and declared CURIEs instead of accepting a profile that can
+never resolve against the dictionary. This resolves the cache contradiction in the
+older design: mutable authoring metadata may inform the next publication, but an
+immutable version URL cannot let `role=label` change meaning. Prefixes and roles
+therefore participate in the release binding used by ETags and cursors even though the
+artifact `content_digest` remains the release-history checksum. New manifests receive
+the federation label defaults unless the publisher supplies a profile.
 
 No new sidecar was added. The live algorithms have explicit caps
 (`max_search_predicates`, `max_search_results`, `max_label_iris`) and budgets, so the
-first implementation is measurable without committing another byte format. A
-predicate-occurrence bitmap or dense subject-to-label array remains an optimization to
-add only if live profiles show it is needed.
+first implementation is measurable without committing another byte format. Search
+and label rows are weighed analytically against their compact JSON encoding, so the
+response-byte budget does not require serializing every row twice. A predicate
+occurrence bitmap or dense subject-to-label array remains an optimization to add only
+if live profiles show it is needed.
 
 *Verified by* a headless hdtc-text fixture checking explicit predicate scope, role
 expansion, subject deduplication, optional hydration, cascade fallback, explicit nulls,
-duplicates and input order; plus real socket tests for GET search, literal QUERY
-labels, `Accept-Query`, and rejection of the removed `lang` parameter.
+duplicates and input order; exact row-size oracles and scope-list parser tests; plus
+real socket tests for GET search (including truthful HTML scope), literal QUERY labels,
+empty-input HTML, `Accept-Query`, and rejection of the removed `lang` parameter.
 
 ### What the implementation still is not
 
@@ -1521,8 +1528,9 @@ following the code.
 31. **Search scopes should be typed parameters, not an overloaded `fields`.** Doc 03
     §3.4.5 makes `fields` accept both role names and explicit predicate IRIs, leaving a
     parser to guess which namespace a token belongs to. This implementation uses
-    `role=` for comma-separated declared roles and `predicate=` for RDF term syntax;
-    both may be present and mean union. It also omits `dedupe=false`: entity-level
+    `role=` for comma-separated declared roles and `predicate=` for RDF term syntax
+    separated by commas or whitespace; both may be present and mean union. It also
+    omits `dedupe=false`: entity-level
     resolution is the operation's contract, while occurrence-oriented text access is
     already `/fragment?o.text=`. The spec is the stale side of both choices.
 32. **Labels have no request language.** Doc 03 §3.4.12 and doc 19 §19.4 make language

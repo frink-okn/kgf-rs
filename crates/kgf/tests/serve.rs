@@ -368,6 +368,8 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
     let search_html = search_page.text();
     assert!(search_html.contains(">ex:alice</a>"), "{search_html}");
     assert!(search_html.contains(">ex:name</a>"), "{search_html}");
+    assert!(search_html.contains("<dt>predicates</dt>"), "{search_html}");
+    assert!(!search_html.contains("all predicates"), "{search_html}");
 
     // Locale is not part of the operation: labels are the release's stable
     // display labels rather than a per-request localization service.
@@ -408,6 +410,24 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
     );
     labels_page.assert_status(200);
     labels_page.assert_header("content-type", "text/html; charset=utf-8");
+
+    let empty_body = serde_json::to_vec(&serde_json::json!({"iris": []})).unwrap();
+    let empty_page = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/labels",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "text/html"),
+        ],
+        &empty_body,
+    );
+    empty_page.assert_status(200);
+    let empty_html = empty_page.text();
+    assert!(
+        empty_html.contains("No IRIs were submitted."),
+        "{empty_html}"
+    );
+    assert!(!empty_html.contains("response budget"), "{empty_html}");
 }
 
 #[test]

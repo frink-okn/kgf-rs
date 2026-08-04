@@ -344,6 +344,27 @@ fn quoted_key(key: &str) -> u64 {
     key.len() as u64 + 3
 }
 
+/// Compact JSON object size for fixed, ASCII keys.
+fn serialized_object<const N: usize>(entries: [(&str, u64); N]) -> u64 {
+    2 + entries
+        .into_iter()
+        .map(|(key, value)| quoted_key(key) + value)
+        .sum::<u64>()
+        + N.saturating_sub(1) as u64
+}
+
+/// Exact compact-JSON size of one string, including its quotes.
+fn serialized_json_string(value: &str) -> u64 {
+    2 + value
+        .chars()
+        .map(|character| match character {
+            '"' | '\\' | '\u{0008}' | '\t' | '\n' | '\u{000c}' | '\r' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => character.len_utf8() as u64,
+        })
+        .sum::<u64>()
+}
+
 /// How many bytes `serde_json` writes for this score.
 ///
 /// Formatted rather than computed because a float's shortest round-trip form
@@ -506,22 +527,35 @@ struct SearchResult {
 impl SearchResult {
     fn new(
         subject: Rc<str>,
+        subject_serialized: u64,
         label: Option<Option<String>>,
         predicate: Rc<str>,
         literal: Rc<str>,
         ranking: Ranking,
     ) -> Self {
-        let mut result = Self {
+        let evidence = SearchEvidence { predicate, literal };
+        let serialized = match &label {
+            None => serialized_object([
+                ("subject", subject_serialized),
+                ("match", evidence.serialized()),
+                (MATCH_KIND, serialized_json_string(ranking.kind)),
+                (SCORE, serialized_score(ranking.score)),
+            ]),
+            Some(label) => serialized_object([
+                ("subject", subject_serialized),
+                ("label", label.as_deref().map_or(4, serialized_json_string)),
+                ("match", evidence.serialized()),
+                (MATCH_KIND, serialized_json_string(ranking.kind)),
+                (SCORE, serialized_score(ranking.score)),
+            ]),
+        };
+        Self {
             subject,
             label,
-            evidence: SearchEvidence { predicate, literal },
+            evidence,
             ranking,
-            serialized: 0,
-        };
-        result.serialized = serde_json::to_vec(&result)
-            .map(|bytes| bytes.len() as u64)
-            .unwrap_or(u64::MAX);
-        result
+            serialized,
+        }
     }
 }
 
@@ -544,6 +578,36 @@ impl Serialize for SearchResult {
 struct SearchEvidence {
     predicate: Rc<str>,
     literal: Rc<str>,
+}
+
+impl SearchEvidence {
+    fn serialized(&self) -> u64 {
+        let predicate = serialized_json_string(&self.predicate);
+        match Term::from_dictionary(&self.literal) {
+            Term::Literal(literal) => {
+                let value = serialized_json_string(literal.value());
+                match literal.kind() {
+                    LiteralKind::Plain => {
+                        serialized_object([("predicate", predicate), ("literal", value)])
+                    }
+                    LiteralKind::Language(language) => serialized_object([
+                        ("predicate", predicate),
+                        ("literal", value),
+                        ("lang", serialized_json_string(language)),
+                    ]),
+                    LiteralKind::Datatype(datatype) => serialized_object([
+                        ("predicate", predicate),
+                        ("literal", value),
+                        ("datatype", serialized_json_string(datatype)),
+                    ]),
+                }
+            }
+            _ => serialized_object([
+                ("predicate", predicate),
+                ("literal", serialized_json_string(&self.literal)),
+            ]),
+        }
+    }
 }
 
 impl Serialize for SearchEvidence {
@@ -607,6 +671,24 @@ struct LabelResult {
     iri: String,
     label: Option<String>,
     serialized: u64,
+}
+
+impl LabelResult {
+    fn new(iri: String, label: Option<String>) -> Self {
+        let iri_term = serialized_object([
+            ("type", serialized_json_string("iri")),
+            ("value", serialized_json_string(&iri)),
+        ]);
+        let serialized = serialized_object([
+            ("iri", iri_term),
+            ("label", label.as_deref().map_or(4, serialized_json_string)),
+        ]);
+        Self {
+            iri,
+            label,
+            serialized,
+        }
+    }
 }
 
 impl Serialize for LabelResult {
@@ -905,13 +987,7 @@ pub fn search(
             break;
         }
 
-        let predicates: Cow<'_, [u64]> = if scoped {
-            Cow::Borrowed(&predicate_ids)
-        } else {
-            Cow::Owned(vec![])
-        };
-
-        if predicates.is_empty() && !scoped {
+        if !scoped {
             if resolution_budget == 0 {
                 resolution_exhausted = true;
                 break;
@@ -957,7 +1033,7 @@ pub fn search(
                 break;
             }
         } else {
-            for predicate in predicates.iter().copied() {
+            for predicate in predicate_ids.iter().copied() {
                 if resolution_budget == 0 {
                     resolution_exhausted = true;
                     break 'hits;
@@ -1049,8 +1125,8 @@ fn push_search_result(
         return Ok(false);
     }
 
-    let subject = cache
-        .resolve(dictionary, Role::Subject, TermId(triple.subject))
+    let (subject, subject_serialized) = cache
+        .measured(dictionary, Role::Subject, TermId(triple.subject))
         .map_err(|error| unreadable("materializing a search subject", &error))?;
     let predicate = cache
         .resolve(dictionary, Role::Predicate, TermId(triple.predicate))
@@ -1075,7 +1151,14 @@ fn push_search_result(
     } else {
         None
     };
-    let result = SearchResult::new(subject, label, predicate, literal, ranking);
+    let result = SearchResult::new(
+        subject,
+        subject_serialized,
+        label,
+        predicate,
+        literal,
+        ranking,
+    );
     let next = spent_bytes.saturating_add(result.serialized);
     // As for the ordinary page materializer, always allow one row through: an
     // oversized legal term must not create an empty response that cannot make
@@ -1099,25 +1182,25 @@ pub fn labels(
     let dictionary = store.dict();
     let label_predicates = resolve_predicate_ids(&dictionary, &request.label_predicates)?;
     let mut cache = TermCache::new();
+    let mut resolved_labels: HashMap<String, Option<String>> = HashMap::new();
     let mut labels = Vec::with_capacity(request.iris().len());
     let mut spent = 0u64;
     let mut exhausted = false;
 
     for requested in request.iris() {
-        let label = match locate(&dictionary, Role::Subject, requested)? {
-            Some(subject) => {
-                preferred_label(store, &dictionary, &mut cache, subject, &label_predicates)?
-            }
-            None => None,
+        let label = if let Some(label) = resolved_labels.get(requested.dictionary()) {
+            label.clone()
+        } else {
+            let label = match locate(&dictionary, Role::Subject, requested)? {
+                Some(subject) => {
+                    preferred_label(store, &dictionary, &mut cache, subject, &label_predicates)?
+                }
+                None => None,
+            };
+            resolved_labels.insert(requested.dictionary().to_owned(), label.clone());
+            label
         };
-        let mut result = LabelResult {
-            iri: requested.dictionary().to_owned(),
-            label,
-            serialized: 0,
-        };
-        result.serialized = serde_json::to_vec(&result)
-            .map(|bytes| bytes.len() as u64)
-            .unwrap_or(u64::MAX);
+        let result = LabelResult::new(requested.dictionary().to_owned(), label);
         let next = spent.saturating_add(result.serialized);
         if next > request.bytes.0 && !labels.is_empty() {
             exhausted = true;
@@ -2484,11 +2567,19 @@ impl Resource for SearchAnswer {
             headers.push("label");
         }
         headers.extend(["predicate", "literal", MATCH_KIND, SCORE]);
-        let roles = if self.roles.is_empty() {
-            "(all predicates)".to_owned()
-        } else {
-            self.roles.join(", ")
-        };
+        let roles = self.roles.join(", ");
+        let predicate_scope = self
+            .predicates
+            .iter()
+            .map(|predicate| {
+                Term::from_dictionary(predicate)
+                    .into_display(&self.target.prefixes)
+                    .into_parts()
+                    .0
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let all_predicates = self.roles.is_empty() && self.predicates.is_empty();
         let returned = self.results.len() as u64;
         let canonical = self.target.canonical();
         page(
@@ -2498,7 +2589,9 @@ impl Resource for SearchAnswer {
             html! {
                 (fields(&[
                     ("query", Value::Text(&self.query)),
-                    ("roles", Value::Text(&roles)),
+                    ("scope", if all_predicates { Value::Text("all predicates") } else { Value::Absent }),
+                    ("roles", if roles.is_empty() { Value::Absent } else { Value::Text(&roles) }),
+                    ("predicates", if predicate_scope.is_empty() { Value::Absent } else { Value::Code(&predicate_scope) }),
                     ("returned", Value::Number(returned)),
                     ("complete", Value::Text(if self.completeness.is_complete() { "yes" } else { "no" })),
                 ]))
@@ -2541,7 +2634,7 @@ impl Resource for LabelsAnswer {
                 ]))
                 h2 { "Labels" }
                 @if rows.is_empty() {
-                    (note("No IRIs were returned within the response budget."))
+                    (note("No IRIs were submitted."))
                 } @else {
                     (table(&["iri", "label"], &rows))
                 }
@@ -2790,6 +2883,71 @@ mod tests {
             }
         }
         assert!(shapes >= 80, "{shapes} shapes");
+    }
+
+    #[test]
+    fn search_and_label_rows_weigh_exactly_what_they_serialize() {
+        let all_controls: String = (0..=0x1f).filter_map(char::from_u32).collect();
+        for value in [
+            "",
+            "plain ASCII",
+            "quote: \"; slash: \\; solidus: /",
+            &all_controls,
+            "Ünicode 💩 \u{2028}",
+        ] {
+            assert_eq!(
+                serialized_json_string(value),
+                serde_json::to_vec(value).unwrap().len() as u64,
+                "{value:?}"
+            );
+        }
+
+        let subject: Rc<str> = Rc::from("http://example.org/Ünicode");
+        let subject_serialized = serde_json::to_vec(&Term::from_dictionary(&subject))
+            .expect("a subject serializes")
+            .len() as u64;
+        let literals = [
+            "\"plain\"",
+            "\"tagged\"@en-gb",
+            "\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+            "\"a \\\"quoted\\\" \\tvalue\"",
+        ];
+        let labels = [
+            None,
+            Some(None),
+            Some(Some("a \"quoted\"\nÜnicode label".to_owned())),
+        ];
+
+        for literal in literals {
+            for label in &labels {
+                for score in [0.0, 14.0, 1.0 / 3.0, f32::NAN, f32::INFINITY] {
+                    let result = SearchResult::new(
+                        Rc::clone(&subject),
+                        subject_serialized,
+                        label.clone(),
+                        Rc::from("http://example.org/predicate,one"),
+                        Rc::from(literal),
+                        Ranking {
+                            score,
+                            kind: "normalized",
+                        },
+                    );
+                    assert_eq!(
+                        result.serialized,
+                        serde_json::to_vec(&result).unwrap().len() as u64,
+                        "{literal:?}, {label:?}, {score}"
+                    );
+                }
+            }
+        }
+
+        for label in [None, Some("a \"quoted\"\nÜnicode label".to_owned())] {
+            let result = LabelResult::new("http://example.org/Ünicode".to_owned(), label);
+            assert_eq!(
+                result.serialized,
+                serde_json::to_vec(&result).unwrap().len() as u64
+            );
+        }
     }
 
     #[test]
