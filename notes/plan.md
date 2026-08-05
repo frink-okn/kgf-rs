@@ -1176,7 +1176,8 @@ to `/describe?iri=` like every other named term, instead of `/fragment?p=`
 (the fragment is one link further, through the describe page's form); a
 literal's `@lang`/`^^datatype` qualifier is set apart from its lexical form
 (`TermDisplay::into_structured`); the `complete` summary line reports the
-actual `truncation_reason` instead of hardcoding "the page filled"; a truncated
+actual `truncation_reason`, except that a first page with an exact cardinality
+turns `page_limit` into the concrete number of remaining pages; a truncated
 answer with no cursor says so in prose; search's label column became the same
 under-the-term annotation the other pages use; the manifest page carries the
 stat row, capability chips, and copyable `$KGF`-relative curl examples; error

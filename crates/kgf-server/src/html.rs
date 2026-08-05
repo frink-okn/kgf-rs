@@ -735,6 +735,7 @@ span.term-static { color: var(--dim); }
 input, select, button { color: var(--fg); font: inherit; }
 input[type=text], input[type=number], select {
   width: 100%;
+  height: 2.65rem;
   min-width: 0;
   border: 1px solid var(--rule-strong);
   border-radius: .48rem;

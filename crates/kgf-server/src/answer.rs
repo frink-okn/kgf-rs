@@ -2537,6 +2537,8 @@ impl Resource for Answer {
             .collect();
         let headers = self.headers();
 
+        let completeness = self.completeness_text();
+        let summary = self.summary(&completeness);
         let canonical = self.target.canonical();
         let heading = self.page_heading();
         let context = self.target.context();
@@ -2550,7 +2552,7 @@ impl Resource for Answer {
                     p."focus-identifier" { code { (identifier) } }
                 }
                 div."answer-summary" {
-                    (fields(&self.summary()))
+                    (fields(&summary))
                 }
                 @if let Some(form) = self.target.form() {
                     div."query-editor" { (form) }
@@ -2639,7 +2641,7 @@ impl Answer {
     }
 
     /// The fields above the table: what was asked, and how much of it came back.
-    fn summary(&self) -> Vec<(&str, Value<'_>)> {
+    fn summary<'a>(&'a self, completeness: &'a str) -> Vec<(&'a str, Value<'a>)> {
         let mut summary = match &self.echo {
             Echo::Fragment { pattern } => pattern_fields(pattern),
             Echo::BindingsFragment { pattern } => binding_pattern_fields(pattern),
@@ -2654,11 +2656,28 @@ impl Answer {
             summary.push(("n", Value::Number(u64::from(*n))));
             summary.push(("seed", Value::Number(*seed)));
         }
-        summary.push((
-            "complete",
-            Value::Text(completeness_text(&self.completeness)),
-        ));
+        summary.push(("complete", Value::Text(completeness)));
         summary
+    }
+
+    /// Prefer a concrete number of remaining pages when this first page has
+    /// an exact cardinality. A cursor can live in an offset, predicate-id,
+    /// binding-row, or ranked space, so later pages deliberately retain the
+    /// reason rather than pretending every cursor reveals how many rows came
+    /// before it.
+    fn completeness_text(&self) -> Cow<'static, str> {
+        // A body-addressed bindings cursor lives in the JSON rather than in
+        // `target.params`, so only a cursorless GET proves it is page one.
+        let first_page = !self.target.body && self.target.params.get("cursor").is_none();
+        let page_limit = self.completeness.truncation_reason() == Some(TruncationReason::PageLimit);
+        let page_size = self.rows.len() as u64;
+        if first_page && page_limit && self.cardinality.is_exact() && page_size > 0 {
+            let remaining = self.cardinality.value().saturating_sub(page_size);
+            let pages = remaining.div_ceil(page_size);
+            let noun = if pages == 1 { "page" } else { "pages" };
+            return Cow::Owned(format!("no — {pages} more {noun}"));
+        }
+        Cow::Borrowed(completeness_text(&self.completeness))
     }
 
     fn headers(&self) -> Vec<&str> {

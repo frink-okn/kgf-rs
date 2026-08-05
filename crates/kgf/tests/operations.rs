@@ -496,6 +496,8 @@ fn every_operation_renders_a_page_as_well_as_json() {
     let page = served.render(&store, "fragment", "limit=2", Representation::Html);
     assert!(page.contains("<h1>Triple pattern</h1>"));
     assert!(page.contains("Fragment · tox 2026-06-01"));
+    assert!(page.contains("no — 4 more pages"));
+    assert!(!page.contains("no — the page filled"));
     assert!(page.find("Fragment · tox 2026-06-01") < page.find("<h1>Triple pattern</h1>"));
     assert!(page.contains(">ex:alice</a>"));
     assert!(page.contains("title=\"http://example.org/alice\""));
@@ -508,6 +510,22 @@ fn every_operation_renders_a_page_as_well_as_json() {
     // A truncated page offers the next one.
     assert!(page.contains("Next page"));
     assert!(page.contains("cursor="));
+
+    let one_more = served.render(&store, "fragment", "limit=6", Representation::Html);
+    assert!(one_more.contains("no — 1 more page"));
+
+    // A later page cannot always turn its opaque cursor position into a row
+    // offset, so it keeps the truthful truncation reason instead of repeating
+    // a first-page estimate as though no rows had already been seen.
+    let first = served.fragment(&store, "limit=2");
+    let cursor = first["next"].as_str().expect("first page cursor");
+    let resumed = served.render(
+        &store,
+        "fragment",
+        &format!("limit=2&cursor={cursor}"),
+        Representation::Html,
+    );
+    assert!(resumed.contains("no — the page filled"));
 
     // A fragment page is a table of triples even though the JSON row carries
     // variables only. Bound request terms are restored in position, remain
