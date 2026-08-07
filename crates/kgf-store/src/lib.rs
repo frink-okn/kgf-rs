@@ -65,7 +65,7 @@ pub use catalog::Catalog;
 pub use description::{
     ClassRelation, ClassRelationFilter, ClassRelationPage, ClassRelationPosition,
     ClassRelationStop, ComponentId, DescriptionStore, DescriptionView, SchemaNode, SchemaSelector,
-    StatsView,
+    StatsView, verify_description_indexes,
 };
 pub use error::{Error, Result};
 pub use manifest::{BundleFacts, Capability, Manifest, ManifestDocument};

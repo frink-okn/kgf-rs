@@ -7,10 +7,12 @@
 //! [`Store::open`](kgf_store::Store::open) accepts, and that the manifest stops
 //! agreeing the moment the artifacts move underneath it.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use kgf_store::manifest::Manifest;
+use kgf_store::manifest::{ArtifactView, Manifest};
+use kgf_store::store::artifact;
 use kgf_store::testing::hdtc_binary;
 use kgf_store::{OpenOptions, Store};
 
@@ -38,6 +40,12 @@ const RETITLED_SOURCE: &str = concat!(
     "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .\n",
     "<http://example.org/bob> <http://example.org/name> \"Bob\" .\n",
     "<http://example.org/bob> <http://example.org/knows> <http://example.org/alice> .\n",
+);
+
+const VOID_SOURCE: &str = concat!(
+    "<https://example.org/design> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+    "<https://example.org/queryable> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+    "<https://example.org/queryable> <http://rdfs.org/ns/void#subset> <https://example.org/design> .\n",
 );
 
 #[test]
@@ -295,6 +303,165 @@ fn a_manifest_from_a_newer_build_is_refused_rather_than_downgraded() {
         newer,
         "a manifest this build cannot read must not be overwritten"
     );
+}
+
+#[test]
+fn manifest_check_runs_the_offline_description_index_proof() {
+    let root = tempfile::tempdir().unwrap();
+    let bundle = root.path().join("demo-kg").join("2026-08-01");
+    std::fs::create_dir_all(&bundle).unwrap();
+    build_artifacts(&bundle, SOURCE);
+    kgf(&["manifest", path(&bundle)]).success();
+
+    let schema = b"view\tkind\tclass\tpredicate\tdatatype\tsubject_id\n";
+    let relations = b"view\tsubject_class\tpredicate\tobject_class\ttriples\n";
+    let empty_views = views(schema.len() as u64, 0, 0, 0, 0);
+    let empty_relations = views(relations.len() as u64, 0, 0, 0, 0);
+    publish_description_manifest(&bundle, schema, empty_views, relations, empty_relations);
+
+    let error = kgf(&["manifest", path(&bundle), "--check"]).failure();
+    assert!(
+        error.contains("queryable view has no dataset selector"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_valid_description_proof_passes_check_and_regeneration() {
+    let root = tempfile::tempdir().unwrap();
+    let bundle = root.path().join("demo-kg").join("2026-08-01");
+    std::fs::create_dir_all(&bundle).unwrap();
+    build_artifacts(&bundle, SOURCE);
+    kgf(&["manifest", path(&bundle)]).success();
+
+    let header = b"view\tkind\tclass\tpredicate\tdatatype\tsubject_id\n";
+    let design = b"design\tdataset\t\t\t\t1\n";
+    let queryable = b"queryable\tdataset\t\t\t\t2\n";
+    let schema = [header.as_slice(), design.as_slice(), queryable.as_slice()].concat();
+    let schema_views = views(
+        header.len() as u64,
+        design.len() as u64,
+        1,
+        queryable.len() as u64,
+        1,
+    );
+    let relations = b"view\tsubject_class\tpredicate\tobject_class\ttriples\n";
+    let relation_views = views(relations.len() as u64, 0, 0, 0, 0);
+    publish_description_manifest(&bundle, &schema, schema_views, relations, relation_views);
+
+    kgf(&["manifest", path(&bundle), "--check"]).success();
+    kgf(&["manifest", path(&bundle)]).success();
+    kgf(&["manifest", path(&bundle), "--check"]).success();
+}
+
+fn publish_description_manifest(
+    bundle: &Path,
+    schema: &[u8],
+    schema_views: BTreeMap<String, ArtifactView>,
+    relations: &[u8],
+    relation_views: BTreeMap<String, ArtifactView>,
+) {
+    build_void_artifacts(bundle);
+    for (name, bytes) in [
+        (artifact::SCHEMA_NODES, schema),
+        (artifact::CLASS_RELATIONS, relations),
+        (artifact::NAMESPACES, b"{}\n".as_slice()),
+        (artifact::SUMMARY_JSON, b"{}\n".as_slice()),
+        (artifact::SUMMARY_MD, b"# Summary\n".as_slice()),
+    ] {
+        std::fs::write(bundle.join(name), bytes).unwrap();
+    }
+
+    let mut manifest = Manifest::read(bundle).unwrap();
+    for name in artifact::DESCRIPTION {
+        let path = bundle.join(name);
+        let mut entry = kgf::manifest::checksum_artifact(&path).unwrap();
+        if matches!(name, artifact::SCHEMA_NODES | artifact::CLASS_RELATIONS) {
+            entry.parents = vec![artifact::VOID_HDT.to_owned()];
+            let bytes = std::fs::read(&path).unwrap();
+            entry.max_row_bytes = Some(max_row_bytes(&bytes));
+            entry.views = if name == artifact::SCHEMA_NODES {
+                schema_views.clone()
+            } else {
+                relation_views.clone()
+            };
+        }
+        manifest.artifacts.insert(name.to_owned(), entry);
+    }
+    manifest.content_digest = kgf::manifest::content_digest(
+        manifest
+            .artifacts
+            .iter()
+            .map(|(name, entry)| (name.as_str(), entry)),
+    );
+    std::fs::write(
+        bundle.join(artifact::MANIFEST),
+        manifest.to_json_bytes().unwrap(),
+    )
+    .unwrap();
+}
+
+fn views(
+    header: u64,
+    design_bytes: u64,
+    design_rows: u64,
+    queryable_bytes: u64,
+    queryable_rows: u64,
+) -> BTreeMap<String, ArtifactView> {
+    BTreeMap::from([
+        (
+            "design".to_owned(),
+            ArtifactView {
+                offset: header,
+                bytes: design_bytes,
+                rows: design_rows,
+            },
+        ),
+        (
+            "queryable".to_owned(),
+            ArtifactView {
+                offset: header + design_bytes,
+                bytes: queryable_bytes,
+                rows: queryable_rows,
+            },
+        ),
+    ])
+}
+
+fn max_row_bytes(bytes: &[u8]) -> u64 {
+    bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .map(<[u8]>::len)
+        .max()
+        .unwrap_or(0) as u64
+}
+
+fn build_void_artifacts(bundle: &Path) {
+    let stats = bundle.join("stats");
+    std::fs::create_dir_all(&stats).unwrap();
+    let input = stats.join("void.nt");
+    std::fs::write(&input, VOID_SOURCE).unwrap();
+    let output = Command::new(hdtc_binary())
+        .args([
+            "create",
+            path(&input),
+            "-o",
+            path(&bundle.join(artifact::VOID_HDT)),
+            "--temp-dir",
+            path(&stats.join("work")),
+            "--memory-limit",
+            "64M",
+            "--perm",
+        ])
+        .output()
+        .expect("run hdtc for VoID graph");
+    assert!(
+        output.status.success(),
+        "hdtc create for VoID graph failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_file(input).unwrap();
+    let _ = std::fs::remove_dir_all(stats.join("work"));
 }
 
 /// Open the bundle through the read layer.

@@ -20,6 +20,10 @@ use crate::store::ArtifactSet;
 use crate::store::artifact;
 use crate::{Role, TermId};
 
+mod verify;
+
+pub use verify::verify_description_indexes;
+
 /// A manifest component identifier used by a description view.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ComponentId(String);
@@ -570,6 +574,7 @@ struct Row<'a> {
 }
 
 struct SchemaRow<'a> {
+    view: &'a str,
     kind: &'a str,
     class: &'a str,
     predicate: &'a str,
@@ -585,8 +590,9 @@ impl SchemaRow<'_> {
 
 fn parse_schema_row<'a>(bytes: &'a [u8], path: &Path) -> Result<SchemaRow<'a>> {
     let mut fields = fields(bytes, path)?;
-    let _view = required_field(&mut fields, 0, 6, path)?;
+    let view = required_field(&mut fields, 0, 6, path)?;
     let row = SchemaRow {
+        view,
         kind: required_field(&mut fields, 1, 6, path)?,
         class: required_field(&mut fields, 2, 6, path)?,
         predicate: required_field(&mut fields, 3, 6, path)?,
@@ -681,6 +687,25 @@ mod tests {
         alice: u64,
         bob: u64,
     }
+
+    const VERIFIED_VOID_NT: &str = concat!(
+        "<https://example.org/queryable> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+        "<https://example.org/design> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+        "<https://example.org/queryable> <http://rdfs.org/ns/void#subset> <https://example.org/design> .\n",
+        "<https://example.org/design> <http://rdfs.org/ns/void#classPartition> <https://example.org/class-a> .\n",
+        "<https://example.org/class-a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+        "<https://example.org/class-a> <http://rdfs.org/ns/void#class> <https://example.org/A> .\n",
+        "<https://example.org/class-a> <http://rdfs.org/ns/void#propertyPartition> <https://example.org/property-p> .\n",
+        "<https://example.org/property-p> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+        "<https://example.org/property-p> <http://rdfs.org/ns/void#property> <https://example.org/p> .\n",
+        "<https://example.org/property-p> <http://ldf.fi/void-ext#objectClassPartition> <https://example.org/target-b> .\n",
+        "<https://example.org/target-b> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+        "<https://example.org/target-b> <http://rdfs.org/ns/void#class> <https://example.org/B> .\n",
+        "<https://example.org/target-b> <http://rdfs.org/ns/void#triples> \"5\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+        "<https://example.org/property-p> <http://ldf.fi/void-ext#datatypePartition> <https://example.org/datatype> .\n",
+        "<https://example.org/datatype> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+        "<https://example.org/datatype> <http://ldf.fi/void-ext#datatype> <https://example.org/Type> .\n",
+    );
 
     fn publish_description(fixture: &Fixture) -> PublishedDescription {
         let ids = {
@@ -876,6 +901,141 @@ mod tests {
         Store::open(&published, OpenOptions::default()).unwrap()
     }
 
+    fn publish_verified_description(fixture: &Fixture) {
+        let (ids, triples, counts) = {
+            let indexed = IndexedHdt::open(fixture.map_hdt(), fixture.map_perm()).unwrap();
+            let dictionary = indexed.dict();
+            let subject = |term: &[u8]| {
+                dictionary
+                    .locate(Role::Subject, term)
+                    .unwrap()
+                    .expect("VoID fixture subject")
+                    .0
+            };
+            (
+                [
+                    subject(b"https://example.org/queryable"),
+                    subject(b"https://example.org/design"),
+                    subject(b"https://example.org/class-a"),
+                    subject(b"https://example.org/property-p"),
+                    subject(b"https://example.org/datatype"),
+                ],
+                indexed.triples(),
+                *indexed.dict_counts(),
+            )
+        };
+
+        let mut schema = SCHEMA_NODES_HEADER.to_vec();
+        let mut schema_views = BTreeMap::new();
+        let schema_rows = |root: u64| {
+            vec![
+                format!("class\thttps://example.org/A\t\t\t{}", ids[2]),
+                format!("dataset\t\t\t\t{root}"),
+                format!(
+                    "datatype\thttps://example.org/A\thttps://example.org/p\thttps://example.org/Type\t{}",
+                    ids[4]
+                ),
+                format!(
+                    "property\thttps://example.org/A\thttps://example.org/p\t\t{}",
+                    ids[3]
+                ),
+            ]
+        };
+        append_view(
+            &mut schema,
+            &mut schema_views,
+            "design",
+            &schema_rows(ids[1]),
+        );
+        append_view(
+            &mut schema,
+            &mut schema_views,
+            "queryable",
+            &[format!("dataset\t\t\t\t{}", ids[0])],
+        );
+        append_view(
+            &mut schema,
+            &mut schema_views,
+            "component:canonical",
+            &schema_rows(ids[1]),
+        );
+
+        let mut relations = CLASS_RELATIONS_HEADER.to_vec();
+        let mut relation_views = BTreeMap::new();
+        let relation =
+            "https://example.org/A\thttps://example.org/p\thttps://example.org/B\t5".to_owned();
+        append_view(
+            &mut relations,
+            &mut relation_views,
+            "design",
+            std::slice::from_ref(&relation),
+        );
+        append_view(&mut relations, &mut relation_views, "queryable", &[]);
+        append_view(
+            &mut relations,
+            &mut relation_views,
+            "component:canonical",
+            &[relation],
+        );
+        fixture.add_description_artifacts(&schema, &relations);
+
+        let bundle = fixture.bundle_path();
+        let mut artifacts = BTreeMap::new();
+        for name in [
+            artifact::HDT,
+            artifact::PERM,
+            artifact::VOID_HDT,
+            artifact::VOID_PERM,
+            artifact::NAMESPACES,
+            artifact::SUMMARY_JSON,
+            artifact::SUMMARY_MD,
+        ] {
+            artifacts.insert(name.to_owned(), checksum_entry(&bundle.join(name)));
+        }
+        artifacts.insert(
+            artifact::SCHEMA_NODES.to_owned(),
+            tsv_entry(schema.len() as u64, max_complete_row(&schema), schema_views),
+        );
+        artifacts.insert(
+            artifact::CLASS_RELATIONS.to_owned(),
+            tsv_entry(
+                relations.len() as u64,
+                max_complete_row(&relations),
+                relation_views,
+            ),
+        );
+        let manifest = Manifest {
+            id: "verified".to_owned(),
+            dataset_iri: None,
+            version: "v1".to_owned(),
+            content_digest: "sha256:00".to_owned(),
+            created: None,
+            formats: Formats::default(),
+            title: None,
+            description: None,
+            license: None,
+            homepage: None,
+            publisher: None,
+            counts: Counts {
+                triples,
+                subjects: counts.len(Role::Subject),
+                predicates: counts.len(Role::Predicate),
+                objects: counts.len(Role::Object),
+            },
+            capabilities: BTreeMap::new(),
+            prefixes: BTreeMap::new(),
+            predicate_roles: BTreeMap::new(),
+            artifacts,
+            previous_version: None,
+        };
+        manifest.validate(bundle).unwrap();
+        std::fs::write(
+            bundle.join(artifact::MANIFEST),
+            manifest.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn row_boundary_search_finds_every_variable_width_key_and_no_gap() {
         let temp = tempfile::tempdir().unwrap();
@@ -918,6 +1078,61 @@ mod tests {
             let found = table.find_schema_row(view, target).unwrap();
             assert!(found.is_none(), "invented gap key {missing:?}");
         }
+    }
+
+    #[test]
+    fn offline_verification_proves_rows_ranges_and_void_bindings() {
+        let fixture = Fixture::build(VERIFIED_VOID_NT);
+        publish_verified_description(&fixture);
+
+        let candidate = Manifest::read(fixture.bundle_path()).unwrap();
+        std::fs::remove_file(fixture.bundle_path().join(artifact::MANIFEST)).unwrap();
+        {
+            let published = published_bundle(fixture.bundle_path());
+            verify_description_indexes(&published, &candidate)
+                .expect("a candidate can be proved without an on-disk manifest");
+        }
+        std::fs::write(
+            fixture.bundle_path().join(artifact::MANIFEST),
+            candidate.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+
+        {
+            let store = opened_description(&fixture);
+            store
+                .description()
+                .expect("description")
+                .verify_indexes()
+                .expect("valid description indexes");
+        }
+
+        let mut manifest = Manifest::read(fixture.bundle_path()).unwrap();
+        let design = manifest
+            .artifacts
+            .get_mut(artifact::SCHEMA_NODES)
+            .unwrap()
+            .views
+            .get_mut("design")
+            .unwrap();
+        design.offset += 1;
+        design.bytes -= 1;
+        std::fs::write(
+            fixture.bundle_path().join(artifact::MANIFEST),
+            manifest.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+
+        let store = opened_description(&fixture);
+        let error = store
+            .description()
+            .expect("description still opens with bounded checks")
+            .verify_indexes()
+            .expect_err("offline proof must reject the shifted range");
+        assert!(
+            error.to_string().contains("expected contiguous offset"),
+            "{error}"
+        );
     }
 
     #[test]

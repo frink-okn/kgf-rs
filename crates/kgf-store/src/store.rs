@@ -228,7 +228,7 @@ impl Store {
     }
 }
 
-fn description_set_disagreement(dir: &Path, detail: &str) -> Error {
+pub(crate) fn description_set_disagreement(dir: &Path, detail: &str) -> Error {
     Error::ManifestSyntax {
         path: dir.join(artifact::MANIFEST),
         detail: detail.to_owned(),

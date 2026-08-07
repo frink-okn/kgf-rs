@@ -33,6 +33,7 @@ use kgf_store::manifest::{
     Publisher, content_digest_preimage, default_predicate_roles, validate_predicate_role_iri,
 };
 use kgf_store::store::artifact;
+use kgf_store::{PublishedBundle, verify_description_indexes};
 use sha2::{Digest, Sha256};
 
 /// Arguments for `kgf manifest`.
@@ -109,7 +110,7 @@ pub fn run(args: Args) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("resolving bundle directory {}", args.bundle.display()))?;
 
-    let facts = read_facts(&dir)?;
+    let BundleInspection { bundle, facts } = inspect_bundle(&dir)?;
     verify_text_binding(&dir)?;
 
     if args.check {
@@ -118,6 +119,7 @@ pub fn run(args: Args) -> Result<()> {
         // changed the data. Then the bytes, which catch a rebuild that did not.
         manifest.verify_against(&facts, &dir)?;
         verify_described_artifacts(&manifest, &dir, &facts)?;
+        verify_description_indexes(&bundle, &manifest)?;
         println!(
             "{}: manifest agrees with its artifacts ({} triples, {})",
             dir.display(),
@@ -139,6 +141,7 @@ pub fn run(args: Args) -> Result<()> {
         document.as_ref().and_then(ManifestDocument::parsed),
     )?;
     manifest.validate(&dir)?;
+    verify_description_indexes(&bundle, &manifest)?;
 
     let bytes = match &document {
         Some(document) => document.rewrite_with(&manifest)?,
@@ -158,7 +161,13 @@ pub fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Read the artifacts' structural facts.
+/// The published capability and bounded facts used throughout one invocation.
+struct BundleInspection {
+    bundle: PublishedBundle,
+    facts: BundleFacts,
+}
+
+/// Read the bundle's structural facts without scanning description indexes.
 ///
 /// # Safety obligation
 ///
@@ -170,9 +179,10 @@ pub fn run(args: Args) -> Result<()> {
 /// what the capability exists for (doc 20 §20.9); the rest of this crate keeps
 /// `unsafe` denied.
 #[allow(unsafe_code)]
-fn read_facts(dir: &Path) -> Result<BundleFacts> {
+fn inspect_bundle(dir: &Path) -> Result<BundleInspection> {
     let bundle = unsafe { kgf_store::PublishedBundle::new(dir) };
-    Ok(BundleFacts::read(&bundle)?)
+    let facts = BundleFacts::read(&bundle)?;
+    Ok(BundleInspection { bundle, facts })
 }
 
 /// Check that the manifest describes the artifacts *byte for byte*, not merely
@@ -237,7 +247,7 @@ fn verify_described_artifacts(manifest: &Manifest, dir: &Path, facts: &BundleFac
         }
     }
 
-    let digest = content_digest(&computed);
+    let digest = content_digest(computed.iter().map(|(name, entry)| (name.as_str(), entry)));
     if manifest.content_digest != digest {
         bail!(
             "manifest {} records content_digest {} but its artifacts hash to {}; \
@@ -286,7 +296,8 @@ fn build(
 
     let mut artifacts = checksum_artifacts(dir, facts)?;
     carry_artifact_metadata(&mut artifacts, previous)?;
-    let content_digest = content_digest(&artifacts);
+    let content_digest =
+        content_digest(artifacts.iter().map(|(name, entry)| (name.as_str(), entry)));
 
     // `created` dates the bundle, not the manifest file, so regenerating over
     // unchanged artifacts must not restate it. That also keeps regeneration
@@ -505,15 +516,23 @@ fn checksum_artifacts(dir: &Path, facts: &BundleFacts) -> Result<Vec<(String, Ar
         .artifact_names()
         .map(|name| {
             let path = dir.join(name);
-            let (bytes, sha256) = if path.is_dir() {
-                sha256_dir(&path)
-            } else {
-                sha256_file(&path)
-            }
-            .with_context(|| format!("checksumming {}", path.display()))?;
-            Ok((name.to_owned(), ArtifactEntry::checksum(bytes, sha256)))
+            Ok((name.to_owned(), checksum_artifact(&path)?))
         })
         .collect()
+}
+
+/// Compute one manifest artifact entry from the bytes at `path`.
+///
+/// Files are streamed through SHA-256. A directory is identified by the same
+/// sorted relative-path/checksum construction used for `data.hdt.text`.
+pub fn checksum_artifact(path: &Path) -> Result<ArtifactEntry> {
+    let (bytes, sha256) = if path.is_dir() {
+        sha256_dir(path)
+    } else {
+        sha256_file(path)
+    }
+    .with_context(|| format!("checksumming {}", path.display()))?;
+    Ok(ArtifactEntry::checksum(bytes, sha256))
 }
 
 /// Carry build-produced artifact metadata only while its artifact is unchanged.
@@ -527,6 +546,11 @@ fn carry_artifact_metadata(
     artifacts: &mut [(String, ArtifactEntry)],
     previous: Option<&Manifest>,
 ) -> Result<()> {
+    let current_digests: BTreeMap<String, (u64, String)> = artifacts
+        .iter()
+        .map(|(name, entry)| (name.clone(), (entry.bytes, entry.sha256.clone())))
+        .collect();
+
     for (name, current) in artifacts {
         let prior = previous.and_then(|manifest| manifest.artifacts.get(name));
         let same_content = prior
@@ -563,6 +587,29 @@ fn carry_artifact_metadata(
 
         if same_content {
             let prior = prior.expect("same_content is true only for a previous entry");
+            for parent in &prior.parents {
+                let prior_parent = previous
+                    .and_then(|manifest| manifest.artifacts.get(parent))
+                    .with_context(|| {
+                        format!(
+                            "artifact {name} declares parent {parent}, but the previous manifest \
+                             has no entry for it; rebuild the derived artifact"
+                        )
+                    })?;
+                let current_parent = current_digests.get(parent).with_context(|| {
+                    format!(
+                        "artifact {name} declares parent {parent}, but the current bundle does \
+                         not contain it; rebuild the derived artifact"
+                    )
+                })?;
+                if current_parent.0 != prior_parent.bytes || current_parent.1 != prior_parent.sha256
+                {
+                    bail!(
+                        "artifact {name} is unchanged but its parent {parent} changed, so the \
+                         derived index may be stale; rebuild the description set with `kgf build`"
+                    );
+                }
+            }
             current.parents.clone_from(&prior.parents);
             current.max_row_bytes = prior.max_row_bytes;
             current.views.clone_from(&prior.views);
@@ -651,12 +698,14 @@ fn sha256_file(path: &Path) -> Result<(u64, String)> {
     Ok((bytes, hex(&hasher.finalize())))
 }
 
-/// The Merkle root over the artifact checksums (doc 04 §4.3).
-fn content_digest(artifacts: &[(String, ArtifactEntry)]) -> String {
+/// Compute the bundle content digest over its artifact entries (doc 04 §4.3).
+pub fn content_digest<'a>(
+    artifacts: impl IntoIterator<Item = (&'a str, &'a ArtifactEntry)>,
+) -> String {
     let digests: Vec<ArtifactDigest> = artifacts
-        .iter()
+        .into_iter()
         .map(|(name, entry)| ArtifactDigest {
-            name: name.clone(),
+            name: name.to_owned(),
             sha256: entry.sha256.clone(),
         })
         .collect();
@@ -877,6 +926,10 @@ mod tests {
     #[test]
     fn manifest_carries_view_metadata_only_for_unchanged_tsv_bytes() {
         let mut previous = manifest_with(BTreeMap::new());
+        previous.artifacts.insert(
+            artifact::VOID_HDT.to_owned(),
+            ArtifactEntry::checksum(90, "void-abc"),
+        );
         let mut entry = ArtifactEntry::checksum(100, "abc");
         entry.parents = vec![artifact::VOID_HDT.to_owned()];
         entry.max_row_bytes = Some(80);
@@ -902,21 +955,46 @@ mod tests {
             .artifacts
             .insert(artifact::SCHEMA_NODES.to_owned(), entry.clone());
 
-        let mut unchanged = vec![(
-            artifact::SCHEMA_NODES.to_owned(),
-            ArtifactEntry::checksum(100, "abc"),
-        )];
+        let mut unchanged = vec![
+            (
+                artifact::VOID_HDT.to_owned(),
+                ArtifactEntry::checksum(90, "void-abc"),
+            ),
+            (
+                artifact::SCHEMA_NODES.to_owned(),
+                ArtifactEntry::checksum(100, "abc"),
+            ),
+        ];
         carry_artifact_metadata(&mut unchanged, Some(&previous)).unwrap();
-        assert_eq!(unchanged[0].1, entry);
+        assert_eq!(unchanged[1].1, entry);
 
-        let mut changed = vec![(
-            artifact::SCHEMA_NODES.to_owned(),
-            ArtifactEntry::checksum(101, "def"),
-        )];
+        let mut changed = vec![
+            (
+                artifact::VOID_HDT.to_owned(),
+                ArtifactEntry::checksum(90, "void-abc"),
+            ),
+            (
+                artifact::SCHEMA_NODES.to_owned(),
+                ArtifactEntry::checksum(101, "def"),
+            ),
+        ];
         let error = carry_artifact_metadata(&mut changed, Some(&previous)).unwrap_err();
         assert!(error.to_string().contains("view ranges may be stale"));
 
         let error = carry_artifact_metadata(&mut unchanged, None).unwrap_err();
         assert!(error.to_string().contains("kgf build"));
+
+        let mut stale_parent = vec![
+            (
+                artifact::VOID_HDT.to_owned(),
+                ArtifactEntry::checksum(91, "void-def"),
+            ),
+            (
+                artifact::SCHEMA_NODES.to_owned(),
+                ArtifactEntry::checksum(100, "abc"),
+            ),
+        ];
+        let error = carry_artifact_metadata(&mut stale_parent, Some(&previous)).unwrap_err();
+        assert!(error.to_string().contains("parent stats/void.hdt changed"));
     }
 }
