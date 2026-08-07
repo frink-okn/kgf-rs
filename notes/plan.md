@@ -17,7 +17,9 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–16 are complete: all of M1 plus `o.text` and bindings; each
+Units 1–18 are complete: all of M1 plus `o.text`, bindings, entity search,
+live labels, and the browser workbench. Unit 19 is in progress on the mandatory
+description surface. Each completed unit
 carries a **What landed** section written after the fact, which is where a unit's plan
 and its outcome are reconciled.
 
@@ -1192,6 +1194,45 @@ browser visual pass over the catalog, manifest workbench and live fragment
 results, with the phone breakpoint kept as a single-column collapse in the
 shared stylesheet.
 
+### 19. The description surface — mapped statistics and bounded navigation 🚧
+
+The store-side foundation is implemented. One internal `IndexedHdt` now owns an
+HDT plus its bound permutation sidecar and serves both `data.hdt` and
+`stats/void.hdt`; its dictionary projection remains encapsulated with the
+mapping it belongs to. A tier-1 description is an all-or-none seven-artifact
+set, included in bundle identity. `Store::open` maps the VoID pair and the two
+TSV indexes without scanning payload rows or allocating state proportional to
+schema size.
+
+`stats/schema-nodes.tsv` resolves typed semantic selectors by row-boundary-aware
+binary search. `stats/class-relations.tsv` pages its persisted order directly,
+including filtered candidate limits and exact byte-position resumption. Full
+publication-time verification checks TSV ranges, ordering, row metadata,
+selector bindings, parent paths, and the class-relation projection against the
+indexed VoID graph; it runs from `kgf manifest`, not from the bounded open path.
+
+The headless schema API now projects the selected node's stated VoID counts and
+pages one immediate collection. Valid selector/collection pairs are distinct
+Rust variants: dataset classes, dataset properties, class properties, property
+object classes, property datatypes, and datatype languages. Results remain in
+the VoID dictionary's id space until serialization, enumerate in indexed HDT
+order, and probe at most `limit + 1` child candidates. Untyped object-target
+partitions are skipped from the `object-classes` collection while their triples
+remain in the property node's aggregate count; question 36 records the sentence
+doc 03 still owes that behavior. A full SPO selection plus the VoID dictionary
+is also exposed as the representation-neutral input for `/void` serialization.
+
+*Verified so far by* a layered golden VoID fixture covering every valid child
+query, every node kind, design/queryable/component views, absent selectors,
+one-item cursor resumption, datatype and language terms, omission of an untyped
+target without a phantom terminal page, numeric node projection, full VoID
+traversal, malformed selector IDs, publication proof, and the existing mapped
+open-cost invariants.
+
+Still to land in this unit: namespace/summary artifact readers, server request
+and cursor types, JSON/HTML `/schema`, RDF `/void`, static `/summary`, and the
+`kgf build stats` producer that creates the complete artifact set.
+
 ### What the implementation still is not
 
 **M1 is a strict subset of doc 03 §3.1's mandatory core profile.** That profile is
@@ -1642,6 +1683,14 @@ following the code.
     hydrated labels (a `labels` sibling map keyed by IRI? a per-cell annotation?) and
     let `labels=true` turn it on for `/fragment`, `/describe` and `/sample`; the HTML
     pages then become the `labels=true` rendering rather than a special case.
+36. **Does `/schema?children=object-classes` omit the untyped target partition?**
+    The response shape requires every child to carry a semantic `term`, and an
+    untyped target has no `void:class`; §3.4.10 explicitly says such a partition is
+    omitted from the flat class-relation projection but does not say what the
+    navigable child collection does. The store omits it there too, while preserving
+    its contribution in the selected property node's `void:triples` count. That keeps
+    `object-classes` literally a collection of classes and avoids inventing a null or
+    sentinel term, but the API document should state the rule. Surfaced in unit 19.
 
 ## Not in this plan
 
@@ -1650,6 +1699,7 @@ everything requiring a sidecar beyond `.perm` and the existing exhaustive text i
 Those are doc 20 §20.8's later milestones and compose through the `Store`, envelope,
 cursor, term, and live-profile layers this plan builds.
 
-`kgf build` is also absent, deliberately. Bundles are assembled with
-`hdtc create --perm` and described with `kgf manifest` (unit 9) until the server work
-is far enough along to say what the build pipeline owes it.
+`kgf build` was deliberately absent from units 1–18. Bundles are assembled with
+`hdtc create --perm` and described with `kgf manifest` (unit 9). Unit 19 now has enough
+of the consumer contract to scope the smallest stats producer; the complete build DAG
+remains later work.

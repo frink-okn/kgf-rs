@@ -64,7 +64,8 @@ pub mod testing;
 pub use catalog::Catalog;
 pub use description::{
     ClassRelation, ClassRelationFilter, ClassRelationPage, ClassRelationPosition,
-    ClassRelationStop, ComponentId, DescriptionStore, DescriptionView, SchemaNode, SchemaSelector,
+    ClassRelationStop, ComponentId, DescriptionStore, DescriptionView, SchemaChildQuery,
+    SchemaCollection, SchemaCounts, SchemaNode, SchemaNodeKind, SchemaPage, SchemaSelector,
     StatsView, verify_description_indexes,
 };
 pub use error::{Error, Result};

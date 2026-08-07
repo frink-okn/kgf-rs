@@ -18,8 +18,10 @@ use crate::store::{ArtifactSet, description_set_disagreement};
 use crate::{Role, TermId};
 
 use super::{
-    DescriptionStore, MappedTsv, SchemaRow, StatsView, compare_fields, fields, malformed,
-    parse_schema_row, reject_extra_fields, required_field,
+    DescriptionStore, MappedTsv, SchemaRow, StatsView, VOID_CLASS, VOID_CLASS_PARTITION,
+    VOID_PROPERTY, VOID_PROPERTY_PARTITION, VOID_TRIPLES, VOIDEXT_DATATYPE,
+    VOIDEXT_DATATYPE_PARTITION, VOIDEXT_OBJECT_CLASS_PARTITION, XSD_INTEGER, compare_fields,
+    fields, malformed, parse_schema_row, reject_extra_fields, required_field,
 };
 use crate::error::Result;
 
@@ -29,15 +31,6 @@ const RELATIONS_HEADER: &[u8] = b"view\tsubject_class\tpredicate\tobject_class\t
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const VOID_DATASET: &str = "http://rdfs.org/ns/void#Dataset";
 const VOID_SUBSET: &str = "http://rdfs.org/ns/void#subset";
-const VOID_CLASS_PARTITION: &str = "http://rdfs.org/ns/void#classPartition";
-const VOID_PROPERTY_PARTITION: &str = "http://rdfs.org/ns/void#propertyPartition";
-const VOID_CLASS: &str = "http://rdfs.org/ns/void#class";
-const VOID_PROPERTY: &str = "http://rdfs.org/ns/void#property";
-const VOID_TRIPLES: &str = "http://rdfs.org/ns/void#triples";
-const VOIDEXT_OBJECT_CLASS_PARTITION: &str = "http://ldf.fi/void-ext#objectClassPartition";
-const VOIDEXT_DATATYPE_PARTITION: &str = "http://ldf.fi/void-ext#datatypePartition";
-const VOIDEXT_DATATYPE: &str = "http://ldf.fi/void-ext#datatype";
-const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 
 /// Fully verify a candidate manifest's description indexes against its bundle.
 ///

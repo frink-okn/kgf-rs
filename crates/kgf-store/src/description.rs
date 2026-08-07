@@ -11,10 +11,12 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
+use crate::dict::Dictionary;
 use crate::error::{Error, Result};
 use crate::indexed::IndexedHdt;
 use crate::manifest::{ArtifactEntry, ArtifactView, DescriptionArtifactEntries};
 use crate::map::{BytesSpec, Mapping, MappingId, PublishedBundle, open_published};
+use crate::pattern::{IdPattern, Selection};
 use crate::store::ArtifactSet;
 #[cfg(test)]
 use crate::store::artifact;
@@ -23,6 +25,22 @@ use crate::{Role, TermId};
 mod verify;
 
 pub use verify::verify_description_indexes;
+
+const VOID_TRIPLES: &str = "http://rdfs.org/ns/void#triples";
+const VOID_DISTINCT_SUBJECTS: &str = "http://rdfs.org/ns/void#distinctSubjects";
+const VOID_DISTINCT_OBJECTS: &str = "http://rdfs.org/ns/void#distinctObjects";
+const VOID_PROPERTIES: &str = "http://rdfs.org/ns/void#properties";
+const VOID_PROPERTY_PARTITION: &str = "http://rdfs.org/ns/void#propertyPartition";
+const VOID_CLASS_PARTITION: &str = "http://rdfs.org/ns/void#classPartition";
+const VOID_PROPERTY: &str = "http://rdfs.org/ns/void#property";
+const VOID_CLASS: &str = "http://rdfs.org/ns/void#class";
+const VOID_ENTITIES: &str = "http://rdfs.org/ns/void#entities";
+const VOIDEXT_OBJECT_CLASS_PARTITION: &str = "http://ldf.fi/void-ext#objectClassPartition";
+const VOIDEXT_DATATYPE_PARTITION: &str = "http://ldf.fi/void-ext#datatypePartition";
+const VOIDEXT_DATATYPE: &str = "http://ldf.fi/void-ext#datatype";
+const VOIDEXT_LANGUAGE_PARTITION: &str = "http://ldf.fi/void-ext#languagePartition";
+const VOIDEXT_LANGUAGE: &str = "http://ldf.fi/void-ext#language";
+const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 
 /// A manifest component identifier used by a description view.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -115,13 +133,223 @@ impl SchemaSelector<'_> {
             } => ["datatype", class.unwrap_or(""), predicate, datatype],
         }
     }
+
+    fn kind(self) -> SchemaNodeKind {
+        match self {
+            Self::Dataset => SchemaNodeKind::Dataset,
+            Self::Class { .. } => SchemaNodeKind::Class,
+            Self::Property { .. } => SchemaNodeKind::Property,
+            Self::Datatype { .. } => SchemaNodeKind::Datatype,
+        }
+    }
+
+    fn term_predicate(self) -> Option<&'static str> {
+        match self {
+            Self::Dataset => None,
+            Self::Class { .. } => Some(VOID_CLASS),
+            Self::Property { .. } => Some(VOID_PROPERTY),
+            Self::Datatype { .. } => Some(VOIDEXT_DATATYPE),
+        }
+    }
 }
 
-/// A schema selector resolved to the final VoID HDT's subject id space.
+/// One valid immediate-child request in the VoID partition tree.
+///
+/// Each variant fixes both the selected node and its permitted outgoing
+/// collection. Invalid combinations such as languages below a property cannot
+/// be represented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaChildQuery<'a> {
+    /// Classes immediately below the selected view's dataset root.
+    Classes,
+    /// Dataset-level properties immediately below the view root.
+    DatasetProperties,
+    /// Properties immediately below one class partition.
+    ClassProperties {
+        /// Expanded class IRI.
+        class: &'a str,
+    },
+    /// Object-class partitions immediately below one property.
+    PropertyObjectClasses {
+        /// Expanded class IRI for a class-scoped property.
+        class: Option<&'a str>,
+        /// Expanded predicate IRI.
+        predicate: &'a str,
+    },
+    /// Datatype partitions immediately below one property.
+    PropertyDatatypes {
+        /// Expanded class IRI for a class-scoped property.
+        class: Option<&'a str>,
+        /// Expanded predicate IRI.
+        predicate: &'a str,
+    },
+    /// Language partitions immediately below one datatype.
+    DatatypeLanguages {
+        /// Expanded class IRI for a class-scoped property.
+        class: Option<&'a str>,
+        /// Expanded predicate IRI.
+        predicate: &'a str,
+        /// Expanded datatype IRI.
+        datatype: &'a str,
+    },
+}
+
+impl<'a> SchemaChildQuery<'a> {
+    fn selector(self) -> SchemaSelector<'a> {
+        match self {
+            Self::Classes | Self::DatasetProperties => SchemaSelector::Dataset,
+            Self::ClassProperties { class } => SchemaSelector::Class { class },
+            Self::PropertyObjectClasses { class, predicate }
+            | Self::PropertyDatatypes { class, predicate } => {
+                SchemaSelector::Property { class, predicate }
+            }
+            Self::DatatypeLanguages {
+                class,
+                predicate,
+                datatype,
+            } => SchemaSelector::Datatype {
+                class,
+                predicate,
+                datatype,
+            },
+        }
+    }
+
+    fn collection(self) -> SchemaCollection {
+        match self {
+            Self::Classes => SchemaCollection::Classes,
+            Self::DatasetProperties | Self::ClassProperties { .. } => SchemaCollection::Properties,
+            Self::PropertyObjectClasses { .. } => SchemaCollection::ObjectClasses,
+            Self::PropertyDatatypes { .. } => SchemaCollection::Datatypes,
+            Self::DatatypeLanguages { .. } => SchemaCollection::Languages,
+        }
+    }
+
+    fn edge_predicate(self) -> &'static str {
+        match self {
+            Self::Classes => VOID_CLASS_PARTITION,
+            Self::DatasetProperties | Self::ClassProperties { .. } => VOID_PROPERTY_PARTITION,
+            Self::PropertyObjectClasses { .. } => VOIDEXT_OBJECT_CLASS_PARTITION,
+            Self::PropertyDatatypes { .. } => VOIDEXT_DATATYPE_PARTITION,
+            Self::DatatypeLanguages { .. } => VOIDEXT_LANGUAGE_PARTITION,
+        }
+    }
+
+    fn child_kind(self) -> SchemaNodeKind {
+        match self {
+            Self::Classes => SchemaNodeKind::Class,
+            Self::DatasetProperties | Self::ClassProperties { .. } => SchemaNodeKind::Property,
+            Self::PropertyObjectClasses { .. } => SchemaNodeKind::ObjectClass,
+            Self::PropertyDatatypes { .. } => SchemaNodeKind::Datatype,
+            Self::DatatypeLanguages { .. } => SchemaNodeKind::Language,
+        }
+    }
+
+    fn child_term_predicate(self) -> &'static str {
+        match self {
+            Self::Classes | Self::PropertyObjectClasses { .. } => VOID_CLASS,
+            Self::DatasetProperties | Self::ClassProperties { .. } => VOID_PROPERTY,
+            Self::PropertyDatatypes { .. } => VOIDEXT_DATATYPE,
+            Self::DatatypeLanguages { .. } => VOIDEXT_LANGUAGE,
+        }
+    }
+}
+
+/// One collection in the shallow `/schema` navigation model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaCollection {
+    /// Class partitions.
+    Classes,
+    /// Property partitions.
+    Properties,
+    /// Object-class partitions.
+    ObjectClasses,
+    /// Datatype partitions.
+    Datatypes,
+    /// Language partitions.
+    Languages,
+}
+
+/// The semantic role of one VoID partition node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaNodeKind {
+    /// A selected view's dataset root.
+    Dataset,
+    /// A class partition.
+    Class,
+    /// A property partition.
+    Property,
+    /// An object-class partition.
+    ObjectClass,
+    /// A datatype partition.
+    Datatype,
+    /// A language partition.
+    Language,
+}
+
+/// The optional numeric facts stated directly by one VoID partition.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SchemaCounts {
+    /// `void:entities`, when present.
+    pub entities: Option<u64>,
+    /// `void:triples`, when present.
+    pub triples: Option<u64>,
+    /// `void:distinctSubjects`, when present.
+    pub distinct_subjects: Option<u64>,
+    /// `void:distinctObjects`, when present.
+    pub distinct_objects: Option<u64>,
+    /// `void:properties`, when present.
+    pub properties: Option<u64>,
+}
+
+/// One selected or immediate-child partition in `stats/void.hdt`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchemaNode {
-    /// One-based subject dictionary id in `stats/void.hdt`.
-    pub subject: TermId,
+    subject: TermId,
+    kind: SchemaNodeKind,
+    term: Option<TermId>,
+    counts: SchemaCounts,
+}
+
+impl SchemaNode {
+    /// One-based subject dictionary id of the opaque partition node.
+    pub fn subject(self) -> TermId {
+        self.subject
+    }
+
+    /// Semantic role of this partition.
+    pub fn kind(self) -> SchemaNodeKind {
+        self.kind
+    }
+
+    /// Semantic term in the VoID object id space.
+    ///
+    /// Dataset roots have no term. Child collections omit observational
+    /// object-target partitions that state no class.
+    pub fn term(self) -> Option<TermId> {
+        self.term
+    }
+
+    /// Numeric facts stated directly by this partition.
+    pub fn counts(self) -> SchemaCounts {
+        self.counts
+    }
+}
+
+/// One bounded page of an immediate schema child collection.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SchemaPage {
+    /// The selected parent node, or `None` when its semantic selector is absent.
+    pub node: Option<SchemaNode>,
+    /// The collection requested by the caller.
+    pub collection: SchemaCollection,
+    /// Immediate children in indexed `stats/void.hdt` order.
+    ///
+    /// The object-class collection omits untyped target partitions, which have
+    /// no semantic term; their triples remain in the parent property's counts.
+    pub items: Vec<SchemaNode>,
+    /// Zero-based child offset for the next page.
+    pub next: Option<u64>,
 }
 
 /// Optional filters over the persisted class-relation order.
@@ -202,6 +430,7 @@ pub struct ClassRelationPage<'a> {
 /// The mapped, immutable description surface for one bundle version.
 pub struct DescriptionStore {
     void: IndexedHdt,
+    void_path: std::path::PathBuf,
     schema_nodes: MappedTsv,
     class_relations: MappedTsv,
 }
@@ -238,8 +467,30 @@ impl DescriptionStore {
 
         Ok(Self {
             void,
+            void_path: description.void_hdt.clone(),
             schema_nodes,
             class_relations,
+        })
+    }
+
+    /// Dictionary of the mapped VoID graph.
+    ///
+    /// Schema nodes and children remain in id space through the store. The
+    /// serialization edge uses this dictionary to materialize their terms.
+    pub fn dict(&self) -> Dictionary<'_> {
+        self.void.dict()
+    }
+
+    /// Resolve a full traversal of the VoID graph in stable SPO order.
+    ///
+    /// This is the representation-neutral input to `/void` serialization. It
+    /// returns the ordinary indexed-HDT selection rather than materializing the
+    /// schema-bounded graph.
+    pub fn void_triples(&self) -> Result<Selection<'_>> {
+        self.void.resolve(IdPattern {
+            subject: None,
+            predicate: None,
+            object: None,
         })
     }
 
@@ -277,35 +528,90 @@ impl<'a> DescriptionView<'a> {
         self.relations.rows
     }
 
-    /// Resolve a semantic selector through the mapped selector index.
+    /// Resolve and project one semantic selector through the mapped index.
     pub fn schema_node(&self, selector: SchemaSelector<'_>) -> Result<Option<SchemaNode>> {
-        let target = selector.key();
-        let Some(row) = self
-            .store
-            .schema_nodes
-            .find_schema_row(self.schema, target)?
-        else {
+        let Some(subject) = self.selector_subject(selector)? else {
             return Ok(None);
         };
-        let subject = row.subject_id.parse::<u64>().map_err(|error| {
-            malformed(
-                self.store.schema_nodes.path(),
-                format!(
-                    "subject_id {:?} is not an unsigned decimal: {error}",
-                    row.subject_id
-                ),
-            )
+        self.project_node(subject, selector.kind(), selector.term_predicate())
+            .map(Some)
+    }
+
+    /// Page one valid immediate-child collection below a selected node.
+    ///
+    /// Selector resolution is one mapped TSV binary search. Each returned item
+    /// then costs a fixed number of indexed VoID probes; neither the tree nor
+    /// any per-node directory is materialized.
+    pub fn schema_children(
+        &self,
+        query: SchemaChildQuery<'_>,
+        from: u64,
+        limit: NonZeroUsize,
+    ) -> Result<SchemaPage> {
+        let collection = query.collection();
+        let selector = query.selector();
+        let Some(subject) = self.selector_subject(selector)? else {
+            return Ok(SchemaPage {
+                node: None,
+                collection,
+                items: Vec::new(),
+                next: None,
+            });
+        };
+        let node = self.project_node(subject, selector.kind(), selector.term_predicate())?;
+
+        let dictionary = self.store.void.dict();
+        let Some(edge) = dictionary.locate(Role::Predicate, query.edge_predicate().as_bytes())?
+        else {
+            return Ok(SchemaPage {
+                node: Some(node),
+                collection,
+                items: Vec::new(),
+                next: None,
+            });
+        };
+        let term_predicate =
+            dictionary.locate(Role::Predicate, query.child_term_predicate().as_bytes())?;
+        let selection = self.store.void.resolve(IdPattern {
+            subject: Some(subject.0),
+            predicate: Some(edge.0),
+            object: None,
         })?;
-        let maximum = self.store.void.dict_counts().len(Role::Subject);
-        if subject == 0 || subject > maximum {
-            return Err(malformed(
-                self.store.schema_nodes.path(),
-                format!("subject_id {subject} is outside the VoID subject id space 1..={maximum}"),
-            ));
+        let total = selection.count().value;
+        let start = from.min(total);
+        let candidate_limit = limit.get().saturating_add(1);
+        let mut items = Vec::with_capacity(limit.get());
+        let mut position = start;
+        let mut next = None;
+        for triple in selection.page(start, candidate_limit) {
+            let candidate_position = position;
+            position = position.checked_add(1).ok_or_else(|| {
+                malformed(
+                    &self.store.void_path,
+                    "schema page position overflows u64".to_owned(),
+                )
+            })?;
+            let child = self.object_to_subject(TermId(triple.object), "schema child")?;
+            let term = self.node_term(child, query.child_kind(), term_predicate)?;
+            if term.is_none() {
+                continue;
+            }
+            if items.len() == limit.get() {
+                next = Some(candidate_position);
+                break;
+            }
+            items.push(self.project_node_with_term(child, query.child_kind(), term)?);
         }
-        Ok(Some(SchemaNode {
-            subject: TermId(subject),
-        }))
+        if next.is_none() && position < total {
+            next = Some(position);
+        }
+
+        Ok(SchemaPage {
+            node: Some(node),
+            collection,
+            items,
+            next,
+        })
     }
 
     /// Validate a decoded cursor offset against this view in constant time.
@@ -371,6 +677,183 @@ impl<'a> DescriptionView<'a> {
             next: None,
             stop: ClassRelationStop::Complete,
             examined,
+        })
+    }
+
+    fn selector_subject(&self, selector: SchemaSelector<'_>) -> Result<Option<TermId>> {
+        let target = selector.key();
+        let Some(row) = self
+            .store
+            .schema_nodes
+            .find_schema_row(self.schema, target)?
+        else {
+            return Ok(None);
+        };
+        let subject = row.subject_id.parse::<u64>().map_err(|error| {
+            malformed(
+                self.store.schema_nodes.path(),
+                format!(
+                    "subject_id {:?} is not an unsigned decimal: {error}",
+                    row.subject_id
+                ),
+            )
+        })?;
+        let maximum = self.store.void.dict_counts().len(Role::Subject);
+        if subject == 0 || subject > maximum {
+            return Err(malformed(
+                self.store.schema_nodes.path(),
+                format!("subject_id {subject} is outside the VoID subject id space 1..={maximum}"),
+            ));
+        }
+        Ok(Some(TermId(subject)))
+    }
+
+    fn project_node(
+        &self,
+        subject: TermId,
+        kind: SchemaNodeKind,
+        term_predicate: Option<&str>,
+    ) -> Result<SchemaNode> {
+        let term_predicate = term_predicate
+            .map(|predicate| {
+                self.store
+                    .void
+                    .dict()
+                    .locate(Role::Predicate, predicate.as_bytes())
+            })
+            .transpose()?
+            .flatten();
+        let term = self.node_term(subject, kind, term_predicate)?;
+        self.project_node_with_term(subject, kind, term)
+    }
+
+    fn project_node_with_term(
+        &self,
+        subject: TermId,
+        kind: SchemaNodeKind,
+        term: Option<TermId>,
+    ) -> Result<SchemaNode> {
+        Ok(SchemaNode {
+            subject,
+            kind,
+            term,
+            counts: SchemaCounts {
+                entities: self.optional_count(subject, VOID_ENTITIES)?,
+                triples: self.optional_count(subject, VOID_TRIPLES)?,
+                distinct_subjects: self.optional_count(subject, VOID_DISTINCT_SUBJECTS)?,
+                distinct_objects: self.optional_count(subject, VOID_DISTINCT_OBJECTS)?,
+                properties: self.optional_count(subject, VOID_PROPERTIES)?,
+            },
+        })
+    }
+
+    fn node_term(
+        &self,
+        subject: TermId,
+        kind: SchemaNodeKind,
+        predicate: Option<TermId>,
+    ) -> Result<Option<TermId>> {
+        let values = match predicate {
+            Some(predicate) => self.store.void.resolve(IdPattern {
+                subject: Some(subject.0),
+                predicate: Some(predicate.0),
+                object: None,
+            })?,
+            None if matches!(kind, SchemaNodeKind::Dataset | SchemaNodeKind::ObjectClass) => {
+                return Ok(None);
+            }
+            None => {
+                return Err(malformed(
+                    &self.store.void_path,
+                    format!(
+                        "{kind:?} partition subject {} has no semantic term",
+                        subject.0
+                    ),
+                ));
+            }
+        };
+        match values.count().value {
+            0 if kind == SchemaNodeKind::ObjectClass => Ok(None),
+            0 => Err(malformed(
+                &self.store.void_path,
+                format!(
+                    "{kind:?} partition subject {} has no semantic term",
+                    subject.0
+                ),
+            )),
+            1 => Ok(Some(TermId(values.at(0).object))),
+            count => Err(malformed(
+                &self.store.void_path,
+                format!(
+                    "{kind:?} partition subject {} has {count} semantic terms",
+                    subject.0
+                ),
+            )),
+        }
+    }
+
+    fn optional_count(&self, subject: TermId, predicate_iri: &str) -> Result<Option<u64>> {
+        let dictionary = self.store.void.dict();
+        let Some(predicate) = dictionary.locate(Role::Predicate, predicate_iri.as_bytes())? else {
+            return Ok(None);
+        };
+        let values = self.store.void.resolve(IdPattern {
+            subject: Some(subject.0),
+            predicate: Some(predicate.0),
+            object: None,
+        })?;
+        match values.count().value {
+            0 => Ok(None),
+            1 => self.integer_object(TermId(values.at(0).object)).map(Some),
+            count => Err(malformed(
+                &self.store.void_path,
+                format!(
+                    "partition subject {} has {count} values for <{}>",
+                    subject.0, predicate_iri
+                ),
+            )),
+        }
+    }
+
+    fn integer_object(&self, object: TermId) -> Result<u64> {
+        let dictionary = self.store.void.dict();
+        let mut buffer = Vec::new();
+        let term = dictionary.extract(Role::Object, object, &mut buffer)?;
+        let literal = hdtc::format::parse_literal(term).ok_or_else(|| {
+            malformed(
+                &self.store.void_path,
+                "VoID count is not a literal".to_owned(),
+            )
+        })?;
+        if literal.language.is_some() || literal.datatype != Some(XSD_INTEGER.as_bytes()) {
+            return Err(malformed(
+                &self.store.void_path,
+                "VoID count is not an xsd:integer literal".to_owned(),
+            ));
+        }
+        let lexical = std::str::from_utf8(literal.value).map_err(|error| {
+            malformed(
+                &self.store.void_path,
+                format!("VoID count lexical form is not UTF-8: {error}"),
+            )
+        })?;
+        lexical.parse::<u64>().map_err(|error| {
+            malformed(
+                &self.store.void_path,
+                format!("VoID count lexical form {lexical:?} is not unsigned: {error}"),
+            )
+        })
+    }
+
+    fn object_to_subject(&self, object: TermId, context: &str) -> Result<TermId> {
+        let dictionary = self.store.void.dict();
+        let mut buffer = Vec::new();
+        let term = dictionary.extract(Role::Object, object, &mut buffer)?;
+        dictionary.locate(Role::Subject, term)?.ok_or_else(|| {
+            malformed(
+                &self.store.void_path,
+                format!("{context} object id {} is not a VoID subject", object.0),
+            )
         })
     }
 }
@@ -685,26 +1168,53 @@ mod tests {
 
     struct PublishedDescription {
         alice: u64,
-        bob: u64,
     }
 
     const VERIFIED_VOID_NT: &str = concat!(
         "<https://example.org/queryable> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+        "<https://example.org/queryable> <http://rdfs.org/ns/void#triples> \"100\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
         "<https://example.org/design> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+        "<https://example.org/design> <http://rdfs.org/ns/void#triples> \"100\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+        "<https://example.org/design> <http://rdfs.org/ns/void#distinctSubjects> \"10\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+        "<https://example.org/design> <http://rdfs.org/ns/void#distinctObjects> \"20\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+        "<https://example.org/design> <http://rdfs.org/ns/void#properties> \"2\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
         "<https://example.org/queryable> <http://rdfs.org/ns/void#subset> <https://example.org/design> .\n",
+        "<https://example.org/design> <http://rdfs.org/ns/void#propertyPartition> <https://example.org/root-property> .\n",
+        "<https://example.org/root-property> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+        "<https://example.org/root-property> <http://rdfs.org/ns/void#property> <https://example.org/root-p> .\n",
+        "<https://example.org/root-property> <http://rdfs.org/ns/void#triples> \"100\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
         "<https://example.org/design> <http://rdfs.org/ns/void#classPartition> <https://example.org/class-a> .\n",
         "<https://example.org/class-a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
         "<https://example.org/class-a> <http://rdfs.org/ns/void#class> <https://example.org/A> .\n",
+        "<https://example.org/class-a> <http://rdfs.org/ns/void#entities> \"4\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+        "<https://example.org/class-a> <http://rdfs.org/ns/void#triples> \"8\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
         "<https://example.org/class-a> <http://rdfs.org/ns/void#propertyPartition> <https://example.org/property-p> .\n",
         "<https://example.org/property-p> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
         "<https://example.org/property-p> <http://rdfs.org/ns/void#property> <https://example.org/p> .\n",
+        "<https://example.org/property-p> <http://rdfs.org/ns/void#triples> \"8\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
         "<https://example.org/property-p> <http://ldf.fi/void-ext#objectClassPartition> <https://example.org/target-b> .\n",
         "<https://example.org/target-b> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
         "<https://example.org/target-b> <http://rdfs.org/ns/void#class> <https://example.org/B> .\n",
         "<https://example.org/target-b> <http://rdfs.org/ns/void#triples> \"5\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
-        "<https://example.org/property-p> <http://ldf.fi/void-ext#datatypePartition> <https://example.org/datatype> .\n",
-        "<https://example.org/datatype> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
-        "<https://example.org/datatype> <http://ldf.fi/void-ext#datatype> <https://example.org/Type> .\n",
+        "<https://example.org/property-p> <http://ldf.fi/void-ext#objectClassPartition> <https://example.org/target-untyped> .\n",
+        "<https://example.org/target-untyped> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+        "<https://example.org/target-untyped> <http://rdfs.org/ns/void#triples> \"3\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+        "<https://example.org/property-p> <http://ldf.fi/void-ext#datatypePartition> <https://example.org/datatype-type> .\n",
+        "<https://example.org/datatype-type> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+        "<https://example.org/datatype-type> <http://ldf.fi/void-ext#datatype> <https://example.org/Type> .\n",
+        "<https://example.org/datatype-type> <http://rdfs.org/ns/void#triples> \"3\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+        "<https://example.org/property-p> <http://ldf.fi/void-ext#datatypePartition> <https://example.org/datatype-language> .\n",
+        "<https://example.org/datatype-language> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+        "<https://example.org/datatype-language> <http://ldf.fi/void-ext#datatype> <http://www.w3.org/1999/02/22-rdf-syntax-ns#langString> .\n",
+        "<https://example.org/datatype-language> <http://rdfs.org/ns/void#triples> \"2\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+        "<https://example.org/datatype-language> <http://ldf.fi/void-ext#languagePartition> <https://example.org/language-en> .\n",
+        "<https://example.org/language-en> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+        "<https://example.org/language-en> <http://ldf.fi/void-ext#language> \"en\" .\n",
+        "<https://example.org/language-en> <http://rdfs.org/ns/void#triples> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+        "<https://example.org/datatype-language> <http://ldf.fi/void-ext#languagePartition> <https://example.org/language-fr> .\n",
+        "<https://example.org/language-fr> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+        "<https://example.org/language-fr> <http://ldf.fi/void-ext#language> \"fr\" .\n",
+        "<https://example.org/language-fr> <http://rdfs.org/ns/void#triples> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
     );
 
     fn publish_description(fixture: &Fixture) -> PublishedDescription {
@@ -843,10 +1353,7 @@ mod tests {
         )
         .unwrap();
 
-        PublishedDescription {
-            alice: ids.0,
-            bob: ids.1,
-        }
+        PublishedDescription { alice: ids.0 }
     }
 
     fn append_view(
@@ -901,6 +1408,21 @@ mod tests {
         Store::open(&published, OpenOptions::default()).unwrap()
     }
 
+    fn schema_term(description: &DescriptionStore, node: SchemaNode) -> Option<String> {
+        let term = node.term()?;
+        let mut buffer = Vec::new();
+        Some(
+            String::from_utf8(
+                description
+                    .dict()
+                    .extract(Role::Object, term, &mut buffer)
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap(),
+        )
+    }
+
     fn publish_verified_description(fixture: &Fixture) {
         let (ids, triples, counts) = {
             let indexed = IndexedHdt::open(fixture.map_hdt(), fixture.map_perm()).unwrap();
@@ -917,8 +1439,10 @@ mod tests {
                     subject(b"https://example.org/queryable"),
                     subject(b"https://example.org/design"),
                     subject(b"https://example.org/class-a"),
+                    subject(b"https://example.org/root-property"),
                     subject(b"https://example.org/property-p"),
-                    subject(b"https://example.org/datatype"),
+                    subject(b"https://example.org/datatype-type"),
+                    subject(b"https://example.org/datatype-language"),
                 ],
                 indexed.triples(),
                 *indexed.dict_counts(),
@@ -928,18 +1452,25 @@ mod tests {
         let mut schema = SCHEMA_NODES_HEADER.to_vec();
         let mut schema_views = BTreeMap::new();
         let schema_rows = |root: u64| {
-            vec![
+            let mut rows = vec![
                 format!("class\thttps://example.org/A\t\t\t{}", ids[2]),
                 format!("dataset\t\t\t\t{root}"),
                 format!(
-                    "datatype\thttps://example.org/A\thttps://example.org/p\thttps://example.org/Type\t{}",
-                    ids[4]
+                    "datatype\thttps://example.org/A\thttps://example.org/p\thttp://www.w3.org/1999/02/22-rdf-syntax-ns#langString\t{}",
+                    ids[6]
                 ),
                 format!(
-                    "property\thttps://example.org/A\thttps://example.org/p\t\t{}",
-                    ids[3]
+                    "datatype\thttps://example.org/A\thttps://example.org/p\thttps://example.org/Type\t{}",
+                    ids[5]
                 ),
-            ]
+                format!("property\t\thttps://example.org/root-p\t\t{}", ids[3]),
+                format!(
+                    "property\thttps://example.org/A\thttps://example.org/p\t\t{}",
+                    ids[4]
+                ),
+            ];
+            rows.sort();
+            rows
         };
         append_view(
             &mut schema,
@@ -1137,53 +1668,62 @@ mod tests {
 
     #[test]
     fn semantic_selectors_binary_search_each_declared_view() {
-        let fixture = Fixture::build(TINY_NT);
-        let expected = publish_description(&fixture);
+        let fixture = Fixture::build(VERIFIED_VOID_NT);
+        publish_verified_description(&fixture);
         let store = opened_description(&fixture);
         let description = store.description().expect("tier-1 description");
 
         let design = description.view(&StatsView::Design).unwrap();
-        assert_eq!(design.schema_rows(), 4);
-        assert_eq!(design.class_relation_rows(), 3);
+        assert_eq!(design.schema_rows(), 6);
+        assert_eq!(design.class_relation_rows(), 1);
+
+        let root = design
+            .schema_node(SchemaSelector::Dataset)
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.kind(), SchemaNodeKind::Dataset);
+        assert_eq!(root.term(), None);
         assert_eq!(
-            design.schema_node(SchemaSelector::Dataset).unwrap(),
-            Some(SchemaNode {
-                subject: TermId(expected.bob)
-            })
+            root.counts(),
+            SchemaCounts {
+                entities: None,
+                triples: Some(100),
+                distinct_subjects: Some(10),
+                distinct_objects: Some(20),
+                properties: Some(2),
+            }
         );
-        assert_eq!(
-            design
-                .schema_node(SchemaSelector::Class {
-                    class: "https://example.org/A"
-                })
-                .unwrap(),
-            Some(SchemaNode {
-                subject: TermId(expected.alice)
+
+        let class = design
+            .schema_node(SchemaSelector::Class {
+                class: "https://example.org/A",
             })
-        );
-        assert_eq!(
-            design
-                .schema_node(SchemaSelector::Property {
-                    class: None,
-                    predicate: "https://example.org/p1"
-                })
-                .unwrap(),
-            Some(SchemaNode {
-                subject: TermId(expected.bob)
+            .unwrap()
+            .unwrap();
+        assert_eq!(class.kind(), SchemaNodeKind::Class);
+        assert_eq!(class.counts().entities, Some(4));
+        assert_eq!(class.counts().triples, Some(8));
+
+        let property = design
+            .schema_node(SchemaSelector::Property {
+                class: None,
+                predicate: "https://example.org/root-p",
             })
-        );
-        assert_eq!(
-            design
-                .schema_node(SchemaSelector::Datatype {
-                    class: None,
-                    predicate: "https://example.org/p1",
-                    datatype: "https://example.org/Type"
-                })
-                .unwrap(),
-            Some(SchemaNode {
-                subject: TermId(expected.alice)
+            .unwrap()
+            .unwrap();
+        assert_eq!(property.kind(), SchemaNodeKind::Property);
+        assert_eq!(property.counts().triples, Some(100));
+
+        let datatype = design
+            .schema_node(SchemaSelector::Datatype {
+                class: Some("https://example.org/A"),
+                predicate: "https://example.org/p",
+                datatype: "https://example.org/Type",
             })
-        );
+            .unwrap()
+            .unwrap();
+        assert_eq!(datatype.kind(), SchemaNodeKind::Datatype);
+        assert_eq!(datatype.counts().triples, Some(3));
         assert_eq!(
             design
                 .schema_node(SchemaSelector::Property {
@@ -1211,17 +1751,190 @@ mod tests {
         let component = description
             .view(&StatsView::component("canonical").unwrap())
             .unwrap();
-        assert_eq!(
-            component.schema_node(SchemaSelector::Dataset).unwrap(),
-            Some(SchemaNode {
-                subject: TermId(expected.bob)
-            })
-        );
+        let component_root = component
+            .schema_node(SchemaSelector::Dataset)
+            .unwrap()
+            .unwrap();
+        assert_eq!(component_root.subject(), root.subject());
         assert!(
             description
                 .view(&StatsView::component("unknown").unwrap())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn typed_child_queries_cover_every_valid_selector_collection_pair() {
+        let fixture = Fixture::build(VERIFIED_VOID_NT);
+        publish_verified_description(&fixture);
+        let store = opened_description(&fixture);
+        let description = store.description().unwrap();
+        let view = description.view(&StatsView::Design).unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+
+        let cases = [
+            (
+                SchemaChildQuery::Classes,
+                SchemaCollection::Classes,
+                SchemaNodeKind::Class,
+                vec!["https://example.org/A"],
+            ),
+            (
+                SchemaChildQuery::DatasetProperties,
+                SchemaCollection::Properties,
+                SchemaNodeKind::Property,
+                vec!["https://example.org/root-p"],
+            ),
+            (
+                SchemaChildQuery::ClassProperties {
+                    class: "https://example.org/A",
+                },
+                SchemaCollection::Properties,
+                SchemaNodeKind::Property,
+                vec!["https://example.org/p"],
+            ),
+            (
+                SchemaChildQuery::PropertyDatatypes {
+                    class: Some("https://example.org/A"),
+                    predicate: "https://example.org/p",
+                },
+                SchemaCollection::Datatypes,
+                SchemaNodeKind::Datatype,
+                vec![
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString",
+                    "https://example.org/Type",
+                ],
+            ),
+            (
+                SchemaChildQuery::DatatypeLanguages {
+                    class: Some("https://example.org/A"),
+                    predicate: "https://example.org/p",
+                    datatype: "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString",
+                },
+                SchemaCollection::Languages,
+                SchemaNodeKind::Language,
+                vec!["\"en\"", "\"fr\""],
+            ),
+        ];
+
+        for (query, collection, kind, expected_terms) in cases {
+            let mut from = 0;
+            let mut nodes = Vec::new();
+            loop {
+                let page = view.schema_children(query, from, one).unwrap();
+                assert!(page.node.is_some());
+                assert_eq!(page.collection, collection);
+                assert!(page.items.iter().all(|node| node.kind() == kind));
+                nodes.extend(page.items);
+                let Some(next) = page.next else {
+                    break;
+                };
+                assert!(next > from);
+                from = next;
+            }
+            let mut terms: Vec<_> = nodes
+                .into_iter()
+                .map(|node| schema_term(description, node).unwrap())
+                .collect();
+            terms.sort();
+            assert_eq!(terms, expected_terms, "{query:?}");
+        }
+    }
+
+    #[test]
+    fn object_class_children_omit_the_untyped_partition_without_a_phantom_page() {
+        let fixture = Fixture::build(VERIFIED_VOID_NT);
+        publish_verified_description(&fixture);
+        let store = opened_description(&fixture);
+        let description = store.description().unwrap();
+        let view = description.view(&StatsView::Design).unwrap();
+        let query = SchemaChildQuery::PropertyObjectClasses {
+            class: Some("https://example.org/A"),
+            predicate: "https://example.org/p",
+        };
+        let one = NonZeroUsize::new(1).unwrap();
+
+        let first = view.schema_children(query, 0, one).unwrap();
+        assert_eq!(first.collection, SchemaCollection::ObjectClasses);
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.next, None);
+        assert_eq!(first.node.unwrap().counts().triples, Some(8));
+        let child = first.items[0];
+        assert_eq!(child.kind(), SchemaNodeKind::ObjectClass);
+        assert_eq!(
+            schema_term(description, child).as_deref(),
+            Some("https://example.org/B")
+        );
+        assert_eq!(child.counts().triples, Some(5));
+    }
+
+    #[test]
+    fn absent_parent_and_past_end_child_positions_are_complete_empty_pages() {
+        let fixture = Fixture::build(VERIFIED_VOID_NT);
+        publish_verified_description(&fixture);
+        let store = opened_description(&fixture);
+        let description = store.description().unwrap();
+        let view = description.view(&StatsView::Design).unwrap();
+        let one = NonZeroUsize::new(1).unwrap();
+
+        let absent = view
+            .schema_children(
+                SchemaChildQuery::ClassProperties {
+                    class: "https://example.org/missing",
+                },
+                0,
+                one,
+            )
+            .unwrap();
+        assert_eq!(absent.node, None);
+        assert!(absent.items.is_empty());
+        assert_eq!(absent.next, None);
+
+        let past_end = view
+            .schema_children(SchemaChildQuery::Classes, u64::MAX, one)
+            .unwrap();
+        assert!(past_end.node.is_some());
+        assert!(past_end.items.is_empty());
+        assert_eq!(past_end.next, None);
+
+        let queryable = description.view(&StatsView::Queryable).unwrap();
+        let queryable_classes = queryable
+            .schema_children(SchemaChildQuery::Classes, 0, one)
+            .unwrap();
+        assert!(queryable_classes.node.is_some());
+        assert!(queryable_classes.items.is_empty());
+
+        let component = description
+            .view(&StatsView::component("canonical").unwrap())
+            .unwrap();
+        let component_classes = component
+            .schema_children(SchemaChildQuery::Classes, 0, one)
+            .unwrap();
+        assert_eq!(component_classes.items.len(), 1);
+        assert_eq!(
+            schema_term(description, component_classes.items[0]).as_deref(),
+            Some("https://example.org/A")
+        );
+    }
+
+    #[test]
+    fn void_traversal_exposes_the_complete_indexed_graph_and_dictionary() {
+        let fixture = Fixture::build(VERIFIED_VOID_NT);
+        publish_verified_description(&fixture);
+        let store = opened_description(&fixture);
+        let description = store.description().unwrap();
+        let selection = description.void_triples().unwrap();
+        let count = selection.count().value;
+        assert_eq!(count, VERIFIED_VOID_NT.lines().count() as u64);
+
+        let triples: Vec<_> = selection.page(0, usize::MAX).collect();
+        assert_eq!(triples.len() as u64, count);
+        let mut buffer = Vec::new();
+        let predicate = description
+            .dict()
+            .extract(Role::Predicate, TermId(triples[0].predicate), &mut buffer)
+            .unwrap();
+        assert!(!predicate.is_empty());
     }
 
     #[test]
@@ -1347,5 +2060,33 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn a_malformed_void_count_is_reported_when_its_node_is_projected() {
+        let valid = concat!(
+            "<https://example.org/design> <http://rdfs.org/ns/void#triples> ",
+            "\"100\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
+        );
+        let invalid = concat!(
+            "<https://example.org/design> <http://rdfs.org/ns/void#triples> ",
+            "\"many\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
+        );
+        let malformed_void = VERIFIED_VOID_NT.replace(valid, invalid);
+        assert_ne!(malformed_void, VERIFIED_VOID_NT);
+        let fixture = Fixture::build(&malformed_void);
+        publish_verified_description(&fixture);
+        let store = opened_description(&fixture);
+        let error = store
+            .description()
+            .unwrap()
+            .view(&StatsView::Design)
+            .unwrap()
+            .schema_node(SchemaSelector::Dataset)
+            .expect_err("invalid integer lexical form must not become a count");
+        assert!(
+            error.to_string().contains("is not unsigned"),
+            "unexpected error: {error}"
+        );
     }
 }
