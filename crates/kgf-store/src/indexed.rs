@@ -31,10 +31,7 @@ impl IndexedHdt {
 
     /// The dictionary projected from the host HDT.
     pub(crate) fn dict(&self) -> Dictionary<'_> {
-        self.permutations
-            .hdt_layout()
-            .dictionary()
-            .view(self.permutations.hdt_mapping())
+        self.permutations.dict()
     }
 
     /// The host's three permutations.

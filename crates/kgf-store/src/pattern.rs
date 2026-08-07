@@ -209,7 +209,7 @@ pub enum SubjectObjectRoute {
 /// mapping that had been unmapped. [`Store::resolve`](crate::store::Store::resolve)
 /// is the entry point callers use; this is where the §20.2 dispatch lives.
 pub fn resolve(perms: &Permutations, pattern: IdPattern) -> Result<Selection<'_>> {
-    validate_pattern(perms.hdt_layout().dictionary().counts(), pattern)?;
+    validate_pattern(perms.dict_counts(), pattern)?;
 
     Ok(match (pattern.subject, pattern.predicate, pattern.object) {
         (None, None, None) => contiguous(Permutation::Spo, perms.spo(), 0..perms.triples()),
@@ -505,10 +505,7 @@ mod tests {
         let fixture = Fixture::build(TINY_NT);
         let permutations =
             Permutations::open(fixture.map_hdt(), fixture.map_perm()).expect("open permutations");
-        let dictionary = permutations
-            .hdt_layout()
-            .dictionary()
-            .view(permutations.hdt_mapping());
+        let dictionary = permutations.dict();
         let counts = *dictionary.counts();
         let source = tiny_id_triples(&dictionary);
 
@@ -583,10 +580,7 @@ mod tests {
         let fixture = Fixture::build(TINY_NT);
         let permutations =
             Permutations::open(fixture.map_hdt(), fixture.map_perm()).expect("open permutations");
-        let dictionary = permutations
-            .hdt_layout()
-            .dictionary()
-            .view(permutations.hdt_mapping());
+        let dictionary = permutations.dict();
 
         let alice_s = id(&dictionary, Role::Subject, b"http://example.org/alice");
         let alice_o = id(&dictionary, Role::Object, b"http://example.org/alice");
@@ -680,7 +674,7 @@ mod tests {
         let fixture = Fixture::build(TINY_NT);
         let permutations =
             Permutations::open(fixture.map_hdt(), fixture.map_perm()).expect("open permutations");
-        let counts = permutations.hdt_layout().dictionary().counts();
+        let counts = permutations.dict_counts();
         let total = permutations.triples();
 
         let by_predicate: u64 = (1..=counts.len(Role::Predicate))
@@ -748,7 +742,7 @@ mod tests {
         let fixture = Fixture::build(TINY_NT);
         let permutations =
             Permutations::open(fixture.map_hdt(), fixture.map_perm()).expect("open permutations");
-        let counts = permutations.hdt_layout().dictionary().counts();
+        let counts = permutations.dict_counts();
 
         for (role, maximum) in [
             (Role::Subject, counts.len(Role::Subject)),
@@ -814,10 +808,7 @@ mod tests {
         let fixture = Fixture::build(&source);
         let permutations =
             Permutations::open(fixture.map_hdt(), fixture.map_perm()).expect("open permutations");
-        let dictionary = permutations
-            .hdt_layout()
-            .dictionary()
-            .view(permutations.hdt_mapping());
+        let dictionary = permutations.dict();
         let subject = id(&dictionary, Role::Subject, b"http://example.org/s");
         let object = id(&dictionary, Role::Object, b"http://example.org/hub");
         let selection = resolve(

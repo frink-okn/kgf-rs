@@ -577,10 +577,7 @@ mod tests {
         let fixture = Fixture::build(TINY_NT);
         let permutations =
             Permutations::open(fixture.map_hdt(), fixture.map_perm()).expect("open permutations");
-        let dictionary = permutations
-            .hdt_layout()
-            .dictionary()
-            .view(permutations.hdt_mapping());
+        let dictionary = permutations.dict();
         let counts = *dictionary.counts();
         let triples = tiny_id_triples(&dictionary);
 
