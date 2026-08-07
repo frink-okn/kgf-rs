@@ -47,6 +47,7 @@ pub mod catalog;
 pub mod dict;
 pub mod error;
 pub mod hdt;
+mod indexed;
 pub mod manifest;
 pub mod pattern;
 pub mod perm;

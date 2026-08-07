@@ -16,6 +16,7 @@ use hdtc::format::{GraphIndexOpenError, TextSearcher};
 
 use crate::dict::Dictionary;
 use crate::error::{Error, Result};
+use crate::indexed::IndexedHdt;
 use crate::map::{PublishedBundle, open_published};
 use crate::pattern::{IdPattern, Selection};
 use crate::perm::Permutations;
@@ -59,7 +60,7 @@ pub struct OpenOptions {}
 /// and needs no synchronisation.
 pub struct Store {
     bundle: PublishedBundle,
-    perms: Permutations,
+    data: IndexedHdt,
     text: Option<TextSearcher>,
 }
 
@@ -71,7 +72,7 @@ impl std::fmt::Debug for Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Store")
             .field("bundle", &self.bundle)
-            .field("perms", &self.perms)
+            .field("data", &self.data)
             .field("text", &self.text.is_some())
             .finish()
     }
@@ -102,13 +103,13 @@ impl Store {
 
         let hdt = open_published(bundle, &artifacts.hdt)?;
         let perm = open_published(bundle, &artifacts.perm)?;
-        let perms = Permutations::open(hdt, perm)?;
+        let data = IndexedHdt::open(hdt, perm)?;
 
         artifacts.verify_graph_index()?;
 
         Ok(Self {
             bundle: bundle.clone(),
-            perms,
+            data,
             text: artifacts.open_text()?,
         })
     }
@@ -120,15 +121,12 @@ impl Store {
 
     /// The dictionary.
     pub fn dict(&self) -> Dictionary<'_> {
-        self.perms
-            .hdt_layout()
-            .dictionary()
-            .view(self.perms.hdt_mapping())
+        self.data.dict()
     }
 
     /// The permutations.
     pub fn perms(&self) -> &Permutations {
-        &self.perms
+        self.data.permutations()
     }
 
     /// The full-text index over this bundle's literals, if it published one.
@@ -147,7 +145,7 @@ impl Store {
 
     /// Total triples in the bundle.
     pub fn triples(&self) -> u64 {
-        self.perms.triples()
+        self.data.triples()
     }
 
     /// Resolve a pattern. `O(log N)`; enumerates nothing.
@@ -158,7 +156,7 @@ impl Store {
     /// §20.4), so nothing needs to outlive the borrow; resumption goes through
     /// an encoded cursor token, not a live `Selection`.
     pub fn resolve(&self, pattern: IdPattern) -> Result<Selection<'_>> {
-        crate::pattern::resolve(&self.perms, pattern)
+        self.data.resolve(pattern)
     }
 }
 

@@ -40,8 +40,8 @@ use serde::{Deserialize, Serialize};
 use crate::Role;
 use crate::dict::DictCounts;
 use crate::error::{Error, Result};
+use crate::indexed::IndexedHdt;
 use crate::map::{PublishedBundle, open_published};
-use crate::perm::Permutations;
 use crate::store::{ArtifactSet, artifact};
 
 /// The manifest format version this build reads and writes (doc 04 §4.3).
@@ -181,7 +181,7 @@ impl BundleFacts {
 
         let hdt = open_published(bundle, &artifacts.hdt)?;
         let perm = open_published(bundle, &artifacts.perm)?;
-        let perms = Permutations::open(hdt, perm)?;
+        let data = IndexedHdt::open(hdt, perm)?;
 
         artifacts.verify_graph_index()?;
         // A manifest must not describe an optional capability whose complete
@@ -191,8 +191,8 @@ impl BundleFacts {
         let _text = artifacts.open_text()?;
 
         Ok(Self {
-            triples: perms.triples(),
-            counts: *perms.dict_counts(),
+            triples: data.triples(),
+            counts: *data.dict_counts(),
             capabilities: capabilities_for(&artifacts),
             artifact_names: artifact_names_for(&artifacts),
         })
