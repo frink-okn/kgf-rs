@@ -31,9 +31,9 @@
 //! # Status
 //!
 //! The mapped query core is implemented: immutable store opening, dictionary and
-//! permutation traversal, all eight triple patterns, and the lazy multi-tenant
-//! catalog. Composed optional-sidecar operations and the HTTP layer are later
-//! milestones in their owning modules/crates.
+//! permutation traversal, all eight triple patterns, the lazy multi-tenant
+//! catalog, and mapped navigation over the description indexes. HTTP operations
+//! remain in `kgf-server`, outside this crate.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -44,6 +44,7 @@
 pub mod map;
 
 pub mod catalog;
+pub mod description;
 pub mod dict;
 pub mod error;
 pub mod hdt;
@@ -61,6 +62,11 @@ pub mod store;
 pub mod testing;
 
 pub use catalog::Catalog;
+pub use description::{
+    ClassRelation, ClassRelationFilter, ClassRelationPage, ClassRelationPosition,
+    ClassRelationStop, ComponentId, DescriptionStore, DescriptionView, SchemaNode, SchemaSelector,
+    StatsView,
+};
 pub use error::{Error, Result};
 pub use manifest::{BundleFacts, Capability, Manifest, ManifestDocument};
 pub use map::{PublishedBundle, PublishedRoot};

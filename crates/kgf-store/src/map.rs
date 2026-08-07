@@ -110,8 +110,9 @@ impl PublishedBundle {
     ///
     /// From construction until this capability and every derived
     /// [`Store`](crate::store::Store) have been dropped, `dir` must keep resolving
-    /// to the same directory, its artifact entries and symlinks must not be
-    /// replaced, and the target files must not be modified or truncated.
+    /// to the same directory, its artifact entries and symlinks at every depth
+    /// must not be replaced, and the target files must not be modified or
+    /// truncated.
     pub unsafe fn new(dir: &Path) -> Self {
         Self {
             dir: dir.to_path_buf(),
@@ -152,9 +153,9 @@ impl PublishedRoot {
     ///
     /// From construction until this capability and every derived store have
     /// been dropped, every discovered bundle path must keep resolving to the
-    /// same directory, its artifact entries and symlinks must not be replaced,
-    /// and the target files must not be modified or truncated. Adding unrelated
-    /// entries beneath `root` is allowed.
+    /// same directory, its artifact entries and symlinks at every depth must not
+    /// be replaced, and the target files must not be modified or truncated.
+    /// Adding unrelated entries beneath `root` is allowed.
     pub unsafe fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
@@ -286,15 +287,23 @@ impl Mapping {
 /// immutability part of what a published version means. Keeping the one unsafe
 /// acknowledgement here preserves this module as the complete audited surface.
 pub(crate) fn open_published(bundle: &PublishedBundle, path: &Path) -> Result<Mapping> {
-    assert_eq!(
-        path.parent(),
-        Some(bundle.path()),
-        "mapped artifact {} is not directly inside published bundle {}",
-        path.display(),
-        bundle.path().display()
+    let relative = path.strip_prefix(bundle.path()).unwrap_or_else(|_| {
+        panic!(
+            "mapped artifact {} is outside published bundle {}",
+            path.display(),
+            bundle.path().display()
+        )
+    });
+    assert!(
+        relative.components().next().is_some()
+            && relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "mapped artifact {} does not name a contained bundle artifact",
+        path.display()
     );
     // SAFETY: constructing `bundle` established that every artifact reachable
-    // through this directory remains immutable for the mapping's lifetime.
+    // beneath this directory remains immutable for the mapping's lifetime.
     unsafe { Mapping::open(path) }
 }
 
@@ -739,6 +748,27 @@ impl<'a> BitmapView<'a> {
 mod tests {
     use super::*;
     use crate::testing::{Rng, bit};
+
+    #[test]
+    fn a_nested_bundle_artifact_is_inside_the_published_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let stats = temp.path().join("stats");
+        std::fs::create_dir(&stats).unwrap();
+        let artifact = stats.join("void.hdt");
+        std::fs::write(&artifact, [1]).unwrap();
+
+        let bundle = PublishedBundle::for_test(temp.path());
+        let mapping = open_published(&bundle, &artifact).unwrap();
+
+        assert_eq!(mapping.as_bytes(), [1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not name a contained bundle artifact")]
+    fn a_lexical_escape_is_not_covered_by_the_published_capability() {
+        let bundle = PublishedBundle::for_test(Path::new("/published/bundle"));
+        let _ = open_published(&bundle, Path::new("/published/bundle/../elsewhere"));
+    }
 
     /// Encode `values` at `width` bits each, one bit at a time.
     ///

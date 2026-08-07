@@ -14,13 +14,15 @@
 //! budgets, formats, or cursors. What the server does with a capability — route
 //! an operation or answer `capability_not_available` — stays in `kgf-server`.
 //!
-//! # Not read by `Store::open`
+//! # Read only for description navigation
 //!
 //! [`Store::open`](crate::store::Store::open) requires `manifest.json` to
-//! *exist*, because a directory without one is not a bundle, but never parses
-//! it. The query core answers patterns from `data.hdt` and `data.hdt.perm`
-//! alone, and keeping the parse out of `open` is what lets the store stay
-//! testable headless against fixture bundles that carry a placeholder.
+//! *exist*, because a directory without one is not a bundle. A tier-0 store
+//! does not parse it: the query core answers patterns from `data.hdt` and
+//! `data.hdt.perm` alone. A description-bearing store parses the manifest once
+//! because its typed view directory is the bounded navigation metadata for the
+//! two mapped TSV indexes. It still scans no payload and retains no structure
+//! proportional to the number of description rows.
 //!
 //! # Producing one
 //!
@@ -184,6 +186,7 @@ impl BundleFacts {
         let data = IndexedHdt::open(hdt, perm)?;
 
         artifacts.verify_graph_index()?;
+        let _description = artifacts.open_description(bundle)?;
         // A manifest must not describe an optional capability whose complete
         // artifact cannot be opened. Reading only hdtc-text.meta would accept
         // a directory with corrupt Tantivy metadata or segment files, while
@@ -289,6 +292,9 @@ fn artifact_names_for(artifacts: &ArtifactSet) -> Vec<&'static str> {
     if artifacts.text.is_some() {
         names.push(artifact::TEXT);
     }
+    if let Some(description) = &artifacts.description {
+        names.extend(description.paths().map(|(name, _)| name));
+    }
     names
 }
 
@@ -341,13 +347,46 @@ pub struct Publisher {
     pub contact: Option<String>,
 }
 
-/// One artifact's size and checksum.
+/// One contiguous view block in a row-oriented artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactView {
+    /// Byte offset of the first complete row in this view.
+    pub offset: u64,
+    /// Exact byte length of the view block.
+    pub bytes: u64,
+    /// Number of rows in the block.
+    pub rows: u64,
+}
+
+/// One artifact's checksum and optional row-index metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactEntry {
     /// Size in bytes.
     pub bytes: u64,
     /// Lowercase hex SHA-256 of the file's contents.
     pub sha256: String,
+    /// Artifacts from which this recoverable index was derived.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parents: Vec<String>,
+    /// Verified maximum complete-row length for bounded mapped searches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_row_bytes: Option<u64>,
+    /// Contiguous byte ranges for the semantic views in this artifact.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub views: BTreeMap<String, ArtifactView>,
+}
+
+impl ArtifactEntry {
+    /// Construct an ordinary artifact entry with no row-index metadata.
+    pub fn checksum(bytes: u64, sha256: impl Into<String>) -> Self {
+        Self {
+            bytes,
+            sha256: sha256.into(),
+            parents: Vec::new(),
+            max_row_bytes: None,
+            views: BTreeMap::new(),
+        }
+    }
 }
 
 /// A bundle manifest.
@@ -434,7 +473,7 @@ impl Manifest {
     /// For readers. A *writer* wants [`ManifestDocument::read`], which also
     /// keeps the fields this build does not model.
     pub fn read(bundle_dir: &Path) -> Result<Self> {
-        ManifestDocument::read(bundle_dir)?
+        let manifest = ManifestDocument::read(bundle_dir)?
             .ok_or_else(|| {
                 Error::Io(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
@@ -444,7 +483,18 @@ impl Manifest {
                     ),
                 ))
             })?
-            .into_parsed()
+            .into_parsed()?;
+        manifest.validate(bundle_dir)?;
+        Ok(manifest)
+    }
+
+    /// Validate cross-field constraints not expressible through serde types.
+    ///
+    /// Writers call this before publication; [`read`](Self::read) applies the
+    /// same checks to an existing document. The path is used only to identify
+    /// `manifest.json` in an error.
+    pub fn validate(&self, bundle_dir: &Path) -> Result<()> {
+        self.validate_description_artifacts(bundle_dir)
     }
 
     /// Serialize to the canonical on-disk bytes: two-space indent, trailing
@@ -461,6 +511,100 @@ impl Manifest {
     /// Whether this bundle declares `capability`.
     pub fn declares(&self, capability: Capability) -> bool {
         self.capabilities.contains_key(capability.as_str())
+    }
+
+    /// Validate the all-or-none description set and its mapped-row metadata.
+    fn validate_description_artifacts(&self, bundle_dir: &Path) -> Result<()> {
+        let path = bundle_dir.join(artifact::MANIFEST);
+        let syntax = |detail: String| Error::ManifestSyntax {
+            path: path.clone(),
+            detail,
+        };
+
+        let present = artifact::DESCRIPTION
+            .iter()
+            .copied()
+            .filter(|name| self.artifacts.contains_key(*name))
+            .count();
+        if present == 0 {
+            return Ok(());
+        }
+        if present != artifact::DESCRIPTION.len() {
+            let missing = artifact::DESCRIPTION
+                .iter()
+                .copied()
+                .filter(|name| !self.artifacts.contains_key(*name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(syntax(format!(
+                "description artifacts are incomplete; missing {missing}"
+            )));
+        }
+
+        for name in [artifact::SCHEMA_NODES, artifact::CLASS_RELATIONS] {
+            let entry = self
+                .artifacts
+                .get(name)
+                .expect("the complete description set contains both TSV indexes");
+            if entry.parents.len() != 1 || entry.parents[0] != artifact::VOID_HDT {
+                return Err(syntax(format!(
+                    "artifact {name} must declare parents: [\"{}\"]",
+                    artifact::VOID_HDT
+                )));
+            }
+            if entry.max_row_bytes.is_none() {
+                return Err(syntax(format!(
+                    "artifact {name} must declare max_row_bytes"
+                )));
+            }
+            for required in ["design", "queryable"] {
+                if !entry.views.contains_key(required) {
+                    return Err(syntax(format!(
+                        "artifact {name} has no {required:?} view range"
+                    )));
+                }
+            }
+            for (view, range) in &entry.views {
+                let valid_name = matches!(view.as_str(), "design" | "queryable")
+                    || view
+                        .strip_prefix("component:")
+                        .is_some_and(|component| !component.is_empty());
+                if !valid_name {
+                    return Err(syntax(format!(
+                        "artifact {name} has invalid view name {view:?}"
+                    )));
+                }
+                let end = range.offset.checked_add(range.bytes).ok_or_else(|| {
+                    syntax(format!(
+                        "artifact {name} view {view:?} byte range overflows"
+                    ))
+                })?;
+                if end > entry.bytes {
+                    return Err(syntax(format!(
+                        "artifact {name} view {view:?} ends at byte {end}, beyond artifact size {}",
+                        entry.bytes
+                    )));
+                }
+            }
+        }
+        let schema_views = &self
+            .artifacts
+            .get(artifact::SCHEMA_NODES)
+            .expect("the complete description set contains schema nodes")
+            .views;
+        let relation_views = &self
+            .artifacts
+            .get(artifact::CLASS_RELATIONS)
+            .expect("the complete description set contains class relations")
+            .views;
+        if !schema_views.keys().eq(relation_views.keys()) {
+            return Err(syntax(format!(
+                "artifacts {} and {} must declare the same views",
+                artifact::SCHEMA_NODES,
+                artifact::CLASS_RELATIONS
+            )));
+        }
+        Ok(())
     }
 
     /// Check that this manifest still describes the artifacts beside it.
@@ -707,6 +851,28 @@ mod tests {
         BundleFacts::read(&bundle).unwrap()
     }
 
+    fn add_description_set(fixture: &Fixture) {
+        let bundle = fixture.bundle_path();
+        std::fs::create_dir_all(bundle.join("stats")).unwrap();
+        std::fs::copy(fixture.hdt_path(), bundle.join(artifact::VOID_HDT)).unwrap();
+        std::fs::copy(fixture.perm_path(), bundle.join(artifact::VOID_PERM)).unwrap();
+        for (name, bytes) in [
+            (
+                artifact::SCHEMA_NODES,
+                b"view\tkind\tclass\tpredicate\tdatatype\tsubject_id\n".as_slice(),
+            ),
+            (
+                artifact::CLASS_RELATIONS,
+                b"view\tsubject_class\tpredicate\tobject_class\ttriples\n".as_slice(),
+            ),
+            (artifact::NAMESPACES, b"{}\n".as_slice()),
+            (artifact::SUMMARY_JSON, b"{}\n".as_slice()),
+            (artifact::SUMMARY_MD, b"# Summary\n".as_slice()),
+        ] {
+            std::fs::write(bundle.join(name), bytes).unwrap();
+        }
+    }
+
     #[test]
     fn facts_read_without_a_manifest_being_parsed() {
         let fixture = Fixture::build(TINY_NT);
@@ -781,6 +947,21 @@ mod tests {
                 artifact::GRAPHS,
                 artifact::GRAPHS_IDX
             ]
+        );
+    }
+
+    #[test]
+    fn a_complete_description_set_joins_the_bundle_identity() {
+        let fixture = Fixture::build(TINY_NT);
+        add_description_set(&fixture);
+
+        let names: Vec<_> = facts(&fixture).artifact_names().collect();
+        assert_eq!(
+            names,
+            [artifact::HDT, artifact::PERM]
+                .into_iter()
+                .chain(artifact::DESCRIPTION)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -894,6 +1075,103 @@ mod tests {
         assert_eq!(parsed.to_json_bytes().unwrap(), bytes);
         assert!(parsed.declares(Capability::Sample));
         assert!(!parsed.declares(Capability::Search));
+    }
+
+    #[test]
+    fn description_view_directories_are_typed_and_all_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manifest = sample_manifest(sample_counts());
+        for name in artifact::DESCRIPTION {
+            manifest
+                .artifacts
+                .insert(name.to_owned(), ArtifactEntry::checksum(100, "abc"));
+        }
+        for name in [artifact::SCHEMA_NODES, artifact::CLASS_RELATIONS] {
+            let entry = manifest.artifacts.get_mut(name).unwrap();
+            entry.parents = vec![artifact::VOID_HDT.to_owned()];
+            entry.max_row_bytes = Some(80);
+            entry.views = BTreeMap::from([
+                (
+                    "design".to_owned(),
+                    ArtifactView {
+                        offset: 50,
+                        bytes: 20,
+                        rows: 1,
+                    },
+                ),
+                (
+                    "queryable".to_owned(),
+                    ArtifactView {
+                        offset: 70,
+                        bytes: 20,
+                        rows: 1,
+                    },
+                ),
+            ]);
+        }
+
+        write_document(
+            dir.path(),
+            &serde_json::to_value(&manifest).expect("serialize manifest"),
+        );
+        let parsed = Manifest::read(dir.path()).expect("complete metadata parses");
+        assert_eq!(parsed, manifest);
+
+        manifest
+            .artifacts
+            .get_mut(artifact::SCHEMA_NODES)
+            .unwrap()
+            .views
+            .get_mut("queryable")
+            .unwrap()
+            .bytes = 31;
+        let error = manifest
+            .validate(dir.path())
+            .expect_err("a view cannot extend past its artifact");
+        assert!(
+            error.to_string().contains("beyond artifact size"),
+            "{error}"
+        );
+        manifest
+            .artifacts
+            .get_mut(artifact::SCHEMA_NODES)
+            .unwrap()
+            .views
+            .get_mut("queryable")
+            .unwrap()
+            .bytes = 20;
+
+        manifest
+            .artifacts
+            .get_mut(artifact::CLASS_RELATIONS)
+            .unwrap()
+            .views
+            .insert(
+                "component:extra".to_owned(),
+                ArtifactView {
+                    offset: 90,
+                    bytes: 10,
+                    rows: 1,
+                },
+            );
+        let error = manifest
+            .validate(dir.path())
+            .expect_err("both TSV indexes must describe the same views");
+        assert!(error.to_string().contains("same views"), "{error}");
+        manifest
+            .artifacts
+            .get_mut(artifact::CLASS_RELATIONS)
+            .unwrap()
+            .views
+            .remove("component:extra");
+
+        manifest.artifacts.remove(artifact::SUMMARY_MD);
+        write_document(
+            dir.path(),
+            &serde_json::to_value(&manifest).expect("serialize partial manifest"),
+        );
+        let error = Manifest::read(dir.path()).expect_err("partial description must fail");
+        assert!(error.to_string().contains(artifact::SUMMARY_MD), "{error}");
     }
 
     fn write_document(dir: &Path, json: &serde_json::Value) {

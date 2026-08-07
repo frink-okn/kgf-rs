@@ -26,6 +26,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+#[cfg(test)]
+use kgf_store::manifest::ArtifactView;
 use kgf_store::manifest::{
     ArtifactDigest, ArtifactEntry, BundleFacts, Capability, Formats, Manifest, ManifestDocument,
     Publisher, content_digest_preimage, default_predicate_roles, validate_predicate_role_iri,
@@ -136,6 +138,7 @@ pub fn run(args: Args) -> Result<()> {
         &facts,
         document.as_ref().and_then(ManifestDocument::parsed),
     )?;
+    manifest.validate(&dir)?;
 
     let bytes = match &document {
         Some(document) => document.rewrite_with(&manifest)?,
@@ -221,7 +224,7 @@ fn verify_described_artifacts(manifest: &Manifest, dir: &Path, facts: &BundleFac
             .artifacts
             .get(name)
             .expect("artifact sets were just compared");
-        if recorded != actual {
+        if recorded.bytes != actual.bytes || recorded.sha256 != actual.sha256 {
             bail!(
                 "manifest {} records {name} as {} bytes, sha256 {}, but it is {} bytes, \
                  sha256 {}; regenerate it with `{remedy}`",
@@ -281,7 +284,8 @@ fn build(
     })
     .context("cannot infer a version from the bundle path; pass --version")?;
 
-    let artifacts = checksum_artifacts(dir, facts)?;
+    let mut artifacts = checksum_artifacts(dir, facts)?;
+    carry_artifact_metadata(&mut artifacts, previous)?;
     let content_digest = content_digest(&artifacts);
 
     // `created` dates the bundle, not the manifest file, so regenerating over
@@ -507,9 +511,64 @@ fn checksum_artifacts(dir: &Path, facts: &BundleFacts) -> Result<Vec<(String, Ar
                 sha256_file(&path)
             }
             .with_context(|| format!("checksumming {}", path.display()))?;
-            Ok((name.to_owned(), ArtifactEntry { bytes, sha256 }))
+            Ok((name.to_owned(), ArtifactEntry::checksum(bytes, sha256)))
         })
         .collect()
+}
+
+/// Carry build-produced artifact metadata only while its artifact is unchanged.
+///
+/// `kgf manifest` can recompute checksums, but it cannot derive the semantic
+/// view blocks in the two stats TSVs without doing the producer's indexed-VoID
+/// traversal. Retaining those ranges across identical bytes is exact. Inventing
+/// them for a new file, or carrying them across changed bytes, would publish
+/// offsets the server has no reason to trust, so both cases name `kgf build`.
+fn carry_artifact_metadata(
+    artifacts: &mut [(String, ArtifactEntry)],
+    previous: Option<&Manifest>,
+) -> Result<()> {
+    for (name, current) in artifacts {
+        let prior = previous.and_then(|manifest| manifest.artifacts.get(name));
+        let same_content = prior
+            .is_some_and(|prior| prior.bytes == current.bytes && prior.sha256 == current.sha256);
+
+        if matches!(
+            name.as_str(),
+            artifact::SCHEMA_NODES | artifact::CLASS_RELATIONS
+        ) {
+            let prior = prior.with_context(|| {
+                format!(
+                    "artifact {name} needs build-produced parents, max_row_bytes and view ranges; \
+                     produce the description set with `kgf build`"
+                )
+            })?;
+            if !same_content {
+                bail!(
+                    "artifact {name} changed, so its recorded view ranges may be stale; \
+                     rebuild the description set with `kgf build`"
+                );
+            }
+            if prior.parents.len() != 1
+                || prior.parents[0] != artifact::VOID_HDT
+                || prior.max_row_bytes.is_none()
+                || !prior.views.contains_key("design")
+                || !prior.views.contains_key("queryable")
+            {
+                bail!(
+                    "artifact {name} has incomplete view metadata; rebuild the description set \
+                     with `kgf build`"
+                );
+            }
+        }
+
+        if same_content {
+            let prior = prior.expect("same_content is true only for a previous entry");
+            current.parents.clone_from(&prior.parents);
+            current.max_row_bytes = prior.max_row_bytes;
+            current.views.clone_from(&prior.views);
+        }
+    }
+    Ok(())
 }
 
 /// Size and digest a directory artifact as one entry (doc 04 §4.3).
@@ -813,5 +872,51 @@ mod tests {
         // Idempotent, so regenerating a manifest does not keep changing it.
         let carried = manifest_with(fresh.clone());
         assert_eq!(prefixes(&args(&[]), Some(&carried)).unwrap(), fresh);
+    }
+
+    #[test]
+    fn manifest_carries_view_metadata_only_for_unchanged_tsv_bytes() {
+        let mut previous = manifest_with(BTreeMap::new());
+        let mut entry = ArtifactEntry::checksum(100, "abc");
+        entry.parents = vec![artifact::VOID_HDT.to_owned()];
+        entry.max_row_bytes = Some(80);
+        entry.views = BTreeMap::from([
+            (
+                "design".to_owned(),
+                ArtifactView {
+                    offset: 50,
+                    bytes: 20,
+                    rows: 1,
+                },
+            ),
+            (
+                "queryable".to_owned(),
+                ArtifactView {
+                    offset: 70,
+                    bytes: 20,
+                    rows: 1,
+                },
+            ),
+        ]);
+        previous
+            .artifacts
+            .insert(artifact::SCHEMA_NODES.to_owned(), entry.clone());
+
+        let mut unchanged = vec![(
+            artifact::SCHEMA_NODES.to_owned(),
+            ArtifactEntry::checksum(100, "abc"),
+        )];
+        carry_artifact_metadata(&mut unchanged, Some(&previous)).unwrap();
+        assert_eq!(unchanged[0].1, entry);
+
+        let mut changed = vec![(
+            artifact::SCHEMA_NODES.to_owned(),
+            ArtifactEntry::checksum(101, "def"),
+        )];
+        let error = carry_artifact_metadata(&mut changed, Some(&previous)).unwrap_err();
+        assert!(error.to_string().contains("view ranges may be stale"));
+
+        let error = carry_artifact_metadata(&mut unchanged, None).unwrap_err();
+        assert!(error.to_string().contains("kgf build"));
     }
 }

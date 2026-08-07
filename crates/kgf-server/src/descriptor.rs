@@ -684,10 +684,7 @@ mod tests {
             predicate_roles: BTreeMap::new(),
             artifacts: BTreeMap::from([(
                 "data.hdt".to_owned(),
-                ArtifactEntry {
-                    bytes: 912,
-                    sha256: "abc123".to_owned(),
-                },
+                ArtifactEntry::checksum(912, "abc123"),
             )]),
             previous_version: Some("2026-03-01".to_owned()),
         }

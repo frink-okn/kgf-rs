@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use hdtc::format::{GraphIndexOpenError, TextSearcher};
 
+use crate::description::DescriptionStore;
 use crate::dict::Dictionary;
 use crate::error::{Error, Result};
 use crate::indexed::IndexedHdt;
@@ -40,6 +41,31 @@ pub mod artifact {
     /// it is a set of segment files whose names the build chooses. Doc 04 §4.1
     /// places it and §4.3 says how one entry checksums the whole directory.
     pub const TEXT: &str = "data.hdt.text";
+    /// VoID description graph as standard HDT. Part of the tier-1 description set.
+    pub const VOID_HDT: &str = "stats/void.hdt";
+    /// Permutations and rank directories for [`VOID_HDT`].
+    pub const VOID_PERM: &str = "stats/void.hdt.perm";
+    /// Semantic schema selector to final VoID subject-id index.
+    pub const SCHEMA_NODES: &str = "stats/schema-nodes.tsv";
+    /// Count-ranked class relation projection.
+    pub const CLASS_RELATIONS: &str = "stats/class-relations.tsv";
+    /// Per-role namespace inventory.
+    pub const NAMESPACES: &str = "stats/namespaces.json";
+    /// Structured LLM summary card.
+    pub const SUMMARY_JSON: &str = "stats/summary.json";
+    /// Rendered Markdown LLM summary card.
+    pub const SUMMARY_MD: &str = "stats/summary.md";
+
+    /// The complete tier-1 description artifact set, in bundle-layout order.
+    pub const DESCRIPTION: [&str; 7] = [
+        VOID_HDT,
+        VOID_PERM,
+        SCHEMA_NODES,
+        CLASS_RELATIONS,
+        NAMESPACES,
+        SUMMARY_JSON,
+        SUMMARY_MD,
+    ];
 }
 
 /// Open-time options, reserved for options that preserve bounded,
@@ -61,6 +87,7 @@ pub struct OpenOptions {}
 pub struct Store {
     bundle: PublishedBundle,
     data: IndexedHdt,
+    description: Option<DescriptionStore>,
     text: Option<TextSearcher>,
 }
 
@@ -73,6 +100,7 @@ impl std::fmt::Debug for Store {
         f.debug_struct("Store")
             .field("bundle", &self.bundle)
             .field("data", &self.data)
+            .field("description", &self.description.is_some())
             .field("text", &self.text.is_some())
             .finish()
     }
@@ -85,9 +113,10 @@ impl Store {
     /// rank-sentinel reads independent of bundle size. It does not scan payload
     /// regions, rebuild indexes, or compute full digests and CRCs.
     ///
-    /// Fails if a required artifact is missing, or if exactly one of
-    /// `data.hdt.graphs` and `data.hdt.graphs.idx` is present. There is no
-    /// degraded mode: the error names the command that produces a missing
+    /// Fails if a required artifact is missing, if exactly one of
+    /// `data.hdt.graphs` and `data.hdt.graphs.idx` is present, or if a published
+    /// description set cannot be bound to its manifest view directory. There
+    /// is no degraded mode: the error names the command that produces a missing
     /// required artifact (doc 20 §20.8).
     ///
     /// Constructing [`PublishedBundle`] is where the caller acknowledges doc 04
@@ -106,10 +135,17 @@ impl Store {
         let data = IndexedHdt::open(hdt, perm)?;
 
         artifacts.verify_graph_index()?;
+        let description = if artifacts.description.is_some() {
+            let manifest = crate::manifest::Manifest::read(dir)?;
+            Some(DescriptionStore::open(bundle, &artifacts, &manifest)?)
+        } else {
+            None
+        };
 
         Ok(Self {
             bundle: bundle.clone(),
             data,
+            description,
             text: artifacts.open_text()?,
         })
     }
@@ -141,6 +177,12 @@ impl Store {
     /// manifest declares no `search` capability — one condition, read two ways.
     pub fn text(&self) -> Option<&TextSearcher> {
         self.text.as_ref()
+    }
+
+    /// The mapped description surface, when this bundle carries the complete
+    /// tier-1 artifact set.
+    pub fn description(&self) -> Option<&DescriptionStore> {
+        self.description.as_ref()
     }
 
     /// Total triples in the bundle.
@@ -175,6 +217,19 @@ pub(crate) struct ArtifactSet {
     pub(crate) graphs: Option<PathBuf>,
     pub(crate) graph_index: Option<PathBuf>,
     pub(crate) text: Option<PathBuf>,
+    pub(crate) description: Option<DescriptionArtifacts>,
+}
+
+/// The all-or-none artifact set behind the tier-1 description surface.
+#[derive(Debug, Clone)]
+pub(crate) struct DescriptionArtifacts {
+    pub(crate) void_hdt: PathBuf,
+    pub(crate) void_perm: PathBuf,
+    pub(crate) schema_nodes: PathBuf,
+    pub(crate) class_relations: PathBuf,
+    pub(crate) namespaces: PathBuf,
+    pub(crate) summary_json: PathBuf,
+    pub(crate) summary_md: PathBuf,
 }
 
 impl ArtifactSet {
@@ -216,7 +271,23 @@ impl ArtifactSet {
             graphs,
             graph_index,
             text: optional_dir(dir, artifact::TEXT)?,
+            description: DescriptionArtifacts::resolve(dir)?,
         })
+    }
+
+    /// Open the description graph when this is a tier-1 artifact set.
+    ///
+    /// [`DescriptionStore`] owns the returned core on the serving path;
+    /// [`crate::manifest::BundleFacts`] opens and drops it as its binding proof.
+    /// Sharing this boundary prevents `kgf manifest` from describing, or
+    /// [`Store`] from accepting, a foreign or malformed VoID permutation pair.
+    pub(crate) fn open_description(&self, bundle: &PublishedBundle) -> Result<Option<IndexedHdt>> {
+        let Some(description) = &self.description else {
+            return Ok(None);
+        };
+        let hdt = open_published(bundle, &description.void_hdt)?;
+        let perm = open_published(bundle, &description.void_perm)?;
+        IndexedHdt::open(hdt, perm).map(Some)
     }
 
     /// Open the text index, if the bundle published one.
@@ -289,6 +360,63 @@ impl ArtifactSet {
     }
 }
 
+impl DescriptionArtifacts {
+    /// Resolve the description surface as one publication unit.
+    ///
+    /// Carrying none of these files is a valid tier-0 bundle. Once any one is
+    /// present, every one is required: publishing a partial set would either
+    /// make a mandatory route lie about its availability or create a fallback
+    /// path, both forbidden by docs 03 and 20.
+    fn resolve(dir: &Path) -> Result<Option<Self>> {
+        let paths: Vec<Option<PathBuf>> = artifact::DESCRIPTION
+            .iter()
+            .map(|name| optional_file(dir, name))
+            .collect::<Result<_>>()?;
+        let present = paths.iter().filter(|path| path.is_some()).count();
+        if present == 0 {
+            return Ok(None);
+        }
+        if present != artifact::DESCRIPTION.len() {
+            let missing = paths
+                .iter()
+                .zip(artifact::DESCRIPTION)
+                .find_map(|(path, name)| path.is_none().then_some(name))
+                .expect("a partial description set has a missing artifact");
+            return Err(Error::MissingRequiredArtifact {
+                bundle: dir.to_path_buf(),
+                artifact: missing.to_owned(),
+                remedy: "kgf build".to_owned(),
+            });
+        }
+
+        let mut paths = paths
+            .into_iter()
+            .map(|path| path.expect("every description artifact was required immediately above"));
+        Ok(Some(Self {
+            void_hdt: paths.next().expect("void HDT"),
+            void_perm: paths.next().expect("void permutations"),
+            schema_nodes: paths.next().expect("schema nodes"),
+            class_relations: paths.next().expect("class relations"),
+            namespaces: paths.next().expect("namespaces"),
+            summary_json: paths.next().expect("summary JSON"),
+            summary_md: paths.next().expect("summary Markdown"),
+        }))
+    }
+
+    /// Every description artifact paired with its bundle-relative name.
+    pub(crate) fn paths(&self) -> [(&'static str, &Path); 7] {
+        [
+            (artifact::VOID_HDT, &self.void_hdt),
+            (artifact::VOID_PERM, &self.void_perm),
+            (artifact::SCHEMA_NODES, &self.schema_nodes),
+            (artifact::CLASS_RELATIONS, &self.class_relations),
+            (artifact::NAMESPACES, &self.namespaces),
+            (artifact::SUMMARY_JSON, &self.summary_json),
+            (artifact::SUMMARY_MD, &self.summary_md),
+        ]
+    }
+}
+
 fn require_file(dir: &Path, name: &str, remedy: impl Into<String>) -> Result<PathBuf> {
     optional_file(dir, name)?.ok_or_else(|| Error::MissingRequiredArtifact {
         bundle: dir.to_path_buf(),
@@ -339,6 +467,29 @@ mod tests {
     use crate::pattern::IdPattern;
     use crate::testing::{Fixture, TINY_NT, published_bundle};
 
+    fn add_description_set(bundle: &Path) {
+        std::fs::create_dir_all(bundle.join("stats")).unwrap();
+        std::fs::copy(bundle.join(artifact::HDT), bundle.join(artifact::VOID_HDT)).unwrap();
+        std::fs::copy(
+            bundle.join(artifact::PERM),
+            bundle.join(artifact::VOID_PERM),
+        )
+        .unwrap();
+        std::fs::write(
+            bundle.join(artifact::SCHEMA_NODES),
+            b"view\tkind\tclass\tpredicate\tdatatype\tsubject_id\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bundle.join(artifact::CLASS_RELATIONS),
+            b"view\tsubject_class\tpredicate\tobject_class\ttriples\n",
+        )
+        .unwrap();
+        std::fs::write(bundle.join(artifact::NAMESPACES), b"{}\n").unwrap();
+        std::fs::write(bundle.join(artifact::SUMMARY_JSON), b"{}\n").unwrap();
+        std::fs::write(bundle.join(artifact::SUMMARY_MD), b"# Summary\n").unwrap();
+    }
+
     #[test]
     fn a_complete_bundle_opens_and_answers_through_the_store() {
         let fixture = Fixture::build(TINY_NT);
@@ -356,6 +507,99 @@ mod tests {
             .unwrap();
         assert_eq!(selection.count().value, 8);
         assert_eq!(selection.page(0, usize::MAX).count(), 8);
+    }
+
+    #[test]
+    fn description_artifacts_are_absent_or_complete() {
+        let fixture = Fixture::build(TINY_NT);
+        std::fs::create_dir_all(fixture.bundle_path().join("stats")).unwrap();
+        std::fs::copy(
+            fixture.hdt_path(),
+            fixture.bundle_path().join(artifact::VOID_HDT),
+        )
+        .unwrap();
+
+        let published = published_bundle(fixture.bundle_path());
+        match Store::open(&published, OpenOptions::default())
+            .expect_err("one description artifact is not a tier-1 set")
+        {
+            Error::MissingRequiredArtifact {
+                artifact: missing,
+                remedy,
+                ..
+            } => {
+                assert_eq!(missing, artifact::VOID_PERM);
+                assert_eq!(remedy, "kgf build");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        add_description_set(fixture.bundle_path());
+        let artifacts = ArtifactSet::resolve(fixture.bundle_path()).unwrap();
+        let description = artifacts
+            .description
+            .as_ref()
+            .expect("all seven files form the description set");
+        assert_eq!(
+            description.void_hdt,
+            fixture.bundle_path().join(artifact::VOID_HDT)
+        );
+        assert_eq!(
+            description.void_perm,
+            fixture.bundle_path().join(artifact::VOID_PERM)
+        );
+        assert_eq!(
+            description.schema_nodes,
+            fixture.bundle_path().join(artifact::SCHEMA_NODES)
+        );
+        assert_eq!(
+            description.class_relations,
+            fixture.bundle_path().join(artifact::CLASS_RELATIONS)
+        );
+        assert_eq!(
+            description.namespaces,
+            fixture.bundle_path().join(artifact::NAMESPACES)
+        );
+        assert_eq!(
+            description.summary_json,
+            fixture.bundle_path().join(artifact::SUMMARY_JSON)
+        );
+        assert_eq!(
+            description.summary_md,
+            fixture.bundle_path().join(artifact::SUMMARY_MD)
+        );
+
+        artifacts
+            .open_description(&published)
+            .expect("a complete description pair binds")
+            .expect("description core");
+    }
+
+    #[test]
+    fn a_foreign_void_permutation_is_refused_with_the_description_set() {
+        let fixture = Fixture::build(TINY_NT);
+        let other = Fixture::build(&format!(
+            "{TINY_NT}<http://example.org/extra> <http://example.org/p> <http://example.org/o> .\n"
+        ));
+        add_description_set(fixture.bundle_path());
+        std::fs::copy(
+            other.perm_path(),
+            fixture.bundle_path().join(artifact::VOID_PERM),
+        )
+        .unwrap();
+
+        let published = published_bundle(fixture.bundle_path());
+        let artifacts = ArtifactSet::resolve(fixture.bundle_path()).unwrap();
+        match artifacts
+            .open_description(&published)
+            .expect_err("the description permutation must bind to its own VoID HDT")
+        {
+            Error::ArtifactBindingMismatch { artifact, hdt, .. } => {
+                assert_eq!(artifact, fixture.bundle_path().join(artifact::VOID_PERM));
+                assert_eq!(hdt, fixture.bundle_path().join(artifact::VOID_HDT));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
