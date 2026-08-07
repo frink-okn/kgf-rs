@@ -18,10 +18,11 @@
 //!
 //! [`Store::open`](crate::store::Store::open) requires `manifest.json` to
 //! *exist*, because a directory without one is not a bundle. A tier-0 store
-//! does not parse it: the query core answers patterns from `data.hdt` and
-//! `data.hdt.perm` alone. A description-bearing store parses the manifest once
-//! because its typed view directory is the bounded navigation metadata for the
-//! two mapped TSV indexes. It still scans no payload and retains no structure
+//! inspects only its raw artifact map, reconciling it with the directory; the
+//! query core still answers patterns from `data.hdt` and `data.hdt.perm` alone.
+//! A description-bearing store additionally requires the complete typed parse,
+//! because its view directory is the bounded navigation metadata for the two
+//! mapped TSV indexes. Neither path scans payload or retains structure
 //! proportional to the number of description rows.
 //!
 //! # Producing one
@@ -376,6 +377,13 @@ pub struct ArtifactEntry {
     pub views: BTreeMap<String, ArtifactView>,
 }
 
+/// Typed manifest entries attached to a complete on-disk description set.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DescriptionArtifactEntries<'a> {
+    pub(crate) schema_nodes: &'a ArtifactEntry,
+    pub(crate) class_relations: &'a ArtifactEntry,
+}
+
 impl ArtifactEntry {
     /// Construct an ordinary artifact entry with no row-index metadata.
     pub fn checksum(bytes: u64, sha256: impl Into<String>) -> Self {
@@ -511,6 +519,19 @@ impl Manifest {
     /// Whether this bundle declares `capability`.
     pub fn declares(&self, capability: Capability) -> bool {
         self.capabilities.contains_key(capability.as_str())
+    }
+
+    /// The two entries whose metadata the mapped description reader consumes.
+    ///
+    /// [`validate`](Self::validate) establishes the all-or-none invariant, so
+    /// finding the selector entry means the relation entry is present too.
+    pub(crate) fn description_artifacts(&self) -> Option<DescriptionArtifactEntries<'_>> {
+        let schema_nodes = self.artifacts.get(artifact::SCHEMA_NODES)?;
+        let class_relations = self.artifacts.get(artifact::CLASS_RELATIONS)?;
+        Some(DescriptionArtifactEntries {
+            schema_nodes,
+            class_relations,
+        })
     }
 
     /// Validate the all-or-none description set and its mapped-row metadata.
@@ -726,6 +747,22 @@ impl ManifestDocument {
         self.parsed.as_ref().ok()
     }
 
+    /// Whether the raw artifact map names any member of the description set.
+    ///
+    /// Store opening uses this before requiring a complete typed manifest, so
+    /// a tier-0 store inspects only the artifact inventory while any manifest
+    /// that claims description files must agree with the directory.
+    pub(crate) fn lists_description_artifacts(&self) -> bool {
+        self.raw
+            .get("artifacts")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|artifacts| {
+                artifact::DESCRIPTION
+                    .iter()
+                    .any(|name| artifacts.contains_key(*name))
+            })
+    }
+
     /// The parsed manifest, or why it is not one.
     pub fn into_parsed(self) -> Result<Manifest> {
         self.parsed.map_err(|detail| Error::ManifestSyntax {
@@ -827,7 +864,9 @@ pub fn content_digest_preimage(artifacts: &[ArtifactDigest]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{Fixture, TINY_NQ, TINY_NT, published_bundle};
+    use crate::testing::{
+        CLASS_RELATIONS_HEADER, Fixture, SCHEMA_NODES_HEADER, TINY_NQ, TINY_NT, published_bundle,
+    };
 
     #[test]
     fn predicate_role_iris_are_full_and_not_declared_curies() {
@@ -852,25 +891,7 @@ mod tests {
     }
 
     fn add_description_set(fixture: &Fixture) {
-        let bundle = fixture.bundle_path();
-        std::fs::create_dir_all(bundle.join("stats")).unwrap();
-        std::fs::copy(fixture.hdt_path(), bundle.join(artifact::VOID_HDT)).unwrap();
-        std::fs::copy(fixture.perm_path(), bundle.join(artifact::VOID_PERM)).unwrap();
-        for (name, bytes) in [
-            (
-                artifact::SCHEMA_NODES,
-                b"view\tkind\tclass\tpredicate\tdatatype\tsubject_id\n".as_slice(),
-            ),
-            (
-                artifact::CLASS_RELATIONS,
-                b"view\tsubject_class\tpredicate\tobject_class\ttriples\n".as_slice(),
-            ),
-            (artifact::NAMESPACES, b"{}\n".as_slice()),
-            (artifact::SUMMARY_JSON, b"{}\n".as_slice()),
-            (artifact::SUMMARY_MD, b"# Summary\n".as_slice()),
-        ] {
-            std::fs::write(bundle.join(name), bytes).unwrap();
-        }
+        fixture.add_description_artifacts(SCHEMA_NODES_HEADER, CLASS_RELATIONS_HEADER);
     }
 
     #[test]

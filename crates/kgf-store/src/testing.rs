@@ -300,6 +300,37 @@ impl Fixture {
         self.dir.path().join(PERM)
     }
 
+    /// Publish the complete physical description set around caller-supplied
+    /// TSV bytes. Manifest metadata stays with the test that exercises it.
+    #[cfg(test)]
+    pub(crate) fn add_description_artifacts(&self, schema_nodes: &[u8], class_relations: &[u8]) {
+        let bundle = self.bundle_path();
+        std::fs::create_dir_all(bundle.join("stats")).expect("create fixture stats directory");
+        std::fs::copy(
+            self.hdt_path(),
+            bundle.join(crate::store::artifact::VOID_HDT),
+        )
+        .expect("copy fixture VoID HDT");
+        std::fs::copy(
+            self.perm_path(),
+            bundle.join(crate::store::artifact::VOID_PERM),
+        )
+        .expect("copy fixture VoID permutations");
+        for (name, bytes) in [
+            (crate::store::artifact::SCHEMA_NODES, schema_nodes),
+            (crate::store::artifact::CLASS_RELATIONS, class_relations),
+            (crate::store::artifact::NAMESPACES, b"{}\n".as_slice()),
+            (crate::store::artifact::SUMMARY_JSON, b"{}\n".as_slice()),
+            (
+                crate::store::artifact::SUMMARY_MD,
+                b"# Summary\n".as_slice(),
+            ),
+        ] {
+            std::fs::write(bundle.join(name), bytes)
+                .unwrap_or_else(|error| panic!("write fixture artifact {name}: {error}"));
+        }
+    }
+
     /// Map `data.hdt`.
     pub fn map_hdt(&self) -> crate::map::Mapping {
         map_fixture(&self.hdt_path())
@@ -333,6 +364,16 @@ impl Fixture {
             .collect()
     }
 }
+
+/// Exact selector-index header from doc 04 §4.2.
+#[cfg(test)]
+pub(crate) const SCHEMA_NODES_HEADER: &[u8] =
+    b"view\tkind\tclass\tpredicate\tdatatype\tsubject_id\n";
+
+/// Exact class-relation header from doc 04 §4.2.
+#[cfg(test)]
+pub(crate) const CLASS_RELATIONS_HEADER: &[u8] =
+    b"view\tsubject_class\tpredicate\tobject_class\ttriples\n";
 
 /// Copy a directory artifact, recursively.
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {

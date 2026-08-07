@@ -135,11 +135,37 @@ impl Store {
         let data = IndexedHdt::open(hdt, perm)?;
 
         artifacts.verify_graph_index()?;
-        let description = if artifacts.description.is_some() {
-            let manifest = crate::manifest::Manifest::read(dir)?;
-            Some(DescriptionStore::open(bundle, &artifacts, &manifest)?)
-        } else {
-            None
+        let document = crate::manifest::ManifestDocument::read(dir)?
+            .expect("manifest existence was required immediately above");
+        let manifest_description = document.lists_description_artifacts();
+        let description = match (artifacts.description.as_ref(), manifest_description) {
+            (Some(_), true) => {
+                let manifest = document.into_parsed()?;
+                manifest.validate(dir)?;
+                let Some(entries) = manifest.description_artifacts() else {
+                    return Err(description_set_disagreement(
+                        dir,
+                        "the manifest does not provide complete typed metadata for the on-disk \
+                         description set; rebuild it with `kgf build`",
+                    ));
+                };
+                Some(DescriptionStore::open(bundle, &artifacts, entries)?)
+            }
+            (None, false) => None,
+            (Some(_), false) => {
+                return Err(description_set_disagreement(
+                    dir,
+                    "the description files are present, but the manifest lists none of them; \
+                     rebuild the description set with `kgf build`",
+                ));
+            }
+            (None, true) => {
+                return Err(description_set_disagreement(
+                    dir,
+                    "the manifest lists the description artifacts, but the files are absent; \
+                     regenerate it with `kgf manifest` or rebuild them with `kgf build`",
+                ));
+            }
         };
 
         Ok(Self {
@@ -199,6 +225,13 @@ impl Store {
     /// an encoded cursor token, not a live `Selection`.
     pub fn resolve(&self, pattern: IdPattern) -> Result<Selection<'_>> {
         self.data.resolve(pattern)
+    }
+}
+
+fn description_set_disagreement(dir: &Path, detail: &str) -> Error {
+    Error::ManifestSyntax {
+        path: dir.join(artifact::MANIFEST),
+        detail: detail.to_owned(),
     }
 }
 
@@ -465,30 +498,9 @@ fn optional(dir: &Path, name: &str, want_dir: bool) -> Result<Option<PathBuf>> {
 mod tests {
     use super::*;
     use crate::pattern::IdPattern;
-    use crate::testing::{Fixture, TINY_NT, published_bundle};
-
-    fn add_description_set(bundle: &Path) {
-        std::fs::create_dir_all(bundle.join("stats")).unwrap();
-        std::fs::copy(bundle.join(artifact::HDT), bundle.join(artifact::VOID_HDT)).unwrap();
-        std::fs::copy(
-            bundle.join(artifact::PERM),
-            bundle.join(artifact::VOID_PERM),
-        )
-        .unwrap();
-        std::fs::write(
-            bundle.join(artifact::SCHEMA_NODES),
-            b"view\tkind\tclass\tpredicate\tdatatype\tsubject_id\n",
-        )
-        .unwrap();
-        std::fs::write(
-            bundle.join(artifact::CLASS_RELATIONS),
-            b"view\tsubject_class\tpredicate\tobject_class\ttriples\n",
-        )
-        .unwrap();
-        std::fs::write(bundle.join(artifact::NAMESPACES), b"{}\n").unwrap();
-        std::fs::write(bundle.join(artifact::SUMMARY_JSON), b"{}\n").unwrap();
-        std::fs::write(bundle.join(artifact::SUMMARY_MD), b"# Summary\n").unwrap();
-    }
+    use crate::testing::{
+        CLASS_RELATIONS_HEADER, Fixture, SCHEMA_NODES_HEADER, TINY_NT, published_bundle,
+    };
 
     #[test]
     fn a_complete_bundle_opens_and_answers_through_the_store() {
@@ -534,7 +546,7 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
 
-        add_description_set(fixture.bundle_path());
+        fixture.add_description_artifacts(SCHEMA_NODES_HEADER, CLASS_RELATIONS_HEADER);
         let artifacts = ArtifactSet::resolve(fixture.bundle_path()).unwrap();
         let description = artifacts
             .description
@@ -576,12 +588,49 @@ mod tests {
     }
 
     #[test]
+    fn disk_and_manifest_description_sets_must_agree_without_panicking() {
+        let files_only = Fixture::build(TINY_NT);
+        files_only.add_description_artifacts(SCHEMA_NODES_HEADER, CLASS_RELATIONS_HEADER);
+        let published = published_bundle(files_only.bundle_path());
+        match Store::open(&published, OpenOptions::default())
+            .expect_err("unlisted description files must be refused")
+        {
+            Error::ManifestSyntax { path, detail } => {
+                assert_eq!(path, files_only.bundle_path().join(artifact::MANIFEST));
+                assert!(detail.contains("files are present"), "{detail}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let manifest_only = Fixture::build(TINY_NT);
+        let listed = artifact::DESCRIPTION
+            .into_iter()
+            .map(|name| (name.to_owned(), serde_json::json!({})))
+            .collect::<serde_json::Map<_, _>>();
+        std::fs::write(
+            manifest_only.bundle_path().join(artifact::MANIFEST),
+            serde_json::to_vec(&serde_json::json!({"artifacts": listed})).unwrap(),
+        )
+        .unwrap();
+        let published = published_bundle(manifest_only.bundle_path());
+        match Store::open(&published, OpenOptions::default())
+            .expect_err("listed but absent description files must be refused")
+        {
+            Error::ManifestSyntax { path, detail } => {
+                assert_eq!(path, manifest_only.bundle_path().join(artifact::MANIFEST));
+                assert!(detail.contains("files are absent"), "{detail}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
     fn a_foreign_void_permutation_is_refused_with_the_description_set() {
         let fixture = Fixture::build(TINY_NT);
         let other = Fixture::build(&format!(
             "{TINY_NT}<http://example.org/extra> <http://example.org/p> <http://example.org/o> .\n"
         ));
-        add_description_set(fixture.bundle_path());
+        fixture.add_description_artifacts(SCHEMA_NODES_HEADER, CLASS_RELATIONS_HEADER);
         std::fs::copy(
             other.perm_path(),
             fixture.bundle_path().join(artifact::VOID_PERM),

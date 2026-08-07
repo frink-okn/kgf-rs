@@ -13,9 +13,11 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 use crate::indexed::IndexedHdt;
-use crate::manifest::{ArtifactEntry, ArtifactView, Manifest};
+use crate::manifest::{ArtifactEntry, ArtifactView, DescriptionArtifactEntries};
 use crate::map::{BytesSpec, Mapping, MappingId, PublishedBundle, open_published};
-use crate::store::{ArtifactSet, artifact};
+use crate::store::ArtifactSet;
+#[cfg(test)]
+use crate::store::artifact;
 use crate::{Role, TermId};
 
 /// A manifest component identifier used by a description view.
@@ -214,7 +216,7 @@ impl DescriptionStore {
     pub(crate) fn open(
         bundle: &PublishedBundle,
         artifacts: &ArtifactSet,
-        manifest: &Manifest,
+        entries: DescriptionArtifactEntries<'_>,
     ) -> Result<Self> {
         let description = artifacts
             .description
@@ -223,15 +225,11 @@ impl DescriptionStore {
         let void = artifacts
             .open_description(bundle)?
             .expect("the resolved description set has a VoID pair");
-        let schema_nodes = open_tsv(
-            bundle,
-            &description.schema_nodes,
-            manifest_entry(manifest, artifact::SCHEMA_NODES),
-        )?;
+        let schema_nodes = open_tsv(bundle, &description.schema_nodes, entries.schema_nodes)?;
         let class_relations = open_tsv(
             bundle,
             &description.class_relations,
-            manifest_entry(manifest, artifact::CLASS_RELATIONS),
+            entries.class_relations,
         )?;
 
         Ok(Self {
@@ -278,14 +276,13 @@ impl<'a> DescriptionView<'a> {
     /// Resolve a semantic selector through the mapped selector index.
     pub fn schema_node(&self, selector: SchemaSelector<'_>) -> Result<Option<SchemaNode>> {
         let target = selector.key();
-        let found = self.store.schema_nodes.binary_search(self.schema, |row| {
-            let row = parse_schema_row(row, self.store.schema_nodes.path())?;
-            Ok(compare_fields(row.key(), target))
-        })?;
-        let Some(row) = found else {
+        let Some(row) = self
+            .store
+            .schema_nodes
+            .find_schema_row(self.schema, target)?
+        else {
             return Ok(None);
         };
-        let row = parse_schema_row(row, self.store.schema_nodes.path())?;
         let subject = row.subject_id.parse::<u64>().map_err(|error| {
             malformed(
                 self.store.schema_nodes.path(),
@@ -388,13 +385,6 @@ fn relation_page<'a>(
     }
 }
 
-fn manifest_entry<'a>(manifest: &'a Manifest, name: &str) -> &'a ArtifactEntry {
-    manifest
-        .artifacts
-        .get(name)
-        .expect("Manifest::validate requires both description TSV entries")
-}
-
 fn open_tsv(bundle: &PublishedBundle, path: &Path, entry: &ArtifactEntry) -> Result<MappedTsv> {
     let mapping = open_published(bundle, path)?;
     MappedTsv::open(mapping, entry)
@@ -486,10 +476,11 @@ impl MappedTsv {
         })
     }
 
-    fn binary_search<F>(&self, view: ViewSpec, mut compare: F) -> Result<Option<&[u8]>>
-    where
-        F: FnMut(&[u8]) -> Result<Ordering>,
-    {
+    fn find_schema_row<'a>(
+        &'a self,
+        view: ViewSpec,
+        target: [&str; 4],
+    ) -> Result<Option<SchemaRow<'a>>> {
         let mut left = view.offset;
         let mut right = view.end();
         while left < right {
@@ -503,10 +494,11 @@ impl MappedTsv {
                 continue;
             }
             let row = self.row_at(start, view.end())?;
-            match compare(row.bytes)? {
+            let parsed = parse_schema_row(row.bytes, self.path())?;
+            match compare_fields(parsed.key(), target) {
                 Ordering::Less => left = row.next,
                 Ordering::Greater => right = start,
-                Ordering::Equal => return Ok(Some(row.bytes)),
+                Ordering::Equal => return Ok(Some(parsed)),
             }
         }
         Ok(None)
@@ -527,7 +519,7 @@ impl MappedTsv {
             .map(|relative| probe + relative as u64 + 1)
     }
 
-    fn row_at(&self, start: u64, view_end: u64) -> Result<Row<'_>> {
+    fn row_at<'a>(&'a self, start: u64, view_end: u64) -> Result<Row<'a>> {
         let limit = start
             .saturating_add(self.max_row_bytes as u64)
             .min(view_end);
@@ -592,24 +584,27 @@ impl SchemaRow<'_> {
 }
 
 fn parse_schema_row<'a>(bytes: &'a [u8], path: &Path) -> Result<SchemaRow<'a>> {
-    let mut fields = fields(bytes, 6, path)?;
-    let _view = fields.next().expect("field count checked");
-    Ok(SchemaRow {
-        kind: fields.next().expect("field count checked"),
-        class: fields.next().expect("field count checked"),
-        predicate: fields.next().expect("field count checked"),
-        datatype: fields.next().expect("field count checked"),
-        subject_id: fields.next().expect("field count checked"),
-    })
+    let mut fields = fields(bytes, path)?;
+    let _view = required_field(&mut fields, 0, 6, path)?;
+    let row = SchemaRow {
+        kind: required_field(&mut fields, 1, 6, path)?,
+        class: required_field(&mut fields, 2, 6, path)?,
+        predicate: required_field(&mut fields, 3, 6, path)?,
+        datatype: required_field(&mut fields, 4, 6, path)?,
+        subject_id: required_field(&mut fields, 5, 6, path)?,
+    };
+    reject_extra_fields(fields, 6, path)?;
+    Ok(row)
 }
 
 fn parse_relation_row<'a>(bytes: &'a [u8], path: &Path) -> Result<ClassRelation<'a>> {
-    let mut fields = fields(bytes, 5, path)?;
-    let _view = fields.next().expect("field count checked");
-    let subject_class = fields.next().expect("field count checked");
-    let predicate = fields.next().expect("field count checked");
-    let object_class = fields.next().expect("field count checked");
-    let triples = fields.next().expect("field count checked");
+    let mut fields = fields(bytes, path)?;
+    let _view = required_field(&mut fields, 0, 5, path)?;
+    let subject_class = required_field(&mut fields, 1, 5, path)?;
+    let predicate = required_field(&mut fields, 2, 5, path)?;
+    let object_class = required_field(&mut fields, 3, 5, path)?;
+    let triples = required_field(&mut fields, 4, 5, path)?;
+    reject_extra_fields(fields, 5, path)?;
     let triples = triples.parse::<u64>().map_err(|error| {
         malformed(
             path,
@@ -624,17 +619,36 @@ fn parse_relation_row<'a>(bytes: &'a [u8], path: &Path) -> Result<ClassRelation<
     })
 }
 
-fn fields<'a>(bytes: &'a [u8], expected: usize, path: &Path) -> Result<std::str::Split<'a, char>> {
+fn fields<'a>(bytes: &'a [u8], path: &Path) -> Result<std::str::Split<'a, char>> {
     let row = std::str::from_utf8(bytes)
         .map_err(|error| malformed(path, format!("row is not UTF-8: {error}")))?;
-    let found = row.as_bytes().iter().filter(|byte| **byte == b'\t').count() + 1;
-    if found != expected {
-        return Err(malformed(
-            path,
-            format!("row has {found} fields, expected {expected}"),
-        ));
-    }
     Ok(row.split('\t'))
+}
+
+fn required_field<'a>(
+    fields: &mut std::str::Split<'a, char>,
+    index: usize,
+    expected: usize,
+    path: &Path,
+) -> Result<&'a str> {
+    fields
+        .next()
+        .ok_or_else(|| malformed(path, format!("row has {index} fields, expected {expected}")))
+}
+
+fn reject_extra_fields(
+    mut fields: std::str::Split<'_, char>,
+    expected: usize,
+    path: &Path,
+) -> Result<()> {
+    let Some(_) = fields.next() else {
+        return Ok(());
+    };
+    let found = expected + 1 + fields.count();
+    Err(malformed(
+        path,
+        format!("row has {found} fields, expected {expected}"),
+    ))
 }
 
 fn compare_fields<const N: usize>(left: [&str; N], right: [&str; N]) -> Ordering {
@@ -657,9 +671,11 @@ fn malformed(path: &Path, detail: String) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{Counts, Formats};
+    use crate::manifest::{Counts, Formats, Manifest};
     use crate::store::{OpenOptions, Store};
-    use crate::testing::{Fixture, TINY_NT, published_bundle};
+    use crate::testing::{
+        CLASS_RELATIONS_HEADER, Fixture, SCHEMA_NODES_HEADER, TINY_NT, published_bundle,
+    };
 
     struct PublishedDescription {
         alice: u64,
@@ -684,11 +700,7 @@ mod tests {
         };
 
         let bundle = fixture.bundle_path();
-        std::fs::create_dir_all(bundle.join("stats")).unwrap();
-        std::fs::copy(fixture.hdt_path(), bundle.join(artifact::VOID_HDT)).unwrap();
-        std::fs::copy(fixture.perm_path(), bundle.join(artifact::VOID_PERM)).unwrap();
-
-        let mut schema = b"view\tkind\tclass\tpredicate\tdatatype\tsubject_id\n".to_vec();
+        let mut schema = SCHEMA_NODES_HEADER.to_vec();
         let mut schema_views = BTreeMap::new();
         append_view(
             &mut schema,
@@ -717,9 +729,8 @@ mod tests {
             &[format!("dataset\t\t\t\t{}", ids.1)],
         );
         let schema_max = max_complete_row(&schema);
-        std::fs::write(bundle.join(artifact::SCHEMA_NODES), &schema).unwrap();
 
-        let mut relations = b"view\tsubject_class\tpredicate\tobject_class\ttriples\n".to_vec();
+        let mut relations = CLASS_RELATIONS_HEADER.to_vec();
         let mut relation_views = BTreeMap::new();
         append_view(
             &mut relations,
@@ -753,15 +764,7 @@ mod tests {
             ],
         );
         let relation_max = max_complete_row(&relations);
-        std::fs::write(bundle.join(artifact::CLASS_RELATIONS), &relations).unwrap();
-
-        for (name, bytes) in [
-            (artifact::NAMESPACES, b"{}\n".as_slice()),
-            (artifact::SUMMARY_JSON, b"{}\n".as_slice()),
-            (artifact::SUMMARY_MD, b"# Summary\n".as_slice()),
-        ] {
-            std::fs::write(bundle.join(name), bytes).unwrap();
-        }
+        fixture.add_description_artifacts(&schema, &relations);
 
         let mut artifacts = BTreeMap::new();
         for name in [
@@ -906,23 +909,13 @@ mod tests {
 
         for key in &keys {
             let target = ["class", key.as_str(), "", ""];
-            let found = table
-                .binary_search(view, |row| {
-                    let row = parse_schema_row(row, table.path())?;
-                    Ok(compare_fields(row.key(), target))
-                })
-                .unwrap();
+            let found = table.find_schema_row(view, target).unwrap();
             assert!(found.is_some(), "missing key {key:?}");
         }
         for index in 0..129 {
             let missing = format!("{index:04}!");
             let target = ["class", missing.as_str(), "", ""];
-            let found = table
-                .binary_search(view, |row| {
-                    let row = parse_schema_row(row, table.path())?;
-                    Ok(compare_fields(row.key(), target))
-                })
-                .unwrap();
+            let found = table.find_schema_row(view, target).unwrap();
             assert!(found.is_none(), "invented gap key {missing:?}");
         }
     }
