@@ -9,6 +9,8 @@
 //! other state proportional to the graph, so opening a second instance for
 //! `stats/void.hdt` preserves the read layer's lazy multi-tenant memory model.
 
+use std::path::Path;
+
 use crate::dict::{DictCounts, Dictionary};
 use crate::error::Result;
 use crate::map::Mapping;
@@ -42,6 +44,11 @@ impl IndexedHdt {
     /// Total triples in the indexed HDT.
     pub(crate) fn triples(&self) -> u64 {
         self.permutations.triples()
+    }
+
+    /// Path of the mapped host HDT.
+    pub(crate) fn path(&self) -> &Path {
+        self.permutations.hdt_path()
     }
 
     /// Dictionary sizes in the three role-scoped id spaces.

@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::indexed::IndexedHdt;
@@ -18,10 +18,11 @@ use crate::store::{ArtifactSet, description_set_disagreement};
 use crate::{Role, TermId};
 
 use super::{
-    DescriptionStore, MappedTsv, SchemaRow, StatsView, VOID_CLASS, VOID_CLASS_PARTITION,
-    VOID_PROPERTY, VOID_PROPERTY_PARTITION, VOID_TRIPLES, VOIDEXT_DATATYPE,
-    VOIDEXT_DATATYPE_PARTITION, VOIDEXT_OBJECT_CLASS_PARTITION, XSD_INTEGER, compare_fields,
-    fields, malformed, parse_schema_row, reject_extra_fields, required_field,
+    CountPredicates, DescriptionStore, MappedTsv, SchemaRow, StatsView, VOID_CLASS,
+    VOID_CLASS_PARTITION, VOID_PROPERTY, VOID_PROPERTY_PARTITION, VOID_TRIPLES, VOIDEXT_DATATYPE,
+    VOIDEXT_DATATYPE_PARTITION, VOIDEXT_OBJECT_CLASS_PARTITION, compare_fields, fields,
+    integer_object, malformed, object_to_subject, parse_schema_row, reject_extra_fields,
+    required_field,
 };
 use crate::error::Result;
 
@@ -105,10 +106,40 @@ impl DescriptionStore {
     pub fn verify_indexes(&self) -> Result<()> {
         let selectors = verify_schema_table(&self.schema_nodes, &self.void)?;
         verify_schema_bindings(&self.void, &selectors, self.schema_nodes.path())?;
+        verify_count_facts(&self.void)?;
         let relations = verify_relation_table(&self.class_relations)?;
         let expected = expected_relations(&self.void, &selectors, self.class_relations.path())?;
         compare_relations(&relations, &expected, self.class_relations.path())
     }
+}
+
+fn verify_count_facts(void: &IndexedHdt) -> Result<()> {
+    let mut subjects = BTreeSet::new();
+    for predicate in CountPredicates::new(void.dict())?.all() {
+        let Some(predicate_id) = predicate.id else {
+            continue;
+        };
+        subjects.clear();
+        let values = void.resolve(IdPattern {
+            subject: None,
+            predicate: Some(predicate_id.0),
+            object: None,
+        })?;
+        for index in 0..values.count().value {
+            let triple = values.at(index);
+            if !subjects.insert(triple.subject) {
+                return Err(malformed(
+                    void.path(),
+                    format!(
+                        "partition subject {} has multiple values for <{}>",
+                        triple.subject, predicate.iri
+                    ),
+                ));
+            }
+            integer_object(void, TermId(triple.object), void.path())?;
+        }
+    }
+    Ok(())
 }
 
 impl MappedTsv {
@@ -791,23 +822,6 @@ fn object_ids(
     Ok(objects)
 }
 
-fn object_to_subject(
-    void: &IndexedHdt,
-    object: TermId,
-    path: &Path,
-    context: &str,
-) -> Result<TermId> {
-    let dictionary = void.dict();
-    let mut buffer = Vec::new();
-    let term = dictionary.extract(Role::Object, object, &mut buffer)?;
-    dictionary.locate(Role::Subject, term)?.ok_or_else(|| {
-        malformed(
-            path,
-            format!("{context} object id {} is not a VoID subject", object.0),
-        )
-    })
-}
-
 fn object_iri(void: &IndexedHdt, object: TermId, path: &Path, context: &str) -> Result<String> {
     let dictionary = void.dict();
     let mut buffer = Vec::new();
@@ -815,30 +829,4 @@ fn object_iri(void: &IndexedHdt, object: TermId, path: &Path, context: &str) -> 
     let value = std::str::from_utf8(term)
         .map_err(|error| malformed(path, format!("{context} is not UTF-8: {error}")))?;
     expanded_iri(value, context, path, 0)
-}
-
-fn integer_object(void: &IndexedHdt, object: TermId, path: &Path) -> Result<u64> {
-    let dictionary = void.dict();
-    let mut buffer = Vec::new();
-    let term = dictionary.extract(Role::Object, object, &mut buffer)?;
-    let literal = hdtc::format::parse_literal(term)
-        .ok_or_else(|| malformed(path, "void:triples value is not a literal".to_owned()))?;
-    if literal.language.is_some() || literal.datatype != Some(XSD_INTEGER.as_bytes()) {
-        return Err(malformed(
-            path,
-            "void:triples value is not an xsd:integer literal".to_owned(),
-        ));
-    }
-    let lexical = std::str::from_utf8(literal.value).map_err(|error| {
-        malformed(
-            path,
-            format!("void:triples lexical form is not UTF-8: {error}"),
-        )
-    })?;
-    lexical.parse::<u64>().map_err(|error| {
-        malformed(
-            path,
-            format!("void:triples lexical form {lexical:?} is not an unsigned integer: {error}"),
-        )
-    })
 }

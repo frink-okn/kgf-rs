@@ -1208,8 +1208,9 @@ schema size.
 binary search. `stats/class-relations.tsv` pages its persisted order directly,
 including filtered candidate limits and exact byte-position resumption. Full
 publication-time verification checks TSV ranges, ordering, row metadata,
-selector bindings, parent paths, and the class-relation projection against the
-indexed VoID graph; it runs from `kgf manifest`, not from the bounded open path.
+selector bindings, parent paths, every numeric count fact the serving API can
+project, and the class-relation projection against the indexed VoID graph; it
+runs from `kgf manifest`, not from the bounded open path.
 
 The headless schema API now projects the selected node's stated VoID counts and
 pages one immediate collection. Valid selector/collection pairs are distinct
@@ -1225,9 +1226,10 @@ is also exposed as the representation-neutral input for `/void` serialization.
 *Verified so far by* a layered golden VoID fixture covering every valid child
 query, every node kind, design/queryable/component views, absent selectors,
 one-item cursor resumption, datatype and language terms, omission of an untyped
-target without a phantom terminal page, numeric node projection, full VoID
-traversal, malformed selector IDs, publication proof, and the existing mapped
-open-cost invariants.
+target interspersed across multiple pages without loss, duplication, or a
+phantom terminal page, numeric node projection, full VoID traversal, malformed
+selector IDs, refusal of malformed or ambiguous count facts at publication,
+publication proof, and the existing mapped open-cost invariants.
 
 Still to land in this unit: namespace/summary artifact readers, server request
 and cursor types, JSON/HTML `/schema`, RDF `/void`, static `/summary`, and the

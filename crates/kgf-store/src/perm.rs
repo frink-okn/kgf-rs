@@ -19,6 +19,8 @@
 //! difference from [`crate::hdt`]. Element access is the same
 //! [`PackedArray`](crate::map::PackedArray) either way.
 
+use std::path::Path;
+
 use hdtc::format::{
     PermutationComponent, PermutationIndex, PermutationIndexOpenError, PermutationSection,
     PermutationSectionKind,
@@ -243,6 +245,11 @@ impl Permutations {
     /// Total triples in every permutation.
     pub fn triples(&self) -> u64 {
         self.triples
+    }
+
+    /// Path of the mapped host HDT.
+    pub(crate) fn hdt_path(&self) -> &Path {
+        self.hdt.path()
     }
 
     /// The dictionary projected from the host HDT.
