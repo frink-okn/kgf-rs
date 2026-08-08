@@ -66,6 +66,17 @@ pub enum Error {
         maximum: u64,
     },
 
+    /// A decoded continuation position falls outside its enumeration.
+    /// Position zero is the initial page; nonzero resumptions must name a row
+    /// inside the immutable enumeration.
+    #[error("resume position {position} is outside an enumeration of {length} rows")]
+    ResumePositionOutOfRange {
+        /// Rejected zero-based position.
+        position: u64,
+        /// Number of rows in the addressed enumeration.
+        length: u64,
+    },
+
     /// A catalog lookup named no scanned dataset/version directory.
     #[error("unknown bundle {dataset}/{version}")]
     UnknownBundle {

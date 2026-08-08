@@ -20,9 +20,9 @@ use crate::{Role, TermId};
 use super::{
     CountPredicates, DescriptionStore, MappedTsv, SchemaRow, StatsView, VOID_CLASS,
     VOID_CLASS_PARTITION, VOID_PROPERTY, VOID_PROPERTY_PARTITION, VOID_TRIPLES, VOIDEXT_DATATYPE,
-    VOIDEXT_DATATYPE_PARTITION, VOIDEXT_OBJECT_CLASS_PARTITION, compare_fields, fields,
-    integer_object, malformed, object_to_subject, parse_schema_row, reject_extra_fields,
-    required_field,
+    VOIDEXT_DATATYPE_PARTITION, VOIDEXT_LANGUAGE, VOIDEXT_LANGUAGE_PARTITION,
+    VOIDEXT_OBJECT_CLASS_PARTITION, compare_fields, fields, integer_object, malformed,
+    object_to_subject, parse_schema_row, reject_extra_fields, required_field,
 };
 use crate::error::Result;
 
@@ -95,6 +95,18 @@ struct RelationRow<'a> {
     triples: &'a str,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct VerifiedChild {
+    subject: TermId,
+    term: Option<TermId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TermRequirement {
+    Required,
+    Optional,
+}
+
 impl DescriptionStore {
     /// Fully verify both description indexes against their manifest directory
     /// and the indexed VoID graph.
@@ -106,6 +118,7 @@ impl DescriptionStore {
     pub fn verify_indexes(&self) -> Result<()> {
         let selectors = verify_schema_table(&self.schema_nodes, &self.void)?;
         verify_schema_bindings(&self.void, &selectors, self.schema_nodes.path())?;
+        verify_schema_children(&self.void, &selectors, self.schema_nodes.path())?;
         verify_count_facts(&self.void)?;
         let relations = verify_relation_table(&self.class_relations)?;
         let expected = expected_relations(&self.void, &selectors, self.class_relations.path())?;
@@ -444,6 +457,233 @@ fn verify_schema_bindings(void: &IndexedHdt, indexes: &SelectorIndex, path: &Pat
         }
     }
     Ok(())
+}
+
+fn verify_schema_children(void: &IndexedHdt, indexes: &SelectorIndex, path: &Path) -> Result<()> {
+    for (view, index) in indexes {
+        let root = required_selector(index, &VerifiedSelector::Dataset, view, path)?;
+        for child in verified_children(
+            void,
+            root,
+            VOID_CLASS_PARTITION,
+            VOID_CLASS,
+            TermRequirement::Required,
+            path,
+            "class partition",
+        )? {
+            let class = child_iri(void, child, path, "class partition term")?;
+            require_child_selector(
+                index,
+                &VerifiedSelector::Class(class),
+                child.subject,
+                view,
+                path,
+                "class partition",
+            )?;
+        }
+
+        for (selector, parent) in index {
+            match selector {
+                VerifiedSelector::Dataset => {
+                    verify_property_children(void, index, view, *parent, None, path)?;
+                }
+                VerifiedSelector::Class(class) => {
+                    verify_property_children(
+                        void,
+                        index,
+                        view,
+                        *parent,
+                        Some(class.as_str()),
+                        path,
+                    )?;
+                }
+                VerifiedSelector::Property { class, predicate } => {
+                    for child in verified_children(
+                        void,
+                        *parent,
+                        VOIDEXT_OBJECT_CLASS_PARTITION,
+                        VOID_CLASS,
+                        TermRequirement::Optional,
+                        path,
+                        "object-class partition",
+                    )? {
+                        if child.term.is_some() {
+                            child_iri(void, child, path, "object-class partition term")?;
+                        }
+                    }
+                    for child in verified_children(
+                        void,
+                        *parent,
+                        VOIDEXT_DATATYPE_PARTITION,
+                        VOIDEXT_DATATYPE,
+                        TermRequirement::Required,
+                        path,
+                        "datatype partition",
+                    )? {
+                        let datatype = child_iri(void, child, path, "datatype partition term")?;
+                        require_child_selector(
+                            index,
+                            &VerifiedSelector::Datatype {
+                                class: class.clone(),
+                                predicate: predicate.clone(),
+                                datatype,
+                            },
+                            child.subject,
+                            view,
+                            path,
+                            "datatype partition",
+                        )?;
+                    }
+                }
+                VerifiedSelector::Datatype { .. } => {
+                    verified_children(
+                        void,
+                        *parent,
+                        VOIDEXT_LANGUAGE_PARTITION,
+                        VOIDEXT_LANGUAGE,
+                        TermRequirement::Required,
+                        path,
+                        "language partition",
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_property_children(
+    void: &IndexedHdt,
+    index: &BTreeMap<VerifiedSelector, TermId>,
+    view: &StatsView,
+    parent: TermId,
+    class: Option<&str>,
+    path: &Path,
+) -> Result<()> {
+    for child in verified_children(
+        void,
+        parent,
+        VOID_PROPERTY_PARTITION,
+        VOID_PROPERTY,
+        TermRequirement::Required,
+        path,
+        "property partition",
+    )? {
+        let predicate = child_iri(void, child, path, "property partition term")?;
+        require_child_selector(
+            index,
+            &VerifiedSelector::Property {
+                class: class.map(str::to_owned),
+                predicate,
+            },
+            child.subject,
+            view,
+            path,
+            "property partition",
+        )?;
+    }
+    Ok(())
+}
+
+fn verified_children(
+    void: &IndexedHdt,
+    parent: TermId,
+    edge_predicate: &str,
+    term_predicate: &str,
+    term_requirement: TermRequirement,
+    path: &Path,
+    context: &str,
+) -> Result<Vec<VerifiedChild>> {
+    let mut children = Vec::new();
+    let mut terms = BTreeSet::new();
+    for object in object_ids(void, parent, edge_predicate, path)? {
+        let subject = object_to_subject(void, object, path, context)?;
+        ensure_named_triple(void, subject, RDF_TYPE, VOID_DATASET, path, context)?;
+        let values = object_ids(void, subject, term_predicate, path)?;
+        let term = match values.as_slice() {
+            [term] => Some(*term),
+            [] if term_requirement == TermRequirement::Optional => None,
+            [] => {
+                return Err(malformed(
+                    path,
+                    format!(
+                        "{context} subject {} has no <{term_predicate}> value",
+                        subject.0
+                    ),
+                ));
+            }
+            _ => {
+                return Err(malformed(
+                    path,
+                    format!(
+                        "{context} subject {} has {} <{term_predicate}> values",
+                        subject.0,
+                        values.len()
+                    ),
+                ));
+            }
+        };
+        if !terms.insert(term) {
+            let detail = term.map_or_else(
+                || "more than one target without a semantic term".to_owned(),
+                |term| format!("repeated semantic term object id {}", term.0),
+            );
+            return Err(malformed(
+                path,
+                format!(
+                    "{context} collection below subject {} has {detail}",
+                    parent.0
+                ),
+            ));
+        }
+        children.push(VerifiedChild { subject, term });
+    }
+    Ok(children)
+}
+
+fn child_iri(
+    void: &IndexedHdt,
+    child: VerifiedChild,
+    path: &Path,
+    context: &str,
+) -> Result<String> {
+    let term = child.term.ok_or_else(|| {
+        malformed(
+            path,
+            format!("{context} subject {} has no semantic term", child.subject.0),
+        )
+    })?;
+    object_iri(void, term, path, context)
+}
+
+fn require_child_selector(
+    index: &BTreeMap<VerifiedSelector, TermId>,
+    selector: &VerifiedSelector,
+    child: TermId,
+    view: &StatsView,
+    path: &Path,
+    context: &str,
+) -> Result<()> {
+    match index.get(selector) {
+        Some(subject) if *subject == child => Ok(()),
+        Some(subject) => Err(malformed(
+            path,
+            format!(
+                "{context} in view {:?} reaches subject {}, but selector {selector:?} names subject {}",
+                manifest_view_name(view),
+                child.0,
+                subject.0
+            ),
+        )),
+        None => Err(malformed(
+            path,
+            format!(
+                "{context} subject {} in view {:?} has no schema selector {selector:?}",
+                child.0,
+                manifest_view_name(view)
+            ),
+        )),
+    }
 }
 
 fn required_selector(

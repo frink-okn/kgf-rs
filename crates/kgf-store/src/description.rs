@@ -393,6 +393,7 @@ pub struct SchemaPage {
     ///
     /// The object-class collection omits untyped target partitions, which have
     /// no semantic term; their triples remain in the parent property's counts.
+    /// Publication verification permits at most one such target per property.
     pub items: Vec<SchemaNode>,
     /// Zero-based child offset for the next page.
     pub next: Option<u64>,
@@ -591,7 +592,8 @@ impl<'a> DescriptionView<'a> {
     ///
     /// Selector resolution is one mapped TSV binary search. Each returned item
     /// then costs a fixed number of indexed VoID probes; neither the tree nor
-    /// any per-node directory is materialized.
+    /// any per-node directory is materialized. A nonzero `from` must fall
+    /// inside this immutable raw-child enumeration.
     pub fn schema_children(
         &self,
         query: SchemaChildQuery<'_>,
@@ -601,6 +603,7 @@ impl<'a> DescriptionView<'a> {
         let collection = query.collection();
         let selector = query.selector();
         let Some(subject) = self.selector_subject(selector)? else {
+            validate_schema_position(from, 0)?;
             return Ok(SchemaPage {
                 node: None,
                 collection,
@@ -618,6 +621,7 @@ impl<'a> DescriptionView<'a> {
 
         let edge = LocatedPredicate::new(dictionary, query.edge_predicate())?;
         let Some(edge_id) = edge.id else {
+            validate_schema_position(from, 0)?;
             return Ok(SchemaPage {
                 node: Some(node),
                 collection,
@@ -632,7 +636,10 @@ impl<'a> DescriptionView<'a> {
             object: None,
         })?;
         let total = selection.count().value;
-        let start = from.min(total);
+        let start = validate_schema_position(from, total)?;
+        // Publication proves that only an object-class collection can omit a
+        // child and that it has at most one omitted bucket. The extra raw
+        // candidate therefore covers both typed lookahead and that omission.
         let candidate_limit = limit.get().saturating_add(1);
         let mut items = Vec::new();
         let mut position = start;
@@ -865,6 +872,13 @@ impl<'a> DescriptionView<'a> {
             )),
         }
     }
+}
+
+fn validate_schema_position(position: u64, length: u64) -> Result<u64> {
+    if position != 0 && position >= length {
+        return Err(Error::ResumePositionOutOfRange { position, length });
+    }
+    Ok(position)
 }
 
 fn object_to_subject(
@@ -1633,6 +1647,15 @@ mod tests {
         .unwrap();
     }
 
+    fn description_verification_error(void: &str) -> Error {
+        let fixture = Fixture::build(void);
+        publish_verified_description(&fixture);
+        let manifest = Manifest::read(fixture.bundle_path()).unwrap();
+        let published = published_bundle(fixture.bundle_path());
+        verify_description_indexes(&published, &manifest)
+            .expect_err("malformed description must fail publication proof")
+    }
+
     #[test]
     fn row_boundary_search_finds_every_variable_width_key_and_no_gap() {
         let temp = tempfile::tempdir().unwrap();
@@ -1953,7 +1976,44 @@ mod tests {
     }
 
     #[test]
-    fn absent_parent_and_past_end_child_positions_are_complete_empty_pages() {
+    fn a_single_trailing_untyped_bucket_does_not_create_a_terminal_page() {
+        let trailing_untyped = VERIFIED_VOID_NT.replace("target-b", "target-z");
+        let fixture = Fixture::build(&trailing_untyped);
+        publish_verified_description(&fixture);
+        let store = opened_description(&fixture);
+        let description = store.description().unwrap();
+        let view = description.view(&StatsView::Design).unwrap();
+        let query = SchemaChildQuery::PropertyObjectClasses {
+            class: Some("https://example.org/A"),
+            predicate: "https://example.org/p",
+        };
+        let one = NonZeroUsize::new(1).unwrap();
+
+        let first = view.schema_children(query, 0, one).unwrap();
+        let second = view
+            .schema_children(query, first.next.unwrap(), one)
+            .unwrap();
+        let third = view
+            .schema_children(query, second.next.unwrap(), one)
+            .unwrap();
+
+        assert_eq!(
+            [first.items[0], second.items[0], third.items[0]].map(|node| {
+                schema_term(description, node).expect("typed object-class partition")
+            }),
+            [
+                "https://example.org/B",
+                "https://example.org/C",
+                "https://example.org/D"
+            ]
+        );
+        assert_eq!(first.next, Some(1));
+        assert_eq!(second.next, Some(2));
+        assert_eq!(third.next, None);
+    }
+
+    #[test]
+    fn absent_parents_are_empty_and_out_of_range_child_positions_are_rejected() {
         let fixture = Fixture::build(VERIFIED_VOID_NT);
         publish_verified_description(&fixture);
         let store = opened_description(&fixture);
@@ -1974,12 +2034,33 @@ mod tests {
         assert!(absent.items.is_empty());
         assert_eq!(absent.next, None);
 
-        let past_end = view
-            .schema_children(SchemaChildQuery::Classes, u64::MAX, one)
-            .unwrap();
-        assert!(past_end.node.is_some());
-        assert!(past_end.items.is_empty());
-        assert_eq!(past_end.next, None);
+        assert!(matches!(
+            view.schema_children(
+                SchemaChildQuery::ClassProperties {
+                    class: "https://example.org/missing",
+                },
+                1,
+                one,
+            ),
+            Err(Error::ResumePositionOutOfRange {
+                position: 1,
+                length: 0
+            })
+        ));
+        assert!(matches!(
+            view.schema_children(SchemaChildQuery::Classes, 1, one),
+            Err(Error::ResumePositionOutOfRange {
+                position: 1,
+                length: 1
+            })
+        ));
+        assert!(matches!(
+            view.schema_children(SchemaChildQuery::Classes, u64::MAX, one),
+            Err(Error::ResumePositionOutOfRange {
+                position: u64::MAX,
+                length: 1
+            })
+        ));
 
         let queryable = description.view(&StatsView::Queryable).unwrap();
         let queryable_classes = queryable
@@ -1987,6 +2068,13 @@ mod tests {
             .unwrap();
         assert!(queryable_classes.node.is_some());
         assert!(queryable_classes.items.is_empty());
+        assert!(matches!(
+            queryable.schema_children(SchemaChildQuery::Classes, 1, one),
+            Err(Error::ResumePositionOutOfRange {
+                position: 1,
+                length: 0
+            })
+        ));
 
         let component = description
             .view(&StatsView::component("canonical").unwrap())
@@ -2194,6 +2282,73 @@ mod tests {
             error
                 .to_string()
                 .contains("has multiple values for <http://rdfs.org/ns/void#distinctSubjects>"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn publication_proof_rejects_an_unindexed_traversable_child() {
+        let malformed_void = format!(
+            "{VERIFIED_VOID_NT}{}{}{}",
+            "<https://example.org/design> <http://rdfs.org/ns/void#classPartition> <https://example.org/class-extra> .\n",
+            "<https://example.org/class-extra> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+            "<https://example.org/class-extra> <http://rdfs.org/ns/void#class> <https://example.org/Extra> .\n",
+        );
+        let error = description_verification_error(&malformed_void);
+        assert!(
+            error.to_string().contains("has no schema selector"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn publication_proof_rejects_a_child_with_multiple_semantic_terms() {
+        let class = concat!(
+            "<https://example.org/class-a> <http://rdfs.org/ns/void#class> ",
+            "<https://example.org/A> .\n"
+        );
+        let duplicate = concat!(
+            "<https://example.org/class-a> <http://rdfs.org/ns/void#class> ",
+            "<https://example.org/A> .\n",
+            "<https://example.org/class-a> <http://rdfs.org/ns/void#class> ",
+            "<https://example.org/AlsoA> .\n"
+        );
+        let malformed_void = VERIFIED_VOID_NT.replace(class, duplicate);
+        let error = description_verification_error(&malformed_void);
+        assert!(
+            error
+                .to_string()
+                .contains("has 2 <http://rdfs.org/ns/void#class> values"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn publication_proof_rejects_an_edge_target_that_is_not_a_subject() {
+        let malformed_void = format!(
+            "{VERIFIED_VOID_NT}{}",
+            "<https://example.org/design> <http://rdfs.org/ns/void#classPartition> <https://example.org/not-a-subject> .\n",
+        );
+        let error = description_verification_error(&malformed_void);
+        assert!(
+            error.to_string().contains("is not a VoID subject"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn publication_proof_rejects_multiple_untyped_object_target_buckets() {
+        let malformed_void = format!(
+            "{VERIFIED_VOID_NT}{}{}{}",
+            "<https://example.org/property-p> <http://ldf.fi/void-ext#objectClassPartition> <https://example.org/target-e> .\n",
+            "<https://example.org/target-e> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+            "<https://example.org/target-e> <http://rdfs.org/ns/void#triples> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+        );
+        let error = description_verification_error(&malformed_void);
+        assert!(
+            error
+                .to_string()
+                .contains("more than one target without a semantic term"),
             "unexpected error: {error}"
         );
     }

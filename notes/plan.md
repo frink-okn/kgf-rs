@@ -1208,9 +1208,11 @@ schema size.
 binary search. `stats/class-relations.tsv` pages its persisted order directly,
 including filtered candidate limits and exact byte-position resumption. Full
 publication-time verification checks TSV ranges, ordering, row metadata,
-selector bindings, parent paths, every numeric count fact the serving API can
-project, and the class-relation projection against the indexed VoID graph; it
-runs from `kgf manifest`, not from the bounded open path.
+selector bindings in both directions, parent paths, every traversable child
+edge and its single semantic term, every numeric count fact the serving API can
+project, and the class-relation projection against the indexed VoID graph. It
+runs from `kgf manifest`, not from the bounded open path, so serving can trust
+that an indexed edge never reaches an unprojectable child or a missing selector.
 
 The headless schema API now projects the selected node's stated VoID counts and
 pages one immediate collection. Valid selector/collection pairs are distinct
@@ -1219,17 +1221,24 @@ object classes, property datatypes, and datatype languages. Results remain in
 the VoID dictionary's id space until serialization, enumerate in indexed HDT
 order, and probe at most `limit + 1` child candidates. Untyped object-target
 partitions are skipped from the `object-classes` collection while their triples
-remain in the property node's aggregate count; question 36 records the sentence
-doc 03 still owes that behavior. A full SPO selection plus the VoID dictionary
-is also exposed as the representation-neutral input for `/void` serialization.
+remain in the property node's aggregate count. Publication permits at most one
+such bucket per property, which makes omission compatible with the documented
+`limit + 1` bound and prevents a phantom terminal page. Nonzero resume positions
+must name a raw child inside the immutable enumeration; an endpoint or larger
+position is refused rather than clamped to an empty page. Question 36 records
+the sentences doc 03 still owes these behaviors. A full SPO selection plus the
+VoID dictionary is also exposed as the representation-neutral input for `/void`
+serialization.
 
 *Verified so far by* a layered golden VoID fixture covering every valid child
 query, every node kind, design/queryable/component views, absent selectors,
 one-item cursor resumption, datatype and language terms, omission of an untyped
-target interspersed across multiple pages without loss, duplication, or a
-phantom terminal page, numeric node projection, full VoID traversal, malformed
-selector IDs, refusal of malformed or ambiguous count facts at publication,
-publication proof, and the existing mapped open-cost invariants.
+target both interspersed and trailing across multiple pages without loss,
+duplication, or a phantom terminal page, refusal of out-of-range resume positions,
+numeric node projection, full VoID traversal, malformed selector IDs, and
+publication refusal for non-subject edge targets, unindexed children, repeated
+semantic terms, multiple untyped buckets, and malformed or ambiguous count
+facts, plus the existing mapped open-cost invariants.
 
 Still to land in this unit: namespace/summary artifact readers, server request
 and cursor types, JSON/HTML `/schema`, RDF `/void`, static `/summary`, and the
@@ -1692,7 +1701,11 @@ following the code.
     navigable child collection does. The store omits it there too, while preserving
     its contribution in the selected property node's `void:triples` count. That keeps
     `object-classes` literally a collection of classes and avoids inventing a null or
-    sentinel term, but the API document should state the rule. Surfaced in unit 19.
+    sentinel term. The producer and publication proof also require at most one untyped
+    target bucket per property: without that invariant, omitting an arbitrary run while
+    retaining §3.5's `limit + 1` cost bound needs a scan budget or another persisted
+    index. The API and storage documents should state both the omission and the single-
+    bucket invariant. Surfaced in unit 19.
 
 ## Not in this plan
 
