@@ -1201,8 +1201,8 @@ HDT plus its bound permutation sidecar and serves both `data.hdt` and
 `stats/void.hdt`; its dictionary projection remains encapsulated with the
 mapping it belongs to. A tier-1 description is an all-or-none seven-artifact
 set, included in bundle identity. `Store::open` maps the VoID pair and the two
-TSV indexes without scanning payload rows or allocating state proportional to
-schema size.
+TSV indexes plus the namespace and two summary documents without scanning
+their payloads or allocating state proportional to schema or prefix-table size.
 
 `stats/schema-nodes.tsv` resolves typed semantic selectors by row-boundary-aware
 binary search. `stats/class-relations.tsv` pages its persisted order directly,
@@ -1210,9 +1210,11 @@ including filtered candidate limits and exact byte-position resumption. Full
 publication-time verification checks TSV ranges, ordering, row metadata,
 selector bindings in both directions, parent paths, every traversable child
 edge and its single semantic term, every numeric count fact the serving API can
-project, and the class-relation projection against the indexed VoID graph. It
-runs from `kgf manifest`, not from the bounded open path, so serving can trust
-that an indexed edge never reaches an unprojectable child or a missing selector.
+project, the namespace document's type/count invariants, summary JSON syntax,
+summary Markdown UTF-8, and the class-relation projection against the indexed
+VoID graph. It runs from `kgf manifest`, not from the bounded open path, so
+serving can trust that an indexed edge never reaches an unprojectable child or
+a missing selector and static bytes do not fail on first use.
 
 The headless schema API now projects the selected node's stated VoID counts and
 pages one immediate collection. Valid selector/collection pairs are distinct
@@ -1230,6 +1232,26 @@ the sentences doc 03 still owes these behaviors. A full SPO selection plus the
 VoID dictionary is also exposed as the representation-neutral input for `/void`
 serialization.
 
+The namespace inventory parses on demand into borrowed domain types, including
+the graph-wide `distinct_iris` union hdtc now emits, and proves role coverage
+identities without leaving a cache on `Store`. `prefix_table.source` remains an
+informational producer label; the reader treats the lowercase SHA-256
+`prefix_table.version` as the merged table's stable identity. Summary JSON stays
+exact published bytes because doc 04 has not fixed its field schema; summary
+Markdown is exposed as checked UTF-8. This keeps `/summary` static and prevents
+the read layer from silently inventing a summary schema.
+
+The server request boundary now parses `/schema` into three mutually exclusive
+shapes: one selected node, one valid immediate-child collection, or the flat
+class-relation projection. Selector terms are required to be IRIs and are
+canonicalized before cursor hashing, so CURIE and expanded spellings resume the
+same request. A dedicated `max_schema_items` cap bounds both paged shapes.
+Schema cursors add explicit child-offset and class-relation-byte-offset position
+spaces; they bind the view, canonical selectors, collection or projection and
+filters, while excluding `limit` and representation. Node-only requests cannot
+carry a cursor, and a cursor in the wrong schema position space is stale before
+the bundle opens.
+
 *Verified so far by* a layered golden VoID fixture covering every valid child
 query, every node kind, design/queryable/component views, absent selectors,
 one-item cursor resumption, datatype and language terms, omission of an untyped
@@ -1238,11 +1260,12 @@ duplication, or a phantom terminal page, refusal of out-of-range resume position
 numeric node projection, full VoID traversal, malformed selector IDs, and
 publication refusal for non-subject edge targets, unindexed children, repeated
 semantic terms, multiple untyped buckets, and malformed or ambiguous count
-facts, plus the existing mapped open-cost invariants.
+facts; namespace union and coverage identities; malformed summary JSON and
+Markdown; exact static-byte access; and the existing mapped open-cost
+invariants.
 
-Still to land in this unit: namespace/summary artifact readers, server request
-and cursor types, JSON/HTML `/schema`, RDF `/void`, static `/summary`, and the
-`kgf build stats` producer that creates the complete artifact set.
+Still to land in this unit: JSON/HTML `/schema`, RDF `/void`, static `/summary`,
+and the `kgf build stats` producer that creates the complete artifact set.
 
 ### What the implementation still is not
 
@@ -1706,6 +1729,16 @@ following the code.
     retaining §3.5's `limit + 1` cost bound needs a scan budget or another persisted
     index. The API and storage documents should state both the omission and the single-
     bucket invariant. Surfaced in unit 19.
+37. **The namespace artifact example predates the hdtc contract.** Doc 04 §4.2's
+    namespace rows omit the graph-wide `distinct_iris` count now emitted by `hdtc
+    namespaces`, and its `prefix_table.version` example is a date while hdtc emits a
+    lowercase SHA-256 over the fully merged prefix map. The implementation types
+    `distinct_iris`, treats that digest as the stable table identity, and keeps
+    `prefix_table.source` informational because hdtc currently joins the input path
+    labels and those can be build-host-specific. Doc 04 should add `distinct_iris`,
+    define `version` as the content digest, and say whether a KGF producer must replace
+    `source` with a logical registry identifier before publication. Surfaced in unit
+    19.
 
 ## Not in this plan
 

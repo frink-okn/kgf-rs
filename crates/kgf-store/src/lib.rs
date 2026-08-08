@@ -64,9 +64,10 @@ pub mod testing;
 pub use catalog::Catalog;
 pub use description::{
     ClassRelation, ClassRelationFilter, ClassRelationPage, ClassRelationPosition,
-    ClassRelationStop, ComponentId, DescriptionStore, DescriptionView, SchemaChildQuery,
+    ClassRelationStop, ComponentId, DescriptionStore, DescriptionView, NamespaceEntry,
+    NamespaceInventory, NamespaceRoleCounts, NamespaceRoles, PrefixTableIdentity, SchemaChildQuery,
     SchemaCollection, SchemaCounts, SchemaNode, SchemaNodeKind, SchemaPage, SchemaSelector,
-    StatsView, verify_description_indexes,
+    StatsView, verify_description_artifacts,
 };
 pub use error::{Error, Result};
 pub use manifest::{BundleFacts, Capability, Manifest, ManifestDocument};

@@ -107,7 +107,7 @@ impl Config {
 /// told has been handed a truncated answer that claims to be complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Caps {
-    /// Rows per page.
+    /// Rows per ordinary result page; `/schema` has `max_schema_items`.
     pub max_limit: u32,
     /// Rows per page when a request does not ask for a number.
     ///
@@ -132,6 +132,8 @@ pub struct Caps {
     pub max_search_results: u32,
     /// IRIs one `/labels` request may resolve.
     pub max_label_iris: u32,
+    /// Child or class-relation rows in one `/schema` page.
+    pub max_schema_items: u32,
 }
 
 impl Caps {
@@ -151,6 +153,7 @@ impl Caps {
             max_search_predicates: 128,
             max_search_results: 1_000,
             max_label_iris: 10_000,
+            max_schema_items: 1_000,
         }
     }
 }
@@ -217,12 +220,20 @@ impl Limits<'_> {
         rows("max_sample", self.caps.max_sample)?;
         rows("max_search_results", self.caps.max_search_results)?;
         rows("max_label_iris", self.caps.max_label_iris)?;
+        rows("max_schema_items", self.caps.max_schema_items)?;
 
         if self.caps.default_limit > self.caps.max_limit {
             return Err(format!(
                 "caps.default_limit is {}, over caps.max_limit of {}; \
                  a request that named no limit would be refused for exceeding one",
                 self.caps.default_limit, self.caps.max_limit
+            ));
+        }
+        if self.caps.default_limit > self.caps.max_schema_items {
+            return Err(format!(
+                "caps.default_limit is {}, over caps.max_schema_items of {}; \
+                 a schema request that named no limit would exceed its cap",
+                self.caps.default_limit, self.caps.max_schema_items
             ));
         }
         if self.caps.max_limit == 0
@@ -232,11 +243,12 @@ impl Limits<'_> {
             || self.caps.max_search_predicates == 0
             || self.caps.max_search_results == 0
             || self.caps.max_label_iris == 0
+            || self.caps.max_schema_items == 0
         {
             return Err(
                 "caps.max_limit, caps.default_limit, caps.max_sample, caps.max_bindings, \
-                 caps.max_search_predicates, caps.max_search_results and caps.max_label_iris \
-                 must be at least 1; \
+                 caps.max_search_predicates, caps.max_search_results, caps.max_label_iris and \
+                 caps.max_schema_items must be at least 1; \
                  a zero-width operation is not usable"
                     .to_owned(),
             );
@@ -415,6 +427,12 @@ mod tests {
         };
         assert!(config(&over_sample, &Budgets::new()).validate().is_err());
 
+        let over_schema = Caps {
+            max_schema_items: 200_000,
+            ..Caps::new()
+        };
+        assert!(config(&over_schema, &Budgets::new()).validate().is_err());
+
         // A default above its own cap would refuse every request that named no
         // limit, for exceeding a limit it did not name.
         let bad_default = Caps {
@@ -425,6 +443,15 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(refused.contains("default_limit"), "{refused}");
+
+        let bad_schema_default = Caps {
+            default_limit: 2_000,
+            ..Caps::new()
+        };
+        let refused = config(&bad_schema_default, &Budgets::new())
+            .validate()
+            .unwrap_err();
+        assert!(refused.contains("max_schema_items"), "{refused}");
 
         for zero in [
             Caps {
@@ -441,6 +468,10 @@ mod tests {
             },
             Caps {
                 default_limit: 0,
+                ..Caps::new()
+            },
+            Caps {
+                max_schema_items: 0,
                 ..Caps::new()
             },
         ] {

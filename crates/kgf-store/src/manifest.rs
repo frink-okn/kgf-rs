@@ -377,11 +377,14 @@ pub struct ArtifactEntry {
     pub views: BTreeMap<String, ArtifactView>,
 }
 
-/// Typed manifest entries attached to a complete on-disk description set.
+/// Typed manifest entries consumed by the mapped description reader.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DescriptionArtifactEntries<'a> {
     pub(crate) schema_nodes: &'a ArtifactEntry,
     pub(crate) class_relations: &'a ArtifactEntry,
+    pub(crate) namespaces: &'a ArtifactEntry,
+    pub(crate) summary_json: &'a ArtifactEntry,
+    pub(crate) summary_md: &'a ArtifactEntry,
 }
 
 impl ArtifactEntry {
@@ -521,16 +524,23 @@ impl Manifest {
         self.capabilities.contains_key(capability.as_str())
     }
 
-    /// The two entries whose metadata the mapped description reader consumes.
+    /// The five entries whose metadata the mapped description reader consumes.
     ///
     /// [`validate`](Self::validate) establishes the all-or-none invariant, so
-    /// finding the selector entry means the relation entry is present too.
+    /// finding the selector entry means every other description entry is
+    /// present too.
     pub(crate) fn description_artifacts(&self) -> Option<DescriptionArtifactEntries<'_>> {
         let schema_nodes = self.artifacts.get(artifact::SCHEMA_NODES)?;
         let class_relations = self.artifacts.get(artifact::CLASS_RELATIONS)?;
+        let namespaces = self.artifacts.get(artifact::NAMESPACES)?;
+        let summary_json = self.artifacts.get(artifact::SUMMARY_JSON)?;
+        let summary_md = self.artifacts.get(artifact::SUMMARY_MD)?;
         Some(DescriptionArtifactEntries {
             schema_nodes,
             class_relations,
+            namespaces,
+            summary_json,
+            summary_md,
         })
     }
 

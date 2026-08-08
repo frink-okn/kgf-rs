@@ -40,7 +40,10 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::ser::{Serialize, SerializeMap, Serializer};
 
 use hdtc::format::TextQuery;
-use kgf_store::{Capability, Role};
+use kgf_store::{
+    Capability, ClassRelationFilter as StoreClassRelationFilter, Role,
+    SchemaChildQuery as StoreSchemaChildQuery, SchemaSelector as StoreSchemaSelector, StatsView,
+};
 
 use crate::Limits;
 use crate::cursor::{
@@ -1417,6 +1420,495 @@ impl Describe {
     }
 }
 
+/// One valid node selector for `/schema`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaSelection {
+    /// The selected view's dataset root.
+    Dataset,
+    /// One class partition.
+    Class {
+        /// The selected class IRI.
+        class: BoundTerm,
+    },
+    /// One dataset- or class-scoped property partition.
+    Property {
+        /// The optional subject class scope.
+        class: Option<BoundTerm>,
+        /// The selected predicate IRI.
+        predicate: BoundTerm,
+    },
+    /// One dataset- or class-scoped datatype partition.
+    Datatype {
+        /// The optional subject class scope.
+        class: Option<BoundTerm>,
+        /// The selected predicate IRI.
+        predicate: BoundTerm,
+        /// The selected datatype IRI.
+        datatype: BoundTerm,
+    },
+}
+
+impl SchemaSelection {
+    /// Borrow this request selection in the store layer's id-resolution shape.
+    pub fn store_selector(&self) -> StoreSchemaSelector<'_> {
+        match self {
+            Self::Dataset => StoreSchemaSelector::Dataset,
+            Self::Class { class } => StoreSchemaSelector::Class {
+                class: class.dictionary(),
+            },
+            Self::Property { class, predicate } => StoreSchemaSelector::Property {
+                class: class.as_ref().map(BoundTerm::dictionary),
+                predicate: predicate.dictionary(),
+            },
+            Self::Datatype {
+                class,
+                predicate,
+                datatype,
+            } => StoreSchemaSelector::Datatype {
+                class: class.as_ref().map(BoundTerm::dictionary),
+                predicate: predicate.dictionary(),
+                datatype: datatype.dictionary(),
+            },
+        }
+    }
+
+    fn canonicalize(&self, request: CanonicalRequest) -> CanonicalRequest {
+        match self {
+            Self::Dataset => request,
+            Self::Class { class } => request.with("class", class.dictionary()),
+            Self::Property { class, predicate } => request
+                .with_opt("class", class.as_ref().map(BoundTerm::dictionary))
+                .with("predicate", predicate.dictionary()),
+            Self::Datatype {
+                class,
+                predicate,
+                datatype,
+            } => request
+                .with_opt("class", class.as_ref().map(BoundTerm::dictionary))
+                .with("predicate", predicate.dictionary())
+                .with("datatype", datatype.dictionary()),
+        }
+    }
+}
+
+/// One valid immediate-child collection request.
+///
+/// The variants pair a collection with the only selector shapes under which
+/// doc 03 permits it, so parsing cannot produce (for example) languages below
+/// a property or classes below a class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaChildren {
+    /// Classes below the selected view's dataset root.
+    Classes,
+    /// Properties below the selected view's dataset root.
+    DatasetProperties,
+    /// Properties below one class partition.
+    ClassProperties {
+        /// The selected class IRI.
+        class: BoundTerm,
+    },
+    /// Object classes below one property partition.
+    PropertyObjectClasses {
+        /// The optional subject class scope.
+        class: Option<BoundTerm>,
+        /// The selected predicate IRI.
+        predicate: BoundTerm,
+    },
+    /// Datatypes below one property partition.
+    PropertyDatatypes {
+        /// The optional subject class scope.
+        class: Option<BoundTerm>,
+        /// The selected predicate IRI.
+        predicate: BoundTerm,
+    },
+    /// Languages below one datatype partition.
+    DatatypeLanguages {
+        /// The optional subject class scope.
+        class: Option<BoundTerm>,
+        /// The selected predicate IRI.
+        predicate: BoundTerm,
+        /// The selected datatype IRI.
+        datatype: BoundTerm,
+    },
+}
+
+impl SchemaChildren {
+    /// Borrow this request in the store layer's typed child-query shape.
+    pub fn store_query(&self) -> StoreSchemaChildQuery<'_> {
+        match self {
+            Self::Classes => StoreSchemaChildQuery::Classes,
+            Self::DatasetProperties => StoreSchemaChildQuery::DatasetProperties,
+            Self::ClassProperties { class } => StoreSchemaChildQuery::ClassProperties {
+                class: class.dictionary(),
+            },
+            Self::PropertyObjectClasses { class, predicate } => {
+                StoreSchemaChildQuery::PropertyObjectClasses {
+                    class: class.as_ref().map(BoundTerm::dictionary),
+                    predicate: predicate.dictionary(),
+                }
+            }
+            Self::PropertyDatatypes { class, predicate } => {
+                StoreSchemaChildQuery::PropertyDatatypes {
+                    class: class.as_ref().map(BoundTerm::dictionary),
+                    predicate: predicate.dictionary(),
+                }
+            }
+            Self::DatatypeLanguages {
+                class,
+                predicate,
+                datatype,
+            } => StoreSchemaChildQuery::DatatypeLanguages {
+                class: class.as_ref().map(BoundTerm::dictionary),
+                predicate: predicate.dictionary(),
+                datatype: datatype.dictionary(),
+            },
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Classes => "classes",
+            Self::DatasetProperties | Self::ClassProperties { .. } => "properties",
+            Self::PropertyObjectClasses { .. } => "object-classes",
+            Self::PropertyDatatypes { .. } => "datatypes",
+            Self::DatatypeLanguages { .. } => "languages",
+        }
+    }
+
+    fn canonicalize(&self, request: CanonicalRequest) -> CanonicalRequest {
+        let request = match self {
+            Self::Classes | Self::DatasetProperties => request,
+            Self::ClassProperties { class } => request.with("class", class.dictionary()),
+            Self::PropertyObjectClasses { class, predicate }
+            | Self::PropertyDatatypes { class, predicate } => request
+                .with_opt("class", class.as_ref().map(BoundTerm::dictionary))
+                .with("predicate", predicate.dictionary()),
+            Self::DatatypeLanguages {
+                class,
+                predicate,
+                datatype,
+            } => request
+                .with_opt("class", class.as_ref().map(BoundTerm::dictionary))
+                .with("predicate", predicate.dictionary())
+                .with("datatype", datatype.dictionary()),
+        };
+        request.with("children", self.name())
+    }
+}
+
+/// Optional filters for `/schema?projection=class-relations`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaRelationFilter {
+    /// Subject-class IRI to retain.
+    pub class: Option<BoundTerm>,
+    /// Predicate IRI to retain.
+    pub predicate: Option<BoundTerm>,
+}
+
+impl SchemaRelationFilter {
+    /// Borrow the filters in the store layer's persisted-projection shape.
+    pub fn store_filter(&self) -> StoreClassRelationFilter<'_> {
+        StoreClassRelationFilter {
+            class: self.class.as_ref().map(BoundTerm::dictionary),
+            predicate: self.predicate.as_ref().map(BoundTerm::dictionary),
+        }
+    }
+
+    fn canonicalize(&self, request: CanonicalRequest) -> CanonicalRequest {
+        request
+            .with("projection", "class-relations")
+            .with_opt("class", self.class.as_ref().map(BoundTerm::dictionary))
+            .with_opt(
+                "predicate",
+                self.predicate.as_ref().map(BoundTerm::dictionary),
+            )
+    }
+}
+
+/// The mutually exclusive result shapes of one `/schema` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaQuery {
+    /// Describe one selected node without paging a child collection.
+    Node(SchemaSelection),
+    /// Describe one node and page one valid immediate-child collection.
+    Children(SchemaChildren),
+    /// Page the persisted flat class-relation projection.
+    ClassRelations(SchemaRelationFilter),
+}
+
+impl SchemaQuery {
+    fn canonicalize(&self, request: CanonicalRequest) -> CanonicalRequest {
+        match self {
+            Self::Node(selection) => selection.canonicalize(request),
+            Self::Children(children) => children.canonicalize(request),
+            Self::ClassRelations(filter) => filter.canonicalize(request),
+        }
+    }
+
+    fn position_space(&self) -> Option<crate::cursor::PositionSpace> {
+        match self {
+            Self::Node(_) => None,
+            Self::Children(_) => Some(crate::cursor::PositionSpace::SchemaChild),
+            Self::ClassRelations(_) => Some(crate::cursor::PositionSpace::ClassRelation),
+        }
+    }
+}
+
+/// `GET /schema` — one bounded description drill-down (§3.4.10).
+#[derive(Debug)]
+pub struct Schema {
+    /// The description layer whose numbers are selected.
+    pub view: StatsView,
+    /// Node-only, one typed child collection, or flat class relations.
+    pub query: SchemaQuery,
+    /// Child or class-relation rows this page may carry.
+    pub limit: u32,
+    /// Bytes its rows may occupy.
+    pub bytes: ResponseBytes,
+    /// Rows a filtered class-relation page may examine.
+    pub candidates: Candidates,
+    /// Where to resume, if the request carried a cursor.
+    pub cursor: Option<Cursor>,
+    /// What a cursor this request issues must match.
+    pub binding: CursorBinding,
+}
+
+impl Schema {
+    const PARAMETERS: &'static [&'static str] = &[
+        "class",
+        "predicate",
+        "datatype",
+        "children",
+        "projection",
+        "view",
+        "limit",
+        "cursor",
+        "format",
+    ];
+
+    /// Parse and type one `/schema` query before a bundle is opened.
+    pub fn parse(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        bundle: &BundleBinding,
+    ) -> Result<Self, Problem> {
+        accept_only(params, SCHEMA, Self::PARAMETERS)?;
+        let view = schema_view(params)?;
+        let query = parse_schema_query(params, limits, prefixes)?;
+        let limit = page_size(
+            params,
+            "limit",
+            limits.caps.default_limit,
+            limits.caps.max_schema_items,
+            "ask for at least one schema item",
+        )?;
+        let canonical = query.canonicalize(canonicalize_schema_view(
+            &view,
+            CanonicalRequest::new(Operation::Schema),
+        ));
+        let binding = CursorBinding::new(bundle, &canonical);
+        let cursor = resume(params, &binding)?;
+        if cursor.as_ref().is_some_and(|cursor| {
+            Some(cursor.space) != query.position_space()
+                || cursor.binding_index.is_some()
+                || cursor.scan_position.is_some()
+        }) {
+            return Err(Problem::from(StaleCursor));
+        }
+        Ok(Self {
+            view,
+            query,
+            limit,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            candidates: Candidates(limits.budgets.candidate_budget),
+            cursor,
+            binding,
+        })
+    }
+}
+
+fn schema_view(params: &Params) -> Result<StatsView, Problem> {
+    match params.get("view") {
+        None | Some("design") => Ok(StatsView::Design),
+        Some("queryable") => Ok(StatsView::Queryable),
+        Some(value) => value
+            .strip_prefix("component:")
+            .and_then(StatsView::component)
+            .ok_or_else(|| {
+                Problem::new(
+                    ErrorCode::MalformedRequest,
+                    format!(
+                        "view={} is not a schema view; use `design`, `queryable`, or `component:<id>`",
+                        reflected(value)
+                    ),
+                )
+            }),
+    }
+}
+
+fn canonicalize_schema_view(view: &StatsView, request: CanonicalRequest) -> CanonicalRequest {
+    match view {
+        StatsView::Design => request.with("view", "design"),
+        StatsView::Queryable => request.with("view", "queryable"),
+        StatsView::Component(component) => {
+            request.with("view", &format!("component:{}", component.as_str()))
+        }
+    }
+}
+
+fn parse_schema_query(
+    params: &Params,
+    limits: Limits<'_>,
+    prefixes: &PrefixMap,
+) -> Result<SchemaQuery, Problem> {
+    if let Some(projection) = params.get("projection") {
+        if projection != "class-relations" {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "projection={} is not a schema projection; use `class-relations` or omit it",
+                    reflected(projection)
+                ),
+            ));
+        }
+        if params.get("children").is_some() || params.get("datatype").is_some() {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "`projection=class-relations` accepts `class` and `predicate` filters, but not `children` or `datatype`",
+            ));
+        }
+        return Ok(SchemaQuery::ClassRelations(SchemaRelationFilter {
+            class: schema_iri(params, "class", limits, prefixes)?,
+            predicate: schema_iri(params, "predicate", limits, prefixes)?,
+        }));
+    }
+
+    let selection = match (
+        schema_iri(params, "class", limits, prefixes)?,
+        schema_iri(params, "predicate", limits, prefixes)?,
+        schema_iri(params, "datatype", limits, prefixes)?,
+    ) {
+        (None, None, None) => SchemaSelection::Dataset,
+        (Some(class), None, None) => SchemaSelection::Class { class },
+        (class, Some(predicate), None) => SchemaSelection::Property { class, predicate },
+        (class, Some(predicate), Some(datatype)) => SchemaSelection::Datatype {
+            class,
+            predicate,
+            datatype,
+        },
+        (_, None, Some(_)) => {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "`datatype` selects a partition beneath a predicate; add `predicate` or omit `datatype`",
+            ));
+        }
+    };
+
+    let Some(children) = params.get("children") else {
+        return Ok(SchemaQuery::Node(selection));
+    };
+    let collection = RequestedSchemaCollection::parse(children)?;
+    Ok(SchemaQuery::Children(collection.beneath(selection)?))
+}
+
+fn schema_iri(
+    params: &Params,
+    name: &str,
+    limits: Limits<'_>,
+    prefixes: &PrefixMap,
+) -> Result<Option<BoundTerm>, Problem> {
+    params
+        .get(name)
+        .map(|value| BoundTerm::parse(name, value, limits, prefixes)?.require_iri(name))
+        .transpose()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RequestedSchemaCollection {
+    Classes,
+    Properties,
+    ObjectClasses,
+    Datatypes,
+    Languages,
+}
+
+impl RequestedSchemaCollection {
+    fn parse(value: &str) -> Result<Self, Problem> {
+        match value {
+            "classes" => Ok(Self::Classes),
+            "properties" => Ok(Self::Properties),
+            "object-classes" => Ok(Self::ObjectClasses),
+            "datatypes" => Ok(Self::Datatypes),
+            "languages" => Ok(Self::Languages),
+            _ => Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "children={} is not a schema collection; use `classes`, `properties`, `object-classes`, `datatypes`, or `languages`",
+                    reflected(value)
+                ),
+            )),
+        }
+    }
+
+    fn beneath(self, selection: SchemaSelection) -> Result<SchemaChildren, Problem> {
+        match (selection, self) {
+            (SchemaSelection::Dataset, Self::Classes) => Ok(SchemaChildren::Classes),
+            (SchemaSelection::Dataset, Self::Properties) => Ok(SchemaChildren::DatasetProperties),
+            (SchemaSelection::Class { class }, Self::Properties) => {
+                Ok(SchemaChildren::ClassProperties { class })
+            }
+            (SchemaSelection::Property { class, predicate }, Self::ObjectClasses) => {
+                Ok(SchemaChildren::PropertyObjectClasses { class, predicate })
+            }
+            (SchemaSelection::Property { class, predicate }, Self::Datatypes) => {
+                Ok(SchemaChildren::PropertyDatatypes { class, predicate })
+            }
+            (
+                SchemaSelection::Datatype {
+                    class,
+                    predicate,
+                    datatype,
+                },
+                Self::Languages,
+            ) => Ok(SchemaChildren::DatatypeLanguages {
+                class,
+                predicate,
+                datatype,
+            }),
+            (selection, collection) => Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "children={} is not available beneath a {} selector",
+                    collection.as_str(),
+                    selection.kind()
+                ),
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Classes => "classes",
+            Self::Properties => "properties",
+            Self::ObjectClasses => "object-classes",
+            Self::Datatypes => "datatypes",
+            Self::Languages => "languages",
+        }
+    }
+}
+
+impl SchemaSelection {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Dataset => "dataset",
+            Self::Class { .. } => "class",
+            Self::Property { .. } => "property",
+            Self::Datatype { .. } => "datatype",
+        }
+    }
+}
+
 /// `GET /sample` — pseudo-random members of a pattern's result set (§3.4.7).
 #[derive(Debug)]
 pub struct Sample {
@@ -1499,6 +1991,20 @@ impl GetRequest for Describe {
     }
 }
 
+impl GetRequest for Schema {
+    fn normalize_params(params: &Params) -> Params {
+        params.without_empty(&[
+            "class",
+            "predicate",
+            "datatype",
+            "children",
+            "projection",
+            "view",
+            "limit",
+        ])
+    }
+}
+
 impl GetRequest for Sample {
     fn normalize_params(params: &Params) -> Params {
         normalize_pattern_params(params, &["n", "seed"])
@@ -1554,6 +2060,7 @@ const FRAGMENT: &str = "fragment";
 const COUNT: &str = "count";
 const DESCRIBE: &str = "describe";
 const SAMPLE: &str = "sample";
+const SCHEMA: &str = "schema";
 const SEARCH: &str = "search";
 const LABELS: &str = "labels";
 
@@ -1784,6 +2291,11 @@ mod tests {
         Fragment::parse(&params(query), limits(), &prefixes(), &bundle())
     }
 
+    fn schema(query: &str) -> Result<Schema, Problem> {
+        let params = Schema::normalize_params(&params(query));
+        Schema::parse(&params, limits(), &prefixes(), &bundle())
+    }
+
     fn binding_fragment(body: &[u8]) -> Result<BindingFragment, Problem> {
         BindingFragment::parse(&params(""), body, limits(), &prefixes(), &bundle())
     }
@@ -1826,6 +2338,148 @@ mod tests {
         // And a different pattern is a different request.
         let other = fragment("s=ex:bob").unwrap();
         assert!(Cursor::decode(token.as_str(), &other.binding).is_err());
+    }
+
+    #[test]
+    fn schema_parses_only_valid_typed_navigation_shapes() {
+        let root = schema("").unwrap();
+        assert_eq!(root.view, StatsView::Design);
+        assert_eq!(root.limit, 100);
+        assert!(matches!(
+            root.query,
+            SchemaQuery::Node(SchemaSelection::Dataset)
+        ));
+
+        for (query, expected) in [
+            ("children=classes", "classes"),
+            ("children=properties", "dataset properties"),
+            ("class=ex%3AClass&children=properties", "class properties"),
+            ("predicate=ex%3Ap&children=object-classes", "object classes"),
+            (
+                "class=ex%3AClass&predicate=ex%3Ap&children=datatypes",
+                "datatypes",
+            ),
+            (
+                "predicate=ex%3Ap&datatype=ex%3AString&children=languages",
+                "languages",
+            ),
+        ] {
+            let parsed = schema(query).unwrap_or_else(|error| panic!("{query}: {error}"));
+            let SchemaQuery::Children(children) = parsed.query else {
+                panic!("{query} did not parse as children");
+            };
+            match (expected, &children) {
+                ("classes", SchemaChildren::Classes)
+                | ("dataset properties", SchemaChildren::DatasetProperties)
+                | ("class properties", SchemaChildren::ClassProperties { .. })
+                | ("object classes", SchemaChildren::PropertyObjectClasses { .. })
+                | ("datatypes", SchemaChildren::PropertyDatatypes { .. })
+                | ("languages", SchemaChildren::DatatypeLanguages { .. }) => {}
+                (_, actual) => panic!("{query} produced {actual:?}, expected {expected}"),
+            }
+            let _store_query = children.store_query();
+        }
+
+        let selected = schema("class=ex%3AClass&predicate=ex%3Ap").unwrap();
+        let SchemaQuery::Node(SchemaSelection::Property { class, predicate }) = selected.query
+        else {
+            panic!("class + predicate must select a property node");
+        };
+        assert_eq!(class.unwrap().dictionary(), "http://example.org/Class");
+        assert_eq!(predicate.dictionary(), "http://example.org/p");
+    }
+
+    #[test]
+    fn schema_rejects_invalid_selector_collection_combinations() {
+        for query in [
+            "datatype=ex%3AString",
+            "children=languages",
+            "class=ex%3AClass&children=classes",
+            "predicate=ex%3Ap&children=properties",
+            "predicate=ex%3Ap&datatype=ex%3AString&children=datatypes",
+            "projection=class-relations&children=classes",
+            "projection=class-relations&datatype=ex%3AString",
+            "projection=recursive",
+            "view=component%3A",
+        ] {
+            assert_eq!(
+                schema(query).unwrap_err().code(),
+                ErrorCode::MalformedRequest,
+                "{query}"
+            );
+        }
+
+        assert_eq!(
+            schema("class=%22not-an-iri%22").unwrap_err().code(),
+            ErrorCode::BadTermSyntax
+        );
+    }
+
+    #[test]
+    fn schema_types_the_flat_projection_and_applies_its_own_cap() {
+        let parsed = schema(
+            "projection=class-relations&class=ex%3AClass&predicate=ex%3Ap&view=component%3Acanonical&limit=1000",
+        )
+        .unwrap();
+        assert_eq!(parsed.limit, CAPS.max_schema_items);
+        assert_eq!(parsed.candidates, Candidates(BUDGETS.candidate_budget));
+        assert_eq!(parsed.view, StatsView::component("canonical").unwrap());
+        let SchemaQuery::ClassRelations(filter) = parsed.query else {
+            panic!("projection did not type as class relations");
+        };
+        let filter = filter.store_filter();
+        assert_eq!(filter.class, Some("http://example.org/Class"));
+        assert_eq!(filter.predicate, Some("http://example.org/p"));
+
+        assert_eq!(
+            schema("projection=class-relations&limit=1001")
+                .unwrap_err()
+                .code(),
+            ErrorCode::CapExceeded
+        );
+    }
+
+    #[test]
+    fn schema_cursors_bind_the_view_selector_and_collection_but_not_limit() {
+        let issued = schema("class=ex%3AClass&children=properties&limit=7").unwrap();
+        let token = Cursor::at_schema_child(&issued.binding, 9).encode();
+        let resumed = schema(&format!(
+            "class=%3Chttp%3A%2F%2Fexample.org%2FClass%3E&children=properties&view=design&limit=1&cursor={token}"
+        ))
+        .unwrap();
+        assert_eq!(resumed.cursor.unwrap().position, 9);
+
+        for query in [
+            format!("class=ex%3AOther&children=properties&cursor={token}"),
+            format!("class=ex%3AClass&cursor={token}"),
+            format!("class=ex%3AClass&children=properties&view=queryable&cursor={token}"),
+        ] {
+            assert_eq!(
+                schema(&query).unwrap_err().code(),
+                ErrorCode::StaleCursor,
+                "{query}"
+            );
+        }
+
+        let projection = schema("projection=class-relations").unwrap();
+        let projection_token = Cursor::at_class_relation(&projection.binding, 4_096).encode();
+        assert_eq!(
+            schema(&format!(
+                "projection=class-relations&limit=2&cursor={projection_token}"
+            ))
+            .unwrap()
+            .cursor
+            .unwrap()
+            .position,
+            4_096
+        );
+        let wrong_space = Cursor::at_schema_child(&projection.binding, 4_096).encode();
+        assert_eq!(
+            schema(&format!("projection=class-relations&cursor={wrong_space}"))
+                .unwrap_err()
+                .code(),
+            ErrorCode::StaleCursor
+        );
     }
 
     #[test]
@@ -2140,6 +2794,24 @@ mod tests {
         }
         for strict in ["q", "labels"] {
             assert_eq!(search.get(strict), Some(""), "{strict}");
+        }
+
+        let schema = Schema::normalize_params(&params(
+            "class=&predicate=&datatype=&children=&projection=&view=&limit=&cursor=&format=",
+        ));
+        for omitted in [
+            "class",
+            "predicate",
+            "datatype",
+            "children",
+            "projection",
+            "view",
+            "limit",
+        ] {
+            assert_eq!(schema.get(omitted), None, "{omitted}");
+        }
+        for strict in ["cursor", "format"] {
+            assert_eq!(schema.get(strict), Some(""), "{strict}");
         }
     }
 

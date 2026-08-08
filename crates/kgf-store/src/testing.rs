@@ -319,8 +319,14 @@ impl Fixture {
         for (name, bytes) in [
             (crate::store::artifact::SCHEMA_NODES, schema_nodes),
             (crate::store::artifact::CLASS_RELATIONS, class_relations),
-            (crate::store::artifact::NAMESPACES, b"{}\n".as_slice()),
-            (crate::store::artifact::SUMMARY_JSON, b"{}\n".as_slice()),
+            (
+                crate::store::artifact::NAMESPACES,
+                NAMESPACES_JSON.as_bytes(),
+            ),
+            (
+                crate::store::artifact::SUMMARY_JSON,
+                SUMMARY_JSON.as_bytes(),
+            ),
             (
                 crate::store::artifact::SUMMARY_MD,
                 b"# Summary\n".as_slice(),
@@ -374,6 +380,23 @@ pub(crate) const SCHEMA_NODES_HEADER: &[u8] =
 #[cfg(test)]
 pub(crate) const CLASS_RELATIONS_HEADER: &[u8] =
     b"view\tsubject_class\tpredicate\tobject_class\ttriples\n";
+
+#[cfg(test)]
+pub(crate) const NAMESPACES_JSON: &str = concat!(
+    "{\n",
+    "  \"prefix_table\": {\"source\": \"fixture\", ",
+    "\"version\": \"sha256:0000000000000000000000000000000000000000000000000000000000000000\"},\n",
+    "  \"roles\": {\n",
+    "    \"subject\": {\"distinct_iris\": 0, \"matched\": 0, \"residual\": 0},\n",
+    "    \"predicate\": {\"distinct_iris\": 0, \"matched\": 0, \"residual\": 0},\n",
+    "    \"object\": {\"distinct_iris\": 0, \"matched\": 0, \"residual\": 0}\n",
+    "  },\n",
+    "  \"namespaces\": []\n",
+    "}\n",
+);
+
+#[cfg(test)]
+pub(crate) const SUMMARY_JSON: &str = "{\n  \"title\": \"Fixture summary\"\n}\n";
 
 /// Copy a directory artifact, recursively.
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {

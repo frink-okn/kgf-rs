@@ -93,6 +93,8 @@ pub enum Operation {
     Count = 2,
     /// `GET /describe`.
     Describe = 3,
+    /// `GET /schema`.
+    Schema = 4,
 }
 
 impl Operation {
@@ -106,6 +108,7 @@ impl Operation {
             1 => Some(Self::Fragment),
             2 => Some(Self::Count),
             3 => Some(Self::Describe),
+            4 => Some(Self::Schema),
             _ => None,
         }
     }
@@ -159,6 +162,10 @@ pub enum PositionSpace {
     /// Opaque hdtc text-index scan position, with the accumulated statement
     /// count in [`Cursor::scan_position`].
     TextScan = 6,
+    /// Zero-based offset in one immediate `/schema` child collection.
+    SchemaChild = 7,
+    /// Byte offset in the persisted `/schema` class-relation projection.
+    ClassRelation = 8,
 }
 
 impl PositionSpace {
@@ -196,6 +203,8 @@ impl PositionSpace {
             4 => Some(Self::Predicate),
             5 => Some(Self::TextRank),
             6 => Some(Self::TextScan),
+            7 => Some(Self::SchemaChild),
+            8 => Some(Self::ClassRelation),
             _ => None,
         }
     }
@@ -429,6 +438,16 @@ impl Cursor {
         }
     }
 
+    /// Resume one immediate `/schema` child collection at a zero-based offset.
+    pub fn at_schema_child(binding: &CursorBinding, offset: u64) -> Self {
+        Self::at(binding, PositionSpace::SchemaChild, offset)
+    }
+
+    /// Resume the `/schema` class-relation projection at an artifact byte offset.
+    pub fn at_class_relation(binding: &CursorBinding, byte_offset: u64) -> Self {
+        Self::at(binding, PositionSpace::ClassRelation, byte_offset)
+    }
+
     /// Encode to the opaque token clients round-trip.
     ///
     /// Fixed layout, little-endian, then URL-safe base64 without padding: 29
@@ -511,7 +530,13 @@ impl Cursor {
             PositionSpace::TextRank | PositionSpace::TextScan => {
                 binding_index.is_none() && scan_position.is_some()
             }
-            _ => scan_position.is_none(),
+            PositionSpace::SchemaChild | PositionSpace::ClassRelation => {
+                binding_index.is_none() && scan_position.is_none()
+            }
+            PositionSpace::Spo
+            | PositionSpace::Pos
+            | PositionSpace::Ops
+            | PositionSpace::Predicate => scan_position.is_none(),
         };
         if !shape_is_valid {
             return Err(StaleCursor);
@@ -603,6 +628,8 @@ mod tests {
             Cursor::at_binding(&binding(), u32::MAX, PositionSpace::Predicate, 0),
             Cursor::at_rank(&binding(), 7, u64::MAX),
             Cursor::at_text_scan(&binding(), 42, 1_000),
+            Cursor::at_schema_child(&binding(), 99),
+            Cursor::at_class_relation(&binding(), 4_096),
         ] {
             assert_eq!(
                 Cursor::decode(cursor.encode().as_str(), &binding()),
@@ -622,6 +649,11 @@ mod tests {
         incomplete.scan_position = None;
         assert_eq!(
             Cursor::decode(incomplete.encode().as_str(), &binding()),
+            Err(StaleCursor)
+        );
+        let impossible = Cursor::at_binding(&binding(), 3, PositionSpace::SchemaChild, 7);
+        assert_eq!(
+            Cursor::decode(impossible.encode().as_str(), &binding()),
             Err(StaleCursor)
         );
 

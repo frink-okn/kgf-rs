@@ -207,6 +207,7 @@ impl Resource for ServiceDescriptor<'_> {
                             ("max_search_predicates", Value::Number(u64::from(self.caps.max_search_predicates))),
                             ("max_search_results", Value::Number(u64::from(self.caps.max_search_results))),
                             ("max_label_iris", Value::Number(u64::from(self.caps.max_label_iris))),
+                            ("max_schema_items", Value::Number(u64::from(self.caps.max_schema_items))),
                         ]))
                         h2 { "Response budgets" }
                         (note(

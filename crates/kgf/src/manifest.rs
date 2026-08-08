@@ -33,7 +33,7 @@ use kgf_store::manifest::{
     Publisher, content_digest_preimage, default_predicate_roles, validate_predicate_role_iri,
 };
 use kgf_store::store::artifact;
-use kgf_store::{PublishedBundle, verify_description_indexes};
+use kgf_store::{PublishedBundle, verify_description_artifacts};
 use sha2::{Digest, Sha256};
 
 /// Arguments for `kgf manifest`.
@@ -119,7 +119,7 @@ pub fn run(args: Args) -> Result<()> {
         // changed the data. Then the bytes, which catch a rebuild that did not.
         manifest.verify_against(&facts, &dir)?;
         verify_described_artifacts(&manifest, &dir, &facts)?;
-        verify_description_indexes(&bundle, &manifest)?;
+        verify_description_artifacts(&bundle, &manifest)?;
         println!(
             "{}: manifest agrees with its artifacts ({} triples, {})",
             dir.display(),
@@ -141,7 +141,7 @@ pub fn run(args: Args) -> Result<()> {
         document.as_ref().and_then(ManifestDocument::parsed),
     )?;
     manifest.validate(&dir)?;
-    verify_description_indexes(&bundle, &manifest)?;
+    verify_description_artifacts(&bundle, &manifest)?;
 
     let bytes = match &document {
         Some(document) => document.rewrite_with(&manifest)?,

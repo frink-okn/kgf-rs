@@ -22,9 +22,13 @@ use crate::store::ArtifactSet;
 use crate::store::artifact;
 use crate::{Role, TermId};
 
+mod documents;
 mod verify;
 
-pub use verify::verify_description_indexes;
+pub use documents::{
+    NamespaceEntry, NamespaceInventory, NamespaceRoleCounts, NamespaceRoles, PrefixTableIdentity,
+};
+pub use verify::verify_description_artifacts;
 
 const VOID_TRIPLES: &str = "http://rdfs.org/ns/void#triples";
 const VOID_DISTINCT_SUBJECTS: &str = "http://rdfs.org/ns/void#distinctSubjects";
@@ -479,6 +483,9 @@ pub struct DescriptionStore {
     void: IndexedHdt,
     schema_nodes: MappedTsv,
     class_relations: MappedTsv,
+    namespaces: Mapping,
+    summary_json: Mapping,
+    summary_md: Mapping,
 }
 
 impl std::fmt::Debug for DescriptionStore {
@@ -487,6 +494,9 @@ impl std::fmt::Debug for DescriptionStore {
             .field("void", &self.void)
             .field("schema_views", &self.schema_nodes.views.len())
             .field("class_relation_views", &self.class_relations.views.len())
+            .field("namespaces", &self.namespaces.path())
+            .field("summary_json", &self.summary_json.path())
+            .field("summary_md", &self.summary_md.path())
             .finish()
     }
 }
@@ -510,11 +520,18 @@ impl DescriptionStore {
             &description.class_relations,
             entries.class_relations,
         )?;
+        let namespaces = open_static_artifact(bundle, &description.namespaces, entries.namespaces)?;
+        let summary_json =
+            open_static_artifact(bundle, &description.summary_json, entries.summary_json)?;
+        let summary_md = open_static_artifact(bundle, &description.summary_md, entries.summary_md)?;
 
         Ok(Self {
             void,
             schema_nodes,
             class_relations,
+            namespaces,
+            summary_json,
+            summary_md,
         })
     }
 
@@ -537,6 +554,30 @@ impl DescriptionStore {
             predicate: None,
             object: None,
         })
+    }
+
+    /// Parse the persisted namespace inventory into borrowed domain values.
+    ///
+    /// Parsing is request-local and leaves no cache or allocation on the
+    /// immutable store. Publication verification has already checked the same
+    /// invariants; the fallible result keeps a manually assembled, unverified
+    /// bundle from causing a panic.
+    pub fn namespace_inventory(&self) -> Result<NamespaceInventory<'_>> {
+        documents::parse_namespace_inventory(self.namespaces.as_bytes(), self.namespaces.path())
+    }
+
+    /// Exact published bytes of `stats/summary.json`.
+    ///
+    /// Doc 04 does not yet fix a field schema for this document, so the store
+    /// preserves it rather than parsing and reserializing it. Publication
+    /// verification requires a JSON object.
+    pub fn summary_json(&self) -> &[u8] {
+        self.summary_json.as_bytes()
+    }
+
+    /// Published `stats/summary.md` as UTF-8 text.
+    pub fn summary_markdown(&self) -> Result<&str> {
+        documents::summary_markdown(self.summary_md.as_bytes(), self.summary_md.path())
     }
 
     /// Select one published description view.
@@ -946,6 +987,25 @@ fn open_tsv(bundle: &PublishedBundle, path: &Path, entry: &ArtifactEntry) -> Res
     MappedTsv::open(mapping, entry)
 }
 
+fn open_static_artifact(
+    bundle: &PublishedBundle,
+    path: &Path,
+    entry: &ArtifactEntry,
+) -> Result<Mapping> {
+    let mapping = open_published(bundle, path)?;
+    let actual = mapping.as_bytes().len() as u64;
+    if entry.bytes != actual {
+        return Err(malformed(
+            mapping.path(),
+            format!(
+                "manifest records {} bytes, but the artifact contains {actual}",
+                entry.bytes
+            ),
+        ));
+    }
+    Ok(mapping)
+}
+
 #[derive(Debug)]
 struct MappedTsv {
     mapping: Mapping,
@@ -1232,7 +1292,8 @@ mod tests {
     use crate::manifest::{Counts, Formats, Manifest};
     use crate::store::{OpenOptions, Store};
     use crate::testing::{
-        CLASS_RELATIONS_HEADER, Fixture, SCHEMA_NODES_HEADER, TINY_NT, published_bundle,
+        CLASS_RELATIONS_HEADER, Fixture, SCHEMA_NODES_HEADER, SUMMARY_JSON, TINY_NT,
+        published_bundle,
     };
 
     struct PublishedDescription {
@@ -1292,6 +1353,23 @@ mod tests {
         "<https://example.org/language-fr> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
         "<https://example.org/language-fr> <http://ldf.fi/void-ext#language> \"fr\" .\n",
         "<https://example.org/language-fr> <http://rdfs.org/ns/void#triples> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+    );
+
+    const RICH_NAMESPACES_JSON: &str = concat!(
+        "{\n",
+        "  \"prefix_table\": {\"source\": \"registry.yaml + overrides.json\", ",
+        "\"version\": \"sha256:1111111111111111111111111111111111111111111111111111111111111111\"},\n",
+        "  \"roles\": {\n",
+        "    \"subject\": {\"distinct_iris\": 2, \"matched\": 2, \"residual\": 0},\n",
+        "    \"predicate\": {\"distinct_iris\": 1, \"matched\": 1, \"residual\": 0},\n",
+        "    \"object\": {\"distinct_iris\": 2, \"matched\": 1, \"residual\": 1}\n",
+        "  },\n",
+        "  \"namespaces\": [{\n",
+        "    \"prefix\": \"ex\", \"namespace\": \"https://example.org/\",\n",
+        "    \"distinct_iris\": 3, \"subject\": 2, \"predicate\": 1, \"object\": 1,\n",
+        "    \"example\": \"https://example.org/A\"\n",
+        "  }]\n",
+        "}\n",
     );
 
     fn publish_description(fixture: &Fixture) -> PublishedDescription {
@@ -1652,8 +1730,20 @@ mod tests {
         publish_verified_description(&fixture);
         let manifest = Manifest::read(fixture.bundle_path()).unwrap();
         let published = published_bundle(fixture.bundle_path());
-        verify_description_indexes(&published, &manifest)
+        verify_description_artifacts(&published, &manifest)
             .expect_err("malformed description must fail publication proof")
+    }
+
+    fn replace_description_document(fixture: &Fixture, name: &str, bytes: &[u8]) -> Manifest {
+        std::fs::write(fixture.bundle_path().join(name), bytes).unwrap();
+        let mut manifest = Manifest::read(fixture.bundle_path()).unwrap();
+        manifest.artifacts.get_mut(name).unwrap().bytes = bytes.len() as u64;
+        std::fs::write(
+            fixture.bundle_path().join(artifact::MANIFEST),
+            manifest.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+        manifest
     }
 
     #[test]
@@ -1709,7 +1799,7 @@ mod tests {
         std::fs::remove_file(fixture.bundle_path().join(artifact::MANIFEST)).unwrap();
         {
             let published = published_bundle(fixture.bundle_path());
-            verify_description_indexes(&published, &candidate)
+            verify_description_artifacts(&published, &candidate)
                 .expect("a candidate can be proved without an on-disk manifest");
         }
         std::fs::write(
@@ -1723,7 +1813,7 @@ mod tests {
             store
                 .description()
                 .expect("description")
-                .verify_indexes()
+                .verify_artifacts()
                 .expect("valid description indexes");
         }
 
@@ -1747,11 +1837,66 @@ mod tests {
         let error = store
             .description()
             .expect("description still opens with bounded checks")
-            .verify_indexes()
+            .verify_artifacts()
             .expect_err("offline proof must reject the shifted range");
         assert!(
             error.to_string().contains("expected contiguous offset"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn static_description_documents_are_mapped_and_typed_on_demand() {
+        let fixture = Fixture::build(VERIFIED_VOID_NT);
+        publish_verified_description(&fixture);
+        replace_description_document(
+            &fixture,
+            artifact::NAMESPACES,
+            RICH_NAMESPACES_JSON.as_bytes(),
+        );
+        let store = opened_description(&fixture);
+        let description = store.description().unwrap();
+
+        let inventory = description.namespace_inventory().unwrap();
+        assert_eq!(
+            inventory.prefix_table().source(),
+            "registry.yaml + overrides.json"
+        );
+        assert_eq!(inventory.roles().subject().distinct_iris(), 2);
+        assert_eq!(inventory.roles().object().residual(), 1);
+        let entry = &inventory.namespaces()[0];
+        assert_eq!(entry.prefix(), "ex");
+        assert_eq!(entry.distinct_iris(), 3);
+        assert_eq!(entry.subject(), 2);
+        assert_eq!(entry.predicate(), 1);
+        assert_eq!(entry.object(), 1);
+        assert_eq!(entry.example(), Some("https://example.org/A"));
+        assert_eq!(description.summary_json(), SUMMARY_JSON.as_bytes());
+        assert_eq!(description.summary_markdown().unwrap(), "# Summary\n");
+    }
+
+    #[test]
+    fn publication_proof_includes_the_static_description_documents() {
+        let fixture = Fixture::build(VERIFIED_VOID_NT);
+        publish_verified_description(&fixture);
+        let manifest = replace_description_document(
+            &fixture,
+            artifact::SUMMARY_JSON,
+            b"[\"not\", \"an\", \"object\"]\n",
+        );
+        {
+            let store = opened_description(&fixture);
+            assert_eq!(
+                store.description().unwrap().summary_json(),
+                b"[\"not\", \"an\", \"object\"]\n"
+            );
+        }
+        let published = published_bundle(fixture.bundle_path());
+        let error = verify_description_artifacts(&published, &manifest)
+            .expect_err("publication must reject a non-object summary");
+        assert!(
+            error.to_string().contains("summary JSON must be an object"),
+            "unexpected error: {error}"
         );
     }
 
@@ -2250,7 +2395,7 @@ mod tests {
         publish_verified_description(&fixture);
         let manifest = Manifest::read(fixture.bundle_path()).unwrap();
         let published = published_bundle(fixture.bundle_path());
-        let error = verify_description_indexes(&published, &manifest)
+        let error = verify_description_artifacts(&published, &manifest)
             .expect_err("publication proof must reject an invalid served count");
         assert!(
             error.to_string().contains("is not unsigned"),
@@ -2276,7 +2421,7 @@ mod tests {
         publish_verified_description(&fixture);
         let manifest = Manifest::read(fixture.bundle_path()).unwrap();
         let published = published_bundle(fixture.bundle_path());
-        let error = verify_description_indexes(&published, &manifest)
+        let error = verify_description_artifacts(&published, &manifest)
             .expect_err("publication proof must reject ambiguous served counts");
         assert!(
             error

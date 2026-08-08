@@ -2,8 +2,8 @@
 //!
 //! Nothing in this module runs from [`Store::open`](crate::Store::open). The
 //! serving path performs only bounded range checks; build and publication tools
-//! call [`verify_description_indexes`] to scan the complete TSVs and prove that
-//! the manifest metadata and indexed VoID graph agree.
+//! call [`verify_description_artifacts`] to scan the complete TSVs and static
+//! documents and prove that the manifest metadata and indexed VoID graph agree.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -17,6 +17,7 @@ use crate::pattern::IdPattern;
 use crate::store::{ArtifactSet, description_set_disagreement};
 use crate::{Role, TermId};
 
+use super::documents::verify_summary_json;
 use super::{
     CountPredicates, DescriptionStore, MappedTsv, SchemaRow, StatsView, VOID_CLASS,
     VOID_CLASS_PARTITION, VOID_PROPERTY, VOID_PROPERTY_PARTITION, VOID_TRIPLES, VOIDEXT_DATATYPE,
@@ -38,7 +39,7 @@ const VOID_SUBSET: &str = "http://rdfs.org/ns/void#subset";
 /// The candidate need not be the manifest currently stored in the bundle. This
 /// is the build/publication boundary: it scans both TSVs and traverses the VoID
 /// graph, while [`crate::Store::open`] remains bounded and size-independent.
-pub fn verify_description_indexes(bundle: &PublishedBundle, manifest: &Manifest) -> Result<()> {
+pub fn verify_description_artifacts(bundle: &PublishedBundle, manifest: &Manifest) -> Result<()> {
     let dir = bundle.path();
     manifest.validate(dir)?;
     let artifacts = ArtifactSet::resolve(dir)?;
@@ -46,7 +47,7 @@ pub fn verify_description_indexes(bundle: &PublishedBundle, manifest: &Manifest)
     match (artifacts.description.as_ref(), entries) {
         (Some(_), Some(entries)) => {
             let description = DescriptionStore::open(bundle, &artifacts, entries)?;
-            description.verify_indexes()
+            description.verify_artifacts()
         }
         (None, None) => Ok(()),
         (Some(_), None) => Err(description_set_disagreement(
@@ -108,21 +109,24 @@ enum TermRequirement {
 }
 
 impl DescriptionStore {
-    /// Fully verify both description indexes against their manifest directory
-    /// and the indexed VoID graph.
+    /// Fully verify the description indexes and static documents.
     ///
     /// This is an offline build/publication operation: it scans every TSV row,
     /// allocates selector maps proportional to the description, and queries the
     /// VoID graph. [`DescriptionStore::open`](super::DescriptionStore::open)
     /// deliberately does none of that work.
-    pub fn verify_indexes(&self) -> Result<()> {
+    pub fn verify_artifacts(&self) -> Result<()> {
         let selectors = verify_schema_table(&self.schema_nodes, &self.void)?;
         verify_schema_bindings(&self.void, &selectors, self.schema_nodes.path())?;
         verify_schema_children(&self.void, &selectors, self.schema_nodes.path())?;
         verify_count_facts(&self.void)?;
         let relations = verify_relation_table(&self.class_relations)?;
         let expected = expected_relations(&self.void, &selectors, self.class_relations.path())?;
-        compare_relations(&relations, &expected, self.class_relations.path())
+        compare_relations(&relations, &expected, self.class_relations.path())?;
+        self.namespace_inventory()?;
+        verify_summary_json(self.summary_json.as_bytes(), self.summary_json.path())?;
+        self.summary_markdown()?;
+        Ok(())
     }
 }
 

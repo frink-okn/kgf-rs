@@ -42,6 +42,19 @@ const RETITLED_SOURCE: &str = concat!(
     "<http://example.org/bob> <http://example.org/knows> <http://example.org/alice> .\n",
 );
 
+const NAMESPACES_JSON: &str = concat!(
+    "{\n",
+    "  \"prefix_table\": {\"source\": \"fixture\", ",
+    "\"version\": \"sha256:0000000000000000000000000000000000000000000000000000000000000000\"},\n",
+    "  \"roles\": {\n",
+    "    \"subject\": {\"distinct_iris\": 0, \"matched\": 0, \"residual\": 0},\n",
+    "    \"predicate\": {\"distinct_iris\": 0, \"matched\": 0, \"residual\": 0},\n",
+    "    \"object\": {\"distinct_iris\": 0, \"matched\": 0, \"residual\": 0}\n",
+    "  },\n",
+    "  \"namespaces\": []\n",
+    "}\n",
+);
+
 const VOID_SOURCE: &str = concat!(
     "<https://example.org/design> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
     "<https://example.org/queryable> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
@@ -365,7 +378,7 @@ fn publish_description_manifest(
     for (name, bytes) in [
         (artifact::SCHEMA_NODES, schema),
         (artifact::CLASS_RELATIONS, relations),
-        (artifact::NAMESPACES, b"{}\n".as_slice()),
+        (artifact::NAMESPACES, NAMESPACES_JSON.as_bytes()),
         (artifact::SUMMARY_JSON, b"{}\n".as_slice()),
         (artifact::SUMMARY_MD, b"# Summary\n".as_slice()),
     ] {
