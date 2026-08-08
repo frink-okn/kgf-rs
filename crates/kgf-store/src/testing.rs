@@ -381,8 +381,8 @@ pub(crate) const SCHEMA_NODES_HEADER: &[u8] =
 pub(crate) const CLASS_RELATIONS_HEADER: &[u8] =
     b"view\tsubject_class\tpredicate\tobject_class\ttriples\n";
 
-#[cfg(test)]
-pub(crate) const NAMESPACES_JSON: &str = concat!(
+/// Minimal valid namespace inventory shared by cross-crate bundle fixtures.
+pub const NAMESPACES_JSON: &str = concat!(
     "{\n",
     "  \"prefix_table\": {\"source\": \"fixture\", ",
     "\"version\": \"sha256:0000000000000000000000000000000000000000000000000000000000000000\"},\n",

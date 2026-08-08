@@ -13,7 +13,7 @@ use std::process::Command;
 
 use kgf_store::manifest::{ArtifactView, Manifest};
 use kgf_store::store::artifact;
-use kgf_store::testing::hdtc_binary;
+use kgf_store::testing::{NAMESPACES_JSON, hdtc_binary};
 use kgf_store::{OpenOptions, Store};
 
 const SOURCE: &str = concat!(
@@ -40,19 +40,6 @@ const RETITLED_SOURCE: &str = concat!(
     "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .\n",
     "<http://example.org/bob> <http://example.org/name> \"Bob\" .\n",
     "<http://example.org/bob> <http://example.org/knows> <http://example.org/alice> .\n",
-);
-
-const NAMESPACES_JSON: &str = concat!(
-    "{\n",
-    "  \"prefix_table\": {\"source\": \"fixture\", ",
-    "\"version\": \"sha256:0000000000000000000000000000000000000000000000000000000000000000\"},\n",
-    "  \"roles\": {\n",
-    "    \"subject\": {\"distinct_iris\": 0, \"matched\": 0, \"residual\": 0},\n",
-    "    \"predicate\": {\"distinct_iris\": 0, \"matched\": 0, \"residual\": 0},\n",
-    "    \"object\": {\"distinct_iris\": 0, \"matched\": 0, \"residual\": 0}\n",
-    "  },\n",
-    "  \"namespaces\": []\n",
-    "}\n",
 );
 
 const VOID_SOURCE: &str = concat!(

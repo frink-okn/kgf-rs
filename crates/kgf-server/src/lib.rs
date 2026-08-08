@@ -195,7 +195,8 @@ impl Limits<'_> {
     /// the one composite budget that has to be applied while a response is
     /// built.
     pub fn validate(&self) -> Result<(), String> {
-        // A row of a describe is the widest this milestone serves.
+        // Describe rows and flat schema class relations are the widest this
+        // milestone serves: each carries three RDF terms.
         const WIDEST_ROW: u64 = 3;
 
         let rows = |what: &str, cap: u32| {

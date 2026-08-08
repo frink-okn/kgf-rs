@@ -1661,8 +1661,8 @@ pub struct Schema {
     pub view: StatsView,
     /// Node-only, one typed child collection, or flat class relations.
     pub query: SchemaQuery,
-    /// Child or class-relation rows this page may carry.
-    pub limit: u32,
+    /// Child or class-relation rows this page may carry; absent for node-only requests.
+    pub limit: Option<u32>,
     /// Bytes its rows may occupy.
     pub bytes: ResponseBytes,
     /// Rows a filtered class-relation page may examine.
@@ -1696,13 +1696,24 @@ impl Schema {
         accept_only(params, SCHEMA, Self::PARAMETERS)?;
         let view = schema_view(params)?;
         let query = parse_schema_query(params, limits, prefixes)?;
-        let limit = page_size(
-            params,
-            "limit",
-            limits.caps.default_limit,
-            limits.caps.max_schema_items,
-            "ask for at least one schema item",
-        )?;
+        let limit = match &query {
+            SchemaQuery::Node(_) => {
+                if params.get("limit").is_some() {
+                    return Err(Problem::new(
+                        ErrorCode::MalformedRequest,
+                        "`limit` applies only when `children` or `projection=class-relations` pages schema items",
+                    ));
+                }
+                None
+            }
+            SchemaQuery::Children(_) | SchemaQuery::ClassRelations(_) => Some(page_size(
+                params,
+                "limit",
+                limits.caps.default_limit,
+                limits.caps.max_schema_items,
+                "ask for at least one schema item",
+            )?),
+        };
         let canonical = query.canonicalize(canonicalize_schema_view(
             &view,
             CanonicalRequest::new(Operation::Schema),
@@ -2344,7 +2355,7 @@ mod tests {
     fn schema_parses_only_valid_typed_navigation_shapes() {
         let root = schema("").unwrap();
         assert_eq!(root.view, StatsView::Design);
-        assert_eq!(root.limit, 100);
+        assert_eq!(root.limit, None);
         assert!(matches!(
             root.query,
             SchemaQuery::Node(SchemaSelection::Dataset)
@@ -2365,6 +2376,7 @@ mod tests {
             ),
         ] {
             let parsed = schema(query).unwrap_or_else(|error| panic!("{query}: {error}"));
+            assert_eq!(parsed.limit, Some(CAPS.default_limit));
             let SchemaQuery::Children(children) = parsed.query else {
                 panic!("{query} did not parse as children");
             };
@@ -2387,6 +2399,16 @@ mod tests {
         };
         assert_eq!(class.unwrap().dictionary(), "http://example.org/Class");
         assert_eq!(predicate.dictionary(), "http://example.org/p");
+
+        for limit in ["5", "2000"] {
+            assert_eq!(
+                schema(&format!("class=ex%3AClass&limit={limit}"))
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::MalformedRequest,
+                "a node-only request must not silently ignore limit={limit}"
+            );
+        }
     }
 
     #[test]
@@ -2416,12 +2438,60 @@ mod tests {
     }
 
     #[test]
+    fn schema_node_selectors_cross_into_store_with_canonical_iris() {
+        let selection = |query: &str| match schema(query).unwrap().query {
+            SchemaQuery::Node(selection) => selection,
+            other => panic!("{query} produced {other:?}, expected a node selector"),
+        };
+
+        let root = selection("");
+        assert_eq!(root.store_selector(), StoreSchemaSelector::Dataset);
+
+        let class = selection("class=ex%3AClass");
+        assert_eq!(
+            class.store_selector(),
+            StoreSchemaSelector::Class {
+                class: "http://example.org/Class"
+            }
+        );
+
+        let property = selection("class=ex%3AClass&predicate=ex%3Ap");
+        assert_eq!(
+            property.store_selector(),
+            StoreSchemaSelector::Property {
+                class: Some("http://example.org/Class"),
+                predicate: "http://example.org/p",
+            }
+        );
+
+        let datatype = selection("predicate=ex%3Ap&datatype=ex%3AString");
+        assert_eq!(
+            datatype.store_selector(),
+            StoreSchemaSelector::Datatype {
+                class: None,
+                predicate: "http://example.org/p",
+                datatype: "http://example.org/String",
+            }
+        );
+
+        let scoped_datatype = selection("class=ex%3AClass&predicate=ex%3Ap&datatype=ex%3AString");
+        assert_eq!(
+            scoped_datatype.store_selector(),
+            StoreSchemaSelector::Datatype {
+                class: Some("http://example.org/Class"),
+                predicate: "http://example.org/p",
+                datatype: "http://example.org/String",
+            }
+        );
+    }
+
+    #[test]
     fn schema_types_the_flat_projection_and_applies_its_own_cap() {
         let parsed = schema(
             "projection=class-relations&class=ex%3AClass&predicate=ex%3Ap&view=component%3Acanonical&limit=1000",
         )
         .unwrap();
-        assert_eq!(parsed.limit, CAPS.max_schema_items);
+        assert_eq!(parsed.limit, Some(CAPS.max_schema_items));
         assert_eq!(parsed.candidates, Candidates(BUDGETS.candidate_budget));
         assert_eq!(parsed.view, StatsView::component("canonical").unwrap());
         let SchemaQuery::ClassRelations(filter) = parsed.query else {

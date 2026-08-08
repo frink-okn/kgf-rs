@@ -1246,6 +1246,8 @@ shapes: one selected node, one valid immediate-child collection, or the flat
 class-relation projection. Selector terms are required to be IRIs and are
 canonicalized before cursor hashing, so CURIE and expanded spellings resume the
 same request. A dedicated `max_schema_items` cap bounds both paged shapes.
+Node-only requests reject `limit` rather than accepting a control they cannot
+use; the typed request carries no page limit for that shape.
 Schema cursors add explicit child-offset and class-relation-byte-offset position
 spaces; they bind the view, canonical selectors, collection or projection and
 filters, while excluding `limit` and representation. Node-only requests cannot
