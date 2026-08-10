@@ -13,11 +13,13 @@
 //! wrong answer of exactly the kind this project refuses, and "does the header
 //! contain `json`" is how that happens.
 //!
-//! # Two representations, and why the order matters
+//! # Default representations, and why the order matters
 //!
-//! Every route answers JSON *and* HTML, and which one a client gets is decided
-//! by `Accept` alone — no user-agent sniffing, no separate `/html` URL space.
-//! It works because the two clients ask differently: a browser navigating sends
+//! Every route answers a machine representation *and* HTML, and which one a
+//! client gets is decided by `Accept` alone — no user-agent sniffing, no
+//! separate `/html` URL space. JSON is the ordinary machine form; `/void` and
+//! `/summary` offer RDF and Markdown-specific sets. It works because the two
+//! clients ask differently: a browser navigating sends
 //! `text/html` at `q=1` with `*/*;q=0.8` behind it, while `curl`, a library, and
 //! an agent send `*/*` or nothing.
 //!
@@ -28,7 +30,7 @@
 //! the machine-readable form as the default rather than the exception, which is
 //! the right way round for an API doc 01 argues should be agent-friendly.
 //!
-//! The CSV/Parquet/Arrow/RDF serializations arrive with M2. Because the choice
+//! Additional CSV/Parquet/Arrow and bulk RDF serializations arrive with M2. Because the choice
 //! is an enum, adding one is a change the compiler routes through every place a
 //! format is named — including every resource's HTML rendering, which is why
 //! [`Resource`](crate::html::Resource) exists rather than a match per handler.
@@ -51,26 +53,49 @@ pub enum Representation {
     Json,
     /// A page, for reading the same resource in a browser.
     Html,
+    /// Turtle RDF. `/void` emits the N-Triples subset of Turtle so every
+    /// statement remains independently budgetable.
+    Turtle,
+    /// Expanded JSON-LD RDF.
+    JsonLd,
+    /// The persisted Markdown summary card.
+    Markdown,
 }
 
 impl Representation {
-    /// Every representation, in the server's preference order.
+    /// The JSON/page pair offered by ordinary KGF resources.
     pub const ALL: &'static [Representation] = &[Representation::Json, Representation::Html];
+
+    /// The RDF representations offered by `/void`, plus its browser page.
+    pub const VOID: &'static [Representation] = &[
+        Representation::Turtle,
+        Representation::JsonLd,
+        Representation::Html,
+    ];
+
+    /// The persisted summary representations, plus its browser page.
+    pub const SUMMARY: &'static [Representation] = &[
+        Representation::Markdown,
+        Representation::Json,
+        Representation::Html,
+    ];
 
     /// The media type `Accept` names it by, without parameters.
     pub fn media_type(self) -> &'static str {
         match self {
             Self::Json => "application/json",
             Self::Html => "text/html",
+            Self::Turtle => "text/turtle",
+            Self::JsonLd => "application/ld+json",
+            Self::Markdown => "text/markdown",
         }
     }
 
     /// The same, parsed, for matching against a request's media ranges.
-    fn media_range(self) -> MediaType<'static> {
-        match self {
-            Self::Json => MediaType::new(names::APPLICATION, names::JSON),
-            Self::Html => MediaType::new(names::TEXT, names::HTML),
-        }
+    fn media_range(self) -> MediaTypeBuf {
+        self.media_type()
+            .parse()
+            .expect("representation media types are compile-time constants")
     }
 
     /// The full `Content-Type`, parameters included.
@@ -82,6 +107,9 @@ impl Representation {
         match self {
             Self::Json => "application/json",
             Self::Html => "text/html; charset=utf-8",
+            Self::Turtle => "text/turtle; charset=utf-8",
+            Self::JsonLd => "application/ld+json",
+            Self::Markdown => "text/markdown; charset=utf-8",
         }
     }
 
@@ -94,15 +122,33 @@ impl Representation {
         match self {
             Self::Json => "json",
             Self::Html => "html",
+            Self::Turtle => "ttl",
+            Self::JsonLd => "jsonld",
+            Self::Markdown => "md",
+        }
+    }
+
+    /// The short human name used by representation-switching links.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Json => "JSON",
+            Self::Html => "HTML",
+            Self::Turtle => "Turtle",
+            Self::JsonLd => "JSON-LD",
+            Self::Markdown => "Markdown",
         }
     }
 
     /// The representation `format=token` names, if this server has it.
     fn from_token(token: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|candidate| candidate.token() == token)
+        match token {
+            "json" => Some(Self::Json),
+            "html" => Some(Self::Html),
+            "ttl" => Some(Self::Turtle),
+            "jsonld" => Some(Self::JsonLd),
+            "md" => Some(Self::Markdown),
+            _ => None,
+        }
     }
 
     /// The representation to render an error in.
@@ -163,7 +209,8 @@ pub fn negotiate(
         .iter()
         .rev()
         .filter_map(|representation| {
-            acceptability(&ranges, &representation.media_range())
+            let media_range = representation.media_range();
+            acceptability(&ranges, &MediaType::from(&media_range))
                 .map(|quality| (quality, *representation))
         })
         .max_by_key(|(quality, _)| *quality)
@@ -677,6 +724,19 @@ mod tests {
             detail["detail"].as_str().unwrap().contains("json"),
             "the detail must name what the operation does offer: {detail}"
         );
+
+        for (token, expected, offered) in [
+            ("ttl", Representation::Turtle, Representation::VOID),
+            ("jsonld", Representation::JsonLd, Representation::VOID),
+            ("html", Representation::Html, Representation::VOID),
+            ("md", Representation::Markdown, Representation::SUMMARY),
+        ] {
+            assert_eq!(
+                negotiate(Some(token), Some("text/csv"), offered),
+                Ok(expected),
+                "format={token} must be recognized before it is checked against the operation's offers"
+            );
+        }
     }
 
     #[test]

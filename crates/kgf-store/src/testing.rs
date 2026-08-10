@@ -9,8 +9,8 @@
 //!
 //! Soundness is a property of a crate's *public* API, so the feature exports
 //! only what a fixture-driven test in another crate needs: build a golden
-//! bundle, and map or search its bytes. Everything that takes a caller-supplied
-//! path is crate-private.
+//! bundle (including the shared description fixture), and map or search its
+//! bytes. Everything that takes a caller-supplied path is crate-private.
 //!
 //! That line is not fussiness. A safe function taking `&Path` and returning a
 //! [`Mapping`](crate::map::Mapping) or a publication capability lets safe code
@@ -93,6 +93,30 @@ pub const TINY_NT: &str = concat!(
     "_:b1 <http://example.org/type> <http://example.org/Thing> .\n",
 );
 
+const DESCRIPTION_NT: &str = concat!(
+    "<https://example.org/queryable> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+    "<https://example.org/queryable> <http://rdfs.org/ns/void#triples> \"21\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+    "<https://example.org/queryable> <http://rdfs.org/ns/void#subset> <https://example.org/design> .\n",
+    "<https://example.org/design> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+    "<https://example.org/design> <http://rdfs.org/ns/void#triples> \"3\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+    "<https://example.org/design> <http://rdfs.org/ns/void#classPartition> <https://example.org/class-a> .\n",
+    "<https://example.org/class-a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+    "<https://example.org/class-a> <http://rdfs.org/ns/void#class> <https://example.org/A> .\n",
+    "<https://example.org/class-a> <http://rdfs.org/ns/void#entities> \"2\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+    "<https://example.org/class-a> <http://rdfs.org/ns/void#propertyPartition> <https://example.org/property-p> .\n",
+    "<https://example.org/property-p> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+    "<https://example.org/property-p> <http://rdfs.org/ns/void#property> <https://example.org/p> .\n",
+    "<https://example.org/property-p> <http://rdfs.org/ns/void#triples> \"3\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+    "<https://example.org/property-p> <http://ldf.fi/void-ext#objectClassPartition> <https://example.org/target-b> .\n",
+    "<https://example.org/target-b> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+    "<https://example.org/target-b> <http://rdfs.org/ns/void#class> <https://example.org/B> .\n",
+    "<https://example.org/target-b> <http://rdfs.org/ns/void#triples> \"2\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+    "<https://example.org/property-p> <http://ldf.fi/void-ext#objectClassPartition> <https://example.org/target-c> .\n",
+    "<https://example.org/target-c> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+    "<https://example.org/target-c> <http://rdfs.org/ns/void#class> <https://example.org/C> .\n",
+    "<https://example.org/target-c> <http://rdfs.org/ns/void#triples> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+);
+
 /// A minimal quad fixture, for the cases that need the optional graph pair.
 ///
 /// Two graphs with one shared triple, so the sidecar has something to
@@ -173,10 +197,13 @@ pub fn tiny_id_triples(dictionary: &crate::dict::Dictionary<'_>) -> Vec<crate::I
 /// A bundle built by hdtc into a temporary directory.
 ///
 /// Doc 20 §20.9's golden bundle: the fixture RDF is checked in and hdtc builds
-/// the artifacts, so the bytes under test are the bytes a real bundle has.
-/// Nothing here writes a byte of any format — that is the point, since a test
-/// fixture written by hand would be this crate's own guess at the format rather
-/// than the producer's output.
+/// the binary artifacts, so the bytes under test are the bytes a real bundle
+/// has. Nothing here writes an HDT, permutation, graph, or text-index byte — a
+/// hand-written fixture would be this crate's own guess at hdtc's format rather
+/// than the producer's output. The description fixture adds only doc 04's
+/// transparent TSV/JSON documents around an hdtc-built VoID pair; publication
+/// verification independently proves those recoverable projections against
+/// the graph before any cross-crate test serves them.
 pub struct Fixture {
     dir: tempfile::TempDir,
 }
@@ -191,6 +218,53 @@ impl Fixture {
     /// test in this crate passing vacuously.
     pub fn build(source: &str) -> Self {
         Self::build_with(source, false)
+    }
+
+    /// Build the shared cross-crate fixture for the tier-1 description surface.
+    ///
+    /// The graph and its two recoverable TSV projections are intentionally
+    /// assembled through hdtc and the mapped dictionary, so integration tests
+    /// exercise the same subject-id binding and publication verification as a
+    /// real stats build without hand-predicting HDT dictionary ids.
+    pub fn description() -> Self {
+        let fixture = Self::build(DESCRIPTION_NT);
+        let (design, queryable, class, property) = {
+            let indexed = crate::indexed::IndexedHdt::open(fixture.map_hdt(), fixture.map_perm())
+                .expect("open description fixture index");
+            let dictionary = indexed.dict();
+            let subject = |term: &str| {
+                dictionary
+                    .locate(crate::Role::Subject, term.as_bytes())
+                    .expect("locate description fixture subject")
+                    .expect("description fixture subject exists")
+                    .0
+            };
+            (
+                subject("https://example.org/design"),
+                subject("https://example.org/queryable"),
+                subject("https://example.org/class-a"),
+                subject("https://example.org/property-p"),
+            )
+        };
+
+        let schema_nodes = format!(
+            concat!(
+                "view\tkind\tclass\tpredicate\tdatatype\tsubject_id\n",
+                "design\tclass\thttps://example.org/A\t\t\t{}\n",
+                "design\tdataset\t\t\t\t{}\n",
+                "design\tproperty\thttps://example.org/A\thttps://example.org/p\t\t{}\n",
+                "queryable\tdataset\t\t\t\t{}\n"
+            ),
+            class, design, property, queryable,
+        );
+        let class_relations = concat!(
+            "view\tsubject_class\tpredicate\tobject_class\ttriples\n",
+            "design\thttps://example.org/A\thttps://example.org/p\thttps://example.org/B\t2\n",
+            "design\thttps://example.org/A\thttps://example.org/p\thttps://example.org/C\t1\n",
+        );
+        fixture.add_description_artifacts(schema_nodes.as_bytes(), class_relations.as_bytes());
+        fixture.seed_description_manifest(schema_nodes.as_bytes(), class_relations.as_bytes());
+        fixture
     }
 
     /// Build a quad bundle with its graph sidecar and graph index.
@@ -276,9 +350,26 @@ impl Fixture {
     /// one from a golden bundle.
     pub fn copy_bundle_to(&self, destination: &std::path::Path) {
         std::fs::create_dir_all(destination).expect("create fixture bundle directory");
-        for name in [MANIFEST, HDT, PERM, GRAPHS, GRAPHS_IDX] {
+        for name in [
+            MANIFEST,
+            HDT,
+            PERM,
+            GRAPHS,
+            GRAPHS_IDX,
+            crate::store::artifact::VOID_HDT,
+            crate::store::artifact::VOID_PERM,
+            crate::store::artifact::SCHEMA_NODES,
+            crate::store::artifact::CLASS_RELATIONS,
+            crate::store::artifact::NAMESPACES,
+            crate::store::artifact::SUMMARY_JSON,
+            crate::store::artifact::SUMMARY_MD,
+        ] {
             if !self.dir.path().join(name).exists() {
                 continue;
+            }
+            if let Some(parent) = destination.join(name).parent() {
+                std::fs::create_dir_all(parent)
+                    .unwrap_or_else(|error| panic!("create parent for fixture {name}: {error}"));
             }
             std::fs::copy(self.dir.path().join(name), destination.join(name))
                 .unwrap_or_else(|error| panic!("copy fixture artifact {name}: {error}"));
@@ -302,9 +393,8 @@ impl Fixture {
 
     /// Publish the complete physical description set around caller-supplied
     /// TSV bytes. Manifest metadata stays with the test that exercises it.
-    #[cfg(test)]
-    pub(crate) fn add_description_artifacts(&self, schema_nodes: &[u8], class_relations: &[u8]) {
-        let bundle = self.bundle_path();
+    pub fn add_description_artifacts(&self, schema_nodes: &[u8], class_relations: &[u8]) {
+        let bundle = self.dir.path();
         std::fs::create_dir_all(bundle.join("stats")).expect("create fixture stats directory");
         std::fs::copy(
             self.hdt_path(),
@@ -335,6 +425,95 @@ impl Fixture {
             std::fs::write(bundle.join(name), bytes)
                 .unwrap_or_else(|error| panic!("write fixture artifact {name}: {error}"));
         }
+    }
+
+    /// Seed only the build-owned TSV metadata that `kgf manifest` cannot
+    /// recover from checksums. The command replaces every ordinary manifest
+    /// field and checksum; these exact ranges survive because their files and
+    /// VoID parent are unchanged.
+    fn seed_description_manifest(&self, schema_nodes: &[u8], class_relations: &[u8]) {
+        use crate::manifest::{ArtifactEntry, ArtifactView};
+
+        let bundle = self.dir.path();
+        let entry = |name: &str| {
+            let path = bundle.join(name);
+            ArtifactEntry::checksum(
+                std::fs::metadata(&path)
+                    .expect("fixture artifact metadata")
+                    .len(),
+                fixture_sha256(&path),
+            )
+        };
+        let views = |bytes: &[u8], design_rows: u64, queryable_rows: u64| {
+            let header_end = bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .expect("TSV header newline")
+                + 1;
+            let queryable = bytes[header_end..]
+                .windows(b"queryable\t".len())
+                .position(|window| window == b"queryable\t")
+                .map_or(bytes.len(), |offset| header_end + offset);
+            std::collections::BTreeMap::from([
+                (
+                    "design".to_owned(),
+                    ArtifactView {
+                        offset: header_end as u64,
+                        bytes: (queryable - header_end) as u64,
+                        rows: design_rows,
+                    },
+                ),
+                (
+                    "queryable".to_owned(),
+                    ArtifactView {
+                        offset: queryable as u64,
+                        bytes: (bytes.len() - queryable) as u64,
+                        rows: queryable_rows,
+                    },
+                ),
+            ])
+        };
+        let indexed = |name: &str, bytes: &[u8], design_rows, queryable_rows| {
+            let mut entry = entry(name);
+            entry.parents = vec![crate::store::artifact::VOID_HDT.to_owned()];
+            entry.max_row_bytes = bytes
+                .split_inclusive(|byte| *byte == b'\n')
+                .map(|row| row.len() as u64)
+                .max();
+            entry.views = views(bytes, design_rows, queryable_rows);
+            entry
+        };
+        let artifacts = std::collections::BTreeMap::from([
+            (
+                crate::store::artifact::VOID_HDT.to_owned(),
+                entry(crate::store::artifact::VOID_HDT),
+            ),
+            (
+                crate::store::artifact::SCHEMA_NODES.to_owned(),
+                indexed(crate::store::artifact::SCHEMA_NODES, schema_nodes, 3, 1),
+            ),
+            (
+                crate::store::artifact::CLASS_RELATIONS.to_owned(),
+                indexed(
+                    crate::store::artifact::CLASS_RELATIONS,
+                    class_relations,
+                    2,
+                    0,
+                ),
+            ),
+        ]);
+        let seed = serde_json::json!({
+            "id": "fixture",
+            "version": "fixture",
+            "content_digest": "sha256:seed",
+            "counts": {"triples": 0, "subjects": 0, "predicates": 0, "objects": 0},
+            "artifacts": artifacts,
+        });
+        std::fs::write(
+            bundle.join(MANIFEST),
+            serde_json::to_vec_pretty(&seed).expect("serialize fixture manifest seed"),
+        )
+        .expect("write fixture manifest seed");
     }
 
     /// Map `data.hdt`.
@@ -395,8 +574,8 @@ pub const NAMESPACES_JSON: &str = concat!(
     "}\n",
 );
 
-#[cfg(test)]
-pub(crate) const SUMMARY_JSON: &str = "{\n  \"title\": \"Fixture summary\"\n}\n";
+/// Minimal valid summary document shared by description fixtures.
+pub const SUMMARY_JSON: &str = "{\n  \"title\": \"Fixture summary\"\n}\n";
 
 /// Copy a directory artifact, recursively.
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
@@ -410,6 +589,18 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
             std::fs::copy(entry.path(), &target).expect("copy fixture artifact file");
         }
     }
+}
+
+fn fixture_sha256(path: &std::path::Path) -> String {
+    use std::fmt::Write as _;
+
+    let mut file = std::fs::File::open(path).expect("open fixture artifact for checksum");
+    let digest = hdtc::format::sha256_to_end(&mut file).expect("checksum fixture artifact");
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        write!(hex, "{byte:02x}").expect("write to String");
+    }
+    hex
 }
 
 const HDT: &str = crate::store::artifact::HDT;

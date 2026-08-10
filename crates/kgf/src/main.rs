@@ -1,5 +1,4 @@
-//! The `kgf` binary: `kgf serve` and `kgf manifest` today, `kgf build` once
-//! `kgf-build` exists.
+//! The `kgf` binary: serving, manifest maintenance, and offline artifact builds.
 //!
 //! Argument parsing and logging setup only; every command's body is in the
 //! library beside this (`kgf::manifest`, `kgf::serve`).
@@ -24,6 +23,9 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Build offline bundle artifacts.
+    Build(kgf::build::Args),
+
     /// Serve bundles over the KGF HTTP API.
     Serve(kgf::serve::Args),
 
@@ -36,6 +38,7 @@ enum Command {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Build(args) => kgf::build::run(args),
         Command::Serve(args) => {
             install_logging();
             kgf::serve::run(args)

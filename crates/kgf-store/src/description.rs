@@ -398,9 +398,24 @@ pub struct SchemaPage {
     /// The object-class collection omits untyped target partitions, which have
     /// no semantic term; their triples remain in the parent property's counts.
     /// Publication verification permits at most one such target per property.
-    pub items: Vec<SchemaNode>,
+    pub items: Vec<SchemaChild>,
     /// Zero-based child offset for the next page.
     pub next: Option<u64>,
+}
+
+/// One immediate schema child and the raw enumeration position that names it.
+///
+/// The position is carried with the node because a response-byte budget may
+/// stop between two materialized children before the store page reaches its
+/// row limit. The server can then issue a cursor for the first child it did
+/// not serialize without reconstructing positions from semantic rows (which
+/// is not possible when an untyped object-target bucket was omitted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaChild {
+    /// Projected child partition.
+    pub node: SchemaNode,
+    /// Zero-based position in the parent's raw child enumeration.
+    pub position: u64,
 }
 
 /// Optional filters over the persisted class-relation order.
@@ -438,6 +453,19 @@ pub struct ClassRelation<'a> {
     pub triples: u64,
 }
 
+/// One class relation and the validated boundary immediately before its row.
+///
+/// Keeping the boundary beside the parsed row lets a caller stop on an
+/// independent response budget and resume at exactly the first row it did not
+/// include.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassRelationItem<'a> {
+    /// Parsed observed class relation.
+    pub relation: ClassRelation<'a>,
+    /// Position from which this relation is returned first.
+    pub position: ClassRelationPosition,
+}
+
 /// A validated byte boundary from which class-relation paging may resume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClassRelationPosition {
@@ -469,7 +497,7 @@ pub enum ClassRelationStop {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ClassRelationPage<'a> {
     /// Matching rows, in the artifact's global count-descending order.
-    pub items: Vec<ClassRelation<'a>>,
+    pub items: Vec<ClassRelationItem<'a>>,
     /// Boundary for the next page; absent only when the view is exhausted.
     pub next: Option<ClassRelationPosition>,
     /// The condition that ended this page.
@@ -707,7 +735,10 @@ impl<'a> DescriptionView<'a> {
                 next = Some(candidate_position);
                 break;
             }
-            items.push(self.project_node_with_term(child, query.child_kind(), term, counts)?);
+            items.push(SchemaChild {
+                node: self.project_node_with_term(child, query.child_kind(), term, counts)?,
+                position: candidate_position,
+            });
         }
         if next.is_none() && position < total {
             next = Some(position);
@@ -770,12 +801,16 @@ impl<'a> DescriptionView<'a> {
                 ));
             }
 
+            let row_position = position;
             let row = table.row_at(position.offset, self.relations.end())?;
             position.offset = row.next;
             examined += 1;
             let relation = parse_relation_row(row.bytes, table.path())?;
             if filter.matches(&relation) {
-                items.push(relation);
+                items.push(ClassRelationItem {
+                    relation,
+                    position: row_position,
+                });
             }
         }
 
@@ -969,7 +1004,7 @@ fn integer_object(void: &IndexedHdt, object: TermId, path: &Path) -> Result<u64>
 }
 
 fn relation_page<'a>(
-    items: Vec<ClassRelation<'a>>,
+    items: Vec<ClassRelationItem<'a>>,
     next: ClassRelationPosition,
     stop: ClassRelationStop,
     examined: usize,
@@ -2058,8 +2093,8 @@ mod tests {
                 let page = view.schema_children(query, from, one).unwrap();
                 assert!(page.node.is_some());
                 assert_eq!(page.collection, collection);
-                assert!(page.items.iter().all(|node| node.kind() == kind));
-                nodes.extend(page.items);
+                assert!(page.items.iter().all(|child| child.node.kind() == kind));
+                nodes.extend(page.items.into_iter().map(|child| child.node));
                 let Some(next) = page.next else {
                     break;
                 };
@@ -2097,7 +2132,7 @@ mod tests {
             assert_eq!(page.collection, SchemaCollection::ObjectClasses);
             assert_eq!(page.node.unwrap().counts().triples, Some(11));
             assert_eq!(page.items.len(), 1);
-            let child = page.items[0];
+            let child = page.items[0].node;
             assert_eq!(child.kind(), SchemaNodeKind::ObjectClass);
             terms.push(schema_term(description, child).unwrap());
             counts.push(child.counts().triples.unwrap());
@@ -2143,9 +2178,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            [first.items[0], second.items[0], third.items[0]].map(|node| {
-                schema_term(description, node).expect("typed object-class partition")
-            }),
+            [
+                first.items[0].node,
+                second.items[0].node,
+                third.items[0].node,
+            ]
+            .map(|node| { schema_term(description, node).expect("typed object-class partition") }),
             [
                 "https://example.org/B",
                 "https://example.org/C",
@@ -2229,7 +2267,7 @@ mod tests {
             .unwrap();
         assert_eq!(component_classes.items.len(), 1);
         assert_eq!(
-            schema_term(description, component_classes.items[0]).as_deref(),
+            schema_term(description, component_classes.items[0].node).as_deref(),
             Some("https://example.org/A")
         );
     }
@@ -2274,7 +2312,7 @@ mod tests {
             first
                 .items
                 .iter()
-                .map(|row| row.triples)
+                .map(|item| item.relation.triples)
                 .collect::<Vec<_>>(),
             [50, 30]
         );
@@ -2291,7 +2329,7 @@ mod tests {
             second
                 .items
                 .iter()
-                .map(|row| row.triples)
+                .map(|item| item.relation.triples)
                 .collect::<Vec<_>>(),
             [10]
         );
@@ -2321,7 +2359,7 @@ mod tests {
             first
                 .items
                 .iter()
-                .map(|row| row.triples)
+                .map(|item| item.relation.triples)
                 .collect::<Vec<_>>(),
             [50]
         );
@@ -2333,7 +2371,7 @@ mod tests {
             second
                 .items
                 .iter()
-                .map(|row| row.triples)
+                .map(|item| item.relation.triples)
                 .collect::<Vec<_>>(),
             [10]
         );

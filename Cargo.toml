@@ -28,6 +28,9 @@ sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 oxiri = "0.2"
+oxrdf = "0.3"
+oxrdfio = "0.2"
+tempfile = "3"
 
 # The HTTP stack (unit 13). axum is doc 20 §20.4's suggestion and survives the
 # QUERY support: hyper parses the extension method and axum routes it through

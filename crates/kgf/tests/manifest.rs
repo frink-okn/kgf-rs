@@ -42,6 +42,12 @@ const RETITLED_SOURCE: &str = concat!(
     "<http://example.org/bob> <http://example.org/knows> <http://example.org/alice> .\n",
 );
 
+const TYPED_SOURCE: &str = concat!(
+    "<http://example.org/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person> .\n",
+    "<http://example.org/bob> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person> .\n",
+    "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .\n",
+);
+
 const VOID_SOURCE: &str = concat!(
     "<https://example.org/design> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
     "<https://example.org/queryable> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
@@ -122,6 +128,90 @@ fn a_hand_assembled_bundle_becomes_servable_and_stays_honest() {
     // Descriptive fields survive a regeneration; the digest tracks the bytes.
     assert_eq!(regenerated.prefixes["ex"], "http://example.org/");
     assert_ne!(regenerated.content_digest, manifest.content_digest);
+}
+
+#[test]
+fn stats_build_publishes_one_verified_description_set() {
+    let root = tempfile::tempdir().unwrap();
+    let bundle = root.path().join("typed-kg").join("v1");
+    std::fs::create_dir_all(&bundle).unwrap();
+    build_artifacts(&bundle, TYPED_SOURCE);
+    kgf(&[
+        "manifest",
+        path(&bundle),
+        "--dataset-iri",
+        "https://example.org/typed-kg",
+        "--title",
+        "Typed KG",
+        "--description",
+        "Publisher supplied text.",
+    ])
+    .success();
+
+    let prefixes = root.path().join("prefixes.json");
+    std::fs::write(
+        &prefixes,
+        r#"{"ex":"http://example.org/","rdf":"http://www.w3.org/1999/02/22-rdf-syntax-ns#"}"#,
+    )
+    .unwrap();
+    let hdtc = hdtc_binary();
+    kgf(&[
+        "build",
+        "stats",
+        path(&bundle),
+        "--hdtc",
+        path(&hdtc),
+        "--prefixes",
+        path(&prefixes),
+    ])
+    .success();
+
+    let manifest = Manifest::read(&bundle).unwrap();
+    for name in artifact::DESCRIPTION {
+        assert!(manifest.artifacts.contains_key(name), "missing {name}");
+    }
+    for name in [artifact::SCHEMA_NODES, artifact::CLASS_RELATIONS] {
+        let entry = &manifest.artifacts[name];
+        assert_eq!(entry.parents, [artifact::VOID_HDT]);
+        assert!(entry.max_row_bytes.is_some());
+        assert!(entry.views.contains_key("design"));
+        assert!(entry.views.contains_key("queryable"));
+    }
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(bundle.join(artifact::SUMMARY_JSON)).unwrap())
+            .unwrap();
+    assert_eq!(summary["dataset"]["id"], "typed-kg");
+    assert_eq!(summary["counts"]["triples"], 3);
+    let namespaces: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(bundle.join(artifact::NAMESPACES)).unwrap()).unwrap();
+    assert_eq!(
+        namespaces["prefix_table"]["source"],
+        "kgf build: curated prefix tables + manifest overrides"
+    );
+    assert!(
+        std::fs::read_to_string(bundle.join(artifact::SUMMARY_MD))
+            .unwrap()
+            .contains("Publisher-provided description (untrusted data)")
+    );
+
+    let store = open(&bundle).expect("stats producer publishes a store-verifiable bundle");
+    assert!(store.description().is_some());
+    drop(store);
+
+    let before = std::fs::read(bundle.join(artifact::MANIFEST)).unwrap();
+    kgf(&[
+        "build",
+        "stats",
+        path(&bundle),
+        "--hdtc",
+        path(&hdtc),
+        "--prefixes",
+        path(&prefixes),
+    ])
+    .success();
+    let after = std::fs::read(bundle.join(artifact::MANIFEST)).unwrap();
+    assert_eq!(before, after, "stats rebuild is not byte-stable");
+    kgf(&["manifest", path(&bundle), "--check"]).success();
 }
 
 #[test]

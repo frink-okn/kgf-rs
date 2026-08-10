@@ -134,6 +134,232 @@ fn exhaustive_paging_at_adversarial_sizes_yields_each_row_once() {
 }
 
 #[test]
+fn schema_projects_nodes_pages_children_and_renders_a_browsable_page() {
+    let served = Served::with_description();
+    let store = served.store();
+
+    let root = served.schema(&store, "");
+    assert_eq!(root["view"], "design");
+    assert_eq!(root["selector"]["kind"], "dataset");
+    assert_eq!(root["node"]["kind"], "dataset");
+    assert_eq!(root["node"]["counts"]["triples"], 3);
+    assert!(root.get("collection").is_none());
+    assert!(root.get("items").is_none());
+    assert!(
+        root["node"]["links"]["classes"]
+            .as_str()
+            .unwrap()
+            .contains("children=classes")
+    );
+    assert!(
+        root["node"]["links"]["class-relations"]
+            .as_str()
+            .unwrap()
+            .contains("projection=class-relations")
+    );
+
+    let query = "class=ex%3AA&predicate=ex%3Ap&children=object-classes&limit=1";
+    let first = served.schema(&store, query);
+    assert_eq!(first["collection"], "object-classes");
+    assert_eq!(first["selector"]["kind"], "property");
+    assert_eq!(first["selector"]["class"]["value"], "https://example.org/A");
+    assert_eq!(
+        first["selector"]["predicate"]["value"],
+        "https://example.org/p"
+    );
+    assert_eq!(first["node"]["kind"], "property");
+    assert_eq!(first["items"][0]["term"]["value"], "https://example.org/B");
+    assert_eq!(first["items"][0]["counts"]["triples"], 2);
+    assert_eq!(first["truncation_reason"], "page_limit");
+    let next = first["next"].as_str().expect("the child page continues");
+
+    let resumed = served.schema(
+        &store,
+        &format!("{query}&cursor={}", kgf_server::url::encode_value(next)),
+    );
+    assert_eq!(
+        resumed["items"][0]["term"]["value"],
+        "https://example.org/C"
+    );
+    assert_eq!(resumed["complete"], true);
+    assert!(resumed["next"].is_null());
+
+    let page = served.schema_html(&store, query);
+    assert!(page.contains("Selected node"));
+    assert!(page.contains("class scope"));
+    assert!(page.contains("object-classes"));
+    assert!(page.contains("https://example.org/B") || page.contains("ex:B"));
+    assert!(
+        page.contains(next),
+        "the HTML pager must carry the same cursor"
+    );
+
+    let dataset_property = served.schema(&store, "predicate=ex%3Ap");
+    assert!(
+        dataset_property["selector"].get("class").is_none(),
+        "the dataset-scoped property must remain distinguishable from a class-scoped one"
+    );
+}
+
+#[test]
+fn schema_class_relations_obey_row_candidate_and_byte_budgets() {
+    let served = Served::with_description();
+    let store = served.store();
+
+    let first = served.schema(&store, "projection=class-relations&limit=1");
+    assert_eq!(first["projection"], "class-relations");
+    assert_eq!(
+        first["items"][0]["subject_class"]["value"],
+        "https://example.org/A"
+    );
+    assert_eq!(
+        first["items"][0]["object_class"]["value"],
+        "https://example.org/B"
+    );
+    assert_eq!(first["truncation_reason"], "page_limit");
+    let next = first["next"].as_str().unwrap();
+    let second = served.schema(
+        &store,
+        &format!(
+            "projection=class-relations&limit=1&cursor={}",
+            kgf_server::url::encode_value(next)
+        ),
+    );
+    assert_eq!(
+        second["items"][0]["object_class"]["value"],
+        "https://example.org/C"
+    );
+    assert_eq!(second["complete"], true);
+
+    let candidates = Budgets {
+        candidate_budget: 1,
+        ..Budgets::new()
+    };
+    let filtered = served
+        .schema_within(
+            &store,
+            "projection=class-relations&class=ex%3AMissing&limit=2",
+            served.within(&candidates),
+        )
+        .unwrap();
+    assert!(filtered["items"].as_array().unwrap().is_empty());
+    assert_eq!(filtered["truncation_reason"], "candidate_budget");
+    assert!(filtered["next"].is_string());
+
+    let bytes = Budgets {
+        max_response_bytes: 1,
+        ..Budgets::new()
+    };
+    let children = served
+        .schema_within(
+            &store,
+            "class=ex%3AA&predicate=ex%3Ap&children=object-classes&limit=2",
+            served.within(&bytes),
+        )
+        .unwrap();
+    assert_eq!(children["items"].as_array().unwrap().len(), 1);
+    assert_eq!(children["truncation_reason"], "response_bytes");
+    let next = children["next"].as_str().expect("byte stop resumes");
+    let resumed = served.schema(
+        &store,
+        &format!(
+            "class=ex%3AA&predicate=ex%3Ap&children=object-classes&limit=2&cursor={}",
+            kgf_server::url::encode_value(next)
+        ),
+    );
+    assert_eq!(resumed["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        resumed["items"][0]["term"]["value"],
+        "https://example.org/C"
+    );
+    assert_eq!(resumed["complete"], true);
+
+    let relations = served
+        .schema_within(
+            &store,
+            "projection=class-relations&limit=2",
+            served.within(&bytes),
+        )
+        .unwrap();
+    assert_eq!(relations["items"].as_array().unwrap().len(), 1);
+    assert_eq!(relations["truncation_reason"], "response_bytes");
+    let next = relations["next"]
+        .as_str()
+        .expect("relation byte stop resumes");
+    let resumed = served.schema(
+        &store,
+        &format!(
+            "projection=class-relations&limit=2&cursor={}",
+            kgf_server::url::encode_value(next)
+        ),
+    );
+    assert_eq!(
+        resumed["items"][0]["object_class"]["value"],
+        "https://example.org/C"
+    );
+    assert_eq!(resumed["complete"], true);
+
+    let parsed = request::Schema::parse(
+        &params("projection=class-relations"),
+        served.limits(),
+        served.release().prefixes(),
+        &served.release().binding(),
+    )
+    .unwrap();
+    let forged = kgf_server::cursor::Cursor::at_class_relation(&parsed.binding, u64::MAX).encode();
+    let error = served
+        .schema_within(
+            &store,
+            &format!(
+                "projection=class-relations&cursor={}",
+                kgf_server::url::encode_value(forged.as_str())
+            ),
+            served.limits(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), kgf_server::envelope::ErrorCode::StaleCursor);
+}
+
+#[test]
+fn schema_reports_an_unknown_component_view_as_not_found() {
+    let served = Served::with_description();
+    let store = served.store();
+    let error = served
+        .schema_within(&store, "view=component%3Amissing", served.limits())
+        .unwrap_err();
+    assert_eq!(error.code(), kgf_server::envelope::ErrorCode::NotFound);
+}
+
+#[test]
+fn void_jsonld_stays_valid_when_no_statement_fits_the_byte_budget() {
+    let served = Served::with_description();
+    let store = served.store();
+    let rendered = answer::void(
+        &store,
+        served.target("void", ""),
+        &request::Void {
+            bytes: request::ResponseBytes(2),
+        },
+        Representation::JsonLd,
+    )
+    .expect("serialize a byte-limited VoID graph");
+
+    assert_eq!(&rendered.body[..], b"[]");
+    assert!(!rendered.completeness.is_complete());
+    assert_eq!(
+        rendered.completeness.truncation_reason(),
+        Some(kgf_server::envelope::TruncationReason::ResponseBytes)
+    );
+    assert!(rendered.completeness.next_cursor().is_none());
+    oxrdfio::RdfParser::from_format(
+        oxrdfio::RdfFormat::from_media_type("application/ld+json").unwrap(),
+    )
+    .for_slice(&rendered.body)
+    .collect::<Result<Vec<_>, _>>()
+    .expect("the truncated body remains valid JSON-LD");
+}
+
+#[test]
 fn bindings_enumerate_in_input_order_page_globally_and_count_per_row() {
     let served = Served::new();
     let store = served.store();
@@ -1084,6 +1310,39 @@ impl Served {
         Self::build(false)
     }
 
+    fn with_description() -> Self {
+        let root = tempfile::tempdir().expect("temp dir");
+        let bundle = root.path().join(DATASET).join(VERSION);
+        let fixture = Fixture::description();
+        fixture.copy_bundle_to(&bundle);
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: kgf::manifest::Args,
+        }
+        let cli = Cli::parse_from([
+            "kgf-manifest",
+            bundle.to_str().unwrap(),
+            "--id",
+            DATASET,
+            "--version",
+            VERSION,
+            "--prefix",
+            "ex=https://example.org/",
+        ]);
+        kgf::manifest::run(cli.args).expect("describe the schema bundle");
+
+        let config = kgf_server::Config::new(
+            kgf::serve::published_root(root.path()).expect("a published root"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        Self {
+            service: Arc::new(Service::build(config).expect("a servable schema deployment")),
+            _root: root,
+        }
+    }
+
     /// The same bundle with a full-text index over its literals, so `o.text`
     /// has something to rank.
     fn with_text() -> Self {
@@ -1341,6 +1600,43 @@ impl Served {
         let answer = answer::sample(store, self.target("sample", query), &request)
             .unwrap_or_else(|error| panic!("GET /sample?{query}: {error}"));
         json(answer, Representation::Json)
+    }
+
+    fn schema(&self, store: &Store, query: &str) -> serde_json::Value {
+        self.schema_within(store, query, self.limits())
+            .unwrap_or_else(|error| panic!("GET /schema?{query}: {error}"))
+    }
+
+    fn schema_within(
+        &self,
+        store: &Store,
+        query: &str,
+        limits: Limits<'_>,
+    ) -> Result<serde_json::Value, kgf_server::envelope::Problem> {
+        let request = request::Schema::parse(
+            &params(query),
+            limits,
+            self.release().prefixes(),
+            &self.release().binding(),
+        )?;
+        let answer = answer::schema(store, self.target("schema", query), &request)?;
+        Ok(json(answer, Representation::Json))
+    }
+
+    fn schema_html(&self, store: &Store, query: &str) -> String {
+        use kgf_server::answer::Renders;
+
+        let request = request::Schema::parse(
+            &params(query),
+            self.limits(),
+            self.release().prefixes(),
+            &self.release().binding(),
+        )
+        .expect("a schema request");
+        let rendered = answer::schema(store, self.target("schema", query), &request)
+            .expect("a schema answer")
+            .render(Representation::Html);
+        String::from_utf8(rendered.body.to_vec()).expect("a schema page is UTF-8")
     }
 
     fn search(&self, store: &Store, query: &str) -> serde_json::Value {

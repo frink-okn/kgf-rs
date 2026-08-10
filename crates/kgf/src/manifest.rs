@@ -26,11 +26,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-#[cfg(test)]
-use kgf_store::manifest::ArtifactView;
 use kgf_store::manifest::{
-    ArtifactDigest, ArtifactEntry, BundleFacts, Capability, Formats, Manifest, ManifestDocument,
-    Publisher, content_digest_preimage, default_predicate_roles, validate_predicate_role_iri,
+    ArtifactDigest, ArtifactEntry, ArtifactView, BundleFacts, Capability, Formats, Manifest,
+    ManifestDocument, Publisher, content_digest_preimage, default_predicate_roles,
+    validate_predicate_role_iri,
 };
 use kgf_store::store::artifact;
 use kgf_store::{PublishedBundle, verify_description_artifacts};
@@ -103,6 +102,24 @@ pub struct Args {
     pub roles: Vec<String>,
 }
 
+/// Build-produced bounds for one row-oriented description artifact.
+#[derive(Debug, Clone)]
+pub(crate) struct RowArtifactMetadata {
+    /// Longest complete row, including its trailing newline.
+    pub(crate) max_row_bytes: u64,
+    /// Exact contiguous range occupied by each semantic view.
+    pub(crate) views: BTreeMap<String, ArtifactView>,
+}
+
+/// Metadata only the stats producer can derive while writing its TSVs.
+#[derive(Debug, Clone)]
+pub(crate) struct DescriptionArtifactMetadata {
+    /// Bounds for `stats/schema-nodes.tsv`.
+    pub(crate) schema_nodes: RowArtifactMetadata,
+    /// Bounds for `stats/class-relations.tsv`.
+    pub(crate) class_relations: RowArtifactMetadata,
+}
+
 /// Run `kgf manifest`.
 pub fn run(args: Args) -> Result<()> {
     let dir = args
@@ -139,6 +156,7 @@ pub fn run(args: Args) -> Result<()> {
         &dir,
         &facts,
         document.as_ref().and_then(ManifestDocument::parsed),
+        None,
     )?;
     manifest.validate(&dir)?;
     verify_description_artifacts(&bundle, &manifest)?;
@@ -159,6 +177,58 @@ pub fn run(args: Args) -> Result<()> {
         manifest.content_digest,
     );
     Ok(())
+}
+
+/// Refresh a manifest after `kgf build stats` publishes a complete description set.
+///
+/// The ordinary manifest command deliberately cannot invent semantic TSV
+/// ranges. The producer supplies the ranges it measured while writing, and
+/// this path performs the same inspection, proof, canonical rewrite, and
+/// content-digest calculation as the standalone command.
+pub(crate) fn write_description_manifest(
+    bundle_dir: &Path,
+    dataset_iri: Option<String>,
+    metadata: &DescriptionArtifactMetadata,
+) -> Result<Manifest> {
+    let dir = bundle_dir
+        .canonicalize()
+        .with_context(|| format!("resolving bundle directory {}", bundle_dir.display()))?;
+    let BundleInspection { bundle, facts } = inspect_bundle(&dir)?;
+    verify_text_binding(&dir)?;
+    let document = ManifestDocument::read(&dir)?;
+    let args = Args {
+        bundle: dir.clone(),
+        check: false,
+        id: None,
+        version: None,
+        dataset_iri,
+        title: None,
+        description: None,
+        license: None,
+        homepage: None,
+        publisher: None,
+        publisher_contact: None,
+        previous_version: None,
+        prefixes: Vec::new(),
+        roles: Vec::new(),
+    };
+    let manifest = build(
+        &args,
+        &dir,
+        &facts,
+        document.as_ref().and_then(ManifestDocument::parsed),
+        Some(metadata),
+    )?;
+    manifest.validate(&dir)?;
+    verify_description_artifacts(&bundle, &manifest)?;
+
+    let bytes = match &document {
+        Some(document) => document.rewrite_with(&manifest)?,
+        None => manifest.to_json_bytes()?,
+    };
+    let path = dir.join(artifact::MANIFEST);
+    std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    Ok(manifest)
 }
 
 /// The published capability and bounded facts used throughout one invocation.
@@ -275,6 +345,7 @@ fn build(
     dir: &Path,
     facts: &BundleFacts,
     previous: Option<&Manifest>,
+    generated_description: Option<&DescriptionArtifactMetadata>,
 ) -> Result<Manifest> {
     let id = pick(&args.id, previous.map(|m| m.id.clone()), || {
         dir.parent()
@@ -295,7 +366,7 @@ fn build(
     .context("cannot infer a version from the bundle path; pass --version")?;
 
     let mut artifacts = checksum_artifacts(dir, facts)?;
-    carry_artifact_metadata(&mut artifacts, previous)?;
+    carry_artifact_metadata(&mut artifacts, previous, generated_description)?;
     let content_digest =
         content_digest(artifacts.iter().map(|(name, entry)| (name.as_str(), entry)));
 
@@ -545,6 +616,7 @@ pub fn checksum_artifact(path: &Path) -> Result<ArtifactEntry> {
 fn carry_artifact_metadata(
     artifacts: &mut [(String, ArtifactEntry)],
     previous: Option<&Manifest>,
+    generated_description: Option<&DescriptionArtifactMetadata>,
 ) -> Result<()> {
     let current_digests: BTreeMap<String, (u64, String)> = artifacts
         .iter()
@@ -552,6 +624,18 @@ fn carry_artifact_metadata(
         .collect();
 
     for (name, current) in artifacts {
+        let generated = generated_description.and_then(|description| match name.as_str() {
+            artifact::SCHEMA_NODES => Some(&description.schema_nodes),
+            artifact::CLASS_RELATIONS => Some(&description.class_relations),
+            _ => None,
+        });
+        if let Some(generated) = generated {
+            current.parents = vec![artifact::VOID_HDT.to_owned()];
+            current.max_row_bytes = Some(generated.max_row_bytes);
+            current.views.clone_from(&generated.views);
+            continue;
+        }
+
         let prior = previous.and_then(|manifest| manifest.artifacts.get(name));
         let same_content = prior
             .is_some_and(|prior| prior.bytes == current.bytes && prior.sha256 == current.sha256);
@@ -965,7 +1049,7 @@ mod tests {
                 ArtifactEntry::checksum(100, "abc"),
             ),
         ];
-        carry_artifact_metadata(&mut unchanged, Some(&previous)).unwrap();
+        carry_artifact_metadata(&mut unchanged, Some(&previous), None).unwrap();
         assert_eq!(unchanged[1].1, entry);
 
         let mut changed = vec![
@@ -978,10 +1062,10 @@ mod tests {
                 ArtifactEntry::checksum(101, "def"),
             ),
         ];
-        let error = carry_artifact_metadata(&mut changed, Some(&previous)).unwrap_err();
+        let error = carry_artifact_metadata(&mut changed, Some(&previous), None).unwrap_err();
         assert!(error.to_string().contains("view ranges may be stale"));
 
-        let error = carry_artifact_metadata(&mut unchanged, None).unwrap_err();
+        let error = carry_artifact_metadata(&mut unchanged, None, None).unwrap_err();
         assert!(error.to_string().contains("kgf build"));
 
         let mut stale_parent = vec![
@@ -994,7 +1078,7 @@ mod tests {
                 ArtifactEntry::checksum(100, "abc"),
             ),
         ];
-        let error = carry_artifact_metadata(&mut stale_parent, Some(&previous)).unwrap_err();
+        let error = carry_artifact_metadata(&mut stale_parent, Some(&previous), None).unwrap_err();
         assert!(error.to_string().contains("parent stats/void.hdt changed"));
     }
 }

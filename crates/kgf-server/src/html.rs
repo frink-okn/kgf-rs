@@ -45,6 +45,8 @@
 use bytes::Bytes;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
+use crate::representation::Representation;
+
 /// What the pages call themselves.
 pub const SITE: &str = "Knowledge Graph Fragments";
 
@@ -109,7 +111,7 @@ impl<'a> Crumb<'a> {
 /// request arrived on, so a page reached through `latest` links to the version
 /// it actually resolved to.
 pub fn page(title: &str, crumbs: &[Crumb<'_>], canonical: Option<&str>, body: Markup) -> String {
-    page_document(title, None, crumbs, canonical, body)
+    page_document(title, None, crumbs, canonical, Representation::Json, body)
 }
 
 /// An operation page whose route and release are quiet context above the
@@ -121,7 +123,31 @@ pub fn operation_page(
     canonical: Option<&str>,
     body: Markup,
 ) -> String {
-    page_document(title, Some(context), crumbs, canonical, body)
+    operation_page_with_format(
+        title,
+        context,
+        crumbs,
+        canonical,
+        Representation::Json,
+        body,
+    )
+}
+
+/// An operation page whose machine-readable alternate is not ordinary JSON.
+pub fn operation_page_with_format(
+    title: &str,
+    context: &str,
+    crumbs: &[Crumb<'_>],
+    canonical: Option<&str>,
+    alternate: Representation,
+    body: Markup,
+) -> String {
+    debug_assert_ne!(
+        alternate,
+        Representation::Html,
+        "a page alternate must be a machine representation"
+    );
+    page_document(title, Some(context), crumbs, canonical, alternate, body)
 }
 
 fn page_document(
@@ -129,6 +155,7 @@ fn page_document(
     context: Option<&str>,
     crumbs: &[Crumb<'_>],
     canonical: Option<&str>,
+    alternate: Representation,
     body: Markup,
 ) -> String {
     // The service descriptor's own title *is* the site name, and a tab reading
@@ -139,9 +166,9 @@ fn page_document(
     } else {
         format!("{title} — {SITE}")
     };
-    let json = canonical.map(|url| {
+    let machine = canonical.map(|url| {
         let separator = if url.contains('?') { '&' } else { '?' };
-        format!("{url}{separator}format=json")
+        format!("{url}{separator}format={}", alternate.token())
     });
 
     html! {
@@ -180,16 +207,16 @@ fn page_document(
                         } @else {
                             h1 { (title) }
                         }
-                        @if let Some(json) = &json {
-                            a."json-action" href=(json) { "View JSON" }
+                        @if let Some(machine) = &machine {
+                            a."json-action" href=(machine) { "View " (alternate.label()) }
                         }
                     }
                     (body)
                 }
                 footer {
                     div."footer-inner" {
-                        @if let Some(json) = &json {
-                            a href=(json) { "This page as JSON" }
+                        @if let Some(machine) = &machine {
+                            a href=(machine) { "This page as " (alternate.label()) }
                             span."sep" { "·" }
                         }
                         span { "one URL for people and software, selected by Accept" }
@@ -918,6 +945,21 @@ mod tests {
 
         let queried = page("t", &[], Some("/a/b?s=x"), html! {});
         assert!(queried.contains("href=\"/a/b?s=x&amp;format=json\""));
+    }
+
+    #[test]
+    fn an_operation_can_name_a_non_json_machine_alternate() {
+        let rendered = operation_page_with_format(
+            "VoID",
+            "tox v1",
+            &[],
+            Some("/tox/v/v1/void"),
+            Representation::JsonLd,
+            html! {},
+        );
+        assert!(rendered.contains("View JSON-LD"));
+        assert!(rendered.contains("href=\"/tox/v/v1/void?format=jsonld\""));
+        assert!(!rendered.contains("/tox/v/v1/void?format=json\""));
     }
 
     #[test]

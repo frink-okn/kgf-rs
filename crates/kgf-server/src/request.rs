@@ -1673,6 +1673,36 @@ pub struct Schema {
     pub binding: CursorBinding,
 }
 
+/// `GET /void` — the complete VoID graph in one RDF representation.
+#[derive(Debug, Clone, Copy)]
+pub struct Void {
+    /// Maximum serialized bytes before the graph is returned as a valid,
+    /// incomplete RDF document.
+    pub bytes: ResponseBytes,
+}
+
+impl Void {
+    /// Parse the representation-only request before opening a bundle.
+    pub fn parse(params: &Params, limits: Limits<'_>) -> Result<Self, Problem> {
+        accept_only(params, VOID, &["format"])?;
+        Ok(Self {
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+        })
+    }
+}
+
+/// `GET /summary` — one persisted summary card.
+#[derive(Debug, Clone, Copy)]
+pub struct Summary;
+
+impl Summary {
+    /// Refuse every query control except representation selection.
+    pub fn parse(params: &Params) -> Result<Self, Problem> {
+        accept_only(params, SUMMARY, &["format"])?;
+        Ok(Self)
+    }
+}
+
 impl Schema {
     const PARAMETERS: &'static [&'static str] = &[
         "class",
@@ -2016,6 +2046,18 @@ impl GetRequest for Schema {
     }
 }
 
+impl GetRequest for Void {
+    fn normalize_params(params: &Params) -> Params {
+        params.clone()
+    }
+}
+
+impl GetRequest for Summary {
+    fn normalize_params(params: &Params) -> Params {
+        params.clone()
+    }
+}
+
 impl GetRequest for Sample {
     fn normalize_params(params: &Params) -> Params {
         normalize_pattern_params(params, &["n", "seed"])
@@ -2072,6 +2114,8 @@ const COUNT: &str = "count";
 const DESCRIBE: &str = "describe";
 const SAMPLE: &str = "sample";
 const SCHEMA: &str = "schema";
+const VOID: &str = "void";
+const SUMMARY: &str = "summary";
 const SEARCH: &str = "search";
 const LABELS: &str = "labels";
 

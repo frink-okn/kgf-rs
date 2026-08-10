@@ -88,6 +88,125 @@ fn the_url_space_answers_over_a_real_listener() {
 }
 
 #[test]
+fn schema_answers_json_html_latest_and_resumable_pages_over_http() {
+    let deployment = Deployment::new();
+    deployment.publish_description("tox", "v1", "2026-08-08T12:00:00Z");
+    let server = deployment.serve();
+    let query = "class=ex%3AA&predicate=ex%3Ap&children=object-classes&limit=1";
+
+    let first = server.get(&format!("/tox/v/v1/schema?{query}"));
+    first.assert_status(200);
+    first.assert_header("content-type", "application/json");
+    first.assert_header("kgf-complete", "false");
+    first.assert_header("kgf-truncation-reason", "page_limit");
+    first.assert_cache_control(&["public", "max-age=31536000", "immutable"]);
+    assert_eq!(
+        first.json()["items"][0]["term"]["value"],
+        "https://example.org/B"
+    );
+    let next = first.json()["next"].as_str().unwrap().to_owned();
+
+    let resumed = server.get(&format!(
+        "/tox/v/v1/schema?{query}&cursor={}",
+        kgf_server::url::encode_value(&next)
+    ));
+    resumed.assert_status(200);
+    resumed.assert_header("kgf-complete", "true");
+    assert_eq!(
+        resumed.json()["items"][0]["term"]["value"],
+        "https://example.org/C"
+    );
+
+    let page = server.request(
+        "GET",
+        &format!("/tox/v/v1/schema?{query}"),
+        &[("Accept", "text/html")],
+    );
+    page.assert_status(200);
+    page.assert_header("content-type", "text/html; charset=utf-8");
+    let html = String::from_utf8(page.body.clone()).unwrap();
+    assert!(html.contains("Selected node"));
+    assert!(html.contains(&next));
+
+    server
+        .get(&format!("/tox/latest/schema?{query}"))
+        .assert_header("location", &format!("/tox/v/v1/schema?{query}"));
+
+    let unknown = server.get("/tox/v/v1/schema?view=component%3Amissing");
+    unknown.assert_status(404);
+    assert_eq!(unknown.json()["code"], "not_found");
+}
+
+#[test]
+fn void_and_summary_serve_the_published_description_in_every_format() {
+    let deployment = Deployment::new();
+    deployment.publish_description("tox", "v1", "2026-08-08T12:00:00Z");
+    let server = deployment.serve();
+
+    let turtle = server.get("/tox/v/v1/void?format=ttl");
+    turtle.assert_status(200);
+    turtle.assert_header("content-type", "text/turtle; charset=utf-8");
+    turtle.assert_header("kgf-complete", "true");
+    let turtle_quads = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+        .for_slice(&turtle.body)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("/void Turtle parses");
+    assert_eq!(turtle_quads.len(), 21);
+
+    let jsonld = server.request(
+        "GET",
+        "/tox/v/v1/void",
+        &[("Accept", "application/ld+json")],
+    );
+    jsonld.assert_status(200);
+    jsonld.assert_header("content-type", "application/ld+json");
+    let format = oxrdfio::RdfFormat::from_media_type("application/ld+json").unwrap();
+    let jsonld_quads = oxrdfio::RdfParser::from_format(format)
+        .for_slice(&jsonld.body)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("/void JSON-LD parses");
+    assert_eq!(jsonld_quads.len(), turtle_quads.len());
+
+    let pinned_jsonld = server.get("/tox/v/v1/void?format=jsonld");
+    pinned_jsonld.assert_status(200);
+    pinned_jsonld.assert_header("content-type", "application/ld+json");
+
+    let page = server.get("/tox/v/v1/void?format=html");
+    page.assert_status(200);
+    page.assert_header("content-type", "text/html; charset=utf-8");
+    let page = String::from_utf8(page.body).unwrap();
+    assert!(page.contains("VoID dataset description"));
+    assert!(page.contains("View JSON-LD"));
+    assert!(page.contains("/tox/v/v1/void?format=jsonld"));
+    assert!(!page.contains("/tox/v/v1/void?format=json\""));
+
+    let markdown = server.get("/tox/v/v1/summary");
+    markdown.assert_status(200);
+    markdown.assert_header("content-type", "text/markdown; charset=utf-8");
+    assert_eq!(markdown.body, b"# Summary\n");
+
+    let json = server.get("/tox/v/v1/summary?format=json");
+    json.assert_status(200);
+    json.assert_header("content-type", "application/json");
+    assert!(json.json().is_object());
+
+    let summary_page = server.request("GET", "/tox/v/v1/summary", &[("Accept", "text/html")]);
+    summary_page.assert_status(200);
+    assert!(
+        String::from_utf8(summary_page.body)
+            .unwrap()
+            .contains("Published summary card")
+    );
+
+    let manifest = server.get("/tox/v/v1/manifest?format=html");
+    manifest.assert_status(200);
+    let manifest = String::from_utf8(manifest.body).unwrap();
+    for operation in ["schema", "void", "summary"] {
+        assert!(manifest.contains(&format!("href=\"/tox/v/v1/{operation}\"")));
+    }
+}
+
+#[test]
 fn a_versioned_manifest_is_immutable_cacheable_and_conditional() {
     let deployment = Deployment::new();
     deployment.publish("tox", "2026-06-01", TINY_NT, "2026-06-01T14:03:22Z");
@@ -1043,6 +1162,31 @@ impl Deployment {
         self.publish_bundle(dataset, version, source, created, true);
     }
 
+    fn publish_description(&self, dataset: &str, version: &str, created: &str) {
+        let bundle = self.bundle(dataset, version);
+        Fixture::description().copy_bundle_to(&bundle);
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: kgf::manifest::Args,
+        }
+        let cli = Cli::parse_from([
+            "kgf-manifest",
+            bundle.to_str().unwrap(),
+            "--id",
+            dataset,
+            "--version",
+            version,
+            "--title",
+            &format!("{dataset} {version}"),
+            "--prefix",
+            "ex=https://example.org/",
+        ]);
+        kgf::manifest::run(cli.args).expect("describe the tier-1 bundle");
+        self.set_created(&bundle, created);
+    }
+
     fn publish_bundle(
         &self,
         dataset: &str,
@@ -1076,6 +1220,10 @@ impl Deployment {
         // `kgf manifest` stamps `created` with the build time, and two bundles
         // built inside one test share a second. The releases here need a
         // defined order, so the timestamps are written explicitly.
+        self.set_created(&bundle, created);
+    }
+
+    fn set_created(&self, bundle: &Path, created: &str) {
         let path = bundle.join("manifest.json");
         let mut document: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();

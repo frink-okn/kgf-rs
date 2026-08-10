@@ -506,8 +506,9 @@ impl Resource for BundleManifest {
                     section."panel" {
                         h2 { "Operations" }
                         (note(
-                            "Read operations over this immutable version. Each URL answers HTML or JSON \
-                             according to Accept, with $KGF as this server's base URL."
+                            "Read operations over this immutable version. Each URL negotiates its \
+                             listed machine representation and HTML according to Accept, with $KGF \
+                             as this server's base URL."
                         ))
                         (table(
                             &["Operation", "Parameters"],
@@ -622,6 +623,17 @@ fn operations(dataset: &str, version: &str, manifest: &Manifest) -> Vec<Vec<Valu
         ("count", count_parameters, true),
         ("describe", "iri, direction, limit, cursor", false),
     ];
+    if manifest.carries_description_artifacts() {
+        operations.extend([
+            (
+                "schema",
+                "class, predicate, datatype, children, projection, view, limit, cursor",
+                true,
+            ),
+            ("void", "format=ttl|jsonld|html", true),
+            ("summary", "format=md|json|html", true),
+        ]);
+    }
     if manifest.declares(Capability::Sample) {
         operations.push(("sample", "s, p, o, n, seed", true));
     }
@@ -744,5 +756,30 @@ mod tests {
         // a link that 400s is worse than none.
         assert!(page.contains("describe"));
         assert!(!page.contains("href=\"/tox/v/2026-06-01/describe\""));
+    }
+
+    #[test]
+    fn a_description_manifest_links_its_three_description_operations() {
+        let mut manifest = manifest();
+        for name in kgf_store::store::artifact::DESCRIPTION {
+            manifest.artifacts.insert(
+                name.to_owned(),
+                ArtifactEntry::checksum(1, format!("sha256-{name}")),
+            );
+        }
+        let page = BundleManifest::new(
+            "tox",
+            "2026-06-01",
+            bytes::Bytes::from_static(b"{}"),
+            std::sync::Arc::new(manifest),
+        )
+        .to_html();
+
+        for operation in ["schema", "void", "summary"] {
+            assert!(
+                page.contains(&format!("href=\"/tox/v/2026-06-01/{operation}\"")),
+                "the manifest page must link /{operation}"
+            );
+        }
     }
 }

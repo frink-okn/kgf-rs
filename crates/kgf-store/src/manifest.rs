@@ -524,6 +524,17 @@ impl Manifest {
         self.capabilities.contains_key(capability.as_str())
     }
 
+    /// Whether this bundle carries the mandatory description artifact set.
+    ///
+    /// [`validate`](Self::validate) establishes that the set is all-or-none,
+    /// so this is also whether `/schema`, `/void`, and `/summary` are
+    /// discoverable operations for this published bundle.
+    pub fn carries_description_artifacts(&self) -> bool {
+        artifact::DESCRIPTION
+            .iter()
+            .all(|name| self.artifacts.contains_key(*name))
+    }
+
     /// The five entries whose metadata the mapped description reader consumes.
     ///
     /// [`validate`](Self::validate) establishes the all-or-none invariant, so

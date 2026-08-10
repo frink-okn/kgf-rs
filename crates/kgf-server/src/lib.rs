@@ -20,18 +20,19 @@
 //!
 //! # One URL, two readers
 //!
-//! Every route answers JSON *and* HTML, chosen by `Accept` alone — a page in a
-//! browser, data from `curl`, at the same URL. See [`representation`] for why
-//! the tie-break falls the way it does, and [`html`] for the rendering.
+//! Every route answers a machine representation *and* HTML, chosen by `Accept`
+//! alone — a page in a browser, data from `curl`, at the same URL. Most use
+//! JSON; RDF `/void` uses Turtle/JSON-LD and static `/summary` uses
+//! Markdown/JSON. See [`representation`] for why the tie-break falls the way it
+//! does, and [`html`] for the rendering.
 //!
 //! # Status
 //!
-//! Units 10–16 of `notes/plan.md` are implemented: [`cursor`], [`term`],
+//! Units 10–19 in `notes/plan.md` are implemented: [`cursor`], [`term`],
 //! [`envelope`], the URL space with `latest`, caching and content negotiation,
-//! and doc 03 §3.4's four read operations — `/fragment`, `/count`, `/describe`
-//! and `/sample` — plus bindings QUERY/POST for fragment and count in [`request`]
-//! and [`answer`]. `/void` and `/summary` remain before a deployment can claim
-//! §3.1's core profile.
+//! and doc 03 §3.4's read operations `/fragment`, `/count`, `/describe`, `/sample`
+//! and `/schema`, the `/void` and `/summary` description resources, plus bindings
+//! QUERY/POST for fragment and count in [`request`] and [`answer`].
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]

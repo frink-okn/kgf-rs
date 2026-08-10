@@ -30,10 +30,14 @@ tokio.workspace = true
 tracing-subscriber.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+oxrdf.workspace = true
+oxrdfio.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync"] }
-tempfile = "3"
+tempfile.workspace = true
 # `testing::hdtc_binary`, so the integration test does not carry its own copy
 # of where the sibling checkout lives.
 kgf-store = { workspace = true, features = ["testing"] }

@@ -85,6 +85,9 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/{dataset}/v/{version}/describe", read(get(describe)))
         .route("/{dataset}/v/{version}/sample", read(get(sample)))
         .route("/{dataset}/v/{version}/search", read(get(search)))
+        .route("/{dataset}/v/{version}/schema", read(get(schema)))
+        .route("/{dataset}/v/{version}/void", read(get(void)))
+        .route("/{dataset}/v/{version}/summary", read(get(summary)))
         .route(
             "/{dataset}/v/{version}/labels",
             MethodRouter::new()
@@ -155,8 +158,9 @@ async fn no_such_route(OriginalUri(uri): OriginalUri) -> Problem {
         ErrorCode::NotFound,
         format!(
             "no resource at {}; this server serves / (service descriptor), \
-             /{{dataset}}, /{{dataset}}/v/{{version}}/manifest, and the same under \
-             /{{dataset}}/latest/",
+             /{{dataset}}, and /{{dataset}}/v/{{version}}/{{manifest,fragment,count,describe,\
+             sample,search,labels,schema,void,summary}}; version resources are also available \
+             under /{{dataset}}/latest/",
             reflected(uri.path())
         ),
     )
@@ -590,6 +594,58 @@ async fn search(
     .await
 }
 
+async fn schema(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate(
+        service,
+        BundleId { dataset, version },
+        "schema",
+        wants,
+        |params, limits, release| {
+            request::Schema::parse(params, limits, release.prefixes(), &release.binding())
+        },
+        answer::schema,
+    )
+    .await
+}
+
+async fn void(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate_special(
+        service,
+        BundleId { dataset, version },
+        "void",
+        wants,
+        Representation::VOID,
+        |params, limits, _release| request::Void::parse(params, limits),
+        answer::void,
+    )
+    .await
+}
+
+async fn summary(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate_special(
+        service,
+        BundleId { dataset, version },
+        "summary",
+        wants,
+        Representation::SUMMARY,
+        |params, _limits, _release| request::Summary::parse(params),
+        answer::summary,
+    )
+    .await
+}
+
 async fn labels_post(
     State(service): State<Arc<Service>>,
     Path((dataset, version)): Path<(String, String)>,
@@ -746,6 +802,54 @@ where
         let mut answer = execute(&store, target, &request)?;
         labels.hydrate(&store, &mut answer)?;
         Ok(answer.render(representation))
+    })
+    .await?;
+
+    respond_rendered(rendered, representation, CachePolicy::Immutable, validator)
+}
+
+/// Run a versioned operation whose representation set is not the ordinary
+/// JSON/page pair.
+async fn operate_special<Q, P, E>(
+    service: Arc<Service>,
+    id: BundleId,
+    operation: &'static str,
+    wants: Wants,
+    offered: &'static [Representation],
+    parse: P,
+    execute: E,
+) -> Result<Response, Problem>
+where
+    Q: request::GetRequest + Send + 'static,
+    P: FnOnce(&Params, Limits<'_>, &Release) -> Result<Q, Problem>,
+    E: FnOnce(&kgf_store::Store, Target, &Q, Representation) -> Result<Rendered, Problem>
+        + Send
+        + 'static,
+{
+    let representation = wants.representation_from(offered)?;
+    let release = service.datasets().release(&id.dataset, &id.version)?;
+    let params = Q::normalize_params(wants.params());
+    let request = parse(&params, service.config().limits(), release)?;
+    let validator = etag(
+        release.digest(),
+        service.descriptor_digest(),
+        representation,
+    );
+    if wants.already_has(&validator) {
+        return not_modified(CachePolicy::Immutable, validator);
+    }
+
+    let target = Target::get(
+        id,
+        operation,
+        params,
+        release.prefixes().clone(),
+        release.declares(Capability::Search),
+    );
+    let opened = Arc::clone(&service);
+    let rendered = blocking(move || {
+        let store = opened.open(target.id())?;
+        execute(&store, target, &request, representation)
     })
     .await?;
 
@@ -1016,11 +1120,15 @@ impl Wants {
 
     /// The representation to answer with, or the negotiation failure.
     pub fn representation(&self) -> Result<Representation, Problem> {
-        negotiate(
-            self.params.get("format"),
-            self.accept.as_deref(),
-            Representation::ALL,
-        )
+        self.representation_from(Representation::ALL)
+    }
+
+    /// Negotiate from the representations one specialized resource offers.
+    pub fn representation_from(
+        &self,
+        offered: &[Representation],
+    ) -> Result<Representation, Problem> {
+        negotiate(self.params.get("format"), self.accept.as_deref(), offered)
     }
 }
 
@@ -1094,6 +1202,9 @@ fn respond(
     let body = match representation {
         Representation::Json => resource.to_json(),
         Representation::Html => bytes::Bytes::from(resource.to_html()),
+        Representation::Turtle | Representation::JsonLd | Representation::Markdown => {
+            unreachable!("Resource responses negotiate only JSON and HTML")
+        }
     };
     finish(
         StatusCode::OK,
@@ -1247,6 +1358,9 @@ async fn render_problems(request: Request, next: Next) -> Response {
             Representation::Html.content_type(),
             bytes::Bytes::from(problem.to_html()),
         ),
+        Representation::Turtle | Representation::JsonLd | Representation::Markdown => {
+            unreachable!("problem negotiation resolves to JSON or HTML")
+        }
     };
 
     *response.body_mut() = Body::from(body);

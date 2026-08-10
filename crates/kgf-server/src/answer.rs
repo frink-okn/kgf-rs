@@ -40,19 +40,24 @@
 //! answer legitimately resumes at predicate 37.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 
 use bytes::Bytes;
 use maud::html;
+use oxrdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term as RdfTerm, Triple};
 use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
 
-use hdtc::format::{TextScanPosition, TextSearcher};
+use hdtc::format::{TextScanPosition, TextSearcher, XSD_STRING, parse_literal};
 use kgf_store::catalog::BundleId;
 use kgf_store::dict::Dictionary;
 use kgf_store::pattern::{IdPattern, Selection};
-use kgf_store::{IdTriple, Role, Store, TermId};
+use kgf_store::{
+    ClassRelationStop, IdTriple, Role, SchemaCollection, SchemaCounts as StoreSchemaCounts,
+    SchemaNode as StoreSchemaNode, SchemaNodeKind, StatsView, Store, TermId,
+};
 
 use crate::cursor::{Cursor, CursorBinding, PositionSpace, StaleCursor};
 use crate::envelope::{
@@ -60,12 +65,13 @@ use crate::envelope::{
 };
 use crate::forms;
 use crate::html::{
-    Crumb, Resource, TermText, Value, fields, json_body, note, operation_page, page, results_table,
+    Crumb, Resource, TermText, Value, fields, json_body, note, operation_page,
+    operation_page_with_format, page, results_table,
 };
 use crate::representation::Representation;
 use crate::request::{
     self, BindingPattern, BindingRow, BoundTerm, Candidates, Direction, Pattern, Position,
-    ResponseBytes, TextFilter,
+    ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter,
 };
 use crate::term::{LiteralKind, PrefixMap, Term, TermCache};
 use crate::url::{self, Params};
@@ -206,6 +212,7 @@ impl Target {
             "describe" => "Describe",
             "sample" => "Sample",
             "search" => "Search",
+            "schema" => "Schema",
             "labels" => "Labels",
             operation => operation,
         }
@@ -533,10 +540,7 @@ pub struct Answer {
 
 impl Renders for Answer {
     fn render(self, representation: Representation) -> Rendered {
-        let body = match representation {
-            Representation::Json => self.to_json(),
-            Representation::Html => Bytes::from(self.to_html()),
-        };
+        let body = standard_body(&self, representation);
         Rendered {
             body,
             completeness: self.completeness,
@@ -643,10 +647,7 @@ pub struct CountAnswer {
 
 impl Renders for CountAnswer {
     fn render(self, representation: Representation) -> Rendered {
-        let body = match representation {
-            Representation::Json => self.to_json(),
-            Representation::Html => Bytes::from(self.to_html()),
-        };
+        let body = standard_body(&self, representation);
         Rendered {
             body,
             completeness: self.completeness,
@@ -819,10 +820,7 @@ pub struct SearchAnswer {
 
 impl Renders for SearchAnswer {
     fn render(self, representation: Representation) -> Rendered {
-        let body = match representation {
-            Representation::Json => self.to_json(),
-            Representation::Html => Bytes::from(self.to_html()),
-        };
+        let body = standard_body(&self, representation);
         Rendered {
             body,
             completeness: self.completeness,
@@ -879,10 +877,7 @@ pub struct LabelsAnswer {
 
 impl Renders for LabelsAnswer {
     fn render(self, representation: Representation) -> Rendered {
-        let body = match representation {
-            Representation::Json => self.to_json(),
-            Representation::Html => Bytes::from(self.to_html()),
-        };
+        let body = standard_body(&self, representation);
         Rendered {
             body,
             completeness: self.completeness,
@@ -892,10 +887,7 @@ impl Renders for LabelsAnswer {
 
 impl Renders for BindingCountAnswer {
     fn render(self, representation: Representation) -> Rendered {
-        let body = match representation {
-            Representation::Json => self.to_json(),
-            Representation::Html => Bytes::from(self.to_html()),
-        };
+        let body = standard_body(&self, representation);
         Rendered {
             body,
             completeness: self.completeness,
@@ -904,8 +896,1085 @@ impl Renders for BindingCountAnswer {
 }
 
 // ---------------------------------------------------------------------------
+// Schema responses
+// ---------------------------------------------------------------------------
+
+/// One materialized term from the description graph.
+///
+/// It stays in dictionary spelling until `Serialize`, exactly like an ordinary
+/// result row, but is wrapped separately because schema nodes are not triples
+/// over the primary data dictionary.
+#[derive(Debug)]
+struct SchemaTerm(Rc<str>);
+
+impl Serialize for SchemaTerm {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Term::from_dictionary(&self.0).serialize(serializer)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SchemaCounts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entities: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    triples: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    distinct_subjects: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    distinct_objects: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    properties: Option<u64>,
+}
+
+impl From<StoreSchemaCounts> for SchemaCounts {
+    fn from(counts: StoreSchemaCounts) -> Self {
+        Self {
+            entities: counts.entities,
+            triples: counts.triples,
+            distinct_subjects: counts.distinct_subjects,
+            distinct_objects: counts.distinct_objects,
+            properties: counts.properties,
+        }
+    }
+}
+
+/// One selected or shallow child partition in the wire projection.
+#[derive(Debug, Serialize)]
+struct SchemaResource {
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    term: Option<SchemaTerm>,
+    counts: SchemaCounts,
+    links: BTreeMap<&'static str, String>,
+    /// Exact compact-JSON bytes for independent response-budget accounting.
+    #[serde(skip)]
+    serialized: u64,
+}
+
+/// The semantic path that selected a node, independent of its opaque VoID
+/// subject. A property or datatype term alone does not reveal whether its
+/// counts are dataset-wide or scoped beneath one class.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum SchemaSelectorResource {
+    Dataset,
+    Class {
+        class: SchemaTerm,
+    },
+    Property {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        class: Option<SchemaTerm>,
+        predicate: SchemaTerm,
+    },
+    Datatype {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        class: Option<SchemaTerm>,
+        predicate: SchemaTerm,
+        datatype: SchemaTerm,
+    },
+}
+
+impl SchemaSelectorResource {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Dataset => "dataset",
+            Self::Class { .. } => "class",
+            Self::Property { .. } => "property",
+            Self::Datatype { .. } => "datatype",
+        }
+    }
+
+    fn class(&self) -> Option<&SchemaTerm> {
+        match self {
+            Self::Dataset => None,
+            Self::Class { class } => Some(class),
+            Self::Property { class, .. } | Self::Datatype { class, .. } => class.as_ref(),
+        }
+    }
+
+    fn predicate(&self) -> Option<&SchemaTerm> {
+        match self {
+            Self::Dataset | Self::Class { .. } => None,
+            Self::Property { predicate, .. } | Self::Datatype { predicate, .. } => Some(predicate),
+        }
+    }
+
+    fn datatype(&self) -> Option<&SchemaTerm> {
+        match self {
+            Self::Datatype { datatype, .. } => Some(datatype),
+            Self::Dataset | Self::Class { .. } | Self::Property { .. } => None,
+        }
+    }
+}
+
+impl SchemaResource {
+    fn finish_size(mut self) -> Self {
+        // Schema pages are capped at a much smaller width than triple pages,
+        // and every item has distinct links. Serializing each item once to
+        // weigh it is exact and bounded without a second hand-written encoding
+        // of this richer object shape.
+        self.serialized = serde_json::to_vec(&self)
+            .expect("a schema resource contains only serializable values")
+            .len() as u64;
+        self
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ClassRelationResource {
+    subject_class: SchemaTerm,
+    predicate: SchemaTerm,
+    object_class: SchemaTerm,
+    triples: u64,
+    #[serde(skip)]
+    serialized: u64,
+}
+
+impl ClassRelationResource {
+    fn new(subject_class: &str, predicate: &str, object_class: &str, triples: u64) -> Self {
+        let mut resource = Self {
+            subject_class: SchemaTerm(Rc::from(subject_class)),
+            predicate: SchemaTerm(Rc::from(predicate)),
+            object_class: SchemaTerm(Rc::from(object_class)),
+            triples,
+            serialized: 0,
+        };
+        resource.serialized = serde_json::to_vec(&resource)
+            .expect("a class relation contains only serializable values")
+            .len() as u64;
+        resource
+    }
+}
+
+/// The node-navigation shape of `GET /schema`.
+#[derive(Debug, Serialize)]
+pub struct SchemaNavigationAnswer {
+    dataset: String,
+    version: String,
+    view: String,
+    selector: SchemaSelectorResource,
+    node: Option<SchemaResource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collection: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    items: Option<Vec<SchemaResource>>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+}
+
+/// The flat observed-class-relation shape of `GET /schema`.
+#[derive(Debug, Serialize)]
+pub struct SchemaRelationsAnswer {
+    dataset: String,
+    version: String,
+    view: String,
+    projection: &'static str,
+    items: Vec<ClassRelationResource>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+}
+
+/// Either response shape selected by one typed `/schema` request.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum SchemaAnswer {
+    /// One node and optionally one shallow child collection.
+    Navigation(SchemaNavigationAnswer),
+    /// The count-ranked flat class-relation projection.
+    Relations(SchemaRelationsAnswer),
+}
+
+impl SchemaAnswer {
+    fn completeness(&self) -> &Completeness {
+        match self {
+            Self::Navigation(answer) => &answer.completeness,
+            Self::Relations(answer) => &answer.completeness,
+        }
+    }
+}
+
+impl Renders for SchemaAnswer {
+    fn render(self, representation: Representation) -> Rendered {
+        let completeness = self.completeness().clone();
+        let body = standard_body(&self, representation);
+        Rendered { body, completeness }
+    }
+}
+
+fn standard_body(resource: &impl Resource, representation: Representation) -> Bytes {
+    match representation {
+        Representation::Json => resource.to_json(),
+        Representation::Html => Bytes::from(resource.to_html()),
+        Representation::Turtle | Representation::JsonLd | Representation::Markdown => {
+            unreachable!("ordinary operations negotiate only JSON and HTML")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Static description responses
+// ---------------------------------------------------------------------------
+
+/// Browser and machine forms of the same VoID graph.
+struct VoidResource {
+    jsonld: Bytes,
+    turtle: Bytes,
+    triples: u64,
+    completeness: Completeness,
+    target: Target,
+}
+
+impl Resource for VoidResource {
+    fn to_json(&self) -> Bytes {
+        self.jsonld.clone()
+    }
+
+    fn to_html(&self) -> String {
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        let turtle = String::from_utf8_lossy(&self.turtle);
+        operation_page_with_format(
+            "VoID dataset description",
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            Representation::JsonLd,
+            html! {
+                div."answer-summary" {
+                    (fields(&[
+                        ("triples", Value::Number(self.triples)),
+                        ("complete", Value::Text(completeness_text(&self.completeness))),
+                    ]))
+                }
+                section."section-block" {
+                    h2 { "Turtle" }
+                    p { "This is the N-Triples subset of Turtle, serialized from the published VoID HDT." }
+                    pre { code { (turtle) } }
+                }
+            },
+        )
+    }
+}
+
+/// Exact persisted summary bytes and their browser rendering.
+struct SummaryResource {
+    json: Bytes,
+    markdown: String,
+    target: Target,
+}
+
+impl Resource for SummaryResource {
+    fn to_json(&self) -> Bytes {
+        self.json.clone()
+    }
+
+    fn to_html(&self) -> String {
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        operation_page(
+            "Dataset summary",
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                section."section-block" {
+                    h2 { "Published summary card" }
+                    pre { (self.markdown) }
+                }
+            },
+        )
+    }
+}
+
+/// Serialize `/void` directly from the mapped VoID HDT.
+pub fn void(
+    store: &Store,
+    target: Target,
+    request: &request::Void,
+    representation: Representation,
+) -> Result<Rendered, Problem> {
+    let description = store.description().ok_or_else(description_not_built)?;
+    let selection = description
+        .void_triples()
+        .map_err(|error| unreadable("reading the VoID graph", &error))?;
+    let total = selection.count().value;
+    let dictionary = description.dict();
+
+    let (body, emitted, complete) = match representation {
+        Representation::Turtle => {
+            let (body, emitted) = serialize_turtle(&selection, dictionary, request.bytes.0)?;
+            (body, emitted, emitted == total)
+        }
+        Representation::JsonLd => {
+            let (body, emitted) = serialize_jsonld(&selection, dictionary, request.bytes.0)?;
+            (body, emitted, emitted == total)
+        }
+        Representation::Html => {
+            let (turtle, turtle_triples) =
+                serialize_turtle(&selection, dictionary, request.bytes.0)?;
+            let (jsonld, _) = serialize_jsonld(&selection, dictionary, request.bytes.0)?;
+            let complete = turtle_triples == total;
+            let completeness = void_completeness(complete);
+            let resource = VoidResource {
+                jsonld,
+                turtle,
+                triples: turtle_triples,
+                completeness: completeness.clone(),
+                target,
+            };
+            return Ok(Rendered {
+                body: Bytes::from(resource.to_html()),
+                completeness,
+            });
+        }
+        Representation::Json | Representation::Markdown => {
+            unreachable!("/void negotiation does not offer this representation")
+        }
+    };
+
+    Ok(Rendered {
+        body,
+        completeness: void_completeness(complete && emitted == total),
+    })
+}
+
+/// Serve `/summary` from the exact persisted JSON or Markdown document.
+pub fn summary(
+    store: &Store,
+    target: Target,
+    _request: &request::Summary,
+    representation: Representation,
+) -> Result<Rendered, Problem> {
+    let description = store.description().ok_or_else(description_not_built)?;
+    let json = Bytes::copy_from_slice(description.summary_json());
+    let markdown = description
+        .summary_markdown()
+        .map_err(|error| unreadable("reading the summary card", &error))?
+        .to_owned();
+    let resource = SummaryResource {
+        json,
+        markdown,
+        target,
+    };
+    let body = match representation {
+        Representation::Json => resource.to_json(),
+        Representation::Markdown => Bytes::copy_from_slice(resource.markdown.as_bytes()),
+        Representation::Html => Bytes::from(resource.to_html()),
+        Representation::Turtle | Representation::JsonLd => {
+            unreachable!("/summary negotiation does not offer RDF representations")
+        }
+    };
+    Ok(Rendered {
+        body,
+        completeness: Completeness::complete(),
+    })
+}
+
+fn description_not_built() -> Problem {
+    Problem::new(
+        ErrorCode::CapabilityNotAvailable,
+        "this bundle does not carry the complete tier-1 description artifact set",
+    )
+}
+
+fn void_completeness(complete: bool) -> Completeness {
+    if complete {
+        Completeness::complete()
+    } else {
+        Completeness::budget_exhausted_without_resume(BudgetReason::ResponseBytes)
+    }
+}
+
+fn serialize_turtle(
+    selection: &Selection<'_>,
+    dictionary: Dictionary<'_>,
+    byte_limit: u64,
+) -> Result<(Bytes, u64), Problem> {
+    let mut body = Vec::new();
+    let mut emitted = 0u64;
+    for ids in selection.page(0, usize::MAX) {
+        let triple = rdf_triple(dictionary, ids)?;
+        let line = format!("{triple} .\n");
+        if (body.len() as u64).saturating_add(line.len() as u64) > byte_limit {
+            break;
+        }
+        body.extend_from_slice(line.as_bytes());
+        emitted += 1;
+    }
+    Ok((Bytes::from(body), emitted))
+}
+
+fn serialize_jsonld(
+    selection: &Selection<'_>,
+    dictionary: Dictionary<'_>,
+    byte_limit: u64,
+) -> Result<(Bytes, u64), Problem> {
+    // Expanded JSON-LD: one node object per statement. Repeated @id objects
+    // merge under JSON-LD's RDF interpretation, while keeping each statement
+    // independently budgetable and avoiding a schema-sized grouping map.
+    // `[]` is the smallest valid JSON-LD document. Like an oversized legal
+    // result row elsewhere, this two-byte container is allowed through even
+    // if an operator configured an unusably smaller byte budget; syntax must
+    // not become invalid merely to save one byte.
+    let mut body = b"[".to_vec();
+    let mut emitted = 0u64;
+    for ids in selection.page(0, usize::MAX) {
+        let triple = rdf_triple(dictionary, ids)?;
+        let item = serde_json::to_vec(&jsonld_statement(&triple))
+            .expect("a JSON-LD statement contains only JSON values");
+        let separator = usize::from(emitted != 0); // `,`
+        let closing = 1; // `]`
+        let next = body
+            .len()
+            .saturating_add(separator)
+            .saturating_add(item.len())
+            .saturating_add(closing);
+        if next as u64 > byte_limit {
+            break;
+        }
+        if emitted > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(&item);
+        emitted += 1;
+    }
+    body.push(b']');
+    Ok((Bytes::from(body), emitted))
+}
+
+fn rdf_triple(dictionary: Dictionary<'_>, ids: IdTriple) -> Result<Triple, Problem> {
+    let mut buffer = Vec::new();
+    let subject = dictionary
+        .extract(Role::Subject, TermId(ids.subject), &mut buffer)
+        .map_err(|error| unreadable("materializing a VoID subject", &error))?;
+    let subject = rdf_subject(subject)?;
+
+    let predicate = dictionary
+        .extract(Role::Predicate, TermId(ids.predicate), &mut buffer)
+        .map_err(|error| unreadable("materializing a VoID predicate", &error))?;
+    let predicate = NamedNode::new(rdf_text(predicate)?)
+        .map_err(|error| unreadable("parsing a VoID predicate IRI", &error))?;
+
+    let object = dictionary
+        .extract(Role::Object, TermId(ids.object), &mut buffer)
+        .map_err(|error| unreadable("materializing a VoID object", &error))?;
+    let object = rdf_object(object)?;
+    Ok(Triple::new(subject, predicate, object))
+}
+
+fn rdf_subject(term: &[u8]) -> Result<NamedOrBlankNode, Problem> {
+    let text = rdf_text(term)?;
+    if let Some(identifier) = text.strip_prefix("_:") {
+        return BlankNode::new(identifier)
+            .map(Into::into)
+            .map_err(|error| unreadable("parsing a VoID blank-node subject", &error));
+    }
+    NamedNode::new(text)
+        .map(Into::into)
+        .map_err(|error| unreadable("parsing a VoID subject IRI", &error))
+}
+
+fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
+    if let Some(literal) = parse_literal(term) {
+        let value = rdf_text(literal.value)?.to_owned();
+        if let Some(language) = literal.language {
+            return Literal::new_language_tagged_literal(value, rdf_text(language)?)
+                .map(Into::into)
+                .map_err(|error| unreadable("parsing a VoID literal language", &error));
+        }
+        if let Some(datatype) = literal.datatype {
+            let datatype = NamedNode::new(rdf_text(datatype)?)
+                .map_err(|error| unreadable("parsing a VoID literal datatype", &error))?;
+            return Ok(Literal::new_typed_literal(value, datatype).into());
+        }
+        return Ok(Literal::new_simple_literal(value).into());
+    }
+    let text = rdf_text(term)?;
+    if let Some(identifier) = text.strip_prefix("_:") {
+        return BlankNode::new(identifier)
+            .map(Into::into)
+            .map_err(|error| unreadable("parsing a VoID blank-node object", &error));
+    }
+    NamedNode::new(text)
+        .map(Into::into)
+        .map_err(|error| unreadable("parsing a VoID object IRI", &error))
+}
+
+fn rdf_text(bytes: &[u8]) -> Result<&str, Problem> {
+    std::str::from_utf8(bytes).map_err(|error| unreadable("reading a VoID RDF term", &error))
+}
+
+fn jsonld_statement(triple: &Triple) -> serde_json::Value {
+    let subject = match &triple.subject {
+        NamedOrBlankNode::NamedNode(node) => node.as_str().to_owned(),
+        NamedOrBlankNode::BlankNode(node) => format!("_:{}", node.as_str()),
+    };
+    let object = match &triple.object {
+        RdfTerm::NamedNode(node) => serde_json::json!({"@id": node.as_str()}),
+        RdfTerm::BlankNode(node) => {
+            serde_json::json!({"@id": format!("_:{}", node.as_str())})
+        }
+        RdfTerm::Literal(literal) => {
+            let mut value = serde_json::Map::from_iter([(
+                "@value".to_owned(),
+                serde_json::Value::String(literal.value().to_owned()),
+            )]);
+            if let Some(language) = literal.language() {
+                value.insert(
+                    "@language".to_owned(),
+                    serde_json::Value::String(language.to_owned()),
+                );
+            } else if literal.datatype().as_str() != XSD_STRING {
+                value.insert(
+                    "@type".to_owned(),
+                    serde_json::Value::String(literal.datatype().as_str().to_owned()),
+                );
+            }
+            serde_json::Value::Object(value)
+        }
+    };
+    serde_json::json!({
+        "@id": subject,
+        triple.predicate.as_str(): [object]
+    })
+}
+
+// ---------------------------------------------------------------------------
 // The operations
 // ---------------------------------------------------------------------------
+
+/// `GET /schema` — one selected partition, one shallow edge, or the persisted
+/// flat class-relation projection (§3.4.10).
+pub fn schema(
+    store: &Store,
+    target: Target,
+    request: &request::Schema,
+) -> Result<SchemaAnswer, Problem> {
+    let description = store.description().ok_or_else(|| {
+        Problem::new(
+            ErrorCode::CapabilityNotAvailable,
+            "this bundle does not carry the complete tier-1 description artifact set needed by `/schema`",
+        )
+    })?;
+    let view = description
+        .view(&request.view)
+        .ok_or_else(|| match &request.view {
+            StatsView::Component(component) => Problem::new(
+                ErrorCode::NotFound,
+                format!(
+                    "this bundle has no description view for component `{}`",
+                    component.as_str()
+                ),
+            ),
+            StatsView::Design | StatsView::Queryable => {
+                tracing::error!(?request.view, "a tier-1 description is missing a required view");
+                Problem::new(
+                    ErrorCode::InternalError,
+                    "the bundle's description indexes are missing a required view",
+                )
+            }
+        })?;
+
+    match &request.query {
+        SchemaQuery::Node(selection) => {
+            let node = view
+                .schema_node(selection.store_selector())
+                .map_err(|error| unreadable("resolving a schema node", &error))?;
+            let mut cache = TermCache::new();
+            let node = node
+                .map(|node| {
+                    materialize_schema_node(
+                        &description.dict(),
+                        &mut cache,
+                        node,
+                        selected_node_links(selection, &request.view),
+                    )
+                })
+                .transpose()?;
+            Ok(SchemaAnswer::Navigation(SchemaNavigationAnswer {
+                dataset: target.id.dataset.clone(),
+                version: target.id.version.clone(),
+                view: schema_view_name(&request.view),
+                selector: selection_resource(selection),
+                node,
+                collection: None,
+                items: None,
+                completeness: Completeness::complete(),
+                target,
+            }))
+        }
+        SchemaQuery::Children(children) => {
+            schema_children(description, view, target, request, children)
+        }
+        SchemaQuery::ClassRelations(filter) => schema_relations(view, target, request, filter),
+    }
+}
+
+fn schema_children(
+    description: &kgf_store::DescriptionStore,
+    view: kgf_store::DescriptionView<'_>,
+    target: Target,
+    request: &request::Schema,
+    children: &SchemaChildren,
+) -> Result<SchemaAnswer, Problem> {
+    let from = request.cursor.as_ref().map_or(0, |cursor| cursor.position);
+    let limit = nonzero_schema_limit(request.limit.expect("children carry a page limit"));
+    let page = match view.schema_children(children.store_query(), from, limit) {
+        Ok(page) => page,
+        Err(kgf_store::Error::ResumePositionOutOfRange { .. }) if request.cursor.is_some() => {
+            return Err(Problem::from(StaleCursor));
+        }
+        Err(error) => return Err(unreadable("paging schema children", &error)),
+    };
+
+    let dictionary = description.dict();
+    let mut cache = TermCache::new();
+    let parent_links = selected_child_parent_links(children, &request.view);
+    let node = page
+        .node
+        .map(|node| materialize_schema_node(&dictionary, &mut cache, node, parent_links))
+        .transpose()?;
+
+    let mut items = Vec::with_capacity(page.items.len());
+    let mut spent = 0u64;
+    let mut byte_next = None;
+    for child in page.items {
+        let term = materialize_schema_term(&dictionary, &mut cache, child.node)?;
+        let links = child_links(children, &request.view, term.as_deref());
+        let resource = schema_resource(child.node, term, links);
+        let next_spent = spent.saturating_add(resource.serialized);
+        // As for triple pages, always let one item through: otherwise one legal
+        // term larger than the whole budget produces a cursor that never moves.
+        if next_spent > request.bytes.0 && !items.is_empty() {
+            byte_next = Some(child.position);
+            break;
+        }
+        spent = next_spent;
+        items.push(resource);
+    }
+
+    // If the first item alone crossed the byte budget, it was included to make
+    // progress. More data still means bytes, rather than the coincident row
+    // limit, are what prevented the next item from being attempted.
+    if byte_next.is_none() && spent > request.bytes.0 {
+        byte_next = page.next;
+    }
+    let completeness = match byte_next {
+        Some(position) => Completeness::budget_exhausted(
+            BudgetReason::ResponseBytes,
+            Cursor::at_schema_child(&request.binding, position).encode(),
+        ),
+        None => match page.next {
+            Some(position) => Completeness::page_limit(
+                Cursor::at_schema_child(&request.binding, position).encode(),
+            ),
+            None => Completeness::complete(),
+        },
+    };
+
+    Ok(SchemaAnswer::Navigation(SchemaNavigationAnswer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        view: schema_view_name(&request.view),
+        selector: child_parent_selection_resource(children),
+        node,
+        collection: Some(schema_collection_name(page.collection)),
+        items: Some(items),
+        completeness,
+        target,
+    }))
+}
+
+fn schema_relations(
+    view: kgf_store::DescriptionView<'_>,
+    target: Target,
+    request: &request::Schema,
+    filter: &request::SchemaRelationFilter,
+) -> Result<SchemaAnswer, Problem> {
+    let from = match request.cursor.as_ref() {
+        None => None,
+        Some(cursor) => Some(
+            view.class_relation_position(cursor.position)
+                .ok_or_else(|| Problem::from(StaleCursor))?,
+        ),
+    };
+    let limit = nonzero_schema_limit(request.limit.expect("relations carry a page limit"));
+    let scan_limit = NonZeroUsize::new(request.candidates.ceiling())
+        .expect("validated configuration has a nonzero candidate budget");
+    let page = view
+        .class_relations(filter.store_filter(), from, limit, scan_limit)
+        .map_err(|error| unreadable("paging schema class relations", &error))?;
+
+    let mut items = Vec::with_capacity(page.items.len());
+    let mut spent = 0u64;
+    let mut byte_next = None;
+    for item in page.items {
+        let relation = item.relation;
+        let resource = ClassRelationResource::new(
+            relation.subject_class,
+            relation.predicate,
+            relation.object_class,
+            relation.triples,
+        );
+        let next_spent = spent.saturating_add(resource.serialized);
+        if next_spent > request.bytes.0 && !items.is_empty() {
+            byte_next = Some(item.position.byte_offset());
+            break;
+        }
+        spent = next_spent;
+        items.push(resource);
+    }
+
+    if byte_next.is_none() && spent > request.bytes.0 {
+        byte_next = page.next.map(|position| position.byte_offset());
+    }
+    let completeness = match byte_next {
+        Some(position) => Completeness::budget_exhausted(
+            BudgetReason::ResponseBytes,
+            Cursor::at_class_relation(&request.binding, position).encode(),
+        ),
+        None => match page.stop {
+            ClassRelationStop::Complete => Completeness::complete(),
+            ClassRelationStop::RowLimit => Completeness::page_limit(
+                Cursor::at_class_relation(
+                    &request.binding,
+                    page.next
+                        .expect("a row-limited relation page has a continuation")
+                        .byte_offset(),
+                )
+                .encode(),
+            ),
+            ClassRelationStop::ScanLimit => Completeness::budget_exhausted(
+                BudgetReason::Candidate,
+                Cursor::at_class_relation(
+                    &request.binding,
+                    page.next
+                        .expect("a scan-limited relation page has a continuation")
+                        .byte_offset(),
+                )
+                .encode(),
+            ),
+        },
+    };
+
+    Ok(SchemaAnswer::Relations(SchemaRelationsAnswer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        view: schema_view_name(&request.view),
+        projection: "class-relations",
+        items,
+        completeness,
+        target,
+    }))
+}
+
+fn nonzero_schema_limit(limit: u32) -> NonZeroUsize {
+    NonZeroUsize::new(limit as usize).expect("request parsing refuses a zero schema limit")
+}
+
+fn materialize_schema_node(
+    dictionary: &Dictionary<'_>,
+    cache: &mut TermCache,
+    node: StoreSchemaNode,
+    links: BTreeMap<&'static str, String>,
+) -> Result<SchemaResource, Problem> {
+    let term = materialize_schema_term(dictionary, cache, node)?;
+    Ok(schema_resource(node, term, links))
+}
+
+fn materialize_schema_term(
+    dictionary: &Dictionary<'_>,
+    cache: &mut TermCache,
+    node: StoreSchemaNode,
+) -> Result<Option<Rc<str>>, Problem> {
+    node.term()
+        .map(|term| {
+            cache
+                .resolve(dictionary, Role::Object, term)
+                .map_err(|error| unreadable("materializing a schema term", &error))
+        })
+        .transpose()
+}
+
+fn schema_resource(
+    node: StoreSchemaNode,
+    term: Option<Rc<str>>,
+    links: BTreeMap<&'static str, String>,
+) -> SchemaResource {
+    SchemaResource {
+        kind: schema_kind_name(node.kind()),
+        term: term.map(SchemaTerm),
+        counts: node.counts().into(),
+        links,
+        serialized: 0,
+    }
+    .finish_size()
+}
+
+fn schema_kind_name(kind: SchemaNodeKind) -> &'static str {
+    match kind {
+        SchemaNodeKind::Dataset => "dataset",
+        SchemaNodeKind::Class => "class",
+        SchemaNodeKind::Property => "property",
+        SchemaNodeKind::ObjectClass => "object-class",
+        SchemaNodeKind::Datatype => "datatype",
+        SchemaNodeKind::Language => "language",
+    }
+}
+
+fn schema_collection_name(collection: SchemaCollection) -> &'static str {
+    match collection {
+        SchemaCollection::Classes => "classes",
+        SchemaCollection::Properties => "properties",
+        SchemaCollection::ObjectClasses => "object-classes",
+        SchemaCollection::Datatypes => "datatypes",
+        SchemaCollection::Languages => "languages",
+    }
+}
+
+fn selection_resource(selection: &SchemaSelection) -> SchemaSelectorResource {
+    match selection {
+        SchemaSelection::Dataset => SchemaSelectorResource::Dataset,
+        SchemaSelection::Class { class } => SchemaSelectorResource::Class {
+            class: selector_term(class),
+        },
+        SchemaSelection::Property { class, predicate } => SchemaSelectorResource::Property {
+            class: class.as_ref().map(selector_term),
+            predicate: selector_term(predicate),
+        },
+        SchemaSelection::Datatype {
+            class,
+            predicate,
+            datatype,
+        } => SchemaSelectorResource::Datatype {
+            class: class.as_ref().map(selector_term),
+            predicate: selector_term(predicate),
+            datatype: selector_term(datatype),
+        },
+    }
+}
+
+fn child_parent_selection_resource(children: &SchemaChildren) -> SchemaSelectorResource {
+    match children {
+        SchemaChildren::Classes | SchemaChildren::DatasetProperties => {
+            SchemaSelectorResource::Dataset
+        }
+        SchemaChildren::ClassProperties { class } => SchemaSelectorResource::Class {
+            class: selector_term(class),
+        },
+        SchemaChildren::PropertyObjectClasses { class, predicate }
+        | SchemaChildren::PropertyDatatypes { class, predicate } => {
+            SchemaSelectorResource::Property {
+                class: class.as_ref().map(selector_term),
+                predicate: selector_term(predicate),
+            }
+        }
+        SchemaChildren::DatatypeLanguages {
+            class,
+            predicate,
+            datatype,
+        } => SchemaSelectorResource::Datatype {
+            class: class.as_ref().map(selector_term),
+            predicate: selector_term(predicate),
+            datatype: selector_term(datatype),
+        },
+    }
+}
+
+fn selector_term(bound: &BoundTerm) -> SchemaTerm {
+    SchemaTerm(Rc::from(bound.dictionary()))
+}
+
+fn schema_view_name(view: &StatsView) -> String {
+    match view {
+        StatsView::Design => "design".to_owned(),
+        StatsView::Queryable => "queryable".to_owned(),
+        StatsView::Component(component) => format!("component:{}", component.as_str()),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SchemaLinkKind {
+    Dataset,
+    Class,
+    Property,
+    Datatype,
+    Leaf,
+}
+
+fn view_params(view: &StatsView) -> Params {
+    Params::default().with("view", &schema_view_name(view))
+}
+
+fn selected_node_links(
+    selection: &SchemaSelection,
+    view: &StatsView,
+) -> BTreeMap<&'static str, String> {
+    let (params, kind) = selection_params(selection, view);
+    schema_links(&params, kind, false)
+}
+
+fn selected_child_parent_links(
+    children: &SchemaChildren,
+    view: &StatsView,
+) -> BTreeMap<&'static str, String> {
+    let (params, kind) = child_parent_params(children, view);
+    schema_links(&params, kind, false)
+}
+
+fn selection_params(selection: &SchemaSelection, view: &StatsView) -> (Params, SchemaLinkKind) {
+    let params = view_params(view);
+    match selection {
+        SchemaSelection::Dataset => (params, SchemaLinkKind::Dataset),
+        SchemaSelection::Class { class } => (
+            params.with("class", class.requested()),
+            SchemaLinkKind::Class,
+        ),
+        SchemaSelection::Property { class, predicate } => (
+            with_optional_param(&params, "class", class.as_ref().map(BoundTerm::requested))
+                .with("predicate", predicate.requested()),
+            SchemaLinkKind::Property,
+        ),
+        SchemaSelection::Datatype {
+            class,
+            predicate,
+            datatype,
+        } => (
+            with_optional_param(&params, "class", class.as_ref().map(BoundTerm::requested))
+                .with("predicate", predicate.requested())
+                .with("datatype", datatype.requested()),
+            SchemaLinkKind::Datatype,
+        ),
+    }
+}
+
+fn child_parent_params(children: &SchemaChildren, view: &StatsView) -> (Params, SchemaLinkKind) {
+    let params = view_params(view);
+    match children {
+        SchemaChildren::Classes | SchemaChildren::DatasetProperties => {
+            (params, SchemaLinkKind::Dataset)
+        }
+        SchemaChildren::ClassProperties { class } => (
+            params.with("class", class.requested()),
+            SchemaLinkKind::Class,
+        ),
+        SchemaChildren::PropertyObjectClasses { class, predicate }
+        | SchemaChildren::PropertyDatatypes { class, predicate } => (
+            with_optional_param(&params, "class", class.as_ref().map(BoundTerm::requested))
+                .with("predicate", predicate.requested()),
+            SchemaLinkKind::Property,
+        ),
+        SchemaChildren::DatatypeLanguages {
+            class,
+            predicate,
+            datatype,
+        } => (
+            with_optional_param(&params, "class", class.as_ref().map(BoundTerm::requested))
+                .with("predicate", predicate.requested())
+                .with("datatype", datatype.requested()),
+            SchemaLinkKind::Datatype,
+        ),
+    }
+}
+
+fn child_links(
+    children: &SchemaChildren,
+    view: &StatsView,
+    term: Option<&str>,
+) -> BTreeMap<&'static str, String> {
+    let Some(term) = term else {
+        return BTreeMap::new();
+    };
+    let requested = Term::from_dictionary(term).to_request();
+    let params = view_params(view);
+    let (params, kind) = match children {
+        SchemaChildren::Classes => (params.with("class", &requested), SchemaLinkKind::Class),
+        SchemaChildren::DatasetProperties => (
+            params.with("predicate", &requested),
+            SchemaLinkKind::Property,
+        ),
+        SchemaChildren::ClassProperties { class } => (
+            params
+                .with("class", class.requested())
+                .with("predicate", &requested),
+            SchemaLinkKind::Property,
+        ),
+        SchemaChildren::PropertyObjectClasses { .. } | SchemaChildren::DatatypeLanguages { .. } => {
+            (params, SchemaLinkKind::Leaf)
+        }
+        SchemaChildren::PropertyDatatypes { class, predicate } => (
+            with_optional_param(&params, "class", class.as_ref().map(BoundTerm::requested))
+                .with("predicate", predicate.requested())
+                .with("datatype", &requested),
+            SchemaLinkKind::Datatype,
+        ),
+    };
+    schema_links(&params, kind, !matches!(kind, SchemaLinkKind::Leaf))
+}
+
+fn schema_links(
+    params: &Params,
+    kind: SchemaLinkKind,
+    include_self: bool,
+) -> BTreeMap<&'static str, String> {
+    let mut links = BTreeMap::new();
+    if include_self {
+        links.insert("self", relative_schema_link(params));
+    }
+    match kind {
+        SchemaLinkKind::Dataset => {
+            links.insert(
+                "classes",
+                relative_schema_link(&params.with("children", "classes")),
+            );
+            links.insert(
+                "properties",
+                relative_schema_link(&params.with("children", "properties")),
+            );
+            links.insert(
+                "class-relations",
+                relative_schema_link(&params.with("projection", "class-relations")),
+            );
+        }
+        SchemaLinkKind::Class => {
+            links.insert(
+                "properties",
+                relative_schema_link(&params.with("children", "properties")),
+            );
+        }
+        SchemaLinkKind::Property => {
+            links.insert(
+                "object-classes",
+                relative_schema_link(&params.with("children", "object-classes")),
+            );
+            links.insert(
+                "datatypes",
+                relative_schema_link(&params.with("children", "datatypes")),
+            );
+        }
+        SchemaLinkKind::Datatype => {
+            links.insert(
+                "languages",
+                relative_schema_link(&params.with("children", "languages")),
+            );
+        }
+        SchemaLinkKind::Leaf => {}
+    }
+    links
+}
+
+fn relative_schema_link(params: &Params) -> String {
+    format!("?{}", params.to_query())
+}
+
+fn with_optional_param(params: &Params, name: &str, value: Option<&str>) -> Params {
+    value.map_or_else(|| params.clone(), |value| params.with(name, value))
+}
 
 /// `GET /fragment` — enumerate a triple pattern (§3.4.1).
 pub fn fragment(
@@ -2524,6 +3593,235 @@ impl SplitMix64 {
 // Pages
 // ---------------------------------------------------------------------------
 
+impl Resource for SchemaAnswer {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        match self {
+            Self::Navigation(answer) => answer.to_html(),
+            Self::Relations(answer) => answer.to_html(),
+        }
+    }
+}
+
+impl SchemaNavigationAnswer {
+    fn to_html(&self) -> String {
+        let item_terms: Vec<_> = self
+            .items
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|item| schema_resource_cell(&self.target, item))
+            .collect();
+        let rows: Vec<Vec<Value<'_>>> = self
+            .items
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .zip(&item_terms)
+            .map(|(item, term)| {
+                vec![
+                    Value::Text(item.kind),
+                    term.value(),
+                    optional_number(item.counts.entities),
+                    optional_number(item.counts.triples),
+                    optional_number(item.counts.distinct_subjects),
+                    optional_number(item.counts.distinct_objects),
+                    optional_number(item.counts.properties),
+                ]
+            })
+            .collect();
+        let node_term = self
+            .node
+            .as_ref()
+            .and_then(|node| node.term.as_ref())
+            .map(|term| schema_cell(&self.target, term, None));
+        let selector_class = self
+            .selector
+            .class()
+            .map(|term| schema_cell(&self.target, term, None));
+        let selector_predicate = self
+            .selector
+            .predicate()
+            .map(|term| schema_cell(&self.target, term, None));
+        let selector_datatype = self
+            .selector
+            .datatype()
+            .map(|term| schema_cell(&self.target, term, None));
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        let returned = self.items.as_ref().map_or(0, |items| items.len()) as u64;
+        operation_page(
+            "Schema",
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" {
+                    (fields(&[
+                        ("view", Value::Code(&self.view)),
+                        ("selector", Value::Code(self.selector.kind())),
+                        ("class scope", selector_class.as_ref().map_or(Value::Absent, Cell::value)),
+                        ("predicate", selector_predicate.as_ref().map_or(Value::Absent, Cell::value)),
+                        ("datatype", selector_datatype.as_ref().map_or(Value::Absent, Cell::value)),
+                        ("collection", self.collection.map_or(Value::Absent, Value::Text)),
+                        ("returned", self.items.as_ref().map_or(Value::Absent, |_| Value::Number(returned))),
+                        ("complete", Value::Text(completeness_text(&self.completeness))),
+                    ]))
+                }
+                section."section-block" {
+                    h2 { "Selected node" }
+                    @if let Some(node) = &self.node {
+                        (fields(&[
+                            ("kind", Value::Text(node.kind)),
+                            ("term", node_term.as_ref().map_or(Value::Absent, Cell::value)),
+                            ("entities", optional_number(node.counts.entities)),
+                            ("triples", optional_number(node.counts.triples)),
+                            ("distinct subjects", optional_number(node.counts.distinct_subjects)),
+                            ("distinct objects", optional_number(node.counts.distinct_objects)),
+                            ("properties", optional_number(node.counts.properties)),
+                        ]))
+                        @if !node.links.is_empty() {
+                            nav aria-label="Schema drill-down" {
+                                ul {
+                                    @for (label, href) in &node.links {
+                                        li { a href=(href) { (label) } }
+                                    }
+                                }
+                            }
+                        }
+                    } @else {
+                        (note("The selected schema node is absent from this view."))
+                    }
+                }
+                @if let Some(collection) = self.collection {
+                    section."section-block" {
+                        h2 { (collection) }
+                        @if rows.is_empty() {
+                            (note("No child items."))
+                        } @else {
+                            (results_table(
+                                &["kind", "term", "entities", "triples", "distinct subjects", "distinct objects", "properties"],
+                                &rows,
+                            ))
+                        }
+                    }
+                }
+                @if let Some(token) = self.completeness.next_cursor() {
+                    @if let Some(next) = self.target.next(token) {
+                        p."pager" { a href=(next) { "Next page →" } }
+                    }
+                }
+            },
+        )
+    }
+}
+
+impl SchemaRelationsAnswer {
+    fn to_html(&self) -> String {
+        let terms: Vec<[Cell<'_>; 3]> = self
+            .items
+            .iter()
+            .map(|item| {
+                [
+                    relation_cell(&self.target, &self.view, "class", &item.subject_class),
+                    relation_cell(&self.target, &self.view, "predicate", &item.predicate),
+                    relation_cell(&self.target, &self.view, "class", &item.object_class),
+                ]
+            })
+            .collect();
+        let rows: Vec<Vec<Value<'_>>> = self
+            .items
+            .iter()
+            .zip(&terms)
+            .map(|(item, terms)| {
+                vec![
+                    terms[0].value(),
+                    terms[1].value(),
+                    terms[2].value(),
+                    Value::Number(item.triples),
+                ]
+            })
+            .collect();
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        operation_page(
+            "Class relations",
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" {
+                    (fields(&[
+                        ("view", Value::Code(&self.view)),
+                        ("projection", Value::Code(self.projection)),
+                        ("returned", Value::Number(self.items.len() as u64)),
+                        ("complete", Value::Text(completeness_text(&self.completeness))),
+                    ]))
+                }
+                section."section-block" {
+                    h2 { "Observed class relations" }
+                    @if rows.is_empty() {
+                        (note("No matching class relations."))
+                    } @else {
+                        (results_table(
+                            &["subject class", "predicate", "object class", "triples"],
+                            &rows,
+                        ))
+                    }
+                }
+                @if let Some(token) = self.completeness.next_cursor() {
+                    @if let Some(next) = self.target.next(token) {
+                        p."pager" { a href=(next) { "Next page →" } }
+                    }
+                }
+            },
+        )
+    }
+}
+
+fn optional_number(number: Option<u64>) -> Value<'static> {
+    number.map_or(Value::Absent, Value::Number)
+}
+
+fn schema_resource_cell<'a>(target: &Target, resource: &'a SchemaResource) -> Cell<'a> {
+    match &resource.term {
+        Some(term) => schema_cell(target, term, resource.links.get("self").cloned()),
+        None => Cell::text("(none)".to_owned()),
+    }
+}
+
+fn relation_cell<'a>(
+    target: &Target,
+    view: &str,
+    parameter: &str,
+    term: &'a SchemaTerm,
+) -> Cell<'a> {
+    let requested = Term::from_dictionary(&term.0).to_request();
+    let href = relative_schema_link(
+        &Params::default()
+            .with(parameter, &requested)
+            .with("view", view),
+    );
+    schema_cell(target, term, Some(href))
+}
+
+fn schema_cell<'a>(target: &Target, term: &'a SchemaTerm, href: Option<String>) -> Cell<'a> {
+    let (label, qualifier, full_iri) = Term::from_dictionary(&term.0)
+        .into_display(&target.prefixes)
+        .into_structured();
+    Cell {
+        label,
+        qualifier,
+        annotation: None,
+        href,
+        full_iri,
+        structured: true,
+    }
+}
+
 impl Resource for Answer {
     fn to_json(&self) -> Bytes {
         json_body(self)
@@ -3126,6 +4424,18 @@ impl<'a> Cell<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jsonld_blank_node_ids_have_exactly_one_prefix() {
+        let triple = Triple::new(
+            BlankNode::new("subject").unwrap(),
+            NamedNode::new("https://example.org/p").unwrap(),
+            BlankNode::new("object").unwrap(),
+        );
+        let value = jsonld_statement(&triple);
+        assert_eq!(value["@id"], "_:subject");
+        assert_eq!(value["https://example.org/p"][0]["@id"], "_:object");
+    }
 
     #[test]
     fn binding_cardinalities_cannot_overflow_the_wire_integer() {

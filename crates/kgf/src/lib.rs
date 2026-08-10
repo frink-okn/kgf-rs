@@ -13,5 +13,6 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod build;
 pub mod manifest;
 pub mod serve;

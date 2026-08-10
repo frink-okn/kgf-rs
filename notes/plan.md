@@ -17,9 +17,8 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–18 are complete: all of M1 plus `o.text`, bindings, entity search,
-live labels, and the browser workbench. Unit 19 is in progress on the mandatory
-description surface. Each completed unit
+Units 1–19 are complete: all of M1 plus `o.text`, bindings, entity search,
+live labels, the browser workbench, and the mandatory description surface. Each completed unit
 carries a **What landed** section written after the fact, which is where a unit's plan
 and its outcome are reconciled.
 
@@ -1194,7 +1193,7 @@ browser visual pass over the catalog, manifest workbench and live fragment
 results, with the phone breakpoint kept as a single-column collapse in the
 shared stylesheet.
 
-### 19. The description surface — mapped statistics and bounded navigation 🚧
+### 19. The description surface — mapped statistics and bounded navigation ✅
 
 The store-side foundation is implemented. One internal `IndexedHdt` now owns an
 HDT plus its bound permutation sidecar and serves both `data.hdt` and
@@ -1254,7 +1253,25 @@ filters, while excluding `limit` and representation. Node-only requests cannot
 carry a cursor, and a cursor in the wrong schema position space is stale before
 the bundle opens.
 
-*Verified so far by* a layered golden VoID fixture covering every valid child
+`GET /schema` now executes those requests and serves both JSON and HTML at the
+versioned and `latest` URLs. Node responses project only stated counts, omit the
+collection shape for a node-only request, and emit version-relative links for
+every valid next drill-down (including the root class-relation projection).
+Child pages materialize terms from the VoID dictionary only at the response
+edge. Class-relation pages retain the TSV's persisted count order and apply the
+candidate budget only to filtered scans. Unknown component views are `not_found`;
+well-formed absent selectors remain complete empty answers.
+
+The response-byte budget is independently resumable for both page shapes. Store
+items now carry the raw child offset or validated TSV row boundary at which they
+begin, so serialization can stop before an item without reconstructing a
+position from semantic rows. This matters for navigable object classes, where
+an omitted untyped bucket makes visible-item indexes differ from raw child
+offsets. Row-limit, candidate-limit, and byte-limit stops therefore all resume
+without loss or duplication, and decoded positions outside the selected view
+are rejected as stale cursors.
+
+*Verified by* a layered golden VoID fixture covering every valid child
 query, every node kind, design/queryable/component views, absent selectors,
 one-item cursor resumption, datatype and language terms, omission of an untyped
 target both interspersed and trailing across multiple pages without loss,
@@ -1264,10 +1281,49 @@ publication refusal for non-subject edge targets, unindexed children, repeated
 semantic terms, multiple untyped buckets, and malformed or ambiguous count
 facts; namespace union and coverage identities; malformed summary JSON and
 Markdown; exact static-byte access; and the existing mapped open-cost
-invariants.
+invariants. Cross-crate execution tests additionally cover the fixed JSON shape,
+authoritative links, HTML navigation, child and class-relation paging, filtered
+candidate interruption, byte-budget interruption and exact resumption in both
+position spaces, forged out-of-range relation cursors, absent component views,
+and the real HTTP route through versioned and `latest` URLs with immutable cache
+and completeness headers.
 
-Still to land in this unit: JSON/HTML `/schema`, RDF `/void`, static `/summary`,
-and the `kgf build stats` producer that creates the complete artifact set.
+`/void` now serializes the indexed VoID graph at the versioned resource URL as
+Turtle or expanded JSON-LD, with HTML at the same URL. Serialization checks the
+response-byte budget before each statement, so every truncated body remains a
+complete RDF document and advertises byte-budget incompleteness without inventing a
+cursor for a non-positional dump. `/summary` serves the persisted Markdown or JSON
+bytes exactly, with an HTML rendering for browsers. Both share the version resource's
+immutable cache validators.
+
+`kgf build stats` is the first build-pipeline node. It invokes hdtc for merged and
+component VoID analysis, builds the final VoID HDT and permutation sidecar, traverses
+the semantic partition graph into selector and count-ranked relation blocks, runs the
+namespace counter with manifest prefix overrides last, replaces build-host paths in
+`prefix_table.source` with a stable logical producer label, and persists structured
+and Markdown summary cards. A componentless bundle gets an explicit design subset over
+the same data; a component manifest requires exactly one `role=source` component and
+publishes design, queryable, and sorted `component:<id>` views. TSV production records
+the exact row bounds it wrote; manifest regeneration accepts those build-owned bounds
+only from this path, preserves unmodeled component metadata, and runs the existing
+offline semantic proof before success.
+
+The seven artifacts are constructed beside the bundle and renamed into `stats/` as
+one set. If publication or verification fails, the prior stats directory and manifest
+are restored. This is intentionally the stats node rather than the full `build.yaml`
+DAG: it consumes an already-built `data.hdt` and any published component HDTs, which
+keeps the hdtc/KGF format boundary explicit while making today's hand-built bundles
+core-profile complete.
+
+*Verified by* the existing route and pure-operation suites plus an end-to-end producer
+test that starts from an hdtc-built typed graph, generates all seven artifacts, opens
+the result through `Store`, and passes `kgf manifest --check`. The producer was also
+run over PHASES KG (2,750 triples), yielding 836 selector rows and 84 typed relation
+rows across its design/queryable views; the resulting `/void`, `/summary`, and paged
+`/schema` resources were exercised through a real listener. A synthetic two-component
+PHASES build additionally passed the publication proof with design, queryable,
+`component:canonical`, and `component:derived` view directories while preserving the
+raw component declarations through manifest rewrite.
 
 ### What the implementation still is not
 
@@ -1737,10 +1793,21 @@ following the code.
     lowercase SHA-256 over the fully merged prefix map. The implementation types
     `distinct_iris`, treats that digest as the stable table identity, and keeps
     `prefix_table.source` informational because hdtc currently joins the input path
-    labels and those can be build-host-specific. Doc 04 should add `distinct_iris`,
-    define `version` as the content digest, and say whether a KGF producer must replace
-    `source` with a logical registry identifier before publication. Surfaced in unit
-    19.
+    labels and those can be build-host-specific. `kgf build stats` replaces those paths
+    with the stable logical labels `kgf build: curated prefix tables` (plus
+    `+ manifest overrides` when applicable), while retaining hdtc's merged-map digest
+    as the identity. Doc 04 should add `distinct_iris`, define `version` as the content
+    digest, and prescribe a logical rather than host-path source label. Surfaced and
+    provisionally resolved in unit 19.
+38. **The `/schema` node envelope needs to echo its semantic selector.** Doc 03
+    §3.4.10's fixed envelope reports the selected node's own term, which distinguishes
+    class nodes but makes a dataset-scoped property indistinguishable from the same
+    property beneath a class; the class survives only inside opaque navigation URLs.
+    It also leaves a deliberately absent node with no structured statement of what was
+    absent. The implementation now emits `selector: {kind, class?, predicate?,
+    datatype?}` and renders the same path on the HTML page. The doc should add this
+    field to the fixed envelope so scope is data rather than something clients reverse-
+    engineer from links. Surfaced while testing the stats surface against PHASES KG.
 
 ## Not in this plan
 
