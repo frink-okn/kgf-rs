@@ -586,6 +586,29 @@ impl Manifest {
             )));
         }
 
+        let void = self
+            .artifacts
+            .get(artifact::VOID_HDT)
+            .expect("the complete description set contains the VoID HDT");
+        if !void.parents.iter().any(|parent| parent == artifact::HDT) {
+            return Err(syntax(format!(
+                "artifact {} must declare {} as a parent",
+                artifact::VOID_HDT,
+                artifact::HDT
+            )));
+        }
+        let void_perm = self
+            .artifacts
+            .get(artifact::VOID_PERM)
+            .expect("the complete description set contains the VoID permutation index");
+        if void_perm.parents.len() != 1 || void_perm.parents[0] != artifact::VOID_HDT {
+            return Err(syntax(format!(
+                "artifact {} must declare parents: [\"{}\"]",
+                artifact::VOID_PERM,
+                artifact::VOID_HDT
+            )));
+        }
+
         for name in [
             artifact::SCHEMA_NODES,
             artifact::CLASS_RELATIONS,
@@ -781,6 +804,18 @@ impl ManifestDocument {
     /// The parsed manifest, if the document is a complete one.
     pub fn parsed(&self) -> Option<&Manifest> {
         self.parsed.as_ref().ok()
+    }
+
+    /// Whether the preserved document declares any bundle components.
+    ///
+    /// Component objects remain deliberately untyped until the full build
+    /// contract has real bundles behind it. Readers use this narrow question
+    /// only to refuse component description views instead of guessing how raw
+    /// declarations bind to artifacts and RDF dataset identities.
+    pub fn declares_components(&self) -> bool {
+        self.raw.get("components").is_some_and(
+            |value| !matches!(value, serde_json::Value::Array(entries) if entries.is_empty()),
+        )
     }
 
     /// Whether the raw artifact map names any member of the description set.
@@ -1148,6 +1183,16 @@ mod tests {
                 .artifacts
                 .insert(name.to_owned(), ArtifactEntry::checksum(100, "abc"));
         }
+        manifest
+            .artifacts
+            .get_mut(artifact::VOID_HDT)
+            .unwrap()
+            .parents = vec![artifact::HDT.to_owned()];
+        manifest
+            .artifacts
+            .get_mut(artifact::VOID_PERM)
+            .unwrap()
+            .parents = vec![artifact::VOID_HDT.to_owned()];
         for name in [
             artifact::SCHEMA_NODES,
             artifact::CLASS_RELATIONS,

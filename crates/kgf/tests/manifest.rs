@@ -51,6 +51,10 @@ const TYPED_SOURCE: &str = concat!(
 const VOID_SOURCE: &str = concat!(
     "<https://example.org/design> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
     "<https://example.org/queryable> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
+    "<https://example.org/queryable> <http://rdfs.org/ns/void#triples> \"4\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+    "<https://example.org/queryable> <http://rdfs.org/ns/void#distinctSubjects> \"2\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+    "<https://example.org/queryable> <http://rdfs.org/ns/void#properties> \"2\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+    "<https://example.org/queryable> <http://rdfs.org/ns/void#distinctObjects> \"4\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
     "<https://example.org/queryable> <http://rdfs.org/ns/void#subset> <https://example.org/design> .\n",
 );
 
@@ -170,6 +174,14 @@ fn stats_build_publishes_one_verified_description_set() {
     for name in artifact::DESCRIPTION {
         assert!(manifest.artifacts.contains_key(name), "missing {name}");
     }
+    assert_eq!(
+        manifest.artifacts[artifact::VOID_HDT].parents,
+        [artifact::HDT]
+    );
+    assert_eq!(
+        manifest.artifacts[artifact::VOID_PERM].parents,
+        [artifact::VOID_HDT]
+    );
     for name in [
         artifact::SCHEMA_NODES,
         artifact::CLASS_RELATIONS,
@@ -199,7 +211,7 @@ fn stats_build_publishes_one_verified_description_set() {
         serde_json::from_slice(&std::fs::read(bundle.join(artifact::NAMESPACES)).unwrap()).unwrap();
     assert_eq!(
         namespaces["prefix_table"]["source"],
-        "kgf build: curated prefix tables + manifest overrides"
+        format!("{} + manifest.json#prefixes", prefixes.display())
     );
     assert!(
         std::fs::read_to_string(bundle.join(artifact::SUMMARY_MD))
@@ -265,6 +277,77 @@ fn stats_build_publishes_one_verified_description_set() {
     let after = std::fs::read(bundle.join(artifact::MANIFEST)).unwrap();
     assert_eq!(before, after, "stats rebuild is not byte-stable");
     kgf(&["manifest", path(&bundle), "--check"]).success();
+
+    let manifest_path = bundle.join(artifact::MANIFEST);
+    let mut document: serde_json::Value = serde_json::from_slice(&after).unwrap();
+    document["components"] = serde_json::json!([{"id": "canonical", "role": "source"}]);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&document).unwrap(),
+    )
+    .unwrap();
+    let open_error = open(&bundle).expect_err("component views are not silently misclassified");
+    assert!(
+        open_error
+            .to_string()
+            .contains("does not yet support component description views"),
+        "{open_error}"
+    );
+    let error = kgf(&["manifest", path(&bundle), "--check"]).failure();
+    assert!(
+        error.contains("does not yet verify component description views"),
+        "{error}"
+    );
+}
+
+#[test]
+fn stats_build_refuses_component_manifests_without_inventing_a_component_contract() {
+    let root = tempfile::tempdir().unwrap();
+    let bundle = root.path().join("component-kg").join("v1");
+    std::fs::create_dir_all(&bundle).unwrap();
+    build_artifacts(&bundle, TYPED_SOURCE);
+    kgf(&[
+        "manifest",
+        path(&bundle),
+        "--dataset-iri",
+        "https://example.org/component-kg",
+    ])
+    .success();
+
+    let manifest_path = bundle.join(artifact::MANIFEST);
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    document["components"] = serde_json::json!([{
+        "id": "canonical",
+        "role": "source",
+        "graph": "https://example.org/graph/canonical",
+        "sha256": "real-contract-not-yet-typed"
+    }]);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&document).unwrap(),
+    )
+    .unwrap();
+    let before = std::fs::read(&manifest_path).unwrap();
+    let prefixes = root.path().join("prefixes.json");
+    std::fs::write(&prefixes, r#"{"ex":"http://example.org/"}"#).unwrap();
+
+    let error = kgf(&[
+        "build",
+        "stats",
+        path(&bundle),
+        "--hdtc",
+        path(&hdtc_binary()),
+        "--prefixes",
+        path(&prefixes),
+    ])
+    .failure();
+    assert!(
+        error.contains("does not yet support component bundles"),
+        "{error}"
+    );
+    assert!(!bundle.join("stats").exists());
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), before);
 }
 
 #[test]
@@ -536,6 +619,10 @@ fn publish_description_manifest(
                 artifact::CLASS_PROPERTIES => class_property_views.clone(),
                 _ => unreachable!("only TSV artifacts reach this branch"),
             };
+        } else if name == artifact::VOID_HDT {
+            entry.parents = vec![artifact::HDT.to_owned()];
+        } else if name == artifact::VOID_PERM {
+            entry.parents = vec![artifact::VOID_HDT.to_owned()];
         }
         manifest.artifacts.insert(name.to_owned(), entry);
     }

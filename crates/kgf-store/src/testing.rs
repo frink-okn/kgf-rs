@@ -95,7 +95,10 @@ pub const TINY_NT: &str = concat!(
 
 const DESCRIPTION_NT: &str = concat!(
     "<https://example.org/queryable> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
-    "<https://example.org/queryable> <http://rdfs.org/ns/void#triples> \"21\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+    "<https://example.org/queryable> <http://rdfs.org/ns/void#triples> \"24\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+    "<https://example.org/queryable> <http://rdfs.org/ns/void#distinctSubjects> \"6\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+    "<https://example.org/queryable> <http://rdfs.org/ns/void#properties> \"12\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+    "<https://example.org/queryable> <http://rdfs.org/ns/void#distinctObjects> \"17\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
     "<https://example.org/queryable> <http://rdfs.org/ns/void#subset> <https://example.org/design> .\n",
     "<https://example.org/design> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
     "<https://example.org/design> <http://rdfs.org/ns/void#triples> \"3\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
@@ -507,15 +510,21 @@ impl Fixture {
             entry.views = views(bytes, design_rows, queryable_rows);
             entry
         };
+        let mut void = entry(crate::store::artifact::VOID_HDT);
+        void.parents = vec![crate::store::artifact::HDT.to_owned()];
+        let mut void_perm = entry(crate::store::artifact::VOID_PERM);
+        void_perm.parents = vec![crate::store::artifact::VOID_HDT.to_owned()];
         let artifacts = std::collections::BTreeMap::from([
             (
-                crate::store::artifact::VOID_HDT.to_owned(),
-                entry(crate::store::artifact::VOID_HDT),
+                crate::store::artifact::HDT.to_owned(),
+                entry(crate::store::artifact::HDT),
             ),
             (
-                crate::store::artifact::VOID_PERM.to_owned(),
-                entry(crate::store::artifact::VOID_PERM),
+                crate::store::artifact::PERM.to_owned(),
+                entry(crate::store::artifact::PERM),
             ),
+            (crate::store::artifact::VOID_HDT.to_owned(), void),
+            (crate::store::artifact::VOID_PERM.to_owned(), void_perm),
             (
                 crate::store::artifact::SCHEMA_NODES.to_owned(),
                 indexed(crate::store::artifact::SCHEMA_NODES, schema_nodes, 3, 1),

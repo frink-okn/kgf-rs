@@ -141,6 +141,12 @@ impl Store {
         let document = crate::manifest::ManifestDocument::read(dir)?
             .expect("manifest existence was required immediately above");
         let manifest_description = document.lists_description_artifacts();
+        if manifest_description && document.declares_components() {
+            return Err(description_set_disagreement(
+                dir,
+                "this build does not yet support component description views; use a componentless bundle or wait for the full `kgf build` component contract",
+            ));
+        }
         let description = match (artifacts.description.as_ref(), manifest_description) {
             (Some(_), true) => {
                 let manifest = document.into_parsed()?;

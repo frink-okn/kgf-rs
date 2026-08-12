@@ -1266,13 +1266,16 @@ candidate budget only to filtered scans. Unknown component views are `not_found`
 well-formed absent selectors remain complete empty answers.
 
 The response-byte budget is independently resumable for both page shapes. Store
-items now carry the raw child offset or validated TSV row boundary at which they
-begin, so serialization can stop before an item without reconstructing a
-position from semantic rows. This matters for navigable object classes, where
-an omitted untyped bucket makes visible-item indexes differ from raw child
-offsets. Row-limit, candidate-limit, and byte-limit stops therefore all resume
-without loss or duplication, and decoded positions outside the selected view
-are rejected as stale cursors.
+items carry the raw child offset or validated TSV row boundary at which they
+begin, so a byte stop can resume without reconstructing a position from semantic
+rows. Budgeting measures the complete selected representation after label
+hydration — envelope, links, filters, order, completeness metadata and labels as
+well as items — and finds the largest fitting prefix with bounded serialization
+passes. This matters for navigable object classes, where an omitted untyped bucket
+makes visible-item indexes differ from raw child offsets. Row-limit,
+candidate-limit, and byte-limit stops therefore all resume without loss or
+duplication, and decoded positions outside the selected view are rejected as
+stale cursors.
 
 *Verified by* a layered golden VoID fixture covering every valid child
 query, every node kind, design/queryable/component views, absent selectors,
@@ -1299,35 +1302,38 @@ cursor for a non-positional dump. `/summary` serves the persisted Markdown or JS
 bytes exactly, with an HTML rendering for browsers. Both share the version resource's
 immutable cache validators.
 
-`kgf build stats` is the first build-pipeline node. It invokes hdtc for merged and
-component VoID analysis, builds the final VoID HDT and permutation sidecar, traverses
+`kgf build stats` is the first incremental build-pipeline node. It invokes hdtc for
+the already-merged componentless graph's VoID analysis, builds the final VoID HDT and
+permutation sidecar, traverses
 the semantic partition graph into selector and count-ranked relation blocks, runs the
-namespace counter with manifest prefix overrides last, replaces build-host paths in
-`prefix_table.source` with a stable logical producer label, and persists structured
-and Markdown summary cards. A componentless bundle publishes only its genuine dataset
-root; the `design` and `queryable` index views both address that root without inventing
-subset RDF. A component manifest requires exactly one `role=source` component and
-publishes design, queryable, and sorted `component:<id>` views. TSV production records
-the exact row bounds it wrote; manifest regeneration accepts those build-owned bounds
-only from this path, preserves unmodeled component metadata, and runs the existing
-offline semantic proof before success.
+namespace counter with manifest prefix overrides last, preserves caller-supplied
+prefix-table provenance while naming the generated override `manifest.json#prefixes`,
+and persists structured and Markdown summary cards. The `design` and `queryable`
+index views both address the one genuine dataset root without inventing subset RDF.
+Manifests with components are refused before staging: component artifact identity,
+graph identity, checksums and entailment regime belong to the future full `kgf build`
+contract and are not inferred from paths or synthetic IRIs here. TSV production
+records the exact row bounds it wrote; manifest regeneration accepts those build-owned
+bounds only from this path and runs the offline semantic proof before success. That
+proof now binds the queryable VoID totals to the manifest counts, while manifest parent
+metadata binds the VoID HDT to `data.hdt` and its permutation index to the VoID HDT.
 
 The eight artifacts are constructed beside the bundle and renamed into `stats/` as
-one set. If publication or verification fails, the prior stats directory and manifest
-are restored. This is intentionally the stats node rather than the full `build.yaml`
-DAG: it consumes an already-built `data.hdt` and any published component HDTs, which
-keeps the hdtc/KGF format boundary explicit while making today's hand-built bundles
-core-profile complete.
+one set. If publication or verification returns an error, the prior stats directory
+and manifest are restored. The stats-directory swap and following manifest rewrite are
+not claimed to be one crash-atomic generation; that belongs to the future full
+`kgf build` publication model. This incremental command intentionally consumes an
+already-built componentless `data.hdt`, keeping today's hand-built bundles usable while
+the full DAG is still under development.
 
 *Verified by* the existing route and pure-operation suites plus an end-to-end producer
 test that starts from an hdtc-built typed graph, generates all eight artifacts, opens
 the result through `Store`, and passes `kgf manifest --check`. The producer was also
 run over PHASES KG (2,750 triples), yielding 836 selector rows and 84 typed relation
 rows across its design/queryable views; the resulting `/void`, `/summary`, and paged
-`/schema` resources were exercised through a real listener. A synthetic two-component
-PHASES build additionally passed the publication proof with design, queryable,
-`component:canonical`, and `component:derived` view directories while preserving the
-raw component declarations through manifest rewrite.
+`/schema` resources were exercised through a real listener. A regression now proves
+that a component manifest is refused without creating `stats/` or rewriting the
+manifest, so provisional path and RDF-identity conventions cannot leak into bundles.
 
 ### What the implementation still is not
 
@@ -1779,7 +1785,7 @@ following the code.
     hydrated labels (a `labels` sibling map keyed by IRI? a per-cell annotation?) and
     let `labels=true` turn it on for `/fragment`, `/describe` and `/sample`; the HTML
     pages then become the `labels=true` rendering rather than a special case.
-36. **Does `/schema?children=object-classes` omit the untyped target partition?**
+36. **Resolved: `/schema?children=object-classes` omits the untyped target partition.**
     The response shape requires every child to carry a semantic `term`, and an
     untyped target has no `void:class`; §3.4.10 explicitly says such a partition is
     omitted from the flat class-relation projection but does not say what the
@@ -1789,62 +1795,59 @@ following the code.
     sentinel term. The producer and publication proof also require at most one untyped
     target bucket per property: without that invariant, omitting an arbitrary run while
     retaining §3.5's `limit + 1` cost bound needs a scan budget or another persisted
-    index. The API and storage documents should state both the omission and the single-
-    bucket invariant. Surfaced in unit 19.
-37. **The namespace artifact example predates the hdtc contract.** Doc 04 §4.2's
+    index. The API and storage documents now state both the omission and the single-
+    bucket invariant. Surfaced and resolved in unit 19.
+37. **Resolved: the namespace artifact example now follows the hdtc contract.** Doc 04 §4.2's
     namespace rows omit the graph-wide `distinct_iris` count now emitted by `hdtc
     namespaces`, and its `prefix_table.version` example is a date while hdtc emits a
     lowercase SHA-256 over the fully merged prefix map. The implementation types
     `distinct_iris`, treats that digest as the stable table identity, and keeps
-    `prefix_table.source` informational because hdtc currently joins the input path
-    labels and those can be build-host-specific. `kgf build stats` replaces those paths
-    with the stable logical labels `kgf build: curated prefix tables` (plus
-    `+ manifest overrides` when applicable), while retaining hdtc's merged-map digest
-    as the identity. Doc 04 should add `distinct_iris`, define `version` as the content
-    digest, and prescribe a logical rather than host-path source label. Surfaced and
-    provisionally resolved in unit 19.
-38. **The `/schema` node envelope needs to echo its semantic selector.** Doc 03
+    `prefix_table.source` informational because hdtc joins input identifiers that may
+    be build-host-specific. `kgf build stats` preserves caller-supplied identifiers and
+    substitutes only the generated manifest override with the truthful stable selector
+    `manifest.json#prefixes`; the merged-map digest remains the identity. Doc 04 now
+    specifies these fields. Surfaced and resolved in unit 19.
+38. **Resolved: the `/schema` node envelope echoes its semantic selector.** Doc 03
     §3.4.10's fixed envelope reports the selected node's own term, which distinguishes
     class nodes but makes a dataset-scoped property indistinguishable from the same
     property beneath a class; the class survives only inside opaque navigation URLs.
     It also leaves a deliberately absent node with no structured statement of what was
     absent. The implementation now emits `selector: {kind, class?, predicate?,
-    datatype?}` and renders the same path on the HTML page. The doc should add this
+    datatype?}` and renders the same path on the HTML page. Doc 03 now includes this
     field to the fixed envelope so scope is data rather than something clients reverse-
     engineer from links. Surfaced while testing the stats surface against PHASES KG.
-39. **Version resources need typed discovery links.** A client should not have to
+39. **Resolved: version resources carry typed discovery links.** A client should not have to
     concatenate undocumented route names after selecting a dataset version. The root
     and dataset descriptors now publish a typed `links` object per release, gated by
     the release's capabilities and description artifacts; persisted summary cards
-    carry relative links into the same discovery surface. Docs 03 and 04 should make
+    carry relative links into the same discovery surface. Docs 03 and 04 now make
     these link relations part of the descriptor and summary contracts.
-40. **Schema label hydration uses a response-level IRI map.** `/schema?labels=true`
+40. **Resolved: schema label hydration uses a response-level IRI map.** `/schema?labels=true`
     now returns `labels: {full_iri: string|null}` for every distinct schema IRI on the
     page, bounded by `max_label_iris` and the release's frozen label cascade. A null is
     a completed lookup with no label; absence of the map means hydration was not
     requested. This is one concrete answer to question 35 for a discovery operation
-    and should be specified before the same modifier expands to triple-row operations.
-41. **Class-to-property discovery needs a persisted flat projection.** Navigating one
+    and is now specified before the same modifier expands to triple-row operations.
+41. **Resolved: class-to-property discovery has a persisted flat projection.** Navigating one
     class at a time is useful for inspection but poor for comparing a graph's kinds.
     Tier 1 now includes `stats/class-properties.tsv` and
     `/schema?projection=class-properties`, ordered by descending triples with stable
     IRI ties and filterable by class or predicate. Rows require triples and carry
-    distinct subjects/objects when the source VoID states them. Doc 04 should add the eighth artifact and doc 03
-    should define the projection beside `class-relations`.
-42. **Collection and projection ordering is response data.** Schema child pages now
+    distinct subjects/objects when the source VoID states them. Docs 03 and 04 now
+    define the projection and eighth artifact beside `class-relations`.
+42. **Resolved: collection and projection ordering is response data.** Schema child pages now
     describe their collection as `{kind, returned, order}`, and flat projections echo
     their filters plus a structured order contract. Agents otherwise have to infer
-    scope and cursor semantics from a URL. Doc 03's fixed envelope should carry this
+    scope and cursor semantics from a URL. Doc 03's fixed envelope now carries this
     metadata explicitly.
-43. **A componentless bundle has one VoID dataset, not a synthetic design subset.**
+43. **Resolved: a componentless bundle has one VoID dataset, not a synthetic design subset.**
     Doc 04 requires `design` and `queryable` selector-index views and defines one
     `void:subset` per published component, while the incremental `kgf build stats`
     command also accepts existing bundles that declare no components. For that case
     the implementation maps both index views to the same genuine top-level dataset
     subject and emits no subset triple. A future full build may create the canonical
     component doc 04 recommends, but a stats pass over an already-published graph must
-    not invent one. The storage and API docs should state this alias explicitly or
-    require component metadata before exposing a distinct design view.
+    not invent one. The storage and API docs now state this alias explicitly.
 
 ## Not in this plan
 

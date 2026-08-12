@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::indexed::IndexedHdt;
-use crate::manifest::Manifest;
+use crate::manifest::{Counts, Manifest, ManifestDocument};
 use crate::map::PublishedBundle;
 use crate::pattern::IdPattern;
 use crate::store::{ArtifactSet, description_set_disagreement};
@@ -19,12 +19,12 @@ use crate::{Role, TermId};
 
 use super::documents::verify_summary_json;
 use super::{
-    CountPredicates, DescriptionStore, MappedTsv, SchemaRow, StatsView, VOID_CLASS,
-    VOID_CLASS_PARTITION, VOID_DISTINCT_OBJECTS, VOID_DISTINCT_SUBJECTS, VOID_PROPERTY,
-    VOID_PROPERTY_PARTITION, VOID_TRIPLES, VOIDEXT_DATATYPE, VOIDEXT_DATATYPE_PARTITION,
-    VOIDEXT_LANGUAGE, VOIDEXT_LANGUAGE_PARTITION, VOIDEXT_OBJECT_CLASS_PARTITION, compare_fields,
-    fields, integer_object, malformed, object_to_subject, parse_schema_row, reject_extra_fields,
-    required_field,
+    CountPredicates, DescriptionStore, MappedTsv, SchemaRow, SchemaSelector, StatsView, VOID_CLASS,
+    VOID_CLASS_PARTITION, VOID_DISTINCT_OBJECTS, VOID_DISTINCT_SUBJECTS, VOID_PROPERTIES,
+    VOID_PROPERTY, VOID_PROPERTY_PARTITION, VOID_TRIPLES, VOIDEXT_DATATYPE,
+    VOIDEXT_DATATYPE_PARTITION, VOIDEXT_LANGUAGE, VOIDEXT_LANGUAGE_PARTITION,
+    VOIDEXT_OBJECT_CLASS_PARTITION, compare_fields, fields, integer_object, malformed,
+    object_to_subject, parse_schema_row, reject_extra_fields, required_field,
 };
 use crate::error::Result;
 
@@ -45,12 +45,21 @@ const VOID_SUBSET: &str = "http://rdfs.org/ns/void#subset";
 pub fn verify_description_artifacts(bundle: &PublishedBundle, manifest: &Manifest) -> Result<()> {
     let dir = bundle.path();
     manifest.validate(dir)?;
+    if manifest.carries_description_artifacts()
+        && ManifestDocument::read(dir)?.is_some_and(|document| document.declares_components())
+    {
+        return Err(description_set_disagreement(
+            dir,
+            "this build does not yet verify component description views against manifest component identities; use a componentless bundle until the full `kgf build` component contract is implemented",
+        ));
+    }
     let artifacts = ArtifactSet::resolve(dir)?;
     let entries = manifest.description_artifacts();
     match (artifacts.description.as_ref(), entries) {
         (Some(_), Some(entries)) => {
             let description = DescriptionStore::open(bundle, &artifacts, entries)?;
-            description.verify_artifacts()
+            description.verify_artifacts()?;
+            verify_queryable_totals(&description, manifest.counts)
         }
         (None, None) => Ok(()),
         (Some(_), None) => Err(description_set_disagreement(
@@ -64,6 +73,34 @@ pub fn verify_description_artifacts(bundle: &PublishedBundle, manifest: &Manifes
              regenerate it with `kgf manifest` or rebuild them with `kgf build`",
         )),
     }
+}
+
+fn verify_queryable_totals(description: &DescriptionStore, expected: Counts) -> Result<()> {
+    let view = description
+        .view(&StatsView::Queryable)
+        .expect("manifest validation requires the queryable view");
+    let root = view
+        .schema_node(SchemaSelector::Dataset)?
+        .expect("offline index verification requires a queryable dataset selector")
+        .subject();
+    let path = description.void.path();
+    for (predicate, field, expected) in [
+        (VOID_TRIPLES, "triples", expected.triples),
+        (VOID_DISTINCT_SUBJECTS, "subjects", expected.subjects),
+        (VOID_PROPERTIES, "predicates", expected.predicates),
+        (VOID_DISTINCT_OBJECTS, "objects", expected.objects),
+    ] {
+        let actual = required_count(&description.void, root, predicate, path)?;
+        if actual != expected {
+            return Err(malformed(
+                path,
+                format!(
+                    "queryable dataset root records {actual} {field}, but manifest counts.{field} records {expected}; rebuild the description set with `kgf build`"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 type SelectorIndex = BTreeMap<StatsView, BTreeMap<VerifiedSelector, TermId>>;

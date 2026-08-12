@@ -919,7 +919,7 @@ impl Renders for BindingCountAnswer {
 /// It stays in dictionary spelling until `Serialize`, exactly like an ordinary
 /// result row, but is wrapped separately because schema nodes are not triples
 /// over the primary data dictionary.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SchemaTerm(Rc<str>);
 
 impl Serialize for SchemaTerm {
@@ -928,7 +928,7 @@ impl Serialize for SchemaTerm {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct SchemaCounts {
     #[serde(skip_serializing_if = "Option::is_none")]
     entities: Option<u64>,
@@ -955,7 +955,7 @@ impl From<StoreSchemaCounts> for SchemaCounts {
 }
 
 /// One selected or shallow child partition in the wire projection.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct SchemaResource {
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -965,10 +965,13 @@ struct SchemaResource {
     /// Exact compact-JSON bytes for independent response-budget accounting.
     #[serde(skip)]
     serialized: u64,
+    /// Raw child offset at which this item begins; absent on the selected node.
+    #[serde(skip)]
+    position: Option<u64>,
 }
 
 /// Metadata for one shallow child collection.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct SchemaCollectionResource {
     kind: &'static str,
     returned: u64,
@@ -978,7 +981,7 @@ struct SchemaCollectionResource {
 }
 
 /// The filters that scope one flat schema projection.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct SchemaProjectionFilters {
     #[serde(skip_serializing_if = "Option::is_none")]
     class: Option<SchemaTerm>,
@@ -987,7 +990,7 @@ struct SchemaProjectionFilters {
 }
 
 /// Machine-readable ordering contract for a flat projection.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 struct SchemaProjectionOrder {
     by: &'static str,
     direction: &'static str,
@@ -1009,7 +1012,7 @@ const CLASS_PROPERTY_ORDER: SchemaProjectionOrder = SchemaProjectionOrder {
 /// The semantic path that selected a node, independent of its opaque VoID
 /// subject. A property or datatype term alone does not reveal whether its
 /// counts are dataset-wide or scoped beneath one class.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum SchemaSelectorResource {
     Dataset,
@@ -1075,7 +1078,7 @@ impl SchemaResource {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ClassRelationResource {
     subject_class: SchemaTerm,
     predicate: SchemaTerm,
@@ -1083,9 +1086,11 @@ struct ClassRelationResource {
     triples: u64,
     #[serde(skip)]
     serialized: u64,
+    #[serde(skip)]
+    position: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ClassPropertyResource {
     class: SchemaTerm,
     predicate: SchemaTerm,
@@ -1096,6 +1101,8 @@ struct ClassPropertyResource {
     distinct_objects: Option<u64>,
     #[serde(skip)]
     serialized: u64,
+    #[serde(skip)]
+    position: u64,
 }
 
 impl ClassPropertyResource {
@@ -1105,6 +1112,7 @@ impl ClassPropertyResource {
         triples: u64,
         distinct_subjects: Option<u64>,
         distinct_objects: Option<u64>,
+        position: u64,
     ) -> Self {
         let mut resource = Self {
             class: SchemaTerm(Rc::from(class)),
@@ -1113,6 +1121,7 @@ impl ClassPropertyResource {
             distinct_subjects,
             distinct_objects,
             serialized: 0,
+            position,
         };
         resource.serialized = serde_json::to_vec(&resource)
             .expect("a class property contains only serializable values")
@@ -1122,13 +1131,20 @@ impl ClassPropertyResource {
 }
 
 impl ClassRelationResource {
-    fn new(subject_class: &str, predicate: &str, object_class: &str, triples: u64) -> Self {
+    fn new(
+        subject_class: &str,
+        predicate: &str,
+        object_class: &str,
+        triples: u64,
+        position: u64,
+    ) -> Self {
         let mut resource = Self {
             subject_class: SchemaTerm(Rc::from(subject_class)),
             predicate: SchemaTerm(Rc::from(predicate)),
             object_class: SchemaTerm(Rc::from(object_class)),
             triples,
             serialized: 0,
+            position,
         };
         resource.serialized = serde_json::to_vec(&resource)
             .expect("a class relation contains only serializable values")
@@ -1138,7 +1154,7 @@ impl ClassRelationResource {
 }
 
 /// The node-navigation shape of `GET /schema`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SchemaNavigationAnswer {
     dataset: String,
     version: String,
@@ -1157,10 +1173,16 @@ pub struct SchemaNavigationAnswer {
     completeness: Completeness,
     #[serde(skip)]
     target: Target,
+    #[serde(skip)]
+    byte_budget: u64,
+    #[serde(skip)]
+    byte_binding: CursorBinding,
+    #[serde(skip)]
+    byte_continuation: Option<u64>,
 }
 
 /// The flat observed-class-relation shape of `GET /schema`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SchemaRelationsAnswer {
     dataset: String,
     version: String,
@@ -1176,10 +1198,16 @@ pub struct SchemaRelationsAnswer {
     completeness: Completeness,
     #[serde(skip)]
     target: Target,
+    #[serde(skip)]
+    byte_budget: u64,
+    #[serde(skip)]
+    byte_binding: CursorBinding,
+    #[serde(skip)]
+    byte_continuation: Option<u64>,
 }
 
 /// The count-ranked class-property shape of `GET /schema`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SchemaClassPropertiesAnswer {
     dataset: String,
     version: String,
@@ -1194,10 +1222,16 @@ pub struct SchemaClassPropertiesAnswer {
     completeness: Completeness,
     #[serde(skip)]
     target: Target,
+    #[serde(skip)]
+    byte_budget: u64,
+    #[serde(skip)]
+    byte_binding: CursorBinding,
+    #[serde(skip)]
+    byte_continuation: Option<u64>,
 }
 
 /// Either response shape selected by one typed `/schema` request.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum SchemaAnswer {
     /// One node and optionally one shallow child collection.
@@ -1216,10 +1250,155 @@ impl SchemaAnswer {
             Self::ClassProperties(answer) => &answer.completeness,
         }
     }
+
+    fn byte_budget(&self) -> u64 {
+        match self {
+            Self::Navigation(answer) => answer.byte_budget,
+            Self::Relations(answer) => answer.byte_budget,
+            Self::ClassProperties(answer) => answer.byte_budget,
+        }
+    }
+
+    fn byte_continuation(&self) -> Option<u64> {
+        match self {
+            Self::Navigation(answer) => answer.byte_continuation,
+            Self::Relations(answer) => answer.byte_continuation,
+            Self::ClassProperties(answer) => answer.byte_continuation,
+        }
+    }
+
+    fn item_count(&self) -> usize {
+        match self {
+            Self::Navigation(answer) => answer.items.as_ref().map_or(0, Vec::len),
+            Self::Relations(answer) => answer.items.len(),
+            Self::ClassProperties(answer) => answer.items.len(),
+        }
+    }
+
+    fn item_position(&self, index: usize) -> Option<u64> {
+        match self {
+            Self::Navigation(answer) => answer.items.as_ref()?.get(index)?.position,
+            Self::Relations(answer) => answer.items.get(index).map(|item| item.position),
+            Self::ClassProperties(answer) => answer.items.get(index).map(|item| item.position),
+        }
+    }
+
+    fn truncate_items(&mut self, keep: usize) {
+        match self {
+            Self::Navigation(answer) => {
+                if let Some(items) = &mut answer.items {
+                    items.truncate(keep);
+                    if let Some(collection) = &mut answer.collection {
+                        collection.returned = items.len() as u64;
+                    }
+                }
+            }
+            Self::Relations(answer) => answer.items.truncate(keep),
+            Self::ClassProperties(answer) => answer.items.truncate(keep),
+        }
+    }
+
+    fn set_byte_completeness(&mut self, position: u64) {
+        match self {
+            Self::Navigation(answer) => {
+                answer.byte_continuation = Some(position);
+                answer.completeness = Completeness::budget_exhausted(
+                    BudgetReason::ResponseBytes,
+                    Cursor::at_schema_child(&answer.byte_binding, position).encode(),
+                );
+            }
+            Self::Relations(answer) => {
+                answer.byte_continuation = Some(position);
+                answer.completeness = Completeness::budget_exhausted(
+                    BudgetReason::ResponseBytes,
+                    Cursor::at_class_relation(&answer.byte_binding, position).encode(),
+                );
+            }
+            Self::ClassProperties(answer) => {
+                answer.byte_continuation = Some(position);
+                answer.completeness = Completeness::budget_exhausted(
+                    BudgetReason::ResponseBytes,
+                    Cursor::at_class_property(&answer.byte_binding, position).encode(),
+                );
+            }
+        }
+    }
+
+    fn prune_labels(&mut self) {
+        let wanted = self.labelable_terms().into_values().collect::<HashSet<_>>();
+        let labels = match self {
+            Self::Navigation(answer) => &mut answer.labels,
+            Self::Relations(answer) => &mut answer.labels,
+            Self::ClassProperties(answer) => &mut answer.labels,
+        };
+        if let Some(labels) = labels {
+            labels.retain(|iri, _| wanted.contains(iri));
+        }
+    }
+
+    fn rendered_size(&self, representation: Representation) -> u64 {
+        standard_body(self, representation).len() as u64
+    }
+
+    /// Fit the complete selected representation, including its envelope,
+    /// completeness metadata, links, filters, ordering, and hydrated labels.
+    ///
+    /// The ordinary path serializes once. Only an over-budget response pays a
+    /// logarithmic number of additional bounded serializations to find the
+    /// largest item prefix that fits. One item is still allowed through when
+    /// it alone exceeds the budget, preserving positional progress.
+    fn fit_response_bytes(&mut self, representation: Representation) {
+        let budget = self.byte_budget();
+        if self.rendered_size(representation) <= budget {
+            return;
+        }
+
+        let original = self.clone();
+        let total = original.item_count();
+        if total == 0 {
+            return;
+        }
+        if total == 1 {
+            if let Some(position) = original.byte_continuation() {
+                self.set_byte_completeness(position);
+            }
+            return;
+        }
+
+        let mut low = 1usize;
+        let mut high = total - 1;
+        let mut best = None;
+        while low <= high {
+            let keep = low + (high - low) / 2;
+            let position = original
+                .item_position(keep)
+                .expect("every schema page item carries its resume position");
+            let mut candidate = original.clone();
+            candidate.truncate_items(keep);
+            candidate.set_byte_completeness(position);
+            candidate.prune_labels();
+            if candidate.rendered_size(representation) <= budget {
+                best = Some(keep);
+                low = keep + 1;
+            } else {
+                high = keep - 1;
+            }
+        }
+
+        let keep = best.unwrap_or(1);
+        let position = original
+            .item_position(keep)
+            .expect("a truncated schema page has a first omitted item");
+        *self = original;
+        self.truncate_items(keep);
+        self.set_byte_completeness(position);
+        self.prune_labels();
+    }
 }
 
 impl Renders for SchemaAnswer {
-    fn render(self, representation: Representation) -> Rendered {
+    fn render(mut self, representation: Representation) -> Rendered {
+        self.fit_response_bytes(representation);
         let completeness = self.completeness().clone();
         let body = standard_body(&self, representation);
         Rendered { body, completeness }
@@ -2015,6 +2194,9 @@ pub fn schema(
                 labels: None,
                 completeness: Completeness::complete(),
                 target,
+                byte_budget: request.bytes.0,
+                byte_binding: request.binding.clone(),
+                byte_continuation: None,
             }))
         }
         SchemaQuery::Children(children) => {
@@ -2043,6 +2225,7 @@ fn schema_children(
         }
         Err(error) => return Err(unreadable("paging schema children", &error)),
     };
+    let page_next = page.next;
 
     let dictionary = description.dict();
     let mut cache = TermCache::new();
@@ -2058,7 +2241,7 @@ fn schema_children(
     for child in page.items {
         let term = materialize_schema_term(&dictionary, &mut cache, child.node)?;
         let links = child_links(children, &request.view, term.as_deref());
-        let resource = schema_resource(child.node, term, links);
+        let resource = schema_resource(child.node, term, links, Some(child.position));
         let next_spent = spent.saturating_add(resource.serialized);
         // As for triple pages, always let one item through: otherwise one legal
         // term larger than the whole budget produces a cursor that never moves.
@@ -2104,6 +2287,9 @@ fn schema_children(
         labels: None,
         completeness,
         target,
+        byte_budget: request.bytes.0,
+        byte_binding: request.binding.clone(),
+        byte_continuation: byte_next.or(page_next),
     }))
 }
 
@@ -2225,6 +2411,7 @@ fn schema_relations(
             relation.predicate,
             relation.object_class,
             relation.triples,
+            item.position.byte_offset(),
         );
         let serialized = resource.serialized;
         (resource, serialized, item.position.byte_offset())
@@ -2248,6 +2435,9 @@ fn schema_relations(
         labels: None,
         completeness,
         target,
+        byte_budget: request.bytes.0,
+        byte_binding: request.binding.clone(),
+        byte_continuation: page.next.or(page_next),
     }))
 }
 
@@ -2280,6 +2470,7 @@ fn schema_class_properties(
             property.triples,
             property.distinct_subjects,
             property.distinct_objects,
+            item.position.byte_offset(),
         );
         let serialized = resource.serialized;
         (resource, serialized, item.position.byte_offset())
@@ -2303,6 +2494,9 @@ fn schema_class_properties(
         labels: None,
         completeness,
         target,
+        byte_budget: request.bytes.0,
+        byte_binding: request.binding.clone(),
+        byte_continuation: page.next.or(page_next),
     }))
 }
 
@@ -2327,7 +2521,7 @@ fn materialize_schema_node(
     links: BTreeMap<&'static str, String>,
 ) -> Result<SchemaResource, Problem> {
     let term = materialize_schema_term(dictionary, cache, node)?;
-    Ok(schema_resource(node, term, links))
+    Ok(schema_resource(node, term, links, None))
 }
 
 fn materialize_schema_term(
@@ -2348,6 +2542,7 @@ fn schema_resource(
     node: StoreSchemaNode,
     term: Option<Rc<str>>,
     links: BTreeMap<&'static str, String>,
+    position: Option<u64>,
 ) -> SchemaResource {
     SchemaResource {
         kind: schema_kind_name(node.kind()),
@@ -2355,6 +2550,7 @@ fn schema_resource(
         counts: node.counts().into(),
         links,
         serialized: 0,
+        position,
     }
     .finish_size()
 }

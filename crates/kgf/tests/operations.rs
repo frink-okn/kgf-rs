@@ -366,6 +366,79 @@ fn schema_class_relations_obey_row_candidate_and_byte_budgets() {
 }
 
 #[test]
+fn schema_byte_budget_measures_the_complete_selected_representation() {
+    let served = Served::with_description();
+    let store = served.store();
+    let children = "class=ex%3AA&predicate=ex%3Ap&children=object-classes&labels=true&limit=2";
+
+    for representation in [Representation::Json, Representation::Html] {
+        let tiny = Budgets {
+            max_response_bytes: 1,
+            ..Budgets::new()
+        };
+        let one = served.schema_rendered_within(
+            &store,
+            children,
+            served.within(&tiny),
+            representation,
+            true,
+        );
+        let cap = one.body.len() as u64;
+        let exact = Budgets {
+            max_response_bytes: cap,
+            ..Budgets::new()
+        };
+        let fitted = served.schema_rendered_within(
+            &store,
+            children,
+            served.within(&exact),
+            representation,
+            true,
+        );
+        assert!(
+            fitted.body.len() as u64 <= cap,
+            "{representation:?} body is {} bytes, over its {cap}-byte budget",
+            fitted.body.len()
+        );
+        if representation == Representation::Json {
+            assert_eq!(
+                fitted.completeness.truncation_reason(),
+                Some(kgf_server::envelope::TruncationReason::ResponseBytes)
+            );
+        }
+    }
+
+    let projection = "projection=class-relations&limit=2";
+    let tiny = Budgets {
+        max_response_bytes: 1,
+        ..Budgets::new()
+    };
+    let one = served.schema_rendered_within(
+        &store,
+        projection,
+        served.within(&tiny),
+        Representation::Json,
+        false,
+    );
+    let cap = one.body.len() as u64;
+    let exact = Budgets {
+        max_response_bytes: cap,
+        ..Budgets::new()
+    };
+    let fitted = served.schema_rendered_within(
+        &store,
+        projection,
+        served.within(&exact),
+        Representation::Json,
+        false,
+    );
+    assert!(fitted.body.len() as u64 <= cap);
+    let body: serde_json::Value = serde_json::from_slice(&fitted.body).unwrap();
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(body["truncation_reason"], "response_bytes");
+}
+
+#[test]
 fn schema_reports_an_unknown_component_view_as_not_found() {
     let served = Served::with_description();
     let store = served.store();
@@ -1682,6 +1755,38 @@ impl Served {
             .expect("a schema answer")
             .render(Representation::Html);
         String::from_utf8(rendered.body.to_vec()).expect("a schema page is UTF-8")
+    }
+
+    fn schema_rendered_within(
+        &self,
+        store: &Store,
+        query: &str,
+        limits: Limits<'_>,
+        representation: Representation,
+        hydrate_labels: bool,
+    ) -> answer::Rendered {
+        use kgf_server::answer::Renders;
+
+        let request = request::Schema::parse(
+            &params(query),
+            limits,
+            self.release().prefixes(),
+            &self.release().binding(),
+        )
+        .expect("a schema request");
+        let mut answer =
+            answer::schema(store, self.target("schema", query), &request).expect("a schema answer");
+        if hydrate_labels {
+            answer
+                .hydrate_labels(
+                    store,
+                    &["http://www.w3.org/2000/01/rdf-schema#label".to_owned()],
+                    1_000,
+                    true,
+                )
+                .expect("hydrate schema labels");
+        }
+        answer.render(representation)
     }
 
     fn search(&self, store: &Store, query: &str) -> serde_json::Value {

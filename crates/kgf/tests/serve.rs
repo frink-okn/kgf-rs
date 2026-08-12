@@ -220,7 +220,7 @@ fn void_and_summary_serve_the_published_description_in_every_format() {
         .for_slice(&turtle.body)
         .collect::<Result<Vec<_>, _>>()
         .expect("/void Turtle parses");
-    assert_eq!(turtle_quads.len(), 21);
+    assert_eq!(turtle_quads.len(), 24);
 
     let jsonld = server.request(
         "GET",

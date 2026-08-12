@@ -19,7 +19,6 @@ use oxrdf::{NamedOrBlankNode, Term, Triple};
 use oxrdfio::{RdfFormat, RdfParser};
 use serde::Serialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use crate::manifest::{
@@ -28,7 +27,6 @@ use crate::manifest::{
 
 const VOID_CLASS_PARTITION: &str = "http://rdfs.org/ns/void#classPartition";
 const VOID_PROPERTY_PARTITION: &str = "http://rdfs.org/ns/void#propertyPartition";
-const VOID_SUBSET: &str = "http://rdfs.org/ns/void#subset";
 const VOID_CLASS: &str = "http://rdfs.org/ns/void#class";
 const VOID_PROPERTY: &str = "http://rdfs.org/ns/void#property";
 const VOID_TRIPLES: &str = "http://rdfs.org/ns/void#triples";
@@ -64,85 +62,26 @@ pub struct Args {
     pub dataset_iri: Option<String>,
 }
 
-#[derive(Debug)]
-struct Component {
-    id: String,
-    role: String,
-    hdt: PathBuf,
-    iri: String,
-    void_nt: PathBuf,
-}
-
-fn read_components(bundle: &Path, staging: &Path, dataset_iri: &str) -> Result<Vec<Component>> {
+fn reject_declared_components(bundle: &Path) -> Result<()> {
     let path = bundle.join(artifact::MANIFEST);
     let document: Value = serde_json::from_slice(
         &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
     )
     .with_context(|| format!("parsing {}", path.display()))?;
     let Some(entries) = document.get("components") else {
-        return Ok(Vec::new());
+        return Ok(());
     };
     let entries = entries
         .as_array()
         .context("manifest components must be an array")?;
-    let mut components = Vec::with_capacity(entries.len());
-    for (index, entry) in entries.iter().enumerate() {
-        let entry = entry
-            .as_object()
-            .with_context(|| format!("manifest component {index} must be an object"))?;
-        let id = entry
-            .get("id")
-            .and_then(Value::as_str)
-            .with_context(|| format!("manifest component {index} has no string id"))?;
-        ensure!(
-            !id.is_empty() && !id.contains(['\t', '\r', '\n']),
-            "manifest component id {id:?} is not safe in a TSV view name"
-        );
-        let mut path_parts = Path::new(id).components();
-        ensure!(
-            matches!(path_parts.next(), Some(std::path::Component::Normal(part)) if part == id)
-                && path_parts.next().is_none(),
-            "manifest component id {id:?} is not a single safe path segment"
-        );
-        let role = entry
-            .get("role")
-            .and_then(Value::as_str)
-            .with_context(|| format!("manifest component {id:?} has no string role"))?;
-        let hdt = bundle.join("components").join(format!("{id}.hdt"));
-        ensure!(
-            hdt.is_file(),
-            "published manifest component {id:?} has no {}",
-            hdt.display()
-        );
-        let digest = Sha256::digest(id.as_bytes());
-        components.push(Component {
-            id: id.to_owned(),
-            role: role.to_owned(),
-            hdt,
-            iri: format!("{dataset_iri}#kgf-component-{digest:x}"),
-            void_nt: staging.join(format!("component-{index}.nt")),
-        });
-    }
-    components.sort_by(|a, b| a.id.cmp(&b.id));
-    for pair in components.windows(2) {
-        ensure!(
-            pair[0].id != pair[1].id,
-            "duplicate component id {:?}",
-            pair[0].id
-        );
-    }
-    let sources = components
-        .iter()
-        .filter(|component| component.role == "source")
-        .count();
     ensure!(
-        sources == 1,
-        "a component bundle needs exactly one role=source design component, found {sources}"
+        entries.is_empty(),
+        "kgf build stats does not yet support component bundles; the full `kgf build` must bind each manifest component to its declared artifact, graph identity, checksum, and entailment regime"
     );
-    Ok(components)
+    Ok(())
 }
 
-/// Build and atomically publish a bundle's complete description set.
+/// Build and publish a bundle's complete description set.
 pub fn run(args: Args) -> Result<()> {
     let bundle = args
         .bundle
@@ -169,6 +108,7 @@ pub fn run(args: Args) -> Result<()> {
         .context("a stable dataset IRI is required; pass --dataset-iri or record dataset_iri in manifest.json")?;
     oxrdf::NamedNode::new(&dataset_iri)
         .with_context(|| format!("dataset IRI {dataset_iri:?} is not an absolute RDF IRI"))?;
+    reject_declared_components(&bundle)?;
 
     for table in &args.prefix_tables {
         ensure!(
@@ -193,9 +133,6 @@ pub fn run(args: Args) -> Result<()> {
     let staged_stats = staging.path().join("stats");
     std::fs::create_dir(&staged_stats)
         .with_context(|| format!("creating {}", staged_stats.display()))?;
-    let components = read_components(&bundle, staging.path(), &dataset_iri)?;
-
-    let queryable_nt = staging.path().join("queryable.nt");
     let void_nt = staging.path().join("void.nt");
     run_hdtc(
         &args.hdtc,
@@ -206,44 +143,10 @@ pub fn run(args: Args) -> Result<()> {
             OsString::from("--dataset-uri"),
             OsString::from(&dataset_iri),
             OsString::from("--output"),
-            queryable_nt.as_os_str().to_owned(),
+            void_nt.as_os_str().to_owned(),
             OsString::from("--quiet"),
         ],
     )?;
-    let design_iri = if components.is_empty() {
-        // A componentless bundle publishes one graph, not an inferred component.
-        // It is both the designed and queryable view, so both selector-index
-        // views point at this genuine dataset root. Minting a second VoID
-        // dataset here would turn an implementation alias into false RDF.
-        dataset_iri.clone()
-    } else {
-        for component in &components {
-            run_hdtc(
-                &args.hdtc,
-                &format!("component {} VoID analysis", component.id),
-                vec![
-                    OsString::from("void"),
-                    component.hdt.as_os_str().to_owned(),
-                    OsString::from("--dataset-uri"),
-                    OsString::from(&component.iri),
-                    OsString::from("--output"),
-                    component.void_nt.as_os_str().to_owned(),
-                    OsString::from("--quiet"),
-                ],
-            )?;
-        }
-        components
-            .iter()
-            .find(|component| component.role == "source")
-            .expect("read_components requires one source component")
-            .iri
-            .clone()
-    };
-    let descriptions = components
-        .iter()
-        .map(|component| (component.iri.as_str(), component.void_nt.as_path()))
-        .collect::<Vec<_>>();
-    combine_void(&queryable_nt, &descriptions, &void_nt, &dataset_iri)?;
 
     let void_hdt = staged_stats.join("void.hdt");
     run_hdtc(
@@ -269,39 +172,24 @@ pub fn run(args: Args) -> Result<()> {
     let triples = read_ntriples(&void_nt)?;
     let graph = VoidGraph::new(&triples);
     let root = NamedOrBlankNode::NamedNode(oxrdf::NamedNode::new(&dataset_iri)?);
-    let design_root = NamedOrBlankNode::NamedNode(oxrdf::NamedNode::new(&design_iri)?);
     graph.require_dataset_root(&root)?;
-    graph.require_dataset_root(&design_root)?;
     let subject_ids = subject_ids(&void_hdt)?;
     let queryable = graph.project(&root, &subject_ids)?;
-    let design = graph.project(&design_root, &subject_ids)?;
-    let component_projections = components
-        .iter()
-        .map(|component| {
-            let root = NamedOrBlankNode::NamedNode(oxrdf::NamedNode::new(&component.iri)?);
-            Ok((
-                format!("component:{}", component.id),
-                graph.project(&root, &subject_ids)?,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut schema_views = vec![
+    // A componentless bundle has one real graph. `design` and `queryable`
+    // are API aliases for that same root, not distinct RDF datasets.
+    let design = graph.project(&root, &subject_ids)?;
+    let schema_views = vec![
         ("design", design.schema.as_slice()),
         ("queryable", queryable.schema.as_slice()),
     ];
-    let mut relation_views = vec![
+    let relation_views = vec![
         ("design", design.relations.as_slice()),
         ("queryable", queryable.relations.as_slice()),
     ];
-    let mut class_property_views = vec![
+    let class_property_views = vec![
         ("design", design.class_properties.as_slice()),
         ("queryable", queryable.class_properties.as_slice()),
     ];
-    for (view, projection) in &component_projections {
-        schema_views.push((view.as_str(), projection.schema.as_slice()));
-        relation_views.push((view.as_str(), projection.relations.as_slice()));
-        class_property_views.push((view.as_str(), projection.class_properties.as_slice()));
-    }
     let schema_row_count = schema_views
         .iter()
         .map(|(_, rows)| rows.len())
@@ -325,6 +213,7 @@ pub fn run(args: Args) -> Result<()> {
     )?;
 
     let manifest_prefixes = staging.path().join("manifest-prefixes.json");
+    let prefix_source = prefix_table_source(&args.prefix_tables, !manifest.prefixes.is_empty());
     let mut namespace_tables = args.prefix_tables;
     if !manifest.prefixes.is_empty() {
         write(
@@ -353,16 +242,24 @@ pub fn run(args: Args) -> Result<()> {
             .with_context(|| format!("reading {}", namespaces_path.display()))?,
     )
     .with_context(|| format!("parsing {}", namespaces_path.display()))?;
-    let source = if manifest.prefixes.is_empty() {
-        "kgf build: curated prefix tables"
-    } else {
-        "kgf build: curated prefix tables + manifest overrides"
-    };
-    namespaces
+    let prefix_table = namespaces
         .get_mut("prefix_table")
         .and_then(Value::as_object_mut)
-        .context("hdtc namespace inventory has no prefix_table object")?
-        .insert("source".to_owned(), Value::String(source.to_owned()));
+        .context("hdtc namespace inventory has no prefix_table object")?;
+    let emitted_source = prefix_table
+        .get("source")
+        .and_then(Value::as_str)
+        .context("hdtc namespace inventory has no prefix_table.source string")?;
+    let emitted_expected = namespace_tables
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" + ");
+    ensure!(
+        emitted_source == emitted_expected,
+        "hdtc namespace inventory reported unexpected prefix provenance {emitted_source:?}; expected {emitted_expected:?}"
+    );
+    prefix_table.insert("source".to_owned(), Value::String(prefix_source));
     write(&namespaces_path, &serde_json::to_vec_pretty(&namespaces)?)?;
 
     let summary = Summary::new(&manifest, &dataset_iri, &graph, &root, &design, namespaces);
@@ -404,30 +301,15 @@ fn write(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
 }
 
-fn combine_void(
-    queryable: &Path,
-    descriptions: &[(&str, &Path)],
-    output: &Path,
-    queryable_iri: &str,
-) -> Result<()> {
-    let mut bytes =
-        std::fs::read(queryable).with_context(|| format!("reading {}", queryable.display()))?;
-    if !bytes.ends_with(b"\n") {
-        bytes.push(b'\n');
+fn prefix_table_source(paths: &[PathBuf], manifest_overrides: bool) -> String {
+    let mut sources = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if manifest_overrides {
+        sources.push("manifest.json#prefixes".to_owned());
     }
-    for (description_iri, description) in descriptions {
-        bytes.extend_from_slice(
-            format!("<{queryable_iri}> <{VOID_SUBSET}> <{description_iri}> .\n").as_bytes(),
-        );
-        bytes.extend_from_slice(
-            &std::fs::read(description)
-                .with_context(|| format!("reading {}", description.display()))?,
-        );
-        if !bytes.ends_with(b"\n") {
-            bytes.push(b'\n');
-        }
-    }
-    write(output, &bytes)
+    sources.join(" + ")
 }
 
 fn publish(

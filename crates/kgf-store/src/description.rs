@@ -1596,6 +1596,9 @@ mod tests {
     const VERIFIED_VOID_NT: &str = concat!(
         "<https://example.org/queryable> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
         "<https://example.org/queryable> <http://rdfs.org/ns/void#triples> \"100\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+        "<https://example.org/queryable> <http://rdfs.org/ns/void#distinctSubjects> \"10\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+        "<https://example.org/queryable> <http://rdfs.org/ns/void#distinctObjects> \"20\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+        "<https://example.org/queryable> <http://rdfs.org/ns/void#properties> \"2\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
         "<https://example.org/design> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://rdfs.org/ns/void#Dataset> .\n",
         "<https://example.org/design> <http://rdfs.org/ns/void#triples> \"100\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
         "<https://example.org/design> <http://rdfs.org/ns/void#distinctSubjects> \"10\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
@@ -1786,6 +1789,9 @@ mod tests {
         ] {
             artifacts.insert(name.to_owned(), checksum_entry(&bundle.join(name)));
         }
+        artifacts.get_mut(artifact::VOID_HDT).unwrap().parents = vec![artifact::HDT.to_owned()];
+        artifacts.get_mut(artifact::VOID_PERM).unwrap().parents =
+            vec![artifact::VOID_HDT.to_owned()];
         artifacts.insert(
             artifact::SCHEMA_NODES.to_owned(),
             tsv_entry(schema.len() as u64, schema_max, schema_views),
@@ -1905,7 +1911,7 @@ mod tests {
     }
 
     fn publish_verified_description(fixture: &Fixture) {
-        let (ids, triples, counts) = {
+        let ids = {
             let indexed = IndexedHdt::open(fixture.map_hdt(), fixture.map_perm()).unwrap();
             let dictionary = indexed.dict();
             let subject = |term: &[u8]| {
@@ -1915,19 +1921,15 @@ mod tests {
                     .expect("VoID fixture subject")
                     .0
             };
-            (
-                [
-                    subject(b"https://example.org/queryable"),
-                    subject(b"https://example.org/design"),
-                    subject(b"https://example.org/class-a"),
-                    subject(b"https://example.org/root-property"),
-                    subject(b"https://example.org/property-p"),
-                    subject(b"https://example.org/datatype-type"),
-                    subject(b"https://example.org/datatype-language"),
-                ],
-                indexed.triples(),
-                *indexed.dict_counts(),
-            )
+            [
+                subject(b"https://example.org/queryable"),
+                subject(b"https://example.org/design"),
+                subject(b"https://example.org/class-a"),
+                subject(b"https://example.org/root-property"),
+                subject(b"https://example.org/property-p"),
+                subject(b"https://example.org/datatype-type"),
+                subject(b"https://example.org/datatype-language"),
+            ]
         };
 
         let mut schema = SCHEMA_NODES_HEADER.to_vec();
@@ -2028,6 +2030,9 @@ mod tests {
         ] {
             artifacts.insert(name.to_owned(), checksum_entry(&bundle.join(name)));
         }
+        artifacts.get_mut(artifact::VOID_HDT).unwrap().parents = vec![artifact::HDT.to_owned()];
+        artifacts.get_mut(artifact::VOID_PERM).unwrap().parents =
+            vec![artifact::VOID_HDT.to_owned()];
         artifacts.insert(
             artifact::SCHEMA_NODES.to_owned(),
             tsv_entry(schema.len() as u64, max_complete_row(&schema), schema_views),
@@ -2061,10 +2066,10 @@ mod tests {
             homepage: None,
             publisher: None,
             counts: Counts {
-                triples,
-                subjects: counts.len(Role::Subject),
-                predicates: counts.len(Role::Predicate),
-                objects: counts.len(Role::Object),
+                triples: 100,
+                subjects: 10,
+                predicates: 2,
+                objects: 20,
             },
             capabilities: BTreeMap::new(),
             prefixes: BTreeMap::new(),
@@ -2808,6 +2813,23 @@ mod tests {
             .expect_err("publication proof must reject an invalid served count");
         assert!(
             error.to_string().contains("is not unsigned"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn publication_proof_binds_queryable_void_totals_to_manifest_counts() {
+        let fixture = Fixture::build(VERIFIED_VOID_NT);
+        publish_verified_description(&fixture);
+        let mut manifest = Manifest::read(fixture.bundle_path()).unwrap();
+        manifest.counts.triples += 1;
+        let published = published_bundle(fixture.bundle_path());
+        let error = verify_description_artifacts(&published, &manifest)
+            .expect_err("stale queryable VoID totals must fail publication proof");
+        assert!(
+            error.to_string().contains(
+                "queryable dataset root records 100 triples, but manifest counts.triples records 101"
+            ),
             "unexpected error: {error}"
         );
     }
