@@ -479,7 +479,7 @@ pub enum ErrorCode {
     UnsupportedMediaType,
     /// A request body exceeds `max_request_bytes` (§3.5).
     PayloadTooLarge,
-    /// The caller's rate-limit bucket is empty (§3.6).
+    /// The server's current rate or concurrent-work capacity is exhausted (§3.6).
     RateLimited,
     /// The bundle does not offer what the request needs (§3.4, §3.7).
     CapabilityNotAvailable,
@@ -618,6 +618,7 @@ pub struct Problem {
     code: ErrorCode,
     detail: String,
     instance: Option<String>,
+    retry_after_seconds: Option<u64>,
 }
 
 impl Problem {
@@ -632,7 +633,19 @@ impl Problem {
             code,
             detail: detail.into(),
             instance: None,
+            retry_after_seconds: None,
         }
+    }
+
+    /// Tell a client when an otherwise retryable problem may be tried again.
+    ///
+    /// This is HTTP response metadata rather than a problem-document field, so
+    /// serialization deliberately omits it; [`crate::routes`] emits it as
+    /// `Retry-After`. Kept on the problem so every negotiated rendering of the
+    /// same failure carries the same retry advice.
+    pub fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after_seconds = Some(seconds);
+        self
     }
 
     /// Attach the request URI this problem is about (RFC 9457 `instance`).
@@ -662,6 +675,11 @@ impl Problem {
     /// The HTTP status to send this with.
     pub fn status(&self) -> u16 {
         self.code.status()
+    }
+
+    /// Seconds to emit in `Retry-After`, when this failure is retryable.
+    pub fn retry_after_seconds(&self) -> Option<u64> {
+        self.retry_after_seconds
     }
 }
 

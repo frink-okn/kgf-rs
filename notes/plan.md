@@ -1335,6 +1335,34 @@ rows across its design/queryable views; the resulting `/void`, `/summary`, and p
 that a component manifest is refused without creating `stats/` or rewriting the
 manifest, so provisional path and RDF-identity conventions cannot leak into bundles.
 
+### Operational admission control ✅
+
+The first 41-KG load pass confirmed concurrent reads and lazy mappings, and exposed
+the host-level bound that per-request caps do not provide: an unlimited number of
+individually bounded requests can still multiply candidate heaps, response buffers,
+blocking threads, and simultaneous page faults without limit. Bundle work now enters
+one fair weighted semaphore before `spawn_blocking`. Ordinary reads consume one of 32
+default work units; candidate-sized or random-I/O operations consume four, admitting
+up to eight heavy requests together. Text fragment/count, search, sample, filtered
+schema projections, VoID serialization, and body operations are the initial heavy
+class. The four numbers are deployment configuration, exposed as `kgf serve` flags
+rather than protocol constants.
+
+Waiting has its own bound: 128 requests may wait for at most 500 ms by default.
+Anything beyond either bound receives doc 03 §3.6.1's `429 rate_limited`,
+`Cache-Control: no-store`, and an integer `Retry-After`; it receives no completeness
+envelope or cursor because no query work began. Negotiation, parameter parsing,
+capability checks, and conditional revalidation all stay ahead of admission, so a bad
+request or a 304 consumes no bundle-work capacity. The owned permit moves into the
+blocking task itself: a disconnected client cannot release capacity early, because
+Tokio cannot cancel blocking work after it starts; the permit drops only when that
+work actually finishes.
+
+*Verified by* direct async tests for weighted capacity, a full waiting room, queue
+timeout, permit release, and startup refusal of impossible weights; request-class
+tests over ordinary/text fragments, sampling, and filtered/unfiltered schema; and a
+response test pinning `429`, `rate_limited`, and `Retry-After` together.
+
 ### What the implementation still is not
 
 **M1 is a strict subset of doc 03 §3.1's mandatory core profile.** That profile is

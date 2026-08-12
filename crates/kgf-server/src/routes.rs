@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Request, State};
-use axum::http::header::{ACCEPT, ALLOW, CONTENT_TYPE, LOCATION, VARY};
+use axum::http::header::{ACCEPT, ALLOW, CONTENT_TYPE, LOCATION, RETRY_AFTER, VARY};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -43,6 +43,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::Limits;
+use crate::admission::WorkClass;
 use crate::answer::{self, Rendered, Renders, Target};
 use crate::descriptor::{BundleManifest, DatasetDescriptor, ServiceDescriptor};
 use crate::envelope::{ErrorCode, PROBLEM_MEDIA_TYPE, Problem, reflected};
@@ -249,7 +250,10 @@ async fn bundle_manifest(
     // blocking boundary at all.
     let id = BundleId { dataset, version };
     let opened = Arc::clone(&service);
-    blocking(move || opened.open(&id).map(|_| ())).await?;
+    blocking(&service, WorkClass::Ordinary, move || {
+        opened.open(&id).map(|_| ())
+    })
+    .await?;
 
     respond(
         &resource,
@@ -779,6 +783,7 @@ where
     let release = service.datasets().release(&id.dataset, &id.version)?;
     let params = Q::normalize_params(wants.params());
     let request = parse(&params, service.config().limits(), release)?;
+    let work_class = request.work_class();
 
     // A versioned operation is a deterministic function of immutable bytes
     // (doc 04 §4.6), so the URL and the representation fix the response
@@ -807,7 +812,7 @@ where
         request.labels_requested(),
     );
     let opened = Arc::clone(&service);
-    let rendered = blocking(move || {
+    let rendered = blocking(&service, work_class, move || {
         let store = opened.open(target.id())?;
         // Serialized in here, not outside: doc 20 §20.5 materializes strings
         // only while writing them, and the term cache that makes that cheap is
@@ -843,6 +848,7 @@ where
     let release = service.datasets().release(&id.dataset, &id.version)?;
     let params = Q::normalize_params(wants.params());
     let request = parse(&params, service.config().limits(), release)?;
+    let work_class = request.work_class();
     let validator = etag(
         release.digest(),
         service.descriptor_digest(),
@@ -860,7 +866,7 @@ where
         release.declares(Capability::Search),
     );
     let opened = Arc::clone(&service);
-    let rendered = blocking(move || {
+    let rendered = blocking(&service, work_class, move || {
         let store = opened.open(target.id())?;
         execute(&store, target, &request, representation)
     })
@@ -993,7 +999,7 @@ where
     );
     let labels = PageLabelProfile::for_request(&service, release, representation, false);
     let opened = Arc::clone(&service);
-    let rendered = blocking(move || {
+    let rendered = blocking(&service, WorkClass::Heavy, move || {
         let store = opened.open(target.id())?;
         let mut answer = execute(&store, target, &request)?;
         labels.hydrate(&store, &mut answer)?;
@@ -1327,6 +1333,13 @@ impl IntoResponse for Problem {
             StatusCode::from_u16(self.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let mut response = Response::new(Body::empty());
         *response.status_mut() = status;
+        if let Some(seconds) = self.retry_after_seconds() {
+            response.headers_mut().insert(
+                RETRY_AFTER,
+                HeaderValue::from_str(&seconds.to_string())
+                    .expect("an integer number of seconds is a valid Retry-After value"),
+            );
+        }
         response.extensions_mut().insert(self);
         response
     }
@@ -1436,12 +1449,22 @@ fn unattributed_error(response: &Response) -> Option<Problem> {
 /// convention for a path that is not built, so an unimplemented operation
 /// reached by a client should answer `internal_error` and log, not look like a
 /// network failure.
-async fn blocking<T, F>(work: F) -> Result<T, Problem>
+async fn blocking<T, F>(service: &Service, class: WorkClass, work: F) -> Result<T, Problem>
 where
     F: FnOnce() -> Result<T, Problem> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::task::spawn_blocking(work).await {
+    let admitted = service.admission().enter(class).await?;
+    match tokio::task::spawn_blocking(move || {
+        // A blocking task cannot be cancelled after it starts. Keep its
+        // capacity in the task itself, so a disconnected client dropping the
+        // awaiting handler does not admit replacement work while this work is
+        // still faulting pages or building a response.
+        let _admitted = admitted;
+        work()
+    })
+    .await
+    {
         Ok(result) => result,
         Err(error) => {
             tracing::error!(%error, "a request panicked on the blocking pool");
@@ -1472,6 +1495,19 @@ mod tests {
         assert!(
             response.extensions().get::<Problem>().is_some(),
             "the middleware has nothing to render without it"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_tells_the_client_when_to_retry() {
+        let response = Problem::new(ErrorCode::RateLimited, "busy")
+            .with_retry_after(2)
+            .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[RETRY_AFTER], "2");
+        assert_eq!(
+            response.extensions().get::<Problem>().map(Problem::code),
+            Some(ErrorCode::RateLimited)
         );
     }
 }

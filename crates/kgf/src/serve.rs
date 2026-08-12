@@ -28,7 +28,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use kgf_server::Config;
+use kgf_server::{Admission, Config};
 use kgf_store::map::PublishedRoot;
 
 /// Arguments for `kgf serve`.
@@ -41,11 +41,33 @@ pub struct Args {
     /// Address to bind. Port 0 binds an ephemeral port, logged at startup.
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub bind: SocketAddr,
+
+    /// Concurrent ordinary bundle-work units; heavy requests consume multiple units.
+    #[arg(long, default_value_t = 32)]
+    pub max_concurrent_work: u32,
+
+    /// Work units consumed by search, sample, and other candidate-heavy requests.
+    #[arg(long, default_value_t = 4)]
+    pub heavy_request_weight: u32,
+
+    /// Requests allowed to wait after all concurrent-work units are occupied.
+    #[arg(long, default_value_t = 128)]
+    pub max_queued_requests: u32,
+
+    /// Milliseconds a queued request waits before receiving HTTP 429.
+    #[arg(long, default_value_t = 500)]
+    pub queue_timeout_ms: u64,
 }
 
 /// Serve until Ctrl-C or `SIGTERM`.
 pub fn run(args: Args) -> Result<()> {
-    let config = Config::new(published_root(&args.bundle_root)?, args.bind);
+    let mut config = Config::new(published_root(&args.bundle_root)?, args.bind);
+    config.admission = Admission {
+        max_concurrent_work: args.max_concurrent_work,
+        heavy_request_weight: args.heavy_request_weight,
+        max_queued_requests: args.max_queued_requests,
+        queue_timeout_ms: args.queue_timeout_ms,
+    };
 
     // A current-thread runtime would serialize every request behind the one
     // that is faulting a page. The blocking pool that store work runs on is

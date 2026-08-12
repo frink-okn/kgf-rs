@@ -56,6 +56,7 @@ use kgf_store::manifest::{
 use kgf_store::store::{OpenOptions, Store, artifact};
 
 use crate::Config;
+use crate::admission::AdmissionController;
 use crate::cursor::BundleBinding;
 use crate::envelope::{ErrorCode, Problem, reflected};
 use crate::representation::ContentDigest;
@@ -95,6 +96,7 @@ pub struct Service {
     catalog: Catalog,
     datasets: Datasets,
     descriptors: ContentDigest,
+    admission: AdmissionController,
 }
 
 impl Service {
@@ -113,6 +115,10 @@ impl Service {
             .limits()
             .validate()
             .map_err(|detail| ServiceError::Configuration { detail })?;
+        config
+            .admission
+            .validate()
+            .map_err(|detail| ServiceError::Configuration { detail })?;
         let catalog = Catalog::scan(config.bundle_root.clone(), OpenOptions::default())?;
         let mut manifests = Vec::new();
         for id in catalog.ids() {
@@ -128,11 +134,13 @@ impl Service {
         let datasets = Datasets::derive(manifests)?;
         datasets.validate_profile_caps(config.caps.max_search_predicates)?;
         let descriptors = descriptor_digest(&config, &datasets);
+        let admission = AdmissionController::new(config.admission);
         Ok(Self {
             config,
             catalog,
             datasets,
             descriptors,
+            admission,
         })
     }
 
@@ -157,6 +165,11 @@ impl Service {
     /// The datasets and their releases.
     pub fn datasets(&self) -> &Datasets {
         &self.datasets
+    }
+
+    /// Deployment-wide active-work and waiting-room gate.
+    pub(crate) fn admission(&self) -> &AdmissionController {
+        &self.admission
     }
 
     /// Open a bundle, or say why this request cannot be answered.

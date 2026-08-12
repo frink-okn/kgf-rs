@@ -36,7 +36,7 @@ tempfile = "3"
 # QUERY support: hyper parses the extension method and axum routes it through
 # the custom-method fallback used by the body-carrying operations.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "original-uri"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros", "sync", "time"] }
 tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
 # hyperium's typed headers: ETag, If-None-Match's RFC 9110 §13.1.2 comparison,
 # and Cache-Control. Already in axum's tree through axum-extra.

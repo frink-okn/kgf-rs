@@ -47,6 +47,7 @@ use kgf_store::{
 };
 
 use crate::Limits;
+use crate::admission::WorkClass;
 use crate::cursor::{
     BundleBinding, CanonicalRequest, Cursor, CursorBinding, Operation, StaleCursor,
 };
@@ -2056,6 +2057,11 @@ pub(crate) trait GetRequest {
     fn labels_requested(&self) -> bool {
         false
     }
+
+    /// Host admission class for the work this parsed request will perform.
+    fn work_class(&self) -> WorkClass {
+        WorkClass::Ordinary
+    }
 }
 
 /// Empty triple positions are unbound; `additional` names the operation's
@@ -2073,11 +2079,27 @@ impl GetRequest for Fragment {
     fn normalize_params(params: &Params) -> Params {
         normalize_pattern_params(params, &["o.text", "limit"])
     }
+
+    fn work_class(&self) -> WorkClass {
+        if self.pattern.text().is_some() {
+            WorkClass::Heavy
+        } else {
+            WorkClass::Ordinary
+        }
+    }
 }
 
 impl GetRequest for Count {
     fn normalize_params(params: &Params) -> Params {
         normalize_pattern_params(params, &["o.text"])
+    }
+
+    fn work_class(&self) -> WorkClass {
+        if self.pattern.text().is_some() {
+            WorkClass::Heavy
+        } else {
+            WorkClass::Ordinary
+        }
     }
 }
 
@@ -2104,11 +2126,32 @@ impl GetRequest for Schema {
     fn labels_requested(&self) -> bool {
         self.labels
     }
+
+    fn work_class(&self) -> WorkClass {
+        let filtered_projection = match &self.query {
+            SchemaQuery::ClassRelations(filter) => {
+                filter.class.is_some() || filter.predicate.is_some()
+            }
+            SchemaQuery::ClassProperties(filter) => {
+                filter.class.is_some() || filter.predicate.is_some()
+            }
+            SchemaQuery::Node(_) | SchemaQuery::Children(_) => false,
+        };
+        if filtered_projection {
+            WorkClass::Heavy
+        } else {
+            WorkClass::Ordinary
+        }
+    }
 }
 
 impl GetRequest for Void {
     fn normalize_params(params: &Params) -> Params {
         params.clone()
+    }
+
+    fn work_class(&self) -> WorkClass {
+        WorkClass::Heavy
     }
 }
 
@@ -2122,11 +2165,19 @@ impl GetRequest for Sample {
     fn normalize_params(params: &Params) -> Params {
         normalize_pattern_params(params, &["n", "seed"])
     }
+
+    fn work_class(&self) -> WorkClass {
+        WorkClass::Heavy
+    }
 }
 
 impl GetRequest for Search {
     fn normalize_params(params: &Params) -> Params {
         params.without_empty(&["role", "predicate", "limit"])
+    }
+
+    fn work_class(&self) -> WorkClass {
+        WorkClass::Heavy
     }
 }
 
@@ -2413,6 +2464,31 @@ mod tests {
 
     fn binding_fragment(body: &[u8]) -> Result<BindingFragment, Problem> {
         BindingFragment::parse(&params(""), body, limits(), &prefixes(), &bundle())
+    }
+
+    #[test]
+    fn candidate_and_random_access_requests_are_admitted_as_heavy_work() {
+        assert_eq!(fragment("").unwrap().work_class(), WorkClass::Ordinary);
+        assert_eq!(
+            fragment("o.text=atrazine").unwrap().work_class(),
+            WorkClass::Heavy
+        );
+        assert_eq!(
+            Sample::parse(&params("n=1000"), limits(), &prefixes())
+                .unwrap()
+                .work_class(),
+            WorkClass::Heavy
+        );
+        assert_eq!(
+            schema("projection=class-relations").unwrap().work_class(),
+            WorkClass::Ordinary
+        );
+        assert_eq!(
+            schema("projection=class-relations&class=ex%3AClass")
+                .unwrap()
+                .work_class(),
+            WorkClass::Heavy
+        );
     }
 
     #[test]

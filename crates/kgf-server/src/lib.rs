@@ -37,6 +37,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod admission;
 pub mod answer;
 pub mod cursor;
 pub mod descriptor;
@@ -57,11 +58,15 @@ use serde::Serialize;
 
 use crate::service::Service;
 
+pub use admission::Admission;
+
 /// Server configuration.
 ///
-/// Also the document published at `/`: doc 03 §3.1 tells clients to read the
-/// caps and budgets rather than assume them, which is only true if the values
-/// they read are the values applied.
+/// Its caps and budgets are also published at `/`: doc 03 §3.1 tells clients
+/// to read those values rather than assume them, which is only true if the
+/// values they read are the values applied. Admission is host policy rather
+/// than a per-request cost promise; clients encounter it through the standard
+/// `rate_limited` problem and `Retry-After`.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Directory of bundles, laid out as `{root}/{dataset}/{version}`.
@@ -78,6 +83,8 @@ pub struct Config {
     pub caps: Caps,
     /// The work one response may cost (doc 03 §3.5).
     pub budgets: Budgets,
+    /// Deployment-wide admission limits for active and waiting bundle work.
+    pub admission: Admission,
 }
 
 impl Config {
@@ -89,6 +96,7 @@ impl Config {
             bind,
             caps: Caps::default(),
             budgets: Budgets::default(),
+            admission: Admission::default(),
         }
     }
 
@@ -318,6 +326,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     tracing::info!(
         address = %listener.local_addr()?,
         datasets = service.datasets().names().len(),
+        max_concurrent_work = service.config().admission.max_concurrent_work,
+        heavy_request_weight = service.config().admission.heavy_request_weight,
+        max_queued_requests = service.config().admission.max_queued_requests,
+        queue_timeout_ms = service.config().admission.queue_timeout_ms,
         "serving",
     );
     serve_on(listener, service, shutdown_signal()).await
