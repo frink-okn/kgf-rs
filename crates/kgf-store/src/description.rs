@@ -1653,7 +1653,7 @@ mod tests {
 
     const RICH_NAMESPACES_JSON: &str = concat!(
         "{\n",
-        "  \"prefix_table\": {\"source\": \"registry.yaml + overrides.json\", ",
+        "  \"prefix_table\": {",
         "\"version\": \"sha256:1111111111111111111111111111111111111111111111111111111111111111\"},\n",
         "  \"roles\": {\n",
         "    \"subject\": {\"distinct_iris\": 2, \"matched\": 2, \"residual\": 0},\n",
@@ -2219,8 +2219,8 @@ mod tests {
 
         let inventory = description.namespace_inventory().unwrap();
         assert_eq!(
-            inventory.prefix_table().source(),
-            "registry.yaml + overrides.json"
+            inventory.prefix_table().version(),
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111"
         );
         assert_eq!(inventory.roles().subject().distinct_iris(), 2);
         assert_eq!(inventory.roles().object().residual(), 1);

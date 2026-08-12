@@ -53,7 +53,7 @@ pub struct Args {
     #[arg(long, default_value = "hdtc")]
     pub hdtc: PathBuf,
 
-    /// Curated prefix table; repeat to layer tables, with later files winning.
+    /// Prefix table; repeat to layer tables, with later files winning.
     #[arg(long = "prefixes", value_name = "TABLE", required = true)]
     pub prefix_tables: Vec<PathBuf>,
 
@@ -213,7 +213,6 @@ pub fn run(args: Args) -> Result<()> {
     )?;
 
     let manifest_prefixes = staging.path().join("manifest-prefixes.json");
-    let prefix_source = prefix_table_source(&args.prefix_tables, !manifest.prefixes.is_empty());
     let mut namespace_tables = args.prefix_tables;
     if !manifest.prefixes.is_empty() {
         write(
@@ -246,20 +245,10 @@ pub fn run(args: Args) -> Result<()> {
         .get_mut("prefix_table")
         .and_then(Value::as_object_mut)
         .context("hdtc namespace inventory has no prefix_table object")?;
-    let emitted_source = prefix_table
-        .get("source")
-        .and_then(Value::as_str)
-        .context("hdtc namespace inventory has no prefix_table.source string")?;
-    let emitted_expected = namespace_tables
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(" + ");
-    ensure!(
-        emitted_source == emitted_expected,
-        "hdtc namespace inventory reported unexpected prefix provenance {emitted_source:?}; expected {emitted_expected:?}"
-    );
-    prefix_table.insert("source".to_owned(), Value::String(prefix_source));
+    // hdtc records its input paths for build diagnostics. Those paths are not
+    // content and would make otherwise identical bundles machine-dependent.
+    // The merged map's version digest is the published prefix-table identity.
+    prefix_table.remove("source");
     write(&namespaces_path, &serde_json::to_vec_pretty(&namespaces)?)?;
 
     let summary = Summary::new(&manifest, &dataset_iri, &graph, &root, &design, namespaces);
@@ -299,17 +288,6 @@ fn run_hdtc(hdtc: &Path, step: &str, args: Vec<OsString>) -> Result<()> {
 
 fn write(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
-}
-
-fn prefix_table_source(paths: &[PathBuf], manifest_overrides: bool) -> String {
-    let mut sources = paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>();
-    if manifest_overrides {
-        sources.push("manifest.json#prefixes".to_owned());
-    }
-    sources.join(" + ")
 }
 
 fn publish(

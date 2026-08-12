@@ -41,12 +41,6 @@ impl<'a> NamespaceInventory<'a> {
     }
 
     fn validate(&self, path: &Path) -> Result<()> {
-        if self.prefix_table.source().is_empty() {
-            return Err(malformed(
-                path,
-                "prefix_table.source must not be empty".to_owned(),
-            ));
-        }
         if !is_sha256(self.prefix_table.version()) {
             return Err(malformed(
                 path,
@@ -144,21 +138,14 @@ impl<'a> NamespaceInventory<'a> {
     }
 }
 
-/// Provenance and stable content identity of the counted prefix map.
+/// Stable content identity of the counted prefix map.
 #[derive(Debug, Deserialize)]
 pub struct PrefixTableIdentity<'a> {
-    #[serde(borrow)]
-    source: Cow<'a, str>,
     #[serde(borrow)]
     version: Cow<'a, str>,
 }
 
 impl PrefixTableIdentity<'_> {
-    /// Informational producer-supplied source label.
-    pub fn source(&self) -> &str {
-        &self.source
-    }
-
     /// Lowercase `sha256:` identity of the fully merged prefix map.
     pub fn version(&self) -> &str {
         &self.version
@@ -330,7 +317,7 @@ mod tests {
     const PATH: &str = "stats/namespaces.json";
     const ONE_NAMESPACE: &str = concat!(
         "{",
-        "\"prefix_table\":{\"source\":\"registry + override\",",
+        "\"prefix_table\":{",
         "\"version\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},",
         "\"roles\":{",
         "\"subject\":{\"distinct_iris\":2,\"matched\":2,\"residual\":0},",
@@ -344,10 +331,13 @@ mod tests {
     );
 
     #[test]
-    fn hdtc_namespace_shape_parses_into_borrowed_domain_values() {
+    fn namespace_shape_parses_into_borrowed_domain_values() {
         let inventory =
             parse_namespace_inventory(ONE_NAMESPACE.as_bytes(), Path::new(PATH)).unwrap();
-        assert_eq!(inventory.prefix_table().source(), "registry + override");
+        assert_eq!(
+            inventory.prefix_table().version(),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
         assert_eq!(inventory.roles().subject().matched(), 2);
         assert_eq!(inventory.roles().object().residual(), 1);
         let entry = &inventory.namespaces()[0];

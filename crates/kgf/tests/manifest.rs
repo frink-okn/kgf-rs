@@ -207,12 +207,14 @@ fn stats_build_publishes_one_verified_description_set() {
         summary["top_classes"][0]["links"]["schema"],
         "schema?children=properties&class=%3Chttp%3A%2F%2Fexample.org%2FPerson%3E&view=design"
     );
+    assert!(
+        summary["namespaces"]["prefix_table"]
+            .get("source")
+            .is_none()
+    );
     let namespaces: serde_json::Value =
         serde_json::from_slice(&std::fs::read(bundle.join(artifact::NAMESPACES)).unwrap()).unwrap();
-    assert_eq!(
-        namespaces["prefix_table"]["source"],
-        format!("{} + manifest.json#prefixes", prefixes.display())
-    );
+    assert!(namespaces["prefix_table"].get("source").is_none());
     assert!(
         std::fs::read_to_string(bundle.join(artifact::SUMMARY_MD))
             .unwrap()
@@ -264,6 +266,8 @@ fn stats_build_publishes_one_verified_description_set() {
     drop(store);
 
     let before = std::fs::read(bundle.join(artifact::MANIFEST)).unwrap();
+    let relocated_prefixes = root.path().join("relocated-prefixes.json");
+    std::fs::rename(&prefixes, &relocated_prefixes).unwrap();
     kgf(&[
         "build",
         "stats",
@@ -271,11 +275,14 @@ fn stats_build_publishes_one_verified_description_set() {
         "--hdtc",
         path(&hdtc),
         "--prefixes",
-        path(&prefixes),
+        path(&relocated_prefixes),
     ])
     .success();
     let after = std::fs::read(bundle.join(artifact::MANIFEST)).unwrap();
-    assert_eq!(before, after, "stats rebuild is not byte-stable");
+    assert_eq!(
+        before, after,
+        "prefix-table filesystem location changed bundle identity"
+    );
     kgf(&["manifest", path(&bundle), "--check"]).success();
 
     let manifest_path = bundle.join(artifact::MANIFEST);

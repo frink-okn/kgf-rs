@@ -626,7 +626,7 @@ pub(crate) const CLASS_PROPERTIES_HEADER: &[u8] =
 /// Minimal valid namespace inventory shared by cross-crate bundle fixtures.
 pub const NAMESPACES_JSON: &str = concat!(
     "{\n",
-    "  \"prefix_table\": {\"source\": \"fixture\", ",
+    "  \"prefix_table\": {",
     "\"version\": \"sha256:0000000000000000000000000000000000000000000000000000000000000000\"},\n",
     "  \"roles\": {\n",
     "    \"subject\": {\"distinct_iris\": 0, \"matched\": 0, \"residual\": 0},\n",

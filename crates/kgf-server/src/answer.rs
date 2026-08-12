@@ -962,9 +962,6 @@ struct SchemaResource {
     term: Option<SchemaTerm>,
     counts: SchemaCounts,
     links: BTreeMap<&'static str, String>,
-    /// Exact compact-JSON bytes for independent response-budget accounting.
-    #[serde(skip)]
-    serialized: u64,
     /// Raw child offset at which this item begins; absent on the selected node.
     #[serde(skip)]
     position: Option<u64>,
@@ -1065,27 +1062,12 @@ impl SchemaSelectorResource {
     }
 }
 
-impl SchemaResource {
-    fn finish_size(mut self) -> Self {
-        // Schema pages are capped at a much smaller width than triple pages,
-        // and every item has distinct links. Serializing each item once to
-        // weigh it is exact and bounded without a second hand-written encoding
-        // of this richer object shape.
-        self.serialized = serde_json::to_vec(&self)
-            .expect("a schema resource contains only serializable values")
-            .len() as u64;
-        self
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct ClassRelationResource {
     subject_class: SchemaTerm,
     predicate: SchemaTerm,
     object_class: SchemaTerm,
     triples: u64,
-    #[serde(skip)]
-    serialized: u64,
     #[serde(skip)]
     position: u64,
 }
@@ -1100,8 +1082,6 @@ struct ClassPropertyResource {
     #[serde(skip_serializing_if = "Option::is_none")]
     distinct_objects: Option<u64>,
     #[serde(skip)]
-    serialized: u64,
-    #[serde(skip)]
     position: u64,
 }
 
@@ -1114,19 +1094,14 @@ impl ClassPropertyResource {
         distinct_objects: Option<u64>,
         position: u64,
     ) -> Self {
-        let mut resource = Self {
+        Self {
             class: SchemaTerm(Rc::from(class)),
             predicate: SchemaTerm(Rc::from(predicate)),
             triples,
             distinct_subjects,
             distinct_objects,
-            serialized: 0,
             position,
-        };
-        resource.serialized = serde_json::to_vec(&resource)
-            .expect("a class property contains only serializable values")
-            .len() as u64;
-        resource
+        }
     }
 }
 
@@ -1138,18 +1113,13 @@ impl ClassRelationResource {
         triples: u64,
         position: u64,
     ) -> Self {
-        let mut resource = Self {
+        Self {
             subject_class: SchemaTerm(Rc::from(subject_class)),
             predicate: SchemaTerm(Rc::from(predicate)),
             object_class: SchemaTerm(Rc::from(object_class)),
             triples,
-            serialized: 0,
             position,
-        };
-        resource.serialized = serde_json::to_vec(&resource)
-            .expect("a class relation contains only serializable values")
-            .len() as u64;
-        resource
+        }
     }
 }
 
@@ -2235,41 +2205,26 @@ fn schema_children(
         .map(|node| materialize_schema_node(&dictionary, &mut cache, node, parent_links))
         .transpose()?;
 
-    let mut items = Vec::with_capacity(page.items.len());
-    let mut spent = 0u64;
-    let mut byte_next = None;
-    for child in page.items {
-        let term = materialize_schema_term(&dictionary, &mut cache, child.node)?;
-        let links = child_links(children, &request.view, term.as_deref());
-        let resource = schema_resource(child.node, term, links, Some(child.position));
-        let next_spent = spent.saturating_add(resource.serialized);
-        // As for triple pages, always let one item through: otherwise one legal
-        // term larger than the whole budget produces a cursor that never moves.
-        if next_spent > request.bytes.0 && !items.is_empty() {
-            byte_next = Some(child.position);
-            break;
-        }
-        spent = next_spent;
-        items.push(resource);
-    }
+    let items = page
+        .items
+        .into_iter()
+        .map(|child| {
+            let term = materialize_schema_term(&dictionary, &mut cache, child.node)?;
+            let links = child_links(children, &request.view, term.as_deref());
+            Ok(schema_resource(
+                child.node,
+                term,
+                links,
+                Some(child.position),
+            ))
+        })
+        .collect::<Result<Vec<_>, Problem>>()?;
 
-    // If the first item alone crossed the byte budget, it was included to make
-    // progress. More data still means bytes, rather than the coincident row
-    // limit, are what prevented the next item from being attempted.
-    if byte_next.is_none() && spent > request.bytes.0 {
-        byte_next = page.next;
-    }
-    let completeness = match byte_next {
-        Some(position) => Completeness::budget_exhausted(
-            BudgetReason::ResponseBytes,
-            Cursor::at_schema_child(&request.binding, position).encode(),
-        ),
-        None => match page.next {
-            Some(position) => Completeness::page_limit(
-                Cursor::at_schema_child(&request.binding, position).encode(),
-            ),
-            None => Completeness::complete(),
-        },
+    let completeness = match page_next {
+        Some(position) => {
+            Completeness::page_limit(Cursor::at_schema_child(&request.binding, position).encode())
+        }
+        None => Completeness::complete(),
     };
 
     Ok(SchemaAnswer::Navigation(SchemaNavigationAnswer {
@@ -2289,7 +2244,7 @@ fn schema_children(
         target,
         byte_budget: request.bytes.0,
         byte_binding: request.binding.clone(),
-        byte_continuation: byte_next.or(page_next),
+        byte_continuation: page_next,
     }))
 }
 
@@ -2320,49 +2275,12 @@ impl From<ClassPropertyStop> for ProjectionStop {
     }
 }
 
-struct BudgetedProjection<T> {
-    items: Vec<T>,
-    next: Option<u64>,
-}
-
-fn budget_projection<I, T>(
-    source: Vec<I>,
-    page_next: Option<u64>,
-    max_bytes: u64,
-    project: impl Fn(I) -> (T, u64, u64),
-) -> BudgetedProjection<T> {
-    let mut items = Vec::with_capacity(source.len());
-    let mut spent = 0u64;
-    let mut next = None;
-    for item in source {
-        let (resource, serialized, position) = project(item);
-        let next_spent = spent.saturating_add(serialized);
-        if next_spent > max_bytes && !items.is_empty() {
-            next = Some(position);
-            break;
-        }
-        spent = next_spent;
-        items.push(resource);
-    }
-    if next.is_none() && spent > max_bytes {
-        next = page_next;
-    }
-    BudgetedProjection { items, next }
-}
-
 fn projection_completeness(
     binding: &CursorBinding,
-    byte_next: Option<u64>,
     page_next: Option<u64>,
     stop: ProjectionStop,
     cursor: fn(&CursorBinding, u64) -> Cursor,
 ) -> Completeness {
-    if let Some(position) = byte_next {
-        return Completeness::budget_exhausted(
-            BudgetReason::ResponseBytes,
-            cursor(binding, position).encode(),
-        );
-    }
     match stop {
         ProjectionStop::Complete => Completeness::complete(),
         ProjectionStop::RowLimit => Completeness::page_limit(
@@ -2404,25 +2322,22 @@ fn schema_relations(
         .map_err(|error| unreadable("paging schema class relations", &error))?;
     let page_next = page.next.map(|position| position.byte_offset());
     let stop = ProjectionStop::from(page.stop);
-    let page = budget_projection(page.items, page_next, request.bytes.0, |item| {
-        let relation = item.relation;
-        let resource = ClassRelationResource::new(
-            relation.subject_class,
-            relation.predicate,
-            relation.object_class,
-            relation.triples,
-            item.position.byte_offset(),
-        );
-        let serialized = resource.serialized;
-        (resource, serialized, item.position.byte_offset())
-    });
-    let completeness = projection_completeness(
-        &request.binding,
-        page.next,
-        page_next,
-        stop,
-        Cursor::at_class_relation,
-    );
+    let items = page
+        .items
+        .into_iter()
+        .map(|item| {
+            let relation = item.relation;
+            ClassRelationResource::new(
+                relation.subject_class,
+                relation.predicate,
+                relation.object_class,
+                relation.triples,
+                item.position.byte_offset(),
+            )
+        })
+        .collect();
+    let completeness =
+        projection_completeness(&request.binding, page_next, stop, Cursor::at_class_relation);
 
     Ok(SchemaAnswer::Relations(SchemaRelationsAnswer {
         dataset: target.id.dataset.clone(),
@@ -2431,13 +2346,13 @@ fn schema_relations(
         projection: "class-relations",
         filters: projection_filters(&filter.class, &filter.predicate),
         order: CLASS_RELATION_ORDER,
-        items: page.items,
+        items,
         labels: None,
         completeness,
         target,
         byte_budget: request.bytes.0,
         byte_binding: request.binding.clone(),
-        byte_continuation: page.next.or(page_next),
+        byte_continuation: page_next,
     }))
 }
 
@@ -2462,26 +2377,23 @@ fn schema_class_properties(
         .map_err(|error| unreadable("paging schema class properties", &error))?;
     let page_next = page.next.map(|position| position.byte_offset());
     let stop = ProjectionStop::from(page.stop);
-    let page = budget_projection(page.items, page_next, request.bytes.0, |item| {
-        let property = item.property;
-        let resource = ClassPropertyResource::new(
-            property.class,
-            property.predicate,
-            property.triples,
-            property.distinct_subjects,
-            property.distinct_objects,
-            item.position.byte_offset(),
-        );
-        let serialized = resource.serialized;
-        (resource, serialized, item.position.byte_offset())
-    });
-    let completeness = projection_completeness(
-        &request.binding,
-        page.next,
-        page_next,
-        stop,
-        Cursor::at_class_property,
-    );
+    let items = page
+        .items
+        .into_iter()
+        .map(|item| {
+            let property = item.property;
+            ClassPropertyResource::new(
+                property.class,
+                property.predicate,
+                property.triples,
+                property.distinct_subjects,
+                property.distinct_objects,
+                item.position.byte_offset(),
+            )
+        })
+        .collect();
+    let completeness =
+        projection_completeness(&request.binding, page_next, stop, Cursor::at_class_property);
 
     Ok(SchemaAnswer::ClassProperties(SchemaClassPropertiesAnswer {
         dataset: target.id.dataset.clone(),
@@ -2490,13 +2402,13 @@ fn schema_class_properties(
         projection: "class-properties",
         filters: projection_filters(&filter.class, &filter.predicate),
         order: CLASS_PROPERTY_ORDER,
-        items: page.items,
+        items,
         labels: None,
         completeness,
         target,
         byte_budget: request.bytes.0,
         byte_binding: request.binding.clone(),
-        byte_continuation: page.next.or(page_next),
+        byte_continuation: page_next,
     }))
 }
 
@@ -2549,10 +2461,8 @@ fn schema_resource(
         term: term.map(SchemaTerm),
         counts: node.counts().into(),
         links,
-        serialized: 0,
         position,
     }
-    .finish_size()
 }
 
 fn schema_kind_name(kind: SchemaNodeKind) -> &'static str {

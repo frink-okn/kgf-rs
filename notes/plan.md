@@ -1236,9 +1236,9 @@ serialization.
 
 The namespace inventory parses on demand into borrowed domain types, including
 the graph-wide `distinct_iris` union hdtc now emits, and proves role coverage
-identities without leaving a cache on `Store`. `prefix_table.source` remains an
-informational producer label; the reader treats the lowercase SHA-256
-`prefix_table.version` as the merged table's stable identity. Summary JSON stays
+identities without leaving a cache on `Store`. The lowercase SHA-256
+`prefix_table.version` is the merged table's sole published identity; build-input
+paths are deliberately omitted. Summary JSON stays
 exact published bytes because doc 04 has not fixed its field schema; summary
 Markdown is exposed as checked UTF-8. This keeps `/summary` static and prevents
 the read layer from silently inventing a summary schema.
@@ -1306,9 +1306,9 @@ immutable cache validators.
 the already-merged componentless graph's VoID analysis, builds the final VoID HDT and
 permutation sidecar, traverses
 the semantic partition graph into selector and count-ranked relation blocks, runs the
-namespace counter with manifest prefix overrides last, preserves caller-supplied
-prefix-table provenance while naming the generated override `manifest.json#prefixes`,
-and persists structured and Markdown summary cards. The `design` and `queryable`
+namespace counter with manifest prefix overrides last, removes hdtc's build-local
+input paths while retaining the merged prefix-map digest, and persists structured
+and Markdown summary cards. The `design` and `queryable`
 index views both address the one genuine dataset root without inventing subset RDF.
 Manifests with components are refused before staging: component artifact identity,
 graph identity, checksums and entailment regime belong to the future full `kgf build`
@@ -1801,12 +1801,11 @@ following the code.
     namespace rows omit the graph-wide `distinct_iris` count now emitted by `hdtc
     namespaces`, and its `prefix_table.version` example is a date while hdtc emits a
     lowercase SHA-256 over the fully merged prefix map. The implementation types
-    `distinct_iris`, treats that digest as the stable table identity, and keeps
-    `prefix_table.source` informational because hdtc joins input identifiers that may
-    be build-host-specific. `kgf build stats` preserves caller-supplied identifiers and
-    substitutes only the generated manifest override with the truthful stable selector
-    `manifest.json#prefixes`; the merged-map digest remains the identity. Doc 04 now
-    specifies these fields. Surfaced and resolved in unit 19.
+    `distinct_iris` and treats that digest as the table identity. KGF omits hdtc's
+    `prefix_table.source`: the counted prefixes and their digest carry the useful
+    information, while input filesystem paths are build-host-specific and would make
+    identical builds produce different bundle identities. Doc 04 now specifies the
+    content field without operational provenance. Surfaced and resolved in unit 19.
 38. **Resolved: the `/schema` node envelope echoes its semantic selector.** Doc 03
     §3.4.10's fixed envelope reports the selected node's own term, which distinguishes
     class nodes but makes a dataset-scoped property indistinguishable from the same
