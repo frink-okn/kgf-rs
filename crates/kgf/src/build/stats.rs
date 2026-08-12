@@ -2,7 +2,7 @@
 //!
 //! hdtc owns the HDT, permutation, VoID, and namespace byte formats. This
 //! command composes those builders, derives KGF's semantic TSV projections and
-//! persisted summaries, and publishes the seven artifacts as one verified set.
+//! persisted summaries, and publishes the eight artifacts as one verified set.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
-use kgf_store::manifest::{ArtifactView, Manifest};
+use kgf_server::url::Params;
+use kgf_store::manifest::{ArtifactView, Manifest, ManifestDocument};
 use kgf_store::store::artifact;
 use oxrdf::{NamedOrBlankNode, Term, Triple};
 use oxrdfio::{RdfFormat, RdfParser};
@@ -41,6 +42,8 @@ const VOID_EXT_DATATYPE: &str = "http://ldf.fi/void-ext#datatype";
 
 const SCHEMA_HEADER: &str = "view\tkind\tclass\tpredicate\tdatatype\tsubject_id\n";
 const RELATIONS_HEADER: &str = "view\tsubject_class\tpredicate\tobject_class\ttriples\n";
+const CLASS_PROPERTIES_HEADER: &str =
+    "view\tclass\tpredicate\ttriples\tdistinct_subjects\tdistinct_objects\n";
 
 /// Arguments for `kgf build stats`.
 #[derive(Debug, clap::Args)]
@@ -147,7 +150,19 @@ pub fn run(args: Args) -> Result<()> {
         .with_context(|| format!("resolving bundle directory {}", args.bundle.display()))?;
     let data = bundle.join(artifact::HDT);
     ensure!(data.is_file(), "bundle has no {}", data.display());
-    let manifest = Manifest::read(&bundle)?;
+    // This command is also the migration boundary between description-set
+    // revisions. A server must reject a partial current set, but the builder
+    // must be able to read the ordinary typed fields of a manifest that
+    // completely described the previous set and then replace it atomically.
+    // `ManifestDocument` preserves unmodeled fields and enforces the manifest
+    // format version without applying the current description all-or-none
+    // invariant before the replacement exists.
+    let document = ManifestDocument::read(&bundle)?
+        .context("kgf build stats requires an existing manifest.json")?;
+    let manifest = document
+        .parsed()
+        .cloned()
+        .context("manifest.json does not contain the typed dataset fields kgf build stats needs")?;
     let dataset_iri = args
         .dataset_iri
         .or_else(|| manifest.dataset_iri.clone())
@@ -295,9 +310,14 @@ pub fn run(args: Args) -> Result<()> {
         ("design", design.relations.as_slice()),
         ("queryable", queryable.relations.as_slice()),
     ];
+    let mut class_property_views = vec![
+        ("design", design.class_properties.as_slice()),
+        ("queryable", queryable.class_properties.as_slice()),
+    ];
     for (view, projection) in &component_projections {
         schema_views.push((view.as_str(), projection.schema.as_slice()));
         relation_views.push((view.as_str(), projection.relations.as_slice()));
+        class_property_views.push((view.as_str(), projection.class_properties.as_slice()));
     }
     let schema_row_count = schema_views
         .iter()
@@ -307,10 +327,19 @@ pub fn run(args: Args) -> Result<()> {
         .iter()
         .map(|(_, rows)| rows.len())
         .sum::<usize>();
+    let class_property_row_count = class_property_views
+        .iter()
+        .map(|(_, rows)| rows.len())
+        .sum::<usize>();
     let schema = render_schema(&schema_views)?;
     let relations = render_relations(&relation_views)?;
+    let class_properties = render_class_properties(&class_property_views)?;
     write(&staged_stats.join("schema-nodes.tsv"), &schema.bytes)?;
     write(&staged_stats.join("class-relations.tsv"), &relations.bytes)?;
+    write(
+        &staged_stats.join("class-properties.tsv"),
+        &class_properties.bytes,
+    )?;
 
     let manifest_prefixes = staging.path().join("manifest-prefixes.json");
     let mut namespace_tables = args.prefix_tables;
@@ -366,13 +395,15 @@ pub fn run(args: Args) -> Result<()> {
     let metadata = DescriptionArtifactMetadata {
         schema_nodes: schema.metadata,
         class_relations: relations.metadata,
+        class_properties: class_properties.metadata,
     };
     publish(&bundle, staging, &dataset_iri, &metadata)?;
     println!(
-        "{}: built and verified Tier-1 statistics ({} schema selectors, {} typed class relations)",
+        "{}: built and verified Tier-1 statistics ({} schema selectors, {} typed class relations, {} class properties)",
         bundle.display(),
         schema_row_count,
         relation_row_count,
+        class_property_row_count,
     );
     Ok(())
 }
@@ -515,11 +546,27 @@ struct RelationRow {
     triples: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ClassPropertyRow {
+    class: String,
+    predicate: String,
+    triples: u64,
+    distinct_subjects: Option<u64>,
+    distinct_objects: Option<u64>,
+}
+
 struct Projections {
     schema: Vec<SchemaRow>,
     relations: Vec<RelationRow>,
+    class_properties: Vec<ClassPropertyRow>,
     classes: Vec<(String, u64)>,
     properties: Vec<(String, u64)>,
+}
+
+struct ProjectionRows<'a> {
+    schema: &'a mut Vec<SchemaRow>,
+    relations: &'a mut Vec<RelationRow>,
+    class_properties: &'a mut Vec<ClassPropertyRow>,
 }
 
 struct RenderedTsv {
@@ -586,6 +633,31 @@ fn render_relations(views: &[(&str, &[RelationRow])]) -> Result<RenderedTsv> {
         let line = format!(
             "{view}\t{}\t{}\t{}\t{}\n",
             row.subject_class, row.predicate, row.object_class, row.triples
+        );
+        *max = (*max).max(line.len() as u64);
+        bytes.extend_from_slice(line.as_bytes());
+    })
+}
+
+fn render_class_properties(views: &[(&str, &[ClassPropertyRow])]) -> Result<RenderedTsv> {
+    let mut blocks = Vec::new();
+    for &(view, rows) in views {
+        let mut sorted = rows.to_vec();
+        sorted.sort_by(|a, b| {
+            b.triples
+                .cmp(&a.triples)
+                .then_with(|| (&a.class, &a.predicate).cmp(&(&b.class, &b.predicate)))
+        });
+        blocks.push((view, sorted));
+    }
+    render_views(CLASS_PROPERTIES_HEADER, blocks, |view, row, bytes, max| {
+        let line = format!(
+            "{view}\t{}\t{}\t{}\t{}\t{}\n",
+            row.class,
+            row.predicate,
+            row.triples,
+            optional_decimal(row.distinct_subjects),
+            optional_decimal(row.distinct_objects),
         );
         *max = (*max).max(line.len() as u64);
         bytes.extend_from_slice(line.as_bytes());
@@ -706,6 +778,10 @@ impl VoidGraph {
         self.count(subject, predicate).unwrap_or(0)
     }
 
+    fn maybe_count(&self, subject: &NamedOrBlankNode, predicate: &str) -> Option<u64> {
+        self.count(subject, predicate).ok()
+    }
+
     fn project(
         &self,
         root: &NamedOrBlankNode,
@@ -719,6 +795,7 @@ impl VoidGraph {
             subject_id: id_for(root, subject_ids)?,
         }];
         let mut relations = Vec::new();
+        let mut class_properties = Vec::new();
         let mut classes = Vec::new();
         let mut properties = Vec::new();
 
@@ -730,8 +807,11 @@ impl VoidGraph {
                 "",
                 &predicate,
                 subject_ids,
-                &mut schema,
-                &mut relations,
+                &mut ProjectionRows {
+                    schema: &mut schema,
+                    relations: &mut relations,
+                    class_properties: &mut class_properties,
+                },
             )?;
         }
         for class_node in self.children(root, VOID_CLASS_PARTITION)? {
@@ -751,8 +831,11 @@ impl VoidGraph {
                     &class,
                     &predicate,
                     subject_ids,
-                    &mut schema,
-                    &mut relations,
+                    &mut ProjectionRows {
+                        schema: &mut schema,
+                        relations: &mut relations,
+                        class_properties: &mut class_properties,
+                    },
                 )?;
             }
         }
@@ -767,9 +850,15 @@ impl VoidGraph {
                 ))
             })
         });
+        class_properties.sort_by(|a, b| {
+            b.triples
+                .cmp(&a.triples)
+                .then_with(|| (&a.class, &a.predicate).cmp(&(&b.class, &b.predicate)))
+        });
         Ok(Projections {
             schema,
             relations,
+            class_properties,
             classes,
             properties,
         })
@@ -781,18 +870,26 @@ impl VoidGraph {
         class: &str,
         predicate: &str,
         subject_ids: &HashMap<String, u64>,
-        schema: &mut Vec<SchemaRow>,
-        relations: &mut Vec<RelationRow>,
+        rows: &mut ProjectionRows<'_>,
     ) -> Result<()> {
-        schema.push(SchemaRow {
+        rows.schema.push(SchemaRow {
             kind: "property",
             class: class.to_owned(),
             predicate: predicate.to_owned(),
             datatype: String::new(),
             subject_id: id_for(property_node, subject_ids)?,
         });
+        if !class.is_empty() {
+            rows.class_properties.push(ClassPropertyRow {
+                class: class.to_owned(),
+                predicate: predicate.to_owned(),
+                triples: self.count(property_node, VOID_TRIPLES)?,
+                distinct_subjects: self.maybe_count(property_node, VOID_DISTINCT_SUBJECTS),
+                distinct_objects: self.maybe_count(property_node, VOID_DISTINCT_OBJECTS),
+            });
+        }
         for datatype_node in self.children(property_node, VOID_EXT_DATATYPE_PARTITION)? {
-            schema.push(SchemaRow {
+            rows.schema.push(SchemaRow {
                 kind: "datatype",
                 class: class.to_owned(),
                 predicate: predicate.to_owned(),
@@ -814,7 +911,7 @@ impl VoidGraph {
                     Term::NamedNode(node) => node.as_str().to_owned(),
                     other => bail!("object-class partition {target} has non-IRI class {other}"),
                 };
-                relations.push(RelationRow {
+                rows.relations.push(RelationRow {
                     subject_class: class.to_owned(),
                     predicate: predicate.to_owned(),
                     object_class,
@@ -824,6 +921,10 @@ impl VoidGraph {
         }
         Ok(())
     }
+}
+
+fn optional_decimal(value: Option<u64>) -> String {
+    value.map_or_else(String::new, |value| value.to_string())
 }
 
 fn id_for(subject: &NamedOrBlankNode, ids: &HashMap<String, u64>) -> Result<u64> {
@@ -887,19 +988,60 @@ impl Summary {
             .classes
             .iter()
             .take(10)
-            .map(|(class, entities)| json!({"class": class, "entities": entities}))
+            .map(|(class, entities)| {
+                json!({
+                    "class": class,
+                    "entities": entities,
+                    "links": {
+                        "schema": summary_schema_link(
+                            Params::default()
+                                .with("class", &iri_request(class))
+                                .with("children", "properties")
+                                .with("view", "design")
+                        )
+                    }
+                })
+            })
             .collect::<Vec<_>>();
         let top_properties = projections
             .properties
             .iter()
             .take(10)
-            .map(|(predicate, triples)| json!({"predicate": predicate, "triples": triples}))
+            .map(|(predicate, triples)| {
+                json!({
+                    "predicate": predicate,
+                    "triples": triples,
+                    "links": {
+                        "schema": summary_schema_link(
+                            Params::default()
+                                .with("predicate", &iri_request(predicate))
+                                .with("view", "design")
+                        )
+                    }
+                })
+            })
             .collect::<Vec<_>>();
         let leading_relations = projections
             .relations
             .iter()
             .take(10)
-            .cloned()
+            .map(|relation| {
+                json!({
+                    "subject_class": relation.subject_class,
+                    "predicate": relation.predicate,
+                    "object_class": relation.object_class,
+                    "triples": relation.triples,
+                    "links": {
+                        "schema": summary_schema_link(
+                            Params::default()
+                                .with("class", &iri_request(&relation.subject_class))
+                                .with("predicate", &iri_request(&relation.predicate))
+                                .with("projection", "class-relations")
+                                .with("view", "design")
+                        )
+                    }
+                })
+            })
             .collect::<Vec<_>>();
         let counts = json!({
             "triples": graph.optional_count(root, VOID_TRIPLES),
@@ -917,6 +1059,16 @@ impl Summary {
                 "homepage": manifest.homepage,
             },
             "view": "design",
+            "links": {
+                "manifest": "manifest",
+                "fragment": "fragment",
+                "schema": "schema?view=design",
+                "classes": "schema?children=classes&view=design",
+                "properties": "schema?children=properties&view=design",
+                "class_relations": "schema?projection=class-relations&view=design",
+                "class_properties": "schema?projection=class-properties&view=design",
+                "void": "void",
+            },
             "counts": counts,
             "publisher_prose": {
                 "untrusted": true,
@@ -930,6 +1082,14 @@ impl Summary {
         let markdown = render_summary_markdown(manifest, &json);
         Self { json, markdown }
     }
+}
+
+fn iri_request(iri: &str) -> String {
+    format!("<{iri}>")
+}
+
+fn summary_schema_link(params: Params) -> String {
+    format!("schema?{}", params.to_query())
 }
 
 fn render_summary_markdown(manifest: &Manifest, summary: &Value) -> String {

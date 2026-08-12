@@ -157,10 +157,18 @@ fn schema_projects_nodes_pages_children_and_renders_a_browsable_page() {
             .unwrap()
             .contains("projection=class-relations")
     );
+    assert!(
+        root["node"]["links"]["class-properties"]
+            .as_str()
+            .unwrap()
+            .contains("projection=class-properties")
+    );
 
     let query = "class=ex%3AA&predicate=ex%3Ap&children=object-classes&limit=1";
     let first = served.schema(&store, query);
-    assert_eq!(first["collection"], "object-classes");
+    assert_eq!(first["collection"]["kind"], "object-classes");
+    assert_eq!(first["collection"]["returned"], 1);
+    assert_eq!(first["collection"]["order"], "published");
     assert_eq!(first["selector"]["kind"], "property");
     assert_eq!(first["selector"]["class"]["value"], "https://example.org/A");
     assert_eq!(
@@ -185,9 +193,11 @@ fn schema_projects_nodes_pages_children_and_renders_a_browsable_page() {
     assert!(resumed["next"].is_null());
 
     let page = served.schema_html(&store, query);
-    assert!(page.contains("Selected node"));
+    assert!(page.contains("Property details"));
     assert!(page.contains("class scope"));
     assert!(page.contains("object-classes"));
+    assert!(page.contains("Object classes"));
+    assert!(page.contains("Datatypes"));
     assert!(page.contains("https://example.org/B") || page.contains("ex:B"));
     assert!(
         page.contains(next),
@@ -198,6 +208,41 @@ fn schema_projects_nodes_pages_children_and_renders_a_browsable_page() {
     assert!(
         dataset_property["selector"].get("class").is_none(),
         "the dataset-scoped property must remain distinguishable from a class-scoped one"
+    );
+
+    let classes = served.schema_html(&store, "children=classes");
+    assert!(
+        classes.contains("children=properties"),
+        "a class term should jump directly to its only child collection"
+    );
+
+    let class_properties = served.schema(&store, "projection=class-properties");
+    assert_eq!(class_properties["projection"], "class-properties");
+    assert_eq!(
+        class_properties["items"][0]["class"]["value"],
+        "https://example.org/A"
+    );
+    assert_eq!(
+        class_properties["items"][0]["predicate"]["value"],
+        "https://example.org/p"
+    );
+    assert_eq!(class_properties["items"][0]["triples"], 3);
+    assert!(
+        class_properties["items"][0]
+            .get("distinct_subjects")
+            .is_none()
+    );
+    assert!(
+        class_properties["items"][0]
+            .get("distinct_objects")
+            .is_none()
+    );
+    assert_eq!(class_properties["order"]["by"], "triples");
+    assert_eq!(class_properties["order"]["direction"], "descending");
+    assert!(
+        served
+            .schema_html(&store, "projection=class-properties")
+            .contains("Properties by class")
     );
 }
 

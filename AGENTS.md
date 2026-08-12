@@ -56,7 +56,7 @@ in, typed requests out) — over a real axum listener serving doc 03 §3.2's URL
 QUERY and POST are implemented on `/fragment`, with per-binding QUERY/POST `/count`.
 The mapped description surface answers `/schema`, RDF `/void`, and persisted
 `/summary`; `kgf build stats` produces and publication-verifies their complete
-seven-artifact set. `kgf serve` runs it.
+eight-artifact set. `kgf serve` runs it.
 
 **M1 is not doc 03 §3.1's core profile**, and the two read like the same set. This
 implementation now extends past M1 with bindings QUERY (§3.4.2) and the complete

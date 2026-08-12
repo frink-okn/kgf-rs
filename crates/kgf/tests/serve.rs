@@ -106,6 +106,18 @@ fn schema_answers_json_html_latest_and_resumable_pages_over_http() {
     );
     let next = first.json()["next"].as_str().unwrap().to_owned();
 
+    let labelled = server.get(&format!("/tox/v/v1/schema?{query}&labels=true"));
+    labelled.assert_status(200);
+    assert_eq!(
+        labelled.json()["labels"]["https://example.org/A"],
+        serde_json::Value::Null,
+        "requested hydration distinguishes a missing label from an omitted labels map"
+    );
+    assert!(
+        first.json().get("labels").is_none(),
+        "labels are opt-in for the machine representation"
+    );
+
     let resumed = server.get(&format!(
         "/tox/v/v1/schema?{query}&cursor={}",
         kgf_server::url::encode_value(&next)
@@ -125,7 +137,7 @@ fn schema_answers_json_html_latest_and_resumable_pages_over_http() {
     page.assert_status(200);
     page.assert_header("content-type", "text/html; charset=utf-8");
     let html = String::from_utf8(page.body.clone()).unwrap();
-    assert!(html.contains("Selected node"));
+    assert!(html.contains("Property details"));
     assert!(html.contains(&next));
 
     server
@@ -135,6 +147,12 @@ fn schema_answers_json_html_latest_and_resumable_pages_over_http() {
     let unknown = server.get("/tox/v/v1/schema?view=component%3Amissing");
     unknown.assert_status(404);
     assert_eq!(unknown.json()["code"], "not_found");
+
+    let root = server.get("/").json();
+    assert_eq!(root["datasets"][0]["links"]["summary"], "/tox/v/v1/summary");
+    assert_eq!(root["datasets"][0]["links"]["schema"], "/tox/v/v1/schema");
+    let dataset = server.get("/tox").json();
+    assert_eq!(dataset["releases"][0]["links"]["void"], "/tox/v/v1/void");
 }
 
 #[test]
@@ -1182,6 +1200,8 @@ impl Deployment {
             &format!("{dataset} {version}"),
             "--prefix",
             "ex=https://example.org/",
+            "--role",
+            "label=https://example.org/label",
         ]);
         kgf::manifest::run(cli.args).expect("describe the tier-1 bundle");
         self.set_created(&bundle, created);

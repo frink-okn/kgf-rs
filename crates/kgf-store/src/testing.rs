@@ -222,7 +222,7 @@ impl Fixture {
 
     /// Build the shared cross-crate fixture for the tier-1 description surface.
     ///
-    /// The graph and its two recoverable TSV projections are intentionally
+    /// The graph and its three recoverable TSV projections are intentionally
     /// assembled through hdtc and the mapped dictionary, so integration tests
     /// exercise the same subject-id binding and publication verification as a
     /// real stats build without hand-predicting HDT dictionary ids.
@@ -262,8 +262,20 @@ impl Fixture {
             "design\thttps://example.org/A\thttps://example.org/p\thttps://example.org/B\t2\n",
             "design\thttps://example.org/A\thttps://example.org/p\thttps://example.org/C\t1\n",
         );
-        fixture.add_description_artifacts(schema_nodes.as_bytes(), class_relations.as_bytes());
-        fixture.seed_description_manifest(schema_nodes.as_bytes(), class_relations.as_bytes());
+        let class_properties = concat!(
+            "view\tclass\tpredicate\ttriples\tdistinct_subjects\tdistinct_objects\n",
+            "design\thttps://example.org/A\thttps://example.org/p\t3\t\t\n",
+        );
+        fixture.add_description_artifacts(
+            schema_nodes.as_bytes(),
+            class_relations.as_bytes(),
+            class_properties.as_bytes(),
+        );
+        fixture.seed_description_manifest(
+            schema_nodes.as_bytes(),
+            class_relations.as_bytes(),
+            class_properties.as_bytes(),
+        );
         fixture
     }
 
@@ -360,6 +372,7 @@ impl Fixture {
             crate::store::artifact::VOID_PERM,
             crate::store::artifact::SCHEMA_NODES,
             crate::store::artifact::CLASS_RELATIONS,
+            crate::store::artifact::CLASS_PROPERTIES,
             crate::store::artifact::NAMESPACES,
             crate::store::artifact::SUMMARY_JSON,
             crate::store::artifact::SUMMARY_MD,
@@ -393,7 +406,12 @@ impl Fixture {
 
     /// Publish the complete physical description set around caller-supplied
     /// TSV bytes. Manifest metadata stays with the test that exercises it.
-    pub fn add_description_artifacts(&self, schema_nodes: &[u8], class_relations: &[u8]) {
+    pub fn add_description_artifacts(
+        &self,
+        schema_nodes: &[u8],
+        class_relations: &[u8],
+        class_properties: &[u8],
+    ) {
         let bundle = self.dir.path();
         std::fs::create_dir_all(bundle.join("stats")).expect("create fixture stats directory");
         std::fs::copy(
@@ -409,6 +427,7 @@ impl Fixture {
         for (name, bytes) in [
             (crate::store::artifact::SCHEMA_NODES, schema_nodes),
             (crate::store::artifact::CLASS_RELATIONS, class_relations),
+            (crate::store::artifact::CLASS_PROPERTIES, class_properties),
             (
                 crate::store::artifact::NAMESPACES,
                 NAMESPACES_JSON.as_bytes(),
@@ -431,7 +450,12 @@ impl Fixture {
     /// recover from checksums. The command replaces every ordinary manifest
     /// field and checksum; these exact ranges survive because their files and
     /// VoID parent are unchanged.
-    fn seed_description_manifest(&self, schema_nodes: &[u8], class_relations: &[u8]) {
+    fn seed_description_manifest(
+        &self,
+        schema_nodes: &[u8],
+        class_relations: &[u8],
+        class_properties: &[u8],
+    ) {
         use crate::manifest::{ArtifactEntry, ArtifactView};
 
         let bundle = self.dir.path();
@@ -489,6 +513,10 @@ impl Fixture {
                 entry(crate::store::artifact::VOID_HDT),
             ),
             (
+                crate::store::artifact::VOID_PERM.to_owned(),
+                entry(crate::store::artifact::VOID_PERM),
+            ),
+            (
                 crate::store::artifact::SCHEMA_NODES.to_owned(),
                 indexed(crate::store::artifact::SCHEMA_NODES, schema_nodes, 3, 1),
             ),
@@ -500,6 +528,27 @@ impl Fixture {
                     2,
                     0,
                 ),
+            ),
+            (
+                crate::store::artifact::CLASS_PROPERTIES.to_owned(),
+                indexed(
+                    crate::store::artifact::CLASS_PROPERTIES,
+                    class_properties,
+                    1,
+                    0,
+                ),
+            ),
+            (
+                crate::store::artifact::NAMESPACES.to_owned(),
+                entry(crate::store::artifact::NAMESPACES),
+            ),
+            (
+                crate::store::artifact::SUMMARY_JSON.to_owned(),
+                entry(crate::store::artifact::SUMMARY_JSON),
+            ),
+            (
+                crate::store::artifact::SUMMARY_MD.to_owned(),
+                entry(crate::store::artifact::SUMMARY_MD),
             ),
         ]);
         let seed = serde_json::json!({
@@ -559,6 +608,11 @@ pub(crate) const SCHEMA_NODES_HEADER: &[u8] =
 #[cfg(test)]
 pub(crate) const CLASS_RELATIONS_HEADER: &[u8] =
     b"view\tsubject_class\tpredicate\tobject_class\ttriples\n";
+
+/// Exact class-property header from doc 04 §4.2.
+#[cfg(test)]
+pub(crate) const CLASS_PROPERTIES_HEADER: &[u8] =
+    b"view\tclass\tpredicate\ttriples\tdistinct_subjects\tdistinct_objects\n";
 
 /// Minimal valid namespace inventory shared by cross-crate bundle fixtures.
 pub const NAMESPACES_JSON: &str = concat!(

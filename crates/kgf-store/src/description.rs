@@ -506,11 +506,98 @@ pub struct ClassRelationPage<'a> {
     pub examined: usize,
 }
 
+/// Optional filters over the persisted class-property order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClassPropertyFilter<'a> {
+    /// Expanded subject-class IRI to retain.
+    pub class: Option<&'a str>,
+    /// Expanded predicate IRI to retain.
+    pub predicate: Option<&'a str>,
+}
+
+impl ClassPropertyFilter<'_> {
+    fn matches(&self, row: &ClassProperty<'_>) -> bool {
+        self.class.is_none_or(|class| class == row.class)
+            && self
+                .predicate
+                .is_none_or(|predicate| predicate == row.predicate)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.class.is_none() && self.predicate.is_none()
+    }
+}
+
+/// One observed property used by instances of one class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassProperty<'a> {
+    /// Expanded subject-class IRI.
+    pub class: &'a str,
+    /// Expanded predicate IRI.
+    pub predicate: &'a str,
+    /// Number of observed triples contributing to this class/property pair.
+    pub triples: u64,
+    /// Distinct subjects contributing to the pair.
+    pub distinct_subjects: Option<u64>,
+    /// Distinct objects contributing to the pair.
+    pub distinct_objects: Option<u64>,
+}
+
+/// One class property and the validated boundary immediately before its row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassPropertyItem<'a> {
+    /// Parsed class property.
+    pub property: ClassProperty<'a>,
+    /// Position from which this property is returned first.
+    pub position: ClassPropertyPosition,
+}
+
+/// A validated byte boundary in `stats/class-properties.tsv`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassPropertyPosition {
+    mapping: MappingId,
+    view_start: u64,
+    view_end: u64,
+    offset: u64,
+}
+
+impl ClassPropertyPosition {
+    /// Absolute byte offset in `stats/class-properties.tsv`.
+    pub fn byte_offset(self) -> u64 {
+        self.offset
+    }
+}
+
+/// Why one class-property page stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassPropertyStop {
+    /// The selected view has no rows left.
+    Complete,
+    /// The requested number of matching rows was returned.
+    RowLimit,
+    /// A filtered scan examined its caller-supplied candidate limit.
+    ScanLimit,
+}
+
+/// One bounded page from the persisted class-property order.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ClassPropertyPage<'a> {
+    /// Matching rows, in the artifact's global count-descending order.
+    pub items: Vec<ClassPropertyItem<'a>>,
+    /// Boundary for the next page; absent only when the view is exhausted.
+    pub next: Option<ClassPropertyPosition>,
+    /// The condition that ended this page.
+    pub stop: ClassPropertyStop,
+    /// Rows examined, including filtered-out candidates.
+    pub examined: usize,
+}
+
 /// The mapped, immutable description surface for one bundle version.
 pub struct DescriptionStore {
     void: IndexedHdt,
     schema_nodes: MappedTsv,
     class_relations: MappedTsv,
+    class_properties: MappedTsv,
     namespaces: Mapping,
     summary_json: Mapping,
     summary_md: Mapping,
@@ -522,6 +609,7 @@ impl std::fmt::Debug for DescriptionStore {
             .field("void", &self.void)
             .field("schema_views", &self.schema_nodes.views.len())
             .field("class_relation_views", &self.class_relations.views.len())
+            .field("class_property_views", &self.class_properties.views.len())
             .field("namespaces", &self.namespaces.path())
             .field("summary_json", &self.summary_json.path())
             .field("summary_md", &self.summary_md.path())
@@ -548,6 +636,11 @@ impl DescriptionStore {
             &description.class_relations,
             entries.class_relations,
         )?;
+        let class_properties = open_tsv(
+            bundle,
+            &description.class_properties,
+            entries.class_properties,
+        )?;
         let namespaces = open_static_artifact(bundle, &description.namespaces, entries.namespaces)?;
         let summary_json =
             open_static_artifact(bundle, &description.summary_json, entries.summary_json)?;
@@ -557,6 +650,7 @@ impl DescriptionStore {
             void,
             schema_nodes,
             class_relations,
+            class_properties,
             namespaces,
             summary_json,
             summary_md,
@@ -615,10 +709,12 @@ impl DescriptionStore {
     pub fn view(&self, view: &StatsView) -> Option<DescriptionView<'_>> {
         let schema = self.schema_nodes.views.get(view)?;
         let relations = self.class_relations.views.get(view)?;
+        let properties = self.class_properties.views.get(view)?;
         Some(DescriptionView {
             store: self,
             schema: *schema,
             relations: *relations,
+            properties: *properties,
         })
     }
 }
@@ -629,6 +725,7 @@ pub struct DescriptionView<'a> {
     store: &'a DescriptionStore,
     schema: ViewSpec,
     relations: ViewSpec,
+    properties: ViewSpec,
 }
 
 impl<'a> DescriptionView<'a> {
@@ -640,6 +737,11 @@ impl<'a> DescriptionView<'a> {
     /// Number of class-relation rows recorded for this view.
     pub fn class_relation_rows(&self) -> u64 {
         self.relations.rows
+    }
+
+    /// Number of class-property rows recorded for this view.
+    pub fn class_property_rows(&self) -> u64 {
+        self.properties.rows
     }
 
     /// Resolve and project one semantic selector through the mapped index.
@@ -818,6 +920,74 @@ impl<'a> DescriptionView<'a> {
             items,
             next: None,
             stop: ClassRelationStop::Complete,
+            examined,
+        })
+    }
+
+    /// Validate a decoded class-property cursor offset in constant time.
+    pub fn class_property_position(&self, offset: u64) -> Option<ClassPropertyPosition> {
+        self.store
+            .class_properties
+            .property_position(self.properties, offset)
+    }
+
+    /// Page the persisted count-ranked class-property inventory.
+    pub fn class_properties(
+        &self,
+        filter: ClassPropertyFilter<'_>,
+        from: Option<ClassPropertyPosition>,
+        row_limit: NonZeroUsize,
+        scan_limit: NonZeroUsize,
+    ) -> Result<ClassPropertyPage<'a>> {
+        let table = &self.store.class_properties;
+        let mut position = from.unwrap_or_else(|| table.start_property_position(self.properties));
+        if position.mapping != table.mapping.id()
+            || position.view_start != self.properties.offset
+            || position.view_end != self.properties.end()
+        {
+            return Err(Error::Region(
+                "class-property position belongs to a different mapped view".to_owned(),
+            ));
+        }
+
+        let mut items = Vec::new();
+        let mut examined = 0usize;
+        let filtered = !filter.is_empty();
+        while position.offset < self.properties.end() {
+            if items.len() == row_limit.get() {
+                return Ok(ClassPropertyPage {
+                    items,
+                    next: Some(position),
+                    stop: ClassPropertyStop::RowLimit,
+                    examined,
+                });
+            }
+            if filtered && examined == scan_limit.get() {
+                return Ok(ClassPropertyPage {
+                    items,
+                    next: Some(position),
+                    stop: ClassPropertyStop::ScanLimit,
+                    examined,
+                });
+            }
+
+            let row_position = position;
+            let row = table.row_at(position.offset, self.properties.end())?;
+            position.offset = row.next;
+            examined += 1;
+            let property = parse_class_property_row(row.bytes, table.path())?;
+            if filter.matches(&property) {
+                items.push(ClassPropertyItem {
+                    property,
+                    position: row_position,
+                });
+            }
+        }
+
+        Ok(ClassPropertyPage {
+            items,
+            next: None,
+            stop: ClassPropertyStop::Complete,
             examined,
         })
     }
@@ -1127,6 +1297,33 @@ impl MappedTsv {
         })
     }
 
+    fn start_property_position(&self, view: ViewSpec) -> ClassPropertyPosition {
+        ClassPropertyPosition {
+            mapping: self.mapping.id(),
+            view_start: view.offset,
+            view_end: view.end(),
+            offset: view.offset,
+        }
+    }
+
+    fn property_position(&self, view: ViewSpec, offset: u64) -> Option<ClassPropertyPosition> {
+        if offset < view.offset || offset > view.end() {
+            return None;
+        }
+        if offset != view.offset
+            && offset != view.end()
+            && self.mapping.as_bytes().get(offset as usize - 1) != Some(&b'\n')
+        {
+            return None;
+        }
+        Some(ClassPropertyPosition {
+            mapping: self.mapping.id(),
+            view_start: view.offset,
+            view_end: view.end(),
+            offset,
+        })
+    }
+
     fn find_schema_row<'a>(
         &'a self,
         view: ViewSpec,
@@ -1272,6 +1469,49 @@ fn parse_relation_row<'a>(bytes: &'a [u8], path: &Path) -> Result<ClassRelation<
     })
 }
 
+fn parse_class_property_row<'a>(bytes: &'a [u8], path: &Path) -> Result<ClassProperty<'a>> {
+    let mut fields = fields(bytes, path)?;
+    let _view = required_field(&mut fields, 0, 6, path)?;
+    let class = required_field(&mut fields, 1, 6, path)?;
+    let predicate = required_field(&mut fields, 2, 6, path)?;
+    let triples = unsigned_field(required_field(&mut fields, 3, 6, path)?, "triples", path)?;
+    let distinct_subjects = optional_unsigned_field(
+        required_field(&mut fields, 4, 6, path)?,
+        "distinct_subjects",
+        path,
+    )?;
+    let distinct_objects = optional_unsigned_field(
+        required_field(&mut fields, 5, 6, path)?,
+        "distinct_objects",
+        path,
+    )?;
+    reject_extra_fields(fields, 6, path)?;
+    Ok(ClassProperty {
+        class,
+        predicate,
+        triples,
+        distinct_subjects,
+        distinct_objects,
+    })
+}
+
+fn unsigned_field(value: &str, name: &str, path: &Path) -> Result<u64> {
+    value.parse::<u64>().map_err(|error| {
+        malformed(
+            path,
+            format!("{name} {value:?} is not an unsigned decimal: {error}"),
+        )
+    })
+}
+
+fn optional_unsigned_field(value: &str, name: &str, path: &Path) -> Result<Option<u64>> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        unsigned_field(value, name, path).map(Some)
+    }
+}
+
 fn fields<'a>(bytes: &'a [u8], path: &Path) -> Result<std::str::Split<'a, char>> {
     let row = std::str::from_utf8(bytes)
         .map_err(|error| malformed(path, format!("row is not UTF-8: {error}")))?;
@@ -1327,8 +1567,8 @@ mod tests {
     use crate::manifest::{Counts, Formats, Manifest};
     use crate::store::{OpenOptions, Store};
     use crate::testing::{
-        CLASS_RELATIONS_HEADER, Fixture, SCHEMA_NODES_HEADER, SUMMARY_JSON, TINY_NT,
-        published_bundle,
+        CLASS_PROPERTIES_HEADER, CLASS_RELATIONS_HEADER, Fixture, SCHEMA_NODES_HEADER,
+        SUMMARY_JSON, TINY_NT, published_bundle,
     };
 
     struct PublishedDescription {
@@ -1489,7 +1729,32 @@ mod tests {
             ],
         );
         let relation_max = max_complete_row(&relations);
-        fixture.add_description_artifacts(&schema, &relations);
+        let mut class_properties = CLASS_PROPERTIES_HEADER.to_vec();
+        let mut class_property_views = BTreeMap::new();
+        append_view(
+            &mut class_properties,
+            &mut class_property_views,
+            "design",
+            &[
+                "https://example.org/A\thttps://example.org/p1\t50\t10\t20".to_owned(),
+                "https://example.org/A\thttps://example.org/p2\t30\t8\t15".to_owned(),
+                "https://example.org/D\thttps://example.org/p1\t10\t2\t5".to_owned(),
+            ],
+        );
+        append_view(
+            &mut class_properties,
+            &mut class_property_views,
+            "queryable",
+            &["https://example.org/Q\thttps://example.org/p\t60\t12\t24".to_owned()],
+        );
+        append_view(
+            &mut class_properties,
+            &mut class_property_views,
+            "component:canonical",
+            &["https://example.org/C\thttps://example.org/p\t20\t4\t9".to_owned()],
+        );
+        let class_property_max = max_complete_row(&class_properties);
+        fixture.add_description_artifacts(&schema, &relations, &class_properties);
 
         let mut artifacts = BTreeMap::new();
         for name in [
@@ -1510,6 +1775,14 @@ mod tests {
         artifacts.insert(
             artifact::CLASS_RELATIONS.to_owned(),
             tsv_entry(relations.len() as u64, relation_max, relation_views),
+        );
+        artifacts.insert(
+            artifact::CLASS_PROPERTIES.to_owned(),
+            tsv_entry(
+                class_properties.len() as u64,
+                class_property_max,
+                class_property_views,
+            ),
         );
 
         let manifest = Manifest {
@@ -1701,7 +1974,28 @@ mod tests {
             "component:canonical",
             &relations_rows,
         );
-        fixture.add_description_artifacts(&schema, &relations);
+        let mut class_properties = CLASS_PROPERTIES_HEADER.to_vec();
+        let mut class_property_views = BTreeMap::new();
+        let property_rows = ["https://example.org/A\thttps://example.org/p\t11\t\t".to_owned()];
+        append_view(
+            &mut class_properties,
+            &mut class_property_views,
+            "design",
+            &property_rows,
+        );
+        append_view(
+            &mut class_properties,
+            &mut class_property_views,
+            "queryable",
+            &[],
+        );
+        append_view(
+            &mut class_properties,
+            &mut class_property_views,
+            "component:canonical",
+            &property_rows,
+        );
+        fixture.add_description_artifacts(&schema, &relations, &class_properties);
 
         let bundle = fixture.bundle_path();
         let mut artifacts = BTreeMap::new();
@@ -1726,6 +2020,14 @@ mod tests {
                 relations.len() as u64,
                 max_complete_row(&relations),
                 relation_views,
+            ),
+        );
+        artifacts.insert(
+            artifact::CLASS_PROPERTIES.to_owned(),
+            tsv_entry(
+                class_properties.len() as u64,
+                max_complete_row(&class_properties),
+                class_property_views,
             ),
         );
         let manifest = Manifest {
@@ -2335,6 +2637,57 @@ mod tests {
         );
         assert_eq!(second.stop, ClassRelationStop::Complete);
         assert_eq!(second.next, None);
+    }
+
+    #[test]
+    fn class_properties_page_filter_and_resume_at_exact_row_boundaries() {
+        let fixture = Fixture::build(TINY_NT);
+        publish_description(&fixture);
+        let store = opened_description(&fixture);
+        let view = store
+            .description()
+            .unwrap()
+            .view(&StatsView::Design)
+            .unwrap();
+        let two = NonZeroUsize::new(2).unwrap();
+        let many = NonZeroUsize::new(100).unwrap();
+
+        let first = view
+            .class_properties(ClassPropertyFilter::default(), None, two, many)
+            .unwrap();
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.property.triples)
+                .collect::<Vec<_>>(),
+            [50, 30]
+        );
+        assert_eq!(first.stop, ClassPropertyStop::RowLimit);
+        let next = first.next.expect("another class property remains");
+        assert_eq!(view.class_property_position(next.byte_offset()), Some(next));
+        assert_eq!(view.class_property_position(next.byte_offset() + 1), None);
+
+        let second = view
+            .class_properties(ClassPropertyFilter::default(), Some(next), two, many)
+            .unwrap();
+        assert_eq!(second.items[0].property.triples, 10);
+        assert_eq!(second.items[0].property.distinct_subjects, Some(2));
+        assert_eq!(second.items[0].property.distinct_objects, Some(5));
+        assert_eq!(second.stop, ClassPropertyStop::Complete);
+
+        let filter = ClassPropertyFilter {
+            class: None,
+            predicate: Some("https://example.org/p1"),
+        };
+        let filtered = view.class_properties(filter, None, many, two).unwrap();
+        assert_eq!(filtered.items[0].property.triples, 50);
+        assert_eq!(filtered.stop, ClassPropertyStop::ScanLimit);
+        let resumed = view
+            .class_properties(filter, filtered.next, many, two)
+            .unwrap();
+        assert_eq!(resumed.items[0].property.triples, 10);
+        assert_eq!(resumed.stop, ClassPropertyStop::Complete);
     }
 
     #[test]

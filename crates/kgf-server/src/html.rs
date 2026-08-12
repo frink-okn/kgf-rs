@@ -598,6 +598,30 @@ a { color: var(--accent); }
   white-space: nowrap;
 }
 .json-action:hover, .pager a:hover { border-color: var(--accent); color: var(--accent); }
+.schema-actions { margin-top: 1rem; }
+.schema-actions ul {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(16rem, 100%), 1fr));
+  gap: .65rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.schema-actions a {
+  display: flex;
+  min-height: 4.5rem;
+  flex-direction: column;
+  gap: .25rem;
+  border: 1px solid var(--rule);
+  border-radius: .7rem;
+  background: var(--surface-muted);
+  padding: .8rem .9rem;
+  color: var(--fg);
+  text-decoration: none;
+}
+.schema-actions a:hover { border-color: var(--accent); background: var(--accent-soft); }
+.schema-actions strong { color: var(--accent); font-size: .86rem; }
+.schema-actions span { color: var(--dim); font-size: .78rem; line-height: 1.45; }
 code {
   border-radius: .3rem;
   background: var(--code);

@@ -47,16 +47,17 @@ use std::rc::Rc;
 use bytes::Bytes;
 use maud::html;
 use oxrdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term as RdfTerm, Triple};
-use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
+use serde::{Deserialize, Serialize};
 
 use hdtc::format::{TextScanPosition, TextSearcher, XSD_STRING, parse_literal};
 use kgf_store::catalog::BundleId;
 use kgf_store::dict::Dictionary;
 use kgf_store::pattern::{IdPattern, Selection};
 use kgf_store::{
-    ClassRelationStop, IdTriple, Role, SchemaCollection, SchemaCounts as StoreSchemaCounts,
-    SchemaNode as StoreSchemaNode, SchemaNodeKind, StatsView, Store, TermId,
+    ClassPropertyStop, ClassRelationStop, IdTriple, Role, SchemaCollection,
+    SchemaCounts as StoreSchemaCounts, SchemaNode as StoreSchemaNode, SchemaNodeKind, StatsView,
+    Store, TermId,
 };
 
 use crate::cursor::{Cursor, CursorBinding, PositionSpace, StaleCursor};
@@ -65,8 +66,8 @@ use crate::envelope::{
 };
 use crate::forms;
 use crate::html::{
-    Crumb, Resource, TermText, Value, fields, json_body, note, operation_page,
-    operation_page_with_format, page, results_table,
+    Crumb, Resource, TermText, Value, fields, group_digits, json_body, note, operation_page,
+    operation_page_with_format, page, results_table, stats, table,
 };
 use crate::representation::Representation;
 use crate::request::{
@@ -279,6 +280,7 @@ pub trait Renders {
         _store: &Store,
         _label_predicates: &[String],
         _cap: usize,
+        _required: bool,
     ) -> Result<(), Problem> {
         Ok(())
     }
@@ -555,6 +557,7 @@ impl Renders for Answer {
         store: &Store,
         label_predicates: &[String],
         cap: usize,
+        required: bool,
     ) -> Result<(), Problem> {
         if label_predicates.is_empty() {
             return Ok(());
@@ -585,7 +588,19 @@ impl Renders for Answer {
         {
             wanted.push(described);
         }
-        if wanted.is_empty() || wanted.len() > cap {
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        if wanted.len() > cap {
+            if required {
+                return Err(Problem::new(
+                    ErrorCode::CapExceeded,
+                    format!(
+                        "this page has {} distinct labelable terms, over this server's max_label_iris of {cap}",
+                        wanted.len()
+                    ),
+                ));
+            }
             return Ok(());
         }
 
@@ -952,6 +967,45 @@ struct SchemaResource {
     serialized: u64,
 }
 
+/// Metadata for one shallow child collection.
+#[derive(Debug, Serialize)]
+struct SchemaCollectionResource {
+    kind: &'static str,
+    returned: u64,
+    /// Cursor order is the immutable order published in the VoID index. It is
+    /// stable, but unlike the flat projections it is not a semantic ranking.
+    order: &'static str,
+}
+
+/// The filters that scope one flat schema projection.
+#[derive(Debug, Serialize)]
+struct SchemaProjectionFilters {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class: Option<SchemaTerm>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predicate: Option<SchemaTerm>,
+}
+
+/// Machine-readable ordering contract for a flat projection.
+#[derive(Debug, Serialize)]
+struct SchemaProjectionOrder {
+    by: &'static str,
+    direction: &'static str,
+    tie_break: &'static [&'static str],
+}
+
+const CLASS_RELATION_ORDER: SchemaProjectionOrder = SchemaProjectionOrder {
+    by: "triples",
+    direction: "descending",
+    tie_break: &["subject-class", "predicate", "object-class"],
+};
+
+const CLASS_PROPERTY_ORDER: SchemaProjectionOrder = SchemaProjectionOrder {
+    by: "triples",
+    direction: "descending",
+    tie_break: &["class", "predicate"],
+};
+
 /// The semantic path that selected a node, independent of its opaque VoID
 /// subject. A property or datatype term alone does not reveal whether its
 /// counts are dataset-wide or scoped beneath one class.
@@ -1031,6 +1085,42 @@ struct ClassRelationResource {
     serialized: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct ClassPropertyResource {
+    class: SchemaTerm,
+    predicate: SchemaTerm,
+    triples: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    distinct_subjects: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    distinct_objects: Option<u64>,
+    #[serde(skip)]
+    serialized: u64,
+}
+
+impl ClassPropertyResource {
+    fn new(
+        class: &str,
+        predicate: &str,
+        triples: u64,
+        distinct_subjects: Option<u64>,
+        distinct_objects: Option<u64>,
+    ) -> Self {
+        let mut resource = Self {
+            class: SchemaTerm(Rc::from(class)),
+            predicate: SchemaTerm(Rc::from(predicate)),
+            triples,
+            distinct_subjects,
+            distinct_objects,
+            serialized: 0,
+        };
+        resource.serialized = serde_json::to_vec(&resource)
+            .expect("a class property contains only serializable values")
+            .len() as u64;
+        resource
+    }
+}
+
 impl ClassRelationResource {
     fn new(subject_class: &str, predicate: &str, object_class: &str, triples: u64) -> Self {
         let mut resource = Self {
@@ -1056,9 +1146,13 @@ pub struct SchemaNavigationAnswer {
     selector: SchemaSelectorResource,
     node: Option<SchemaResource>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    collection: Option<&'static str>,
+    collection: Option<SchemaCollectionResource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     items: Option<Vec<SchemaResource>>,
+    /// Preferred labels keyed by full IRI. Present only for `labels=true` in
+    /// JSON; HTML uses the same bounded hydration internally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<BTreeMap<String, Option<String>>>,
     #[serde(flatten)]
     completeness: Completeness,
     #[serde(skip)]
@@ -1072,7 +1166,30 @@ pub struct SchemaRelationsAnswer {
     version: String,
     view: String,
     projection: &'static str,
+    filters: SchemaProjectionFilters,
+    order: SchemaProjectionOrder,
     items: Vec<ClassRelationResource>,
+    /// Preferred labels keyed by full IRI. See [`SchemaNavigationAnswer`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<BTreeMap<String, Option<String>>>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+}
+
+/// The count-ranked class-property shape of `GET /schema`.
+#[derive(Debug, Serialize)]
+pub struct SchemaClassPropertiesAnswer {
+    dataset: String,
+    version: String,
+    view: String,
+    projection: &'static str,
+    filters: SchemaProjectionFilters,
+    order: SchemaProjectionOrder,
+    items: Vec<ClassPropertyResource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<BTreeMap<String, Option<String>>>,
     #[serde(flatten)]
     completeness: Completeness,
     #[serde(skip)]
@@ -1087,6 +1204,8 @@ pub enum SchemaAnswer {
     Navigation(SchemaNavigationAnswer),
     /// The count-ranked flat class-relation projection.
     Relations(SchemaRelationsAnswer),
+    /// The count-ranked class-property inventory.
+    ClassProperties(SchemaClassPropertiesAnswer),
 }
 
 impl SchemaAnswer {
@@ -1094,6 +1213,7 @@ impl SchemaAnswer {
         match self {
             Self::Navigation(answer) => &answer.completeness,
             Self::Relations(answer) => &answer.completeness,
+            Self::ClassProperties(answer) => &answer.completeness,
         }
     }
 }
@@ -1103,6 +1223,137 @@ impl Renders for SchemaAnswer {
         let completeness = self.completeness().clone();
         let body = standard_body(&self, representation);
         Rendered { body, completeness }
+    }
+
+    fn hydrate_labels(
+        &mut self,
+        store: &Store,
+        label_predicates: &[String],
+        cap: usize,
+        required: bool,
+    ) -> Result<(), Problem> {
+        let wanted = self.labelable_terms();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        if wanted.len() > cap {
+            if required {
+                return Err(Problem::new(
+                    ErrorCode::CapExceeded,
+                    format!(
+                        "this schema page has {} distinct IRIs, over this server's max_label_iris of {cap}",
+                        wanted.len()
+                    ),
+                ));
+            }
+            return Ok(());
+        }
+
+        let dictionary = store.dict();
+        let predicates: Vec<u64> = label_predicates
+            .iter()
+            .map(|iri| {
+                dictionary
+                    .locate(Role::Predicate, iri.as_bytes())
+                    .map(|found| found.map(|id| id.0))
+                    .map_err(|error| unreadable("looking a label predicate up", &error))
+            })
+            .filter_map(Result::transpose)
+            .collect::<Result<_, _>>()?;
+        let mut cache = TermCache::new();
+        let mut labels = BTreeMap::new();
+        for (term, iri) in wanted {
+            let label = match dictionary
+                .locate(Role::Subject, term.as_bytes())
+                .map_err(|error| unreadable("looking a schema IRI up", &error))?
+            {
+                Some(subject) => {
+                    preferred_label(store, &dictionary, &mut cache, subject.0, &predicates)?
+                }
+                None => None,
+            };
+            labels.insert(iri, label);
+        }
+        self.set_labels(labels);
+        Ok(())
+    }
+}
+
+impl SchemaAnswer {
+    fn labelable_terms(&self) -> BTreeMap<String, String> {
+        let mut terms = BTreeMap::new();
+        let mut insert = |term: &SchemaTerm| {
+            if let Term::Iri(iri) = Term::from_dictionary(&term.0) {
+                terms.insert(term.0.to_string(), iri.into_owned());
+            }
+        };
+        match self {
+            Self::Navigation(answer) => {
+                match &answer.selector {
+                    SchemaSelectorResource::Dataset => {}
+                    SchemaSelectorResource::Class { class } => insert(class),
+                    SchemaSelectorResource::Property { class, predicate } => {
+                        if let Some(class) = class {
+                            insert(class);
+                        }
+                        insert(predicate);
+                    }
+                    SchemaSelectorResource::Datatype {
+                        class,
+                        predicate,
+                        datatype,
+                    } => {
+                        if let Some(class) = class {
+                            insert(class);
+                        }
+                        insert(predicate);
+                        insert(datatype);
+                    }
+                }
+                if let Some(term) = answer.node.as_ref().and_then(|node| node.term.as_ref()) {
+                    insert(term);
+                }
+                for item in answer.items.as_deref().unwrap_or_default() {
+                    if let Some(term) = &item.term {
+                        insert(term);
+                    }
+                }
+            }
+            Self::Relations(answer) => {
+                if let Some(class) = &answer.filters.class {
+                    insert(class);
+                }
+                if let Some(predicate) = &answer.filters.predicate {
+                    insert(predicate);
+                }
+                for relation in &answer.items {
+                    insert(&relation.subject_class);
+                    insert(&relation.predicate);
+                    insert(&relation.object_class);
+                }
+            }
+            Self::ClassProperties(answer) => {
+                if let Some(class) = &answer.filters.class {
+                    insert(class);
+                }
+                if let Some(predicate) = &answer.filters.predicate {
+                    insert(predicate);
+                }
+                for property in &answer.items {
+                    insert(&property.class);
+                    insert(&property.predicate);
+                }
+            }
+        }
+        terms
+    }
+
+    fn set_labels(&mut self, labels: BTreeMap<String, Option<String>>) {
+        match self {
+            Self::Navigation(answer) => answer.labels = Some(labels),
+            Self::Relations(answer) => answer.labels = Some(labels),
+            Self::ClassProperties(answer) => answer.labels = Some(labels),
+        }
     }
 }
 
@@ -1165,7 +1416,62 @@ impl Resource for VoidResource {
 struct SummaryResource {
     json: Bytes,
     markdown: String,
+    card: Option<SummaryCard>,
     target: Target,
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryCard {
+    dataset: SummaryDataset,
+    counts: SummaryCounts,
+    #[serde(default)]
+    links: BTreeMap<String, String>,
+    #[serde(default)]
+    top_classes: Vec<SummaryClass>,
+    #[serde(default)]
+    top_properties: Vec<SummaryProperty>,
+    #[serde(default)]
+    leading_class_relations: Vec<SummaryRelation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryDataset {
+    id: String,
+    version: String,
+    title: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryCounts {
+    triples: u64,
+    subjects: u64,
+    predicates: u64,
+    objects: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryClass {
+    #[serde(rename = "class")]
+    class_iri: String,
+    entities: u64,
+    #[serde(default)]
+    links: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryProperty {
+    predicate: String,
+    triples: u64,
+    #[serde(default)]
+    links: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SummaryRelation {
+    subject_class: String,
+    predicate: String,
+    object_class: String,
+    triples: u64,
 }
 
 impl Resource for SummaryResource {
@@ -1176,19 +1482,224 @@ impl Resource for SummaryResource {
     fn to_html(&self) -> String {
         let canonical = self.target.canonical();
         let context = self.target.context();
+        let Some(card) = &self.card else {
+            return operation_page(
+                "Dataset summary",
+                &context,
+                &self.target.crumbs(),
+                canonical.as_deref(),
+                html! {
+                    section."section-block" {
+                        h2 { "Published summary card" }
+                        pre { (self.markdown) }
+                    }
+                },
+            );
+        };
+
+        let class_cells: Vec<_> = card
+            .top_classes
+            .iter()
+            .map(|class| summary_term_cell(&self.target, &class.class_iri, &class.links))
+            .collect();
+        let class_rows: Vec<_> = card
+            .top_classes
+            .iter()
+            .zip(&class_cells)
+            .map(|(class, cell)| vec![cell.value(), Value::Number(class.entities)])
+            .collect();
+        let property_cells: Vec<_> = card
+            .top_properties
+            .iter()
+            .map(|property| summary_term_cell(&self.target, &property.predicate, &property.links))
+            .collect();
+        let property_rows: Vec<_> = card
+            .top_properties
+            .iter()
+            .zip(&property_cells)
+            .map(|(property, cell)| vec![cell.value(), Value::Number(property.triples)])
+            .collect();
+        let relation_cells: Vec<_> = card
+            .leading_class_relations
+            .iter()
+            .map(|relation| {
+                [
+                    summary_class_cell(&self.target, &relation.subject_class),
+                    summary_property_cell(&self.target, &relation.predicate),
+                    summary_class_cell(&self.target, &relation.object_class),
+                ]
+            })
+            .collect();
+        let relation_rows: Vec<_> = card
+            .leading_class_relations
+            .iter()
+            .zip(&relation_cells)
+            .map(|(relation, cells)| {
+                vec![
+                    cells[0].value(),
+                    cells[1].value(),
+                    cells[2].value(),
+                    Value::Number(relation.triples),
+                ]
+            })
+            .collect();
+        let title = card.dataset.title.as_deref().unwrap_or(&card.dataset.id);
         operation_page(
-            "Dataset summary",
+            title,
             &context,
             &self.target.crumbs(),
             canonical.as_deref(),
             html! {
+                section."overview" {
+                    p."lede" {
+                        "Start here for the graph's major kinds, predicates, and observed typed \
+                         connections; follow any term into the bounded schema navigator."
+                    }
+                    (stats(&[
+                        ("triples", group_digits(card.counts.triples)),
+                        ("subjects", group_digits(card.counts.subjects)),
+                        ("predicates", group_digits(card.counts.predicates)),
+                        ("objects", group_digits(card.counts.objects)),
+                    ]))
+                    (fields(&[
+                        ("dataset", Value::Code(&card.dataset.id)),
+                        ("version", Value::Code(&card.dataset.version)),
+                    ]))
+                    (summary_actions(&card.links))
+                }
+                div."dashboard-grid" {
+                    section."panel" {
+                        h2 { "Top classes" }
+                        (note("Observed classes ranked by entity count in the designed-schema view."))
+                        (table(&["Class", "Entities"], &class_rows))
+                    }
+                    section."panel" {
+                        h2 { "Top properties" }
+                        (note("Observed predicates ranked by triple count in the designed-schema view."))
+                        (table(&["Property", "Triples"], &property_rows))
+                    }
+                }
                 section."section-block" {
-                    h2 { "Published summary card" }
-                    pre { (self.markdown) }
+                    h2 { "Leading typed class relations" }
+                    (note(
+                        "Observed typed connections, not declared domain/range axioms. Untyped \
+                         targets are absent and multi-typed entities may contribute to several rows."
+                    ))
+                    (results_table(
+                        &["Subject class", "Property", "Object class", "Triples"],
+                        &relation_rows,
+                    ))
                 }
             },
         )
     }
+}
+
+fn summary_actions(links: &BTreeMap<String, String>) -> maud::Markup {
+    const ACTIONS: [(&str, &str, &str); 7] = [
+        (
+            "classes",
+            "Browse classes",
+            "The observed kinds of entities represented in this graph.",
+        ),
+        (
+            "properties",
+            "Browse properties",
+            "The predicates used to describe and connect those entities.",
+        ),
+        (
+            "class_relations",
+            "Map class relations",
+            "The count-ranked typed connections between kinds of things.",
+        ),
+        (
+            "class_properties",
+            "Compare class properties",
+            "The count-ranked predicates used to describe instances of each class.",
+        ),
+        (
+            "schema",
+            "Schema overview",
+            "The complete bounded drill-down surface and its statistics.",
+        ),
+        (
+            "fragment",
+            "Browse triples",
+            "Inspect concrete statements from the queryable graph.",
+        ),
+        (
+            "void",
+            "Full VoID description",
+            "Download the complete RDF statistical description.",
+        ),
+    ];
+    html! {
+        nav."schema-actions" aria-label="Dataset discovery" {
+            ul {
+                @for (relation, label, description) in ACTIONS {
+                    @if let Some(href) = links.get(relation) {
+                        li {
+                            a href=(href) {
+                                strong { (label) }
+                                span { (description) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn summary_term_cell<'a>(
+    target: &Target,
+    iri: &'a str,
+    links: &BTreeMap<String, String>,
+) -> Cell<'a> {
+    summary_iri_cell(target, iri, links.get("schema").cloned())
+}
+
+fn summary_class_cell<'a>(target: &Target, iri: &'a str) -> Cell<'a> {
+    summary_iri_cell(
+        target,
+        iri,
+        Some(summary_schema_href(
+            &Params::default()
+                .with("class", &format!("<{iri}>"))
+                .with("children", "properties")
+                .with("view", "design"),
+        )),
+    )
+}
+
+fn summary_property_cell<'a>(target: &Target, iri: &'a str) -> Cell<'a> {
+    summary_iri_cell(
+        target,
+        iri,
+        Some(summary_schema_href(
+            &Params::default()
+                .with("predicate", &format!("<{iri}>"))
+                .with("view", "design"),
+        )),
+    )
+}
+
+fn summary_iri_cell<'a>(target: &Target, iri: &'a str, href: Option<String>) -> Cell<'a> {
+    let (label, qualifier, full_iri) = Term::from_dictionary(iri)
+        .into_display(&target.prefixes)
+        .into_structured();
+    Cell {
+        label,
+        qualifier,
+        annotation: None,
+        href,
+        full_iri: full_iri.map(|iri| Cow::Owned(iri.into_owned())),
+        structured: true,
+    }
+}
+
+fn summary_schema_href(params: &Params) -> String {
+    format!("schema?{}", params.to_query())
 }
 
 /// Serialize `/void` directly from the mapped VoID HDT.
@@ -1257,6 +1768,7 @@ pub fn summary(
         .map_err(|error| unreadable("reading the summary card", &error))?
         .to_owned();
     let resource = SummaryResource {
+        card: serde_json::from_slice(&json).ok(),
         json,
         markdown,
         target,
@@ -1504,6 +2016,7 @@ pub fn schema(
                 node,
                 collection: None,
                 items: None,
+                labels: None,
                 completeness: Completeness::complete(),
                 target,
             }))
@@ -1512,6 +2025,9 @@ pub fn schema(
             schema_children(description, view, target, request, children)
         }
         SchemaQuery::ClassRelations(filter) => schema_relations(view, target, request, filter),
+        SchemaQuery::ClassProperties(filter) => {
+            schema_class_properties(view, target, request, filter)
+        }
     }
 }
 
@@ -1583,8 +2099,13 @@ fn schema_children(
         view: schema_view_name(&request.view),
         selector: child_parent_selection_resource(children),
         node,
-        collection: Some(schema_collection_name(page.collection)),
+        collection: Some(SchemaCollectionResource {
+            kind: schema_collection_name(page.collection),
+            returned: items.len() as u64,
+            order: "published",
+        }),
         items: Some(items),
+        labels: None,
         completeness,
         target,
     }))
@@ -1667,7 +2188,97 @@ fn schema_relations(
         version: target.id.version.clone(),
         view: schema_view_name(&request.view),
         projection: "class-relations",
+        filters: projection_filters(&filter.class, &filter.predicate),
+        order: CLASS_RELATION_ORDER,
         items,
+        labels: None,
+        completeness,
+        target,
+    }))
+}
+
+fn schema_class_properties(
+    view: kgf_store::DescriptionView<'_>,
+    target: Target,
+    request: &request::Schema,
+    filter: &request::SchemaClassPropertyFilter,
+) -> Result<SchemaAnswer, Problem> {
+    let from = match request.cursor.as_ref() {
+        None => None,
+        Some(cursor) => Some(
+            view.class_property_position(cursor.position)
+                .ok_or_else(|| Problem::from(StaleCursor))?,
+        ),
+    };
+    let limit = nonzero_schema_limit(request.limit.expect("projections carry a page limit"));
+    let scan_limit = NonZeroUsize::new(request.candidates.ceiling())
+        .expect("validated configuration has a nonzero candidate budget");
+    let page = view
+        .class_properties(filter.store_filter(), from, limit, scan_limit)
+        .map_err(|error| unreadable("paging schema class properties", &error))?;
+
+    let mut items = Vec::with_capacity(page.items.len());
+    let mut spent = 0u64;
+    let mut byte_next = None;
+    for item in page.items {
+        let property = item.property;
+        let resource = ClassPropertyResource::new(
+            property.class,
+            property.predicate,
+            property.triples,
+            property.distinct_subjects,
+            property.distinct_objects,
+        );
+        let next_spent = spent.saturating_add(resource.serialized);
+        if next_spent > request.bytes.0 && !items.is_empty() {
+            byte_next = Some(item.position.byte_offset());
+            break;
+        }
+        spent = next_spent;
+        items.push(resource);
+    }
+
+    if byte_next.is_none() && spent > request.bytes.0 {
+        byte_next = page.next.map(|position| position.byte_offset());
+    }
+    let completeness = match byte_next {
+        Some(position) => Completeness::budget_exhausted(
+            BudgetReason::ResponseBytes,
+            Cursor::at_class_property(&request.binding, position).encode(),
+        ),
+        None => match page.stop {
+            ClassPropertyStop::Complete => Completeness::complete(),
+            ClassPropertyStop::RowLimit => Completeness::page_limit(
+                Cursor::at_class_property(
+                    &request.binding,
+                    page.next
+                        .expect("a row-limited property page has a continuation")
+                        .byte_offset(),
+                )
+                .encode(),
+            ),
+            ClassPropertyStop::ScanLimit => Completeness::budget_exhausted(
+                BudgetReason::Candidate,
+                Cursor::at_class_property(
+                    &request.binding,
+                    page.next
+                        .expect("a scan-limited property page has a continuation")
+                        .byte_offset(),
+                )
+                .encode(),
+            ),
+        },
+    };
+
+    Ok(SchemaAnswer::ClassProperties(SchemaClassPropertiesAnswer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        view: schema_view_name(&request.view),
+        projection: "class-properties",
+        filters: projection_filters(&filter.class, &filter.predicate),
+        order: CLASS_PROPERTY_ORDER,
+        items,
+        labels: None,
         completeness,
         target,
     }))
@@ -1675,6 +2286,16 @@ fn schema_relations(
 
 fn nonzero_schema_limit(limit: u32) -> NonZeroUsize {
     NonZeroUsize::new(limit as usize).expect("request parsing refuses a zero schema limit")
+}
+
+fn projection_filters(
+    class: &Option<BoundTerm>,
+    predicate: &Option<BoundTerm>,
+) -> SchemaProjectionFilters {
+    SchemaProjectionFilters {
+        class: class.as_ref().map(selector_term),
+        predicate: predicate.as_ref().map(selector_term),
+    }
 }
 
 fn materialize_schema_node(
@@ -1824,7 +2445,10 @@ fn selected_child_parent_links(
     view: &StatsView,
 ) -> BTreeMap<&'static str, String> {
     let (params, kind) = child_parent_params(children, view);
-    schema_links(&params, kind, false)
+    // A child page describes its parent node as well as the collection. Keep a
+    // route back to the cheap node-only representation beside the routes that
+    // continue deeper.
+    schema_links(&params, kind, true)
 }
 
 fn selection_params(selection: &SchemaSelection, view: &StatsView) -> (Params, SchemaLinkKind) {
@@ -1939,6 +2563,10 @@ fn schema_links(
             links.insert(
                 "class-relations",
                 relative_schema_link(&params.with("projection", "class-relations")),
+            );
+            links.insert(
+                "class-properties",
+                relative_schema_link(&params.with("projection", "class-properties")),
             );
         }
         SchemaLinkKind::Class => {
@@ -3602,6 +4230,7 @@ impl Resource for SchemaAnswer {
         match self {
             Self::Navigation(answer) => answer.to_html(),
             Self::Relations(answer) => answer.to_html(),
+            Self::ClassProperties(answer) => answer.to_html(),
         }
     }
 }
@@ -3613,7 +4242,7 @@ impl SchemaNavigationAnswer {
             .as_deref()
             .unwrap_or_default()
             .iter()
-            .map(|item| schema_resource_cell(&self.target, item))
+            .map(|item| schema_resource_cell(&self.target, item, self.labels.as_ref()))
             .collect();
         let rows: Vec<Vec<Value<'_>>> = self
             .items
@@ -3637,28 +4266,54 @@ impl SchemaNavigationAnswer {
             .node
             .as_ref()
             .and_then(|node| node.term.as_ref())
-            .map(|term| schema_cell(&self.target, term, None));
+            .map(|term| schema_cell(&self.target, term, None, self.labels.as_ref()));
         let selector_class = self
             .selector
             .class()
-            .map(|term| schema_cell(&self.target, term, None));
+            .map(|term| schema_cell(&self.target, term, None, self.labels.as_ref()));
         let selector_predicate = self
             .selector
             .predicate()
-            .map(|term| schema_cell(&self.target, term, None));
+            .map(|term| schema_cell(&self.target, term, None, self.labels.as_ref()));
         let selector_datatype = self
             .selector
             .datatype()
-            .map(|term| schema_cell(&self.target, term, None));
+            .map(|term| schema_cell(&self.target, term, None, self.labels.as_ref()));
         let canonical = self.target.canonical();
-        let context = self.target.context();
+        let context = format!(
+            "Schema · {} · {} {}",
+            self.selector.kind(),
+            self.target.id.dataset,
+            self.target.id.version
+        );
         let returned = self.items.as_ref().map_or(0, |items| items.len()) as u64;
+        let focus = node_term
+            .as_ref()
+            .or(selector_datatype.as_ref())
+            .or(selector_predicate.as_ref())
+            .or(selector_class.as_ref());
+        let title = focus.map_or_else(
+            || match &self.collection {
+                Some(collection) => schema_collection_title(collection.kind).to_owned(),
+                None => "Schema overview".to_owned(),
+            },
+            |cell| cell.label.clone(),
+        );
+        let details = self
+            .node
+            .as_ref()
+            .and_then(|node| node.links.get("self"))
+            .map(String::as_str);
+        let crumbs = self.schema_crumbs(details);
         operation_page(
-            "Schema",
+            &title,
             &context,
-            &self.target.crumbs(),
+            &crumbs,
             canonical.as_deref(),
             html! {
+                @if let Some(full_iri) = focus.and_then(|cell| cell.full_iri.as_deref()) {
+                    p."focus-identifier" { code { (full_iri) } }
+                }
                 div."answer-summary" {
                     (fields(&[
                         ("view", Value::Code(&self.view)),
@@ -3666,13 +4321,14 @@ impl SchemaNavigationAnswer {
                         ("class scope", selector_class.as_ref().map_or(Value::Absent, Cell::value)),
                         ("predicate", selector_predicate.as_ref().map_or(Value::Absent, Cell::value)),
                         ("datatype", selector_datatype.as_ref().map_or(Value::Absent, Cell::value)),
-                        ("collection", self.collection.map_or(Value::Absent, Value::Text)),
+                        ("collection", self.collection.as_ref().map_or(Value::Absent, |collection| Value::Text(collection.kind))),
+                        ("order", self.collection.as_ref().map_or(Value::Absent, |collection| Value::Code(collection.order))),
                         ("returned", self.items.as_ref().map_or(Value::Absent, |_| Value::Number(returned))),
                         ("complete", Value::Text(completeness_text(&self.completeness))),
                     ]))
                 }
                 section."section-block" {
-                    h2 { "Selected node" }
+                    h2 { (schema_node_heading(self.selector.kind())) }
                     @if let Some(node) = &self.node {
                         (fields(&[
                             ("kind", Value::Text(node.kind)),
@@ -3684,10 +4340,15 @@ impl SchemaNavigationAnswer {
                             ("properties", optional_number(node.counts.properties)),
                         ]))
                         @if !node.links.is_empty() {
-                            nav aria-label="Schema drill-down" {
+                            nav."schema-actions" aria-label="Schema drill-down" {
                                 ul {
                                     @for (label, href) in &node.links {
-                                        li { a href=(href) { (label) } }
+                                        li {
+                                            a href=(href) {
+                                                strong { (schema_action_label(label)) }
+                                                span { (schema_action_description(label)) }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -3696,9 +4357,9 @@ impl SchemaNavigationAnswer {
                         (note("The selected schema node is absent from this view."))
                     }
                 }
-                @if let Some(collection) = self.collection {
+                @if let Some(collection) = &self.collection {
                     section."section-block" {
-                        h2 { (collection) }
+                        h2 { (schema_collection_title(collection.kind)) }
                         @if rows.is_empty() {
                             (note("No child items."))
                         } @else {
@@ -3717,18 +4378,80 @@ impl SchemaNavigationAnswer {
             },
         )
     }
+
+    fn schema_crumbs<'a>(&'a self, details: Option<&str>) -> Vec<Crumb<'a>> {
+        let mut crumbs = vec![
+            Crumb::to(
+                &self.target.id.dataset,
+                url::dataset(&self.target.id.dataset),
+            ),
+            Crumb::to(
+                &self.target.id.version,
+                url::operation(&self.target.id.dataset, &self.target.id.version, "manifest"),
+            ),
+        ];
+        if self.selector.kind() == "dataset" && self.collection.is_none() {
+            crumbs.push(Crumb::here("schema"));
+            return crumbs;
+        }
+
+        crumbs.push(Crumb::to(
+            "schema",
+            query(
+                url::operation(&self.target.id.dataset, &self.target.id.version, "schema"),
+                &Params::default().with("view", &self.view),
+            ),
+        ));
+        if let Some(collection) = &self.collection {
+            if let Some(details) = details {
+                crumbs.push(Crumb::to(self.selector.kind(), details.to_owned()));
+            }
+            crumbs.push(Crumb::here(collection.kind));
+        } else {
+            crumbs.push(Crumb::here(self.selector.kind()));
+        }
+        crumbs
+    }
 }
 
 impl SchemaRelationsAnswer {
     fn to_html(&self) -> String {
+        let filter_class = self
+            .filters
+            .class
+            .as_ref()
+            .map(|term| schema_cell(&self.target, term, None, self.labels.as_ref()));
+        let filter_predicate = self
+            .filters
+            .predicate
+            .as_ref()
+            .map(|term| schema_cell(&self.target, term, None, self.labels.as_ref()));
         let terms: Vec<[Cell<'_>; 3]> = self
             .items
             .iter()
             .map(|item| {
                 [
-                    relation_cell(&self.target, &self.view, "class", &item.subject_class),
-                    relation_cell(&self.target, &self.view, "predicate", &item.predicate),
-                    relation_cell(&self.target, &self.view, "class", &item.object_class),
+                    relation_cell(
+                        &self.target,
+                        &self.view,
+                        "class",
+                        &item.subject_class,
+                        self.labels.as_ref(),
+                    ),
+                    relation_cell(
+                        &self.target,
+                        &self.view,
+                        "predicate",
+                        &item.predicate,
+                        self.labels.as_ref(),
+                    ),
+                    relation_cell(
+                        &self.target,
+                        &self.view,
+                        "class",
+                        &item.object_class,
+                        self.labels.as_ref(),
+                    ),
                 ]
             })
             .collect();
@@ -3757,12 +4480,21 @@ impl SchemaRelationsAnswer {
                     (fields(&[
                         ("view", Value::Code(&self.view)),
                         ("projection", Value::Code(self.projection)),
+                        ("class filter", filter_class.as_ref().map_or(Value::Absent, Cell::value)),
+                        ("predicate filter", filter_predicate.as_ref().map_or(Value::Absent, Cell::value)),
+                        ("order", Value::Text("triples descending")),
                         ("returned", Value::Number(self.items.len() as u64)),
                         ("complete", Value::Text(completeness_text(&self.completeness))),
                     ]))
                 }
                 section."section-block" {
                     h2 { "Observed class relations" }
+                    (note(
+                        "These are observed connections whose subject and object both have RDF \
+                         types. They are not rdfs:domain or rdfs:range declarations; multi-typed \
+                         entities can contribute to more than one row, and untyped targets are \
+                         not represented here."
+                    ))
                     @if rows.is_empty() {
                         (note("No matching class relations."))
                     } @else {
@@ -3782,14 +4514,187 @@ impl SchemaRelationsAnswer {
     }
 }
 
+impl SchemaClassPropertiesAnswer {
+    fn to_html(&self) -> String {
+        let filter_class = self
+            .filters
+            .class
+            .as_ref()
+            .map(|term| schema_cell(&self.target, term, None, self.labels.as_ref()));
+        let filter_predicate = self
+            .filters
+            .predicate
+            .as_ref()
+            .map(|term| schema_cell(&self.target, term, None, self.labels.as_ref()));
+        let terms: Vec<[Cell<'_>; 2]> = self
+            .items
+            .iter()
+            .map(|item| {
+                [
+                    relation_cell(
+                        &self.target,
+                        &self.view,
+                        "class",
+                        &item.class,
+                        self.labels.as_ref(),
+                    ),
+                    relation_cell(
+                        &self.target,
+                        &self.view,
+                        "predicate",
+                        &item.predicate,
+                        self.labels.as_ref(),
+                    ),
+                ]
+            })
+            .collect();
+        let has_distinct = self
+            .items
+            .iter()
+            .any(|item| item.distinct_subjects.is_some() || item.distinct_objects.is_some());
+        let rows: Vec<Vec<Value<'_>>> = self
+            .items
+            .iter()
+            .zip(&terms)
+            .map(|(item, terms)| {
+                let mut row = vec![
+                    terms[0].value(),
+                    terms[1].value(),
+                    Value::Number(item.triples),
+                ];
+                if has_distinct {
+                    row.push(optional_number(item.distinct_subjects));
+                    row.push(optional_number(item.distinct_objects));
+                }
+                row
+            })
+            .collect();
+        let canonical = self.target.canonical();
+        operation_page(
+            "Class properties",
+            &self.target.context(),
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" {
+                    (fields(&[
+                        ("view", Value::Code(&self.view)),
+                        ("projection", Value::Code(self.projection)),
+                        ("class filter", filter_class.as_ref().map_or(Value::Absent, Cell::value)),
+                        ("predicate filter", filter_predicate.as_ref().map_or(Value::Absent, Cell::value)),
+                        ("order", Value::Text("triples descending")),
+                        ("returned", Value::Number(self.items.len() as u64)),
+                        ("complete", Value::Text(completeness_text(&self.completeness))),
+                    ]))
+                }
+                section."section-block" {
+                    h2 { "Properties by class" }
+                    (note(
+                        "Observed predicates used on instances of each class, ranked by triple count."
+                    ))
+                    @if rows.is_empty() {
+                        (note("No matching class properties."))
+                    } @else if has_distinct {
+                        (results_table(
+                            &["class", "property", "triples", "distinct subjects", "distinct objects"],
+                            &rows,
+                        ))
+                    } @else {
+                        (results_table(
+                            &["class", "property", "triples"],
+                            &rows,
+                        ))
+                    }
+                }
+                @if let Some(token) = self.completeness.next_cursor() {
+                    @if let Some(next) = self.target.next(token) {
+                        p."pager" { a href=(next) { "Next page →" } }
+                    }
+                }
+            },
+        )
+    }
+}
+
 fn optional_number(number: Option<u64>) -> Value<'static> {
     number.map_or(Value::Absent, Value::Number)
 }
 
-fn schema_resource_cell<'a>(target: &Target, resource: &'a SchemaResource) -> Cell<'a> {
+fn schema_resource_cell<'a>(
+    target: &Target,
+    resource: &'a SchemaResource,
+    labels: Option<&'a BTreeMap<String, Option<String>>>,
+) -> Cell<'a> {
     match &resource.term {
-        Some(term) => schema_cell(target, term, resource.links.get("self").cloned()),
+        Some(term) => schema_cell(target, term, preferred_schema_href(&resource.links), labels),
         None => Cell::text("(none)".to_owned()),
+    }
+}
+
+/// Follow the only continuation directly; otherwise preserve the branch node.
+///
+/// A class has only `properties`, and a datatype only `languages`, so making a
+/// human click their node-only page first adds no choice. A property has two
+/// meaningful branches and therefore keeps its own page as the term link.
+fn preferred_schema_href(links: &BTreeMap<&'static str, String>) -> Option<String> {
+    let mut children = links
+        .iter()
+        .filter(|(relation, _)| **relation != "self")
+        .map(|(_, href)| href);
+    match (children.next(), children.next()) {
+        (Some(only), None) => Some(only.clone()),
+        _ => links.get("self").cloned(),
+    }
+}
+
+fn schema_collection_title(collection: &str) -> &str {
+    match collection {
+        "classes" => "Classes",
+        "properties" => "Properties",
+        "class-relations" => "Class relations",
+        "class-properties" => "Class properties",
+        "object-classes" => "Object classes",
+        "datatypes" => "Datatypes",
+        "languages" => "Languages",
+        collection => collection,
+    }
+}
+
+fn schema_node_heading(kind: &str) -> &str {
+    match kind {
+        "dataset" => "Dataset statistics",
+        "class" => "Class details",
+        "property" => "Property details",
+        "datatype" => "Datatype details",
+        _ => "Selected node",
+    }
+}
+
+fn schema_action_label(relation: &str) -> &str {
+    match relation {
+        "self" => "Details only",
+        "classes" => "Browse classes",
+        "properties" => "Browse properties",
+        "class-relations" => "Explore class relations",
+        "class-properties" => "Compare class properties",
+        "object-classes" => "Object classes",
+        "datatypes" => "Datatypes",
+        "languages" => "Languages",
+        relation => relation,
+    }
+}
+
+fn schema_action_description(relation: &str) -> &str {
+    match relation {
+        "self" => "Show this node without expanding a collection.",
+        "classes" => "The observed RDF types represented in this view.",
+        "properties" => "The predicates used at this scope.",
+        "class-relations" => "Observed typed connections between subject and object classes.",
+        "class-properties" => "Observed predicates used to describe instances of each class.",
+        "object-classes" => "The observed RDF types of IRI-valued targets.",
+        "datatypes" => "The datatypes used by literal values.",
+        "languages" => "The language tags used by these literal values.",
+        _ => "Continue through this schema branch.",
     }
 }
 
@@ -3798,24 +4703,40 @@ fn relation_cell<'a>(
     view: &str,
     parameter: &str,
     term: &'a SchemaTerm,
+    labels: Option<&'a BTreeMap<String, Option<String>>>,
 ) -> Cell<'a> {
     let requested = Term::from_dictionary(&term.0).to_request();
-    let href = relative_schema_link(
-        &Params::default()
-            .with(parameter, &requested)
-            .with("view", view),
-    );
-    schema_cell(target, term, Some(href))
+    let params = Params::default()
+        .with(parameter, &requested)
+        .with("view", view);
+    let params = if parameter == "class" {
+        params.with("children", "properties")
+    } else {
+        params
+    };
+    let href = relative_schema_link(&params);
+    schema_cell(target, term, Some(href), labels)
 }
 
-fn schema_cell<'a>(target: &Target, term: &'a SchemaTerm, href: Option<String>) -> Cell<'a> {
+fn schema_cell<'a>(
+    target: &Target,
+    term: &'a SchemaTerm,
+    href: Option<String>,
+    labels: Option<&'a BTreeMap<String, Option<String>>>,
+) -> Cell<'a> {
+    let annotation = match Term::from_dictionary(&term.0) {
+        Term::Iri(iri) => labels
+            .and_then(|labels| labels.get(iri.as_ref()))
+            .and_then(Option::as_deref),
+        Term::BlankNode(_) | Term::Literal(_) => None,
+    };
     let (label, qualifier, full_iri) = Term::from_dictionary(&term.0)
         .into_display(&target.prefixes)
         .into_structured();
     Cell {
         label,
         qualifier,
-        annotation: None,
+        annotation,
         href,
         full_iri,
         structured: true,

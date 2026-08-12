@@ -605,7 +605,15 @@ async fn schema(
         "schema",
         wants,
         |params, limits, release| {
-            request::Schema::parse(params, limits, release.prefixes(), &release.binding())
+            let request =
+                request::Schema::parse(params, limits, release.prefixes(), &release.binding())?;
+            if request.labels && !release.declares(Capability::Labels) {
+                return Err(Problem::new(
+                    ErrorCode::CapabilityNotAvailable,
+                    "this bundle does not declare the `labels` capability; omit `labels=true` or use a release that does",
+                ));
+            }
+            Ok(request)
         },
         answer::schema,
     )
@@ -792,7 +800,12 @@ where
         release.prefixes().clone(),
         release.declares(Capability::Search),
     );
-    let labels = PageLabelProfile::for_html(&service, release, representation);
+    let labels = PageLabelProfile::for_request(
+        &service,
+        release,
+        representation,
+        request.labels_requested(),
+    );
     let opened = Arc::clone(&service);
     let rendered = blocking(move || {
         let store = opened.open(target.id())?;
@@ -865,21 +878,24 @@ where
 struct PageLabelProfile {
     predicates: Vec<String>,
     cap: usize,
+    required: bool,
 }
 
 impl PageLabelProfile {
-    fn for_html(
+    fn for_request(
         service: &Service,
         release: &Release,
         representation: Representation,
+        requested: bool,
     ) -> Option<Self> {
-        (representation == Representation::Html).then(|| Self {
+        (representation == Representation::Html || requested).then(|| Self {
             predicates: release
                 .predicate_roles()
                 .get("label")
                 .map(<[String]>::to_vec)
                 .unwrap_or_default(),
             cap: usize::try_from(service.config().caps.max_label_iris).unwrap_or(usize::MAX),
+            required: requested,
         })
     }
 }
@@ -893,7 +909,9 @@ impl HydrateForPage for Option<PageLabelProfile> {
     fn hydrate(&self, store: &kgf_store::Store, answer: &mut impl Renders) -> Result<(), Problem> {
         match self {
             None => Ok(()),
-            Some(profile) => answer.hydrate_labels(store, &profile.predicates, profile.cap),
+            Some(profile) => {
+                answer.hydrate_labels(store, &profile.predicates, profile.cap, profile.required)
+            }
         }
     }
 }
@@ -973,7 +991,7 @@ where
         wants.params().clone(),
         release.prefixes().clone(),
     );
-    let labels = PageLabelProfile::for_html(&service, release, representation);
+    let labels = PageLabelProfile::for_request(&service, release, representation, false);
     let opened = Arc::clone(&service);
     let rendered = blocking(move || {
         let store = opened.open(target.id())?;

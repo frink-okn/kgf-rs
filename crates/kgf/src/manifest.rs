@@ -118,6 +118,8 @@ pub(crate) struct DescriptionArtifactMetadata {
     pub(crate) schema_nodes: RowArtifactMetadata,
     /// Bounds for `stats/class-relations.tsv`.
     pub(crate) class_relations: RowArtifactMetadata,
+    /// Bounds for `stats/class-properties.tsv`.
+    pub(crate) class_properties: RowArtifactMetadata,
 }
 
 /// Run `kgf manifest`.
@@ -609,7 +611,7 @@ pub fn checksum_artifact(path: &Path) -> Result<ArtifactEntry> {
 /// Carry build-produced artifact metadata only while its artifact is unchanged.
 ///
 /// `kgf manifest` can recompute checksums, but it cannot derive the semantic
-/// view blocks in the two stats TSVs without doing the producer's indexed-VoID
+/// view blocks in the three stats TSVs without doing the producer's indexed-VoID
 /// traversal. Retaining those ranges across identical bytes is exact. Inventing
 /// them for a new file, or carrying them across changed bytes, would publish
 /// offsets the server has no reason to trust, so both cases name `kgf build`.
@@ -627,6 +629,7 @@ fn carry_artifact_metadata(
         let generated = generated_description.and_then(|description| match name.as_str() {
             artifact::SCHEMA_NODES => Some(&description.schema_nodes),
             artifact::CLASS_RELATIONS => Some(&description.class_relations),
+            artifact::CLASS_PROPERTIES => Some(&description.class_properties),
             _ => None,
         });
         if let Some(generated) = generated {
@@ -642,7 +645,7 @@ fn carry_artifact_metadata(
 
         if matches!(
             name.as_str(),
-            artifact::SCHEMA_NODES | artifact::CLASS_RELATIONS
+            artifact::SCHEMA_NODES | artifact::CLASS_RELATIONS | artifact::CLASS_PROPERTIES
         ) {
             let prior = prior.with_context(|| {
                 format!(

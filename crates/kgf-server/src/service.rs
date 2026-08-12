@@ -662,6 +662,11 @@ impl Release {
     pub fn declares(&self, capability: Capability) -> bool {
         self.manifest.parsed.declares(capability)
     }
+
+    /// Whether this release carries the complete Tier-1 description set.
+    pub fn carries_description(&self) -> bool {
+        self.manifest.parsed.carries_description_artifacts()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +856,11 @@ mod tests {
         assert_eq!(json["releases"].as_array().unwrap().len(), 2);
         assert_eq!(json["releases"][0]["version"], "new");
         assert_eq!(json["releases"][0]["url"], "/tox/v/new/");
+        assert_eq!(
+            json["releases"][0]["links"]["manifest"],
+            "/tox/v/new/manifest"
+        );
+        assert!(json["releases"][0]["links"].get("summary").is_none());
         assert!(
             json["releases"][0]["content_digest"]
                 .as_str()

@@ -166,6 +166,8 @@ pub enum PositionSpace {
     SchemaChild = 7,
     /// Byte offset in the persisted `/schema` class-relation projection.
     ClassRelation = 8,
+    /// Byte offset in the persisted `/schema` class-property projection.
+    ClassProperty = 9,
 }
 
 impl PositionSpace {
@@ -205,6 +207,7 @@ impl PositionSpace {
             6 => Some(Self::TextScan),
             7 => Some(Self::SchemaChild),
             8 => Some(Self::ClassRelation),
+            9 => Some(Self::ClassProperty),
             _ => None,
         }
     }
@@ -448,6 +451,11 @@ impl Cursor {
         Self::at(binding, PositionSpace::ClassRelation, byte_offset)
     }
 
+    /// Resume the `/schema` class-property projection at an artifact byte offset.
+    pub fn at_class_property(binding: &CursorBinding, byte_offset: u64) -> Self {
+        Self::at(binding, PositionSpace::ClassProperty, byte_offset)
+    }
+
     /// Encode to the opaque token clients round-trip.
     ///
     /// Fixed layout, little-endian, then URL-safe base64 without padding: 29
@@ -530,9 +538,9 @@ impl Cursor {
             PositionSpace::TextRank | PositionSpace::TextScan => {
                 binding_index.is_none() && scan_position.is_some()
             }
-            PositionSpace::SchemaChild | PositionSpace::ClassRelation => {
-                binding_index.is_none() && scan_position.is_none()
-            }
+            PositionSpace::SchemaChild
+            | PositionSpace::ClassRelation
+            | PositionSpace::ClassProperty => binding_index.is_none() && scan_position.is_none(),
             PositionSpace::Spo
             | PositionSpace::Pos
             | PositionSpace::Ops
@@ -686,7 +694,7 @@ mod tests {
             reencode(&raw[..FIXED_LEN - 1]),
             reencode(&[raw.clone(), vec![0u8]].concat()),
         ];
-        for (index, value) in [(0, 2u8), (3, 9u8), (4, 0b1000_0000u8)] {
+        for (index, value) in [(0, 2u8), (3, 10u8), (4, 0b1000_0000u8)] {
             let mut tampered = raw.clone();
             tampered[index] = value;
             bad.push(reencode(&tampered));

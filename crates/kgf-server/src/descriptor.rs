@@ -77,6 +77,29 @@ pub struct DatasetSummary<'a> {
     capabilities: Vec<&'a str>,
     /// The dataset descriptor, relative to this origin (see [`ReleaseEntry::url`]).
     url: String,
+    /// Direct entry points into the current immutable release.
+    links: ReleaseLinks,
+}
+
+/// Machine-discoverable resources belonging to one immutable release.
+#[derive(Debug, Serialize)]
+pub struct ReleaseLinks {
+    manifest: String,
+    fragment: String,
+    count: String,
+    describe: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    void: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    labels: Option<String>,
 }
 
 /// Which build and protocol answered.
@@ -101,6 +124,7 @@ impl<'a> ServiceDescriptor<'a> {
                     current: dataset.current(),
                     capabilities: dataset.capabilities().collect(),
                     url: url::dataset(name),
+                    links: release_links(name, dataset.current(), dataset.current_release()),
                 })
                 .collect(),
             caps: &service.config().caps,
@@ -268,6 +292,7 @@ pub struct ReleaseEntry<'a> {
     /// relative reference resolves against the request URI to the same place,
     /// so it says what it knows rather than guessing at a hostname.
     url: String,
+    links: ReleaseLinks,
 }
 
 impl<'a> DatasetDescriptor<'a> {
@@ -287,6 +312,7 @@ impl<'a> DatasetDescriptor<'a> {
                     version,
                     content_digest: release.content_digest().as_str(),
                     url: url::bundle_base(name, version),
+                    links: release_links(name, version, release),
                 })
                 .collect(),
             triples: dataset.triples(),
@@ -301,6 +327,12 @@ impl Resource for DatasetDescriptor<'_> {
     }
 
     fn to_html(&self) -> String {
+        let current_links = &self
+            .releases
+            .iter()
+            .find(|release| release.version == self.current)
+            .expect("the current release appears in its release history")
+            .links;
         let role_members: Vec<String> = self
             .predicate_roles
             .iter()
@@ -348,10 +380,16 @@ impl Resource for DatasetDescriptor<'_> {
                         (chips(&self.capabilities))
                     }
                     p."pager" {
-                        a href=(format!("/{}/latest/fragment", url::encode_segment(self.id))) {
+                        @if let Some(summary) = &current_links.summary {
+                            a href=(summary) { "Understand this graph →" }
+                        }
+                        @if let Some(schema) = &current_links.schema {
+                            a href=(schema) { "Explore its schema →" }
+                        }
+                        a href=(&current_links.fragment) {
                             "Browse the data →"
                         }
-                        a href=(url::operation(self.id, self.current, "manifest")) {
+                        a href=(&current_links.manifest) {
                             "Latest manifest →"
                         }
                     }
@@ -392,6 +430,29 @@ impl Resource for DatasetDescriptor<'_> {
                 }
             },
         )
+    }
+}
+
+fn release_links(dataset: &str, version: &str, release: &crate::service::Release) -> ReleaseLinks {
+    let operation = |name| url::operation(dataset, version, name);
+    let description = release.carries_description();
+    ReleaseLinks {
+        manifest: operation("manifest"),
+        fragment: operation("fragment"),
+        count: operation("count"),
+        describe: operation("describe"),
+        summary: description.then(|| operation("summary")),
+        schema: description.then(|| operation("schema")),
+        void: description.then(|| operation("void")),
+        sample: release
+            .declares(Capability::Sample)
+            .then(|| operation("sample")),
+        search: release
+            .declares(Capability::Search)
+            .then(|| operation("search")),
+        labels: release
+            .declares(Capability::Labels)
+            .then(|| operation("labels")),
     }
 }
 

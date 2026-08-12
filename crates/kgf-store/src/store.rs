@@ -49,6 +49,8 @@ pub mod artifact {
     pub const SCHEMA_NODES: &str = "stats/schema-nodes.tsv";
     /// Count-ranked class relation projection.
     pub const CLASS_RELATIONS: &str = "stats/class-relations.tsv";
+    /// Count-ranked properties used by each observed subject class.
+    pub const CLASS_PROPERTIES: &str = "stats/class-properties.tsv";
     /// Per-role namespace inventory.
     pub const NAMESPACES: &str = "stats/namespaces.json";
     /// Structured LLM summary card.
@@ -57,11 +59,12 @@ pub mod artifact {
     pub const SUMMARY_MD: &str = "stats/summary.md";
 
     /// The complete tier-1 description artifact set, in bundle-layout order.
-    pub const DESCRIPTION: [&str; 7] = [
+    pub const DESCRIPTION: [&str; 8] = [
         VOID_HDT,
         VOID_PERM,
         SCHEMA_NODES,
         CLASS_RELATIONS,
+        CLASS_PROPERTIES,
         NAMESPACES,
         SUMMARY_JSON,
         SUMMARY_MD,
@@ -260,6 +263,7 @@ pub(crate) struct DescriptionArtifacts {
     pub(crate) void_perm: PathBuf,
     pub(crate) schema_nodes: PathBuf,
     pub(crate) class_relations: PathBuf,
+    pub(crate) class_properties: PathBuf,
     pub(crate) namespaces: PathBuf,
     pub(crate) summary_json: PathBuf,
     pub(crate) summary_md: PathBuf,
@@ -430,6 +434,7 @@ impl DescriptionArtifacts {
             void_perm: paths.next().expect("void permutations"),
             schema_nodes: paths.next().expect("schema nodes"),
             class_relations: paths.next().expect("class relations"),
+            class_properties: paths.next().expect("class properties"),
             namespaces: paths.next().expect("namespaces"),
             summary_json: paths.next().expect("summary JSON"),
             summary_md: paths.next().expect("summary Markdown"),
@@ -437,12 +442,13 @@ impl DescriptionArtifacts {
     }
 
     /// Every description artifact paired with its bundle-relative name.
-    pub(crate) fn paths(&self) -> [(&'static str, &Path); 7] {
+    pub(crate) fn paths(&self) -> [(&'static str, &Path); 8] {
         [
             (artifact::VOID_HDT, &self.void_hdt),
             (artifact::VOID_PERM, &self.void_perm),
             (artifact::SCHEMA_NODES, &self.schema_nodes),
             (artifact::CLASS_RELATIONS, &self.class_relations),
+            (artifact::CLASS_PROPERTIES, &self.class_properties),
             (artifact::NAMESPACES, &self.namespaces),
             (artifact::SUMMARY_JSON, &self.summary_json),
             (artifact::SUMMARY_MD, &self.summary_md),
@@ -499,7 +505,8 @@ mod tests {
     use super::*;
     use crate::pattern::IdPattern;
     use crate::testing::{
-        CLASS_RELATIONS_HEADER, Fixture, SCHEMA_NODES_HEADER, TINY_NT, published_bundle,
+        CLASS_PROPERTIES_HEADER, CLASS_RELATIONS_HEADER, Fixture, SCHEMA_NODES_HEADER, TINY_NT,
+        published_bundle,
     };
 
     #[test]
@@ -546,12 +553,16 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
 
-        fixture.add_description_artifacts(SCHEMA_NODES_HEADER, CLASS_RELATIONS_HEADER);
+        fixture.add_description_artifacts(
+            SCHEMA_NODES_HEADER,
+            CLASS_RELATIONS_HEADER,
+            CLASS_PROPERTIES_HEADER,
+        );
         let artifacts = ArtifactSet::resolve(fixture.bundle_path()).unwrap();
         let description = artifacts
             .description
             .as_ref()
-            .expect("all seven files form the description set");
+            .expect("all eight files form the description set");
         assert_eq!(
             description.void_hdt,
             fixture.bundle_path().join(artifact::VOID_HDT)
@@ -567,6 +578,10 @@ mod tests {
         assert_eq!(
             description.class_relations,
             fixture.bundle_path().join(artifact::CLASS_RELATIONS)
+        );
+        assert_eq!(
+            description.class_properties,
+            fixture.bundle_path().join(artifact::CLASS_PROPERTIES)
         );
         assert_eq!(
             description.namespaces,
@@ -590,7 +605,11 @@ mod tests {
     #[test]
     fn disk_and_manifest_description_sets_must_agree_without_panicking() {
         let files_only = Fixture::build(TINY_NT);
-        files_only.add_description_artifacts(SCHEMA_NODES_HEADER, CLASS_RELATIONS_HEADER);
+        files_only.add_description_artifacts(
+            SCHEMA_NODES_HEADER,
+            CLASS_RELATIONS_HEADER,
+            CLASS_PROPERTIES_HEADER,
+        );
         let published = published_bundle(files_only.bundle_path());
         match Store::open(&published, OpenOptions::default())
             .expect_err("unlisted description files must be refused")
@@ -630,7 +649,11 @@ mod tests {
         let other = Fixture::build(&format!(
             "{TINY_NT}<http://example.org/extra> <http://example.org/p> <http://example.org/o> .\n"
         ));
-        fixture.add_description_artifacts(SCHEMA_NODES_HEADER, CLASS_RELATIONS_HEADER);
+        fixture.add_description_artifacts(
+            SCHEMA_NODES_HEADER,
+            CLASS_RELATIONS_HEADER,
+            CLASS_PROPERTIES_HEADER,
+        );
         std::fs::copy(
             other.perm_path(),
             fixture.bundle_path().join(artifact::VOID_PERM),

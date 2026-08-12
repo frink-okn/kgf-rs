@@ -1198,14 +1198,17 @@ shared stylesheet.
 The store-side foundation is implemented. One internal `IndexedHdt` now owns an
 HDT plus its bound permutation sidecar and serves both `data.hdt` and
 `stats/void.hdt`; its dictionary projection remains encapsulated with the
-mapping it belongs to. A tier-1 description is an all-or-none seven-artifact
-set, included in bundle identity. `Store::open` maps the VoID pair and the two
+mapping it belongs to. A tier-1 description is an all-or-none eight-artifact
+set, included in bundle identity. `Store::open` maps the VoID pair and the three
 TSV indexes plus the namespace and two summary documents without scanning
 their payloads or allocating state proportional to schema or prefix-table size.
 
 `stats/schema-nodes.tsv` resolves typed semantic selectors by row-boundary-aware
 binary search. `stats/class-relations.tsv` pages its persisted order directly,
 including filtered candidate limits and exact byte-position resumption. Full
+`stats/class-properties.tsv` supplies the analogous count-ranked inventory of
+predicates observed on instances of each class, including triple and distinct-term
+counts. Full
 publication-time verification checks TSV ranges, ordering, row metadata,
 selector bindings in both directions, parent paths, every traversable child
 edge and its single semantic term, every numeric count fact the serving API can
@@ -1308,7 +1311,7 @@ the exact row bounds it wrote; manifest regeneration accepts those build-owned b
 only from this path, preserves unmodeled component metadata, and runs the existing
 offline semantic proof before success.
 
-The seven artifacts are constructed beside the bundle and renamed into `stats/` as
+The eight artifacts are constructed beside the bundle and renamed into `stats/` as
 one set. If publication or verification fails, the prior stats directory and manifest
 are restored. This is intentionally the stats node rather than the full `build.yaml`
 DAG: it consumes an already-built `data.hdt` and any published component HDTs, which
@@ -1316,7 +1319,7 @@ keeps the hdtc/KGF format boundary explicit while making today's hand-built bund
 core-profile complete.
 
 *Verified by* the existing route and pure-operation suites plus an end-to-end producer
-test that starts from an hdtc-built typed graph, generates all seven artifacts, opens
+test that starts from an hdtc-built typed graph, generates all eight artifacts, opens
 the result through `Store`, and passes `kgf manifest --check`. The producer was also
 run over PHASES KG (2,750 triples), yielding 836 selector rows and 84 typed relation
 rows across its design/queryable views; the resulting `/void`, `/summary`, and paged
@@ -1808,6 +1811,30 @@ following the code.
     datatype?}` and renders the same path on the HTML page. The doc should add this
     field to the fixed envelope so scope is data rather than something clients reverse-
     engineer from links. Surfaced while testing the stats surface against PHASES KG.
+39. **Version resources need typed discovery links.** A client should not have to
+    concatenate undocumented route names after selecting a dataset version. The root
+    and dataset descriptors now publish a typed `links` object per release, gated by
+    the release's capabilities and description artifacts; persisted summary cards
+    carry relative links into the same discovery surface. Docs 03 and 04 should make
+    these link relations part of the descriptor and summary contracts.
+40. **Schema label hydration uses a response-level IRI map.** `/schema?labels=true`
+    now returns `labels: {full_iri: string|null}` for every distinct schema IRI on the
+    page, bounded by `max_label_iris` and the release's frozen label cascade. A null is
+    a completed lookup with no label; absence of the map means hydration was not
+    requested. This is one concrete answer to question 35 for a discovery operation
+    and should be specified before the same modifier expands to triple-row operations.
+41. **Class-to-property discovery needs a persisted flat projection.** Navigating one
+    class at a time is useful for inspection but poor for comparing a graph's kinds.
+    Tier 1 now includes `stats/class-properties.tsv` and
+    `/schema?projection=class-properties`, ordered by descending triples with stable
+    IRI ties and filterable by class or predicate. Rows require triples and carry
+    distinct subjects/objects when the source VoID states them. Doc 04 should add the eighth artifact and doc 03
+    should define the projection beside `class-relations`.
+42. **Collection and projection ordering is response data.** Schema child pages now
+    describe their collection as `{kind, returned, order}`, and flat projections echo
+    their filters plus a structured order contract. Agents otherwise have to infer
+    scope and cursor semantics from a URL. Doc 03's fixed envelope should carry this
+    metadata explicitly.
 
 ## Not in this plan
 

@@ -382,6 +382,7 @@ pub struct ArtifactEntry {
 pub(crate) struct DescriptionArtifactEntries<'a> {
     pub(crate) schema_nodes: &'a ArtifactEntry,
     pub(crate) class_relations: &'a ArtifactEntry,
+    pub(crate) class_properties: &'a ArtifactEntry,
     pub(crate) namespaces: &'a ArtifactEntry,
     pub(crate) summary_json: &'a ArtifactEntry,
     pub(crate) summary_md: &'a ArtifactEntry,
@@ -535,7 +536,7 @@ impl Manifest {
             .all(|name| self.artifacts.contains_key(*name))
     }
 
-    /// The five entries whose metadata the mapped description reader consumes.
+    /// The six entries whose metadata the mapped description reader consumes.
     ///
     /// [`validate`](Self::validate) establishes the all-or-none invariant, so
     /// finding the selector entry means every other description entry is
@@ -543,12 +544,14 @@ impl Manifest {
     pub(crate) fn description_artifacts(&self) -> Option<DescriptionArtifactEntries<'_>> {
         let schema_nodes = self.artifacts.get(artifact::SCHEMA_NODES)?;
         let class_relations = self.artifacts.get(artifact::CLASS_RELATIONS)?;
+        let class_properties = self.artifacts.get(artifact::CLASS_PROPERTIES)?;
         let namespaces = self.artifacts.get(artifact::NAMESPACES)?;
         let summary_json = self.artifacts.get(artifact::SUMMARY_JSON)?;
         let summary_md = self.artifacts.get(artifact::SUMMARY_MD)?;
         Some(DescriptionArtifactEntries {
             schema_nodes,
             class_relations,
+            class_properties,
             namespaces,
             summary_json,
             summary_md,
@@ -583,11 +586,15 @@ impl Manifest {
             )));
         }
 
-        for name in [artifact::SCHEMA_NODES, artifact::CLASS_RELATIONS] {
+        for name in [
+            artifact::SCHEMA_NODES,
+            artifact::CLASS_RELATIONS,
+            artifact::CLASS_PROPERTIES,
+        ] {
             let entry = self
                 .artifacts
                 .get(name)
-                .expect("the complete description set contains both TSV indexes");
+                .expect("the complete description set contains every TSV index");
             if entry.parents.len() != 1 || entry.parents[0] != artifact::VOID_HDT {
                 return Err(syntax(format!(
                     "artifact {name} must declare parents: [\"{}\"]",
@@ -639,11 +646,19 @@ impl Manifest {
             .get(artifact::CLASS_RELATIONS)
             .expect("the complete description set contains class relations")
             .views;
-        if !schema_views.keys().eq(relation_views.keys()) {
+        let property_views = &self
+            .artifacts
+            .get(artifact::CLASS_PROPERTIES)
+            .expect("the complete description set contains class properties")
+            .views;
+        if !schema_views.keys().eq(relation_views.keys())
+            || !schema_views.keys().eq(property_views.keys())
+        {
             return Err(syntax(format!(
-                "artifacts {} and {} must declare the same views",
+                "artifacts {}, {}, and {} must declare the same views",
                 artifact::SCHEMA_NODES,
-                artifact::CLASS_RELATIONS
+                artifact::CLASS_RELATIONS,
+                artifact::CLASS_PROPERTIES
             )));
         }
         Ok(())
@@ -886,7 +901,8 @@ pub fn content_digest_preimage(artifacts: &[ArtifactDigest]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::testing::{
-        CLASS_RELATIONS_HEADER, Fixture, SCHEMA_NODES_HEADER, TINY_NQ, TINY_NT, published_bundle,
+        CLASS_PROPERTIES_HEADER, CLASS_RELATIONS_HEADER, Fixture, SCHEMA_NODES_HEADER, TINY_NQ,
+        TINY_NT, published_bundle,
     };
 
     #[test]
@@ -912,7 +928,11 @@ mod tests {
     }
 
     fn add_description_set(fixture: &Fixture) {
-        fixture.add_description_artifacts(SCHEMA_NODES_HEADER, CLASS_RELATIONS_HEADER);
+        fixture.add_description_artifacts(
+            SCHEMA_NODES_HEADER,
+            CLASS_RELATIONS_HEADER,
+            CLASS_PROPERTIES_HEADER,
+        );
     }
 
     #[test]
@@ -1128,7 +1148,11 @@ mod tests {
                 .artifacts
                 .insert(name.to_owned(), ArtifactEntry::checksum(100, "abc"));
         }
-        for name in [artifact::SCHEMA_NODES, artifact::CLASS_RELATIONS] {
+        for name in [
+            artifact::SCHEMA_NODES,
+            artifact::CLASS_RELATIONS,
+            artifact::CLASS_PROPERTIES,
+        ] {
             let entry = manifest.artifacts.get_mut(name).unwrap();
             entry.parents = vec![artifact::VOID_HDT.to_owned()];
             entry.max_row_bytes = Some(80);

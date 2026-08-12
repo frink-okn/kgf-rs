@@ -41,7 +41,8 @@ use serde::ser::{Serialize, SerializeMap, Serializer};
 
 use hdtc::format::TextQuery;
 use kgf_store::{
-    Capability, ClassRelationFilter as StoreClassRelationFilter, Role,
+    Capability, ClassPropertyFilter as StoreClassPropertyFilter,
+    ClassRelationFilter as StoreClassRelationFilter, Role,
     SchemaChildQuery as StoreSchemaChildQuery, SchemaSelector as StoreSchemaSelector, StatsView,
 };
 
@@ -1625,6 +1626,35 @@ impl SchemaRelationFilter {
     }
 }
 
+/// Optional filters for `/schema?projection=class-properties`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaClassPropertyFilter {
+    /// Subject-class IRI to retain.
+    pub class: Option<BoundTerm>,
+    /// Predicate IRI to retain.
+    pub predicate: Option<BoundTerm>,
+}
+
+impl SchemaClassPropertyFilter {
+    /// Borrow the filters in the store layer's persisted-projection shape.
+    pub fn store_filter(&self) -> StoreClassPropertyFilter<'_> {
+        StoreClassPropertyFilter {
+            class: self.class.as_ref().map(BoundTerm::dictionary),
+            predicate: self.predicate.as_ref().map(BoundTerm::dictionary),
+        }
+    }
+
+    fn canonicalize(&self, request: CanonicalRequest) -> CanonicalRequest {
+        request
+            .with("projection", "class-properties")
+            .with_opt("class", self.class.as_ref().map(BoundTerm::dictionary))
+            .with_opt(
+                "predicate",
+                self.predicate.as_ref().map(BoundTerm::dictionary),
+            )
+    }
+}
+
 /// The mutually exclusive result shapes of one `/schema` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaQuery {
@@ -1634,6 +1664,8 @@ pub enum SchemaQuery {
     Children(SchemaChildren),
     /// Page the persisted flat class-relation projection.
     ClassRelations(SchemaRelationFilter),
+    /// Page the persisted count-ranked class-property inventory.
+    ClassProperties(SchemaClassPropertyFilter),
 }
 
 impl SchemaQuery {
@@ -1642,6 +1674,7 @@ impl SchemaQuery {
             Self::Node(selection) => selection.canonicalize(request),
             Self::Children(children) => children.canonicalize(request),
             Self::ClassRelations(filter) => filter.canonicalize(request),
+            Self::ClassProperties(filter) => filter.canonicalize(request),
         }
     }
 
@@ -1650,6 +1683,7 @@ impl SchemaQuery {
             Self::Node(_) => None,
             Self::Children(_) => Some(crate::cursor::PositionSpace::SchemaChild),
             Self::ClassRelations(_) => Some(crate::cursor::PositionSpace::ClassRelation),
+            Self::ClassProperties(_) => Some(crate::cursor::PositionSpace::ClassProperty),
         }
     }
 }
@@ -1667,6 +1701,9 @@ pub struct Schema {
     pub bytes: ResponseBytes,
     /// Rows a filtered class-relation page may examine.
     pub candidates: Candidates,
+    /// Whether the JSON response should carry the preferred label (or an
+    /// explicit null) for each distinct schema IRI on the page.
+    pub labels: bool,
     /// Where to resume, if the request carried a cursor.
     pub cursor: Option<Cursor>,
     /// What a cursor this request issues must match.
@@ -1713,6 +1750,7 @@ impl Schema {
         "view",
         "limit",
         "cursor",
+        "labels",
         "format",
     ];
 
@@ -1726,6 +1764,7 @@ impl Schema {
         accept_only(params, SCHEMA, Self::PARAMETERS)?;
         let view = schema_view(params)?;
         let query = parse_schema_query(params, limits, prefixes)?;
+        let labels = boolean(params, "labels", false)?;
         let limit = match &query {
             SchemaQuery::Node(_) => {
                 if params.get("limit").is_some() {
@@ -1736,7 +1775,9 @@ impl Schema {
                 }
                 None
             }
-            SchemaQuery::Children(_) | SchemaQuery::ClassRelations(_) => Some(page_size(
+            SchemaQuery::Children(_)
+            | SchemaQuery::ClassRelations(_)
+            | SchemaQuery::ClassProperties(_) => Some(page_size(
                 params,
                 "limit",
                 limits.caps.default_limit,
@@ -1763,6 +1804,7 @@ impl Schema {
             limit,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
             candidates: Candidates(limits.budgets.candidate_budget),
+            labels,
             cursor,
             binding,
         })
@@ -1804,11 +1846,11 @@ fn parse_schema_query(
     prefixes: &PrefixMap,
 ) -> Result<SchemaQuery, Problem> {
     if let Some(projection) = params.get("projection") {
-        if projection != "class-relations" {
+        if !matches!(projection, "class-relations" | "class-properties") {
             return Err(Problem::new(
                 ErrorCode::MalformedRequest,
                 format!(
-                    "projection={} is not a schema projection; use `class-relations` or omit it",
+                    "projection={} is not a schema projection; use `class-relations`, `class-properties`, or omit it",
                     reflected(projection)
                 ),
             ));
@@ -1816,13 +1858,20 @@ fn parse_schema_query(
         if params.get("children").is_some() || params.get("datatype").is_some() {
             return Err(Problem::new(
                 ErrorCode::MalformedRequest,
-                "`projection=class-relations` accepts `class` and `predicate` filters, but not `children` or `datatype`",
+                "schema projections accept `class` and `predicate` filters, but not `children` or `datatype`",
             ));
         }
-        return Ok(SchemaQuery::ClassRelations(SchemaRelationFilter {
-            class: schema_iri(params, "class", limits, prefixes)?,
-            predicate: schema_iri(params, "predicate", limits, prefixes)?,
-        }));
+        let class = schema_iri(params, "class", limits, prefixes)?;
+        let predicate = schema_iri(params, "predicate", limits, prefixes)?;
+        return Ok(match projection {
+            "class-relations" => {
+                SchemaQuery::ClassRelations(SchemaRelationFilter { class, predicate })
+            }
+            "class-properties" => {
+                SchemaQuery::ClassProperties(SchemaClassPropertyFilter { class, predicate })
+            }
+            _ => unreachable!("projection spelling checked above"),
+        });
     }
 
     let selection = match (
@@ -2001,6 +2050,12 @@ impl Sample {
 pub(crate) trait GetRequest {
     /// Remove empty controls whose omission selects this request's default.
     fn normalize_params(params: &Params) -> Params;
+
+    /// Whether this request explicitly asks for preferred labels in its
+    /// machine representation.
+    fn labels_requested(&self) -> bool {
+        false
+    }
 }
 
 /// Empty triple positions are unbound; `additional` names the operation's
@@ -2042,7 +2097,12 @@ impl GetRequest for Schema {
             "projection",
             "view",
             "limit",
+            "labels",
         ])
+    }
+
+    fn labels_requested(&self) -> bool {
+        self.labels
     }
 }
 
@@ -2551,6 +2611,16 @@ mod tests {
                 .code(),
             ErrorCode::CapExceeded
         );
+
+        let properties =
+            schema("projection=class-properties&class=ex%3AClass&predicate=ex%3Ap&limit=10")
+                .unwrap();
+        let SchemaQuery::ClassProperties(filter) = properties.query else {
+            panic!("projection did not type as class properties");
+        };
+        let filter = filter.store_filter();
+        assert_eq!(filter.class, Some("http://example.org/Class"));
+        assert_eq!(filter.predicate, Some("http://example.org/p"));
     }
 
     #[test]
@@ -2593,6 +2663,19 @@ mod tests {
                 .unwrap_err()
                 .code(),
             ErrorCode::StaleCursor
+        );
+
+        let properties = schema("projection=class-properties").unwrap();
+        let property_token = Cursor::at_class_property(&properties.binding, 8_192).encode();
+        assert_eq!(
+            schema(&format!(
+                "projection=class-properties&limit=2&cursor={property_token}"
+            ))
+            .unwrap()
+            .cursor
+            .unwrap()
+            .position,
+            8_192
         );
     }
 

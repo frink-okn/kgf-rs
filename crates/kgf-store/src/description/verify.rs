@@ -20,15 +20,18 @@ use crate::{Role, TermId};
 use super::documents::verify_summary_json;
 use super::{
     CountPredicates, DescriptionStore, MappedTsv, SchemaRow, StatsView, VOID_CLASS,
-    VOID_CLASS_PARTITION, VOID_PROPERTY, VOID_PROPERTY_PARTITION, VOID_TRIPLES, VOIDEXT_DATATYPE,
-    VOIDEXT_DATATYPE_PARTITION, VOIDEXT_LANGUAGE, VOIDEXT_LANGUAGE_PARTITION,
-    VOIDEXT_OBJECT_CLASS_PARTITION, compare_fields, fields, integer_object, malformed,
-    object_to_subject, parse_schema_row, reject_extra_fields, required_field,
+    VOID_CLASS_PARTITION, VOID_DISTINCT_OBJECTS, VOID_DISTINCT_SUBJECTS, VOID_PROPERTY,
+    VOID_PROPERTY_PARTITION, VOID_TRIPLES, VOIDEXT_DATATYPE, VOIDEXT_DATATYPE_PARTITION,
+    VOIDEXT_LANGUAGE, VOIDEXT_LANGUAGE_PARTITION, VOIDEXT_OBJECT_CLASS_PARTITION, compare_fields,
+    fields, integer_object, malformed, object_to_subject, parse_schema_row, reject_extra_fields,
+    required_field,
 };
 use crate::error::Result;
 
 const SCHEMA_HEADER: &[u8] = b"view\tkind\tclass\tpredicate\tdatatype\tsubject_id\n";
 const RELATIONS_HEADER: &[u8] = b"view\tsubject_class\tpredicate\tobject_class\ttriples\n";
+const CLASS_PROPERTIES_HEADER: &[u8] =
+    b"view\tclass\tpredicate\ttriples\tdistinct_subjects\tdistinct_objects\n";
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const VOID_DATASET: &str = "http://rdfs.org/ns/void#Dataset";
@@ -37,7 +40,7 @@ const VOID_SUBSET: &str = "http://rdfs.org/ns/void#subset";
 /// Fully verify a candidate manifest's description indexes against its bundle.
 ///
 /// The candidate need not be the manifest currently stored in the bundle. This
-/// is the build/publication boundary: it scans both TSVs and traverses the VoID
+/// is the build/publication boundary: it scans all three TSVs and traverses the VoID
 /// graph, while [`crate::Store::open`] remains bounded and size-independent.
 pub fn verify_description_artifacts(bundle: &PublishedBundle, manifest: &Manifest) -> Result<()> {
     let dir = bundle.path();
@@ -65,6 +68,7 @@ pub fn verify_description_artifacts(bundle: &PublishedBundle, manifest: &Manifes
 
 type SelectorIndex = BTreeMap<StatsView, BTreeMap<VerifiedSelector, TermId>>;
 type RelationIndex = BTreeMap<StatsView, BTreeMap<RelationKey, u64>>;
+type ClassPropertyIndex = BTreeMap<StatsView, BTreeMap<ClassPropertyKey, ClassPropertyCounts>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum VerifiedSelector {
@@ -88,12 +92,34 @@ struct RelationKey {
     object_class: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ClassPropertyKey {
+    class: String,
+    predicate: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClassPropertyCounts {
+    triples: u64,
+    distinct_subjects: Option<u64>,
+    distinct_objects: Option<u64>,
+}
+
 struct RelationRow<'a> {
     view: &'a str,
     subject_class: &'a str,
     predicate: &'a str,
     object_class: &'a str,
     triples: &'a str,
+}
+
+struct ClassPropertyRow<'a> {
+    view: &'a str,
+    class: &'a str,
+    predicate: &'a str,
+    triples: &'a str,
+    distinct_subjects: &'a str,
+    distinct_objects: &'a str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,6 +149,10 @@ impl DescriptionStore {
         let relations = verify_relation_table(&self.class_relations)?;
         let expected = expected_relations(&self.void, &selectors, self.class_relations.path())?;
         compare_relations(&relations, &expected, self.class_relations.path())?;
+        let class_properties = verify_class_property_table(&self.class_properties)?;
+        let expected =
+            expected_class_properties(&self.void, &selectors, self.class_properties.path())?;
+        compare_class_properties(&class_properties, &expected, self.class_properties.path())?;
         self.namespace_inventory()?;
         verify_summary_json(self.summary_json.as_bytes(), self.summary_json.path())?;
         self.summary_markdown()?;
@@ -925,6 +955,255 @@ fn compare_relations(actual: &RelationIndex, expected: &RelationIndex, path: &Pa
                 path,
                 format!(
                     "class relation {extra:?} in view {:?} is absent from VoID",
+                    manifest_view_name(view)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_class_property_table(table: &MappedTsv) -> Result<ClassPropertyIndex> {
+    let mut indexes: ClassPropertyIndex = table
+        .views
+        .keys()
+        .cloned()
+        .map(|view| (view, BTreeMap::new()))
+        .collect();
+    let mut previous_view: Option<StatsView> = None;
+    let mut previous: Option<(u64, ClassPropertyKey)> = None;
+
+    table.verify_rows(CLASS_PROPERTIES_HEADER, |view, offset, bytes| {
+        let row = parse_verified_class_property(bytes, table.path())?;
+        require_row_view(row.view, view, table.path(), offset)?;
+        if previous_view.as_ref() != Some(view) {
+            previous_view = Some(view.clone());
+            previous = None;
+        }
+        let key = ClassPropertyKey {
+            class: expanded_iri(row.class, "class", table.path(), offset)?,
+            predicate: expanded_iri(row.predicate, "predicate", table.path(), offset)?,
+        };
+        let counts = ClassPropertyCounts {
+            triples: count_field(row.triples, "triples", table.path(), offset)?,
+            distinct_subjects: optional_count_field(
+                row.distinct_subjects,
+                "distinct_subjects",
+                table.path(),
+                offset,
+            )?,
+            distinct_objects: optional_count_field(
+                row.distinct_objects,
+                "distinct_objects",
+                table.path(),
+                offset,
+            )?,
+        };
+        if counts
+            .distinct_subjects
+            .is_some_and(|count| count > counts.triples)
+            || counts
+                .distinct_objects
+                .is_some_and(|count| count > counts.triples)
+        {
+            return Err(malformed(
+                table.path(),
+                format!(
+                    "class property at byte {offset} has a distinct count larger than its triple count"
+                ),
+            ));
+        }
+        if let Some((previous_triples, previous_key)) = &previous
+            && (*previous_triples < counts.triples
+                || (*previous_triples == counts.triples && previous_key >= &key))
+        {
+            return Err(malformed(
+                table.path(),
+                format!(
+                    "class property at byte {offset} is not in triples-descending, IRI-ascending order"
+                ),
+            ));
+        }
+        previous = Some((counts.triples, key.clone()));
+        if indexes
+            .get_mut(view)
+            .expect("every declared view was pre-populated")
+            .insert(key, counts)
+            .is_some()
+        {
+            return Err(malformed(
+                table.path(),
+                format!("duplicate class property at byte {offset}"),
+            ));
+        }
+        Ok(())
+    })?;
+    Ok(indexes)
+}
+
+fn parse_verified_class_property<'a>(bytes: &'a [u8], path: &Path) -> Result<ClassPropertyRow<'a>> {
+    let mut fields = fields(bytes, path)?;
+    let row = ClassPropertyRow {
+        view: required_field(&mut fields, 0, 6, path)?,
+        class: required_field(&mut fields, 1, 6, path)?,
+        predicate: required_field(&mut fields, 2, 6, path)?,
+        triples: required_field(&mut fields, 3, 6, path)?,
+        distinct_subjects: required_field(&mut fields, 4, 6, path)?,
+        distinct_objects: required_field(&mut fields, 5, 6, path)?,
+    };
+    reject_extra_fields(fields, 6, path)?;
+    Ok(row)
+}
+
+fn count_field(value: &str, name: &str, path: &Path, offset: u64) -> Result<u64> {
+    value.parse::<u64>().map_err(|error| {
+        malformed(
+            path,
+            format!("{name} {value:?} at byte {offset} is not an unsigned decimal: {error}"),
+        )
+    })
+}
+
+fn optional_count_field(value: &str, name: &str, path: &Path, offset: u64) -> Result<Option<u64>> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        count_field(value, name, path, offset).map(Some)
+    }
+}
+
+fn expected_class_properties(
+    void: &IndexedHdt,
+    selectors: &SelectorIndex,
+    path: &Path,
+) -> Result<ClassPropertyIndex> {
+    let mut expected = BTreeMap::new();
+    for (view, index) in selectors {
+        let mut properties = BTreeMap::new();
+        for (selector, property_node) in index {
+            let VerifiedSelector::Property {
+                class: Some(class),
+                predicate,
+            } = selector
+            else {
+                continue;
+            };
+            let key = ClassPropertyKey {
+                class: class.clone(),
+                predicate: predicate.clone(),
+            };
+            let counts = ClassPropertyCounts {
+                triples: required_count(void, *property_node, VOID_TRIPLES, path)?,
+                distinct_subjects: optional_count(
+                    void,
+                    *property_node,
+                    VOID_DISTINCT_SUBJECTS,
+                    path,
+                )?,
+                distinct_objects: optional_count(
+                    void,
+                    *property_node,
+                    VOID_DISTINCT_OBJECTS,
+                    path,
+                )?,
+            };
+            if properties.insert(key.clone(), counts).is_some() {
+                return Err(malformed(
+                    path,
+                    format!(
+                        "VoID graph yields duplicate class property {key:?} in view {:?}",
+                        manifest_view_name(view)
+                    ),
+                ));
+            }
+        }
+        expected.insert(view.clone(), properties);
+    }
+    Ok(expected)
+}
+
+fn required_count(void: &IndexedHdt, subject: TermId, predicate: &str, path: &Path) -> Result<u64> {
+    let values = object_ids(void, subject, predicate, path)?;
+    if values.len() != 1 {
+        return Err(malformed(
+            path,
+            format!(
+                "partition subject {} has {} values for <{predicate}>, expected one",
+                subject.0,
+                values.len()
+            ),
+        ));
+    }
+    integer_object(void, values[0], path)
+}
+
+fn optional_count(
+    void: &IndexedHdt,
+    subject: TermId,
+    predicate: &str,
+    path: &Path,
+) -> Result<Option<u64>> {
+    let values = object_ids(void, subject, predicate, path)?;
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => integer_object(void, *value, path).map(Some),
+        _ => Err(malformed(
+            path,
+            format!(
+                "partition subject {} has {} values for <{predicate}>, expected at most one",
+                subject.0,
+                values.len()
+            ),
+        )),
+    }
+}
+
+fn compare_class_properties(
+    actual: &ClassPropertyIndex,
+    expected: &ClassPropertyIndex,
+    path: &Path,
+) -> Result<()> {
+    if actual.keys().ne(expected.keys()) {
+        return Err(malformed(
+            path,
+            "schema and class-property indexes do not contain the same views".to_owned(),
+        ));
+    }
+    for (view, expected_rows) in expected {
+        let actual_rows = actual
+            .get(view)
+            .expect("view key sets were compared immediately above");
+        for (key, expected_counts) in expected_rows {
+            match actual_rows.get(key) {
+                Some(actual_counts) if actual_counts == expected_counts => {}
+                Some(actual_counts) => {
+                    return Err(malformed(
+                        path,
+                        format!(
+                            "class property {key:?} in view {:?} records {actual_counts:?}, VoID records {expected_counts:?}",
+                            manifest_view_name(view)
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(malformed(
+                        path,
+                        format!(
+                            "class property {key:?} from VoID is missing in view {:?}",
+                            manifest_view_name(view)
+                        ),
+                    ));
+                }
+            }
+        }
+        if let Some(extra) = actual_rows
+            .keys()
+            .find(|key| !expected_rows.contains_key(*key))
+        {
+            return Err(malformed(
+                path,
+                format!(
+                    "class property {extra:?} in view {:?} is absent from VoID",
                     manifest_view_name(view)
                 ),
             ));

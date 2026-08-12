@@ -170,7 +170,11 @@ fn stats_build_publishes_one_verified_description_set() {
     for name in artifact::DESCRIPTION {
         assert!(manifest.artifacts.contains_key(name), "missing {name}");
     }
-    for name in [artifact::SCHEMA_NODES, artifact::CLASS_RELATIONS] {
+    for name in [
+        artifact::SCHEMA_NODES,
+        artifact::CLASS_RELATIONS,
+        artifact::CLASS_PROPERTIES,
+    ] {
         let entry = &manifest.artifacts[name];
         assert_eq!(entry.parents, [artifact::VOID_HDT]);
         assert!(entry.max_row_bytes.is_some());
@@ -182,6 +186,15 @@ fn stats_build_publishes_one_verified_description_set() {
             .unwrap();
     assert_eq!(summary["dataset"]["id"], "typed-kg");
     assert_eq!(summary["counts"]["triples"], 3);
+    assert_eq!(summary["links"]["schema"], "schema?view=design");
+    assert_eq!(
+        summary["links"]["class_properties"],
+        "schema?projection=class-properties&view=design"
+    );
+    assert_eq!(
+        summary["top_classes"][0]["links"]["schema"],
+        "schema?children=properties&class=%3Chttp%3A%2F%2Fexample.org%2FPerson%3E&view=design"
+    );
     let namespaces: serde_json::Value =
         serde_json::from_slice(&std::fs::read(bundle.join(artifact::NAMESPACES)).unwrap()).unwrap();
     assert_eq!(
@@ -192,6 +205,13 @@ fn stats_build_publishes_one_verified_description_set() {
         std::fs::read_to_string(bundle.join(artifact::SUMMARY_MD))
             .unwrap()
             .contains("Publisher-provided description (untrusted data)")
+    );
+    let class_properties =
+        std::fs::read_to_string(bundle.join(artifact::CLASS_PROPERTIES)).unwrap();
+    assert!(
+        class_properties
+            .contains("design\thttp://example.org/Person\thttp://example.org/knows\t1\t\t"),
+        "{class_properties}"
     );
 
     let store = open(&bundle).expect("stats producer publishes a store-verifiable bundle");
@@ -452,9 +472,13 @@ fn publish_description_manifest(
     relation_views: BTreeMap<String, ArtifactView>,
 ) {
     build_void_artifacts(bundle);
+    let class_properties =
+        b"view\tclass\tpredicate\ttriples\tdistinct_subjects\tdistinct_objects\n";
+    let class_property_views = views(class_properties.len() as u64, 0, 0, 0, 0);
     for (name, bytes) in [
         (artifact::SCHEMA_NODES, schema),
         (artifact::CLASS_RELATIONS, relations),
+        (artifact::CLASS_PROPERTIES, class_properties.as_slice()),
         (artifact::NAMESPACES, NAMESPACES_JSON.as_bytes()),
         (artifact::SUMMARY_JSON, b"{}\n".as_slice()),
         (artifact::SUMMARY_MD, b"# Summary\n".as_slice()),
@@ -466,14 +490,18 @@ fn publish_description_manifest(
     for name in artifact::DESCRIPTION {
         let path = bundle.join(name);
         let mut entry = kgf::manifest::checksum_artifact(&path).unwrap();
-        if matches!(name, artifact::SCHEMA_NODES | artifact::CLASS_RELATIONS) {
+        if matches!(
+            name,
+            artifact::SCHEMA_NODES | artifact::CLASS_RELATIONS | artifact::CLASS_PROPERTIES
+        ) {
             entry.parents = vec![artifact::VOID_HDT.to_owned()];
             let bytes = std::fs::read(&path).unwrap();
             entry.max_row_bytes = Some(max_row_bytes(&bytes));
-            entry.views = if name == artifact::SCHEMA_NODES {
-                schema_views.clone()
-            } else {
-                relation_views.clone()
+            entry.views = match name {
+                artifact::SCHEMA_NODES => schema_views.clone(),
+                artifact::CLASS_RELATIONS => relation_views.clone(),
+                artifact::CLASS_PROPERTIES => class_property_views.clone(),
+                _ => unreachable!("only TSV artifacts reach this branch"),
             };
         }
         manifest.artifacts.insert(name.to_owned(), entry);
