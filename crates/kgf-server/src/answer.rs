@@ -1232,6 +1232,9 @@ impl Renders for SchemaAnswer {
         cap: usize,
         required: bool,
     ) -> Result<(), Problem> {
+        if label_predicates.is_empty() {
+            return Ok(());
+        }
         let wanted = self.labelable_terms();
         if wanted.is_empty() {
             return Ok(());
@@ -1373,18 +1376,13 @@ fn standard_body(resource: &impl Resource, representation: Representation) -> By
 
 /// Browser and machine forms of the same VoID graph.
 struct VoidResource {
-    jsonld: Bytes,
     turtle: Bytes,
     triples: u64,
     completeness: Completeness,
     target: Target,
 }
 
-impl Resource for VoidResource {
-    fn to_json(&self) -> Bytes {
-        self.jsonld.clone()
-    }
-
+impl VoidResource {
     fn to_html(&self) -> String {
         let canonical = self.target.canonical();
         let context = self.target.context();
@@ -1414,7 +1412,6 @@ impl Resource for VoidResource {
 
 /// Exact persisted summary bytes and their browser rendering.
 struct SummaryResource {
-    json: Bytes,
     markdown: String,
     card: Option<SummaryCard>,
     target: Target,
@@ -1474,11 +1471,7 @@ struct SummaryRelation {
     triples: u64,
 }
 
-impl Resource for SummaryResource {
-    fn to_json(&self) -> Bytes {
-        self.json.clone()
-    }
-
+impl SummaryResource {
     fn to_html(&self) -> String {
         let canonical = self.target.canonical();
         let context = self.target.context();
@@ -1728,11 +1721,9 @@ pub fn void(
         Representation::Html => {
             let (turtle, turtle_triples) =
                 serialize_turtle(&selection, dictionary, request.bytes.0)?;
-            let (jsonld, _) = serialize_jsonld(&selection, dictionary, request.bytes.0)?;
             let complete = turtle_triples == total;
             let completeness = void_completeness(complete);
             let resource = VoidResource {
-                jsonld,
                 turtle,
                 triples: turtle_triples,
                 completeness: completeness.clone(),
@@ -1762,21 +1753,26 @@ pub fn summary(
     representation: Representation,
 ) -> Result<Rendered, Problem> {
     let description = store.description().ok_or_else(description_not_built)?;
-    let json = Bytes::copy_from_slice(description.summary_json());
-    let markdown = description
-        .summary_markdown()
-        .map_err(|error| unreadable("reading the summary card", &error))?
-        .to_owned();
-    let resource = SummaryResource {
-        card: serde_json::from_slice(&json).ok(),
-        json,
-        markdown,
-        target,
-    };
     let body = match representation {
-        Representation::Json => resource.to_json(),
-        Representation::Markdown => Bytes::copy_from_slice(resource.markdown.as_bytes()),
-        Representation::Html => Bytes::from(resource.to_html()),
+        Representation::Json => Bytes::copy_from_slice(description.summary_json()),
+        Representation::Markdown => Bytes::copy_from_slice(
+            description
+                .summary_markdown()
+                .map_err(|error| unreadable("reading the summary card", &error))?
+                .as_bytes(),
+        ),
+        Representation::Html => {
+            let json = description.summary_json();
+            let resource = SummaryResource {
+                card: serde_json::from_slice(json).ok(),
+                markdown: description
+                    .summary_markdown()
+                    .map_err(|error| unreadable("reading the summary card", &error))?
+                    .to_owned(),
+                target,
+            };
+            Bytes::from(resource.to_html())
+        }
         Representation::Turtle | Representation::JsonLd => {
             unreachable!("/summary negotiation does not offer RDF representations")
         }
@@ -2111,6 +2107,96 @@ fn schema_children(
     }))
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ProjectionStop {
+    Complete,
+    RowLimit,
+    ScanLimit,
+}
+
+impl From<ClassRelationStop> for ProjectionStop {
+    fn from(stop: ClassRelationStop) -> Self {
+        match stop {
+            ClassRelationStop::Complete => Self::Complete,
+            ClassRelationStop::RowLimit => Self::RowLimit,
+            ClassRelationStop::ScanLimit => Self::ScanLimit,
+        }
+    }
+}
+
+impl From<ClassPropertyStop> for ProjectionStop {
+    fn from(stop: ClassPropertyStop) -> Self {
+        match stop {
+            ClassPropertyStop::Complete => Self::Complete,
+            ClassPropertyStop::RowLimit => Self::RowLimit,
+            ClassPropertyStop::ScanLimit => Self::ScanLimit,
+        }
+    }
+}
+
+struct BudgetedProjection<T> {
+    items: Vec<T>,
+    next: Option<u64>,
+}
+
+fn budget_projection<I, T>(
+    source: Vec<I>,
+    page_next: Option<u64>,
+    max_bytes: u64,
+    project: impl Fn(I) -> (T, u64, u64),
+) -> BudgetedProjection<T> {
+    let mut items = Vec::with_capacity(source.len());
+    let mut spent = 0u64;
+    let mut next = None;
+    for item in source {
+        let (resource, serialized, position) = project(item);
+        let next_spent = spent.saturating_add(serialized);
+        if next_spent > max_bytes && !items.is_empty() {
+            next = Some(position);
+            break;
+        }
+        spent = next_spent;
+        items.push(resource);
+    }
+    if next.is_none() && spent > max_bytes {
+        next = page_next;
+    }
+    BudgetedProjection { items, next }
+}
+
+fn projection_completeness(
+    binding: &CursorBinding,
+    byte_next: Option<u64>,
+    page_next: Option<u64>,
+    stop: ProjectionStop,
+    cursor: fn(&CursorBinding, u64) -> Cursor,
+) -> Completeness {
+    if let Some(position) = byte_next {
+        return Completeness::budget_exhausted(
+            BudgetReason::ResponseBytes,
+            cursor(binding, position).encode(),
+        );
+    }
+    match stop {
+        ProjectionStop::Complete => Completeness::complete(),
+        ProjectionStop::RowLimit => Completeness::page_limit(
+            cursor(
+                binding,
+                page_next.expect("a row-limited projection page has a continuation"),
+            )
+            .encode(),
+        ),
+        ProjectionStop::ScanLimit => Completeness::budget_exhausted(
+            BudgetReason::Candidate,
+            cursor(
+                binding,
+                page_next.expect("a scan-limited projection page has a continuation"),
+            )
+            .encode(),
+        ),
+    }
+}
+
 fn schema_relations(
     view: kgf_store::DescriptionView<'_>,
     target: Target,
@@ -2130,11 +2216,9 @@ fn schema_relations(
     let page = view
         .class_relations(filter.store_filter(), from, limit, scan_limit)
         .map_err(|error| unreadable("paging schema class relations", &error))?;
-
-    let mut items = Vec::with_capacity(page.items.len());
-    let mut spent = 0u64;
-    let mut byte_next = None;
-    for item in page.items {
+    let page_next = page.next.map(|position| position.byte_offset());
+    let stop = ProjectionStop::from(page.stop);
+    let page = budget_projection(page.items, page_next, request.bytes.0, |item| {
         let relation = item.relation;
         let resource = ClassRelationResource::new(
             relation.subject_class,
@@ -2142,46 +2226,16 @@ fn schema_relations(
             relation.object_class,
             relation.triples,
         );
-        let next_spent = spent.saturating_add(resource.serialized);
-        if next_spent > request.bytes.0 && !items.is_empty() {
-            byte_next = Some(item.position.byte_offset());
-            break;
-        }
-        spent = next_spent;
-        items.push(resource);
-    }
-
-    if byte_next.is_none() && spent > request.bytes.0 {
-        byte_next = page.next.map(|position| position.byte_offset());
-    }
-    let completeness = match byte_next {
-        Some(position) => Completeness::budget_exhausted(
-            BudgetReason::ResponseBytes,
-            Cursor::at_class_relation(&request.binding, position).encode(),
-        ),
-        None => match page.stop {
-            ClassRelationStop::Complete => Completeness::complete(),
-            ClassRelationStop::RowLimit => Completeness::page_limit(
-                Cursor::at_class_relation(
-                    &request.binding,
-                    page.next
-                        .expect("a row-limited relation page has a continuation")
-                        .byte_offset(),
-                )
-                .encode(),
-            ),
-            ClassRelationStop::ScanLimit => Completeness::budget_exhausted(
-                BudgetReason::Candidate,
-                Cursor::at_class_relation(
-                    &request.binding,
-                    page.next
-                        .expect("a scan-limited relation page has a continuation")
-                        .byte_offset(),
-                )
-                .encode(),
-            ),
-        },
-    };
+        let serialized = resource.serialized;
+        (resource, serialized, item.position.byte_offset())
+    });
+    let completeness = projection_completeness(
+        &request.binding,
+        page.next,
+        page_next,
+        stop,
+        Cursor::at_class_relation,
+    );
 
     Ok(SchemaAnswer::Relations(SchemaRelationsAnswer {
         dataset: target.id.dataset.clone(),
@@ -2190,7 +2244,7 @@ fn schema_relations(
         projection: "class-relations",
         filters: projection_filters(&filter.class, &filter.predicate),
         order: CLASS_RELATION_ORDER,
-        items,
+        items: page.items,
         labels: None,
         completeness,
         target,
@@ -2216,11 +2270,9 @@ fn schema_class_properties(
     let page = view
         .class_properties(filter.store_filter(), from, limit, scan_limit)
         .map_err(|error| unreadable("paging schema class properties", &error))?;
-
-    let mut items = Vec::with_capacity(page.items.len());
-    let mut spent = 0u64;
-    let mut byte_next = None;
-    for item in page.items {
+    let page_next = page.next.map(|position| position.byte_offset());
+    let stop = ProjectionStop::from(page.stop);
+    let page = budget_projection(page.items, page_next, request.bytes.0, |item| {
         let property = item.property;
         let resource = ClassPropertyResource::new(
             property.class,
@@ -2229,46 +2281,16 @@ fn schema_class_properties(
             property.distinct_subjects,
             property.distinct_objects,
         );
-        let next_spent = spent.saturating_add(resource.serialized);
-        if next_spent > request.bytes.0 && !items.is_empty() {
-            byte_next = Some(item.position.byte_offset());
-            break;
-        }
-        spent = next_spent;
-        items.push(resource);
-    }
-
-    if byte_next.is_none() && spent > request.bytes.0 {
-        byte_next = page.next.map(|position| position.byte_offset());
-    }
-    let completeness = match byte_next {
-        Some(position) => Completeness::budget_exhausted(
-            BudgetReason::ResponseBytes,
-            Cursor::at_class_property(&request.binding, position).encode(),
-        ),
-        None => match page.stop {
-            ClassPropertyStop::Complete => Completeness::complete(),
-            ClassPropertyStop::RowLimit => Completeness::page_limit(
-                Cursor::at_class_property(
-                    &request.binding,
-                    page.next
-                        .expect("a row-limited property page has a continuation")
-                        .byte_offset(),
-                )
-                .encode(),
-            ),
-            ClassPropertyStop::ScanLimit => Completeness::budget_exhausted(
-                BudgetReason::Candidate,
-                Cursor::at_class_property(
-                    &request.binding,
-                    page.next
-                        .expect("a scan-limited property page has a continuation")
-                        .byte_offset(),
-                )
-                .encode(),
-            ),
-        },
-    };
+        let serialized = resource.serialized;
+        (resource, serialized, item.position.byte_offset())
+    });
+    let completeness = projection_completeness(
+        &request.binding,
+        page.next,
+        page_next,
+        stop,
+        Cursor::at_class_property,
+    );
 
     Ok(SchemaAnswer::ClassProperties(SchemaClassPropertiesAnswer {
         dataset: target.id.dataset.clone(),
@@ -2277,7 +2299,7 @@ fn schema_class_properties(
         projection: "class-properties",
         filters: projection_filters(&filter.class, &filter.predicate),
         order: CLASS_PROPERTY_ORDER,
-        items,
+        items: page.items,
         labels: None,
         completeness,
         target,

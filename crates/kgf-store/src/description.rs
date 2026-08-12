@@ -1,10 +1,10 @@
 //! Mapped access to the bundle's description indexes.
 //!
-//! A [`DescriptionStore`] owns the indexed VoID HDT and the two TSV mappings,
+//! A [`DescriptionStore`] owns the indexed VoID HDT and the three TSV mappings,
 //! while the manifest contributes only a small typed directory of byte ranges.
 //! Opening therefore reads no TSV row and allocates nothing proportional to the
 //! description size. Schema lookup binary-searches one declared view block;
-//! class-relation paging walks rows from a resumable byte boundary.
+//! count-ranked projections page rows from resumable byte boundaries.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -469,16 +469,13 @@ pub struct ClassRelationItem<'a> {
 /// A validated byte boundary from which class-relation paging may resume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClassRelationPosition {
-    mapping: MappingId,
-    view_start: u64,
-    view_end: u64,
-    offset: u64,
+    row: TsvPosition,
 }
 
 impl ClassRelationPosition {
     /// Absolute byte offset in `stats/class-relations.tsv`.
     pub fn byte_offset(self) -> u64 {
-        self.offset
+        self.row.offset
     }
 }
 
@@ -555,17 +552,54 @@ pub struct ClassPropertyItem<'a> {
 /// A validated byte boundary in `stats/class-properties.tsv`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClassPropertyPosition {
+    row: TsvPosition,
+}
+
+impl ClassPropertyPosition {
+    /// Absolute byte offset in `stats/class-properties.tsv`.
+    pub fn byte_offset(self) -> u64 {
+        self.row.offset
+    }
+}
+
+/// A validated row boundary in one mapped TSV view.
+///
+/// Public projection positions wrap this shared representation so relation
+/// and class-property cursors remain distinct domain types even though their
+/// mapped paging mechanism is identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TsvPosition {
     mapping: MappingId,
     view_start: u64,
     view_end: u64,
     offset: u64,
 }
 
-impl ClassPropertyPosition {
-    /// Absolute byte offset in `stats/class-properties.tsv`.
-    pub fn byte_offset(self) -> u64 {
-        self.offset
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TsvPageStop {
+    Complete,
+    RowLimit,
+    ScanLimit,
+}
+
+struct TsvPageItem<T> {
+    value: T,
+    position: TsvPosition,
+}
+
+struct TsvPage<T> {
+    items: Vec<TsvPageItem<T>>,
+    next: Option<TsvPosition>,
+    stop: TsvPageStop,
+    examined: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TsvPageRequest {
+    row_limit: NonZeroUsize,
+    scan_limit: NonZeroUsize,
+    filtered: bool,
+    projection: &'static str,
 }
 
 /// Why one class-property page stopped.
@@ -856,7 +890,10 @@ impl<'a> DescriptionView<'a> {
 
     /// Validate a decoded cursor offset against this view in constant time.
     pub fn class_relation_position(&self, offset: u64) -> Option<ClassRelationPosition> {
-        self.store.class_relations.position(self.relations, offset)
+        self.store
+            .class_relations
+            .position(self.relations, offset)
+            .map(|row| ClassRelationPosition { row })
     }
 
     /// Page the persisted class-relation order.
@@ -872,55 +909,34 @@ impl<'a> DescriptionView<'a> {
         scan_limit: NonZeroUsize,
     ) -> Result<ClassRelationPage<'a>> {
         let table = &self.store.class_relations;
-        let mut position = from.unwrap_or_else(|| table.start_position(self.relations));
-        if position.mapping != table.mapping.id()
-            || position.view_start != self.relations.offset
-            || position.view_end != self.relations.end()
-        {
-            return Err(Error::Region(
-                "class-relation position belongs to a different mapped view".to_owned(),
-            ));
-        }
-
-        let mut items = Vec::new();
-        let mut examined = 0usize;
-        let filtered = !filter.is_empty();
-        while position.offset < self.relations.end() {
-            if items.len() == row_limit.get() {
-                return Ok(relation_page(
-                    items,
-                    position,
-                    ClassRelationStop::RowLimit,
-                    examined,
-                ));
-            }
-            if filtered && examined == scan_limit.get() {
-                return Ok(relation_page(
-                    items,
-                    position,
-                    ClassRelationStop::ScanLimit,
-                    examined,
-                ));
-            }
-
-            let row_position = position;
-            let row = table.row_at(position.offset, self.relations.end())?;
-            position.offset = row.next;
-            examined += 1;
-            let relation = parse_relation_row(row.bytes, table.path())?;
-            if filter.matches(&relation) {
-                items.push(ClassRelationItem {
-                    relation,
-                    position: row_position,
-                });
-            }
-        }
-
+        let page = table.page(
+            self.relations,
+            from.map(|position| position.row),
+            TsvPageRequest {
+                row_limit,
+                scan_limit,
+                filtered: !filter.is_empty(),
+                projection: "class-relation",
+            },
+            parse_relation_row,
+            |relation| filter.matches(relation),
+        )?;
         Ok(ClassRelationPage {
-            items,
-            next: None,
-            stop: ClassRelationStop::Complete,
-            examined,
+            items: page
+                .items
+                .into_iter()
+                .map(|item| ClassRelationItem {
+                    relation: item.value,
+                    position: ClassRelationPosition { row: item.position },
+                })
+                .collect(),
+            next: page.next.map(|row| ClassRelationPosition { row }),
+            stop: match page.stop {
+                TsvPageStop::Complete => ClassRelationStop::Complete,
+                TsvPageStop::RowLimit => ClassRelationStop::RowLimit,
+                TsvPageStop::ScanLimit => ClassRelationStop::ScanLimit,
+            },
+            examined: page.examined,
         })
     }
 
@@ -928,7 +944,8 @@ impl<'a> DescriptionView<'a> {
     pub fn class_property_position(&self, offset: u64) -> Option<ClassPropertyPosition> {
         self.store
             .class_properties
-            .property_position(self.properties, offset)
+            .position(self.properties, offset)
+            .map(|row| ClassPropertyPosition { row })
     }
 
     /// Page the persisted count-ranked class-property inventory.
@@ -940,55 +957,34 @@ impl<'a> DescriptionView<'a> {
         scan_limit: NonZeroUsize,
     ) -> Result<ClassPropertyPage<'a>> {
         let table = &self.store.class_properties;
-        let mut position = from.unwrap_or_else(|| table.start_property_position(self.properties));
-        if position.mapping != table.mapping.id()
-            || position.view_start != self.properties.offset
-            || position.view_end != self.properties.end()
-        {
-            return Err(Error::Region(
-                "class-property position belongs to a different mapped view".to_owned(),
-            ));
-        }
-
-        let mut items = Vec::new();
-        let mut examined = 0usize;
-        let filtered = !filter.is_empty();
-        while position.offset < self.properties.end() {
-            if items.len() == row_limit.get() {
-                return Ok(ClassPropertyPage {
-                    items,
-                    next: Some(position),
-                    stop: ClassPropertyStop::RowLimit,
-                    examined,
-                });
-            }
-            if filtered && examined == scan_limit.get() {
-                return Ok(ClassPropertyPage {
-                    items,
-                    next: Some(position),
-                    stop: ClassPropertyStop::ScanLimit,
-                    examined,
-                });
-            }
-
-            let row_position = position;
-            let row = table.row_at(position.offset, self.properties.end())?;
-            position.offset = row.next;
-            examined += 1;
-            let property = parse_class_property_row(row.bytes, table.path())?;
-            if filter.matches(&property) {
-                items.push(ClassPropertyItem {
-                    property,
-                    position: row_position,
-                });
-            }
-        }
-
+        let page = table.page(
+            self.properties,
+            from.map(|position| position.row),
+            TsvPageRequest {
+                row_limit,
+                scan_limit,
+                filtered: !filter.is_empty(),
+                projection: "class-property",
+            },
+            parse_class_property_row,
+            |property| filter.matches(property),
+        )?;
         Ok(ClassPropertyPage {
-            items,
-            next: None,
-            stop: ClassPropertyStop::Complete,
-            examined,
+            items: page
+                .items
+                .into_iter()
+                .map(|item| ClassPropertyItem {
+                    property: item.value,
+                    position: ClassPropertyPosition { row: item.position },
+                })
+                .collect(),
+            next: page.next.map(|row| ClassPropertyPosition { row }),
+            stop: match page.stop {
+                TsvPageStop::Complete => ClassPropertyStop::Complete,
+                TsvPageStop::RowLimit => ClassPropertyStop::RowLimit,
+                TsvPageStop::ScanLimit => ClassPropertyStop::ScanLimit,
+            },
+            examined: page.examined,
         })
     }
 
@@ -1173,20 +1169,6 @@ fn integer_object(void: &IndexedHdt, object: TermId, path: &Path) -> Result<u64>
     })
 }
 
-fn relation_page<'a>(
-    items: Vec<ClassRelationItem<'a>>,
-    next: ClassRelationPosition,
-    stop: ClassRelationStop,
-    examined: usize,
-) -> ClassRelationPage<'a> {
-    ClassRelationPage {
-        items,
-        next: Some(next),
-        stop,
-        examined,
-    }
-}
-
 fn open_tsv(bundle: &PublishedBundle, path: &Path, entry: &ArtifactEntry) -> Result<MappedTsv> {
     let mapping = open_published(bundle, path)?;
     MappedTsv::open(mapping, entry)
@@ -1270,8 +1252,8 @@ impl MappedTsv {
         self.mapping.path()
     }
 
-    fn start_position(&self, view: ViewSpec) -> ClassRelationPosition {
-        ClassRelationPosition {
+    fn start_position(&self, view: ViewSpec) -> TsvPosition {
+        TsvPosition {
             mapping: self.mapping.id(),
             view_start: view.offset,
             view_end: view.end(),
@@ -1279,7 +1261,7 @@ impl MappedTsv {
         }
     }
 
-    fn position(&self, view: ViewSpec, offset: u64) -> Option<ClassRelationPosition> {
+    fn position(&self, view: ViewSpec, offset: u64) -> Option<TsvPosition> {
         if offset < view.offset || offset > view.end() {
             return None;
         }
@@ -1289,7 +1271,7 @@ impl MappedTsv {
         {
             return None;
         }
-        Some(ClassRelationPosition {
+        Some(TsvPosition {
             mapping: self.mapping.id(),
             view_start: view.offset,
             view_end: view.end(),
@@ -1297,30 +1279,66 @@ impl MappedTsv {
         })
     }
 
-    fn start_property_position(&self, view: ViewSpec) -> ClassPropertyPosition {
-        ClassPropertyPosition {
-            mapping: self.mapping.id(),
-            view_start: view.offset,
-            view_end: view.end(),
-            offset: view.offset,
-        }
-    }
-
-    fn property_position(&self, view: ViewSpec, offset: u64) -> Option<ClassPropertyPosition> {
-        if offset < view.offset || offset > view.end() {
-            return None;
-        }
-        if offset != view.offset
-            && offset != view.end()
-            && self.mapping.as_bytes().get(offset as usize - 1) != Some(&b'\n')
+    fn page<'a, T, Parse, Matches>(
+        &'a self,
+        view: ViewSpec,
+        from: Option<TsvPosition>,
+        request: TsvPageRequest,
+        parse: Parse,
+        matches: Matches,
+    ) -> Result<TsvPage<T>>
+    where
+        Parse: Fn(&'a [u8], &Path) -> Result<T>,
+        Matches: Fn(&T) -> bool,
+    {
+        let mut position = from.unwrap_or_else(|| self.start_position(view));
+        if position.mapping != self.mapping.id()
+            || position.view_start != view.offset
+            || position.view_end != view.end()
         {
-            return None;
+            return Err(Error::Region(format!(
+                "{} position belongs to a different mapped view",
+                request.projection
+            )));
         }
-        Some(ClassPropertyPosition {
-            mapping: self.mapping.id(),
-            view_start: view.offset,
-            view_end: view.end(),
-            offset,
+
+        let mut items = Vec::new();
+        let mut examined = 0usize;
+        while position.offset < view.end() {
+            let stop = if items.len() == request.row_limit.get() {
+                Some(TsvPageStop::RowLimit)
+            } else if request.filtered && examined == request.scan_limit.get() {
+                Some(TsvPageStop::ScanLimit)
+            } else {
+                None
+            };
+            if let Some(stop) = stop {
+                return Ok(TsvPage {
+                    items,
+                    next: Some(position),
+                    stop,
+                    examined,
+                });
+            }
+
+            let row_position = position;
+            let row = self.row_at(position.offset, view.end())?;
+            position.offset = row.next;
+            examined += 1;
+            let value = parse(row.bytes, self.path())?;
+            if matches(&value) {
+                items.push(TsvPageItem {
+                    value,
+                    position: row_position,
+                });
+            }
+        }
+
+        Ok(TsvPage {
+            items,
+            next: None,
+            stop: TsvPageStop::Complete,
+            examined,
         })
     }
 

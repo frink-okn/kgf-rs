@@ -850,11 +850,6 @@ impl VoidGraph {
                 ))
             })
         });
-        class_properties.sort_by(|a, b| {
-            b.triples
-                .cmp(&a.triples)
-                .then_with(|| (&a.class, &a.predicate).cmp(&(&b.class, &b.predicate)))
-        });
         Ok(Projections {
             schema,
             relations,

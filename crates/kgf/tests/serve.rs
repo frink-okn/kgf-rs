@@ -30,6 +30,43 @@ const GROWN_NT: &str = concat!(
     "<http://example.org/carol> <http://example.org/name> \"Carol\" .\n",
 );
 
+const SUMMARY_CARD_JSON: &str = r#"{
+  "dataset": {"id": "tox", "version": "v1", "title": "Fixture graph"},
+  "counts": {"triples": 21, "subjects": 9, "predicates": 7, "objects": 14},
+  "links": {
+    "classes": "/tox/v/v1/schema?children=classes&view=design",
+    "properties": "/tox/v/v1/schema?children=properties&view=design",
+    "class_relations": "/tox/v/v1/schema?projection=class-relations&view=design",
+    "class_properties": "/tox/v/v1/schema?projection=class-properties&view=design",
+    "schema": "/tox/v/v1/schema",
+    "fragment": "/tox/v/v1/fragment",
+    "void": "/tox/v/v1/void"
+  },
+  "top_classes": [
+    {
+      "class": "https://example.org/A",
+      "entities": 3,
+      "links": {"schema": "/tox/v/v1/schema?class=ex%3AA&view=design"}
+    }
+  ],
+  "top_properties": [
+    {
+      "predicate": "https://example.org/p",
+      "triples": 3,
+      "links": {"schema": "/tox/v/v1/schema?predicate=ex%3Ap&view=design"}
+    }
+  ],
+  "leading_class_relations": [
+    {
+      "subject_class": "https://example.org/A",
+      "predicate": "https://example.org/p",
+      "object_class": "https://example.org/B",
+      "triples": 2
+    }
+  ]
+}
+"#;
+
 #[test]
 fn the_url_space_answers_over_a_real_listener() {
     let deployment = Deployment::new();
@@ -156,6 +193,20 @@ fn schema_answers_json_html_latest_and_resumable_pages_over_http() {
 }
 
 #[test]
+fn schema_omits_requested_labels_when_the_release_has_no_label_cascade() {
+    let deployment = Deployment::new();
+    deployment.publish_description_without_labels("tox", "v1", "2026-08-08T12:00:00Z");
+    let server = deployment.serve();
+
+    let response = server.get("/tox/v/v1/schema?children=classes&labels=true");
+    response.assert_status(200);
+    assert!(
+        response.json().get("labels").is_none(),
+        "an absent cascade is distinct from configured predicates that found no labels"
+    );
+}
+
+#[test]
 fn void_and_summary_serve_the_published_description_in_every_format() {
     let deployment = Deployment::new();
     deployment.publish_description("tox", "v1", "2026-08-08T12:00:00Z");
@@ -210,11 +261,22 @@ fn void_and_summary_serve_the_published_description_in_every_format() {
 
     let summary_page = server.request("GET", "/tox/v/v1/summary", &[("Accept", "text/html")]);
     summary_page.assert_status(200);
-    assert!(
-        String::from_utf8(summary_page.body)
-            .unwrap()
-            .contains("Published summary card")
-    );
+    let summary_page = String::from_utf8(summary_page.body).unwrap();
+    for expected in [
+        "Fixture graph",
+        "Browse classes",
+        "Top classes",
+        "Top properties",
+        "Leading typed class relations",
+        "ex:A",
+        "ex:p",
+        "schema?children=properties",
+    ] {
+        assert!(
+            summary_page.contains(expected),
+            "rich summary page is missing {expected:?}"
+        );
+    }
 
     let manifest = server.get("/tox/v/v1/manifest?format=html");
     manifest.assert_status(200);
@@ -1181,28 +1243,56 @@ impl Deployment {
     }
 
     fn publish_description(&self, dataset: &str, version: &str, created: &str) {
+        self.publish_description_with_labels(dataset, version, created, true);
+    }
+
+    fn publish_description_without_labels(&self, dataset: &str, version: &str, created: &str) {
+        self.publish_description_with_labels(dataset, version, created, false);
+    }
+
+    fn publish_description_with_labels(
+        &self,
+        dataset: &str,
+        version: &str,
+        created: &str,
+        labels: bool,
+    ) {
         let bundle = self.bundle(dataset, version);
         Fixture::description().copy_bundle_to(&bundle);
+        std::fs::write(bundle.join("stats/summary.json"), SUMMARY_CARD_JSON)
+            .expect("write rich summary fixture");
 
         #[derive(Parser)]
         struct Cli {
             #[command(flatten)]
             args: kgf::manifest::Args,
         }
-        let cli = Cli::parse_from([
-            "kgf-manifest",
-            bundle.to_str().unwrap(),
-            "--id",
-            dataset,
-            "--version",
-            version,
-            "--title",
-            &format!("{dataset} {version}"),
-            "--prefix",
-            "ex=https://example.org/",
-            "--role",
-            "label=https://example.org/label",
-        ]);
+        let mut arguments = vec![
+            "kgf-manifest".to_owned(),
+            bundle.to_str().unwrap().to_owned(),
+            "--id".to_owned(),
+            dataset.to_owned(),
+            "--version".to_owned(),
+            version.to_owned(),
+            "--title".to_owned(),
+            format!("{dataset} {version}"),
+            "--prefix".to_owned(),
+            "ex=https://example.org/".to_owned(),
+        ];
+        if labels {
+            arguments.extend([
+                "--role".to_owned(),
+                "label=https://example.org/label".to_owned(),
+            ]);
+        } else {
+            // Supplying a non-label role opts out of the federation defaults,
+            // whose profile deliberately includes a label cascade.
+            arguments.extend([
+                "--role".to_owned(),
+                "synonym=https://example.org/synonym".to_owned(),
+            ]);
+        }
+        let cli = Cli::parse_from(arguments);
         kgf::manifest::run(cli.args).expect("describe the tier-1 bundle");
         self.set_created(&bundle, created);
     }
