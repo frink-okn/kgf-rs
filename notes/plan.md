@@ -1304,8 +1304,9 @@ component VoID analysis, builds the final VoID HDT and permutation sidecar, trav
 the semantic partition graph into selector and count-ranked relation blocks, runs the
 namespace counter with manifest prefix overrides last, replaces build-host paths in
 `prefix_table.source` with a stable logical producer label, and persists structured
-and Markdown summary cards. A componentless bundle gets an explicit design subset over
-the same data; a component manifest requires exactly one `role=source` component and
+and Markdown summary cards. A componentless bundle publishes only its genuine dataset
+root; the `design` and `queryable` index views both address that root without inventing
+subset RDF. A component manifest requires exactly one `role=source` component and
 publishes design, queryable, and sorted `component:<id>` views. TSV production records
 the exact row bounds it wrote; manifest regeneration accepts those build-owned bounds
 only from this path, preserves unmodeled component metadata, and runs the existing
@@ -1835,6 +1836,15 @@ following the code.
     their filters plus a structured order contract. Agents otherwise have to infer
     scope and cursor semantics from a URL. Doc 03's fixed envelope should carry this
     metadata explicitly.
+43. **A componentless bundle has one VoID dataset, not a synthetic design subset.**
+    Doc 04 requires `design` and `queryable` selector-index views and defines one
+    `void:subset` per published component, while the incremental `kgf build stats`
+    command also accepts existing bundles that declare no components. For that case
+    the implementation maps both index views to the same genuine top-level dataset
+    subject and emits no subset triple. A future full build may create the canonical
+    component doc 04 recommends, but a stats pass over an already-published graph must
+    not invent one. The storage and API docs should state this alias explicitly or
+    require component metadata before exposing a distinct design view.
 
 ## Not in this plan
 

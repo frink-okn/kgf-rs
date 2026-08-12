@@ -196,7 +196,6 @@ pub fn run(args: Args) -> Result<()> {
     let components = read_components(&bundle, staging.path(), &dataset_iri)?;
 
     let queryable_nt = staging.path().join("queryable.nt");
-    let design_nt = staging.path().join("design.nt");
     let void_nt = staging.path().join("void.nt");
     run_hdtc(
         &args.hdtc,
@@ -212,23 +211,11 @@ pub fn run(args: Args) -> Result<()> {
         ],
     )?;
     let design_iri = if components.is_empty() {
-        let design_iri = format!("{dataset_iri}#kgf-design");
-        oxrdf::NamedNode::new(&design_iri)
-            .with_context(|| format!("derived design-view IRI {design_iri:?} is not an RDF IRI"))?;
-        run_hdtc(
-            &args.hdtc,
-            "design VoID analysis",
-            vec![
-                OsString::from("void"),
-                data.as_os_str().to_owned(),
-                OsString::from("--dataset-uri"),
-                OsString::from(&design_iri),
-                OsString::from("--output"),
-                design_nt.as_os_str().to_owned(),
-                OsString::from("--quiet"),
-            ],
-        )?;
-        design_iri
+        // A componentless bundle publishes one graph, not an inferred component.
+        // It is both the designed and queryable view, so both selector-index
+        // views point at this genuine dataset root. Minting a second VoID
+        // dataset here would turn an implementation alias into false RDF.
+        dataset_iri.clone()
     } else {
         for component in &components {
             run_hdtc(
@@ -252,14 +239,10 @@ pub fn run(args: Args) -> Result<()> {
             .iri
             .clone()
     };
-    let descriptions = if components.is_empty() {
-        vec![(design_iri.as_str(), design_nt.as_path())]
-    } else {
-        components
-            .iter()
-            .map(|component| (component.iri.as_str(), component.void_nt.as_path()))
-            .collect()
-    };
+    let descriptions = components
+        .iter()
+        .map(|component| (component.iri.as_str(), component.void_nt.as_path()))
+        .collect::<Vec<_>>();
     combine_void(&queryable_nt, &descriptions, &void_nt, &dataset_iri)?;
 
     let void_hdt = staged_stats.join("void.hdt");

@@ -14,7 +14,7 @@ use std::process::Command;
 use kgf_store::manifest::{ArtifactView, Manifest};
 use kgf_store::store::artifact;
 use kgf_store::testing::{NAMESPACES_JSON, hdtc_binary};
-use kgf_store::{OpenOptions, Store};
+use kgf_store::{OpenOptions, Role, SchemaSelector, StatsView, Store};
 
 const SOURCE: &str = concat!(
     "<http://example.org/alice> <http://example.org/name> \"Alice\" .\n",
@@ -215,7 +215,40 @@ fn stats_build_publishes_one_verified_description_set() {
     );
 
     let store = open(&bundle).expect("stats producer publishes a store-verifiable bundle");
-    assert!(store.description().is_some());
+    let description = store.description().expect("description set opens");
+    let dictionary = description.dict();
+    assert_eq!(
+        dictionary
+            .locate(Role::Subject, b"https://example.org/typed-kg#kgf-design")
+            .unwrap(),
+        None,
+        "a componentless build must not mint a synthetic design dataset"
+    );
+    assert_eq!(
+        dictionary
+            .locate(Role::Predicate, b"http://rdfs.org/ns/void#subset")
+            .unwrap(),
+        None,
+        "a componentless build has no component subset to assert"
+    );
+    let design_root = description
+        .view(&StatsView::Design)
+        .unwrap()
+        .schema_node(SchemaSelector::Dataset)
+        .unwrap()
+        .unwrap()
+        .subject();
+    let queryable_root = description
+        .view(&StatsView::Queryable)
+        .unwrap()
+        .schema_node(SchemaSelector::Dataset)
+        .unwrap()
+        .unwrap()
+        .subject();
+    assert_eq!(
+        design_root, queryable_root,
+        "the two API views alias the sole published dataset root"
+    );
     drop(store);
 
     let before = std::fs::read(bundle.join(artifact::MANIFEST)).unwrap();

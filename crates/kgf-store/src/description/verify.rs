@@ -403,6 +403,9 @@ fn verify_schema_bindings(void: &IndexedHdt, indexes: &SelectorIndex, path: &Pat
         .and_then(|index| index.get(&VerifiedSelector::Dataset))
         .copied()
         .ok_or_else(|| malformed(path, "queryable view has no dataset selector".to_owned()))?;
+    let has_component_views = indexes
+        .keys()
+        .any(|view| matches!(view, StatsView::Component(_)));
 
     for (view, index) in indexes {
         let root = index
@@ -418,7 +421,9 @@ fn verify_schema_bindings(void: &IndexedHdt, indexes: &SelectorIndex, path: &Pat
                 )
             })?;
         ensure_named_triple(void, root, RDF_TYPE, VOID_DATASET, path, "dataset type")?;
-        if *view != StatsView::Queryable {
+        let componentless_design_alias =
+            *view == StatsView::Design && !has_component_views && root == queryable;
+        if *view != StatsView::Queryable && !componentless_design_alias {
             ensure_link(void, queryable, VOID_SUBSET, root, path, "view root")?;
         }
 
