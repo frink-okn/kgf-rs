@@ -626,12 +626,17 @@ fn carry_artifact_metadata(
         .collect();
 
     for (name, current) in artifacts {
-        if generated_description.is_some() {
-            match name.as_str() {
-                artifact::VOID_HDT => current.parents = vec![artifact::HDT.to_owned()],
-                artifact::VOID_PERM => current.parents = vec![artifact::VOID_HDT.to_owned()],
-                _ => {}
+        if generated_description.is_some()
+            && let Some(parent) = match name.as_str() {
+                artifact::VOID_HDT => Some(artifact::HDT),
+                artifact::VOID_PERM => Some(artifact::VOID_HDT),
+                _ => None,
             }
+        {
+            // This producer owns the binding. Do not let identical bytes carry
+            // a legacy manifest's absent or stale parent back over it.
+            current.parents = vec![parent.to_owned()];
+            continue;
         }
         let generated = generated_description.and_then(|description| match name.as_str() {
             artifact::SCHEMA_NODES => Some(&description.schema_nodes),

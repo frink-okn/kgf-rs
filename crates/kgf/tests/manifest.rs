@@ -266,6 +266,20 @@ fn stats_build_publishes_one_verified_description_set() {
     drop(store);
 
     let before = std::fs::read(bundle.join(artifact::MANIFEST)).unwrap();
+    let mut legacy_manifest: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    legacy_manifest["artifacts"][artifact::VOID_HDT]
+        .as_object_mut()
+        .unwrap()
+        .remove("parents");
+    legacy_manifest["artifacts"][artifact::VOID_PERM]
+        .as_object_mut()
+        .unwrap()
+        .remove("parents");
+    std::fs::write(
+        bundle.join(artifact::MANIFEST),
+        serde_json::to_vec_pretty(&legacy_manifest).unwrap(),
+    )
+    .unwrap();
     let relocated_prefixes = root.path().join("relocated-prefixes.json");
     std::fs::rename(&prefixes, &relocated_prefixes).unwrap();
     kgf(&[
