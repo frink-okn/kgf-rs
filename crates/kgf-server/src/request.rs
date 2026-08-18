@@ -89,6 +89,17 @@ impl Position {
         }
     }
 
+    /// Conventional spelling used only when echoing an omitted brTPF GET
+    /// position. The request model keeps it anonymous, so this display name
+    /// can never join it to an explicitly named variable.
+    fn default_variable(self) -> &'static str {
+        match self {
+            Self::Subject => "?s",
+            Self::Predicate => "?p",
+            Self::Object => "?o",
+        }
+    }
+
     /// The id space a term in this position resolves in.
     pub fn role(self) -> Role {
         match self {
@@ -835,7 +846,13 @@ impl Variable {
 /// One position of a body-carried pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BindingCell {
+    /// An explicitly named SPARQL variable that a bindings column may bind.
     Variable(Variable),
+    /// A GET position the client omitted. It is unbound but deliberately has
+    /// no variable identity: synthesizing `?s`, `?p`, or `?o` here can collide
+    /// with a name explicitly used at another position and silently turn two
+    /// independent positions into a repeated-variable join.
+    Unbound(Position),
     Term(BoundTerm),
 }
 
@@ -886,7 +903,7 @@ impl BindingPattern {
                 Some(value) => BindingCell::Term(BoundTerm::parse_fragment(
                     parameter, value, limits, prefixes,
                 )?),
-                None => BindingCell::Variable(Variable(format!("?{parameter}"))),
+                None => BindingCell::Unbound(position),
             };
             cells.push(cell);
         }
@@ -905,6 +922,7 @@ impl BindingPattern {
     pub fn requested(&self, position: Position) -> &str {
         match self.cell(position) {
             BindingCell::Variable(variable) => variable.as_str(),
+            BindingCell::Unbound(position) => position.default_variable(),
             BindingCell::Term(term) => term.requested(),
         }
     }
@@ -913,7 +931,7 @@ impl BindingPattern {
     pub fn bound(&self, position: Position) -> Option<&BoundTerm> {
         match self.cell(position) {
             BindingCell::Term(term) => Some(term),
-            BindingCell::Variable(_) => None,
+            BindingCell::Variable(_) | BindingCell::Unbound(_) => None,
         }
     }
 
@@ -921,14 +939,19 @@ impl BindingPattern {
     pub fn vars(&self) -> Vec<Position> {
         Position::ALL
             .into_iter()
-            .filter(|position| matches!(self.cell(*position), BindingCell::Variable(_)))
+            .filter(|position| {
+                matches!(
+                    self.cell(*position),
+                    BindingCell::Variable(_) | BindingCell::Unbound(_)
+                )
+            })
             .collect()
     }
 
     fn variables(&self) -> impl Iterator<Item = &Variable> {
         self.cells.iter().filter_map(|cell| match cell {
             BindingCell::Variable(variable) => Some(variable),
-            BindingCell::Term(_) => None,
+            BindingCell::Unbound(_) | BindingCell::Term(_) => None,
         })
     }
 
@@ -947,6 +970,7 @@ impl BindingPattern {
                     output.push('v');
                     push_canonical(&mut output, variable.as_str());
                 }
+                BindingCell::Unbound(_) => output.push('u'),
                 BindingCell::Term(term) => {
                     output.push('t');
                     push_canonical(&mut output, term.dictionary());
@@ -964,6 +988,9 @@ impl Serialize for BindingPattern {
             match self.cell(position) {
                 BindingCell::Variable(variable) => {
                     map.serialize_entry(position.as_str(), variable.as_str())?;
+                }
+                BindingCell::Unbound(position) => {
+                    map.serialize_entry(position.as_str(), position.default_variable())?;
                 }
                 BindingCell::Term(term) => {
                     map.serialize_entry(position.as_str(), term.requested())?;
@@ -997,6 +1024,7 @@ impl<'a> BindingRow<'a> {
                 .columns
                 .get(variable)
                 .and_then(|column| self.values[*column].bound()),
+            BindingCell::Unbound(_) => None,
         }
     }
 }
@@ -3471,6 +3499,30 @@ mod tests {
                 .unwrap_err()
                 .code(),
             ErrorCode::MalformedRequest
+        );
+    }
+
+    #[test]
+    fn omitted_brtpf_positions_are_anonymous_not_synthetic_variables() {
+        let values = "(?p ?known) { (<http://example.org/alice> <http://example.org/bob>) }";
+        let query = format!(
+            "s=%3Fp&o=%3Fknown&values={}",
+            crate::url::encode_value(values)
+        );
+        let parsed =
+            GetFragment::parse(&params(&query), limits(), &prefixes(), &bundle(), true).unwrap();
+        let GetFragment::Bindings(parsed) = parsed else {
+            panic!("values= must select the bindings grammar")
+        };
+        let row = parsed.rows().next().unwrap();
+        assert_eq!(
+            row.bound(Position::Subject).unwrap().dictionary(),
+            "http://example.org/alice"
+        );
+        assert_eq!(row.bound(Position::Predicate), None);
+        assert_eq!(
+            row.bound(Position::Object).unwrap().dictionary(),
+            "http://example.org/bob"
         );
     }
 

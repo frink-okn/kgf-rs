@@ -80,6 +80,14 @@ pub struct Config {
     pub bundle_root: PublishedRoot,
     /// Address to bind.
     pub bind: std::net::SocketAddr,
+    /// Trusted external origin used for absolute Hydra IRIs when TLS or host
+    /// rewriting happens in a reverse proxy.
+    ///
+    /// Forwarding headers are deliberately not trusted implicitly: an
+    /// untrusted client could otherwise choose the dataset and continuation
+    /// IRIs emitted in a response. Leave this unset for direct plain-HTTP
+    /// service, where the request's `Host` is authoritative.
+    pub public_origin: Option<PublicOrigin>,
     /// The largest values a request may ask for (doc 03 §3.5).
     pub caps: Caps,
     /// The work one response may cost (doc 03 §3.5).
@@ -95,6 +103,7 @@ impl Config {
         Self {
             bundle_root,
             bind,
+            public_origin: None,
             caps: Caps::default(),
             budgets: Budgets::default(),
             admission: Admission::default(),
@@ -109,6 +118,49 @@ impl Config {
         }
     }
 }
+
+/// A deployment's trusted externally visible scheme and authority.
+///
+/// This is an origin, not a base URL: KGF's route paths are appended exactly
+/// as received, so a path, query, or fragment here would produce ambiguous
+/// resource identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicOrigin(String);
+
+impl PublicOrigin {
+    /// The normalized `scheme://authority` spelling, without a trailing slash.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for PublicOrigin {
+    type Err = PublicOriginError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.contains('#') {
+            return Err(PublicOriginError);
+        }
+        let uri: axum::http::Uri = value.parse().map_err(|_| PublicOriginError)?;
+        if !matches!(uri.scheme_str(), Some("http" | "https"))
+            || uri.authority().is_none()
+            || !matches!(uri.path(), "" | "/")
+            || uri.query().is_some()
+        {
+            return Err(PublicOriginError);
+        }
+        Ok(Self(format!(
+            "{}://{}",
+            uri.scheme_str().expect("checked above"),
+            uri.authority().expect("checked above")
+        )))
+    }
+}
+
+/// A configured public origin is not an HTTP(S) origin.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("expected an absolute http:// or https:// origin with no path, query, or fragment")]
+pub struct PublicOriginError;
 
 /// The largest values a request may ask for (doc 03 §3.5).
 ///
@@ -410,6 +462,26 @@ mod tests {
     #[test]
     fn the_published_defaults_are_consistent_with_each_other() {
         assert_eq!(config(&Caps::new(), &Budgets::new()).validate(), Ok(()));
+    }
+
+    #[test]
+    fn public_origins_are_typed_and_normalized() {
+        assert_eq!(
+            "https://data.example:8443/"
+                .parse::<PublicOrigin>()
+                .unwrap()
+                .as_str(),
+            "https://data.example:8443"
+        );
+        for invalid in [
+            "data.example",
+            "ftp://data.example",
+            "https://data.example/kgf",
+            "https://data.example/?tenant=a",
+            "https://data.example/#fragment",
+        ] {
+            assert!(invalid.parse::<PublicOrigin>().is_err(), "{invalid}");
+        }
     }
 
     #[test]

@@ -324,6 +324,38 @@ fn an_rdf_fragment_without_an_authority_is_a_client_error() {
 }
 
 #[test]
+fn a_trusted_public_origin_drives_hydra_identity_and_continuations() {
+    const HYDRA_NEXT: &str = "http://www.w3.org/ns/hydra/core#next";
+    const HYDRA_TEMPLATE: &str = "http://www.w3.org/ns/hydra/core#template";
+
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve_with_public_origin("https://data.example");
+    let target = "/tox/v/v1/fragment?p=ex%3Aknows&limit=1";
+    let response = server.request_without_host(target, &[("Accept", "text/turtle")]);
+    response.assert_status(200);
+    let graph: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+        .for_slice(&response.body)
+        .collect::<Result<_, _>>()
+        .expect("fragment Turtle parses");
+    let dataset = "https://data.example/tox/v/v1/fragment";
+    let page = format!("https://data.example{target}");
+
+    assert!(graph.iter().any(|quad| {
+        matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == page)
+            && quad.predicate.as_str() == "http://www.w3.org/ns/hydra/core#totalItems"
+    }));
+    assert!(graph.iter().any(|quad| {
+        quad.predicate.as_str() == HYDRA_NEXT
+            && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str().starts_with(dataset))
+    }));
+    assert!(graph.iter().any(|quad| {
+        quad.predicate.as_str() == HYDRA_TEMPLATE
+            && matches!(&quad.object, oxrdf::Term::Literal(value) if value.value() == format!("{dataset}{{?s,p,o}}"))
+    }));
+}
+
+#[test]
 fn brtpf_values_accept_undef_and_project_overlapping_rows_to_distinct_rdf() {
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
@@ -1672,12 +1704,30 @@ impl Deployment {
     }
 
     fn serve_with_limits(&self, caps: kgf_server::Caps, budgets: kgf_server::Budgets) -> Server {
+        self.serve_config(caps, budgets, None)
+    }
+
+    fn serve_with_public_origin(&self, public_origin: &str) -> Server {
+        self.serve_config(
+            kgf_server::Caps::new(),
+            kgf_server::Budgets::new(),
+            Some(public_origin.parse().expect("a valid public origin")),
+        )
+    }
+
+    fn serve_config(
+        &self,
+        caps: kgf_server::Caps,
+        budgets: kgf_server::Budgets,
+        public_origin: Option<kgf_server::PublicOrigin>,
+    ) -> Server {
         let mut config = kgf_server::Config::new(
             kgf::serve::published_root(self.root.path()).expect("a published root"),
             "127.0.0.1:0".parse().unwrap(),
         );
         config.caps = caps;
         config.budgets = budgets;
+        config.public_origin = public_origin;
         let service = Arc::new(Service::build(config).expect("a servable deployment"));
 
         let runtime = tokio::runtime::Builder::new_multi_thread()

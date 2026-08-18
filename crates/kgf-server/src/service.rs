@@ -229,6 +229,12 @@ fn descriptor_digest(config: &Config, datasets: &Datasets) -> ContentDigest {
             .expect("budgets serialize")
             .as_slice(),
     );
+    field(
+        config
+            .public_origin
+            .as_ref()
+            .map_or(&[], |origin| origin.as_str().as_bytes()),
+    );
     field(env!("CARGO_PKG_VERSION").as_bytes());
     for name in datasets.names() {
         field(name.as_bytes());

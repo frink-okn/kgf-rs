@@ -1417,6 +1417,10 @@ page/continuation IRIs keyed to the exact request URL. Complete-document byte fi
 retains a first-omitted-row cursor rather than interrupting a serializer. RDF fragment
 requests are admitted as heavy work: complete-document fitting is bounded but has the
 same `Z·(1 + log limit)` worst case that doc 03 already records for schema fitting.
+`kgf serve --public-origin https://…` supplies a typed, trusted external origin for
+Hydra page, dataset, template, and continuation IRIs behind TLS or host-rewriting
+proxies; forwarded headers remain untrusted unless an embedding deployment handles
+that trust boundary itself.
 
 GET additionally accepts the variable-preserving URL form emitted by a source typed
 `brtpf` and parses `values=` by wrapping it in a SPARQL query handled by `spargebra`.
@@ -1453,9 +1457,7 @@ extensions rather than conformance requirements.
 What remains is beyond that core profile: graph-scoped reads and their four-position
 QPF form; later composed operations such as ranges, stars, and key resolution; and
 the complete `kgf build` DAG beyond today's hdtc assembly plus KGF stats producer.
-A TLS-terminating reverse proxy also needs a trusted public-origin setting before
-Hydra can publish its external `https` page, template, and continuation IRIs. Finally,
-the corresponding decisions recorded below still need to be applied to the sibling
+The corresponding decisions recorded below still need to be applied to the sibling
 `../kgf` specifications so the working design and this implementation say the same
 thing.
 
@@ -1722,10 +1724,11 @@ following the code.
     resolving one against the request URI gets the right answer and a client expecting
     an absolute URL does not. Unit 20 makes the wider deployment question concrete:
     Hydra page subjects, templates, and continuations must identify the public request
-    URL. The direct HTTP server can reconstruct that from `Host`; a TLS-terminating
-    reverse proxy also needs an explicit trusted public-origin configuration (or an
-    equivalently trusted forwarded scheme) before it can emit `https` links rather than
-    its internal `http` view. Surfaced in units 13 and 20.
+    URL. The direct HTTP server reconstructs that from `Host`; unit 20 now gives a
+    TLS-terminating or host-rewriting reverse proxy an explicit `--public-origin`
+    configuration rather than trusting spoofable forwarding headers. The spec should
+    state this trust requirement while leaving an embedder free to establish an
+    equivalent trusted forwarded scheme. Surfaced in units 13 and 20.
 19. **§3.4.4's example sends `s=` and `o=` for unbound positions,** while §3.3 says
     "omitted = variable". The implementation originally refused empty positions to catch
     unset client variables, but that made ordinary HTML GET forms hostile: browsers submit

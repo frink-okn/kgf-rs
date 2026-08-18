@@ -28,7 +28,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use kgf_server::{Admission, Config};
+use kgf_server::{Admission, Config, PublicOrigin};
 use kgf_store::map::PublishedRoot;
 
 /// Arguments for `kgf serve`.
@@ -41,6 +41,10 @@ pub struct Args {
     /// Address to bind. Port 0 binds an ephemeral port, logged at startup.
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub bind: SocketAddr,
+
+    /// Trusted external origin for Hydra IRIs when serving behind a TLS or host-rewriting proxy.
+    #[arg(long, value_name = "ORIGIN")]
+    pub public_origin: Option<PublicOrigin>,
 
     /// Concurrent ordinary bundle-work units; heavy requests consume multiple units.
     #[arg(long, default_value_t = 32)]
@@ -62,6 +66,7 @@ pub struct Args {
 /// Serve until Ctrl-C or `SIGTERM`.
 pub fn run(args: Args) -> Result<()> {
     let mut config = Config::new(published_root(&args.bundle_root)?, args.bind);
+    config.public_origin = args.public_origin;
     config.admission = Admission {
         max_concurrent_work: args.max_concurrent_work,
         heavy_request_weight: args.heavy_request_weight,

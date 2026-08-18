@@ -547,13 +547,10 @@ pub struct Answer {
     absent_terms: Vec<&'static str>,
     vars: Vec<Position>,
     rows: Vec<Row>,
-    /// Store ids aligned with `rows`, retained so the RDF projection can
-    /// assign an overlapping binding result to its deterministic first owner
-    /// without resolving serialized terms back through the dictionary.
     #[serde(skip)]
-    row_ids: Vec<IdTriple>,
+    row_resumes: Vec<RowResume>,
     #[serde(skip)]
-    row_cursors: Vec<CursorToken>,
+    row_binding: Option<CursorBinding>,
     /// Cardinality of the distinct RDF projection. The native binding
     /// relation keeps its independently exact row count in `cardinality`.
     #[serde(skip)]
@@ -716,18 +713,7 @@ impl Answer {
 
         let total = self.rows.len();
         let encode_prefix = |keep: usize| {
-            let next = self.row_cursors.get(keep).ok_or_else(|| {
-                tracing::error!(
-                    rows = self.rows.len(),
-                    row_cursors = self.row_cursors.len(),
-                    keep,
-                    "an RDF-renderable answer has no cursor for its omitted row"
-                );
-                Problem::new(
-                    ErrorCode::InternalError,
-                    "the fragment page could not be resumed",
-                )
-            })?;
+            let next = self.rdf_row_cursor(keep)?;
             self.fragment_rdf_prefix(format, keep, Some(next.as_str()))
         };
 
@@ -776,23 +762,36 @@ impl Answer {
 
     fn truncate_rdf_rows(&mut self, keep: usize) -> Result<(), Problem> {
         debug_assert!(keep > 0 && keep < self.rows.len());
-        let next = self.row_cursors.get(keep).cloned().ok_or_else(|| {
-            tracing::error!(
-                rows = self.rows.len(),
-                row_cursors = self.row_cursors.len(),
-                keep,
-                "an RDF-renderable answer has no cursor for its omitted row"
-            );
-            Problem::new(
-                ErrorCode::InternalError,
-                "the fragment page could not be resumed",
-            )
-        })?;
+        let next = self.rdf_row_cursor(keep)?;
         self.rows.truncate(keep);
-        self.row_ids.truncate(keep);
-        self.row_cursors.truncate(keep);
+        self.row_resumes.truncate(keep);
         self.completeness = Completeness::budget_exhausted(BudgetReason::ResponseBytes, next);
         Ok(())
+    }
+
+    /// Encode only the logarithmically many cursors RDF byte fitting probes.
+    /// JSON and HTML never call this path, so they pay no per-row base64 work.
+    fn rdf_row_cursor(&self, index: usize) -> Result<CursorToken, Problem> {
+        let Some(resume) = self.row_resumes.get(index) else {
+            tracing::error!(
+                rows = self.rows.len(),
+                row_resumes = self.row_resumes.len(),
+                index,
+                "an RDF-renderable answer has no cursor for its omitted row"
+            );
+            return Err(Problem::new(
+                ErrorCode::InternalError,
+                "the fragment page could not be resumed",
+            ));
+        };
+        let Some(binding) = &self.row_binding else {
+            tracing::error!("an RDF-renderable answer has no cursor binding for its omitted row");
+            return Err(Problem::new(
+                ErrorCode::InternalError,
+                "the fragment page could not be resumed",
+            ));
+        };
+        Ok(resume.cursor(binding))
     }
 
     /// Project an ordinary fragment page into the TPF RDF graph understood by
@@ -815,12 +814,11 @@ impl Answer {
                 "RDF was negotiated for an operation that does not publish an RDF graph",
             ));
         }
-        if self.row_ids.len() != self.rows.len() || keep > self.rows.len() {
+        if keep > self.rows.len() {
             tracing::error!(
                 rows = self.rows.len(),
-                row_ids = self.row_ids.len(),
                 keep,
-                "an RDF-renderable answer's rows and ids are not aligned"
+                "an RDF-renderable answer was asked for rows it does not hold"
             );
             return Err(Problem::new(
                 ErrorCode::InternalError,
@@ -3858,7 +3856,6 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         .collect();
 
     let (rows, spent_at) = materialize(&dictionary, &vars, &steps, request.bytes)?;
-    let row_ids = steps[..rows.len()].iter().map(|step| step.triple).collect();
     Ok(Answer {
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
@@ -3869,8 +3866,8 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         cardinality: Cardinality::exact(count),
         absent_terms,
         rows,
-        row_ids,
-        row_cursors: Vec::new(),
+        row_resumes: Vec::new(),
+        row_binding: None,
         rdf_cardinality: None,
         byte_budget: request.bytes.0,
         vars,
@@ -3944,27 +3941,55 @@ struct Step {
     ranking: Option<Ranking>,
 }
 
-impl Step {
-    /// The token that resumes a page at this row.
-    fn cursor(&self, binding: &CursorBinding) -> crate::cursor::CursorToken {
-        // On the space rather than on `scan.is_some()`. The two agree today,
-        // and `Cursor::at_rank` hardcodes `TextRank` — so dispatching on the
-        // trailer would silently mint a ranked token for the first M2 position
-        // that wants a second number in some other space, which
-        // `Cursor::scan_position` is already reserved for.
+/// The result-order position needed if RDF byte fitting omits this row.
+///
+/// It deliberately excludes the request binding: one binding is shared by the
+/// page, while these small values vary per row. Keeping positions rather than
+/// encoded tokens removes base64 allocation from JSON and HTML responses.
+#[derive(Debug, Clone, Copy)]
+struct RowResume {
+    space: PositionSpace,
+    position: u64,
+    scan: Option<u64>,
+    binding_index: Option<u32>,
+}
+
+impl RowResume {
+    fn cursor(self, binding: &CursorBinding) -> CursorToken {
         match self.space {
             PositionSpace::TextRank => {
-                Cursor::at_rank(binding, self.resume, self.scan.unwrap_or(0))
+                Cursor::at_rank(binding, self.position, self.scan.unwrap_or(0))
             }
             space if self.binding_index.is_some() => Cursor::at_binding(
                 binding,
                 self.binding_index.expect("checked above"),
                 space,
-                self.resume,
+                self.position,
             ),
-            space => Cursor::at(binding, space, self.resume),
+            space => Cursor::at(binding, space, self.position),
         }
         .encode()
+    }
+}
+
+impl Step {
+    fn row_resume(&self) -> RowResume {
+        RowResume {
+            space: self.space,
+            position: self.resume,
+            scan: self.scan,
+            binding_index: self.binding_index,
+        }
+    }
+
+    /// The token that resumes a page at this row.
+    fn cursor(&self, binding: &CursorBinding) -> CursorToken {
+        // On the space rather than on `scan.is_some()`. The two agree today,
+        // and `Cursor::at_rank` hardcodes `TextRank` — so dispatching on the
+        // trailer would silently mint a ranked token for the first M2 position
+        // that wants a second number in some other space, which
+        // `Cursor::scan_position` is already reserved for.
+        self.row_resume().cursor(binding)
     }
 }
 
@@ -4498,11 +4523,7 @@ fn finish(
     // applies — before the response exists rather than after, which also bounds
     // the memory a page can take.
     let (rows, spent_at) = materialize(dictionary, &vars, &steps, paging.bytes)?;
-    let row_ids = steps[..rows.len()].iter().map(|step| step.triple).collect();
-    let row_cursors = steps[..rows.len()]
-        .iter()
-        .map(|step| step.cursor(paging.binding))
-        .collect();
+    let row_resumes = steps[..rows.len()].iter().map(Step::row_resume).collect();
 
     // Whichever bound was reached first names the reason and the resume point.
     // Bytes first, because a page stopped for bytes never reached its row count
@@ -4531,8 +4552,8 @@ fn finish(
         cardinality: cardinality(&completeness, &rows),
         absent_terms,
         rows,
-        row_ids,
-        row_cursors,
+        row_resumes,
+        row_binding: Some(paging.binding.clone()),
         rdf_cardinality: None,
         byte_budget: paging.bytes.0,
         vars,
@@ -4766,6 +4787,15 @@ fn resume_position(cursor: &Cursor, phase: &Phase<'_>, predicates: u64) -> Resul
 /// cost a third of what rendering the response costs (10 000 rows: 1.0 ms of
 /// weighing against 3.0 ms of rendering), which is what that arrangement is
 /// worth avoiding.
+///
+/// RDF has a second, exact complete-document fit because Turtle and JSON-LD
+/// size is not row-local: serializers group statements and retain closing
+/// syntax until `finish`. This first pass still applies there as the hard bound
+/// on materialized term memory. The exact RDF pass may therefore conservatively
+/// return fewer rows than its wire budget alone could hold, but the alternative
+/// would require assembling up to `max_limit * max_term_bytes` before any byte
+/// bound applied. The two passes bound different resources; neither can be
+/// removed without replacing it with an equally explicit memory bound.
 fn materialize(
     dictionary: &Dictionary<'_>,
     vars: &[Position],

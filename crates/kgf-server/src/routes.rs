@@ -42,7 +42,6 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::Limits;
 use crate::admission::WorkClass;
 use crate::answer::{self, Rendered, Renders, Target};
 use crate::descriptor::{BundleManifest, DatasetDescriptor, ServiceDescriptor};
@@ -52,6 +51,7 @@ use crate::representation::{CachePolicy, Representation, etag, etag_for_body, ne
 use crate::request;
 use crate::service::{Release, Service};
 use crate::url::{self, Params};
+use crate::{Limits, PublicOrigin};
 
 /// The KGF routes over a built service.
 pub fn router(service: Arc<Service>) -> Router {
@@ -1204,12 +1204,12 @@ impl Wants {
     }
 }
 
-impl<S: Send + Sync> FromRequestParts<S> for Wants {
+impl FromRequestParts<Arc<Service>> for Wants {
     type Rejection = Problem;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
-        _state: &S,
+        service: &Arc<Service>,
     ) -> Result<Self, Self::Rejection> {
         Ok(Self {
             params: Params::parse(parts.uri.query())?,
@@ -1218,16 +1218,25 @@ impl<S: Send + Sync> FromRequestParts<S> for Wants {
             // §13.1 requires of a precondition a server cannot evaluate: the
             // response is the full one, never a wrong 304.
             if_none_match: parts.headers.typed_get(),
-            request_url: absolute_request_url(parts),
+            request_url: absolute_request_url(parts, service.config().public_origin.as_ref()),
         })
     }
 }
 
 /// Reconstruct the absolute request target from HTTP's authority and the
-/// untouched path/query. `kgf serve` is a plain-HTTP listener; a TLS reverse
-/// proxy must preserve the public Host (public-origin configuration remains a
-/// deployment-level design question in `notes/plan.md`).
-fn absolute_request_url(parts: &axum::http::request::Parts) -> Option<String> {
+/// untouched path/query. A configured origin is trusted over request headers;
+/// without one, `kgf serve` is a plain-HTTP listener and `Host` is authoritative.
+fn absolute_request_url(
+    parts: &axum::http::request::Parts,
+    public_origin: Option<&PublicOrigin>,
+) -> Option<String> {
+    if let Some(origin) = public_origin {
+        return Some(format!(
+            "{}{}",
+            origin.as_str(),
+            parts.uri.path_and_query()?.as_str()
+        ));
+    }
     if parts.uri.scheme().is_some() && parts.uri.authority().is_some() {
         return Some(parts.uri.to_string());
     }
