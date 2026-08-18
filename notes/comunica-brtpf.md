@@ -119,6 +119,13 @@ carry an input-row index. Both projections use the same dictionary resolution,
 `Selection`s, enumeration order, and positional cursor machinery, but their
 visible cardinalities can differ when binding rows overlap.
 
+The RDF cardinality follows that projection without introducing an unbounded counting
+scan. It is exact when restrictions are pairwise disjoint or one restriction subsumes
+all others. For arbitrary partial overlap it is a planning estimate bounded above by
+both the per-binding relation sum and the count of the base triple pattern containing
+every restriction. Comunica already consumes TPF cardinality as planning metadata;
+result correctness comes from following Hydra pages to exhaustion.
+
 The original native body was narrower than Comunica's input: it required every
 cell to be a term and every binding variable to occur in the pattern. The shared
 domain model now admits `UNDEF`, retains foreign columns for input-row identity

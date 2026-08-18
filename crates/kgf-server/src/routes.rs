@@ -813,6 +813,16 @@ where
     E: FnOnce(&kgf_store::Store, Target, &Q) -> Result<A, Problem> + Send + 'static,
 {
     let representation = wants.representation_from(offered)?;
+    if matches!(
+        representation,
+        Representation::Turtle | Representation::JsonLd
+    ) && wants.request_url.is_none()
+    {
+        return Err(Problem::new(
+            ErrorCode::MalformedRequest,
+            "an RDF fragment request requires an absolute request target or a valid Host header",
+        ));
+    }
     let release = service.datasets().release(&id.dataset, &id.version)?;
     let params = Q::normalize_params(wants.params());
     let request = parse(&params, service.config().limits(), release, representation)?;

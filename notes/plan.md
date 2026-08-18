@@ -1423,7 +1423,10 @@ are retained in cursor identity but do not restrict a selection. Native JSON sti
 enumerates the binding relation. RDF assigns each overlapping triple to its first
 compatible input row, using resolved id patterns, so duplicates do not reappear across
 pages and no server-side state is needed. The ownership check costs at most the
-published binding cap times the already-bounded page rows.
+published binding cap times the already-bounded page rows. Its distinct cardinality is
+exact for disjoint restrictions or when one restriction subsumes the rest; arbitrary
+partial overlap is a bounded upper estimate, capped by both the relation sum and the
+base triple-pattern count rather than paid for with an unbounded union enumeration.
 
 `interop/comunica` pins stock Comunica 5.3.0. Its real-listener gate forces one-row
 pages, executes an ordinary pattern and bind join, and completes a join across two KGF

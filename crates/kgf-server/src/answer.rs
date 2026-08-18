@@ -559,6 +559,10 @@ pub struct Answer {
     /// to one copy of each triple across every page.
     #[serde(skip)]
     rdf_restrictions: Option<Vec<(u32, IdPattern)>>,
+    /// Cardinality of the distinct RDF projection. The native binding
+    /// relation keeps its independently exact row count in `cardinality`.
+    #[serde(skip)]
+    rdf_cardinality: Option<Cardinality>,
     #[serde(skip)]
     byte_budget: u64,
     #[serde(flatten)]
@@ -710,44 +714,85 @@ impl Answer {
             return Ok(body);
         }
 
-        let original = self.clone();
-        let total = original.rows.len();
-        let mut low = 1usize;
-        let mut high = total - 1;
-        let mut best: Option<(Self, Bytes)> = None;
-        while low <= high {
-            let keep = low + (high - low) / 2;
-            let mut candidate = original.clone();
-            candidate.truncate_rdf_rows(keep);
-            let body = candidate.fragment_rdf(format)?;
-            if body.len() as u64 <= candidate.byte_budget {
-                best = Some((candidate, body));
-                low = keep + 1;
+        let total = self.rows.len();
+        let encode_prefix = |keep: usize| {
+            let next = self.row_cursors.get(keep).ok_or_else(|| {
+                tracing::error!(
+                    rows = self.rows.len(),
+                    row_cursors = self.row_cursors.len(),
+                    keep,
+                    "an RDF-renderable answer has no cursor for its omitted row"
+                );
+                Problem::new(
+                    ErrorCode::InternalError,
+                    "the fragment page could not be resumed",
+                )
+            })?;
+            self.fragment_rdf_prefix(format, keep, Some(next.as_str()))
+        };
+
+        // Grow from one row until the first complete document that does not
+        // fit, then binary-search only inside that bracket. Unlike starting at
+        // half of a max-sized page, every probe is proportional to the output
+        // prefix the byte budget can plausibly admit.
+        let mut best_keep = 1usize;
+        let mut best_body = encode_prefix(best_keep)?;
+        if best_body.len() as u64 > self.byte_budget {
+            self.truncate_rdf_rows(best_keep)?;
+            return Ok(best_body);
+        }
+
+        let mut first_over = total;
+        let mut probe = 2usize;
+        while probe < total {
+            let candidate = encode_prefix(probe)?;
+            if candidate.len() as u64 <= self.byte_budget {
+                best_keep = probe;
+                best_body = candidate;
+                probe = probe.saturating_mul(2).min(total);
             } else {
-                high = keep - 1;
+                first_over = probe;
+                break;
             }
         }
 
-        let (candidate, body) = match best {
-            Some(best) => best,
-            None => {
-                let mut candidate = original;
-                candidate.truncate_rdf_rows(1);
-                let body = candidate.fragment_rdf(format)?;
-                (candidate, body)
+        let mut low = best_keep + 1;
+        let mut high = first_over;
+        while low < high {
+            let keep = low + (high - low) / 2;
+            let candidate = encode_prefix(keep)?;
+            if candidate.len() as u64 <= self.byte_budget {
+                best_keep = keep;
+                best_body = candidate;
+                low = keep + 1;
+            } else {
+                high = keep;
             }
-        };
-        *self = candidate;
-        Ok(body)
+        }
+
+        self.truncate_rdf_rows(best_keep)?;
+        Ok(best_body)
     }
 
-    fn truncate_rdf_rows(&mut self, keep: usize) {
+    fn truncate_rdf_rows(&mut self, keep: usize) -> Result<(), Problem> {
         debug_assert!(keep > 0 && keep < self.rows.len());
-        let next = self.row_cursors[keep].clone();
+        let next = self.row_cursors.get(keep).cloned().ok_or_else(|| {
+            tracing::error!(
+                rows = self.rows.len(),
+                row_cursors = self.row_cursors.len(),
+                keep,
+                "an RDF-renderable answer has no cursor for its omitted row"
+            );
+            Problem::new(
+                ErrorCode::InternalError,
+                "the fragment page could not be resumed",
+            )
+        })?;
         self.rows.truncate(keep);
         self.row_ids.truncate(keep);
         self.row_cursors.truncate(keep);
         self.completeness = Completeness::budget_exhausted(BudgetReason::ResponseBytes, next);
+        Ok(())
     }
 
     /// Project an ordinary fragment page into the TPF RDF graph understood by
@@ -755,15 +800,36 @@ impl Answer {
     /// negotiate this representation; brTPF's GET transport joins this path
     /// once its `values=` request parser has normalized the restrictions.
     fn fragment_rdf(&self, format: GraphFormat) -> Result<Bytes, Problem> {
+        self.fragment_rdf_prefix(format, self.rows.len(), self.completeness.next_cursor())
+    }
+
+    fn fragment_rdf_prefix(
+        &self,
+        format: GraphFormat,
+        keep: usize,
+        next_cursor: Option<&str>,
+    ) -> Result<Bytes, Problem> {
         if matches!(self.echo, Echo::Describe { .. } | Echo::Sample { .. }) {
             return Err(Problem::new(
                 ErrorCode::InternalError,
                 "RDF was negotiated for an operation that does not publish an RDF graph",
             ));
         }
-        let mut triples = Vec::with_capacity(self.rows.len().saturating_add(18));
-        let mut data = HashSet::with_capacity(self.rows.len());
-        for (row_index, row) in self.rows.iter().enumerate() {
+        if self.row_ids.len() != self.rows.len() || keep > self.rows.len() {
+            tracing::error!(
+                rows = self.rows.len(),
+                row_ids = self.row_ids.len(),
+                keep,
+                "an RDF-renderable answer's rows and ids are not aligned"
+            );
+            return Err(Problem::new(
+                ErrorCode::InternalError,
+                "the fragment page could not be represented as RDF",
+            ));
+        }
+        let mut triples = Vec::with_capacity(keep.saturating_add(18));
+        let mut data = HashSet::with_capacity(keep);
+        for (row_index, row) in self.rows.iter().take(keep).enumerate() {
             if let (Some(restrictions), Some(binding)) = (&self.rdf_restrictions, row.binding)
                 && restrictions.iter().any(|(owner, pattern)| {
                     *owner < binding && id_pattern_matches(*pattern, self.row_ids[row_index])
@@ -771,10 +837,13 @@ impl Answer {
             {
                 continue;
             }
-            let cell = |position| match &self.echo {
-                Echo::Fragment { pattern } => fragment_cell(pattern, row, position),
-                Echo::BindingsFragment { pattern } => binding_fragment_cell(pattern, row, position),
-                Echo::Describe { .. } | Echo::Sample { .. } => None,
+            let cell = |position| {
+                let bound = match &self.echo {
+                    Echo::Fragment { pattern } => pattern.bound(position),
+                    Echo::BindingsFragment { pattern } => pattern.bound(position),
+                    Echo::Describe { .. } | Echo::Sample { .. } => None,
+                };
+                rdf_fragment_cell(bound, row, position)
             };
             let subject =
                 cell(Position::Subject).expect("every fragment row binds every triple position");
@@ -870,9 +939,9 @@ impl Answer {
         triples.push(Triple::new(
             page.clone(),
             metadata_iri(HYDRA_TOTAL_ITEMS, "hydra:totalItems")?,
-            Literal::from(self.cardinality.value()),
+            Literal::from(self.rdf_cardinality.unwrap_or(self.cardinality).value()),
         ));
-        if let Some(cursor) = self.completeness.next_cursor() {
+        if let Some(cursor) = next_cursor {
             triples.push(Triple::new(
                 page,
                 metadata_iri(HYDRA_NEXT, "hydra:next")?,
@@ -894,36 +963,40 @@ impl Answer {
     }
 }
 
-fn fragment_cell<'a>(pattern: &'a Pattern, row: &'a Row, position: Position) -> Option<&'a str> {
-    pattern
-        .bound(position)
-        .map(BoundTerm::dictionary)
-        .or_else(|| {
-            row.cells
-                .iter()
-                .find_map(|(found, value)| (*found == position).then_some(value.as_ref()))
-        })
-}
-
-fn binding_fragment_cell<'a>(
-    pattern: &'a BindingPattern,
+fn rdf_fragment_cell<'a>(
+    bound: Option<&'a BoundTerm>,
     row: &'a Row,
     position: Position,
 ) -> Option<&'a str> {
-    pattern
-        .bound(position)
-        .map(BoundTerm::dictionary)
-        .or_else(|| {
-            row.cells
-                .iter()
-                .find_map(|(found, value)| (*found == position).then_some(value.as_ref()))
-        })
+    bound.map(BoundTerm::dictionary).or_else(|| {
+        row.cells
+            .iter()
+            .find_map(|(found, value)| (*found == position).then_some(value.as_ref()))
+    })
 }
 
 fn id_pattern_matches(pattern: IdPattern, triple: IdTriple) -> bool {
     pattern.subject.is_none_or(|id| id == triple.subject)
         && pattern.predicate.is_none_or(|id| id == triple.predicate)
         && pattern.object.is_none_or(|id| id == triple.object)
+}
+
+fn id_pattern_subsumes(general: IdPattern, specific: IdPattern) -> bool {
+    general
+        .subject
+        .is_none_or(|id| specific.subject == Some(id))
+        && general
+            .predicate
+            .is_none_or(|id| specific.predicate == Some(id))
+        && general.object.is_none_or(|id| specific.object == Some(id))
+}
+
+fn id_patterns_overlap(left: IdPattern, right: IdPattern) -> bool {
+    let compatible =
+        |left: Option<u64>, right: Option<u64>| left.is_none() || right.is_none() || left == right;
+    compatible(left.subject, right.subject)
+        && compatible(left.predicate, right.predicate)
+        && compatible(left.object, right.object)
 }
 
 fn metadata_iri(value: &str, what: &'static str) -> Result<NamedNode, Problem> {
@@ -3180,13 +3253,18 @@ pub fn binding_fragment(
     let mut cache = LookupCache::new(dictionary);
     let mut phases = Vec::new();
     let mut restrictions = Vec::new();
+    let mut restriction_counts = Vec::new();
+    let base_pattern = resolve_binding_pattern(&mut cache, &request.pattern)?;
     for row in request.rows() {
         let Some(ids) = resolve_binding(&mut cache, row)? else {
             continue;
         };
+        let selection = select(store, ids)?;
+        restriction_counts.push((ids, selection.count().value));
         restrictions.push((row.index(), ids));
-        phases.push(binding_phase(select(store, ids)?, row.index()));
+        phases.push(binding_phase(selection, row.index()));
     }
+    let rdf_cardinality = rdf_projection_cardinality(store, base_pattern, &restriction_counts)?;
 
     let mut answer = paged(
         &dictionary,
@@ -3209,6 +3287,7 @@ pub fn binding_fragment(
         },
     )?;
     answer.rdf_restrictions = Some(restrictions);
+    answer.rdf_cardinality = Some(rdf_cardinality);
     Ok(answer)
 }
 
@@ -3772,6 +3851,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         row_ids,
         row_cursors: Vec::new(),
         rdf_restrictions: None,
+        rdf_cardinality: None,
         byte_budget: request.bytes.0,
         vars,
         // A sample stops for one reason only. It is not paged, so `n` is what
@@ -4137,6 +4217,34 @@ fn resolve_binding(
     Ok(Some(ids))
 }
 
+/// Resolve only the terms fixed directly in a bindings pattern. Every input
+/// row is a subset of this selection, so its count is a cheap upper bound for
+/// the RDF union when restrictions overlap.
+fn resolve_binding_pattern(
+    cache: &mut LookupCache<'_>,
+    pattern: &BindingPattern,
+) -> Result<Option<IdPattern>, Problem> {
+    let mut ids = IdPattern {
+        subject: None,
+        predicate: None,
+        object: None,
+    };
+    for position in Position::ALL {
+        let Some(term) = pattern.bound(position) else {
+            continue;
+        };
+        let Some(id) = cache.locate(position.role(), term)? else {
+            return Ok(None);
+        };
+        match position {
+            Position::Subject => ids.subject = Some(id),
+            Position::Predicate => ids.predicate = Some(id),
+            Position::Object => ids.object = Some(id),
+        }
+    }
+    Ok(Some(ids))
+}
+
 fn select(store: &Store, ids: IdPattern) -> Result<Selection<'_>, Problem> {
     // Every id here came out of this bundle's own dictionary, so the only error
     // `resolve` defines — an id outside its role's space — is unreachable.
@@ -4207,6 +4315,57 @@ fn exact_cardinality_sum(counts: impl IntoIterator<Item = u64>) -> Result<Cardin
             )
         })?;
     Ok(Cardinality::exact(value))
+}
+
+/// Cardinality of brTPF's distinct-RDF projection.
+///
+/// Disjoint restrictions add exactly, and a restriction that subsumes all the
+/// others gives the union exactly. Arbitrary partial overlaps would require an
+/// unbounded union enumeration, so report a bounded upper estimate: no larger
+/// than either the relation sum or the base triple pattern containing every
+/// restriction. TPF cardinalities are planning estimates; query correctness
+/// continues to come from paging the distinct projection to exhaustion.
+fn rdf_projection_cardinality(
+    store: &Store,
+    base_pattern: Option<IdPattern>,
+    restrictions: &[(IdPattern, u64)],
+) -> Result<Cardinality, Problem> {
+    let total = exact_cardinality_sum(restrictions.iter().map(|(_, count)| *count))?.value();
+    let active: Vec<_> = restrictions
+        .iter()
+        .copied()
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    if active.is_empty() {
+        return Ok(Cardinality::exact(0));
+    }
+    if let Some((_, count)) = active.iter().find(|(general, _)| {
+        active
+            .iter()
+            .all(|(specific, _)| id_pattern_subsumes(*general, *specific))
+    }) {
+        return Ok(Cardinality::exact(*count));
+    }
+    let disjoint = active.iter().enumerate().all(|(index, (left, _))| {
+        active[index + 1..]
+            .iter()
+            .all(|(right, _)| !id_patterns_overlap(*left, *right))
+    });
+    if disjoint {
+        return Ok(Cardinality::exact(total));
+    }
+
+    let Some(base_pattern) = base_pattern else {
+        // A fixed base term absent from the dictionary makes every restriction
+        // empty, which the `active` check above would already have returned.
+        tracing::error!("non-empty binding restrictions have an absent base pattern");
+        return Err(Problem::new(
+            ErrorCode::InternalError,
+            "the RDF fragment cardinality could not be determined",
+        ));
+    };
+    let base_count = select(store, base_pattern)?.count().value;
+    Ok(Cardinality::estimated(total.min(base_count)))
 }
 
 /// Finish a text-filtered page (§3.4.1).
@@ -4317,6 +4476,7 @@ fn finish(
         row_ids,
         row_cursors,
         rdf_restrictions: None,
+        rdf_cardinality: None,
         byte_budget: paging.bytes.0,
         vars,
         completeness,

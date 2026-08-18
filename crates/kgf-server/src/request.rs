@@ -56,7 +56,7 @@ use crate::cursor::{
 };
 use crate::envelope::{ErrorCode, Problem, reflected};
 use crate::service::PredicateRoles;
-use crate::term::{PrefixMap, Term};
+use crate::term::{Literal as KgfLiteral, PrefixMap, Term};
 use crate::url::Params;
 
 // ---------------------------------------------------------------------------
@@ -192,6 +192,44 @@ impl BoundTerm {
         let term = Term::from_json(&value).map_err(|error| {
             Problem::new(ErrorCode::BadTermSyntax, format!("{parameter}: {error}"))
         })?;
+        let dictionary = term.to_dictionary().into_owned();
+        let max = limits.budgets.max_term_bytes;
+        if dictionary.len() as u64 > max {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "the term in `{parameter}` is {} bytes in canonical form, over this \
+                     server's max_term_bytes of {max}",
+                    dictionary.len()
+                ),
+            ));
+        }
+        Ok(Self {
+            requested: term.to_request(),
+            dictionary,
+        })
+    }
+
+    /// Convert a term already parsed by SPARQL without formatting and parsing
+    /// it a second time. KGF's HDT dictionaries deliberately store literal
+    /// lexical forms unescaped, whereas `oxrdf`'s display form uses SPARQL /
+    /// N-Triples escapes; crossing those two syntaxes would change the term.
+    fn from_ground_term(
+        parameter: &str,
+        term: GroundTerm,
+        limits: Limits<'_>,
+    ) -> Result<Self, Problem> {
+        let term = match term {
+            GroundTerm::NamedNode(node) => Term::Iri(node.into_string().into()),
+            GroundTerm::Literal(literal) => {
+                let value = literal.value().to_owned();
+                let literal = match literal.language() {
+                    Some(language) => KgfLiteral::tagged(value, language.to_owned()),
+                    None => KgfLiteral::typed(value, literal.datatype().as_str().to_owned()),
+                };
+                Term::Literal(literal)
+            }
+        };
         let dictionary = term.to_dictionary().into_owned();
         let max = limits.budgets.max_term_bytes;
         if dictionary.len() as u64 > max {
@@ -841,12 +879,6 @@ impl BindingPattern {
         limits: Limits<'_>,
         prefixes: &PrefixMap,
     ) -> Result<Self, Problem> {
-        if params.get("o.text").is_some() {
-            return Err(Problem::new(
-                ErrorCode::MalformedRequest,
-                "values= cannot be combined with o.text; bindings restrict an RDF triple pattern",
-            ));
-        }
         let mut cells = Vec::with_capacity(3);
         for position in Position::ALL {
             let parameter = position.as_str();
@@ -1068,7 +1100,6 @@ impl Bindings {
         text: &str,
         pattern: &BindingPattern,
         limits: Limits<'_>,
-        prefixes: &PrefixMap,
     ) -> Result<Self, Problem> {
         let query = SparqlParser::new()
             .parse_query(&format!("SELECT * WHERE {{ VALUES {text} }}"))
@@ -1133,11 +1164,10 @@ impl Bindings {
                     .enumerate()
                     .map(|(column, value)| match value {
                         None => Ok(BindingValue::Undef),
-                        Some(term) => BoundTerm::parse(
+                        Some(term) => BoundTerm::from_ground_term(
                             &format!("values row {row_index}, column {column}"),
-                            &ground_term_syntax(term),
+                            term,
                             limits,
-                            prefixes,
                         )
                         .map(BindingValue::Bound),
                     })
@@ -1202,10 +1232,6 @@ impl Bindings {
         }
         output
     }
-}
-
-fn ground_term_syntax(term: GroundTerm) -> String {
-    term.to_string()
 }
 
 fn unbounded_repeated_variable(variable: &Variable) -> Problem {
@@ -1284,7 +1310,7 @@ impl BindingFragment {
         )?;
         let pattern = BindingPattern::parse_get(params, limits, prefixes)?;
         let values = params.get("values").expect("the caller selected values=");
-        let bindings = Bindings::parse_values(values, &pattern, limits, prefixes)?;
+        let bindings = Bindings::parse_values(values, &pattern, limits)?;
         let limit = page_size(
             params,
             "limit",
@@ -3417,6 +3443,28 @@ mod tests {
         assert_eq!(second.bound(Position::Subject), None);
         assert_eq!(second.bound(Position::Object), None);
         assert!(rows.next().is_none());
+    }
+
+    #[test]
+    fn brtpf_values_preserve_special_characters_in_literal_lexical_forms() {
+        let values = r#"(?value) { ("a\"b\nc\\d\t\r"@EN) }"#;
+        let query = format!(
+            "s=%3Fs&p=%3Fp&o=%3Fvalue&values={}",
+            crate::url::encode_value(values)
+        );
+        let parsed =
+            GetFragment::parse(&params(&query), limits(), &prefixes(), &bundle(), false).unwrap();
+        let GetFragment::Bindings(parsed) = parsed else {
+            panic!("values= must select the bindings grammar")
+        };
+        let literal = parsed
+            .rows()
+            .next()
+            .unwrap()
+            .bound(Position::Object)
+            .unwrap();
+        assert_eq!(literal.dictionary(), "\"a\"b\nc\\d\t\r\"@en");
+        assert_eq!(literal.requested(), "\"a\"b\nc\\d\t\r\"@en");
     }
 
     #[test]

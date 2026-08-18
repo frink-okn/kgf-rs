@@ -302,6 +302,23 @@ fn fragment_rdf_is_one_parseable_tpf_graph_in_turtle_and_jsonld() {
 }
 
 #[test]
+fn an_rdf_fragment_without_an_authority_is_a_client_error() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let target = "/tox/v/v1/fragment?p=ex%3Aknows";
+
+    let rdf = server.request_without_host(target, &[("Accept", "text/turtle")]);
+    rdf.assert_status(400);
+    assert_eq!(rdf.json()["code"], "malformed_request");
+
+    // Only an RDF representation needs its absolute URL for Hydra metadata.
+    server
+        .request_without_host(target, &[("Accept", "application/json")])
+        .assert_status(200);
+}
+
+#[test]
 fn brtpf_values_accept_undef_and_project_overlapping_rows_to_distinct_rdf() {
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
@@ -323,6 +340,21 @@ fn brtpf_values_accept_undef_and_project_overlapping_rows_to_distinct_rdf() {
             .for_slice(&response.body)
             .collect::<Result<_, _>>()
             .expect("brTPF Turtle parses");
+        let total = graph
+            .iter()
+            .find_map(|quad| {
+                (quad.predicate.as_str() == "http://www.w3.org/ns/hydra/core#totalItems")
+                    .then(|| match &quad.object {
+                        oxrdf::Term::Literal(value) => Some(value.value()),
+                        _ => None,
+                    })
+                    .flatten()
+            })
+            .expect("the brTPF page carries a cardinality");
+        assert_eq!(
+            total, "2",
+            "a restriction subsumed by another must not inflate the distinct RDF total"
+        );
         for quad in graph
             .iter()
             .filter(|quad| quad.predicate.as_str() == "http://example.org/knows")
@@ -1636,7 +1668,6 @@ impl Server {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Response {
-        let mut stream = TcpStream::connect(self.address).expect("connect");
         let mut request = format!(
             "{method} {target} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
             self.address
@@ -1647,6 +1678,20 @@ impl Server {
         // Always present, so a server expecting a body on QUERY or POST does
         // not wait for one.
         request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+        self.exchange(method, &request, body)
+    }
+
+    fn request_without_host(&self, target: &str, headers: &[(&str, &str)]) -> Response {
+        let mut request = format!("GET {target} HTTP/1.0\r\nConnection: close\r\n");
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("Content-Length: 0\r\n\r\n");
+        self.exchange("GET", &request, &[])
+    }
+
+    fn exchange(&self, method: &str, request: &str, body: &[u8]) -> Response {
+        let mut stream = TcpStream::connect(self.address).expect("connect");
         stream.write_all(request.as_bytes()).expect("write");
         // A server that rejects the body mid-stream closes the connection, and
         // its response is still worth reading — so a broken pipe here is not a
