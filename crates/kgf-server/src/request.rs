@@ -38,6 +38,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Deserialize;
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::ser::{Serialize, SerializeMap, Serializer};
+use spargebra::algebra::GraphPattern;
+use spargebra::term::GroundTerm;
+use spargebra::{Query, SparqlParser};
 
 use hdtc::format::TextQuery;
 use kgf_store::{
@@ -207,6 +210,41 @@ impl BoundTerm {
         })
     }
 
+    /// Parse a fragment-protocol URL term. TPF clients write a named node as
+    /// its bare absolute IRI, while KGF's native spelling brackets it. Keep
+    /// the native/CURIE interpretation first (so a declared `ex:a` stays a
+    /// CURIE), then accept the TPF spelling when that interpretation fails.
+    fn parse_fragment(
+        parameter: &str,
+        text: &str,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+    ) -> Result<Self, Problem> {
+        match Self::parse(parameter, text, limits, prefixes) {
+            Ok(term) => Ok(term),
+            Err(native_error) => {
+                if spargebra::term::NamedNode::new(text).is_err() {
+                    return Err(native_error);
+                }
+                let max = limits.budgets.max_term_bytes;
+                if text.len() as u64 > max {
+                    return Err(Problem::new(
+                        ErrorCode::CapExceeded,
+                        format!(
+                            "the term in `{parameter}` is {} bytes in canonical form, over this \
+                             server's max_term_bytes of {max}",
+                            text.len()
+                        ),
+                    ));
+                }
+                Ok(Self {
+                    requested: text.to_owned(),
+                    dictionary: text.to_owned(),
+                })
+            }
+        }
+    }
+
     /// The term as the request wrote it.
     pub fn requested(&self) -> &str {
         &self.requested
@@ -255,14 +293,26 @@ pub struct Pattern {
 
 impl Pattern {
     fn parse(params: &Params, limits: Limits<'_>, prefixes: &PrefixMap) -> Result<Self, Problem> {
+        Self::parse_with(params, limits, prefixes, false)
+    }
+
+    fn parse_with(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        tpf_terms: bool,
+    ) -> Result<Self, Problem> {
         let mut pattern = Self::default();
         for position in Position::ALL {
             if let Some(text) = params
                 .get(position.as_str())
                 .filter(|text| !text.is_empty())
             {
-                *pattern.slot(position) =
-                    Some(BoundTerm::parse(position.as_str(), text, limits, prefixes)?);
+                *pattern.slot(position) = Some(if tpf_terms {
+                    BoundTerm::parse_fragment(position.as_str(), text, limits, prefixes)?
+                } else {
+                    BoundTerm::parse(position.as_str(), text, limits, prefixes)?
+                });
             }
         }
         // Part of the pattern rather than beside it, which is how §3.4.1 echoes
@@ -782,6 +832,42 @@ impl BindingPattern {
         Ok(Self { cells })
     }
 
+    /// Read the variable-preserving pattern a brTPF client puts in `s/p/o`.
+    /// Comunica includes variable names on a bindings-restricted request so
+    /// the `values=` table can be joined to positions; ordinary TPF omits
+    /// unbound positions and never takes this path.
+    fn parse_get(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+    ) -> Result<Self, Problem> {
+        if params.get("o.text").is_some() {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "values= cannot be combined with o.text; bindings restrict an RDF triple pattern",
+            ));
+        }
+        let mut cells = Vec::with_capacity(3);
+        for position in Position::ALL {
+            let parameter = position.as_str();
+            let cell = match params.get(parameter).filter(|value| !value.is_empty()) {
+                Some(value) if value.starts_with('?') => {
+                    BindingCell::Variable(Variable::parse(value, parameter)?)
+                }
+                Some(value) => BindingCell::Term(BoundTerm::parse_fragment(
+                    parameter, value, limits, prefixes,
+                )?),
+                None => BindingCell::Variable(Variable(format!("?{parameter}"))),
+            };
+            cells.push(cell);
+        }
+        Ok(Self {
+            cells: cells
+                .try_into()
+                .expect("the three positions produce three cells"),
+        })
+    }
+
     fn cell(&self, position: Position) -> &BindingCell {
         &self.cells[position_index(position)]
     }
@@ -791,6 +877,14 @@ impl BindingPattern {
         match self.cell(position) {
             BindingCell::Variable(variable) => variable.as_str(),
             BindingCell::Term(term) => term.requested(),
+        }
+    }
+
+    /// A term fixed directly in the pattern, before any input row applies.
+    pub fn bound(&self, position: Position) -> Option<&BoundTerm> {
+        match self.cell(position) {
+            BindingCell::Term(term) => Some(term),
+            BindingCell::Variable(_) => None,
         }
     }
 
@@ -857,7 +951,7 @@ pub struct BindingRow<'a> {
     index: u32,
     pattern: &'a BindingPattern,
     columns: &'a BTreeMap<Variable, usize>,
-    values: &'a [BoundTerm],
+    values: &'a [BindingValue],
 }
 
 impl<'a> BindingRow<'a> {
@@ -873,7 +967,23 @@ impl<'a> BindingRow<'a> {
             BindingCell::Variable(variable) => self
                 .columns
                 .get(variable)
-                .map(|column| &self.values[*column]),
+                .and_then(|column| self.values[*column].bound()),
+        }
+    }
+}
+
+/// One cell of a generalized binding table.
+#[derive(Debug)]
+enum BindingValue {
+    Bound(BoundTerm),
+    Undef,
+}
+
+impl BindingValue {
+    fn bound(&self) -> Option<&BoundTerm> {
+        match self {
+            Self::Bound(term) => Some(term),
+            Self::Undef => None,
         }
     }
 }
@@ -883,7 +993,7 @@ impl<'a> BindingRow<'a> {
 struct Bindings {
     columns: BTreeMap<Variable, usize>,
     variables: Vec<Variable>,
-    rows: Vec<Vec<BoundTerm>>,
+    rows: Vec<Vec<BindingValue>>,
 }
 
 impl Bindings {
@@ -904,20 +1014,10 @@ impl Bindings {
             ));
         }
 
-        let pattern_variables: BTreeSet<_> = pattern.variables().map(Variable::as_str).collect();
         let mut columns = BTreeMap::new();
         let mut variables = Vec::with_capacity(wire.vars.len());
         for (column, text) in wire.vars.iter().enumerate() {
             let variable = Variable::parse(text, &format!("bindings.vars[{column}]"))?;
-            if !pattern_variables.contains(variable.as_str()) {
-                return Err(Problem::new(
-                    ErrorCode::MalformedRequest,
-                    format!(
-                        "bindings.vars[{column}] names {}, which is not a variable in the pattern",
-                        reflected(variable.as_str())
-                    ),
-                ));
-            }
             if columns.insert(variable.clone(), column).is_some() {
                 return Err(Problem::new(
                     ErrorCode::MalformedRequest,
@@ -928,23 +1028,6 @@ impl Bindings {
                 ));
             }
             variables.push(variable);
-        }
-
-        // `?x p ?x` is bounded when every input row fixes `?x`: it becomes a
-        // ground or singly-variable lookup. Left unbound it is an equality
-        // filter over a non-contiguous enumeration, whose rejected candidates
-        // are not bounded by the result limit.
-        for variable in pattern.repeated_variables() {
-            if !columns.contains_key(variable) {
-                return Err(Problem::new(
-                    ErrorCode::MalformedRequest,
-                    format!(
-                        "repeated pattern variable {} must be present in bindings.vars; leaving \
-                         it unbound would require an unbudgeted equality scan",
-                        reflected(variable.as_str())
-                    ),
-                ));
-            }
         }
 
         let mut rows = Vec::with_capacity(wire.rows.len());
@@ -961,21 +1044,131 @@ impl Bindings {
             }
             let mut row = Vec::with_capacity(wire_row.len());
             for (column, value) in wire_row.into_iter().enumerate() {
-                row.push(BoundTerm::parse_body(
-                    &format!("bindings.rows[{row_index}][{column}]"),
-                    value,
-                    limits,
-                    prefixes,
-                )?);
+                let parameter = format!("bindings.rows[{row_index}][{column}]");
+                row.push(match value {
+                    WireTerm::Other(serde_json::Value::Null) => BindingValue::Undef,
+                    value => BindingValue::Bound(BoundTerm::parse_body(
+                        &parameter, value, limits, prefixes,
+                    )?),
+                });
             }
             rows.push(row);
         }
+
+        Self::require_bounded_repeated_variables(pattern, &columns, &rows)?;
 
         Ok(Self {
             columns,
             variables,
             rows,
         })
+    }
+
+    fn parse_values(
+        text: &str,
+        pattern: &BindingPattern,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+    ) -> Result<Self, Problem> {
+        let query = SparqlParser::new()
+            .parse_query(&format!("SELECT * WHERE {{ VALUES {text} }}"))
+            .map_err(|error| {
+                Problem::new(
+                    ErrorCode::MalformedRequest,
+                    format!("values= is not a SPARQL VALUES table: {error}"),
+                )
+            })?;
+        let Query::Select {
+            pattern: parsed, ..
+        } = query
+        else {
+            unreachable!("the wrapper is a SELECT query")
+        };
+        let parsed = match parsed {
+            GraphPattern::Project { inner, .. } => *inner,
+            pattern => pattern,
+        };
+        let GraphPattern::Values {
+            variables: parsed_variables,
+            bindings,
+        } = parsed
+        else {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "values= must contain exactly one SPARQL VALUES table",
+            ));
+        };
+        if bindings.len() > limits.caps.max_bindings as usize {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "values= has {} rows, over this server's max_bindings of {}",
+                    bindings.len(),
+                    limits.caps.max_bindings
+                ),
+            ));
+        }
+
+        let mut columns = BTreeMap::new();
+        let mut variables = Vec::with_capacity(parsed_variables.len());
+        for (column, parsed) in parsed_variables.into_iter().enumerate() {
+            let variable = Variable(format!("?{}", parsed.as_str()));
+            if columns.insert(variable.clone(), column).is_some() {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    format!(
+                        "values= names {} more than once",
+                        reflected(variable.as_str())
+                    ),
+                ));
+            }
+            variables.push(variable);
+        }
+
+        let rows = bindings
+            .into_iter()
+            .enumerate()
+            .map(|(row_index, row)| {
+                row.into_iter()
+                    .enumerate()
+                    .map(|(column, value)| match value {
+                        None => Ok(BindingValue::Undef),
+                        Some(term) => BoundTerm::parse(
+                            &format!("values row {row_index}, column {column}"),
+                            &ground_term_syntax(term),
+                            limits,
+                            prefixes,
+                        )
+                        .map(BindingValue::Bound),
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::require_bounded_repeated_variables(pattern, &columns, &rows)?;
+        Ok(Self {
+            columns,
+            variables,
+            rows,
+        })
+    }
+
+    fn require_bounded_repeated_variables(
+        pattern: &BindingPattern,
+        columns: &BTreeMap<Variable, usize>,
+        rows: &[Vec<BindingValue>],
+    ) -> Result<(), Problem> {
+        // `?x p ?x` is bounded only when every row fixes `?x`. An absent or
+        // UNDEF cell leaves an equality filter over a non-contiguous
+        // enumeration, whose rejected candidates are not bounded by limit.
+        for variable in pattern.repeated_variables() {
+            let Some(column) = columns.get(variable) else {
+                return Err(unbounded_repeated_variable(variable));
+            };
+            if rows.iter().any(|row| row[*column].bound().is_none()) {
+                return Err(unbounded_repeated_variable(variable));
+            }
+        }
+        Ok(())
     }
 
     fn rows<'a>(&'a self, pattern: &'a BindingPattern) -> impl Iterator<Item = BindingRow<'a>> {
@@ -997,12 +1190,33 @@ impl Bindings {
         }
         push_canonical(&mut output, &self.rows.len().to_string());
         for row in &self.rows {
-            for term in row {
-                push_canonical(&mut output, term.dictionary());
+            for value in row {
+                match value {
+                    BindingValue::Bound(term) => {
+                        output.push('t');
+                        push_canonical(&mut output, term.dictionary());
+                    }
+                    BindingValue::Undef => output.push('u'),
+                }
             }
         }
         output
     }
+}
+
+fn ground_term_syntax(term: GroundTerm) -> String {
+    term.to_string()
+}
+
+fn unbounded_repeated_variable(variable: &Variable) -> Problem {
+    Problem::new(
+        ErrorCode::MalformedRequest,
+        format!(
+            "repeated pattern variable {} must be bound in every input row; leaving it UNDEF \
+             would require an unbudgeted equality scan",
+            reflected(variable.as_str())
+        ),
+    )
 }
 
 /// `QUERY|POST /fragment` — a pattern restricted by an input binding table.
@@ -1051,6 +1265,91 @@ impl BindingFragment {
             limit,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
             cursor,
+            binding,
+        })
+    }
+
+    /// Parse Comunica's brTPF GET transport: a variable-preserving `s/p/o`
+    /// pattern plus SPARQL VALUES syntax without the `VALUES` keyword.
+    fn parse_values(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        bundle: &BundleBinding,
+    ) -> Result<Self, Problem> {
+        accept_only(
+            params,
+            FRAGMENT,
+            &["s", "p", "o", "values", "limit", "cursor", "format"],
+        )?;
+        let pattern = BindingPattern::parse_get(params, limits, prefixes)?;
+        let values = params.get("values").expect("the caller selected values=");
+        let bindings = Bindings::parse_values(values, &pattern, limits, prefixes)?;
+        let limit = page_size(
+            params,
+            "limit",
+            limits.caps.default_limit,
+            limits.caps.max_limit,
+            "use /count for a cardinality on its own",
+        )?;
+        let canonical = bindings.canonicalize(pattern.canonicalize(String::new()));
+        let binding = CursorBinding::new(
+            bundle,
+            &CanonicalRequest::new(Operation::Fragment).with("bindings", &canonical),
+        );
+        Ok(Self {
+            pattern,
+            bindings,
+            limit,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            cursor: resume(params, &binding)?,
+            binding,
+        })
+    }
+
+    /// Parse the variable-preserving URL emitted by a source typed `brtpf`
+    /// before a bind-join block is available. Comunica includes `?name`
+    /// positions on every request to such a source, even when it has no
+    /// `values=` restriction yet.
+    fn parse_variable_get(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        bundle: &BundleBinding,
+    ) -> Result<Self, Problem> {
+        accept_only(
+            params,
+            FRAGMENT,
+            &["s", "p", "o", "limit", "cursor", "format"],
+        )?;
+        let pattern = BindingPattern::parse_get(params, limits, prefixes)?;
+        let bindings = Bindings::parse(
+            WireBindings {
+                vars: Vec::new(),
+                rows: vec![Vec::new()],
+            },
+            &pattern,
+            limits,
+            prefixes,
+        )?;
+        let limit = page_size(
+            params,
+            "limit",
+            limits.caps.default_limit,
+            limits.caps.max_limit,
+            "use /count for a cardinality on its own",
+        )?;
+        let canonical = bindings.canonicalize(pattern.canonicalize(String::new()));
+        let binding = CursorBinding::new(
+            bundle,
+            &CanonicalRequest::new(Operation::Fragment).with("bindings", &canonical),
+        );
+        Ok(Self {
+            pattern,
+            bindings,
+            limit,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            cursor: resume(params, &binding)?,
             binding,
         })
     }
@@ -1277,6 +1576,48 @@ pub struct Fragment {
     pub binding: CursorBinding,
 }
 
+/// The two GET grammars of the one fragment operation.
+#[derive(Debug)]
+pub enum GetFragment {
+    /// Ordinary TPF/KGF query parameters.
+    Plain(Fragment),
+    /// A brTPF variable pattern restricted by `values=`.
+    Bindings(BindingFragment),
+}
+
+impl GetFragment {
+    /// Select the grammar by the presence of `values=` and normalize both to
+    /// the existing typed operation requests.
+    pub fn parse(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        bundle: &BundleBinding,
+        tpf_terms: bool,
+    ) -> Result<Self, Problem> {
+        if params.get("values").is_some() {
+            BindingFragment::parse_values(params, limits, prefixes, bundle).map(Self::Bindings)
+        } else if Position::ALL.into_iter().any(|position| {
+            params
+                .get(position.as_str())
+                .is_some_and(|value| value.starts_with('?'))
+        }) {
+            BindingFragment::parse_variable_get(params, limits, prefixes, bundle)
+                .map(Self::Bindings)
+        } else {
+            Fragment::parse_with(params, limits, prefixes, bundle, tpf_terms).map(Self::Plain)
+        }
+    }
+
+    /// A text filter exists only on the ordinary KGF grammar.
+    pub fn text(&self) -> Option<&TextFilter> {
+        match self {
+            Self::Plain(request) => request.pattern.text(),
+            Self::Bindings(_) => None,
+        }
+    }
+}
+
 impl Fragment {
     const PARAMETERS: &'static [&'static str] =
         &["s", "p", "o", "o.text", "limit", "cursor", "format"];
@@ -1288,8 +1629,18 @@ impl Fragment {
         prefixes: &PrefixMap,
         bundle: &BundleBinding,
     ) -> Result<Self, Problem> {
+        Self::parse_with(params, limits, prefixes, bundle, false)
+    }
+
+    fn parse_with(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        bundle: &BundleBinding,
+        tpf_terms: bool,
+    ) -> Result<Self, Problem> {
         accept_only(params, FRAGMENT, Self::PARAMETERS)?;
-        let pattern = Pattern::parse(params, limits, prefixes)?;
+        let pattern = Pattern::parse_with(params, limits, prefixes, tpf_terms)?;
         let limit = page_size(
             params,
             "limit",
@@ -2085,6 +2436,19 @@ impl GetRequest for Fragment {
             WorkClass::Heavy
         } else {
             WorkClass::Ordinary
+        }
+    }
+}
+
+impl GetRequest for GetFragment {
+    fn normalize_params(params: &Params) -> Params {
+        normalize_pattern_params(params, &["o.text", "limit"])
+    }
+
+    fn work_class(&self) -> WorkClass {
+        match self {
+            Self::Plain(request) => request.work_class(),
+            Self::Bindings(_) => WorkClass::Heavy,
         }
     }
 }
@@ -2991,15 +3355,27 @@ mod tests {
     }
 
     #[test]
-    fn binding_variables_must_describe_a_bounded_pattern() {
+    fn generalized_bindings_keep_foreign_columns_and_undef_but_bound_repeated_variables() {
+        let foreign = serde_json::json!({
+            "pattern": {"s": "?s", "p": "ex:p", "o": "?o"},
+            "bindings": {"vars": ["?missing", "?s"], "rows": [["ex:a", null]]}
+        });
+        let parsed = binding_fragment(&serde_json::to_vec(&foreign).unwrap()).unwrap();
+        let row = parsed.rows().next().unwrap();
+        assert_eq!(row.bound(Position::Subject), None);
+        assert_eq!(
+            row.bound(Position::Predicate).unwrap().dictionary(),
+            "http://example.org/p"
+        );
+
         for body in [
-            serde_json::json!({
-                "pattern": {"s": "?s", "p": "ex:p", "o": "?o"},
-                "bindings": {"vars": ["?missing"], "rows": [["ex:a"]]}
-            }),
             serde_json::json!({
                 "pattern": {"s": "?same", "p": "ex:p", "o": "?same"},
                 "bindings": {"vars": [], "rows": [[]]}
+            }),
+            serde_json::json!({
+                "pattern": {"s": "?same", "p": "ex:p", "o": "?same"},
+                "bindings": {"vars": ["?same"], "rows": [[null]]}
             }),
         ] {
             assert_eq!(
@@ -3015,6 +3391,32 @@ mod tests {
             "bindings": {"vars": ["?same"], "rows": [["ex:a"]]}
         });
         assert!(binding_fragment(&serde_json::to_vec(&bounded).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn brtpf_values_are_parsed_by_sparql_and_keep_variable_names() {
+        let values = "(?person ?foreign) { (<http://example.org/alice> UNDEF) (UNDEF \"x\"@en) }";
+        let query = format!(
+            "s=%3Fperson&p={}&o=%3Fknown&values={}",
+            crate::url::encode_value("http://example.org/knows"),
+            crate::url::encode_value(values)
+        );
+        let parsed =
+            GetFragment::parse(&params(&query), limits(), &prefixes(), &bundle(), false).unwrap();
+        let GetFragment::Bindings(parsed) = parsed else {
+            panic!("values= must select the bindings grammar")
+        };
+        let mut rows = parsed.rows();
+        let first = rows.next().unwrap();
+        assert_eq!(
+            first.bound(Position::Subject).unwrap().dictionary(),
+            "http://example.org/alice"
+        );
+        assert_eq!(first.bound(Position::Object), None);
+        let second = rows.next().unwrap();
+        assert_eq!(second.bound(Position::Subject), None);
+        assert_eq!(second.bound(Position::Object), None);
+        assert!(rows.next().is_none());
     }
 
     #[test]

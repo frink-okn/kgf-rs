@@ -1668,6 +1668,7 @@ impl Served {
         )
         .expect("a bindings fragment answer")
         .render(representation)
+        .expect("render a bindings fragment")
     }
 
     fn binding_count(&self, store: &Store, body: &serde_json::Value) -> serde_json::Value {
@@ -1753,7 +1754,8 @@ impl Served {
         .expect("a schema request");
         let rendered = answer::schema(store, self.target("schema", query), &request)
             .expect("a schema answer")
-            .render(Representation::Html);
+            .render(Representation::Html)
+            .expect("render a schema page");
         String::from_utf8(rendered.body.to_vec()).expect("a schema page is UTF-8")
     }
 
@@ -1786,7 +1788,9 @@ impl Served {
                 )
                 .expect("hydrate schema labels");
         }
-        answer.render(representation)
+        answer
+            .render(representation)
+            .expect("render a schema answer")
     }
 
     fn search(&self, store: &Store, query: &str) -> serde_json::Value {
@@ -1892,7 +1896,8 @@ impl Served {
                     .render(representation)
             }
             other => panic!("no such operation: {other}"),
-        };
+        }
+        .expect("render an operation answer");
         String::from_utf8(rendered.body.to_vec()).expect("a UTF-8 body")
     }
 
@@ -2075,7 +2080,9 @@ fn json(
     answer: impl kgf_server::answer::Renders,
     representation: Representation,
 ) -> serde_json::Value {
-    let rendered = answer.render(representation);
+    let rendered = answer
+        .render(representation)
+        .expect("render an answer as JSON");
     serde_json::from_slice(&rendered.body).expect("an answer serializes as JSON")
 }
 

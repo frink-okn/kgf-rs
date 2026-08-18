@@ -34,7 +34,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, any, get};
 use axum::{Router, middleware};
-use headers::{ETag, HeaderMapExt, IfNoneMatch};
+use headers::{ETag, HeaderMapExt, Host, IfNoneMatch};
 use kgf_store::Capability;
 use kgf_store::catalog::BundleId;
 use mediatype::{MediaTypeBuf, names};
@@ -274,22 +274,27 @@ async fn fragment(
     wants: Wants,
 ) -> Result<Response, Problem> {
     advertise_query(
-        operate(
+        operate_represented(
             service,
             BundleId { dataset, version },
             "fragment",
             wants,
-            |params, limits, release| {
-                let request = request::Fragment::parse(
+            Representation::FRAGMENT,
+            |params, limits, release, representation| {
+                let request = request::GetFragment::parse(
                     params,
                     limits,
                     release.prefixes(),
                     &release.binding(),
+                    matches!(
+                        representation,
+                        Representation::Turtle | Representation::JsonLd
+                    ),
                 )?;
-                declares_search(release, request.pattern.text().is_some())?;
+                declares_search(release, request.text().is_some())?;
                 Ok(request)
             },
-            answer::fragment,
+            answer::get_fragment,
         )
         .await,
     )
@@ -306,7 +311,7 @@ async fn count(
             BundleId { dataset, version },
             "count",
             wants,
-            |params, limits, release| {
+            |params, limits, release, _representation| {
                 let request =
                     request::Count::parse(params, limits, release.prefixes(), &release.binding())?;
                 declares_search(release, request.pattern.text().is_some())?;
@@ -532,7 +537,7 @@ async fn describe(
         BundleId { dataset, version },
         "describe",
         wants,
-        |params, limits, release| {
+        |params, limits, release, _representation| {
             request::Describe::parse(params, limits, release.prefixes(), &release.binding())
         },
         answer::describe,
@@ -550,7 +555,7 @@ async fn sample(
         BundleId { dataset, version },
         "sample",
         wants,
-        |params, limits, release| {
+        |params, limits, release, _representation| {
             // §3.4.7 is an optional capability, so a bundle that does not
             // declare one is refused rather than served from artifacts it
             // never promised — and refused *here*, before the open, because
@@ -579,7 +584,7 @@ async fn search(
         BundleId { dataset, version },
         "search",
         wants,
-        |params, limits, release| {
+        |params, limits, release, _representation| {
             if !release.declares(Capability::Search) {
                 return Err(Problem::new(
                     ErrorCode::CapabilityNotAvailable,
@@ -608,7 +613,7 @@ async fn schema(
         BundleId { dataset, version },
         "schema",
         wants,
-        |params, limits, release| {
+        |params, limits, release, _representation| {
             let request =
                 request::Schema::parse(params, limits, release.prefixes(), &release.binding())?;
             if request.labels && !release.declares(Capability::Labels) {
@@ -776,13 +781,41 @@ async fn operate<Q, A, P, E>(
 where
     Q: request::GetRequest + Send + 'static,
     A: Renders,
-    P: FnOnce(&Params, Limits<'_>, &Release) -> Result<Q, Problem>,
+    P: FnOnce(&Params, Limits<'_>, &Release, Representation) -> Result<Q, Problem>,
     E: FnOnce(&kgf_store::Store, Target, &Q) -> Result<A, Problem> + Send + 'static,
 {
-    let representation = wants.representation()?;
+    operate_represented(
+        service,
+        id,
+        operation,
+        wants,
+        Representation::ALL,
+        parse,
+        execute,
+    )
+    .await
+}
+
+/// Run an ordinary answer operation with its own representation set.
+async fn operate_represented<Q, A, P, E>(
+    service: Arc<Service>,
+    id: BundleId,
+    operation: &'static str,
+    wants: Wants,
+    offered: &'static [Representation],
+    parse: P,
+    execute: E,
+) -> Result<Response, Problem>
+where
+    Q: request::GetRequest + Send + 'static,
+    A: Renders,
+    P: FnOnce(&Params, Limits<'_>, &Release, Representation) -> Result<Q, Problem>,
+    E: FnOnce(&kgf_store::Store, Target, &Q) -> Result<A, Problem> + Send + 'static,
+{
+    let representation = wants.representation_from(offered)?;
     let release = service.datasets().release(&id.dataset, &id.version)?;
     let params = Q::normalize_params(wants.params());
-    let request = parse(&params, service.config().limits(), release)?;
+    let request = parse(&params, service.config().limits(), release, representation)?;
     let work_class = request.work_class();
 
     // A versioned operation is a deterministic function of immutable bytes
@@ -804,6 +837,7 @@ where
         params,
         release.prefixes().clone(),
         release.declares(Capability::Search),
+        wants.request_url.clone(),
     );
     let labels = PageLabelProfile::for_request(
         &service,
@@ -819,7 +853,7 @@ where
         // deliberately not `Send`.
         let mut answer = execute(&store, target, &request)?;
         labels.hydrate(&store, &mut answer)?;
-        Ok(answer.render(representation))
+        answer.render(representation)
     })
     .await?;
 
@@ -864,6 +898,7 @@ where
         params,
         release.prefixes().clone(),
         release.declares(Capability::Search),
+        wants.request_url.clone(),
     );
     let opened = Arc::clone(&service);
     let rendered = blocking(&service, work_class, move || {
@@ -1003,7 +1038,7 @@ where
         let store = opened.open(target.id())?;
         let mut answer = execute(&store, target, &request)?;
         labels.hydrate(&store, &mut answer)?;
-        Ok(answer.render(representation))
+        answer.render(representation)
     })
     .await?;
 
@@ -1116,6 +1151,9 @@ pub struct Wants {
     params: Params,
     accept: Option<String>,
     if_none_match: Option<IfNoneMatch>,
+    /// Exact absolute URL as the client addressed it, when the request carries
+    /// a usable authority. Fragment RDF needs this for Hydra's page subject.
+    request_url: Option<String>,
 }
 
 impl Wants {
@@ -1170,8 +1208,21 @@ impl<S: Send + Sync> FromRequestParts<S> for Wants {
             // §13.1 requires of a precondition a server cannot evaluate: the
             // response is the full one, never a wrong 304.
             if_none_match: parts.headers.typed_get(),
+            request_url: absolute_request_url(parts),
         })
     }
+}
+
+/// Reconstruct the absolute request target from HTTP's authority and the
+/// untouched path/query. `kgf serve` is a plain-HTTP listener; a TLS reverse
+/// proxy must preserve the public Host (public-origin configuration remains a
+/// deployment-level design question in `notes/plan.md`).
+fn absolute_request_url(parts: &axum::http::request::Parts) -> Option<String> {
+    if parts.uri.scheme().is_some() && parts.uri.authority().is_some() {
+        return Some(parts.uri.to_string());
+    }
+    let host: Host = parts.headers.typed_get()?;
+    Some(format!("http://{host}{}", parts.uri))
 }
 
 // ---------------------------------------------------------------------------

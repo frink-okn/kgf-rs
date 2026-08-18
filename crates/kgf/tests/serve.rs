@@ -10,10 +10,11 @@
 //! that might normalize the request. Writing `QUERY /… HTTP/1.1` onto the
 //! socket leaves nothing between the test and hyper's parser.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -29,6 +30,8 @@ const GROWN_NT: &str = concat!(
     "<http://example.org/bob> <http://example.org/name> \"Bob\" .\n",
     "<http://example.org/carol> <http://example.org/name> \"Carol\" .\n",
 );
+
+const REMOTE_NT: &str = "<http://example.org/bob> <http://example.org/remoteName> \"Bobby\" .\n";
 
 const SUMMARY_CARD_JSON: &str = r#"{
   "dataset": {"id": "tox", "version": "v1", "title": "Fixture graph"},
@@ -203,6 +206,218 @@ fn schema_omits_requested_labels_when_the_release_has_no_label_cascade() {
     assert!(
         response.json().get("labels").is_none(),
         "an absent cascade is distinct from configured predicates that found no labels"
+    );
+}
+
+#[test]
+fn fragment_rdf_is_one_parseable_tpf_graph_in_turtle_and_jsonld() {
+    const HYDRA: &str = "http://www.w3.org/ns/hydra/core#";
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let target = "/tox/v/v1/fragment?p=ex%3Aknows&limit=1";
+
+    let turtle = server.request("GET", target, &[("Accept", "text/turtle")]);
+    turtle.assert_status(200);
+    turtle.assert_header("content-type", "text/turtle; charset=utf-8");
+    turtle.assert_header("kgf-complete", "false");
+    turtle.assert_header("kgf-truncation-reason", "page_limit");
+    let turtle_graph: HashSet<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+        .for_slice(&turtle.body)
+        .collect::<Result<_, _>>()
+        .expect("fragment Turtle parses");
+
+    let jsonld = server.request("GET", target, &[("Accept", "application/ld+json")]);
+    jsonld.assert_status(200);
+    jsonld.assert_header("content-type", "application/ld+json");
+    let jsonld_graph: HashSet<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::JsonLd {
+        profile: oxrdfio::JsonLdProfile::Streaming | oxrdfio::JsonLdProfile::Expanded,
+    })
+    .for_slice(&jsonld.body)
+    .collect::<Result<_, _>>()
+    .expect("fragment JSON-LD parses");
+    assert_eq!(jsonld_graph, turtle_graph, "both syntaxes carry one graph");
+
+    let dataset = format!("http://{}/tox/v/v1/fragment", server.address);
+    let page = format!("http://{}{}", server.address, target);
+    let predicate_count = |iri: &str| {
+        turtle_graph
+            .iter()
+            .filter(|quad| quad.predicate.as_str() == iri)
+            .count()
+    };
+
+    assert_eq!(predicate_count("http://example.org/knows"), 1);
+    assert_eq!(predicate_count(&format!("{HYDRA}search")), 1);
+    assert_eq!(predicate_count(&format!("{HYDRA}mapping")), 3);
+    assert_eq!(predicate_count(&format!("{HYDRA}variable")), 3);
+    assert_eq!(predicate_count(&format!("{HYDRA}property")), 3);
+    assert!(turtle_graph.iter().any(|quad| {
+        matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == dataset)
+            && quad.predicate.as_str() == format!("{HYDRA}search")
+    }));
+
+    let variables: HashSet<_> = turtle_graph
+        .iter()
+        .filter(|quad| quad.predicate.as_str() == format!("{HYDRA}variable"))
+        .filter_map(|quad| match &quad.object {
+            oxrdf::Term::Literal(value) => Some(value.value().to_owned()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        variables,
+        HashSet::from(["s".to_owned(), "p".to_owned(), "o".to_owned()])
+    );
+
+    let properties: HashSet<_> = turtle_graph
+        .iter()
+        .filter(|quad| quad.predicate.as_str() == format!("{HYDRA}property"))
+        .filter_map(|quad| match &quad.object {
+            oxrdf::Term::NamedNode(value) => Some(value.as_str().to_owned()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        properties,
+        HashSet::from([
+            format!("{RDF}subject"),
+            format!("{RDF}predicate"),
+            format!("{RDF}object"),
+        ])
+    );
+
+    assert!(turtle_graph.iter().any(|quad| {
+        matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == page)
+            && quad.predicate.as_str() == format!("{HYDRA}totalItems")
+            && matches!(&quad.object, oxrdf::Term::Literal(value) if value.value() == "2")
+    }));
+    assert!(turtle_graph.iter().any(|quad| {
+        matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == page)
+            && quad.predicate.as_str() == format!("{HYDRA}next")
+            && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str().starts_with(&dataset))
+    }));
+}
+
+#[test]
+fn brtpf_values_accept_undef_and_project_overlapping_rows_to_distinct_rdf() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let values = "(?person ?foreign) { (<http://example.org/alice> UNDEF) (UNDEF \"ignored\"@en) }";
+    let mut target = format!(
+        "/tox/v/v1/fragment?s=%3Fperson&p=ex%3Aknows&o=%3Fknown&limit=1&values={}",
+        kgf_server::url::encode_value(values)
+    );
+    let origin = format!("http://{}", server.address);
+    let mut knows = HashSet::new();
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages < 10, "the Hydra continuation must terminate");
+        let response = server.request("GET", &target, &[("Accept", "text/turtle")]);
+        response.assert_status(200);
+        let graph: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+            .for_slice(&response.body)
+            .collect::<Result<_, _>>()
+            .expect("brTPF Turtle parses");
+        for quad in graph
+            .iter()
+            .filter(|quad| quad.predicate.as_str() == "http://example.org/knows")
+        {
+            assert!(
+                knows.insert((
+                    quad.subject.clone(),
+                    quad.predicate.clone(),
+                    quad.object.clone(),
+                )),
+                "an overlapping triple must not reappear on a later RDF page"
+            );
+        }
+        let next = graph.iter().find_map(|quad| {
+            (quad.predicate.as_str() == "http://www.w3.org/ns/hydra/core#next")
+                .then(|| match &quad.object {
+                    oxrdf::Term::NamedNode(node) => Some(node.as_str()),
+                    _ => None,
+                })
+                .flatten()
+        });
+        let Some(next) = next else { break };
+        target = next
+            .strip_prefix(&origin)
+            .expect("the continuation stays on this endpoint")
+            .to_owned();
+    }
+    assert_eq!(
+        knows.len(),
+        2,
+        "the Alice row overlaps the UNDEF row, but RDF is a set projection"
+    );
+    assert_eq!(pages, 3, "the overlap-only middle page must still advance");
+}
+
+#[test]
+fn fragment_rdf_byte_fitting_keeps_a_complete_parseable_document_and_cursor() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let unlimited = deployment.serve();
+    let target = "/tox/v/v1/fragment?limit=8";
+    let full = unlimited.request("GET", target, &[("Accept", "text/turtle")]);
+    full.assert_status(200);
+    full.assert_header("kgf-complete", "true");
+
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.max_response_bytes = (full.body.len() - 100) as u64;
+    let limited = deployment.serve_with_limits(kgf_server::Caps::new(), budgets);
+    let response = limited.request("GET", target, &[("Accept", "text/turtle")]);
+    response.assert_status(200);
+    response.assert_header("kgf-complete", "false");
+    response.assert_header("kgf-truncation-reason", "response_bytes");
+    assert!(
+        response.body.len() as u64 <= budgets.max_response_bytes,
+        "fitted={} budget={} full={}",
+        response.body.len(),
+        budgets.max_response_bytes,
+        full.body.len()
+    );
+    let graph: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+        .for_slice(&response.body)
+        .collect::<Result<_, _>>()
+        .expect("the fitted RDF response is still a complete document");
+    assert!(
+        graph
+            .iter()
+            .any(|quad| { quad.predicate.as_str() == "http://www.w3.org/ns/hydra/core#next" })
+    );
+}
+
+#[test]
+#[ignore = "requires npm ci --prefix interop/comunica"]
+fn stock_comunica_5_3_queries_the_fragment_endpoint() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let mut caps = kgf_server::Caps::new();
+    caps.default_limit = 1;
+    let server = deployment.serve_with(caps);
+    let endpoint = format!("http://{}/tox/v/v1/fragment", server.address);
+    let remote = Deployment::new();
+    remote.publish("remote", "v1", REMOTE_NT, "2026-06-01T14:03:22Z");
+    let remote_server = remote.serve_with(caps);
+    let remote_endpoint = format!("http://{}/remote/v/v1/fragment", remote_server.address);
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("interop/comunica/test.mjs");
+    let status = Command::new("node")
+        .arg(script)
+        .arg(endpoint)
+        .arg(remote_endpoint)
+        .status()
+        .expect("run Node.js; install it and run npm ci --prefix interop/comunica first");
+    assert!(
+        status.success(),
+        "the stock Comunica conformance script failed"
     );
 }
 
@@ -1346,11 +1561,16 @@ impl Deployment {
     }
 
     fn serve_with(&self, caps: kgf_server::Caps) -> Server {
+        self.serve_with_limits(caps, kgf_server::Budgets::new())
+    }
+
+    fn serve_with_limits(&self, caps: kgf_server::Caps, budgets: kgf_server::Budgets) -> Server {
         let mut config = kgf_server::Config::new(
             kgf::serve::published_root(self.root.path()).expect("a published root"),
             "127.0.0.1:0".parse().unwrap(),
         );
         config.caps = caps;
+        config.budgets = budgets;
         let service = Arc::new(Service::build(config).expect("a servable deployment"));
 
         let runtime = tokio::runtime::Builder::new_multi_thread()

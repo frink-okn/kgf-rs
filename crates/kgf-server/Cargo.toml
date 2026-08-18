@@ -32,6 +32,8 @@ bytes.workspace = true
 jiff.workspace = true
 percent-encoding.workspace = true
 oxrdf.workspace = true
+oxrdfio.workspace = true
+spargebra.workspace = true
 
 [dev-dependencies]
 # An independent implementation of RFC 9110 §12.5.1, as the oracle for

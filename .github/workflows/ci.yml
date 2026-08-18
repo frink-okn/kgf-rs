@@ -65,3 +65,20 @@ jobs:
         env:
           KGF_HDTC: ${{ github.workspace }}/hdtc/target/release/hdtc
         run: cargo test
+
+      - name: Install Node.js for stock Comunica
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: kgf-rs/interop/comunica/package-lock.json
+
+      - name: Install pinned Comunica
+        working-directory: kgf-rs
+        run: npm ci --prefix interop/comunica
+
+      - name: Stock Comunica conformance
+        working-directory: kgf-rs
+        env:
+          KGF_HDTC: ${{ github.workspace }}/hdtc/target/release/hdtc
+        run: cargo test -p kgf --test serve stock_comunica_5_3_queries_the_fragment_endpoint -- --ignored --nocapture

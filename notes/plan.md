@@ -17,8 +17,9 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–19 are complete: all of M1 plus `o.text`, bindings, entity search,
-live labels, the browser workbench, and the mandatory description surface. Each completed unit
+Units 1–20 are complete: all of M1 plus `o.text`, bindings, entity search,
+live labels, the browser workbench, the mandatory description surface, standard RDF
+serialization, and stock Comunica TPF/brTPF interoperability. Each completed unit
 carries a **What landed** section written after the fact, which is where a unit's plan
 and its outcome are reconciled.
 
@@ -1363,16 +1364,91 @@ timeout, permit release, and startup refusal of impossible weights; request-clas
 tests over ordinary/text fragments, sampling, and filtered/unfiltered schema; and a
 response test pinning `429`, `rate_limited`, and `Retry-After` together.
 
+### 20. Standard RDF and first-class TPF/brTPF
+
+KGF is a bounded extension of the Triple Pattern Fragments family, not an unrelated
+API with an optional compatibility facade. The same versioned `/fragment` resource
+therefore serves the native JSON/HTML forms and Hydra-annotated RDF. Plain GET is TPF;
+GET with Comunica's `values=` spelling is brTPF; QUERY/POST remains KGF's native body
+transport for the same restricted-pattern operation. There is no `/tpf` or `/qpf`
+alias and no bundle-level TPF capability: every core-profile release can answer the
+three-position form. The graph-aware four-position QPF form stays on this route when
+doc 03 §3.7's read semantics land.
+
+The implementation is staged as independently testable vertical slices:
+
+1. `kgf-server` builds RDF terms and statements with `oxrdf` and serializes every RDF
+   representation through `oxrdfio`. `/void` moves first, deleting its handwritten
+   Turtle and expanded JSON-LD writers. Tests parse each result back through an
+   independent `oxrdfio::RdfParser` and compare datasets, including escaped literals,
+   language/datatype values, blank nodes, and response-byte fitting.
+2. GET `/fragment` offers Turtle and JSON-LD containing the selected data triples plus
+   the TPF metadata graph: dataset identity, exact ordinary-pattern cardinality,
+   `hydra:search` with exactly three mappings onto `s/p/o`, and an opaque
+   `hydra:next` link carrying the existing cursor. RDF is a representation of the
+   operation, so cursor identity excludes the format as it already does for JSON/HTML.
+3. A checked-in Node harness pins stock Comunica 5.3.0 and queries a real fixture
+   listener typed as `brtpf`. The first gate is one ordinary pattern; the final gate
+   covers a bind join that demonstrably sends `values=`, multiple Hydra pages,
+   `UNDEF`, overlapping restrictions, RDF term edge cases, and a join across two KGF
+   endpoints.
+4. The request layer gains a generalized restricted-pattern model. Binding cells are
+   `Bound(term)` or `Undef`; columns not used by the pattern remain part of input-row
+   identity but do not constrain a selection. The brTPF payload is parsed by a real
+   SPARQL grammar rather than a local Turtle/SPARQL subset. Both wire forms normalize
+   to position restrictions and then use the one existing `Selection` implementation.
+5. KGF JSON exposes the compatibility relation with its existing binding index. RDF
+   projects that relation to distinct compatible triples, as brTPF requires. Identical
+   and subsumed restrictions are normalized away; remaining overlaps are assigned a
+   deterministic first owning row, and examined duplicate candidates consume a
+   published candidate budget. The cursor resumes the owning row and underlying store
+   position without server state. Cardinality is exact for disjoint normalized rows
+   (the ordinary Comunica bind-join shape) and explicitly estimated where overlap
+   prevents an enumeration-free union count.
+
+*Verified by* unit and round-trip format tests, real HTTP representation negotiation,
+and the pinned external client. `cargo fmt --check`, clippy with denied warnings, the
+workspace tests, and the Comunica suite are all gates before this unit is marked done.
+
+**What landed (2026-08-18).** `oxrdfio` now owns Turtle and expanded streaming
+JSON-LD for both `/void` and `/fragment`; handwritten RDF escaping is gone. Fragment
+RDF carries a three-mapping Hydra form, exact ordinary-pattern count, and absolute
+page/continuation IRIs keyed to the exact request URL. Complete-document byte fitting
+retains a first-omitted-row cursor rather than interrupting a serializer.
+
+GET additionally accepts the variable-preserving URL form emitted by a source typed
+`brtpf` and parses `values=` by wrapping it in a SPARQL query handled by `spargebra`.
+Binding cells are terms or `UNDEF` (`null` in the native JSON body); unrelated columns
+are retained in cursor identity but do not restrict a selection. Native JSON still
+enumerates the binding relation. RDF assigns each overlapping triple to its first
+compatible input row, using resolved id patterns, so duplicates do not reappear across
+pages and no server-side state is needed. The ownership check costs at most the
+published binding cap times the already-bounded page rows.
+
+`interop/comunica` pins stock Comunica 5.3.0. Its real-listener gate forces one-row
+pages, executes an ordinary pattern and bind join, and completes a join across two KGF
+brTPF endpoints. Rust integration tests separately pin generalized `UNDEF`, foreign
+columns, overlap-only middle pages, RDF round trips, and RDF response-byte fitting.
+
 ### What the implementation still is not
 
-**M1 is a strict subset of doc 03 §3.1's mandatory core profile.** That profile is
-`fragment` *including QUERY-with-bindings*, `count`, `describe`, and the description
-surface `manifest` + `void` + `summary`. Doc 20 §20.8's M1 omits bindings QUERY,
-`/void`, and `/summary`, and adds `/sample`, which is an optional capability. So a
-deployment at the end of unit 14 answers useful traffic but **cannot claim core-profile
-conformance**. Unit 16 closes the bindings part, leaving `/void` and `/summary` before
-this implementation can make that claim. Worth stating because "the mandatory
-operations" and "M1" read like the same set and are not.
+**The mandatory core profile is now implemented; M1 alone was not that profile.** Doc
+20 §20.8's M1 omitted bindings-restricted fragments, `/void`, and `/summary`, while
+adding optional `/sample`. Unit 16 supplied the bindings operation, unit 19 supplied
+the complete description surface, and unit 20 made the same `/fragment` operation a
+standard TPF/brTPF RDF source. A current deployment therefore answers `fragment`
+(plain, QUERY/POST bindings, and Comunica's GET `values=` transport), `count`,
+`describe`, `manifest`, `void`, and `summary`. `/sample` and `o.text` remain optional
+extensions rather than conformance requirements.
+
+What remains is beyond that core profile: graph-scoped reads and their four-position
+QPF form; later composed operations such as ranges, stars, and key resolution; and
+the complete `kgf build` DAG beyond today's hdtc assembly plus KGF stats producer.
+A TLS-terminating reverse proxy also needs a trusted public-origin setting before
+Hydra can publish its external `https` page, template, and continuation IRIs. Finally,
+the corresponding decisions recorded below still need to be applied to the sibling
+`../kgf` specifications so the working design and this implementation say the same
+thing.
 
 ## Testing spine
 
@@ -1635,7 +1711,12 @@ following the code.
     public origin. Same question for the `url` field of a derived dataset descriptor,
     where doc 04 §4.3's example shows an absolute URL. Worth stating, since a client
     resolving one against the request URI gets the right answer and a client expecting
-    an absolute URL does not. Surfaced in unit 13.
+    an absolute URL does not. Unit 20 makes the wider deployment question concrete:
+    Hydra page subjects, templates, and continuations must identify the public request
+    URL. The direct HTTP server can reconstruct that from `Host`; a TLS-terminating
+    reverse proxy also needs an explicit trusted public-origin configuration (or an
+    equivalently trusted forwarded scheme) before it can emit `https` links rather than
+    its internal `http` view. Surfaced in units 13 and 20.
 19. **§3.4.4's example sends `s=` and `o=` for unbound positions,** while §3.3 says
     "omitted = variable". The implementation originally refused empty positions to catch
     unset client variables, but that made ordinary HTML GET forms hostile: browsers submit
@@ -1875,6 +1956,18 @@ following the code.
     subject and emits no subset triple. A future full build may create the canonical
     component doc 04 recommends, but a stats pass over an already-published graph must
     not invent one. The storage and API docs now state this alias explicitly.
+44. **TPF URL terms and variables are a transport grammar beside §3.3.** §3.3's native
+    KGF grammar deliberately requires `<…>` around full IRIs and treats a declared
+    `ex:a` as a CURIE. Stock Comunica instead expands the Hydra template with bare full
+    IRIs and, for a source typed `brtpf`, includes `?name` in every unbound position even
+    before it appends `values=`. A plain `/fragment` request selected as RDF and every
+    explicitly variable-preserving/`values=` request therefore keeps native parsing
+    first, then accepts a valid bare absolute IRI when that fails; declared prefixes
+    retain their CURIE meaning. Variable-preserving positions select the
+    restricted-pattern model, with one empty input row when `values=` is absent. Doc 03
+    should specify this as the TPF ingress grammar rather than weakening §3.3 for every
+    route.
+    Found by the pinned Comunica 5.3.0 conformance test in unit 20.
 
 ## Not in this plan
 

@@ -50,7 +50,7 @@ use oxrdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term as RdfTerm, Tr
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 
-use hdtc::format::{TextScanPosition, TextSearcher, XSD_STRING, parse_literal};
+use hdtc::format::{TextScanPosition, TextSearcher, parse_literal};
 use kgf_store::catalog::BundleId;
 use kgf_store::dict::Dictionary;
 use kgf_store::pattern::{IdPattern, Selection};
@@ -60,7 +60,7 @@ use kgf_store::{
     Store, TermId,
 };
 
-use crate::cursor::{Cursor, CursorBinding, PositionSpace, StaleCursor};
+use crate::cursor::{Cursor, CursorBinding, CursorToken, PositionSpace, StaleCursor};
 use crate::envelope::{
     BudgetReason, Cardinality, Completeness, ErrorCode, Problem, TruncationReason,
 };
@@ -69,6 +69,7 @@ use crate::html::{
     Crumb, Resource, TermText, Value, fields, group_digits, json_body, note, operation_page,
     operation_page_with_format, page, results_table, stats, table,
 };
+use crate::rdf::{GraphFormat, serialize_graph};
 use crate::representation::Representation;
 use crate::request::{
     self, BindingPattern, BindingRow, BoundTerm, Candidates, Direction, Pattern, Position,
@@ -95,13 +96,17 @@ pub struct Target {
     prefixes: PrefixMap,
     body: bool,
     has_search: bool,
+    /// The exact absolute GET URL received over HTTP. Hydra metadata keys its
+    /// page controls by this IRI, so a merely equivalent canonical URL is not
+    /// enough for an LDF client looking up controls for its request URL.
+    request_url: Option<String>,
 }
 
 impl Target {
     /// The version and operation a request addressed, with its parameters and
     /// the version's immutable prefix map for human-facing result labels.
     pub fn new(id: BundleId, operation: &'static str, params: Params, prefixes: PrefixMap) -> Self {
-        Self::get(id, operation, params, prefixes, false)
+        Self::get(id, operation, params, prefixes, false, None)
     }
 
     /// A GET target with the release capabilities its page may expose.
@@ -111,6 +116,7 @@ impl Target {
         params: Params,
         prefixes: PrefixMap,
         has_search: bool,
+        request_url: Option<String>,
     ) -> Self {
         Self {
             id,
@@ -119,6 +125,7 @@ impl Target {
             prefixes,
             body: false,
             has_search,
+            request_url,
         }
     }
 
@@ -136,6 +143,7 @@ impl Target {
             prefixes,
             body: true,
             has_search: false,
+            request_url: None,
         }
     }
 
@@ -146,6 +154,28 @@ impl Target {
 
     fn base(&self) -> String {
         url::operation(&self.id.dataset, &self.id.version, self.operation)
+    }
+
+    /// The origin on which the request arrived.
+    fn origin(&self) -> Option<String> {
+        let uri = self
+            .request_url
+            .as_deref()?
+            .parse::<axum::http::Uri>()
+            .ok()?;
+        Some(format!(
+            "{}://{}",
+            uri.scheme_str()?,
+            uri.authority()?.as_str()
+        ))
+    }
+
+    fn absolute_base(&self) -> Option<String> {
+        Some(format!("{}{}", self.origin()?, self.base()))
+    }
+
+    fn absolute_next(&self, token: &str) -> Option<String> {
+        Some(format!("{}{}", self.origin()?, self.next(token)?))
     }
 
     /// This response's URL, with the representation selector removed.
@@ -264,7 +294,7 @@ pub struct Rendered {
 /// reason [`Resource`] exists.
 pub trait Renders {
     /// Serialize into `representation`, with the metadata its headers need.
-    fn render(self, representation: Representation) -> Rendered;
+    fn render(self, representation: Representation) -> Result<Rendered, Problem>;
 
     /// Resolve display labels for the page's IRIs, before an HTML render.
     ///
@@ -328,7 +358,7 @@ fn match_kind(kind: hdtc::format::MatchKind) -> &'static str {
 
 /// One result row: a term per variable, and for `/describe` which side of the
 /// neighborhood it came from.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Row {
     cells: Vec<(Position, Rc<str>)>,
     binding: Option<u32>,
@@ -475,7 +505,7 @@ fn serialized_score(score: f32) -> u64 {
 ///
 /// An enum rather than a struct of optional fields, so that a `/count` cannot
 /// acquire a seed and a `/describe` cannot acquire a pattern.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 enum Echo {
     Fragment {
@@ -497,7 +527,7 @@ enum Echo {
 
 /// A page of rows: doc 03 §3.4.1's envelope, shared by `/fragment`,
 /// `/describe` and `/sample`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Answer {
     dataset: String,
     version: String,
@@ -517,6 +547,20 @@ pub struct Answer {
     absent_terms: Vec<&'static str>,
     vars: Vec<Position>,
     rows: Vec<Row>,
+    /// Store ids aligned with `rows`, retained so the RDF projection can
+    /// assign an overlapping binding result to its deterministic first owner
+    /// without resolving serialized terms back through the dictionary.
+    #[serde(skip)]
+    row_ids: Vec<IdTriple>,
+    #[serde(skip)]
+    row_cursors: Vec<CursorToken>,
+    /// Resolved binding restrictions in input order. Native JSON exposes the
+    /// full compatibility relation; RDF uses these to project that relation
+    /// to one copy of each triple across every page.
+    #[serde(skip)]
+    rdf_restrictions: Option<Vec<(u32, IdPattern)>>,
+    #[serde(skip)]
+    byte_budget: u64,
     #[serde(flatten)]
     completeness: Completeness,
     #[serde(skip)]
@@ -541,12 +585,16 @@ pub struct Answer {
 }
 
 impl Renders for Answer {
-    fn render(self, representation: Representation) -> Rendered {
-        let body = standard_body(&self, representation);
-        Rendered {
+    fn render(mut self, representation: Representation) -> Result<Rendered, Problem> {
+        let body = match representation {
+            Representation::Turtle => self.fit_fragment_rdf(GraphFormat::Turtle)?,
+            Representation::JsonLd => self.fit_fragment_rdf(GraphFormat::JsonLd)?,
+            _ => standard_body(&self, representation),
+        };
+        Ok(Rendered {
             body,
             completeness: self.completeness,
-        }
+        })
     }
 
     /// One bounded cascade per distinct IRI or blank node on the page — the
@@ -639,6 +687,276 @@ impl Renders for Answer {
     }
 }
 
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+const RDF_SUBJECT: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#subject";
+const RDF_PREDICATE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#predicate";
+const RDF_OBJECT: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#object";
+const VOID_DATASET: &str = "http://rdfs.org/ns/void#Dataset";
+const HYDRA_SEARCH: &str = "http://www.w3.org/ns/hydra/core#search";
+const HYDRA_TEMPLATE: &str = "http://www.w3.org/ns/hydra/core#template";
+const HYDRA_MAPPING: &str = "http://www.w3.org/ns/hydra/core#mapping";
+const HYDRA_VARIABLE: &str = "http://www.w3.org/ns/hydra/core#variable";
+const HYDRA_PROPERTY: &str = "http://www.w3.org/ns/hydra/core#property";
+const HYDRA_TOTAL_ITEMS: &str = "http://www.w3.org/ns/hydra/core#totalItems";
+const HYDRA_NEXT: &str = "http://www.w3.org/ns/hydra/core#next";
+
+impl Answer {
+    /// Fit a finished RDF document, Hydra metadata included, to the response
+    /// budget. One indivisible row may exceed the budget so a client can
+    /// always advance past it.
+    fn fit_fragment_rdf(&mut self, format: GraphFormat) -> Result<Bytes, Problem> {
+        let body = self.fragment_rdf(format)?;
+        if body.len() as u64 <= self.byte_budget || self.rows.len() <= 1 {
+            return Ok(body);
+        }
+
+        let original = self.clone();
+        let total = original.rows.len();
+        let mut low = 1usize;
+        let mut high = total - 1;
+        let mut best: Option<(Self, Bytes)> = None;
+        while low <= high {
+            let keep = low + (high - low) / 2;
+            let mut candidate = original.clone();
+            candidate.truncate_rdf_rows(keep);
+            let body = candidate.fragment_rdf(format)?;
+            if body.len() as u64 <= candidate.byte_budget {
+                best = Some((candidate, body));
+                low = keep + 1;
+            } else {
+                high = keep - 1;
+            }
+        }
+
+        let (candidate, body) = match best {
+            Some(best) => best,
+            None => {
+                let mut candidate = original;
+                candidate.truncate_rdf_rows(1);
+                let body = candidate.fragment_rdf(format)?;
+                (candidate, body)
+            }
+        };
+        *self = candidate;
+        Ok(body)
+    }
+
+    fn truncate_rdf_rows(&mut self, keep: usize) {
+        debug_assert!(keep > 0 && keep < self.rows.len());
+        let next = self.row_cursors[keep].clone();
+        self.rows.truncate(keep);
+        self.row_ids.truncate(keep);
+        self.row_cursors.truncate(keep);
+        self.completeness = Completeness::budget_exhausted(BudgetReason::ResponseBytes, next);
+    }
+
+    /// Project an ordinary fragment page into the TPF RDF graph understood by
+    /// stock LDF clients. Native binding answers are body-addressed and never
+    /// negotiate this representation; brTPF's GET transport joins this path
+    /// once its `values=` request parser has normalized the restrictions.
+    fn fragment_rdf(&self, format: GraphFormat) -> Result<Bytes, Problem> {
+        if matches!(self.echo, Echo::Describe { .. } | Echo::Sample { .. }) {
+            return Err(Problem::new(
+                ErrorCode::InternalError,
+                "RDF was negotiated for an operation that does not publish an RDF graph",
+            ));
+        }
+        let mut triples = Vec::with_capacity(self.rows.len().saturating_add(18));
+        let mut data = HashSet::with_capacity(self.rows.len());
+        for (row_index, row) in self.rows.iter().enumerate() {
+            if let (Some(restrictions), Some(binding)) = (&self.rdf_restrictions, row.binding)
+                && restrictions.iter().any(|(owner, pattern)| {
+                    *owner < binding && id_pattern_matches(*pattern, self.row_ids[row_index])
+                })
+            {
+                continue;
+            }
+            let cell = |position| match &self.echo {
+                Echo::Fragment { pattern } => fragment_cell(pattern, row, position),
+                Echo::BindingsFragment { pattern } => binding_fragment_cell(pattern, row, position),
+                Echo::Describe { .. } | Echo::Sample { .. } => None,
+            };
+            let subject =
+                cell(Position::Subject).expect("every fragment row binds every triple position");
+            let predicate =
+                cell(Position::Predicate).expect("every fragment row binds every triple position");
+            let object =
+                cell(Position::Object).expect("every fragment row binds every triple position");
+            let triple = Triple::new(
+                rdf_subject(subject.as_bytes())?,
+                NamedNode::new(predicate)
+                    .map_err(|error| unreadable("parsing an RDF predicate IRI", &error))?,
+                rdf_object(object.as_bytes())?,
+            );
+            if data.insert(triple.clone()) {
+                triples.push(triple);
+            }
+        }
+
+        let page = metadata_iri(
+            self.target.request_url.as_deref().ok_or_else(|| {
+                Problem::new(
+                    ErrorCode::InternalError,
+                    "an RDF fragment response needs the absolute request URL",
+                )
+            })?,
+            "the fragment page URL",
+        )?;
+        let dataset = metadata_iri(
+            &self.target.absolute_base().ok_or_else(|| {
+                Problem::new(
+                    ErrorCode::InternalError,
+                    "an RDF fragment response needs the request origin",
+                )
+            })?,
+            "the fragment dataset URL",
+        )?;
+
+        // Blank-node labels are deterministic (strong ETags require stable
+        // bytes) and selected not to merge with any data blank node in this
+        // document.
+        let mut used = rdf_blank_node_labels(&triples);
+        let search = metadata_blank_node("kgf-hydra-search", &mut used);
+        let mappings = [
+            (
+                "s",
+                RDF_SUBJECT,
+                metadata_blank_node("kgf-hydra-s", &mut used),
+            ),
+            (
+                "p",
+                RDF_PREDICATE,
+                metadata_blank_node("kgf-hydra-p", &mut used),
+            ),
+            (
+                "o",
+                RDF_OBJECT,
+                metadata_blank_node("kgf-hydra-o", &mut used),
+            ),
+        ];
+
+        triples.push(Triple::new(
+            dataset.clone(),
+            metadata_iri(RDF_TYPE, "rdf:type")?,
+            metadata_iri(VOID_DATASET, "void:Dataset")?,
+        ));
+        triples.push(Triple::new(
+            dataset.clone(),
+            metadata_iri(HYDRA_SEARCH, "hydra:search")?,
+            search.clone(),
+        ));
+        triples.push(Triple::new(
+            search.clone(),
+            metadata_iri(HYDRA_TEMPLATE, "hydra:template")?,
+            Literal::new_simple_literal(format!("{}{{?s,p,o}}", dataset.as_str())),
+        ));
+        for (variable, property, mapping) in mappings {
+            triples.push(Triple::new(
+                search.clone(),
+                metadata_iri(HYDRA_MAPPING, "hydra:mapping")?,
+                mapping.clone(),
+            ));
+            triples.push(Triple::new(
+                mapping.clone(),
+                metadata_iri(HYDRA_VARIABLE, "hydra:variable")?,
+                Literal::new_simple_literal(variable),
+            ));
+            triples.push(Triple::new(
+                mapping,
+                metadata_iri(HYDRA_PROPERTY, "hydra:property")?,
+                metadata_iri(property, "an RDF triple-position property")?,
+            ));
+        }
+        triples.push(Triple::new(
+            page.clone(),
+            metadata_iri(HYDRA_TOTAL_ITEMS, "hydra:totalItems")?,
+            Literal::from(self.cardinality.value()),
+        ));
+        if let Some(cursor) = self.completeness.next_cursor() {
+            triples.push(Triple::new(
+                page,
+                metadata_iri(HYDRA_NEXT, "hydra:next")?,
+                metadata_iri(
+                    &self.target.absolute_next(cursor).ok_or_else(|| {
+                        Problem::new(
+                            ErrorCode::InternalError,
+                            "an RDF fragment continuation needs the request origin",
+                        )
+                    })?,
+                    "the fragment continuation URL",
+                )?,
+            ));
+        }
+
+        serialize_graph(format, &triples)
+            .map(Bytes::from)
+            .map_err(|error| unreadable("serializing the fragment RDF graph", &error))
+    }
+}
+
+fn fragment_cell<'a>(pattern: &'a Pattern, row: &'a Row, position: Position) -> Option<&'a str> {
+    pattern
+        .bound(position)
+        .map(BoundTerm::dictionary)
+        .or_else(|| {
+            row.cells
+                .iter()
+                .find_map(|(found, value)| (*found == position).then_some(value.as_ref()))
+        })
+}
+
+fn binding_fragment_cell<'a>(
+    pattern: &'a BindingPattern,
+    row: &'a Row,
+    position: Position,
+) -> Option<&'a str> {
+    pattern
+        .bound(position)
+        .map(BoundTerm::dictionary)
+        .or_else(|| {
+            row.cells
+                .iter()
+                .find_map(|(found, value)| (*found == position).then_some(value.as_ref()))
+        })
+}
+
+fn id_pattern_matches(pattern: IdPattern, triple: IdTriple) -> bool {
+    pattern.subject.is_none_or(|id| id == triple.subject)
+        && pattern.predicate.is_none_or(|id| id == triple.predicate)
+        && pattern.object.is_none_or(|id| id == triple.object)
+}
+
+fn metadata_iri(value: &str, what: &'static str) -> Result<NamedNode, Problem> {
+    NamedNode::new(value).map_err(|error| {
+        tracing::error!(%error, value, what, "could not construct fragment metadata IRI");
+        Problem::new(
+            ErrorCode::InternalError,
+            "the fragment metadata could not be represented as RDF",
+        )
+    })
+}
+
+fn rdf_blank_node_labels(triples: &[Triple]) -> HashSet<String> {
+    let mut labels = HashSet::new();
+    for triple in triples {
+        if let NamedOrBlankNode::BlankNode(node) = &triple.subject {
+            labels.insert(node.as_str().to_owned());
+        }
+        if let RdfTerm::BlankNode(node) = &triple.object {
+            labels.insert(node.as_str().to_owned());
+        }
+    }
+    labels
+}
+
+fn metadata_blank_node(stem: &str, used: &mut HashSet<String>) -> BlankNode {
+    let mut label = stem.to_owned();
+    while !used.insert(label.clone()) {
+        label.push('_');
+    }
+    BlankNode::new(label).expect("the metadata blank-node stem is a valid RDF blank-node label")
+}
+
 /// `GET /count`'s envelope (§3.4.4).
 ///
 /// `count` is an object rather than §3.4.4's first example's bare integer, so
@@ -661,12 +979,12 @@ pub struct CountAnswer {
 }
 
 impl Renders for CountAnswer {
-    fn render(self, representation: Representation) -> Rendered {
+    fn render(self, representation: Representation) -> Result<Rendered, Problem> {
         let body = standard_body(&self, representation);
-        Rendered {
+        Ok(Rendered {
             body,
             completeness: self.completeness,
-        }
+        })
     }
 }
 
@@ -834,12 +1152,12 @@ pub struct SearchAnswer {
 }
 
 impl Renders for SearchAnswer {
-    fn render(self, representation: Representation) -> Rendered {
+    fn render(self, representation: Representation) -> Result<Rendered, Problem> {
         let body = standard_body(&self, representation);
-        Rendered {
+        Ok(Rendered {
             body,
             completeness: self.completeness,
-        }
+        })
     }
 }
 
@@ -891,22 +1209,22 @@ pub struct LabelsAnswer {
 }
 
 impl Renders for LabelsAnswer {
-    fn render(self, representation: Representation) -> Rendered {
+    fn render(self, representation: Representation) -> Result<Rendered, Problem> {
         let body = standard_body(&self, representation);
-        Rendered {
+        Ok(Rendered {
             body,
             completeness: self.completeness,
-        }
+        })
     }
 }
 
 impl Renders for BindingCountAnswer {
-    fn render(self, representation: Representation) -> Rendered {
+    fn render(self, representation: Representation) -> Result<Rendered, Problem> {
         let body = standard_body(&self, representation);
-        Rendered {
+        Ok(Rendered {
             body,
             completeness: self.completeness,
-        }
+        })
     }
 }
 
@@ -1367,11 +1685,11 @@ impl SchemaAnswer {
 }
 
 impl Renders for SchemaAnswer {
-    fn render(mut self, representation: Representation) -> Rendered {
+    fn render(mut self, representation: Representation) -> Result<Rendered, Problem> {
         self.fit_response_bytes(representation);
         let completeness = self.completeness().clone();
         let body = standard_body(&self, representation);
-        Rendered { body, completeness }
+        Ok(Rendered { body, completeness })
     }
 
     fn hydrate_labels(
@@ -1551,7 +1869,7 @@ impl VoidResource {
                 }
                 section."section-block" {
                     h2 { "Turtle" }
-                    p { "This is the N-Triples subset of Turtle, serialized from the published VoID HDT." }
+                    p { "This Turtle document is serialized from the published VoID HDT through the shared RDF writer." }
                     pre { code { (turtle) } }
                 }
             },
@@ -1860,16 +2178,18 @@ pub fn void(
 
     let (body, emitted, complete) = match representation {
         Representation::Turtle => {
-            let (body, emitted) = serialize_turtle(&selection, dictionary, request.bytes.0)?;
+            let (body, emitted) =
+                serialize_rdf(&selection, dictionary, GraphFormat::Turtle, request.bytes.0)?;
             (body, emitted, emitted == total)
         }
         Representation::JsonLd => {
-            let (body, emitted) = serialize_jsonld(&selection, dictionary, request.bytes.0)?;
+            let (body, emitted) =
+                serialize_rdf(&selection, dictionary, GraphFormat::JsonLd, request.bytes.0)?;
             (body, emitted, emitted == total)
         }
         Representation::Html => {
             let (turtle, turtle_triples) =
-                serialize_turtle(&selection, dictionary, request.bytes.0)?;
+                serialize_rdf(&selection, dictionary, GraphFormat::Turtle, request.bytes.0)?;
             let complete = turtle_triples == total;
             let completeness = void_completeness(complete);
             let resource = VoidResource {
@@ -1947,61 +2267,66 @@ fn void_completeness(complete: bool) -> Completeness {
     }
 }
 
-fn serialize_turtle(
+fn serialize_rdf(
     selection: &Selection<'_>,
     dictionary: Dictionary<'_>,
+    format: GraphFormat,
     byte_limit: u64,
 ) -> Result<(Bytes, u64), Problem> {
-    let mut body = Vec::new();
-    let mut emitted = 0u64;
-    for ids in selection.page(0, usize::MAX) {
-        let triple = rdf_triple(dictionary, ids)?;
-        let line = format!("{triple} .\n");
-        if (body.len() as u64).saturating_add(line.len() as u64) > byte_limit {
-            break;
-        }
-        body.extend_from_slice(line.as_bytes());
-        emitted += 1;
-    }
-    Ok((Bytes::from(body), emitted))
-}
+    let encode = |triples: &[Triple]| {
+        serialize_graph(format, triples)
+            .map_err(|error| unreadable("serializing the VoID RDF graph", &error))
+    };
 
-fn serialize_jsonld(
-    selection: &Selection<'_>,
-    dictionary: Dictionary<'_>,
-    byte_limit: u64,
-) -> Result<(Bytes, u64), Problem> {
-    // Expanded JSON-LD: one node object per statement. Repeated @id objects
-    // merge under JSON-LD's RDF interpretation, while keeping each statement
-    // independently budgetable and avoiding a schema-sized grouping map.
-    // `[]` is the smallest valid JSON-LD document. Like an oversized legal
-    // result row elsewhere, this two-byte container is allowed through even
-    // if an operator configured an unusably smaller byte budget; syntax must
-    // not become invalid merely to save one byte.
-    let mut body = b"[".to_vec();
-    let mut emitted = 0u64;
-    for ids in selection.page(0, usize::MAX) {
-        let triple = rdf_triple(dictionary, ids)?;
-        let item = serde_json::to_vec(&jsonld_statement(&triple))
-            .expect("a JSON-LD statement contains only JSON values");
-        let separator = usize::from(emitted != 0); // `,`
-        let closing = 1; // `]`
-        let next = body
-            .len()
-            .saturating_add(separator)
-            .saturating_add(item.len())
-            .saturating_add(closing);
-        if next as u64 > byte_limit {
-            break;
+    // Grow geometrically until a complete serialized document crosses the
+    // byte budget, then find the largest fitting prefix. This keeps work
+    // bounded by the selected representation's bytes and, unlike interrupting
+    // a writer, always lets `oxrdfio` emit its closing syntax.
+    let mut triples = Vec::new();
+    let mut ids = selection.page(0, usize::MAX);
+    let mut best_body = encode(&triples)?;
+    let mut best_count = 0usize;
+    let mut target = 1usize;
+
+    loop {
+        let mut exhausted = false;
+        while triples.len() < target {
+            let Some(ids) = ids.next() else {
+                exhausted = true;
+                break;
+            };
+            triples.push(rdf_triple(dictionary, ids)?);
         }
-        if emitted > 0 {
-            body.push(b',');
+
+        if triples.len() == best_count && exhausted {
+            return Ok((Bytes::from(best_body), best_count as u64));
         }
-        body.extend_from_slice(&item);
-        emitted += 1;
+
+        let body = encode(&triples)?;
+        if body.len() as u64 <= byte_limit || triples.is_empty() {
+            best_count = triples.len();
+            best_body = body;
+            if exhausted {
+                return Ok((Bytes::from(best_body), best_count as u64));
+            }
+            target = target.saturating_mul(2);
+            continue;
+        }
+
+        let mut low = best_count;
+        let mut high = triples.len();
+        while low + 1 < high {
+            let middle = low + (high - low) / 2;
+            let candidate = encode(&triples[..middle])?;
+            if candidate.len() as u64 <= byte_limit {
+                low = middle;
+                best_body = candidate;
+            } else {
+                high = middle;
+            }
+        }
+        return Ok((Bytes::from(best_body), low as u64));
     }
-    body.push(b']');
-    Ok((Bytes::from(body), emitted))
 }
 
 fn rdf_triple(dictionary: Dictionary<'_>, ids: IdTriple) -> Result<Triple, Problem> {
@@ -2064,41 +2389,6 @@ fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
 
 fn rdf_text(bytes: &[u8]) -> Result<&str, Problem> {
     std::str::from_utf8(bytes).map_err(|error| unreadable("reading a VoID RDF term", &error))
-}
-
-fn jsonld_statement(triple: &Triple) -> serde_json::Value {
-    let subject = match &triple.subject {
-        NamedOrBlankNode::NamedNode(node) => node.as_str().to_owned(),
-        NamedOrBlankNode::BlankNode(node) => format!("_:{}", node.as_str()),
-    };
-    let object = match &triple.object {
-        RdfTerm::NamedNode(node) => serde_json::json!({"@id": node.as_str()}),
-        RdfTerm::BlankNode(node) => {
-            serde_json::json!({"@id": format!("_:{}", node.as_str())})
-        }
-        RdfTerm::Literal(literal) => {
-            let mut value = serde_json::Map::from_iter([(
-                "@value".to_owned(),
-                serde_json::Value::String(literal.value().to_owned()),
-            )]);
-            if let Some(language) = literal.language() {
-                value.insert(
-                    "@language".to_owned(),
-                    serde_json::Value::String(language.to_owned()),
-                );
-            } else if literal.datatype().as_str() != XSD_STRING {
-                value.insert(
-                    "@type".to_owned(),
-                    serde_json::Value::String(literal.datatype().as_str().to_owned()),
-                );
-            }
-            serde_json::Value::Object(value)
-        }
-    };
-    serde_json::json!({
-        "@id": subject,
-        triple.predicate.as_str(): [object]
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2733,6 +3023,18 @@ fn with_optional_param(params: &Params, name: &str, value: Option<&str>) -> Para
 }
 
 /// `GET /fragment` — enumerate a triple pattern (§3.4.1).
+pub fn get_fragment(
+    store: &Store,
+    target: Target,
+    request: &request::GetFragment,
+) -> Result<Answer, Problem> {
+    match request {
+        request::GetFragment::Plain(request) => fragment(store, target, request),
+        request::GetFragment::Bindings(request) => binding_fragment(store, target, request),
+    }
+}
+
+/// Enumerate an ordinary triple pattern.
 pub fn fragment(
     store: &Store,
     target: Target,
@@ -2877,14 +3179,16 @@ pub fn binding_fragment(
     let dictionary = store.dict();
     let mut cache = LookupCache::new(dictionary);
     let mut phases = Vec::new();
+    let mut restrictions = Vec::new();
     for row in request.rows() {
         let Some(ids) = resolve_binding(&mut cache, row)? else {
             continue;
         };
+        restrictions.push((row.index(), ids));
         phases.push(binding_phase(select(store, ids)?, row.index()));
     }
 
-    paged(
+    let mut answer = paged(
         &dictionary,
         target,
         Envelope {
@@ -2903,7 +3207,9 @@ pub fn binding_fragment(
             bytes: request.bytes,
             binding: &request.binding,
         },
-    )
+    )?;
+    answer.rdf_restrictions = Some(restrictions);
+    Ok(answer)
 }
 
 /// `QUERY|POST /count` — one exact count for each input binding row.
@@ -3452,6 +3758,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         .collect();
 
     let (rows, spent_at) = materialize(&dictionary, &vars, &steps, request.bytes)?;
+    let row_ids = steps[..rows.len()].iter().map(|step| step.triple).collect();
     Ok(Answer {
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
@@ -3462,6 +3769,10 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         cardinality: Cardinality::exact(count),
         absent_terms,
         rows,
+        row_ids,
+        row_cursors: Vec::new(),
+        rdf_restrictions: None,
+        byte_budget: request.bytes.0,
         vars,
         // A sample stops for one reason only. It is not paged, so `n` is what
         // it returns unless the bundle's own literals spend the byte budget
@@ -3973,6 +4284,11 @@ fn finish(
     // applies — before the response exists rather than after, which also bounds
     // the memory a page can take.
     let (rows, spent_at) = materialize(dictionary, &vars, &steps, paging.bytes)?;
+    let row_ids = steps[..rows.len()].iter().map(|step| step.triple).collect();
+    let row_cursors = steps[..rows.len()]
+        .iter()
+        .map(|step| step.cursor(paging.binding))
+        .collect();
 
     // Whichever bound was reached first names the reason and the resume point.
     // Bytes first, because a page stopped for bytes never reached its row count
@@ -3998,6 +4314,10 @@ fn finish(
         cardinality: cardinality(&completeness, &rows),
         absent_terms,
         rows,
+        row_ids,
+        row_cursors,
+        rdf_restrictions: None,
+        byte_budget: paging.bytes.0,
         vars,
         completeness,
         directed,
@@ -5473,18 +5793,6 @@ impl<'a> Cell<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn jsonld_blank_node_ids_have_exactly_one_prefix() {
-        let triple = Triple::new(
-            BlankNode::new("subject").unwrap(),
-            NamedNode::new("https://example.org/p").unwrap(),
-            BlankNode::new("object").unwrap(),
-        );
-        let value = jsonld_statement(&triple);
-        assert_eq!(value["@id"], "_:subject");
-        assert_eq!(value["https://example.org/p"][0]["@id"], "_:object");
-    }
 
     #[test]
     fn binding_cardinalities_cannot_overflow_the_wire_integer() {

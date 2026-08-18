@@ -1,0 +1,11 @@
+{
+  "name": "kgf-comunica-conformance",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "dependencies": {
+    "@comunica/query-sparql": "5.3.0"
+  }
+}

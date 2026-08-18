@@ -53,8 +53,7 @@ pub enum Representation {
     Json,
     /// A page, for reading the same resource in a browser.
     Html,
-    /// Turtle RDF. `/void` emits the N-Triples subset of Turtle so every
-    /// statement remains independently budgetable.
+    /// Turtle RDF, serialized by `oxrdfio` from the resource's RDF graph.
     Turtle,
     /// Expanded JSON-LD RDF.
     JsonLd,
@@ -65,6 +64,17 @@ pub enum Representation {
 impl Representation {
     /// The JSON/page pair offered by ordinary KGF resources.
     pub const ALL: &'static [Representation] = &[Representation::Json, Representation::Html];
+
+    /// The native and RDF representations of the fragment resource.
+    ///
+    /// JSON remains first so an unconstrained client still receives KGF's
+    /// richer envelope. TPF/brTPF clients name an RDF media type explicitly.
+    pub const FRAGMENT: &'static [Representation] = &[
+        Representation::Json,
+        Representation::Turtle,
+        Representation::JsonLd,
+        Representation::Html,
+    ];
 
     /// The RDF representations offered by `/void`, plus its browser page.
     pub const VOID: &'static [Representation] = &[

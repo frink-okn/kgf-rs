@@ -44,6 +44,7 @@ pub mod descriptor;
 pub mod envelope;
 mod forms;
 pub mod html;
+mod rdf;
 pub mod representation;
 pub mod request;
 pub mod routes;

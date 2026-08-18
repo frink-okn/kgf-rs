@@ -30,6 +30,7 @@ base64 = "0.22"
 oxiri = "0.2"
 oxrdf = "0.3"
 oxrdfio = "0.2"
+spargebra = "0.4"
 tempfile = "3"
 
 # The HTTP stack (unit 13). axum is doc 20 §20.4's suggestion and survives the
