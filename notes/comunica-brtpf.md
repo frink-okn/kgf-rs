@@ -144,6 +144,24 @@ built as `oxrdf` triples/quads and serialized by `oxrdfio`; KGF owns the graph i
 publishes, while the library owns escaping and syntax for Turtle, N-Triples,
 JSON-LD, and eventually TriG/N-Quads.
 
+### Blank nodes across fragment documents
+
+RDF blank-node labels are document-local, while one TPF query consumes many
+documents and brTPF can feed a term from one request into the next. Data blank
+nodes are therefore emitted as stable, reversible FDC URNs scoped by hdtc's
+SHA-256 identity of the immutable HDT dictionary and triples:
+
+```
+urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:{hdt-data-digest}:{base64url-dictionary-term}
+```
+
+The full dictionary spelling, including `_:` is encoded. When that named node
+returns in an `s` or `o` position or a binding row, the addressed bundle
+reverses it only if the digest matches its own HDT; foreign URNs remain ordinary
+IRIs. Hydra's structural blank nodes remain local metadata nodes. Identical HDT
+content intentionally produces identical skolem identities across endpoints
+and mirrors.
+
 ### Target TPF/brTPF now; QPF on the same route later
 
 Serve the three-mapping (`s/p/o`) form over today's triple read layer. A
@@ -187,8 +205,11 @@ capability.
    truthful cardinality metadata, and positional resumption.
 6. Extended the gates through bind joins, `UNDEF`, overlapping rows, paging,
    term edge cases, and federation over two KGF endpoints. The stock-client harness
-   covers paging, bind join, and federation; focused Rust HTTP tests cover the input
-   and projection edge cases that Comunica does not deterministically generate.
+   covers paging, bind join, cross-document blank-node identity, and federation;
+   focused Rust HTTP tests cover the input and projection edge cases that Comunica
+   does not deterministically generate.
+7. Added reversible HDT-scoped blank-node skolemization so RDF joins remain correct
+   across fragment pages and later bindings-restricted requests.
 
 ## Questions for `../kgf`
 

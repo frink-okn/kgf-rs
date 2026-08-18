@@ -49,6 +49,7 @@ pub mod representation;
 pub mod request;
 pub mod routes;
 pub mod service;
+mod skolem;
 pub mod term;
 pub mod url;
 
@@ -142,8 +143,10 @@ impl std::str::FromStr for PublicOrigin {
             return Err(PublicOriginError);
         }
         let uri: axum::http::Uri = value.parse().map_err(|_| PublicOriginError)?;
+        let authority = uri.authority().ok_or(PublicOriginError)?;
         if !matches!(uri.scheme_str(), Some("http" | "https"))
-            || uri.authority().is_none()
+            || authority.host().is_empty()
+            || authority.as_str().contains('@')
             || !matches!(uri.path(), "" | "/")
             || uri.query().is_some()
         {
@@ -152,14 +155,16 @@ impl std::str::FromStr for PublicOrigin {
         Ok(Self(format!(
             "{}://{}",
             uri.scheme_str().expect("checked above"),
-            uri.authority().expect("checked above")
+            authority
         )))
     }
 }
 
 /// A configured public origin is not an HTTP(S) origin.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("expected an absolute http:// or https:// origin with no path, query, or fragment")]
+#[error(
+    "expected an absolute http:// or https:// origin with a host and no userinfo, path, query, or fragment"
+)]
 pub struct PublicOriginError;
 
 /// The largest values a request may ask for (doc 03 §3.5).
@@ -340,7 +345,8 @@ pub struct Budgets {
     pub max_output_terms: u64,
     /// Serialized response size, pre-compression.
     pub max_response_bytes: u64,
-    /// Request body size, enforced on the wire by the router.
+    /// Serialized request input size: enforced on the wire for bodies and
+    /// before SPARQL parsing for brTPF's `values=` query parameter.
     pub max_request_bytes: u64,
     /// Any single term or literal, in requests and bindings.
     pub max_term_bytes: u64,
@@ -479,6 +485,8 @@ mod tests {
             "https://data.example/kgf",
             "https://data.example/?tenant=a",
             "https://data.example/#fragment",
+            "https://:443",
+            "https://user@example.com",
         ] {
             assert!(invalid.parse::<PublicOrigin>().is_err(), "{invalid}");
         }

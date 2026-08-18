@@ -104,11 +104,11 @@ pub fn router(service: Arc<Service>) -> Router {
         // because it sets `Vary: Accept` with `insert` and CORS appends its own
         // afterwards; the other way round would wipe them.
         .layer(TraceLayer::new_for_http())
-        // Two limits, because they catch different things. `RequestBodyLimitLayer`
-        // enforces the published figure on the wire whether or not anything
-        // reads the body, which is what makes `max_request_bytes` true today
-        // rather than a promise. `DefaultBodyLimit` is what the bindings body
-        // extractors consult.
+        // Two body limits, because they catch different things.
+        // `RequestBodyLimitLayer` enforces the published figure on the wire
+        // whether or not anything reads the body. `DefaultBodyLimit` is what
+        // the bindings body extractors consult. brTPF's query-carried
+        // `values=` applies the same figure before its SPARQL parser runs.
         .layer(RequestBodyLimitLayer::new(body_limit))
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(middleware::from_fn(render_problems))

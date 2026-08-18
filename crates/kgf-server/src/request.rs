@@ -1126,6 +1126,16 @@ impl Bindings {
         pattern: &BindingPattern,
         limits: Limits<'_>,
     ) -> Result<Self, Problem> {
+        let max = limits.budgets.max_request_bytes;
+        if text.len() as u64 > max {
+            return Err(Problem::new(
+                ErrorCode::PayloadTooLarge,
+                format!(
+                    "values= is {} decoded bytes, over this server's max_request_bytes of {max}",
+                    text.len()
+                ),
+            ));
+        }
         let query = SparqlParser::new()
             .parse_query(&format!("SELECT * WHERE {{ VALUES {text} }}"))
             .map_err(|error| {
@@ -1212,6 +1222,12 @@ impl Bindings {
         columns: &BTreeMap<Variable, usize>,
         rows: &[Vec<BindingValue>],
     ) -> Result<(), Problem> {
+        // The empty relation has an empty result without probing the store,
+        // regardless of whether a repeated variable would be bounded in a row
+        // that does not exist.
+        if rows.is_empty() {
+            return Ok(());
+        }
         // `?x p ?x` is bounded only when every row fixes `?x`. An absent or
         // UNDEF cell leaves an equality filter over a non-contiguous
         // enumeration, whose rejected candidates are not bounded by limit.
@@ -3478,6 +3494,42 @@ mod tests {
             "bindings": {"vars": ["?same"], "rows": [["ex:a"]]}
         });
         assert!(binding_fragment(&serde_json::to_vec(&bounded).unwrap()).is_ok());
+
+        let empty = serde_json::json!({
+            "pattern": {"s": "?same", "p": "ex:p", "o": "?same"},
+            "bindings": {"vars": [], "rows": []}
+        });
+        assert!(binding_fragment(&serde_json::to_vec(&empty).unwrap()).is_ok());
+
+        let empty_values = "(?foreign) {}";
+        let query = format!(
+            "s=%3Fsame&p=ex%3Ap&o=%3Fsame&values={}",
+            crate::url::encode_value(empty_values)
+        );
+        assert!(
+            GetFragment::parse(&params(&query), limits(), &prefixes(), &bundle(), true).is_ok()
+        );
+    }
+
+    #[test]
+    fn brtpf_values_are_byte_bounded_before_sparql_parsing() {
+        let budgets = crate::Budgets {
+            max_request_bytes: 8,
+            ..BUDGETS
+        };
+        let limits = Limits {
+            caps: &CAPS,
+            budgets: &budgets,
+        };
+        let values = "(?s) { (<http://example.org/alice>) }";
+        let query = format!(
+            "s=%3Fs&p=%3Fp&o=%3Fo&values={}",
+            crate::url::encode_value(values)
+        );
+        let error =
+            GetFragment::parse(&params(&query), limits, &prefixes(), &bundle(), true).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::PayloadTooLarge);
+        assert_eq!(error.status(), 413);
     }
 
     #[test]

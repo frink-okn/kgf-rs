@@ -129,6 +129,7 @@ impl PermutationSpec {
 pub struct Permutations {
     hdt: Mapping,
     sidecar: Mapping,
+    hdt_identity_digest: [u8; 32],
     hdt_layout: HdtLayout,
     triples: u64,
     pos: PermutationSpec,
@@ -166,10 +167,12 @@ impl Permutations {
         let ops = PermutationSpec::sidecar(&index, &sidecar, PermutationComponent::Ops)?;
         let spo = PermutationSpec::spo(&index, &sidecar, *hdt_layout.spo())?;
         let triples = index.header().triples;
+        let hdt_identity_digest = index.header().source_digest;
 
         let permutations = Self {
             hdt,
             sidecar,
+            hdt_identity_digest,
             hdt_layout,
             triples,
             pos,
@@ -245,6 +248,17 @@ impl Permutations {
     /// Total triples in every permutation.
     pub fn triples(&self) -> u64 {
         self.triples
+    }
+
+    /// SHA-256 identity of the host HDT's dictionary and triples.
+    ///
+    /// This is the source digest recorded by the required permutation
+    /// sidecar. Query opening validates its cheap structural binding to the
+    /// HDT; publication verification establishes the full cryptographic
+    /// binding. It deliberately excludes the mutable HDT header; see
+    /// `hdtc/docs/permutation-index-format.md` §9.
+    pub fn hdt_identity_digest(&self) -> [u8; 32] {
+        self.hdt_identity_digest
     }
 
     /// Path of the mapped host HDT.
@@ -351,6 +365,7 @@ mod tests {
             Permutations::open(fixture.map_hdt(), fixture.map_perm()).expect("bind permutations");
 
         assert_eq!(permutations.triples(), header.triples);
+        assert_eq!(permutations.hdt_identity_digest(), header.source_digest);
         assert_eq!(permutations.pos.layout.pairs(), header.pos_pairs);
         assert_eq!(permutations.ops.layout.pairs(), header.ops_pairs);
         assert_eq!(

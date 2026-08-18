@@ -477,7 +477,7 @@ pub enum ErrorCode {
     MethodNotAllowed,
     /// A request body's media type is not supported (`Accept-Query`, §3.6).
     UnsupportedMediaType,
-    /// A request body exceeds `max_request_bytes` (§3.5).
+    /// Serialized request input exceeds `max_request_bytes` (§3.5).
     PayloadTooLarge,
     /// The server's current rate or concurrent-work capacity is exhausted (§3.6).
     RateLimited,

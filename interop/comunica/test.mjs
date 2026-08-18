@@ -46,6 +46,24 @@ assert.deepEqual(
   'stock Comunica must complete its bind join through brTPF values= requests',
 );
 
+const blankNodeJoin = await rows(`
+  SELECT ?node ?kind WHERE {
+    ?node <http://example.org/type> <http://example.org/Thing> .
+    ?node <http://example.org/type> ?kind .
+  }
+`, ['node', 'kind']);
+assert.equal(
+  blankNodeJoin.length,
+  1,
+  'the same stored blank node must join across fragment documents and brTPF bindings',
+);
+assert.equal(blankNodeJoin[0].kind, 'http://example.org/Thing');
+assert.match(
+  blankNodeJoin[0].node,
+  /^urn:fdc:frink-okn\.github\.io:20260818:kgf:bnode:v1:sha256:/,
+  'fragment data blank nodes must have stable content-scoped identities',
+);
+
 const federatedStream = await engine.queryBindings(`
   SELECT ?person ?remoteName WHERE {
     ?person <http://example.org/knows> ?known .
@@ -67,4 +85,4 @@ assert.deepEqual(
   'stock Comunica must join bindings across two KGF brTPF endpoints',
 );
 
-console.log('Comunica 5.3.0 TPF paging, brTPF bind join, and federation passed');
+console.log('Comunica 5.3.0 TPF paging, brTPF bind join, blank-node identity, and federation passed');

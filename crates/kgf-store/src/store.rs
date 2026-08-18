@@ -225,6 +225,16 @@ impl Store {
         self.data.triples()
     }
 
+    /// SHA-256 identity of `data.hdt`'s dictionary and triples.
+    ///
+    /// Read from the required, publication-verified permutation sidecar after
+    /// hdtc validates its cheap structural binding to this HDT. The digest
+    /// excludes the mutable HDT header and is available without scanning
+    /// either mapped payload on the request path.
+    pub fn hdt_identity_digest(&self) -> [u8; 32] {
+        self.data.permutations().hdt_identity_digest()
+    }
+
     /// Resolve a pattern. `O(log N)`; enumerates nothing.
     ///
     /// The returned [`Selection`] borrows this store, which is what makes

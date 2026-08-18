@@ -75,6 +75,7 @@ use crate::request::{
     self, BindingPattern, BindingRow, BoundTerm, Candidates, Direction, Pattern, Position,
     ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter,
 };
+use crate::skolem::SkolemScope;
 use crate::term::{LiteralKind, PrefixMap, Term, TermCache};
 use crate::url::{self, Params};
 
@@ -565,6 +566,9 @@ pub struct Answer {
     bindings: bool,
     #[serde(skip)]
     target: Target,
+    /// Stable, reversible RDF identity for this HDT's data blank nodes.
+    #[serde(skip)]
+    blank_nodes: SkolemScope,
     /// Display labels for the page's IRIs, resolved only when this answer is
     /// being rendered as HTML — a reading affordance, never response data.
     ///
@@ -843,10 +847,10 @@ impl Answer {
             let object =
                 cell(Position::Object).expect("every fragment row binds every triple position");
             let triple = Triple::new(
-                rdf_subject(subject.as_bytes())?,
+                rdf_fragment_subject(subject.as_bytes(), &self.blank_nodes)?,
                 NamedNode::new(predicate)
                     .map_err(|error| unreadable("parsing an RDF predicate IRI", &error))?,
-                rdf_object(object.as_bytes())?,
+                rdf_fragment_object(object.as_bytes(), &self.blank_nodes)?,
             );
             if data.insert(triple.clone()) {
                 triples.push(triple);
@@ -872,9 +876,9 @@ impl Answer {
             "the fragment dataset URL",
         )?;
 
-        // Blank-node labels are deterministic (strong ETags require stable
-        // bytes) and selected not to merge with any data blank node in this
-        // document.
+        // Metadata blank-node labels are deterministic because strong ETags
+        // require stable bytes. Data blank nodes have already become stable
+        // HDT-scoped IRIs and therefore cannot merge with these local nodes.
         let mut used = rdf_blank_node_labels(&triples);
         let search = metadata_blank_node("kgf-hydra-search", &mut used);
         let mappings = [
@@ -2440,6 +2444,19 @@ fn rdf_subject(term: &[u8]) -> Result<NamedOrBlankNode, Problem> {
         .map_err(|error| unreadable("parsing a VoID subject IRI", &error))
 }
 
+fn rdf_fragment_subject(
+    term: &[u8],
+    blank_nodes: &SkolemScope,
+) -> Result<NamedOrBlankNode, Problem> {
+    let text = rdf_text(term)?;
+    if let Some(iri) = blank_nodes.iri(text) {
+        return NamedNode::new(iri)
+            .map(Into::into)
+            .map_err(|error| unreadable("skolemizing an RDF blank-node subject", &error));
+    }
+    rdf_subject(term)
+}
+
 fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
     if let Some(literal) = parse_literal(term) {
         let value = rdf_text(literal.value)?.to_owned();
@@ -2464,6 +2481,16 @@ fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
     NamedNode::new(text)
         .map(Into::into)
         .map_err(|error| unreadable("parsing a VoID object IRI", &error))
+}
+
+fn rdf_fragment_object(term: &[u8], blank_nodes: &SkolemScope) -> Result<RdfTerm, Problem> {
+    let text = rdf_text(term)?;
+    if let Some(iri) = blank_nodes.iri(text) {
+        return NamedNode::new(iri)
+            .map(Into::into)
+            .map_err(|error| unreadable("skolemizing an RDF blank-node object", &error));
+    }
+    rdf_object(term)
 }
 
 fn rdf_text(bytes: &[u8]) -> Result<&str, Problem> {
@@ -3120,6 +3147,7 @@ pub fn fragment(
     request: &request::Fragment,
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest());
     let echo = Echo::Fragment {
         pattern: request.pattern.clone(),
     };
@@ -3137,10 +3165,11 @@ pub fn fragment(
         directed: false,
         bindings: false,
         absent_terms: Vec::new(),
+        blank_nodes,
     };
 
     match (
-        resolve(&dictionary, &request.pattern)?,
+        resolve(&dictionary, &envelope.blank_nodes, &request.pattern)?,
         request.pattern.text(),
     ) {
         (Resolved::Absent(absent), _) => paged(
@@ -3204,13 +3233,14 @@ pub fn count(
     request: &request::Count,
 ) -> Result<CountAnswer, Problem> {
     let dictionary = store.dict();
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest());
     if request.cursor.is_some() && request.pattern.text().is_none() {
         // Parsing enforces this too; keep the operation correct for callers
         // constructing the public request type directly.
         return Err(Problem::from(StaleCursor));
     }
     let (count, completeness, absent_terms) = match (
-        resolve(&dictionary, &request.pattern)?,
+        resolve(&dictionary, &blank_nodes, &request.pattern)?,
         request.pattern.text(),
     ) {
         // Exact and free of the enumeration: a range width after bounded
@@ -3256,7 +3286,8 @@ pub fn binding_fragment(
     request: &request::BindingFragment,
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
-    let mut cache = LookupCache::new(dictionary);
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest());
+    let mut cache = LookupCache::new(dictionary, blank_nodes.clone());
     let mut restrictions = Vec::new();
     for row in request.rows() {
         let Some(ids) = resolve_binding(&mut cache, row)? else {
@@ -3284,6 +3315,7 @@ pub fn binding_fragment(
         directed: false,
         bindings: true,
         absent_terms: Vec::new(),
+        blank_nodes,
     };
     let paging = Paging {
         cursor: request.cursor.as_ref(),
@@ -3317,7 +3349,8 @@ pub fn binding_count(
     request: &request::BindingCount,
 ) -> Result<BindingCountAnswer, Problem> {
     let dictionary = store.dict();
-    let mut cache = LookupCache::new(dictionary);
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest());
+    let mut cache = LookupCache::new(dictionary, blank_nodes);
     let mut counts = Vec::new();
     for row in request.rows() {
         let value = match resolve_binding(&mut cache, row)? {
@@ -3574,6 +3607,7 @@ pub fn labels(
     request: &request::Labels,
 ) -> Result<LabelsAnswer, Problem> {
     let dictionary = store.dict();
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest());
     let label_predicates = resolve_predicate_ids(&dictionary, &request.label_predicates)?;
     let mut cache = TermCache::new();
     let mut resolved_labels: HashMap<String, Option<String>> = HashMap::new();
@@ -3585,7 +3619,7 @@ pub fn labels(
         let label = if let Some(label) = resolved_labels.get(requested.dictionary()) {
             label.clone()
         } else {
-            let label = match locate(&dictionary, Role::Subject, requested)? {
+            let label = match locate_scoped(&dictionary, &blank_nodes, Role::Subject, requested)? {
                 Some(subject) => {
                     preferred_label(store, &dictionary, &mut cache, subject, &label_predicates)?
                 }
@@ -3757,6 +3791,7 @@ pub fn describe(
     request: &request::Describe,
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest());
     let echo = Echo::Describe {
         resource: request.resource.requested().to_owned(),
         direction: request.direction,
@@ -3764,7 +3799,8 @@ pub fn describe(
 
     let mut phases = Vec::new();
     if request.direction.walks_out()
-        && let Some(subject) = locate(&dictionary, Role::Subject, &request.resource)?
+        && let Some(subject) =
+            locate_scoped(&dictionary, &blank_nodes, Role::Subject, &request.resource)?
     {
         let selection = select(
             store,
@@ -3777,7 +3813,8 @@ pub fn describe(
         phases.push(phase(selection, Some(Direction::Out)));
     }
     if request.direction.walks_in()
-        && let Some(object) = locate(&dictionary, Role::Object, &request.resource)?
+        && let Some(object) =
+            locate_scoped(&dictionary, &blank_nodes, Role::Object, &request.resource)?
     {
         let selection = select(
             store,
@@ -3810,6 +3847,7 @@ pub fn describe(
             directed: true,
             bindings: false,
             absent_terms,
+            blank_nodes,
         },
         phases,
         Paging {
@@ -3826,6 +3864,7 @@ pub fn describe(
 /// `GET /sample` — pseudo-random members of a pattern's results (§3.4.7).
 pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Result<Answer, Problem> {
     let dictionary = store.dict();
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest());
     let echo = Echo::Sample {
         pattern: request.pattern.clone(),
         n: request.n,
@@ -3833,7 +3872,8 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
     };
     let vars = request.pattern.vars();
 
-    let (count, triples, absent_terms) = match resolve(&dictionary, &request.pattern)? {
+    let (count, triples, absent_terms) = match resolve(&dictionary, &blank_nodes, &request.pattern)?
+    {
         Resolved::Absent(absent) => (0, Vec::new(), absent),
         Resolved::Ids(ids) => {
             let (count, drawn) = draw(&select(store, ids)?, u64::from(request.n), request.seed);
@@ -3883,6 +3923,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         directed: false,
         bindings: false,
         target,
+        blank_nodes,
         page_labels: HashMap::new(),
         described: None,
     })
@@ -4165,7 +4206,11 @@ enum Resolved {
     Absent(Vec<&'static str>),
 }
 
-fn resolve(dictionary: &Dictionary<'_>, pattern: &Pattern) -> Result<Resolved, Problem> {
+fn resolve(
+    dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    pattern: &Pattern,
+) -> Result<Resolved, Problem> {
     let mut ids = IdPattern {
         subject: None,
         predicate: None,
@@ -4176,7 +4221,7 @@ fn resolve(dictionary: &Dictionary<'_>, pattern: &Pattern) -> Result<Resolved, P
         let Some(term) = pattern.bound(position) else {
             continue;
         };
-        match locate(dictionary, position.role(), term)? {
+        match locate_scoped(dictionary, blank_nodes, position.role(), term)? {
             Some(id) => match position {
                 Position::Subject => ids.subject = Some(id),
                 Position::Predicate => ids.predicate = Some(id),
@@ -4205,16 +4250,35 @@ fn locate(
         .map_err(|error| unreadable("looking a term up", &error))
 }
 
+/// Look up a request term, reversing this HDT's skolem URNs in RDF term roles.
+fn locate_scoped(
+    dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    role: Role,
+    term: &BoundTerm,
+) -> Result<Option<u64>, Problem> {
+    let text = match role {
+        Role::Subject | Role::Object => blank_nodes.dictionary_term(term.dictionary()),
+        Role::Predicate => Cow::Borrowed(term.dictionary()),
+    };
+    dictionary
+        .locate(role, text.as_bytes())
+        .map(|found| found.map(|id| id.0))
+        .map_err(|error| unreadable("looking a term up", &error))
+}
+
 /// Dictionary probes shared by all rows of one binding table.
 struct LookupCache<'a> {
     dictionary: Dictionary<'a>,
+    blank_nodes: SkolemScope,
     found: [HashMap<String, Option<u64>>; 3],
 }
 
 impl<'a> LookupCache<'a> {
-    fn new(dictionary: Dictionary<'a>) -> Self {
+    fn new(dictionary: Dictionary<'a>, blank_nodes: SkolemScope) -> Self {
         Self {
             dictionary,
+            blank_nodes,
             found: std::array::from_fn(|_| HashMap::new()),
         }
     }
@@ -4224,7 +4288,7 @@ impl<'a> LookupCache<'a> {
         if let Some(found) = by_term.get(term.dictionary()) {
             return Ok(*found);
         }
-        let found = locate(&self.dictionary, role, term)?;
+        let found = locate_scoped(&self.dictionary, &self.blank_nodes, role, term)?;
         by_term.insert(term.dictionary().to_owned(), found);
         Ok(found)
     }
@@ -4307,6 +4371,7 @@ struct Envelope {
     directed: bool,
     bindings: bool,
     absent_terms: Vec<&'static str>,
+    blank_nodes: SkolemScope,
 }
 
 /// Where a page starts, how far it may go, and what a cursor out of it binds to.
@@ -4517,6 +4582,7 @@ fn finish(
         directed,
         bindings,
         absent_terms,
+        blank_nodes,
     } = envelope;
 
     // Materializing is where the bytes appear, so it is where the byte budget
@@ -4561,6 +4627,7 @@ fn finish(
         directed,
         bindings,
         target,
+        blank_nodes,
         page_labels: HashMap::new(),
         described: None,
     })
@@ -6105,6 +6172,23 @@ mod tests {
         );
         let overflow = exact_cardinality_sum([u64::MAX, 1]).unwrap_err();
         assert_eq!(overflow.code(), ErrorCode::InternalError);
+    }
+
+    #[test]
+    fn fragment_rdf_publishes_data_blank_nodes_as_named_urns() {
+        let blank_nodes = SkolemScope::new([0xab; 32]);
+        let subject = rdf_fragment_subject(b"_:b1", &blank_nodes).unwrap();
+        let object = rdf_fragment_object(b"_:b1", &blank_nodes).unwrap();
+        let expected = blank_nodes.iri("_:b1").unwrap();
+
+        match subject {
+            NamedOrBlankNode::NamedNode(node) => assert_eq!(node.as_str(), expected),
+            NamedOrBlankNode::BlankNode(_) => panic!("fragment data kept a local blank node"),
+        }
+        match object {
+            RdfTerm::NamedNode(node) => assert_eq!(node.as_str(), expected),
+            other => panic!("fragment data became {other:?} rather than a named node"),
+        }
     }
 
     #[test]

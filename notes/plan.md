@@ -1990,6 +1990,28 @@ following the code.
     when filtering partial overlaps before the page limit. The two fragment table rows
     should name both terms; the implementation is bounded and the cost table is the
     stale side of this disagreement.
+46. **Resolved: fragment RDF uses content-scoped blank-node identities.** A stored `_:`
+    label cannot be emitted unchanged in Turtle or JSON-LD pages: RDF scopes that
+    identity to one document, so the same HDT node would become unrelated nodes across
+    pages and a brTPF bind join could return a wrong answer. Fragment RDF now
+    skolemizes data blank nodes as
+    `urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:{hdt-data-digest}:{base64url-term}`.
+    The digest is hdtc's existing identity over the HDT dictionary and triples (not its
+    mutable header), and the final component losslessly encodes the complete dictionary
+    spelling. Subject/object ingress reverses a URN only when its digest matches the
+    addressed HDT; a foreign bundle's URN remains an ordinary IRI. Identical immutable
+    HDT content therefore intentionally gives its blank nodes identical identities
+    across versions, datasets, deployments and mirrors. `../kgf` doc 03 §3.4.1 now
+    makes this wire rule normative; docs 04, 07, 14, 15, 17, and 18 record its storage,
+    lifecycle, sketch, and exact-key-set consequences.
+47. **`max_request_bytes` must cover query-carried brTPF input, not only bodies.**
+    `values=` is SPARQL syntax in the request target, and parsing the whole table before
+    applying `max_bindings` otherwise spends CPU and memory outside the published cost
+    model. This implementation applies `max_request_bytes` to the decoded `values=` text
+    before invoking the SPARQL parser, as well as enforcing it on QUERY/POST bodies at
+    the HTTP layer. Doc 03 §3.5 currently calls this a request-*body* budget; it should
+    define it as the serialized request-input bound or publish a separate equivalent
+    bound for the query transport.
 
 ## Not in this plan
 
