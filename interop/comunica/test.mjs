@@ -60,7 +60,7 @@ assert.equal(
 assert.equal(blankNodeJoin[0].kind, 'http://example.org/Thing');
 assert.match(
   blankNodeJoin[0].node,
-  /^urn:fdc:frink-okn\.github\.io:20260818:kgf:bnode:v1:sha256:/,
+  /^urn:fdc:frink-okn\.github\.io:20260818:kgf:bnode:v1:sha256:[0-9a-f]{64}:(?:sh|s|o)-[1-9][0-9]*$/,
   'fragment data blank nodes must have stable content-scoped identities',
 );
 

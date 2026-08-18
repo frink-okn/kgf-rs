@@ -152,15 +152,23 @@ nodes are therefore emitted as stable, reversible FDC URNs scoped by hdtc's
 SHA-256 identity of the immutable HDT dictionary and triples:
 
 ```
-urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:{hdt-data-digest}:{base64url-dictionary-term}
+urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:{hdt-data-digest}:{section}-{local-id}
 ```
 
-The full dictionary spelling, including `_:` is encoded. When that named node
-returns in an `s` or `o` position or a binding row, the addressed bundle
-reverses it only if the digest matches its own HDT; foreign URNs remain ordinary
-IRIs. Hydra's structural blank nodes remain local metadata nodes. Identical HDT
-content intentionally produces identical skolem identities across endpoints
-and mirrors.
+`{section}` is `sh`, `s`, or `o` for the shared, subjects-only, or objects-only
+`dictionaryFour` section, and `{local-id}` is that section's canonical one-based
+integer. When that named node returns in an `s` or `o` position or a binding row,
+the addressed bundle reverses it only if the digest, section, role, range, and
+referenced blank-node term all agree; foreign or malformed URNs remain ordinary
+IRIs. Turtle binds `kgfbn:` to the digest-scoped namespace, making the terms
+compact names such as `kgfbn:sh-7`; expanded JSON-LD continues to emit full IRIs.
+Hydra's structural blank nodes remain local metadata nodes. Identical HDT content
+intentionally produces identical skolem identities across endpoints and mirrors.
+Native KGF JSON is not an RDF document serialization: it retains the `bnode` term
+object and dictionary label so the term preserves its RDF type and round-trips against
+the addressed immutable release. Clients combining native results scope those blank
+nodes to their source release; the named wire identity is specifically the TPF RDF
+transport rule.
 
 ### Target TPF/brTPF now; QPF on the same route later
 

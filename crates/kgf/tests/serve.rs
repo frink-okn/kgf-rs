@@ -229,6 +229,10 @@ fn fragment_rdf_is_one_parseable_tpf_graph_in_turtle_and_jsonld() {
     turtle.assert_header("content-type", "text/turtle; charset=utf-8");
     turtle.assert_header("kgf-complete", "false");
     turtle.assert_header("kgf-truncation-reason", "page_limit");
+    assert!(
+        String::from_utf8_lossy(&turtle.body).contains("@prefix kgfbn:"),
+        "every prefix-capable RDF response declares the dataset blank-node namespace"
+    );
     let turtle_graph: HashSet<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
         .for_slice(&turtle.body)
         .collect::<Result<_, _>>()
@@ -304,6 +308,41 @@ fn fragment_rdf_is_one_parseable_tpf_graph_in_turtle_and_jsonld() {
             && quad.predicate.as_str() == format!("{HYDRA}next")
             && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str().starts_with(&dataset))
     }));
+}
+
+#[test]
+fn fragment_json_preserves_blank_node_terms_while_rdf_uses_wire_iris() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let target = "/tox/v/v1/fragment?p=ex%3Atype";
+
+    let json = server.get(target);
+    json.assert_status(200);
+    assert_eq!(
+        json.json()["rows"][0]["s"],
+        serde_json::json!({"type": "bnode", "value": "b1"}),
+        "native term objects preserve the RDF term type and round-trip spelling"
+    );
+
+    let turtle = server.request("GET", target, &[("Accept", "text/turtle")]);
+    turtle.assert_status(200);
+    let data_subject = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+        .for_slice(&turtle.body)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("fragment Turtle parses")
+        .into_iter()
+        .find(|quad| quad.predicate.as_str() == "http://example.org/type")
+        .expect("the fragment contains its data triple")
+        .subject;
+    assert!(
+        matches!(
+            data_subject,
+            oxrdf::NamedOrBlankNode::NamedNode(node)
+                if node.as_str().contains(":s-")
+        ),
+        "RDF fragments use the subject-only dictionary-section identity"
+    );
 }
 
 #[test]
@@ -570,6 +609,7 @@ fn void_and_summary_serve_the_published_description_in_every_format() {
     turtle.assert_status(200);
     turtle.assert_header("content-type", "text/turtle; charset=utf-8");
     turtle.assert_header("kgf-complete", "true");
+    assert!(String::from_utf8_lossy(&turtle.body).contains("@prefix kgfbn:"));
     let turtle_quads = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
         .for_slice(&turtle.body)
         .collect::<Result<Vec<_>, _>>()

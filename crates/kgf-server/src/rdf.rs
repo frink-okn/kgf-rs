@@ -32,8 +32,18 @@ impl GraphFormat {
 /// `finish` is part of the operation: JSON-LD and the grouped Turtle writer
 /// may retain closing syntax or the final statement. Callers fit byte budgets
 /// by trying complete prefixes, never by interrupting this writer.
-pub(crate) fn serialize_graph(format: GraphFormat, triples: &[Triple]) -> io::Result<Vec<u8>> {
-    let mut serializer = RdfSerializer::from_format(format.rdf_format()).for_writer(Vec::new());
+pub(crate) fn serialize_graph(
+    format: GraphFormat,
+    triples: &[Triple],
+    prefixes: &[(&str, &str)],
+) -> io::Result<Vec<u8>> {
+    let mut serializer = RdfSerializer::from_format(format.rdf_format());
+    for &(name, iri) in prefixes {
+        serializer = serializer
+            .with_prefix(name, iri)
+            .map_err(io::Error::other)?;
+    }
+    let mut serializer = serializer.for_writer(Vec::new());
     for triple in triples {
         serializer.serialize_triple(triple)?;
     }
@@ -72,7 +82,7 @@ mod tests {
             .collect();
 
         for format in [GraphFormat::Turtle, GraphFormat::JsonLd] {
-            let bytes = serialize_graph(format, &graph()).unwrap();
+            let bytes = serialize_graph(format, &graph(), &[]).unwrap();
             let parsed: HashSet<Quad> = RdfParser::from_format(format.rdf_format())
                 .for_reader(bytes.as_slice())
                 .map(Result::unwrap)
@@ -84,5 +94,21 @@ mod tests {
                 String::from_utf8_lossy(&bytes)
             );
         }
+    }
+
+    #[test]
+    fn turtle_declares_and_uses_supplied_prefixes() {
+        let namespace = "urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:abc:";
+        let graph = [Triple::new(
+            NamedNode::new(format!("{namespace}sh-7")).unwrap(),
+            NamedNode::new("https://example.org/p").unwrap(),
+            NamedNode::new(format!("{namespace}o-2")).unwrap(),
+        )];
+        let bytes = serialize_graph(GraphFormat::Turtle, &graph, &[("kgfbn", namespace)]).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(text.contains(&format!("@prefix kgfbn: <{namespace}> .")));
+        assert!(text.contains("kgfbn:sh-7"));
+        assert!(text.contains("kgfbn:o-2"));
     }
 }

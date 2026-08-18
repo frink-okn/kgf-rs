@@ -1995,13 +1995,19 @@ following the code.
     identity to one document, so the same HDT node would become unrelated nodes across
     pages and a brTPF bind join could return a wrong answer. Fragment RDF now
     skolemizes data blank nodes as
-    `urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:{hdt-data-digest}:{base64url-term}`.
+    `urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:{hdt-data-digest}:{section}-{local-id}`.
     The digest is hdtc's existing identity over the HDT dictionary and triples (not its
-    mutable header), and the final component losslessly encodes the complete dictionary
-    spelling. Subject/object ingress reverses a URN only when its digest matches the
-    addressed HDT; a foreign bundle's URN remains an ordinary IRI. Identical immutable
-    HDT content therefore intentionally gives its blank nodes identical identities
-    across versions, datasets, deployments and mirrors. `../kgf` doc 03 §3.4.1 now
+    mutable header). The suffix uses `sh`, `s`, or `o` plus the canonical one-based id
+    within the shared, subjects-only, or objects-only `dictionaryFour` section. A shared
+    node therefore has one identity in subject and object positions without carrying
+    its parser-local label on the wire. Subject/object ingress reverses a URN only when
+    its digest, section, role, range, and referenced blank-node term all agree; a foreign
+    bundle's URN remains an ordinary IRI. Prefix-capable RDF documents bind `kgfbn:` to
+    the digest-scoped namespace. Identical immutable HDT content therefore intentionally
+    gives its blank nodes identical identities across versions, datasets, deployments
+    and mirrors. Native JSON deliberately retains its `bnode` term object and dictionary
+    label: it is not an RDF document, preserves the term's RDF type, and round-trips only
+    in the scope of the addressed immutable release. `../kgf` doc 03 §3.4.1 now
     makes this wire rule normative; docs 04, 07, 14, 15, 17, and 18 record its storage,
     lifecycle, sketch, and exact-key-set consequences.
 47. **`max_request_bytes` must cover query-carried brTPF input, not only bodies.**

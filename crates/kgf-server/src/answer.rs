@@ -362,6 +362,7 @@ fn match_kind(kind: hdtc::format::MatchKind) -> &'static str {
 #[derive(Debug, Clone)]
 pub struct Row {
     cells: Vec<(Position, Rc<str>)>,
+    triple: IdTriple,
     binding: Option<u32>,
     direction: Option<Direction>,
     ranking: Option<Ranking>,
@@ -418,6 +419,7 @@ impl Row {
     fn new(
         cells: Vec<(Position, Rc<str>)>,
         terms: u64,
+        triple: IdTriple,
         binding: Option<u32>,
         direction: Option<Direction>,
         ranking: Option<Ranking>,
@@ -447,6 +449,7 @@ impl Row {
         }
         Self {
             cells,
+            triple,
             binding,
             direction,
             ranking,
@@ -847,10 +850,18 @@ impl Answer {
             let object =
                 cell(Position::Object).expect("every fragment row binds every triple position");
             let triple = Triple::new(
-                rdf_fragment_subject(subject.as_bytes(), &self.blank_nodes)?,
+                rdf_fragment_subject(
+                    subject.as_bytes(),
+                    TermId(row.triple.subject),
+                    &self.blank_nodes,
+                )?,
                 NamedNode::new(predicate)
                     .map_err(|error| unreadable("parsing an RDF predicate IRI", &error))?,
-                rdf_fragment_object(object.as_bytes(), &self.blank_nodes)?,
+                rdf_fragment_object(
+                    object.as_bytes(),
+                    TermId(row.triple.object),
+                    &self.blank_nodes,
+                )?,
             );
             if data.insert(triple.clone()) {
                 triples.push(triple);
@@ -879,7 +890,7 @@ impl Answer {
         // Metadata blank-node labels are deterministic because strong ETags
         // require stable bytes. Data blank nodes have already become stable
         // HDT-scoped IRIs and therefore cannot merge with these local nodes.
-        let mut used = rdf_blank_node_labels(&triples);
+        let mut used = HashSet::new();
         let search = metadata_blank_node("kgf-hydra-search", &mut used);
         let mappings = [
             (
@@ -952,9 +963,13 @@ impl Answer {
             ));
         }
 
-        serialize_graph(format, &triples)
-            .map(Bytes::from)
-            .map_err(|error| unreadable("serializing the fragment RDF graph", &error))
+        serialize_graph(
+            format,
+            &triples,
+            &[("kgfbn", self.blank_nodes.iri_prefix())],
+        )
+        .map(Bytes::from)
+        .map_err(|error| unreadable("serializing the fragment RDF graph", &error))
     }
 }
 
@@ -1017,19 +1032,6 @@ fn metadata_iri(value: &str, what: &'static str) -> Result<NamedNode, Problem> {
             "the fragment metadata could not be represented as RDF",
         )
     })
-}
-
-fn rdf_blank_node_labels(triples: &[Triple]) -> HashSet<String> {
-    let mut labels = HashSet::new();
-    for triple in triples {
-        if let NamedOrBlankNode::BlankNode(node) = &triple.subject {
-            labels.insert(node.as_str().to_owned());
-        }
-        if let RdfTerm::BlankNode(node) = &triple.object {
-            labels.insert(node.as_str().to_owned());
-        }
-    }
-    labels
 }
 
 fn metadata_blank_node(stem: &str, used: &mut HashSet<String>) -> BlankNode {
@@ -2258,21 +2260,39 @@ pub fn void(
         .map_err(|error| unreadable("reading the VoID graph", &error))?;
     let total = selection.count().value;
     let dictionary = description.dict();
+    let data_dictionary = store.dict();
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *data_dictionary.counts());
+    let prefixes = &[("kgfbn", blank_nodes.iri_prefix())];
 
     let (body, emitted, complete) = match representation {
         Representation::Turtle => {
-            let (body, emitted) =
-                serialize_rdf(&selection, dictionary, GraphFormat::Turtle, request.bytes.0)?;
+            let (body, emitted) = serialize_rdf(
+                &selection,
+                dictionary,
+                GraphFormat::Turtle,
+                request.bytes.0,
+                prefixes,
+            )?;
             (body, emitted, emitted == total)
         }
         Representation::JsonLd => {
-            let (body, emitted) =
-                serialize_rdf(&selection, dictionary, GraphFormat::JsonLd, request.bytes.0)?;
+            let (body, emitted) = serialize_rdf(
+                &selection,
+                dictionary,
+                GraphFormat::JsonLd,
+                request.bytes.0,
+                prefixes,
+            )?;
             (body, emitted, emitted == total)
         }
         Representation::Html => {
-            let (turtle, turtle_triples) =
-                serialize_rdf(&selection, dictionary, GraphFormat::Turtle, request.bytes.0)?;
+            let (turtle, turtle_triples) = serialize_rdf(
+                &selection,
+                dictionary,
+                GraphFormat::Turtle,
+                request.bytes.0,
+                prefixes,
+            )?;
             let complete = turtle_triples == total;
             let completeness = void_completeness(complete);
             let resource = VoidResource {
@@ -2355,9 +2375,10 @@ fn serialize_rdf(
     dictionary: Dictionary<'_>,
     format: GraphFormat,
     byte_limit: u64,
+    prefixes: &[(&str, &str)],
 ) -> Result<(Bytes, u64), Problem> {
     let encode = |triples: &[Triple]| {
-        serialize_graph(format, triples)
+        serialize_graph(format, triples, prefixes)
             .map_err(|error| unreadable("serializing the VoID RDF graph", &error))
     };
 
@@ -2446,10 +2467,11 @@ fn rdf_subject(term: &[u8]) -> Result<NamedOrBlankNode, Problem> {
 
 fn rdf_fragment_subject(
     term: &[u8],
+    id: TermId,
     blank_nodes: &SkolemScope,
 ) -> Result<NamedOrBlankNode, Problem> {
     let text = rdf_text(term)?;
-    if let Some(iri) = blank_nodes.iri(text) {
+    if let Some(iri) = blank_nodes.iri(Role::Subject, id, text) {
         return NamedNode::new(iri)
             .map(Into::into)
             .map_err(|error| unreadable("skolemizing an RDF blank-node subject", &error));
@@ -2483,9 +2505,13 @@ fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
         .map_err(|error| unreadable("parsing a VoID object IRI", &error))
 }
 
-fn rdf_fragment_object(term: &[u8], blank_nodes: &SkolemScope) -> Result<RdfTerm, Problem> {
+fn rdf_fragment_object(
+    term: &[u8],
+    id: TermId,
+    blank_nodes: &SkolemScope,
+) -> Result<RdfTerm, Problem> {
     let text = rdf_text(term)?;
-    if let Some(iri) = blank_nodes.iri(text) {
+    if let Some(iri) = blank_nodes.iri(Role::Object, id, text) {
         return NamedNode::new(iri)
             .map(Into::into)
             .map_err(|error| unreadable("skolemizing an RDF blank-node object", &error));
@@ -3147,7 +3173,7 @@ pub fn fragment(
     request: &request::Fragment,
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest());
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
     let echo = Echo::Fragment {
         pattern: request.pattern.clone(),
     };
@@ -3233,7 +3259,7 @@ pub fn count(
     request: &request::Count,
 ) -> Result<CountAnswer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest());
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
     if request.cursor.is_some() && request.pattern.text().is_none() {
         // Parsing enforces this too; keep the operation correct for callers
         // constructing the public request type directly.
@@ -3286,7 +3312,7 @@ pub fn binding_fragment(
     request: &request::BindingFragment,
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest());
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
     let mut cache = LookupCache::new(dictionary, blank_nodes.clone());
     let mut restrictions = Vec::new();
     for row in request.rows() {
@@ -3349,7 +3375,7 @@ pub fn binding_count(
     request: &request::BindingCount,
 ) -> Result<BindingCountAnswer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest());
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
     let mut cache = LookupCache::new(dictionary, blank_nodes);
     let mut counts = Vec::new();
     for row in request.rows() {
@@ -3607,7 +3633,7 @@ pub fn labels(
     request: &request::Labels,
 ) -> Result<LabelsAnswer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest());
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
     let label_predicates = resolve_predicate_ids(&dictionary, &request.label_predicates)?;
     let mut cache = TermCache::new();
     let mut resolved_labels: HashMap<String, Option<String>> = HashMap::new();
@@ -3791,7 +3817,7 @@ pub fn describe(
     request: &request::Describe,
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest());
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
     let echo = Echo::Describe {
         resource: request.resource.requested().to_owned(),
         direction: request.direction,
@@ -3864,7 +3890,7 @@ pub fn describe(
 /// `GET /sample` — pseudo-random members of a pattern's results (§3.4.7).
 pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Result<Answer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest());
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
     let echo = Echo::Sample {
         pattern: request.pattern.clone(),
         n: request.n,
@@ -4257,12 +4283,19 @@ fn locate_scoped(
     role: Role,
     term: &BoundTerm,
 ) -> Result<Option<u64>, Problem> {
-    let text = match role {
-        Role::Subject | Role::Object => blank_nodes.dictionary_term(term.dictionary()),
-        Role::Predicate => Cow::Borrowed(term.dictionary()),
-    };
+    if matches!(role, Role::Subject | Role::Object)
+        && let Some(id) = blank_nodes.role_id(role, term.dictionary())
+    {
+        let mut buffer = Vec::new();
+        let stored = dictionary
+            .extract(role, id, &mut buffer)
+            .map_err(|error| unreadable("reversing a blank-node IRI", &error))?;
+        if stored.starts_with(b"_:") {
+            return Ok(Some(id.0));
+        }
+    }
     dictionary
-        .locate(role, text.as_bytes())
+        .locate(role, term.dictionary().as_bytes())
         .map(|found| found.map(|id| id.0))
         .map_err(|error| unreadable("looking a term up", &error))
 }
@@ -4889,6 +4922,7 @@ fn materialize(
         let row = Row::new(
             cells,
             terms,
+            step.triple,
             step.binding_index,
             step.direction,
             step.ranking,
@@ -6176,10 +6210,16 @@ mod tests {
 
     #[test]
     fn fragment_rdf_publishes_data_blank_nodes_as_named_urns() {
-        let blank_nodes = SkolemScope::new([0xab; 32]);
-        let subject = rdf_fragment_subject(b"_:b1", &blank_nodes).unwrap();
-        let object = rdf_fragment_object(b"_:b1", &blank_nodes).unwrap();
-        let expected = blank_nodes.iri("_:b1").unwrap();
+        let counts = kgf_store::dict::DictCounts {
+            shared: 1,
+            subjects: 0,
+            objects: 0,
+            predicates: 0,
+        };
+        let blank_nodes = SkolemScope::new([0xab; 32], counts);
+        let subject = rdf_fragment_subject(b"_:b1", TermId(1), &blank_nodes).unwrap();
+        let object = rdf_fragment_object(b"_:b1", TermId(1), &blank_nodes).unwrap();
+        let expected = blank_nodes.iri(Role::Subject, TermId(1), "_:b1").unwrap();
 
         match subject {
             NamedOrBlankNode::NamedNode(node) => assert_eq!(node.as_str(), expected),
@@ -6250,8 +6290,18 @@ mod tests {
                                 .expect("a term serializes")
                                 .len() as u64;
 
-                            let row =
-                                Row::new(cells, each * width as u64, binding, direction, score);
+                            let row = Row::new(
+                                cells,
+                                each * width as u64,
+                                IdTriple {
+                                    subject: 1,
+                                    predicate: 1,
+                                    object: 1,
+                                },
+                                binding,
+                                direction,
+                                score,
+                            );
                             assert_eq!(
                                 row.serialized,
                                 serde_json::to_vec(&row).expect("a row serializes").len() as u64,

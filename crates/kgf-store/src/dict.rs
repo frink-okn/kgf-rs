@@ -63,6 +63,54 @@ impl DictCounts {
         }
     }
 
+    /// Convert a role-scoped HDT id to its section and one-based local id.
+    ///
+    /// The inverse is [`role_id`](Self::role_id). Keeping both conversions
+    /// here prevents HTTP and serialization layers from duplicating the
+    /// shared-section arithmetic owned by the dictionary.
+    pub fn section_id(&self, role: Role, id: TermId) -> Result<SectionTermId> {
+        let maximum = self.len(role);
+        if id.0 == 0 || id.0 > maximum {
+            return Err(Error::TermIdOutOfRange {
+                role,
+                id: id.0,
+                maximum,
+            });
+        }
+        let (section, local_id) = match role {
+            Role::Predicate => (Section::Predicates, id.0),
+            Role::Subject if id.0 <= self.shared => (Section::Shared, id.0),
+            Role::Subject => (Section::Subjects, id.0 - self.shared),
+            Role::Object if id.0 <= self.shared => (Section::Shared, id.0),
+            Role::Object => (Section::Objects, id.0 - self.shared),
+        };
+        Ok(SectionTermId::new(section, local_id)
+            .expect("a validated role id maps to a nonzero section-local id"))
+    }
+
+    /// Convert a section-local id into `role`'s id space when that section is
+    /// part of the role and the local id exists.
+    pub fn role_id(&self, role: Role, id: SectionTermId) -> Option<TermId> {
+        let local_id = id.local_id();
+        let in_section = match id.section() {
+            Section::Shared => local_id <= self.shared,
+            Section::Subjects => local_id <= self.subjects,
+            Section::Predicates => local_id <= self.predicates,
+            Section::Objects => local_id <= self.objects,
+        };
+        if !in_section {
+            return None;
+        }
+        match (role, id.section()) {
+            (Role::Subject | Role::Object, Section::Shared)
+            | (Role::Predicate, Section::Predicates) => Some(TermId(local_id)),
+            (Role::Subject, Section::Subjects) | (Role::Object, Section::Objects) => {
+                self.shared.checked_add(local_id).map(TermId)
+            }
+            _ => None,
+        }
+    }
+
     /// Establish the invariant that makes [`len`](Self::len)'s additions total.
     fn validate_role_lengths(&self) -> Result<()> {
         let subjects = self.shared.checked_add(self.subjects).ok_or_else(|| {
@@ -96,7 +144,7 @@ impl DictCounts {
 ///
 /// A section, not a [`Role`]: the subject and object id spaces each span *two*
 /// sections, and which one an id falls in is the arithmetic [`Dictionary`] owns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
     /// Terms occurring as both subject and object. Ids `1..=shared` in both
     /// spaces, which is what makes the permutations' `ArrayZ` payloads
@@ -108,6 +156,38 @@ pub enum Section {
     Predicates,
     /// Terms occurring only as objects.
     Objects,
+}
+
+/// A one-based term id scoped to one `dictionaryFour` section.
+///
+/// Unlike [`TermId`], this identifier is independent of a subject or object
+/// role. That makes a shared term one identifier even when it occurs in both
+/// positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SectionTermId {
+    section: Section,
+    local_id: NonZeroU64,
+}
+
+impl SectionTermId {
+    /// Construct a section-local id, rejecting zero because HDT ids are
+    /// one-based.
+    pub fn new(section: Section, local_id: u64) -> Option<Self> {
+        Some(Self {
+            section,
+            local_id: NonZeroU64::new(local_id)?,
+        })
+    }
+
+    /// The dictionary section that scopes this integer.
+    pub fn section(self) -> Section {
+        self.section
+    }
+
+    /// The one-based integer within [`section`](Self::section).
+    pub fn local_id(self) -> u64 {
+        self.local_id.get()
+    }
 }
 
 /// Where one PFC section's parts are, validated at open.
@@ -669,6 +749,39 @@ mod tests {
             predicates: u64::MAX,
         };
         assert!(no_one_past_predicate.validate_role_lengths().is_err());
+    }
+
+    #[test]
+    fn section_local_ids_invert_role_ids_without_conflating_sections() {
+        let counts = DictCounts {
+            shared: 3,
+            subjects: 4,
+            objects: 5,
+            predicates: 2,
+        };
+
+        let shared = counts.section_id(Role::Subject, TermId(2)).unwrap();
+        assert_eq!(shared, SectionTermId::new(Section::Shared, 2).unwrap());
+        assert_eq!(counts.role_id(Role::Subject, shared), Some(TermId(2)));
+        assert_eq!(counts.role_id(Role::Object, shared), Some(TermId(2)));
+
+        let subject = counts.section_id(Role::Subject, TermId(5)).unwrap();
+        assert_eq!(subject, SectionTermId::new(Section::Subjects, 2).unwrap());
+        assert_eq!(counts.role_id(Role::Subject, subject), Some(TermId(5)));
+        assert_eq!(counts.role_id(Role::Object, subject), None);
+
+        let object = counts.section_id(Role::Object, TermId(6)).unwrap();
+        assert_eq!(object, SectionTermId::new(Section::Objects, 3).unwrap());
+        assert_eq!(counts.role_id(Role::Object, object), Some(TermId(6)));
+        assert_eq!(counts.role_id(Role::Subject, object), None);
+
+        assert_eq!(
+            counts.role_id(
+                Role::Subject,
+                SectionTermId::new(Section::Subjects, 5).unwrap()
+            ),
+            None
+        );
     }
 
     #[test]
