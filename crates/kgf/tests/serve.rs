@@ -33,6 +33,11 @@ const GROWN_NT: &str = concat!(
 
 const REMOTE_NT: &str = "<http://example.org/bob> <http://example.org/remoteName> \"Bobby\" .\n";
 
+const PARTIAL_OVERLAP_NT: &str = concat!(
+    "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .\n",
+    "<http://example.org/carol> <http://example.org/knows> <http://example.org/bob> .\n",
+);
+
 const SUMMARY_CARD_JSON: &str = r#"{
   "dataset": {"id": "tox", "version": "v1", "title": "Fixture graph"},
   "counts": {"triples": 21, "subjects": 9, "predicates": 7, "objects": 14},
@@ -355,10 +360,16 @@ fn brtpf_values_accept_undef_and_project_overlapping_rows_to_distinct_rdf() {
             total, "2",
             "a restriction subsumed by another must not inflate the distinct RDF total"
         );
-        for quad in graph
+        let page_knows: Vec<_> = graph
             .iter()
             .filter(|quad| quad.predicate.as_str() == "http://example.org/knows")
-        {
+            .collect();
+        assert_eq!(
+            page_knows.len(),
+            1,
+            "overlap filtering must happen before the Hydra page limit"
+        );
+        for quad in page_knows {
             assert!(
                 knows.insert((
                     quad.subject.clone(),
@@ -387,7 +398,71 @@ fn brtpf_values_accept_undef_and_project_overlapping_rows_to_distinct_rdf() {
         2,
         "the Alice row overlaps the UNDEF row, but RDF is a set projection"
     );
-    assert_eq!(pages, 3, "the overlap-only middle page must still advance");
+    assert_eq!(
+        pages, 2,
+        "a subsumed restriction must not create an empty page"
+    );
+}
+
+#[test]
+fn brtpf_partial_overlap_spends_the_candidate_budget_and_resumes() {
+    let deployment = Deployment::new();
+    deployment.publish("overlap", "v1", PARTIAL_OVERLAP_NT, "2026-06-01T14:03:22Z");
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.candidate_budget = 2;
+    let server = deployment.serve_with_limits(kgf_server::Caps::new(), budgets);
+    let values =
+        "(?person ?known) { (<http://example.org/alice> UNDEF) (UNDEF <http://example.org/bob>) }";
+    let target = format!(
+        "/overlap/v/v1/fragment?s=%3Fperson&p=ex%3Aknows&o=%3Fknown&limit=2&values={}",
+        kgf_server::url::encode_value(values)
+    );
+
+    let first = server.request("GET", &target, &[("Accept", "text/turtle")]);
+    first.assert_status(200);
+    first.assert_header("kgf-complete", "false");
+    first.assert_header("kgf-truncation-reason", "candidate_budget");
+    let first_graph: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+        .for_slice(&first.body)
+        .collect::<Result<_, _>>()
+        .expect("the first brTPF page parses");
+    assert_eq!(
+        first_graph
+            .iter()
+            .filter(|quad| quad.predicate.as_str() == "http://example.org/knows")
+            .count(),
+        1
+    );
+    let next = first_graph
+        .iter()
+        .find_map(|quad| {
+            (quad.predicate.as_str() == "http://www.w3.org/ns/hydra/core#next")
+                .then(|| match &quad.object {
+                    oxrdf::Term::NamedNode(node) => Some(node.as_str()),
+                    _ => None,
+                })
+                .flatten()
+        })
+        .expect("candidate exhaustion carries a Hydra continuation");
+    let origin = format!("http://{}", server.address);
+    let next_target = next
+        .strip_prefix(&origin)
+        .expect("the continuation stays on this endpoint");
+
+    let second = server.request("GET", next_target, &[("Accept", "text/turtle")]);
+    second.assert_status(200);
+    second.assert_header("kgf-complete", "true");
+    let second_graph: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+        .for_slice(&second.body)
+        .collect::<Result<_, _>>()
+        .expect("the resumed brTPF page parses");
+    assert_eq!(
+        second_graph
+            .iter()
+            .filter(|quad| quad.predicate.as_str() == "http://example.org/knows")
+            .count(),
+        1
+    );
 }
 
 #[test]

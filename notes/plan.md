@@ -1414,7 +1414,9 @@ workspace tests, and the Comunica suite are all gates before this unit is marked
 JSON-LD for both `/void` and `/fragment`; handwritten RDF escaping is gone. Fragment
 RDF carries a three-mapping Hydra form, exact ordinary-pattern count, and absolute
 page/continuation IRIs keyed to the exact request URL. Complete-document byte fitting
-retains a first-omitted-row cursor rather than interrupting a serializer.
+retains a first-omitted-row cursor rather than interrupting a serializer. RDF fragment
+requests are admitted as heavy work: complete-document fitting is bounded but has the
+same `Z·(1 + log limit)` worst case that doc 03 already records for schema fitting.
 
 GET additionally accepts the variable-preserving URL form emitted by a source typed
 `brtpf` and parses `values=` by wrapping it in a SPARQL query handled by `spargebra`.
@@ -1422,8 +1424,11 @@ Binding cells are terms or `UNDEF` (`null` in the native JSON body); unrelated c
 are retained in cursor identity but do not restrict a selection. Native JSON still
 enumerates the binding relation. RDF assigns each overlapping triple to its first
 compatible input row, using resolved id patterns, so duplicates do not reappear across
-pages and no server-side state is needed. The ownership check costs at most the
-published binding cap times the already-bounded page rows. Its distinct cardinality is
+pages and no server-side state is needed. Identical and subsumed restrictions are
+removed before paging; remaining overlap is filtered before the page limit and every
+examined candidate spends the published candidate budget. Normalization costs `O(k²)`
+over the capped binding table, and each candidate checks at most `k` restrictions. Its
+distinct cardinality is
 exact for disjoint restrictions or when one restriction subsumes the rest; arbitrary
 partial overlap is a bounded upper estimate, capped by both the relation sum and the
 base triple-pattern count rather than paid for with an unbounded union enumeration.
@@ -1431,7 +1436,8 @@ base triple-pattern count rather than paid for with an unbounded union enumerati
 `interop/comunica` pins stock Comunica 5.3.0. Its real-listener gate forces one-row
 pages, executes an ordinary pattern and bind join, and completes a join across two KGF
 brTPF endpoints. Rust integration tests separately pin generalized `UNDEF`, foreign
-columns, overlap-only middle pages, RDF round trips, and RDF response-byte fitting.
+columns, pre-page overlap filtering, candidate-budget continuations, RDF round trips,
+and RDF response-byte fitting.
 
 ### What the implementation still is not
 
@@ -1971,6 +1977,16 @@ following the code.
     should specify this as the TPF ingress grammar rather than weakening §3.3 for every
     route.
     Found by the pinned Comunica 5.3.0 conformance test in unit 20.
+45. **Doc 03 §3.5 understates RDF fragment cost.** Its fragment rows describe selection
+    and paging as `O(log N + limit)` (or `O(k·log N + limit)` for bindings), but a
+    complete Turtle or JSON-LD document cannot be interrupted at the byte boundary.
+    The implementation uses the same bounded complete-prefix fitting already specified
+    for `/schema`, whose worst case is `Z·(1 + log limit)`, and admits RDF fragments as
+    heavy work. brTPF's distinct union also examines at most `candidate_budget`
+    compatibility rows against at most `k` restrictions after `O(k²)` normalization
+    when filtering partial overlaps before the page limit. The two fragment table rows
+    should name both terms; the implementation is bounded and the cost table is the
+    stale side of this disagreement.
 
 ## Not in this plan
 

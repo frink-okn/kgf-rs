@@ -554,11 +554,6 @@ pub struct Answer {
     row_ids: Vec<IdTriple>,
     #[serde(skip)]
     row_cursors: Vec<CursorToken>,
-    /// Resolved binding restrictions in input order. Native JSON exposes the
-    /// full compatibility relation; RDF uses these to project that relation
-    /// to one copy of each triple across every page.
-    #[serde(skip)]
-    rdf_restrictions: Option<Vec<(u32, IdPattern)>>,
     /// Cardinality of the distinct RDF projection. The native binding
     /// relation keeps its independently exact row count in `cardinality`.
     #[serde(skip)]
@@ -708,6 +703,11 @@ impl Answer {
     /// Fit a finished RDF document, Hydra metadata included, to the response
     /// budget. One indivisible row may exceed the budget so a client can
     /// always advance past it.
+    ///
+    /// Worst case is `Z·(1 + log limit)` serialized bytes: one complete
+    /// candidate document plus bounded complete-prefix probes. RDF fragments
+    /// are admitted as heavy work; doc 03's stale fragment cost rows are
+    /// tracked in `notes/plan.md` question 45.
     fn fit_fragment_rdf(&mut self, format: GraphFormat) -> Result<Bytes, Problem> {
         let body = self.fragment_rdf(format)?;
         if body.len() as u64 <= self.byte_budget || self.rows.len() <= 1 {
@@ -829,14 +829,7 @@ impl Answer {
         }
         let mut triples = Vec::with_capacity(keep.saturating_add(18));
         let mut data = HashSet::with_capacity(keep);
-        for (row_index, row) in self.rows.iter().take(keep).enumerate() {
-            if let (Some(restrictions), Some(binding)) = (&self.rdf_restrictions, row.binding)
-                && restrictions.iter().any(|(owner, pattern)| {
-                    *owner < binding && id_pattern_matches(*pattern, self.row_ids[row_index])
-                })
-            {
-                continue;
-            }
+        for row in self.rows.iter().take(keep) {
             let cell = |position| {
                 let bound = match &self.echo {
                     Echo::Fragment { pattern } => pattern.bound(position),
@@ -989,6 +982,21 @@ fn id_pattern_subsumes(general: IdPattern, specific: IdPattern) -> bool {
             .predicate
             .is_none_or(|id| specific.predicate == Some(id))
         && general.object.is_none_or(|id| specific.object == Some(id))
+}
+
+/// Remove restrictions that cannot add a triple to brTPF's RDF union.
+///
+/// Equal restrictions keep their first input row. A strictly more general
+/// restriction wins regardless of input order: RDF exposes neither binding
+/// index, so retaining the narrower phase would only create candidates that a
+/// later phase must discard.
+fn normalize_rdf_restrictions(restrictions: &mut Vec<(u32, IdPattern)>) {
+    let original = restrictions.clone();
+    restrictions.retain(|(row, specific)| {
+        !original.iter().any(|(other_row, general)| {
+            id_pattern_subsumes(*general, *specific) && (general != specific || other_row < row)
+        })
+    });
 }
 
 fn id_patterns_overlap(left: IdPattern, right: IdPattern) -> bool {
@@ -3251,42 +3259,55 @@ pub fn binding_fragment(
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
     let mut cache = LookupCache::new(dictionary);
-    let mut phases = Vec::new();
     let mut restrictions = Vec::new();
-    let mut restriction_counts = Vec::new();
-    let base_pattern = resolve_binding_pattern(&mut cache, &request.pattern)?;
     for row in request.rows() {
         let Some(ids) = resolve_binding(&mut cache, row)? else {
             continue;
         };
+        restrictions.push((row.index(), ids));
+    }
+    if request.distinct_rdf() {
+        normalize_rdf_restrictions(&mut restrictions);
+    }
+
+    let mut phases = Vec::with_capacity(restrictions.len());
+    let mut restriction_counts = Vec::with_capacity(restrictions.len());
+    for (row_index, ids) in restrictions.iter().copied() {
         let selection = select(store, ids)?;
         restriction_counts.push((ids, selection.count().value));
-        restrictions.push((row.index(), ids));
-        phases.push(binding_phase(selection, row.index()));
+        phases.push(binding_phase(selection, row_index));
     }
-    let rdf_cardinality = rdf_projection_cardinality(store, base_pattern, &restriction_counts)?;
 
-    let mut answer = paged(
+    let envelope = Envelope {
+        echo: Echo::BindingsFragment {
+            pattern: request.pattern.clone(),
+        },
+        vars: request.pattern.vars(),
+        directed: false,
+        bindings: true,
+        absent_terms: Vec::new(),
+    };
+    let paging = Paging {
+        cursor: request.cursor.as_ref(),
+        limit: request.limit,
+        bytes: request.bytes,
+        binding: &request.binding,
+    };
+    if !request.distinct_rdf() {
+        return paged(&dictionary, target, envelope, phases, paging);
+    }
+
+    let base_pattern = resolve_binding_pattern(&mut cache, &request.pattern)?;
+    let rdf_cardinality = rdf_projection_cardinality(store, base_pattern, &restriction_counts)?;
+    let mut answer = paged_distinct_bindings(
         &dictionary,
         target,
-        Envelope {
-            echo: Echo::BindingsFragment {
-                pattern: request.pattern.clone(),
-            },
-            vars: request.pattern.vars(),
-            directed: false,
-            bindings: true,
-            absent_terms: Vec::new(),
-        },
+        envelope,
         phases,
-        Paging {
-            cursor: request.cursor.as_ref(),
-            limit: request.limit,
-            bytes: request.bytes,
-            binding: &request.binding,
-        },
+        &restrictions,
+        request.candidates,
+        paging,
     )?;
-    answer.rdf_restrictions = Some(restrictions);
     answer.rdf_cardinality = Some(rdf_cardinality);
     Ok(answer)
 }
@@ -3850,7 +3871,6 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         rows,
         row_ids,
         row_cursors: Vec::new(),
-        rdf_restrictions: None,
         rdf_cardinality: None,
         byte_budget: request.bytes.0,
         vars,
@@ -3978,11 +3998,13 @@ struct Ranked {
 
 /// What a filtered operation does when it stops for candidates rather than
 /// rows.
-#[derive(Debug, Clone, Copy)]
 enum Spent {
     /// As deep into the ranking as this server pages. No cursor: there is
     /// nowhere further to go, and offering one would be a loop.
     Deepest,
+    /// Duplicate candidates exhausted a bounded RDF-union walk. This is the
+    /// first unexamined candidate and therefore its continuation.
+    Candidate(Step),
 }
 
 /// Enumerate a pattern whose object is constrained by a text query.
@@ -4301,6 +4323,39 @@ fn paged(
     })
 }
 
+/// Build a brTPF RDF page after filtering the compatibility relation to its
+/// distinct triple union. Filtering happens before the page limit, so overlap
+/// cannot turn a full native page into an empty Hydra page.
+fn paged_distinct_bindings(
+    dictionary: &Dictionary<'_>,
+    target: Target,
+    envelope: Envelope,
+    phases: Vec<Phase<'_>>,
+    restrictions: &[(u32, IdPattern)],
+    candidates: Candidates,
+    paging: Paging<'_>,
+) -> Result<Answer, Problem> {
+    let predicates = dictionary.counts().len(Role::Predicate);
+    let (steps, spent) = walk_distinct_bindings(
+        &phases,
+        restrictions,
+        paging.cursor,
+        predicates,
+        paging.want(),
+        candidates,
+    )?;
+    let cardinality = exact_cardinality_sum(phases.iter().map(|phase| phase.count))?;
+    finish(
+        dictionary,
+        target,
+        envelope,
+        steps,
+        paging,
+        spent,
+        |_, _| cardinality,
+    )
+}
+
 /// Sum independently resolved phase cardinalities without letting a valid
 /// request wrap its answer or panic the blocking worker.
 fn exact_cardinality_sum(counts: impl IntoIterator<Item = u64>) -> Result<Cardinality, Problem> {
@@ -4462,6 +4517,9 @@ fn finish(
         (None, None, Some(Spent::Deepest)) => {
             Completeness::budget_exhausted_without_resume(BudgetReason::Candidate)
         }
+        (None, None, Some(Spent::Candidate(next))) => {
+            Completeness::budget_exhausted(BudgetReason::Candidate, next.cursor(paging.binding))
+        }
         // The enumeration ran out inside this page, so it is the whole answer.
         (None, None, None) => Completeness::complete(),
     };
@@ -4475,7 +4533,6 @@ fn finish(
         rows,
         row_ids,
         row_cursors,
-        rdf_restrictions: None,
         rdf_cardinality: None,
         byte_budget: paging.bytes.0,
         vars,
@@ -4545,18 +4602,7 @@ fn walk(
     predicates: u64,
     want: usize,
 ) -> Result<Vec<Step>, Problem> {
-    let (start, mut from) = match cursor {
-        None => (0, 0),
-        Some(cursor) => {
-            let index = phases
-                .iter()
-                .position(|phase| {
-                    phase.space == cursor.space && phase.binding_index == cursor.binding_index
-                })
-                .ok_or_else(|| Problem::from(StaleCursor))?;
-            (index, resume_position(cursor, &phases[index], predicates)?)
-        }
-    };
+    let (start, mut from) = walk_start(phases, cursor, predicates)?;
 
     let mut steps = Vec::new();
     for phase in &phases[start..] {
@@ -4580,6 +4626,72 @@ fn walk(
         from = 0;
     }
     Ok(steps)
+}
+
+/// Walk binding phases while assigning every RDF triple to its first matching
+/// normalized restriction. Both retained and discarded candidates spend the
+/// published budget; the continuation is the first candidate not examined.
+fn walk_distinct_bindings(
+    phases: &[Phase<'_>],
+    restrictions: &[(u32, IdPattern)],
+    cursor: Option<&Cursor>,
+    predicates: u64,
+    want: usize,
+    candidates: Candidates,
+) -> Result<(Vec<Step>, Option<Spent>), Problem> {
+    let (start, mut from) = walk_start(phases, cursor, predicates)?;
+    let mut steps = Vec::new();
+    let mut examined = 0u64;
+    for phase in &phases[start..] {
+        let binding_index = phase
+            .binding_index
+            .expect("a distinct binding walk contains only binding phases");
+        for (triple, resume) in positioned(&phase.selection, phase.space, from) {
+            let candidate = Step {
+                triple,
+                space: phase.space,
+                resume,
+                scan: None,
+                binding_index: phase.binding_index,
+                direction: phase.direction,
+                ranking: None,
+            };
+            if examined >= candidates.0 {
+                return Ok((steps, Some(Spent::Candidate(candidate))));
+            }
+            examined += 1;
+            if restrictions.iter().any(|(owner, pattern)| {
+                *owner < binding_index && id_pattern_matches(*pattern, triple)
+            }) {
+                continue;
+            }
+            steps.push(candidate);
+            if steps.len() >= want {
+                return Ok((steps, None));
+            }
+        }
+        from = 0;
+    }
+    Ok((steps, None))
+}
+
+fn walk_start(
+    phases: &[Phase<'_>],
+    cursor: Option<&Cursor>,
+    predicates: u64,
+) -> Result<(usize, u64), Problem> {
+    match cursor {
+        None => Ok((0, 0)),
+        Some(cursor) => {
+            let index = phases
+                .iter()
+                .position(|phase| {
+                    phase.space == cursor.space && phase.binding_index == cursor.binding_index
+                })
+                .ok_or_else(|| Problem::from(StaleCursor))?;
+            Ok((index, resume_position(cursor, &phases[index], predicates)?))
+        }
+    }
 }
 
 /// Pair each triple with the position a page resumes at to return it first.

@@ -35,6 +35,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use oxrdf::VariableRef as SparqlVariableRef;
 use serde::Deserialize;
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::ser::{Serialize, SerializeMap, Serializer};
@@ -817,14 +818,10 @@ impl Variable {
                 ),
             ));
         };
-        if name.is_empty() || name.chars().any(char::is_whitespace) {
+        if SparqlVariableRef::new(name).is_err() {
             return Err(Problem::new(
                 ErrorCode::MalformedRequest,
-                format!(
-                    "{where_}={} is not a variable name; put a non-empty name after `?` and \
-                     do not include whitespace",
-                    reflected(text)
-                ),
+                format!("{where_}={} is not a SPARQL variable name", reflected(text)),
             ));
         }
         Ok(Self(text.to_owned()))
@@ -1255,10 +1252,15 @@ pub struct BindingFragment {
     pub limit: u32,
     /// Bytes its rows may occupy.
     pub bytes: ResponseBytes,
+    /// Candidates an RDF projection may examine while removing overlaps.
+    pub candidates: Candidates,
     /// Where to resume, if the body carried a cursor.
     pub cursor: Option<Cursor>,
     /// What a cursor this request issues must match.
     pub binding: CursorBinding,
+    /// GET RDF is the distinct brTPF projection; native bodies preserve the
+    /// complete compatibility relation and its binding indices.
+    distinct_rdf: bool,
 }
 
 impl BindingFragment {
@@ -1290,8 +1292,10 @@ impl BindingFragment {
             bindings,
             limit,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            candidates: Candidates(limits.budgets.candidate_budget),
             cursor,
             binding,
+            distinct_rdf: false,
         })
     }
 
@@ -1302,6 +1306,7 @@ impl BindingFragment {
         limits: Limits<'_>,
         prefixes: &PrefixMap,
         bundle: &BundleBinding,
+        distinct_rdf: bool,
     ) -> Result<Self, Problem> {
         accept_only(
             params,
@@ -1328,8 +1333,10 @@ impl BindingFragment {
             bindings,
             limit,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            candidates: Candidates(limits.budgets.candidate_budget),
             cursor: resume(params, &binding)?,
             binding,
+            distinct_rdf,
         })
     }
 
@@ -1342,6 +1349,7 @@ impl BindingFragment {
         limits: Limits<'_>,
         prefixes: &PrefixMap,
         bundle: &BundleBinding,
+        distinct_rdf: bool,
     ) -> Result<Self, Problem> {
         accept_only(
             params,
@@ -1375,14 +1383,22 @@ impl BindingFragment {
             bindings,
             limit,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            candidates: Candidates(limits.budgets.candidate_budget),
             cursor: resume(params, &binding)?,
             binding,
+            distinct_rdf,
         })
     }
 
     /// Input rows in their contractual enumeration order.
     pub fn rows(&self) -> impl Iterator<Item = BindingRow<'_>> {
         self.bindings.rows(&self.pattern)
+    }
+
+    /// Whether this transport returns brTPF's distinct RDF projection rather
+    /// than KGF's native compatibility relation.
+    pub(crate) fn distinct_rdf(&self) -> bool {
+        self.distinct_rdf
     }
 }
 
@@ -1600,6 +1616,8 @@ pub struct Fragment {
     pub cursor: Option<Cursor>,
     /// What a cursor this request issues must match.
     pub binding: CursorBinding,
+    /// RDF fitting performs bounded repeated complete-document serialization.
+    rdf_serialization: bool,
 }
 
 /// The two GET grammars of the one fragment operation.
@@ -1619,19 +1637,27 @@ impl GetFragment {
         limits: Limits<'_>,
         prefixes: &PrefixMap,
         bundle: &BundleBinding,
-        tpf_terms: bool,
+        rdf_representation: bool,
     ) -> Result<Self, Problem> {
         if params.get("values").is_some() {
-            BindingFragment::parse_values(params, limits, prefixes, bundle).map(Self::Bindings)
+            BindingFragment::parse_values(params, limits, prefixes, bundle, rdf_representation)
+                .map(Self::Bindings)
         } else if Position::ALL.into_iter().any(|position| {
             params
                 .get(position.as_str())
                 .is_some_and(|value| value.starts_with('?'))
         }) {
-            BindingFragment::parse_variable_get(params, limits, prefixes, bundle)
-                .map(Self::Bindings)
+            BindingFragment::parse_variable_get(
+                params,
+                limits,
+                prefixes,
+                bundle,
+                rdf_representation,
+            )
+            .map(Self::Bindings)
         } else {
-            Fragment::parse_with(params, limits, prefixes, bundle, tpf_terms).map(Self::Plain)
+            Fragment::parse_with(params, limits, prefixes, bundle, rdf_representation)
+                .map(Self::Plain)
         }
     }
 
@@ -1663,10 +1689,10 @@ impl Fragment {
         limits: Limits<'_>,
         prefixes: &PrefixMap,
         bundle: &BundleBinding,
-        tpf_terms: bool,
+        rdf_representation: bool,
     ) -> Result<Self, Problem> {
         accept_only(params, FRAGMENT, Self::PARAMETERS)?;
-        let pattern = Pattern::parse_with(params, limits, prefixes, tpf_terms)?;
+        let pattern = Pattern::parse_with(params, limits, prefixes, rdf_representation)?;
         let limit = page_size(
             params,
             "limit",
@@ -1685,6 +1711,7 @@ impl Fragment {
             candidates: Candidates(limits.budgets.candidate_budget),
             cursor: resume(params, &binding)?,
             binding,
+            rdf_serialization: rdf_representation,
         })
     }
 }
@@ -2458,7 +2485,7 @@ impl GetRequest for Fragment {
     }
 
     fn work_class(&self) -> WorkClass {
-        if self.pattern.text().is_some() {
+        if self.pattern.text().is_some() || self.rdf_serialization {
             WorkClass::Heavy
         } else {
             WorkClass::Ordinary
@@ -2859,6 +2886,12 @@ mod tests {
     #[test]
     fn candidate_and_random_access_requests_are_admitted_as_heavy_work() {
         assert_eq!(fragment("").unwrap().work_class(), WorkClass::Ordinary);
+        assert_eq!(
+            GetFragment::parse(&params(""), limits(), &prefixes(), &bundle(), true)
+                .unwrap()
+                .work_class(),
+            WorkClass::Heavy
+        );
         assert_eq!(
             fragment("o.text=atrazine").unwrap().work_class(),
             WorkClass::Heavy
@@ -3417,6 +3450,28 @@ mod tests {
             "bindings": {"vars": ["?same"], "rows": [["ex:a"]]}
         });
         assert!(binding_fragment(&serde_json::to_vec(&bounded).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn binding_variables_follow_the_sparql_varname_grammar() {
+        for invalid in ["?", "??person", "?has-hyphen", "?$person"] {
+            assert_eq!(
+                Variable::parse(invalid, "pattern.s").unwrap_err().code(),
+                ErrorCode::MalformedRequest,
+                "{invalid}"
+            );
+        }
+        for valid in ["?person", "?person_1", "?1person", "?éclair"] {
+            assert_eq!(Variable::parse(valid, "pattern.s").unwrap().as_str(), valid);
+        }
+
+        let query = "s=%3F%3Fperson&p=ex%3Aknows&o=%3Fknown&values=%28%3Fperson%29%20%7B%20%28ex%3Aalice%29%20%7D";
+        assert_eq!(
+            GetFragment::parse(&params(query), limits(), &prefixes(), &bundle(), true)
+                .unwrap_err()
+                .code(),
+            ErrorCode::MalformedRequest
+        );
     }
 
     #[test]
