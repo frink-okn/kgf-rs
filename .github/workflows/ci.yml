@@ -32,7 +32,7 @@ jobs:
           # kgf-rs currently develops against hdtc's published format façade,
           # which has not landed on hdtc's default branch yet. Pin this to the
           # release commit when the two repositories stop moving together.
-          ref: lib
+          ref: main
           path: hdtc
 
       - name: Install the toolchain
