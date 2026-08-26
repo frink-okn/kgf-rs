@@ -1,0 +1,6 @@
+# The build context is sent to the daemon in full, and these are large and
+# rebuilt inside the image anyway.
+target/
+demo/
+interop/comunica/node_modules/
+.git/
