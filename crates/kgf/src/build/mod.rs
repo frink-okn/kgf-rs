@@ -1,5 +1,6 @@
 //! Offline bundle producers.
 
+pub mod bundle;
 pub mod stats;
 
 use anyhow::Result;
@@ -14,6 +15,9 @@ pub struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
+    /// Assemble and publish a complete bundle from one config.
+    Bundle(bundle::Args),
+
     /// Build the complete Tier-1 description/statistics artifact set.
     Stats(stats::Args),
 }
@@ -21,6 +25,7 @@ enum Command {
 /// Run `kgf build`.
 pub fn run(args: Args) -> Result<()> {
     match args.command {
+        Command::Bundle(args) => bundle::run(args),
         Command::Stats(args) => stats::run(args),
     }
 }

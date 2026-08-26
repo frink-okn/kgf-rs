@@ -24,6 +24,10 @@ memmap2 = "0.9"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+# The build config is YAML. `serde_norway` and not another fork because it is the
+# one hdtc uses for the prefix tables that config points at: one YAML
+# implementation across the toolchain rather than two that disagree at the edges.
+serde_norway = "0.9"
 sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
