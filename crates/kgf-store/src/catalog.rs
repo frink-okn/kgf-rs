@@ -256,11 +256,32 @@ fn directory_entries(path: &Path) -> Result<Vec<std::fs::DirEntry>> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
-        if resolves_to_directory(&entry)? {
+        if resolves_to_directory(&entry)? && !is_in_progress(&entry) {
             entries.push(entry);
         }
     }
     Ok(entries)
+}
+
+/// Whether a directory entry is a build in progress rather than a publication.
+///
+/// A producer stages on the same filesystem as its output so that publication
+/// is a `rename` — `kgf build stats` already does, and `kgf build bundle`
+/// does — which puts a half-written directory inside the tree this scan walks.
+/// Without this rule a server started mid-build lists that directory as a
+/// release, and a request for it fails at open instead of at the catalog.
+///
+/// A leading `.` is the rule, and it is a rule rather than a convention: it is
+/// the other half of the one `kgf build bundle` enforces on a dataset id and a
+/// version label, which refuse a leading `.` for exactly this reason. Between
+/// them a staging directory can never be mistaken for a published one, in
+/// either direction.
+fn is_in_progress(entry: &std::fs::DirEntry) -> bool {
+    entry
+        .file_name()
+        .as_encoded_bytes()
+        .first()
+        .is_some_and(|byte| *byte == b'.')
 }
 
 /// Whether a directory entry resolves to a directory.
@@ -315,6 +336,9 @@ mod tests {
         std::fs::create_dir_all(root.path().join("alpha/broken")).unwrap();
         std::fs::create_dir_all(root.path().join("zeta/1")).unwrap();
         std::fs::write(root.path().join("not-a-dataset"), b"ignored").unwrap();
+        // A build staging on the same filesystem as its output, mid-`rename`.
+        std::fs::create_dir_all(root.path().join("alpha/.kgf-build-2026-02")).unwrap();
+        std::fs::create_dir_all(root.path().join(".kgf-staging/2026-01")).unwrap();
 
         let catalog = Catalog::scan(published_root(root.path()), OpenOptions::default()).unwrap();
         assert_eq!(catalog.root(), root.path());

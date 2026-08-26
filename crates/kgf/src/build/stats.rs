@@ -133,15 +133,118 @@ pub fn run(args: Args) -> Result<()> {
     let staged_stats = staging.path().join("stats");
     std::fs::create_dir(&staged_stats)
         .with_context(|| format!("creating {}", staged_stats.display()))?;
-    let void_nt = staging.path().join("void.nt");
+
+    let outcome = produce(
+        Inputs {
+            hdtc: &args.hdtc,
+            data: &data,
+            dataset_iri: &dataset_iri,
+            prefix_tables: &args.prefix_tables,
+            extra_prefixes: &manifest.prefixes,
+            card: DatasetCard::from_manifest(&manifest),
+            work: staging.path(),
+        },
+        &staged_stats,
+    )?;
+
+    publish(&bundle, staging, &dataset_iri, &outcome.metadata)?;
+    println!(
+        "{}: built and verified Tier-1 statistics ({} schema selectors, {} typed class relations, {} class properties)",
+        bundle.display(),
+        outcome.schema_rows,
+        outcome.relation_rows,
+        outcome.class_property_rows,
+    );
+    Ok(())
+}
+
+/// What a summary card says about the dataset it describes.
+///
+/// The summary needs six descriptive fields and nothing structural. Taking them
+/// as their own value rather than as a [`Manifest`] is what lets the producer
+/// run before a manifest exists: `kgf build stats` upgrades a bundle that
+/// already has one, `kgf build bundle` has only a config, and neither should
+/// have to invent the other's document to reach this code.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DatasetCard<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) version: &'a str,
+    pub(crate) title: Option<&'a str>,
+    pub(crate) description: Option<&'a str>,
+    pub(crate) license: Option<&'a str>,
+    pub(crate) homepage: Option<&'a str>,
+}
+
+impl<'a> DatasetCard<'a> {
+    pub(crate) fn from_manifest(manifest: &'a Manifest) -> Self {
+        Self {
+            id: &manifest.id,
+            version: &manifest.version,
+            title: manifest.title.as_deref(),
+            description: manifest.description.as_deref(),
+            license: manifest.license.as_deref(),
+            homepage: manifest.homepage.as_deref(),
+        }
+    }
+}
+
+/// Everything the description producer needs, and nothing about where the
+/// bundle it describes gets its identity from.
+pub(crate) struct Inputs<'a> {
+    /// hdtc executable for the VoID, HDT, permutation and namespace steps.
+    pub(crate) hdtc: &'a Path,
+    /// The bundle's `data.hdt`.
+    pub(crate) data: &'a Path,
+    /// Stable dataset IRI, already validated as an absolute IRI.
+    pub(crate) dataset_iri: &'a str,
+    /// Prefix tables, layered with later files winning.
+    pub(crate) prefix_tables: &'a [PathBuf],
+    /// Prefixes layered last of all, above every table.
+    pub(crate) extra_prefixes: &'a BTreeMap<String, String>,
+    /// What the summary card says about the dataset.
+    pub(crate) card: DatasetCard<'a>,
+    /// Scratch directory for intermediates that are not published.
+    pub(crate) work: &'a Path,
+}
+
+/// What a description build produced, beyond the files themselves.
+pub(crate) struct Outcome {
+    /// Row bounds and view ranges only the producer can measure.
+    pub(crate) metadata: DescriptionArtifactMetadata,
+    /// Schema selectors written, across both views.
+    pub(crate) schema_rows: usize,
+    /// Typed class relations written, across both views.
+    pub(crate) relation_rows: usize,
+    /// Class properties written, across both views.
+    pub(crate) class_property_rows: usize,
+}
+
+/// Produce the complete eight-artifact description set into `into`.
+///
+/// Writes files and nothing else: no manifest is read, none is written, and
+/// nothing is published. The caller owns where `into` came from and what
+/// happens to it, which is the difference between upgrading a live bundle in
+/// place and assembling a new one.
+pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
+    let Inputs {
+        hdtc,
+        data,
+        dataset_iri,
+        prefix_tables,
+        extra_prefixes,
+        card,
+        work,
+    } = inputs;
+
+    let void_nt = work.join("void.nt");
     run_hdtc(
-        &args.hdtc,
+        hdtc,
         "queryable VoID analysis",
         vec![
             OsString::from("void"),
             data.as_os_str().to_owned(),
             OsString::from("--dataset-uri"),
-            OsString::from(&dataset_iri),
+            OsString::from(dataset_iri),
             OsString::from("--output"),
             void_nt.as_os_str().to_owned(),
             // Dataset-level property partitions carry exact distinct subject and
@@ -153,9 +256,9 @@ pub fn run(args: Args) -> Result<()> {
         ],
     )?;
 
-    let void_hdt = staged_stats.join("void.hdt");
+    let void_hdt = into.join("void.hdt");
     run_hdtc(
-        &args.hdtc,
+        hdtc,
         "VoID HDT and permutation build",
         vec![
             OsString::from("create"),
@@ -163,20 +266,20 @@ pub fn run(args: Args) -> Result<()> {
             void_hdt.as_os_str().to_owned(),
             OsString::from("--perm"),
             OsString::from("--dataset-uri"),
-            OsString::from(&dataset_iri),
+            OsString::from(dataset_iri),
             OsString::from("--quiet"),
             void_nt.as_os_str().to_owned(),
         ],
     )?;
     ensure!(
-        staged_stats.join("void.hdt.perm").is_file(),
+        into.join("void.hdt.perm").is_file(),
         "hdtc did not produce {}",
-        staged_stats.join("void.hdt.perm").display()
+        into.join("void.hdt.perm").display()
     );
 
     let triples = read_ntriples(&void_nt)?;
     let graph = VoidGraph::new(&triples);
-    let root = NamedOrBlankNode::NamedNode(oxrdf::NamedNode::new(&dataset_iri)?);
+    let root = NamedOrBlankNode::NamedNode(oxrdf::NamedNode::new(dataset_iri)?);
     graph.require_dataset_root(&root)?;
     let subject_ids = subject_ids(&void_hdt)?;
     let queryable = graph.project(&root, &subject_ids)?;
@@ -195,38 +298,34 @@ pub fn run(args: Args) -> Result<()> {
         ("design", design.class_properties.as_slice()),
         ("queryable", queryable.class_properties.as_slice()),
     ];
-    let schema_row_count = schema_views
+    let schema_rows = schema_views
         .iter()
         .map(|(_, rows)| rows.len())
         .sum::<usize>();
-    let relation_row_count = relation_views
+    let relation_rows = relation_views
         .iter()
         .map(|(_, rows)| rows.len())
         .sum::<usize>();
-    let class_property_row_count = class_property_views
+    let class_property_rows = class_property_views
         .iter()
         .map(|(_, rows)| rows.len())
         .sum::<usize>();
     let schema = render_schema(&schema_views)?;
     let relations = render_relations(&relation_views)?;
     let class_properties = render_class_properties(&class_property_views)?;
-    write(&staged_stats.join("schema-nodes.tsv"), &schema.bytes)?;
-    write(&staged_stats.join("class-relations.tsv"), &relations.bytes)?;
-    write(
-        &staged_stats.join("class-properties.tsv"),
-        &class_properties.bytes,
-    )?;
+    write(&into.join("schema-nodes.tsv"), &schema.bytes)?;
+    write(&into.join("class-relations.tsv"), &relations.bytes)?;
+    write(&into.join("class-properties.tsv"), &class_properties.bytes)?;
 
-    let manifest_prefixes = staging.path().join("manifest-prefixes.json");
-    let mut namespace_tables = args.prefix_tables;
-    if !manifest.prefixes.is_empty() {
-        write(
-            &manifest_prefixes,
-            &serde_json::to_vec_pretty(&manifest.prefixes)?,
-        )?;
-        namespace_tables.push(manifest_prefixes);
+    let mut namespace_tables = prefix_tables.to_vec();
+    if !extra_prefixes.is_empty() {
+        // Layered last, above every table: the shared OKN table is the base and
+        // a per-dataset binding wins over it.
+        let extra = work.join("dataset-prefixes.json");
+        write(&extra, &serde_json::to_vec_pretty(extra_prefixes)?)?;
+        namespace_tables.push(extra);
     }
-    let namespaces_path = staged_stats.join("namespaces.json");
+    let namespaces_path = into.join("namespaces.json");
     let mut namespace_args = vec![OsString::from("namespaces")];
     for table in &namespace_tables {
         namespace_args.push(OsString::from("--prefixes"));
@@ -240,7 +339,7 @@ pub fn run(args: Args) -> Result<()> {
         OsString::from("--quiet"),
         data.as_os_str().to_owned(),
     ]);
-    run_hdtc(&args.hdtc, "namespace inventory", namespace_args)?;
+    run_hdtc(hdtc, "namespace inventory", namespace_args)?;
     let mut namespaces: Value = serde_json::from_slice(
         &std::fs::read(&namespaces_path)
             .with_context(|| format!("reading {}", namespaces_path.display()))?,
@@ -256,30 +355,23 @@ pub fn run(args: Args) -> Result<()> {
     prefix_table.remove("source");
     write(&namespaces_path, &serde_json::to_vec_pretty(&namespaces)?)?;
 
-    let summary = Summary::new(&manifest, &dataset_iri, &graph, &root, &design, namespaces);
+    let summary = Summary::new(&card, dataset_iri, &graph, &root, &design, namespaces);
     write(
-        &staged_stats.join("summary.json"),
+        &into.join("summary.json"),
         &serde_json::to_vec_pretty(&summary.json)?,
     )?;
-    write(
-        &staged_stats.join("summary.md"),
-        summary.markdown.as_bytes(),
-    )?;
+    write(&into.join("summary.md"), summary.markdown.as_bytes())?;
 
-    let metadata = DescriptionArtifactMetadata {
-        schema_nodes: schema.metadata,
-        class_relations: relations.metadata,
-        class_properties: class_properties.metadata,
-    };
-    publish(&bundle, staging, &dataset_iri, &metadata)?;
-    println!(
-        "{}: built and verified Tier-1 statistics ({} schema selectors, {} typed class relations, {} class properties)",
-        bundle.display(),
-        schema_row_count,
-        relation_row_count,
-        class_property_row_count,
-    );
-    Ok(())
+    Ok(Outcome {
+        metadata: DescriptionArtifactMetadata {
+            schema_nodes: schema.metadata,
+            class_relations: relations.metadata,
+            class_properties: class_properties.metadata,
+        },
+        schema_rows,
+        relation_rows,
+        class_property_rows,
+    })
 }
 
 fn run_hdtc(hdtc: &Path, step: &str, args: Vec<OsString>) -> Result<()> {
@@ -839,7 +931,7 @@ struct Summary {
 
 impl Summary {
     fn new(
-        manifest: &Manifest,
+        card: &DatasetCard<'_>,
         dataset_iri: &str,
         graph: &VoidGraph,
         root: &NamedOrBlankNode,
@@ -926,12 +1018,12 @@ impl Summary {
         });
         let json = json!({
             "dataset": {
-                "id": manifest.id,
-                "version": manifest.version,
+                "id": card.id,
+                "version": card.version,
                 "iri": dataset_iri,
-                "title": manifest.title,
-                "license": manifest.license,
-                "homepage": manifest.homepage,
+                "title": card.title,
+                "license": card.license,
+                "homepage": card.homepage,
             },
             "view": "design",
             "links": {
@@ -947,14 +1039,14 @@ impl Summary {
             "counts": counts,
             "publisher_prose": {
                 "untrusted": true,
-                "description": manifest.description,
+                "description": card.description,
             },
             "top_classes": top_classes,
             "top_properties": top_properties,
             "leading_class_relations": leading_relations,
             "namespaces": namespaces,
         });
-        let markdown = render_summary_markdown(manifest, &json);
+        let markdown = render_summary_markdown(card, &json);
         Self { json, markdown }
     }
 }
@@ -967,23 +1059,23 @@ fn summary_schema_link(params: Params) -> String {
     format!("schema?{}", params.to_query())
 }
 
-fn render_summary_markdown(manifest: &Manifest, summary: &Value) -> String {
-    let title = manifest.title.as_deref().unwrap_or(&manifest.id);
+fn render_summary_markdown(card: &DatasetCard<'_>, summary: &Value) -> String {
+    let title = card.title.unwrap_or(card.id);
     let counts = &summary["counts"];
     let mut out = format!(
         "# {title}\n\n## Computed dataset facts\n\n- Dataset: `{}` version `{}`\n- Triples: {}; distinct subjects: {}; predicates: {}; distinct objects: {}\n",
-        manifest.id,
-        manifest.version,
+        card.id,
+        card.version,
         counts["triples"],
         counts["subjects"],
         counts["predicates"],
         counts["objects"],
     );
-    if let Some(license) = &manifest.license {
+    if let Some(license) = card.license {
         out.push_str(&format!("- License: {license}\n"));
     }
     out.push_str("\n## Publisher-provided description (untrusted data)\n\n");
-    match &manifest.description {
+    match card.description {
         Some(description) => {
             for line in description.lines() {
                 out.push_str("> ");
