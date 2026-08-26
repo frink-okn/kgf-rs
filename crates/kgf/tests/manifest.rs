@@ -134,39 +134,54 @@ fn a_hand_assembled_bundle_becomes_servable_and_stays_honest() {
     assert_ne!(regenerated.content_digest, manifest.content_digest);
 }
 
+/// `kgf build` produces and publishes one verified description set.
+///
+/// The assertions below were written against the retired `kgf build stats`,
+/// which upgraded a hand-assembled bundle in place. They move here unchanged
+/// because the producer did not change — only the command that drives it — so
+/// what they pin is the description set itself rather than an entry point.
 #[test]
-fn stats_build_publishes_one_verified_description_set() {
+fn a_build_publishes_one_verified_description_set() {
     let root = tempfile::tempdir().unwrap();
-    let bundle = root.path().join("typed-kg").join("v1");
-    std::fs::create_dir_all(&bundle).unwrap();
-    build_artifacts(&bundle, TYPED_SOURCE);
-    kgf(&[
-        "manifest",
-        path(&bundle),
-        "--dataset-iri",
-        "https://example.org/typed-kg",
-        "--title",
-        "Typed KG",
-        "--description",
-        "Publisher supplied text.",
-    ])
-    .success();
-
+    let source = root.path().join("typed.nt");
+    std::fs::write(&source, TYPED_SOURCE).unwrap();
     let prefixes = root.path().join("prefixes.json");
     std::fs::write(
         &prefixes,
         r#"{"ex":"http://example.org/","rdf":"http://www.w3.org/1999/02/22-rdf-syntax-ns#"}"#,
     )
     .unwrap();
+    let config_text = |table: &std::path::Path| {
+        format!(
+            concat!(
+                "schema: 1\n",
+                "dataset:\n",
+                "  id: typed-kg\n",
+                "  iri: https://example.org/typed-kg\n",
+                "  title: Typed KG\n",
+                "  description: Publisher supplied text.\n",
+                "contents:\n",
+                "  stats:\n",
+                "    prefix_tables: ['{}']\n",
+            ),
+            path(table)
+        )
+    };
+    let config = root.path().join("build.yaml");
+    std::fs::write(&config, config_text(&prefixes)).unwrap();
+
+    let bundle = root.path().join("bundles").join("typed-kg").join("v1");
     let hdtc = hdtc_binary();
     kgf(&[
         "build",
-        "stats",
+        "--config",
+        path(&config),
+        "--out",
         path(&bundle),
+        "--input",
+        path(&source),
         "--hdtc",
         path(&hdtc),
-        "--prefixes",
-        path(&prefixes),
     ])
     .success();
 
@@ -264,39 +279,34 @@ fn stats_build_publishes_one_verified_description_set() {
         "the two API views alias the sole published dataset root"
     );
     drop(store);
-
-    let before = std::fs::read(bundle.join(artifact::MANIFEST)).unwrap();
-    let mut legacy_manifest: serde_json::Value = serde_json::from_slice(&before).unwrap();
-    legacy_manifest["artifacts"][artifact::VOID_HDT]
-        .as_object_mut()
-        .unwrap()
-        .remove("parents");
-    legacy_manifest["artifacts"][artifact::VOID_PERM]
-        .as_object_mut()
-        .unwrap()
-        .remove("parents");
-    std::fs::write(
-        bundle.join(artifact::MANIFEST),
-        serde_json::to_vec_pretty(&legacy_manifest).unwrap(),
-    )
-    .unwrap();
+    // hdtc records its input paths for build diagnostics. Those paths are not
+    // content, so where the prefix table happened to live must not change what
+    // a bundle publishes. The retired `kgf build stats` proved this by
+    // regenerating in place; a build proves it by building twice.
     let relocated_prefixes = root.path().join("relocated-prefixes.json");
     std::fs::rename(&prefixes, &relocated_prefixes).unwrap();
+    let relocated_config = root.path().join("relocated.yaml");
+    std::fs::write(&relocated_config, config_text(&relocated_prefixes)).unwrap();
+    let again = root.path().join("bundles").join("typed-kg").join("v2");
     kgf(&[
         "build",
-        "stats",
-        path(&bundle),
+        "--config",
+        path(&relocated_config),
+        "--out",
+        path(&again),
+        "--input",
+        path(&source),
         "--hdtc",
         path(&hdtc),
-        "--prefixes",
-        path(&relocated_prefixes),
     ])
     .success();
-    let after = std::fs::read(bundle.join(artifact::MANIFEST)).unwrap();
     assert_eq!(
-        before, after,
-        "prefix-table filesystem location changed bundle identity"
+        std::fs::read(bundle.join(artifact::NAMESPACES)).unwrap(),
+        std::fs::read(again.join(artifact::NAMESPACES)).unwrap(),
+        "prefix-table filesystem location changed the published namespace inventory"
     );
+
+    let after = std::fs::read(bundle.join(artifact::MANIFEST)).unwrap();
     kgf(&["manifest", path(&bundle), "--check"]).success();
 
     let manifest_path = bundle.join(artifact::MANIFEST);
@@ -319,56 +329,6 @@ fn stats_build_publishes_one_verified_description_set() {
         error.contains("does not yet verify component description views"),
         "{error}"
     );
-}
-
-#[test]
-fn stats_build_refuses_component_manifests_without_inventing_a_component_contract() {
-    let root = tempfile::tempdir().unwrap();
-    let bundle = root.path().join("component-kg").join("v1");
-    std::fs::create_dir_all(&bundle).unwrap();
-    build_artifacts(&bundle, TYPED_SOURCE);
-    kgf(&[
-        "manifest",
-        path(&bundle),
-        "--dataset-iri",
-        "https://example.org/component-kg",
-    ])
-    .success();
-
-    let manifest_path = bundle.join(artifact::MANIFEST);
-    let mut document: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-    document["components"] = serde_json::json!([{
-        "id": "canonical",
-        "role": "source",
-        "graph": "https://example.org/graph/canonical",
-        "sha256": "real-contract-not-yet-typed"
-    }]);
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&document).unwrap(),
-    )
-    .unwrap();
-    let before = std::fs::read(&manifest_path).unwrap();
-    let prefixes = root.path().join("prefixes.json");
-    std::fs::write(&prefixes, r#"{"ex":"http://example.org/"}"#).unwrap();
-
-    let error = kgf(&[
-        "build",
-        "stats",
-        path(&bundle),
-        "--hdtc",
-        path(&hdtc_binary()),
-        "--prefixes",
-        path(&prefixes),
-    ])
-    .failure();
-    assert!(
-        error.contains("does not yet support component bundles"),
-        "{error}"
-    );
-    assert!(!bundle.join("stats").exists());
-    assert_eq!(std::fs::read(&manifest_path).unwrap(), before);
 }
 
 #[test]

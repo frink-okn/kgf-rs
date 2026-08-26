@@ -42,6 +42,20 @@ pub struct Config {
     /// Limits for the external builders.
     #[serde(default)]
     pub resources: Resources,
+
+    /// Derived-triple components (doc 04 §4.4). Recognized, not yet supported.
+    ///
+    /// Named rather than left to `deny_unknown_fields` so that a config written
+    /// against doc 04's component DAG fails with an explanation instead of
+    /// "unknown field `components`". Claiming the key now stays additive: when
+    /// the DAG lands, the refusal becomes an implementation and no config that
+    /// works today breaks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub components: Option<serde_norway::Value>,
+
+    /// Which components merge into `data.hdt` (doc 04 §4.4). As above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<serde_norway::Value>,
 }
 
 /// Identity and description.
@@ -152,7 +166,7 @@ pub struct Perm {
 #[serde(deny_unknown_fields)]
 pub struct Text {
     /// Build it. `search` and `o.text` are absent from a bundle without it.
-    #[serde(default = "crate::build::bundle::config::yes")]
+    #[serde(default = "crate::build::config::yes")]
     pub enabled: bool,
     /// Skip literals whose lexical form exceeds this many bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]

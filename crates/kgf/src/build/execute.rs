@@ -25,8 +25,16 @@ use super::plan::{BundlePlan, Input, KEYSET_ROLES, SKETCH_ROLES};
 use crate::build::stats;
 use crate::manifest::Requested;
 
+/// What a completed build produced.
+pub(super) struct Built {
+    /// The manifest written last, describing everything beside it.
+    pub(super) manifest: Manifest,
+    /// Row counts from the description set, so an empty one is visible.
+    pub(super) description: stats::Outcome,
+}
+
 /// Build and publish one bundle.
-pub(super) fn execute(build: &Build) -> Result<Manifest> {
+pub(super) fn execute(build: &Build) -> Result<Built> {
     let plan = &build.plan;
     let parent = plan
         .output
@@ -127,7 +135,10 @@ pub(super) fn execute(build: &Build) -> Result<Manifest> {
             plan.output.display()
         )
     })?;
-    Ok(manifest)
+    Ok(Built {
+        manifest,
+        description: outcome,
+    })
 }
 
 /// Where a build's artifacts go. Purely paths, so that the commands a plan
@@ -599,9 +610,10 @@ fn quote(argument: &OsStr) -> String {
 }
 
 /// The per-artifact sizes doc 04 §4.4 asks a build to report.
-pub(super) fn report(manifest: &Manifest, output: &Path) -> String {
+pub(super) fn report(built: &Built, output: &Path) -> String {
     use std::fmt::Write;
 
+    let manifest = &built.manifest;
     let mut lines = String::new();
     let sizes: BTreeMap<&str, u64> = manifest
         .artifacts
@@ -623,6 +635,13 @@ pub(super) fn report(manifest: &Manifest, output: &Path) -> String {
         let _ = width;
     }
     let _ = writeln!(lines, "  {:<width$}  {}", "total", human(total));
+    let _ = writeln!(
+        lines,
+        "  described: {} schema selectors, {} typed class relations, {} class properties",
+        built.description.schema_rows,
+        built.description.relation_rows,
+        built.description.class_property_rows,
+    );
     lines
 }
 

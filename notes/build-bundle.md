@@ -1,4 +1,4 @@
-# `kgf build bundle` — one command, one config
+# `kgf build` — one command, one config
 
 Status: built and working end to end — config, plan, `--check-config`,
 `--dry-run`, the hdtc pipeline, provenance, and atomic publication. Two things
@@ -16,6 +16,8 @@ and the config schema kace will render. Where the two disagree, §7 says so.
 A bundle is assembled by hand: `hdtc create --perm`, then `hdtc text`, then
 optionally `hdtc sketch` and `hdtc keyset`, then `kgf manifest` to describe it,
 then `kgf build stats` to produce and publish the eight-artifact description set.
+Both stop-gaps are now retired: `kgf build` is the whole pipeline, and the
+producer they shared lives on as `build::stats::produce`.
 The ordering is load-bearing and written down nowhere executable. The risk the
 deployment plan names is precise: if kace learns that ordering, it lives in two
 repos and drifts, the way `augmentations.py` did.
@@ -26,7 +28,7 @@ out of a person's head and into one binary with one config schema.
 ## 2. Command shape
 
 ```
-kgf build bundle --config build.yaml --out <root>/<dataset>/<version>/
+kgf build --config build.yaml --out <root>/<dataset>/<version>/
 ```
 
 `--out` is the final version directory, exactly as doc 04 §4.4 spells it. The
@@ -170,29 +172,40 @@ what `kgf build stats` already does with the manifest's prefix map
    precision, so report actuals as they land and let `resources.max_bundle_bytes`
    refuse, rather than print a number that will be wrong.
 
-## 5. The refactor this needs
+## 5. One producer, one command
 
-`kgf build stats` requires a bundle that already has a `manifest.json` carrying
-typed dataset fields (`build/stats.rs:97`), because it was built as a producer
-that upgrades a hand-assembled bundle in place. `kgf build bundle` has that
-identity in hand from the config and has no manifest yet, so composing the two as
-they stand means writing a provisional manifest purely to satisfy a read.
+`kgf build stats` was the stop-gap that produced the description set, and it
+required a bundle that already had a `manifest.json` carrying typed dataset
+fields — it upgraded a hand-assembled bundle in place. `kgf build` has that
+identity from the config and has no manifest yet, so the two could not compose
+until the producer was separated from the command.
 
-Extract from `stats::run` a function that takes the staging directory, the
-dataset IRI, and the resolved prefix tables, produces the eight artifacts, and
-returns `DescriptionArtifactMetadata` — with no manifest read and no publish.
-Then:
+`build::stats::produce` now writes the eight artifacts into a directory and does
+nothing else: no manifest read, none written, nothing published. `kgf build`
+owns where that directory came from and what happens to it. What had forced the
+coupling was the summary card taking a `&Manifest` for six descriptive fields
+and nothing structural; `DatasetCard` carries those six from a config instead.
 
-- `kgf build stats` keeps its current contract: read identity from the manifest,
-  call the extracted function, publish with rollback.
-- `kgf build bundle` calls the same function with identity from the config and
-  publishes once, at the end, by renaming the whole staging directory.
+With the producer separated, `kgf build stats` had no unique job left except
+regenerating a description set *in place* on a published bundle — which fights
+doc 04 §4.6's immutability and the `PublishedBundle` obligation that rests on
+it. It is retired, and with it `kgf build bundle` collapses to `kgf build`,
+which is how doc 04 §4.4 spells it.
 
-The manifest is still written last and still verified by
-`write_description_manifest`, so "the manifest is the commit record" survives.
-The rollback machinery in `stats::publish` is specific to replacing a live
-description set in a published bundle; a fresh build has nothing to roll back to
-and should not inherit it.
+**What retiring it costs, and how that comes back.** When the description-set
+format revs, regenerating it across the corpus used to be cheap: stats are
+small, and the text index — the expensive step, covering every literal — could
+be left alone. A full rebuild pays for the text index again. The immutability-
+respecting version of that shortcut is a mode of `kgf build`: derive a new
+version from an existing one by hardlinking the expensive artifacts and
+rebuilding only stats and the manifest. That is a *new version*, not an edit,
+so it keeps §4.6.
+
+Worth building rather than a nicety, because it is the same primitive a
+predicate-roles correction needs (§7): a directory of hardlinks plus a new
+`manifest.json`, seconds rather than a rebuild. Two independent needs landing on
+one operation. It is additive — a flag on a command whose shape is already
+fixed — so the pipeline can depend on `kgf build` today without waiting for it.
 
 ## 6. How kace renders the config
 
@@ -452,10 +465,11 @@ rather than the build growing an artifact nothing reads.
 ## 8. Explicitly not in this
 
 The component DAG (doc 04 §4.4's `components:` and `publish:`), external tools,
-content-addressed memoisation, and per-component VoID. `kgf build stats` refuses
-component bundles today and should keep refusing. The config's top level must
-leave `components:` and `publish:` unclaimed so adding them later is additive
-rather than a schema break — which is the whole reason for the `schema: 1` line.
+content-addressed memoisation, and per-component VoID. The config names
+`components:` and `publish:` and refuses them with that reason rather than as
+unknown fields, so a config written against doc 04's DAG fails with an
+explanation. Claiming the keys stays additive: when the DAG lands the refusal
+becomes an implementation, and no config that works today breaks. That is the whole reason for the `schema: 1` line.
 
 Named graphs are off for this deployment (plan §9): `hdtc create` drops the graph
 component of quads, so there is no `.graphs` sidecar and no `graphs` capability

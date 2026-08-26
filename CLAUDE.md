@@ -42,7 +42,7 @@ Source/
 |---|---|
 | `kgf-store` | The memory-mapped read layer (doc 20). No HTTP, no async, no locks on the read path. |
 | `kgf-server` | The HTTP API (doc 03) over `kgf-store`: caps, budgets, cursors, formats. |
-| `kgf` | The binary. `kgf manifest`, `kgf serve`, and the first offline producer, `kgf build stats`. |
+| `kgf` | The binary: `kgf build`, `kgf serve`, `kgf manifest`. |
 
 **Status: M1 is built and answers.** `kgf-store` implements doc 20's read layer in
 full — mapped bundles, dictionary, all eight patterns with exact counts and positional
@@ -55,8 +55,11 @@ in, typed requests out) — over a real axum listener serving doc 03 §3.2's URL
 `/fragment`, `/count`, `/describe` and `/sample` in `answer`. Bindings-restricted
 QUERY and POST are implemented on `/fragment`, with per-binding QUERY/POST `/count`.
 The mapped description surface answers `/schema`, RDF `/void`, and persisted
-`/summary`; `kgf build stats` produces and publication-verifies their complete
-eight-artifact set. `kgf serve` runs it.
+`/summary`. `kgf build` assembles a whole bundle from one config — HDT and
+permutation, text, filters, key sets, the eight-artifact description set, and
+the manifest written last — staged beside the output and published by one
+rename. `kgf manifest` describes or `--check`s a bundle assembled by hand.
+`kgf serve` runs it.
 
 **M1 is not doc 03 §3.1's core profile**, and the two read like the same set. This
 implementation now extends past M1 with bindings QUERY (§3.4.2) and the complete

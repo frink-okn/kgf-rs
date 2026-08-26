@@ -1,8 +1,13 @@
-//! `kgf build stats` — produce the complete Tier-1 description set.
+//! The Tier-1 description set: `stats/`'s eight artifacts.
 //!
 //! hdtc owns the HDT, permutation, VoID, and namespace byte formats. This
-//! command composes those builders, derives KGF's semantic TSV projections and
-//! persisted summaries, and publishes the eight artifacts as one verified set.
+//! module composes those builders and derives KGF's semantic TSV projections
+//! and persisted summaries on top of them.
+//!
+//! It writes files and nothing else — no manifest is read, none is written,
+//! nothing is published. [`super::execute`] owns where the output directory
+//! came from and what happens to it, which is what lets one producer serve a
+//! build without knowing anything about staging or publication.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -13,17 +18,13 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
 use kgf_server::url::Params;
-use kgf_store::manifest::{ArtifactView, Manifest, ManifestDocument};
-use kgf_store::store::artifact;
+use kgf_store::manifest::ArtifactView;
 use oxrdf::{NamedOrBlankNode, Term, Triple};
 use oxrdfio::{RdfFormat, RdfParser};
 use serde::Serialize;
 use serde_json::{Value, json};
-use tempfile::TempDir;
 
-use crate::manifest::{
-    DescriptionArtifactMetadata, RowArtifactMetadata, write_description_manifest,
-};
+use crate::manifest::{DescriptionArtifactMetadata, RowArtifactMetadata};
 
 const VOID_CLASS_PARTITION: &str = "http://rdfs.org/ns/void#classPartition";
 const VOID_PROPERTY_PARTITION: &str = "http://rdfs.org/ns/void#propertyPartition";
@@ -43,128 +44,13 @@ const RELATIONS_HEADER: &str = "view\tsubject_class\tpredicate\tobject_class\ttr
 const CLASS_PROPERTIES_HEADER: &str =
     "view\tclass\tpredicate\ttriples\tdistinct_subjects\tdistinct_objects\n";
 
-/// Arguments for `kgf build stats`.
-#[derive(Debug, clap::Args)]
-pub struct Args {
-    /// Bundle version directory containing `data.hdt` and `manifest.json`.
-    pub bundle: PathBuf,
-
-    /// hdtc executable used for VoID, HDT, permutation, and namespace production.
-    #[arg(long, default_value = "hdtc")]
-    pub hdtc: PathBuf,
-
-    /// Prefix table; repeat to layer tables, with later files winning.
-    #[arg(long = "prefixes", value_name = "TABLE", required = true)]
-    pub prefix_tables: Vec<PathBuf>,
-
-    /// Stable dataset IRI; defaults to `dataset_iri` in the current manifest.
-    #[arg(long)]
-    pub dataset_iri: Option<String>,
-}
-
-fn reject_declared_components(bundle: &Path) -> Result<()> {
-    let path = bundle.join(artifact::MANIFEST);
-    let document: Value = serde_json::from_slice(
-        &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
-    )
-    .with_context(|| format!("parsing {}", path.display()))?;
-    let Some(entries) = document.get("components") else {
-        return Ok(());
-    };
-    let entries = entries
-        .as_array()
-        .context("manifest components must be an array")?;
-    ensure!(
-        entries.is_empty(),
-        "kgf build stats does not yet support component bundles; the full `kgf build` must bind each manifest component to its declared artifact, graph identity, checksum, and entailment regime"
-    );
-    Ok(())
-}
-
-/// Build and publish a bundle's complete description set.
-pub fn run(args: Args) -> Result<()> {
-    let bundle = args
-        .bundle
-        .canonicalize()
-        .with_context(|| format!("resolving bundle directory {}", args.bundle.display()))?;
-    let data = bundle.join(artifact::HDT);
-    ensure!(data.is_file(), "bundle has no {}", data.display());
-    // This command is also the migration boundary between description-set
-    // revisions. A server must reject a partial current set, but the builder
-    // must be able to read the ordinary typed fields of a manifest that
-    // completely described the previous set and then replace it atomically.
-    // `ManifestDocument` preserves unmodeled fields and enforces the manifest
-    // format version without applying the current description all-or-none
-    // invariant before the replacement exists.
-    let document = ManifestDocument::read(&bundle)?
-        .context("kgf build stats requires an existing manifest.json")?;
-    let manifest = document
-        .parsed()
-        .cloned()
-        .context("manifest.json does not contain the typed dataset fields kgf build stats needs")?;
-    let dataset_iri = args
-        .dataset_iri
-        .or_else(|| manifest.dataset_iri.clone())
-        .context("a stable dataset IRI is required; pass --dataset-iri or record dataset_iri in manifest.json")?;
-    oxrdf::NamedNode::new(&dataset_iri)
-        .with_context(|| format!("dataset IRI {dataset_iri:?} is not an absolute RDF IRI"))?;
-    reject_declared_components(&bundle)?;
-
-    for table in &args.prefix_tables {
-        ensure!(
-            table.is_file(),
-            "prefix table {} is not a file",
-            table.display()
-        );
-    }
-
-    let parent = bundle
-        .parent()
-        .context("bundle directory has no parent for same-filesystem staging")?;
-    let staging = tempfile::Builder::new()
-        .prefix(".kgf-stats-")
-        .tempdir_in(parent)
-        .with_context(|| {
-            format!(
-                "creating stats staging directory under {}",
-                parent.display()
-            )
-        })?;
-    let staged_stats = staging.path().join("stats");
-    std::fs::create_dir(&staged_stats)
-        .with_context(|| format!("creating {}", staged_stats.display()))?;
-
-    let outcome = produce(
-        Inputs {
-            hdtc: &args.hdtc,
-            data: &data,
-            dataset_iri: &dataset_iri,
-            prefix_tables: &args.prefix_tables,
-            extra_prefixes: &manifest.prefixes,
-            card: DatasetCard::from_manifest(&manifest),
-            work: staging.path(),
-        },
-        &staged_stats,
-    )?;
-
-    publish(&bundle, staging, &dataset_iri, &outcome.metadata)?;
-    println!(
-        "{}: built and verified Tier-1 statistics ({} schema selectors, {} typed class relations, {} class properties)",
-        bundle.display(),
-        outcome.schema_rows,
-        outcome.relation_rows,
-        outcome.class_property_rows,
-    );
-    Ok(())
-}
-
 /// What a summary card says about the dataset it describes.
 ///
 /// The summary needs six descriptive fields and nothing structural. Taking them
-/// as their own value rather than as a [`Manifest`] is what lets the producer
-/// run before a manifest exists: `kgf build stats` upgrades a bundle that
-/// already has one, `kgf build bundle` has only a config, and neither should
-/// have to invent the other's document to reach this code.
+/// as their own value rather than as a `Manifest` is what lets the producer run
+/// before a manifest exists at all — which it must, because `kgf build` writes
+/// the manifest last, after this has already produced the artifacts it will
+/// describe.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DatasetCard<'a> {
     pub(crate) id: &'a str,
@@ -173,19 +59,6 @@ pub(crate) struct DatasetCard<'a> {
     pub(crate) description: Option<&'a str>,
     pub(crate) license: Option<&'a str>,
     pub(crate) homepage: Option<&'a str>,
-}
-
-impl<'a> DatasetCard<'a> {
-    pub(crate) fn from_manifest(manifest: &'a Manifest) -> Self {
-        Self {
-            id: &manifest.id,
-            version: &manifest.version,
-            title: manifest.title.as_deref(),
-            description: manifest.description.as_deref(),
-            license: manifest.license.as_deref(),
-            homepage: manifest.homepage.as_deref(),
-        }
-    }
 }
 
 /// Everything the description producer needs, and nothing about where the
@@ -385,83 +258,6 @@ fn run_hdtc(hdtc: &Path, step: &str, args: Vec<OsString>) -> Result<()> {
 
 fn write(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
-}
-
-fn publish(
-    bundle: &Path,
-    staging: TempDir,
-    dataset_iri: &str,
-    metadata: &DescriptionArtifactMetadata,
-) -> Result<()> {
-    let staged = staging.path().join("stats");
-    let live = bundle.join("stats");
-    let backup = staging.path().join("previous-stats");
-    let manifest_path = bundle.join(artifact::MANIFEST);
-    let previous_manifest = std::fs::read(&manifest_path).with_context(|| {
-        format!(
-            "reading {} for publication rollback",
-            manifest_path.display()
-        )
-    })?;
-
-    if live.exists() {
-        std::fs::rename(&live, &backup).with_context(|| {
-            format!("moving existing {} to atomic-build backup", live.display())
-        })?;
-    }
-    if let Err(error) = std::fs::rename(&staged, &live)
-        .with_context(|| format!("publishing staged description set to {}", live.display()))
-    {
-        if backup.exists()
-            && let Err(restore) = std::fs::rename(&backup, &live)
-        {
-            return Err(error).context(format!(
-                "publication failed and restoring {} also failed: {restore}",
-                live.display()
-            ));
-        }
-        return Err(error);
-    }
-
-    let requested = crate::manifest::Requested {
-        dataset_iri: Some(dataset_iri.to_owned()),
-        ..Default::default()
-    };
-    if let Err(error) = write_description_manifest(bundle, &requested, metadata) {
-        let failed = staging.path().join("failed-stats");
-        if let Err(restore) =
-            restore_publication(&live, &failed, &backup, &manifest_path, &previous_manifest)
-        {
-            return Err(error).context(format!(
-                "published stats failed verification and restoring the prior bundle also failed: {restore:#}"
-            ));
-        }
-        return Err(error)
-            .context("published stats failed bundle verification; restored prior bundle");
-    }
-    Ok(())
-}
-
-fn restore_publication(
-    live: &Path,
-    failed: &Path,
-    backup: &Path,
-    manifest: &Path,
-    previous_manifest: &[u8],
-) -> Result<()> {
-    std::fs::rename(live, failed).with_context(|| {
-        format!(
-            "moving failed description set {} out of the publication path",
-            live.display()
-        )
-    })?;
-    if backup.exists() {
-        std::fs::rename(backup, live)
-            .with_context(|| format!("restoring prior description set to {}", live.display()))?;
-    }
-    std::fs::write(manifest, previous_manifest)
-        .with_context(|| format!("restoring prior manifest {}", manifest.display()))?;
-    Ok(())
 }
 
 fn read_ntriples(path: &Path) -> Result<Vec<Triple>> {

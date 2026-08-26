@@ -1,7 +1,7 @@
-//! `kgf build bundle`'s command surface: what a caller can and cannot ask for.
+//! `kgf build`'s command surface: what a caller can and cannot ask for.
 //!
 //! The resolution rules themselves are unit-tested beside them in
-//! `build::bundle::plan`. What is tested here is the seam kace meets — a config
+//! `build::plan`. What is tested here is the seam kace meets — a config
 //! on stdin, a resolved plan on stdout, and refusals that name the fix — because
 //! that surface is the contract `notes/build-bundle.md` §6 asks a build workflow
 //! to depend on.
@@ -34,11 +34,7 @@ const SOURCE: &str = concat!(
 /// without knowing where a bundle would ever be written.
 #[test]
 fn check_config_needs_neither_an_output_nor_an_input() {
-    let stdout = kgf(
-        &["build", "bundle", "--config", "-", "--check-config"],
-        MINIMAL,
-    )
-    .ok();
+    let stdout = kgf(&["build", "--config", "-", "--check-config"], MINIMAL).ok();
     let plan: serde_json::Value = serde_json::from_str(&stdout).expect("a resolved plan is JSON");
     assert_eq!(plan["dataset"]["id"], "dreamkg");
     assert_eq!(plan["contents"]["filters"]["k"], 65536);
@@ -47,7 +43,7 @@ fn check_config_needs_neither_an_output_nor_an_input() {
 
 #[test]
 fn a_build_without_an_output_is_refused_by_the_parser() {
-    let stderr = kgf(&["build", "bundle", "--config", "-"], MINIMAL).err();
+    let stderr = kgf(&["build", "--config", "-"], MINIMAL).err();
     assert!(stderr.contains("--out"), "{stderr}");
 }
 
@@ -55,11 +51,7 @@ fn a_build_without_an_output_is_refused_by_the_parser() {
 fn a_build_without_an_input_says_which_flags_supply_one() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("dreamkg/2026-06-01");
-    let stderr = kgf(
-        &["build", "bundle", "--config", "-", "--out", path(&out)],
-        MINIMAL,
-    )
-    .err();
+    let stderr = kgf(&["build", "--config", "-", "--out", path(&out)], MINIMAL).err();
     assert!(
         stderr.contains("--hdt") && stderr.contains("--input"),
         "{stderr}"
@@ -79,7 +71,6 @@ fn an_existing_output_directory_is_refused() {
     let stderr = kgf(
         &[
             "build",
-            "bundle",
             "--config",
             "-",
             "--out",
@@ -104,7 +95,6 @@ fn an_output_path_disagreeing_with_the_config_is_refused() {
     let stderr = kgf(
         &[
             "build",
-            "bundle",
             "--config",
             "-",
             "--out",
@@ -131,7 +121,6 @@ fn a_build_produces_a_bundle_its_own_check_accepts() {
     let stdout = kgf(
         &[
             "build",
-            "bundle",
             "--config",
             "-",
             "--out",
@@ -211,7 +200,6 @@ fn key_artifacts_are_described_per_file_and_cross_checked() {
     kgf(
         &[
             "build",
-            "bundle",
             "--config",
             "-",
             "--out",
@@ -298,7 +286,6 @@ fn a_key_set_from_another_bundle_is_refused_even_when_the_counts_agree() {
         kgf(
             &[
                 "build",
-                "bundle",
                 "--config",
                 "-",
                 "--out",
@@ -347,7 +334,6 @@ fn a_key_set_stored_under_another_role_name_is_refused() {
     kgf(
         &[
             "build",
-            "bundle",
             "--config",
             "-",
             "--out",
@@ -384,7 +370,6 @@ fn a_mismatched_source_digest_publishes_nothing() {
     let stderr = kgf(
         &[
             "build",
-            "bundle",
             "--config",
             "-",
             "--out",
@@ -421,7 +406,6 @@ fn a_dry_run_names_every_command_and_creates_nothing() {
     let stdout = kgf(
         &[
             "build",
-            "bundle",
             "--config",
             "-",
             "--out",
@@ -470,7 +454,6 @@ fn an_asserted_source_digest_must_look_like_one() {
         let stderr = kgf(
             &[
                 "build",
-                "bundle",
                 "--config",
                 "-",
                 "--out",
@@ -487,12 +470,29 @@ fn an_asserted_source_digest_must_look_like_one() {
     }
 }
 
+/// Doc 04 §4.4's component DAG is not built here, and a config that declares
+/// one is refused with that reason rather than with "unknown field". The
+/// failure mode this prevents is quiet: a bundle whose config named components
+/// and whose artifacts contain none would be described as an ordinary bundle,
+/// with every per-component statistic and graph identity silently absent.
+#[test]
+fn a_config_declaring_components_is_refused_with_a_reason() {
+    for field in ["components", "publish"] {
+        let stderr = kgf(
+            &["build", "--config", "-", "--check-config"],
+            &format!("{MINIMAL}{field}: []\n"),
+        )
+        .err();
+        assert!(stderr.contains("doc 04 §4.4"), "{field}: {stderr}");
+        assert!(stderr.contains("--input"), "{field}: {stderr}");
+    }
+}
+
 #[test]
 fn an_unreadable_config_names_the_file() {
     let stderr = kgf(
         &[
             "build",
-            "bundle",
             "--config",
             "/nonexistent/build.yaml",
             "--check-config",

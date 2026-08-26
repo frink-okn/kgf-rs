@@ -15,7 +15,7 @@ the spec versions independently of it.
 |---|---|
 | `kgf-store` | The memory-mapped read layer (doc 20). No HTTP, no async, no locks on the read path. |
 | `kgf-server` | The HTTP API (doc 03) over `kgf-store`: caps, budgets, cursors, formats. |
-| `kgf` | The binary. `kgf serve` now; `kgf build` when `kgf-build` lands. |
+| `kgf` | The binary: `kgf build`, `kgf serve`, `kgf manifest`. |
 
 ## Building
 

@@ -517,6 +517,24 @@ impl ConfigPlan {
             config::SCHEMA_VERSION
         );
 
+        // Refused rather than ignored. A bundle whose config declares components
+        // and whose artifacts contain none would be described as a plain bundle
+        // — the statistics, the graph identities, and the entailment flags doc
+        // 04 §4.3 hangs off each component all silently absent.
+        for (field, value) in [
+            ("components", &config.components),
+            ("publish", &config.publish),
+        ] {
+            ensure!(
+                value.is_none(),
+                "build config declares `{field}`, but this build has no component \
+                 DAG: it merges no derived components, binds no per-component graph \
+                 identity, and produces no per-component statistics (doc 04 §4.4). \
+                 Remove it, or build the components with their own tools and pass \
+                 the merged result as `--input`"
+            );
+        }
+
         let dataset = resolve_dataset(config.dataset)?;
         let semantics = resolve_semantics(config.semantics)?;
         let contents = resolve_contents(config.contents)?;
