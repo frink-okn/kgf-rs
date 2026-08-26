@@ -29,10 +29,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frink-okn/hdtc
-          # kgf-rs currently develops against hdtc's published format façade,
-          # which has not landed on hdtc's default branch yet. Pin this to the
-          # release commit when the two repositories stop moving together.
-          ref: lib
+          ref: 1.2.0-beta.2
           path: hdtc
 
       - name: Install the toolchain
