@@ -649,12 +649,15 @@ fn verify_text_binding(dir: &Path) -> Result<()> {
 /// not in `kgf-store`: full digests belong to publish and `kgf verify`, never to
 /// the latency-sensitive open path (doc 20 §20.6).
 fn checksum_artifacts(dir: &Path, facts: &BundleFacts) -> Result<Vec<(String, ArtifactEntry)>> {
+    // Computed once, not per file: seven sidecars would otherwise rescan the
+    // same HDT seven times to reach the same answer.
+    let identity = hdt_data_digest(&dir.join(artifact::HDT))?;
     let entries: Vec<(String, ArtifactEntry)> = facts
         .artifact_names()
         .map(|name| {
             let path = dir.join(name);
             let entry = checksum_artifact(&path)?;
-            let entry = match describe_key_artifact(name, &path)? {
+            let entry = match describe_key_artifact(name, &path, &identity)? {
                 Some(keys) => ArtifactEntry::key_artifact(entry.bytes, entry.sha256, keys),
                 None => entry,
             };
@@ -673,11 +676,16 @@ fn checksum_artifacts(dir: &Path, facts: &BundleFacts) -> Result<Vec<(String, Ar
 /// `docs/keyset-format.md` §4.4 require — a full pass, which is why this lives
 /// in the producer beside the checksum that already reads the file, and not in
 /// `BundleFacts::read`, whose cost must stay independent of bundle size.
-fn describe_key_artifact(name: &str, path: &Path) -> Result<Option<KeyArtifact>> {
+fn describe_key_artifact(
+    name: &str,
+    path: &Path,
+    identity: &[u8; 32],
+) -> Result<Option<KeyArtifact>> {
     if artifact::FILTERS.contains(&name) {
         let header = hdtc::format::read_sketch_header(path)
             .with_context(|| format!("reading the sketch header of {}", path.display()))?;
         verify_role_matches_name(name, path, header.role.file_stem())?;
+        verify_binding(path, &header.source_digest, identity)?;
         return Ok(Some(KeyArtifact {
             convention_id: header.convention_id,
             format_version: header.format_version,
@@ -691,6 +699,7 @@ fn describe_key_artifact(name: &str, path: &Path) -> Result<Option<KeyArtifact>>
         let header = hdtc::format::read_keyset_header(path)
             .with_context(|| format!("reading the key-set header of {}", path.display()))?;
         verify_role_matches_name(name, path, header.role.file_stem())?;
+        verify_binding(path, &header.source_digest, identity)?;
         return Ok(Some(KeyArtifact {
             convention_id: header.convention_id,
             format_version: header.format_version,
@@ -701,6 +710,56 @@ fn describe_key_artifact(name: &str, path: &Path) -> Result<Option<KeyArtifact>>
         }));
     }
     Ok(None)
+}
+
+/// The identity digest every sidecar binds to its HDT.
+///
+/// The SHA-256 of the Dictionary-and-Triples suffix, starting where the
+/// dictionary's control info begins (`hdtc/docs/keyset-format.md` §6,
+/// `sketch-format.md` §7). The header is excluded so that `hdtc header`
+/// rewriting an HDT's metadata leaves its sidecars bound to it.
+///
+/// Composed from `hdtc::format` rather than reimplemented: `scan_hdt_sections`
+/// locates the offset and `sha256_to_end` hashes from there, which is exactly
+/// what hdtc's own internal helper does.
+fn hdt_data_digest(hdt: &Path) -> Result<[u8; 32]> {
+    use std::io::{BufReader, Seek, SeekFrom};
+
+    let file = std::fs::File::open(hdt)
+        .with_context(|| format!("opening {} for its identity digest", hdt.display()))?;
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let sections = hdtc::format::scan_hdt_sections(&mut reader)
+        .with_context(|| format!("locating the dictionary in {}", hdt.display()))?;
+    reader
+        .seek(SeekFrom::Start(sections.data_offset))
+        .with_context(|| format!("seeking to the dictionary in {}", hdt.display()))?;
+    hdtc::format::sha256_to_end(&mut reader).with_context(|| format!("digesting {}", hdt.display()))
+}
+
+/// A key artifact must be bound to *this* bundle's HDT.
+///
+/// The formats call `source_digest` advisory, and for a *consumer* it is: doc 18
+/// §4.1 forbids letting it gate comparability, because a rebuild changes the
+/// digest without changing what the keys mean. A producer describing its own
+/// bundle is the opposite case — here a mismatch says this file was built from
+/// different bytes than the ones beside it, which is precisely the staleness
+/// the digest exists to detect, and the same rule `verify_text_binding` applies
+/// to the text index.
+///
+/// This is the content check the doc 18 §18.4 count identity cannot make. That
+/// identity compares totals, so a file swapped for another bundle's passes
+/// whenever the numbers happen to agree — which two of this repo's own fixtures
+/// do.
+fn verify_binding(path: &Path, declared: &[u8; 32], identity: &[u8; 32]) -> Result<()> {
+    ensure!(
+        declared == identity,
+        "{} was built from a different HDT than the one beside it ({} against \
+         this bundle's {}); it belongs to another bundle or another build",
+        path.display(),
+        hex(declared),
+        hex(identity)
+    );
+    Ok(())
 }
 
 /// A key artifact's declared role must be the one its file name says.
@@ -1076,6 +1135,61 @@ mod tests {
     /// are about the flag surface, so they must exercise the parse.
     fn args(bindings: &[&str]) -> Requested {
         requested(bindings, &[])
+    }
+
+    /// The doc 18 §18.4 identity, exercised directly.
+    ///
+    /// Unit rather than end-to-end because the `source_digest` binding now
+    /// refuses a foreign key set before the counts are ever compared, which
+    /// leaves this check guarding a narrower case: artifacts that do belong to
+    /// this HDT and still disagree — an hdtc bug, or the concurrent-temp-dir
+    /// corruption doc 18 §18.4 records. That case cannot be staged by copying
+    /// files around, so it is staged here.
+    #[test]
+    fn the_key_decomposition_identity_is_checked_both_ways() {
+        let entry = |count: u64| {
+            ArtifactEntry::key_artifact(
+                1,
+                "00",
+                KeyArtifact {
+                    convention_id: 1,
+                    format_version: 1,
+                    hash_id: 1,
+                    role: "unused".to_owned(),
+                    key_count: count,
+                    encoding: None,
+                },
+            )
+        };
+        let bundle = |shared, subjects_only, objects_only, subjects, objects| {
+            vec![
+                ("keysets/shared.keys".to_owned(), entry(shared)),
+                (
+                    "keysets/subjects-only.keys".to_owned(),
+                    entry(subjects_only),
+                ),
+                ("keysets/objects-only.keys".to_owned(), entry(objects_only)),
+                ("filters/subjects.filter".to_owned(), entry(subjects)),
+                ("filters/objects.filter".to_owned(), entry(objects)),
+            ]
+        };
+        let dir = Path::new("/bundle");
+
+        assert!(verify_key_decomposition(dir, &bundle(2, 1, 3, 3, 5)).is_ok());
+
+        let subjects_wrong = verify_key_decomposition(dir, &bundle(2, 1, 3, 4, 5))
+            .expect_err("a subjects-side disagreement must be refused");
+        assert!(format!("{subjects_wrong:#}").contains("subjects-only"));
+
+        let objects_wrong = verify_key_decomposition(dir, &bundle(2, 1, 3, 3, 6))
+            .expect_err("an objects-side disagreement must be refused");
+        assert!(format!("{objects_wrong:#}").contains("objects-only"));
+
+        // A missing role is absent information, never an empty role
+        // (doc 18 §18.4), so there is nothing to compare rather than a
+        // mismatch to report.
+        let partial = vec![("filters/subjects.filter".to_owned(), entry(9))];
+        assert!(verify_key_decomposition(dir, &partial).is_ok());
     }
 
     fn bad_prefix_flags(bindings: &[&str]) -> Result<Requested> {

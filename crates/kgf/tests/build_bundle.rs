@@ -269,21 +269,25 @@ fn key_artifacts_are_described_per_file_and_cross_checked() {
     }
 }
 
-/// The identity is worth nothing if it cannot fail. Doc 18 §18.4 records a
-/// build whose key sets were structurally perfect — correct CRC32C, correct
-/// `source_digest`, ascending keys — and held another graph's keys; only this
-/// check caught it.
+/// The case the doc 18 §18.4 count identity cannot catch: a key set from
+/// another bundle whose totals happen to agree. Both fixtures here have two
+/// shared keys, so the identity holds and only the `source_digest` binding
+/// separates them.
 #[test]
-fn a_key_set_from_another_bundle_is_refused() {
+fn a_key_set_from_another_bundle_is_refused_even_when_the_counts_agree() {
     let dir = tempfile::tempdir().unwrap();
     let mine = dir.path().join("mine.nt");
     let theirs = dir.path().join("theirs.nt");
     std::fs::write(&mine, SOURCE).unwrap();
-    // One more subject, so the decomposition totals differ.
+    // A structural mirror of SOURCE — same triple shape, same role
+    // cardinalities, different IRIs — so every count agrees and nothing but the
+    // binding can tell the two bundles' key sets apart.
     std::fs::write(
         &theirs,
-        format!(
-            "{SOURCE}<http://example.org/carol> <http://example.org/knows>              <http://example.org/dave> .\n"
+        concat!(
+            "<http://example.org/carol> <http://www.w3.org/2000/01/rdf-schema#label> \"Carol\" .\n",
+            "<http://example.org/carol> <http://example.org/knows> <http://example.org/dave> .\n",
+            "<http://example.org/dave> <http://www.w3.org/2000/01/rdf-schema#label> \"Dave\" .\n",
         ),
     )
     .unwrap();
@@ -309,14 +313,27 @@ fn a_key_set_from_another_bundle_is_refused() {
         .ok();
     }
 
+    let key_count = |bundle: &std::path::Path| -> u64 {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+        manifest["artifacts"]["keysets/shared.keys"]["keys"]["key_count"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!(
+        key_count(&ours),
+        key_count(&other),
+        "the fixtures must agree on this count, or the test proves nothing"
+    );
+
     std::fs::copy(
-        other.join("keysets/subjects-only.keys"),
-        ours.join("keysets/subjects-only.keys"),
+        other.join("keysets/shared.keys"),
+        ours.join("keysets/shared.keys"),
     )
     .unwrap();
     let stderr = kgf(&["manifest", path(&ours)], "").err();
-    assert!(stderr.contains("doc 18 §18.4"), "{stderr}");
-    assert!(stderr.contains("one artifact is wrong"), "{stderr}");
+    assert!(stderr.contains("different HDT"), "{stderr}");
+    assert!(stderr.contains("another bundle"), "{stderr}");
 }
 
 /// The half the count identity cannot cover: a file whose header names a

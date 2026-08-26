@@ -338,14 +338,27 @@ capabilities. Doc 18 §18.4's cross-family identity runs before any manifest is
 written. What follows is the original finding, kept because the reasoning about
 *why* it had to happen before the corpus build still applies.
 
-**One limit worth stating.** The §18.4 identity compares **counts, not content**.
-A key set swapped for another bundle's passes whenever the totals happen to
-agree — which is not hypothetical: two of the fixture bundles here had the same
-`shared.keys` count, so the planted file went undetected until the count
-differed. A role/name consistency check now covers part of the gap, but the real
-content guard is `source_digest`, and computing it needs the HDT's
-Dictionary-and-Triples offset — `hdt_data_offset`, which hdtc keeps
-`pub(crate)`. A third small hdtc request (§7a).
+**Three checks, because the first one alone is not enough.** The §18.4 identity
+compares **counts, not content**: a key set swapped for another bundle's passes
+whenever the totals happen to agree, which is not hypothetical — two fixtures
+here had the same `shared.keys` count and the planted file went undetected until
+a count differed. So the build also verifies that a file's declared role matches
+the name it is stored under, and — the real guard — that its `source_digest`
+binds to this bundle's own HDT.
+
+That last one needed no hdtc change, which is worth recording because the first
+conclusion was that it did. hdtc's `hdt_data_digest` is `pub(crate)`, but it is
+only `scan_hdt_sections` to find `data_offset`, a seek, and `sha256_to_end` —
+and all three of those *are* exported. Composing them here gives the identical
+digest. Check what the façade already permits before asking for an addition to
+it.
+
+The formats call `source_digest` advisory, and for a consumer it is: doc 18 §4.1
+forbids letting it gate comparability, since a rebuild changes the digest
+without changing what the keys mean. A producer describing its own bundle is the
+opposite case — a mismatch there says this file was built from different bytes
+than the ones beside it, exactly the staleness the digest exists to detect, and
+the same rule `verify_text_binding` already applies to the text index.
 
 The original finding:
 
