@@ -32,8 +32,14 @@ jobs:
           ref: 1.2.0-beta.2
           path: hdtc
 
+      # Pinned, not `@stable`. A floating toolchain means CI can go red with no
+      # code change at all — which is what happened when 1.98 added
+      # `clippy::chunks_exact_to_as_chunks` and `-D warnings` turned it into a
+      # build failure. The differential tests already pin hdtc to a tag; a
+      # floating compiler was the odd one out. Bumping this is a deliberate
+      # commit, and the same commit fixes whatever the new lints find.
       - name: Install the toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: rustfmt, clippy
 
