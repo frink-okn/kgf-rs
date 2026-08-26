@@ -477,6 +477,71 @@ pub struct Manifest {
     /// The version this one supersedes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_version: Option<String>,
+    /// How this bundle was built, for re-derivation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
+}
+
+/// Provenance: what this bundle was built from, and by what.
+///
+/// **Not identity.** `content_digest` is a Merkle root over *published bytes*,
+/// and doc 04 §4.3 is emphatic that it is not a digest of build inputs — two
+/// builds from one source may legitimately differ. So nothing here participates
+/// in the digest, and none of it is verified at open. It answers "what would I
+/// run to get a bundle like this one again", which matters when a serving volume
+/// is the only copy and a rebuild is the recovery path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Source {
+    /// What the bundle was built from, in the order the builder read them.
+    ///
+    ///
+    /// A list rather than doc 04 §4.3's single object: building from several
+    /// files is ordinary, and per-input blank-node disambiguation (§4.4 step 1)
+    /// already makes the order meaningful.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<SourceInput>,
+    /// What built it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator: Option<Generator>,
+}
+
+/// One build input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceInput {
+    /// Where it came from. Caller-supplied and unverifiable: a builder can hash
+    /// the bytes it read but cannot confirm the name they were fetched under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Its serialization: `hdt`, `n-triples`, `turtle`, …
+    ///
+    /// `hdt` is a legitimate value. Doc 04 §4.4 assumes RDF in, but a pipeline
+    /// that already normalized and built one is the ordinary OKN case.
+    pub format: String,
+    /// Lowercase hex SHA-256 of the bytes the builder actually read.
+    pub sha256: String,
+}
+
+/// What produced a bundle.
+///
+/// Doc 04 §4.3 hangs `generator` off each *component*, which leaves a bundle
+/// with no derived components — every OKN bundle today — with nowhere to record
+/// which toolchain built it. Without that, "re-derive exactly" is not true:
+/// the permutation, sketch, and text formats are pinned by convention rather
+/// than by commit, so the producing version is what makes a rebuild comparable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Generator {
+    /// The `kgf` that orchestrated the build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kgf: Option<String>,
+    /// The `hdtc` that produced the byte formats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdtc: Option<String>,
+    /// OCI reference of the builder image. Caller-supplied and unverifiable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 impl Manifest {
@@ -1145,6 +1210,7 @@ mod tests {
             predicate_roles: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             previous_version: None,
+            source: None,
         }
     }
 
@@ -1358,14 +1424,32 @@ mod tests {
         assert!(error.to_string().contains("found an array"), "{error}");
     }
 
+    /// `source` was an unmodeled field before `kgf build bundle` produced one,
+    /// and doc 04 §4.3 still shows the older `{format, sha256, url}` shape. A
+    /// document written to that shape must fail loudly rather than parse into
+    /// an empty `Source`: silently dropping provenance would leave a manifest
+    /// that looks like it records where the bundle came from and does not.
+    #[test]
+    fn a_source_block_in_the_superseded_shape_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut json = serde_json::to_value(sample_manifest(sample_counts())).unwrap();
+        json["source"] = serde_json::json!({"format": "n-triples", "sha256": "abc"});
+        write_document(dir.path(), &json);
+
+        let document = ManifestDocument::read(dir.path()).unwrap().unwrap();
+        assert!(
+            document.parsed().is_none(),
+            "a superseded source shape must not parse as an empty one"
+        );
+    }
+
     #[test]
     fn rewriting_replaces_modeled_fields_and_keeps_everything_else() {
         let dir = tempfile::tempdir().unwrap();
 
-        // A document carrying doc 04 §4.3 fields this build does not model, plus
-        // one from a newer writer.
+        // A document carrying a doc 04 §4.3 field this build does not model,
+        // plus one from a newer writer.
         let mut json = serde_json::to_value(sample_manifest(sample_counts())).unwrap();
-        json["source"] = serde_json::json!({"format": "n-triples", "sha256": "abc"});
         json["components"] = serde_json::json!([{"id": "canonical", "role": "source"}]);
         json["something_newer"] = serde_json::json!(["a", "b"]);
         write_document(dir.path(), &json);
@@ -1382,7 +1466,6 @@ mod tests {
         assert_eq!(rewritten["counts"]["triples"], 9);
         assert_eq!(rewritten["content_digest"], "sha256:new");
         // Everything else is exactly as it was.
-        assert_eq!(rewritten["source"], json["source"]);
         assert_eq!(rewritten["components"], json["components"]);
         assert_eq!(rewritten["something_newer"], json["something_newer"]);
 

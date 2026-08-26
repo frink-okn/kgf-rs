@@ -1,9 +1,11 @@
 # `kgf build bundle` — one command, one config
 
-Status: the configuration half is built — `config`, `plan`, `--check-config`, and
-the command surface. The execution engine that runs hdtc and publishes is the
-next unit. Written 2026-08-26 against kgf-rs `cbfed49`, hdtc `1.2.0-beta.2`
-(`087d7a1`), okn-registry `docs/registry/kgs.yaml`, kace `d6414eb`.
+Status: built and working end to end — config, plan, `--check-config`,
+`--dry-run`, the hdtc pipeline, provenance, and atomic publication. Two things
+remain, both blocked on hdtc (§7): describing `filters/` and `keysets/` in the
+manifest, and the doc 18 §18.4 cross-check between them. Written 2026-08-26
+against kgf-rs `7b238d0`, hdtc `1.2.0-beta.2` (`087d7a1`), okn-registry
+`docs/registry/kgs.yaml`, kace `d6414eb`.
 
 Scopes `../kgf/docs/gcp-deployment-plan.md` §3.2. Doc 04 §4.4 is the authority on
 what the build pipeline is; this note is about the subset that is buildable today
@@ -347,6 +349,15 @@ entry: unlike `data.hdt.text/`, whose Tantivy segment names are build-generated,
 these have stable role-derived names (`subjects.filter`, `objects.minhash`,
 `shared.keys`) and, per doc 04 §4.3, different dependency sets and lifecycles.
 A missing role file means "not built", never "empty role".
+
+**hdtc answers no `--version`.** Its clap command sets no `version`, so
+`hdtc --version` exits 2. `source.generator.hdtc` is therefore empty in every
+bundle built today, and "re-derive exactly" is not true without it: the
+permutation, sketch, and text formats are pinned by convention rather than by
+commit, so the producing version is what makes a rebuild comparable. The build
+warns rather than passing over it, because a `source` block that quietly omits
+the toolchain looks like provenance while failing at the one thing provenance is
+for. One attribute in hdtc fixes it.
 
 **hdtc's façade exposes no sketch or key-set readers.** `hdtc::format` re-exports
 section framing, PFC, permutation, graph-index, and text items and nothing for

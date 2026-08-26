@@ -502,12 +502,13 @@ fn regeneration_preserves_fields_this_build_does_not_model() {
     build_artifacts(&bundle, SOURCE);
     kgf(&["manifest", path(&bundle)]).success();
 
-    // Doc 04 §4.3 fields with no producer yet, added by hand as someone would.
+    // A doc 04 §4.3 field with no producer yet, added by hand as someone would.
+    // `source` is deliberately not the example any more: `kgf build bundle`
+    // models and writes it, so it is carried forward as a typed field rather
+    // than as an opaque one.
     let manifest_path = bundle.join("manifest.json");
     let mut document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-    document["source"] =
-        serde_json::json!({"format": "n-triples", "url": "https://example.org/d.nt"});
     document["components"] = serde_json::json!([{"id": "canonical", "role": "source"}]);
     std::fs::write(
         &manifest_path,
@@ -522,7 +523,6 @@ fn regeneration_preserves_fields_this_build_does_not_model() {
 
     let rewritten: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-    assert_eq!(rewritten["source"], document["source"]);
     assert_eq!(rewritten["components"], document["components"]);
     assert_eq!(rewritten["counts"]["triples"], 5);
 }

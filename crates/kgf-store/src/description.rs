@@ -1832,6 +1832,7 @@ mod tests {
             predicate_roles: BTreeMap::new(),
             artifacts,
             previous_version: None,
+            source: None,
         };
         manifest.validate(bundle).unwrap();
         std::fs::write(
@@ -2076,6 +2077,7 @@ mod tests {
             predicate_roles: BTreeMap::new(),
             artifacts,
             previous_version: None,
+            source: None,
         };
         manifest.validate(bundle).unwrap();
         std::fs::write(

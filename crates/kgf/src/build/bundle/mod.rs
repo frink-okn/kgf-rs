@@ -4,10 +4,13 @@
 //! contributor with a `.nt.gz` — learns the artifact ordering once, from here,
 //! rather than reproducing it. `notes/build-bundle.md` is the design.
 //!
-//! **This is the configuration half.** Resolution, validation, `--check-config`
-//! and `--dry-run` are implemented; the execution engine that runs hdtc and
-//! publishes is the next unit, and `run` says so rather than building a partial
-//! bundle.
+//! Three ways in, sharing one resolution: `--check-config` validates and prints
+//! the resolved plan, `--dry-run` prints the commands the plan implies, and a
+//! plain run carries them out. The first needs neither an output nor an input,
+//! and none of the three can disagree about what the config means, because all
+//! three read the same [`plan::ConfigPlan`].
+
+mod execute;
 
 pub mod config;
 pub mod plan;
@@ -91,21 +94,13 @@ pub fn run(args: Args) -> Result<()> {
     let build = resolve_build(args, config)?;
 
     if build.dry_run {
-        // The command list is the execution engine's to produce, and inventing
-        // one here would be a second answer to what this build runs.
-        bail!(
-            "--dry-run needs the execution engine, which is the next unit; \
-             `--check-config` validates and prints the resolved plan today"
-        );
+        print!("{}", execute::rehearse(&build));
+        return Ok(());
     }
 
-    bail!(
-        "kgf build bundle resolved a plan for {}/{} but the execution engine is \
-         the next unit; assemble with hdtc and `kgf manifest` for now, or run \
-         `--check-config` to validate this configuration",
-        build.plan.config.dataset.id,
-        build.plan.version,
-    );
+    let manifest = execute::execute(&build)?;
+    print!("{}", execute::report(&manifest, &build.plan.output));
+    Ok(())
 }
 
 /// A resolved plan and the process-level settings that carry it out.
@@ -116,7 +111,6 @@ pub fn run(args: Args) -> Result<()> {
 /// document `--check-config` prints.
 struct Build {
     plan: BundlePlan,
-    #[expect(dead_code, reason = "the execution engine is the next unit")]
     hdtc: PathBuf,
     dry_run: bool,
 }

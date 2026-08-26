@@ -423,7 +423,11 @@ fn publish(
         return Err(error);
     }
 
-    if let Err(error) = write_description_manifest(bundle, Some(dataset_iri.to_owned()), metadata) {
+    let requested = crate::manifest::Requested {
+        dataset_iri: Some(dataset_iri.to_owned()),
+        ..Default::default()
+    };
+    if let Err(error) = write_description_manifest(bundle, &requested, metadata) {
         let failed = staging.path().join("failed-stats");
         if let Err(restore) =
             restore_publication(&live, &failed, &backup, &manifest_path, &previous_manifest)

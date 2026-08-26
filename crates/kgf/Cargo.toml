@@ -39,6 +39,7 @@ tempfile.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tempfile.workspace = true
 # `testing::hdtc_binary`, so the integration test does not carry its own copy

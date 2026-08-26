@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use kgf_store::manifest::{
     ArtifactDigest, ArtifactEntry, ArtifactView, BundleFacts, Capability, Formats, Manifest,
-    ManifestDocument, Publisher, content_digest_preimage, default_predicate_roles,
+    ManifestDocument, Publisher, Source, content_digest_preimage, default_predicate_roles,
     validate_predicate_role_iri,
 };
 use kgf_store::store::artifact;
@@ -102,6 +102,92 @@ pub struct Args {
     pub roles: Vec<String>,
 }
 
+/// What a caller asks a manifest to *say*, as values rather than flag strings.
+///
+/// Everything structural — counts, capabilities, sizes, checksums, the content
+/// digest — is derived from the artifacts and is not requestable. This is the
+/// identity and description half, and `None` throughout means "keep whatever
+/// the current manifest has", which is what makes regenerating after a rebuild
+/// a no-flag operation.
+///
+/// It exists so that the two non-CLI callers — the description producer and
+/// `kgf build bundle` — can supply a prefix map they already hold instead of
+/// rendering it to `prefix=IRI` strings for this module to parse back.
+#[derive(Debug, Default)]
+pub(crate) struct Requested {
+    pub(crate) id: Option<String>,
+    pub(crate) version: Option<String>,
+    pub(crate) dataset_iri: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) license: Option<String>,
+    pub(crate) homepage: Option<String>,
+    pub(crate) publisher: Option<String>,
+    pub(crate) publisher_contact: Option<String>,
+    pub(crate) previous_version: Option<String>,
+    /// Empty keeps the current map; non-empty replaces it, so that removing a
+    /// stale binding is possible.
+    pub(crate) prefixes: BTreeMap<String, String>,
+    /// Empty keeps the current profile; non-empty replaces it, ordered.
+    pub(crate) roles: BTreeMap<String, Vec<String>>,
+    /// Provenance for re-derivation. `None` keeps what the manifest has.
+    pub(crate) source: Option<Source>,
+}
+
+impl Requested {
+    /// Parse the repeatable `prefix=IRI` and `role=IRI` flags into maps.
+    ///
+    /// The `=` splitting lives here because it is a property of the command
+    /// line, not of a manifest.
+    fn from_args(args: &Args) -> Result<Self> {
+        let mut prefixes = BTreeMap::new();
+        for binding in &args.prefixes {
+            let (prefix, expansion) = binding
+                .split_once('=')
+                .with_context(|| format!("--prefix {binding} is not of the form prefix=IRI"))?;
+            if prefix.is_empty() || expansion.is_empty() {
+                bail!("--prefix {binding} has an empty prefix or expansion");
+            }
+            if let Some(existing) = prefixes.insert(prefix.to_owned(), expansion.to_owned()) {
+                bail!("--prefix {prefix} given twice ({existing} and {expansion})");
+            }
+        }
+
+        let mut roles: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for declaration in &args.roles {
+            let (role, iri) = declaration
+                .split_once('=')
+                .with_context(|| format!("--role {declaration} is not of the form role=IRI"))?;
+            if role.is_empty() || iri.is_empty() {
+                bail!("--role {declaration} has an empty role or IRI");
+            }
+            let members = roles.entry(role.to_owned()).or_default();
+            if members.iter().any(|member| member == iri) {
+                bail!("--role {declaration} repeats the same predicate IRI");
+            }
+            members.push(iri.to_owned());
+        }
+
+        Ok(Self {
+            id: args.id.clone(),
+            version: args.version.clone(),
+            dataset_iri: args.dataset_iri.clone(),
+            title: args.title.clone(),
+            description: args.description.clone(),
+            license: args.license.clone(),
+            homepage: args.homepage.clone(),
+            publisher: args.publisher.clone(),
+            publisher_contact: args.publisher_contact.clone(),
+            previous_version: args.previous_version.clone(),
+            prefixes,
+            roles,
+            // Not a flag: `kgf manifest` describes artifacts it did not build,
+            // so it is in no position to state where they came from.
+            source: None,
+        })
+    }
+}
+
 /// Build-produced bounds for one row-oriented description artifact.
 #[derive(Debug, Clone)]
 pub(crate) struct RowArtifactMetadata {
@@ -154,7 +240,7 @@ pub fn run(args: Args) -> Result<()> {
     // bundle gets its first real manifest.
     let document = ManifestDocument::read(&dir)?;
     let manifest = build(
-        &args,
+        &Requested::from_args(&args)?,
         &dir,
         &facts,
         document.as_ref().and_then(ManifestDocument::parsed),
@@ -189,7 +275,7 @@ pub fn run(args: Args) -> Result<()> {
 /// content-digest calculation as the standalone command.
 pub(crate) fn write_description_manifest(
     bundle_dir: &Path,
-    dataset_iri: Option<String>,
+    requested: &Requested,
     metadata: &DescriptionArtifactMetadata,
 ) -> Result<Manifest> {
     let dir = bundle_dir
@@ -198,24 +284,8 @@ pub(crate) fn write_description_manifest(
     let BundleInspection { bundle, facts } = inspect_bundle(&dir)?;
     verify_text_binding(&dir)?;
     let document = ManifestDocument::read(&dir)?;
-    let args = Args {
-        bundle: dir.clone(),
-        check: false,
-        id: None,
-        version: None,
-        dataset_iri,
-        title: None,
-        description: None,
-        license: None,
-        homepage: None,
-        publisher: None,
-        publisher_contact: None,
-        previous_version: None,
-        prefixes: Vec::new(),
-        roles: Vec::new(),
-    };
     let manifest = build(
-        &args,
+        requested,
         &dir,
         &facts,
         document.as_ref().and_then(ManifestDocument::parsed),
@@ -343,13 +413,13 @@ fn join(names: &BTreeSet<&str>) -> String {
 /// Assemble the manifest from derived facts, supplied identity, and whatever the
 /// current manifest already said.
 fn build(
-    args: &Args,
+    requested: &Requested,
     dir: &Path,
     facts: &BundleFacts,
     previous: Option<&Manifest>,
     generated_description: Option<&DescriptionArtifactMetadata>,
 ) -> Result<Manifest> {
-    let id = pick(&args.id, previous.map(|m| m.id.clone()), || {
+    let id = pick(&requested.id, previous.map(|m| m.id.clone()), || {
         dir.parent()
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
@@ -360,11 +430,15 @@ fn build(
          (the catalog layout is {root}/{dataset}/{version})",
     )?;
 
-    let version = pick(&args.version, previous.map(|m| m.version.clone()), || {
-        dir.file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_owned)
-    })
+    let version = pick(
+        &requested.version,
+        previous.map(|m| m.version.clone()),
+        || {
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        },
+    )
     .context("cannot infer a version from the bundle path; pass --version")?;
 
     let mut artifacts = checksum_artifacts(dir, facts)?;
@@ -381,12 +455,12 @@ fn build(
         _ => None,
     }
     .unwrap_or_else(now_rfc3339);
-    let prefixes = prefixes(args, previous)?;
-    let predicate_roles = predicate_roles(args, previous, &prefixes)?;
+    let prefixes = prefixes(requested, previous)?;
+    let predicate_roles = predicate_roles(requested, previous, &prefixes)?;
 
     Ok(Manifest {
         id,
-        dataset_iri: args
+        dataset_iri: requested
             .dataset_iri
             .clone()
             .or_else(|| previous.and_then(|m| m.dataset_iri.clone())),
@@ -394,23 +468,23 @@ fn build(
         content_digest,
         created: Some(created),
         formats: Formats::default(),
-        title: args
+        title: requested
             .title
             .clone()
             .or_else(|| previous.and_then(|m| m.title.clone())),
-        description: args
+        description: requested
             .description
             .clone()
             .or_else(|| previous.and_then(|m| m.description.clone())),
-        license: args
+        license: requested
             .license
             .clone()
             .or_else(|| previous.and_then(|m| m.license.clone())),
-        homepage: args
+        homepage: requested
             .homepage
             .clone()
             .or_else(|| previous.and_then(|m| m.homepage.clone())),
-        publisher: publisher(args, previous),
+        publisher: publisher(requested, previous),
         counts: facts.counts(),
         capabilities: facts
             .capabilities()
@@ -419,59 +493,58 @@ fn build(
         prefixes,
         predicate_roles,
         artifacts: artifacts.into_iter().collect(),
-        previous_version: args
+        previous_version: requested
             .previous_version
             .clone()
             .or_else(|| previous.and_then(|m| m.previous_version.clone())),
+        // Carried forward like every other descriptive field: regenerating a
+        // manifest after a rebuild must not silently drop the record of what
+        // the bundle was built from.
+        source: requested
+            .source
+            .clone()
+            .or_else(|| previous.and_then(|m| m.source.clone())),
     })
 }
 
 fn predicate_roles(
-    args: &Args,
+    requested: &Requested,
     previous: Option<&Manifest>,
     prefixes: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, Vec<String>>> {
-    if args.roles.is_empty() {
-        let roles = previous
+    let roles = if requested.roles.is_empty() {
+        previous
             .map(|manifest| manifest.predicate_roles.clone())
             .filter(|roles| !roles.is_empty())
-            .unwrap_or_else(default_predicate_roles);
-        for (role, members) in &roles {
-            for iri in members {
-                validate_predicate_role_iri(iri, prefixes).map_err(|detail| {
-                    anyhow::anyhow!(
-                        "predicate role {role} does not contain a full predicate IRI {iri:?}: {detail}"
-                    )
-                })?;
-            }
-        }
-        return Ok(roles);
-    }
+            .unwrap_or_else(default_predicate_roles)
+    } else {
+        requested.roles.clone()
+    };
 
-    let mut roles: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for declaration in &args.roles {
-        let (role, iri) = declaration
-            .split_once('=')
-            .with_context(|| format!("--role {declaration} is not of the form role=IRI"))?;
-        if role.is_empty() || iri.is_empty() {
-            bail!("--role {declaration} has an empty role or IRI");
-        }
-        if !role
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    // Checked on every path, including the carried-forward one: a role profile
+    // that was valid against one prefix map is not automatically valid against
+    // another, and a rebuild is exactly when the map may have changed.
+    for (role, members) in &roles {
+        if role.is_empty()
+            || !role
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
         {
             bail!(
-                "--role {declaration} has an invalid role name; use ASCII letters, digits, `_` or `-`"
+                "predicate role {role:?} is not a usable role name; use ASCII letters, \
+                 digits, `_` or `-`"
             );
         }
-        validate_predicate_role_iri(iri, prefixes).map_err(|detail| {
-            anyhow::anyhow!("--role {declaration} does not contain a full predicate IRI: {detail}")
-        })?;
-        let members = roles.entry(role.to_owned()).or_default();
-        if members.iter().any(|member| member == iri) {
-            bail!("--role {declaration} repeats the same predicate IRI");
+        if members.is_empty() {
+            bail!("predicate role {role} declares no predicates");
         }
-        members.push(iri.to_owned());
+        for iri in members {
+            validate_predicate_role_iri(iri, prefixes).map_err(|detail| {
+                anyhow::anyhow!(
+                    "predicate role {role} does not contain a full predicate IRI {iri:?}: {detail}"
+                )
+            })?;
+        }
     }
     Ok(roles)
 }
@@ -486,15 +559,15 @@ fn pick(
     flag.clone().or(carried).or_else(infer)
 }
 
-fn publisher(args: &Args, previous: Option<&Manifest>) -> Option<Publisher> {
+fn publisher(requested: &Requested, previous: Option<&Manifest>) -> Option<Publisher> {
     let carried = previous.and_then(|m| m.publisher.clone());
-    let name = args
+    let name = requested
         .publisher
         .clone()
         .or_else(|| carried.as_ref().map(|p| p.name.clone()))?;
     Some(Publisher {
         name,
-        contact: args
+        contact: requested
             .publisher_contact
             .clone()
             .or_else(|| carried.and_then(|p| p.contact)),
@@ -521,7 +594,10 @@ const WELL_KNOWN_PREFIXES: [(&str, &str); 4] = [
     ("xsd", "http://www.w3.org/2001/XMLSchema#"),
 ];
 
-fn prefixes(args: &Args, previous: Option<&Manifest>) -> Result<BTreeMap<String, String>> {
+fn prefixes(
+    requested: &Requested,
+    previous: Option<&Manifest>,
+) -> Result<BTreeMap<String, String>> {
     // Seeded first so an explicit binding, or one carried forward from a
     // manifest that chose differently, overrides rather than collides.
     let mut prefixes: BTreeMap<String, String> = WELL_KNOWN_PREFIXES
@@ -529,26 +605,14 @@ fn prefixes(args: &Args, previous: Option<&Manifest>) -> Result<BTreeMap<String,
         .map(|(prefix, namespace)| ((*prefix).to_owned(), (*namespace).to_owned()))
         .collect();
 
-    if args.prefixes.is_empty() {
+    if requested.prefixes.is_empty() {
         if let Some(previous) = previous {
             prefixes.extend(previous.prefixes.clone());
         }
         return Ok(prefixes);
     }
 
-    let mut declared = BTreeMap::new();
-    for binding in &args.prefixes {
-        let (prefix, expansion) = binding
-            .split_once('=')
-            .with_context(|| format!("--prefix {binding} is not of the form prefix=IRI"))?;
-        if prefix.is_empty() || expansion.is_empty() {
-            bail!("--prefix {binding} has an empty prefix or expansion");
-        }
-        if let Some(existing) = declared.insert(prefix.to_owned(), expansion.to_owned()) {
-            bail!("--prefix {prefix} given twice ({existing} and {expansion})");
-        }
-    }
-    prefixes.extend(declared);
+    prefixes.extend(requested.prefixes.clone());
     Ok(prefixes)
 }
 
@@ -887,7 +951,22 @@ mod tests {
     }
 
     /// `kgf manifest` invoked with only `--prefix` bindings.
-    fn args(bindings: &[&str]) -> Args {
+    /// The `--prefix`/`--role` flags as the command line would give them,
+    /// parsed the way `kgf manifest` parses them. Going through `from_args`
+    /// rather than building a `Requested` directly is deliberate: these tests
+    /// are about the flag surface, so they must exercise the parse.
+    fn args(bindings: &[&str]) -> Requested {
+        requested(bindings, &[])
+    }
+
+    fn bad_prefix_flags(bindings: &[&str]) -> Result<Requested> {
+        Requested::from_args(&Args {
+            prefixes: bindings.iter().map(|s| (*s).to_owned()).collect(),
+            ..blank_args()
+        })
+    }
+
+    fn blank_args() -> Args {
         Args {
             bundle: PathBuf::new(),
             check: false,
@@ -901,9 +980,18 @@ mod tests {
             publisher: None,
             publisher_contact: None,
             previous_version: None,
-            prefixes: bindings.iter().map(|s| (*s).to_owned()).collect(),
+            prefixes: Vec::new(),
             roles: Vec::new(),
         }
+    }
+
+    fn requested(prefixes: &[&str], roles: &[&str]) -> Requested {
+        Requested::from_args(&Args {
+            prefixes: prefixes.iter().map(|s| (*s).to_owned()).collect(),
+            roles: roles.iter().map(|s| (*s).to_owned()).collect(),
+            ..blank_args()
+        })
+        .expect("test flags parse")
     }
 
     /// A manifest carrying nothing but a prefix map.
@@ -931,6 +1019,7 @@ mod tests {
             predicate_roles: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             previous_version: None,
+            source: None,
         }
     }
 
@@ -943,20 +1032,30 @@ mod tests {
         let parsed = prefixes(&args(&["q=http://example.org/?a=b"]), None).unwrap();
         assert_eq!(parsed["q"], "http://example.org/?a=b");
 
-        assert!(prefixes(&args(&["nope"]), None).is_err());
-        assert!(prefixes(&args(&["=http://example.org/"]), None).is_err());
-        assert!(prefixes(&args(&["ex="]), None).is_err());
-        assert!(prefixes(&args(&["ex=a", "ex=b"]), None).is_err());
+        // A malformed binding is now refused where the flag is parsed, which
+        // is what lets every non-CLI caller hand over a map it already holds.
+        for bad in ["nope", "=http://example.org/", "ex="] {
+            assert!(
+                bad_prefix_flags(&[bad]).is_err(),
+                "--prefix {bad} must be refused"
+            );
+        }
+        assert!(
+            bad_prefix_flags(&["ex=a", "ex=b"]).is_err(),
+            "a repeat must be refused"
+        );
     }
 
     #[test]
     fn role_declarations_keep_predicate_order_and_reject_duplicates() {
-        let mut supplied = args(&[]);
-        supplied.roles = vec![
-            "label=http://example.org/preferred".to_owned(),
-            "label=http://example.org/fallback".to_owned(),
-            "synonym=http://example.org/alias".to_owned(),
-        ];
+        let supplied = requested(
+            &[],
+            &[
+                "label=http://example.org/preferred",
+                "label=http://example.org/fallback",
+                "synonym=http://example.org/alias",
+            ],
+        );
         let roles = predicate_roles(&supplied, None, &BTreeMap::new()).unwrap();
         assert_eq!(
             roles["label"],
@@ -967,19 +1066,29 @@ mod tests {
         );
         assert_eq!(roles["synonym"], ["http://example.org/alias"]);
 
-        supplied
-            .roles
-            .push("label=http://example.org/preferred".to_owned());
-        assert!(predicate_roles(&supplied, None, &BTreeMap::new()).is_err());
+        let repeated = Requested::from_args(&Args {
+            roles: vec![
+                "label=http://example.org/preferred".to_owned(),
+                "label=http://example.org/preferred".to_owned(),
+            ],
+            ..blank_args()
+        });
+        assert!(repeated.is_err(), "a repeated predicate must be refused");
 
         let defaults = predicate_roles(&args(&[]), None, &BTreeMap::new()).unwrap();
         assert!(defaults.contains_key("label"));
 
-        let mut curie = args(&[]);
-        curie.roles = vec!["label=ex:name".to_owned()];
+        let curie = requested(&[], &["label=ex:name"]);
         let prefixes = BTreeMap::from([("ex".to_owned(), "http://example.org/".to_owned())]);
         let error = predicate_roles(&curie, None, &prefixes).unwrap_err();
         assert!(error.to_string().contains("http://example.org/name"));
+
+        // A carried-forward profile is checked too: it was valid against some
+        // other prefix map, and a rebuild is when that map may have changed.
+        let mut carried = manifest_with(prefixes.clone());
+        carried.predicate_roles =
+            BTreeMap::from([("label".to_owned(), vec!["ex:name".to_owned()])]);
+        assert!(predicate_roles(&args(&[]), Some(&carried), &prefixes).is_err());
     }
 
     #[test]

@@ -24,6 +24,22 @@ use serde::Serialize;
 
 use super::config;
 
+/// The sketch roles a conforming bundle publishes.
+///
+/// Doc 17 §17.3 makes each family all-or-nothing — both filter roles or
+/// neither, both sketch roles or neither — so this is the profile rather than a
+/// default, and it is not configurable.
+pub const SKETCH_ROLES: &str = "subjects,objects";
+
+/// The key-set roles the `kgf-keyset/1` profile fixes (doc 18 §18.4).
+///
+/// The disjoint trio rather than the overlapping pair: measured across the 40
+/// OKN graphs it costs 2.53 GB against 3.87 GB, and every composite view is a
+/// streaming merge of two sections. hdtc's experimental `terms` role is
+/// deliberately absent — it carries predicate IRIs, which would make every pair
+/// of knowledge graphs "overlap" through `rdfs:label`.
+pub const KEYSET_ROLES: &str = "subjects-only,objects-only,shared";
+
 /// A host-local dataset slug.
 ///
 /// It is simultaneously a directory name under the bundle root and the first

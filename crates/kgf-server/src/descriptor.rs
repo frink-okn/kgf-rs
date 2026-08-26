@@ -761,6 +761,7 @@ mod tests {
                 ArtifactEntry::checksum(912, "abc123"),
             )]),
             previous_version: Some("2026-03-01".to_owned()),
+            source: None,
         }
     }
 

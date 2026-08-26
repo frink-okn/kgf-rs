@@ -764,6 +764,7 @@ mod tests {
             predicate_roles: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             previous_version: None,
+            source: None,
         })
         .expect("a manifest serializes")
     }
