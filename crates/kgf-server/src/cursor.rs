@@ -329,13 +329,14 @@ impl BundleBinding {
     pub fn from_content_digest(content_digest: &str) -> Option<Self> {
         let (_algorithm, hex) = content_digest.split_once(':')?;
         let mut digest_prefix = [0u8; 8];
-        for (byte, pair) in digest_prefix.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+        let (pairs, _) = hex.as_bytes().as_chunks::<2>();
+        for (byte, pair) in digest_prefix.iter_mut().zip(pairs) {
             let hi = (pair[0] as char).to_digit(16)?;
             let lo = (pair[1] as char).to_digit(16)?;
             *byte = (hi * 16 + lo) as u8;
         }
-        // `chunks_exact` yields nothing past the end, so a short digest would
-        // leave trailing zeros rather than failing. Check the length instead.
+        // `as_chunks` yields only whole pairs, so a short digest would leave
+        // trailing zeros rather than failing. Check the length instead.
         if hex.len() < 16 {
             return None;
         }

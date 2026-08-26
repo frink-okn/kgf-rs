@@ -733,11 +733,11 @@ impl<'a> BitmapView<'a> {
         // "at most eight u64 popcounts" the format's §7.2 costs it at.
         let middle = &self.bytes[first + 1..last];
         let mut count = u64::from((self.bytes[first] & low_mask).count_ones());
-        let mut words = middle.chunks_exact(8);
-        for word in &mut words {
-            count += u64::from(u64::from_le_bytes(word.try_into().expect("8 bytes")).count_ones());
+        let (words, remainder) = middle.as_chunks::<8>();
+        for word in words {
+            count += u64::from(u64::from_le_bytes(*word).count_ones());
         }
-        for &byte in words.remainder() {
+        for &byte in remainder {
             count += u64::from(byte.count_ones());
         }
         count + u64::from((self.bytes[last] & high_mask).count_ones())
