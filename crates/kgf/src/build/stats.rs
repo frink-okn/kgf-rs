@@ -144,6 +144,11 @@ pub fn run(args: Args) -> Result<()> {
             OsString::from(&dataset_iri),
             OsString::from("--output"),
             void_nt.as_os_str().to_owned(),
+            // Dataset-level property partitions carry exact distinct subject and
+            // object counts; the object side reads `data.hdt.perm`, which every
+            // bundle publishes.
+            OsString::from("--partition-distinct-counts"),
+            OsString::from("dataset-properties"),
             OsString::from("--quiet"),
         ],
     )?;
@@ -403,7 +408,17 @@ struct Projections {
     relations: Vec<RelationRow>,
     class_properties: Vec<ClassPropertyRow>,
     classes: Vec<(String, u64)>,
-    properties: Vec<(String, u64)>,
+    properties: Vec<PropertyRow>,
+}
+
+/// A dataset-level property partition. The distinct counts are `None` when the
+/// source VoID partition does not state them, exactly as in `ClassPropertyRow`.
+#[derive(Debug, Clone)]
+struct PropertyRow {
+    predicate: String,
+    triples: u64,
+    distinct_subjects: Option<u64>,
+    distinct_objects: Option<u64>,
 }
 
 struct ProjectionRows<'a> {
@@ -644,7 +659,12 @@ impl VoidGraph {
 
         for property_node in self.children(root, VOID_PROPERTY_PARTITION)? {
             let predicate = self.unique_iri(&property_node, VOID_PROPERTY)?;
-            properties.push((predicate.clone(), self.count(&property_node, VOID_TRIPLES)?));
+            properties.push(PropertyRow {
+                predicate: predicate.clone(),
+                triples: self.count(&property_node, VOID_TRIPLES)?,
+                distinct_subjects: self.maybe_count(&property_node, VOID_DISTINCT_SUBJECTS),
+                distinct_objects: self.maybe_count(&property_node, VOID_DISTINCT_OBJECTS),
+            });
             self.project_property(
                 &property_node,
                 "",
@@ -683,7 +703,11 @@ impl VoidGraph {
             }
         }
         classes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        properties.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        properties.sort_by(|a, b| {
+            b.triples
+                .cmp(&a.triples)
+                .then_with(|| a.predicate.cmp(&b.predicate))
+        });
         relations.sort_by(|a, b| {
             b.triples.cmp(&a.triples).then_with(|| {
                 (&a.subject_class, &a.predicate, &a.object_class).cmp(&(
@@ -845,18 +869,31 @@ impl Summary {
             .properties
             .iter()
             .take(10)
-            .map(|(predicate, triples)| {
-                json!({
-                    "predicate": predicate,
-                    "triples": triples,
-                    "links": {
+            .map(|row| {
+                let mut entry = serde_json::Map::new();
+                entry.insert("predicate".into(), json!(row.predicate));
+                entry.insert("triples".into(), json!(row.triples));
+                // Omitted rather than nulled when the partition does not state
+                // them, matching the class-properties projection (doc 03 §3.6).
+                for (key, value) in [
+                    ("distinct_subjects", row.distinct_subjects),
+                    ("distinct_objects", row.distinct_objects),
+                ] {
+                    if let Some(value) = value {
+                        entry.insert(key.into(), json!(value));
+                    }
+                }
+                entry.insert(
+                    "links".into(),
+                    json!({
                         "schema": summary_schema_link(
                             Params::default()
-                                .with("predicate", &iri_request(predicate))
+                                .with("predicate", &iri_request(&row.predicate))
                                 .with("view", "design")
                         )
-                    }
-                })
+                    }),
+                );
+                Value::Object(entry)
             })
             .collect::<Vec<_>>();
         let leading_relations = projections
