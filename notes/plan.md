@@ -1443,6 +1443,69 @@ brTPF endpoints. Rust integration tests separately pin generalized `UNDEF`, fore
 columns, pre-page overlap filtering, candidate-budget continuations, RDF round trips,
 and RDF response-byte fitting.
 
+### 21. `kgf build` — one command, one config ✅
+
+The offline half. Units 1–20 read bundles; this one makes them. Until it landed, a
+bundle was assembled by hand — `hdtc create --perm`, `hdtc text`, `hdtc sketch`,
+`hdtc keyset`, `kgf manifest`, `kgf build stats` — an ordering that worked and was
+written down nowhere executable. The risk was specific: the OKN pipeline (kace) was
+about to learn that ordering, at which point it would live in two repos and drift, the
+way `augmentations.py` did. `notes/build-bundle.md` is the design and carries the open
+questions; what follows is what the unit decided.
+
+**Three entry points, one resolution.** `--check-config` validates and prints the
+resolved plan, `--dry-run` prints the hdtc invocations the plan implies, and a plain
+run carries them out. All three read one `ConfigPlan`, so they cannot disagree about
+what a config means. `--check-config` needs neither an output nor an input, which is
+what lets a registry validate all ~40 entries in CI without knowing where a bundle
+would go.
+
+**Two plan types rather than one with optional fields.** `ConfigPlan` is everything
+the config alone determines; `BundlePlan` adds the per-build facts (version, input,
+output, provenance) and exists only when building. The resolved plan parses as a
+config again — including a declined text index, which serializes as
+`{"enabled": false}` rather than being omitted so it cannot come back enabled. That
+round-trip is not decoration: it makes `sha256` of the resolved plan a canonical
+config identity, invariant to key order and omitted defaults, which is what a build
+pipeline needs for change detection.
+
+**Conformance is in the type, not in a check.** `filters` and `keysets` carry no
+enable flag and no role list, because doc 18 §18.1 publishes key sets unconditionally,
+doc 17 §17.3 makes each sketch family all-or-nothing, and doc 18 §18.4 excludes
+hdtc's experimental `terms` role from the profile. A nonconforming bundle is
+unrepresentable rather than validated. hdtc's own defaults are restated in the plan
+with the doc that fixes each, so a future hdtc changing one changes a test rather than
+a bundle; the `--roles` lists are passed explicitly for the same reason.
+
+**Publication is a rename.** Every step writes into a dot-prefixed staging directory
+beside the output, the manifest is written last, and the last act is one
+`rename`. A directory at the output path is therefore a complete bundle by
+construction. `Catalog::scan` learned to skip dot-prefixed names, which is the other
+half of the rule `DatasetId` and `VersionLabel` enforce — a staging directory cannot
+be mistaken for a published version from either side. That hazard was not new: `kgf
+build stats` already staged inside the dataset directory.
+
+**Key artifacts are described and bound.** `filters/` and `keysets/` were built into
+every bundle and mentioned by no manifest, so they fell outside `content_digest` and
+no mirror could verify them. Each file now carries doc 18 §18.4's entry —
+`convention_id`, `format_version`, `hash_id`, `role`, `key_count`, `encoding` — and
+three checks run before any manifest is written: §18.4's count identity, a role/name
+agreement, and the `source_digest` binding to this bundle's own HDT. The identity
+alone was not enough, and the way that was found is worth recording: a planted foreign
+key set passed it, because two fixtures happened to share a `shared.keys` count.
+
+**One producer.** `build::stats::produce` writes the eight description artifacts into
+a directory and does nothing else. Extracting it is what let `kgf build stats` retire:
+after the extraction its only remaining job was regenerating a description set in
+place on a published bundle, which fights doc 04 §4.6. With it gone, `kgf build
+bundle` collapsed to `kgf build`, which is how doc 04 §4.4 spelled it all along. `kgf
+manifest` stays, because `--check` is a verifier rather than a stop-gap.
+
+**Deliberately deferred.** Doc 04 §4.4's component DAG. The config names
+`components:` and `publish:` and refuses them with that reason rather than as unknown
+fields, so a config written against the DAG fails with an explanation; claiming the
+keys keeps adding them additive.
+
 ### What the implementation still is not
 
 **The mandatory core profile is now implemented; M1 alone was not that profile.** Doc
@@ -1456,7 +1519,8 @@ extensions rather than conformance requirements.
 
 What remains is beyond that core profile: graph-scoped reads and their four-position
 QPF form; later composed operations such as ranges, stars, and key resolution; and
-the complete `kgf build` DAG beyond today's hdtc assembly plus KGF stats producer.
+doc 04 §4.4's component DAG, which unit 21's `kgf build` recognizes and refuses
+rather than implements.
 The corresponding decisions recorded below still need to be applied to the sibling
 `../kgf` specifications so the working design and this implementation say the same
 thing.
@@ -2019,6 +2083,46 @@ following the code.
     define it as the serialized request-input bound or publish a separate equivalent
     bound for the query transport.
 
+48. **Doc 04 §4.3's `source` block cannot describe an ordinary build.** It specifies
+    one object, `{format, sha256, url}`, hung off the manifest, and puts `generator`
+    on each *component*. Three problems for a componentless bundle, which is every OKN
+    bundle today: several inputs are ordinary, so `inputs` wants to be a list; there is
+    nowhere to record which toolchain built it, without which "re-derive exactly" is
+    false, because `.hdt.perm`, the sketch and key-set formats, and the text index are
+    pinned by convention rather than by commit; and `format: "hdt"` is a legitimate
+    source format, since the OKN input is an HDT another pipeline already built, while
+    §4.4 step 1 assumes RDF in. This implementation writes
+    `{inputs: [{url, format, sha256}], generator: {kgf, hdtc, image}}` and refuses the
+    superseded shape rather than parsing it into an empty `Source`. Found in unit 21.
+49. **Doc 04 §4.4 step 3 describes a label array hdtc does not build, and should not.**
+    It has hdtc emitting "the label array for the declared default cascade" at build
+    time. `hdtc text` has no cascade flag, and the server resolves the cascade per
+    request from the core permutations by probing `(s, p, ?)` for each role predicate
+    in order — a bounded number of lookups against an index the bundle already has.
+    The division that falls out is the better one and is why roles are a manifest field
+    rather than a sidecar: hdtc indexes literals exhaustively and role-agnostically,
+    KGF applies the roles at read time, and nothing expensive depends on the cheap
+    declaration. Doc 04 §4.4 and doc 19 §19.4.5 should follow the implementation.
+50. **Predicate roles cannot be a serve-time overlay, and doc 04 §4.3 needs the
+    caveat.** §4.3 puts roles in the mutable dataset descriptor because "correcting one
+    must be an edit, not a rebuild". The implementation freezes them into the manifest,
+    and the reason is written on `Manifest::predicate_roles`: a versioned URL is
+    cacheable forever, so letting `role=label` resolve through mutable state would let
+    a cache-forever answer change meaning. Both are right about different URLs. The
+    resolution the field comment already implies: the descriptor carries the
+    publisher's *current* profile and `/{dataset}` shows it, while each bundle freezes
+    the snapshot `/{dataset}/v/{version}/search` and `/labels` resolve against. So a
+    roles correction does require a new version — but a cheap one, since
+    `content_digest` covers artifacts and roles are not an artifact, making the new
+    version a directory of hardlinks plus a new `manifest.json`. `gcp-deployment-plan`
+    §3.4 and §5 assume the overlay and need revising with it.
+51. **Doc 04 §4.3's capability example lists `filters` and `keysets`; nothing said what
+    their manifest entries hold.** Doc 17 §17.3 and doc 18 §18.4 do — an entry per file
+    with `convention_id`, `format_version`, `role`, `encoding`, `key_count`, size and
+    checksum — but §4.3 is where a producer looks. Worth a cross-reference, and worth
+    saying that `convention_id` and `hash_id` are published because they are the
+    comparability pair both formats define. Found in unit 21.
+
 ## Not in this plan
 
 Remaining composed operations (ranges, star, key resolution), graph scoping, and
@@ -2026,7 +2130,9 @@ everything requiring a sidecar beyond `.perm` and the existing exhaustive text i
 Those are doc 20 §20.8's later milestones and compose through the `Store`, envelope,
 cursor, term, and live-profile layers this plan builds.
 
-`kgf build` was deliberately absent from units 1–18. Bundles are assembled with
-`hdtc create --perm` and described with `kgf manifest` (unit 9). Unit 19 now has enough
-of the consumer contract to scope the smallest stats producer; the complete build DAG
-remains later work.
+`kgf build` was deliberately absent from units 1–18 and landed as unit 21, once unit
+19 had settled enough of the consumer contract to say what a description set must
+contain. What remains of it is doc 04 §4.4's component DAG — external tools,
+content-addressed memoisation, per-component VoID — and the additive mode that derives
+a new version from an existing one by relinking the expensive artifacts, which is what
+makes both a description-format migration and a predicate-roles correction cheap.

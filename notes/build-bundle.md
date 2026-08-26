@@ -209,16 +209,44 @@ fixed — so the pipeline can depend on `kgf build` today without waiting for it
 
 ## 6. How kace renders the config
 
-The answer to "assemble it out of band from the registry" is yes, and the shape
-of the yes is what keeps it from drifting.
+The answer to "assemble it out of band from the registry" is yes, rendered in
+the workflow rather than by a separate script, and the shape of the yes is what
+keeps it from drifting.
 
-Registry top-level fields already map onto `dataset:` with no invention:
-`shortname` → `id`, plus `title`, `description`, `license`, `homepage`, and
-`contacts` → `publisher`. `iri` is the string kace already mints for the VoID
-step, `https://purl.org/okn/frink/kg/{shortname}`, so the bundle's VoID and the
+**No committed config files.** They would be a second copy of registry data, and
+the failure mode is the one this plan already names with `augmentations.py`: two
+places to edit, one forgotten. The registry is the source of truth, kace already
+loads it through `KGConfig.from_git()`, and rendering is a few dozen lines.
+
+### The mechanism already exists
+
+`JobMan.run_job` takes `configmap_overrides: Dict[str, str]`, documented as
+"{configmap_path: content} — replace the content of a configmap file declared in
+the job template ... Lets callers supply config-driven file contents without
+baking them into the static template." That is what the QLever settings JSON
+already uses. A build config is the same problem, so:
+
+```python
+configmap_overrides={
+    "/kgf/build.yaml": render_build_config(kg),
+    "/kgf/prefixes.yaml": shared_prefix_table,
+}
+```
+
+with the job template's args carrying `--config /kgf/build.yaml`. No new
+machinery, and it follows the house pattern rather than adding a second one.
+`--config -` reads stdin and also works, but there is no reason to reach for it.
+
+### What is rendered, and what stays a flag
+
+`dataset:` comes from fields kace already has — `shortname` -> `id`, plus
+`title`, `description`, `license`, `homepage`, and `contacts` -> `publisher`.
+`iri` is the string kace already mints for the VoID step,
+`https://purl.org/okn/frink/kg/{shortname}`, so the bundle's VoID and the
 okn-void graph describe one resource.
 
-The rest should be a **verbatim subtree**, not a field-by-field translation:
+`semantics:` and `contents:` are a **verbatim subtree**, not a field-by-field
+translation:
 
 ```yaml
 frink-options:
@@ -234,18 +262,56 @@ frink-options:
       text: {max_literal_bytes: 8192}
 ```
 
-`frink-options.kgf` is exactly the `semantics:` and `contents:` sections of
-`build.yaml`. kace copies the subtree and merges the `dataset:` block it derived;
-its pydantic model needs `Optional[Dict[str, Any]]` and nothing more, and the
-schema stays owned by this repo. `--check-config` is then the validator, run in
-registry CI over all ~40 entries. This is the same pattern as `augmentations:`
-minus the part where the schema ends up in two languages.
+`frink-options.kgf` *is* those two sections. kace copies the subtree and merges
+the `dataset:` block it derived; its pydantic model needs
+`Optional[Dict[str, Any]]` and nothing more, so the schema stays owned by this
+repo. Same pattern as `augmentations:`, minus the part where the schema ends up
+in two languages.
 
-Rendering the *descriptor* from the same file closes the loop. Deployment plan
-§5 step 6 has kace refreshing `{root}/{dataset}/descriptor.json` from the
-registry, which means kace learning a second JSON schema. A
-`kgf descriptor --config build.yaml --out descriptor.json` renders it from the
-config kace already holds, and kace learns one schema total.
+Per-build values stay flags, never config, because they change every run:
+`--out` (the LakeFS tag), `--source-url` (`lakefs://` pinned to the **commit**,
+not the tag), `--source-sha256`, `--previous-version`.
+
+### The prefix table has to reach the container
+
+`contents.stats.prefix_tables` names a path, and the base table is the
+registry's `docs/registry/prefixes.yaml`. Baking it into the kgf image would pin
+it at image-build time, so a registry prefix addition would not reach a bundle
+until the image was rebuilt. Render it as a second `configmap_overrides` entry
+instead, so the table tracks the registry the way everything else does — and so
+it falls inside the config hash below automatically. `hdtc namespaces` records
+the table's sha256 in its output, which keeps a bundle auditable against a
+registry revision.
+
+### Change detection needs the config
+
+Deployment plan §5 step 2 compares `(commit_id, builder_image)` and says a
+registry-only edit does not retrigger a build. That is not quite right any more:
+a `frink-options.kgf` edit **can** change bytes — `text.max_literal_bytes`,
+`filters.k`, a role cascade — and must retrigger. The tuple wants to be
+`(commit_id, builder_image, config_hash)`.
+
+The hash should be over `kgf build --check-config` output, not over the rendered
+YAML. The resolved plan is canonical and round-trips, so it is invariant to key
+order, formatting, and omitted defaults: two configs that *mean* the same thing
+hash the same, and only a real change trips a rebuild. That property is the
+reason `--check-config` prints a document that parses as a config again rather
+than a report.
+
+### Validate in registry CI
+
+Run `kgf build --check-config` over every entry's rendered config in the
+registry's own CI. A malformed `kgf:` block then fails in the pull request
+rather than at 3am in a K8s Job, and the validator is the real one instead of a
+pydantic reimplementation of it.
+
+### The descriptor closes the loop
+
+Deployment plan §5 step 6 has kace refreshing
+`{root}/{dataset}/descriptor.json` from the registry, which means kace learning
+a second JSON schema. A `kgf descriptor --config build.yaml --out
+descriptor.json` renders it from the config kace already holds, and kace learns
+one schema total.
 
 ## 6a. What goes in `source`
 
