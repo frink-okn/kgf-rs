@@ -1,0 +1,17 @@
+# The toolchain this repo is built and linted with, pinned so that a local
+# `cargo clippy` and CI see the same lint set.
+#
+# The required checks in CLAUDE.md are `cargo fmt --check` and
+# `cargo clippy --all-targets -- -D warnings`, which only mean something if
+# everyone runs the same compiler: a floating `stable` turned 1.98's new
+# `clippy::chunks_exact_to_as_chunks` into a CI failure on code that had not
+# changed, while local clippy stayed clean and could not see it.
+#
+# `.github/workflows/ci.yml` pins `dtolnay/rust-toolchain` to the same version.
+# Change both together, in a commit that also carries whatever fixes the newer
+# lints ask for. `Cargo.toml`'s `rust-version` is the MSRV and is a separate,
+# lower bound — this is what we build with, not the oldest we support.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
