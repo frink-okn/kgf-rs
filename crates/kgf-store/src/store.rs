@@ -58,6 +58,37 @@ pub mod artifact {
     /// Rendered Markdown LLM summary card.
     pub const SUMMARY_MD: &str = "stats/summary.md";
 
+    /// Every `filters/` file the sketch convention can produce.
+    ///
+    /// Enumerated rather than discovered by listing the directory, because a
+    /// manifest's artifact set must be a closed vocabulary: a stray file in
+    /// `filters/` is not an artifact, and checksumming whatever happens to be
+    /// there would let one appear in `content_digest`. Doc 17 §17.3 restricts
+    /// the sketch families to the subject and object roles, so this is the
+    /// complete space; which of them a bundle carries is discovered.
+    pub const FILTERS: [&str; 4] = [
+        "filters/objects.filter",
+        "filters/objects.minhash",
+        "filters/subjects.filter",
+        "filters/subjects.minhash",
+    ];
+
+    /// Every `keysets/` file the key-set profile can produce.
+    ///
+    /// Doc 18 §18.4 publishes the disjoint trio by default but keeps the
+    /// composite roles available, and says consumers "must not assume exactly
+    /// two key-set files per bundle" — so all six roles are listed and presence
+    /// decides. hdtc's experimental `terms` role is deliberately absent: doc 18
+    /// §18.4 excludes it from the KGF profile.
+    pub const KEYSETS: [&str; 6] = [
+        "keysets/objects-only.keys",
+        "keysets/objects.keys",
+        "keysets/predicates.keys",
+        "keysets/shared.keys",
+        "keysets/subjects-only.keys",
+        "keysets/subjects.keys",
+    ];
+
     /// The complete tier-1 description artifact set, in bundle-layout order.
     pub const DESCRIPTION: [&str; 8] = [
         VOID_HDT,
@@ -270,6 +301,10 @@ pub(crate) struct ArtifactSet {
     pub(crate) graph_index: Option<PathBuf>,
     pub(crate) text: Option<PathBuf>,
     pub(crate) description: Option<DescriptionArtifacts>,
+    /// The `filters/` files present, a subset of [`artifact::FILTERS`].
+    pub(crate) filters: Vec<&'static str>,
+    /// The `keysets/` files present, a subset of [`artifact::KEYSETS`].
+    pub(crate) keysets: Vec<&'static str>,
 }
 
 /// The all-or-none artifact set behind the tier-1 description surface.
@@ -325,6 +360,8 @@ impl ArtifactSet {
             graph_index,
             text: optional_dir(dir, artifact::TEXT)?,
             description: DescriptionArtifacts::resolve(dir)?,
+            filters: present(dir, &artifact::FILTERS)?,
+            keysets: present(dir, &artifact::KEYSETS)?,
         })
     }
 
@@ -478,6 +515,22 @@ fn require_file(dir: &Path, name: &str, remedy: impl Into<String>) -> Result<Pat
         artifact: name.to_owned(),
         remedy: remedy.into(),
     })
+}
+
+/// Which of a closed set of artifact names a directory carries.
+///
+/// Existence only. These files are validated when a producer reads their
+/// headers to describe them, which costs a full pass for the CRC32C the two
+/// formats require before any field may be interpreted — far outside what an
+/// open may spend (doc 20 §20.6).
+fn present(dir: &Path, names: &[&'static str]) -> Result<Vec<&'static str>> {
+    let mut found = Vec::new();
+    for name in names {
+        if dir.join(name).try_exists()? {
+            found.push(*name);
+        }
+    }
+    Ok(found)
 }
 
 fn optional_file(dir: &Path, name: &str) -> Result<Option<PathBuf>> {

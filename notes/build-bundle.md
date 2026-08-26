@@ -329,8 +329,27 @@ still publish by `rename`. `DatasetId` and `VersionLabel` refuse leading dots
 from the other side, so the two halves cannot drift into disagreeing about which
 directories are real.
 
-**`filters/` and `keysets/` are undescribed bytes, and that is the thing to
-fix.** Neither appears in `store::artifact`, `Capability` has no variant for
+**~~`filters/` and `keysets/` are undescribed bytes~~ — fixed.** hdtc
+v1.2.0-beta.3 added the header readers, so both families now carry a manifest
+entry per file with `convention_id`, `format_version`, `hash_id`, `role`,
+`key_count` and (for key sets) `encoding`, they are covered by
+`content_digest`, and the bundle declares the `filters` and `keysets`
+capabilities. Doc 18 §18.4's cross-family identity runs before any manifest is
+written. What follows is the original finding, kept because the reasoning about
+*why* it had to happen before the corpus build still applies.
+
+**One limit worth stating.** The §18.4 identity compares **counts, not content**.
+A key set swapped for another bundle's passes whenever the totals happen to
+agree — which is not hypothetical: two of the fixture bundles here had the same
+`shared.keys` count, so the planted file went undetected until the count
+differed. A role/name consistency check now covers part of the gap, but the real
+content guard is `source_digest`, and computing it needs the HDT's
+Dictionary-and-Triples offset — `hdt_data_offset`, which hdtc keeps
+`pub(crate)`. A third small hdtc request (§7a).
+
+The original finding:
+
+ Neither appears in `store::artifact`, `Capability` has no variant for
 either, and — the sharp part — neither is in the `artifacts` map, so neither is
 covered by `content_digest`. The demo bundles carry both directories today as
 bytes no mirror can verify and no manifest mentions.
@@ -350,6 +369,9 @@ these have stable role-derived names (`subjects.filter`, `objects.minhash`,
 `shared.keys`) and, per doc 04 §4.3, different dependency sets and lifecycles.
 A missing role file means "not built", never "empty role".
 
+**~~hdtc answers no `--version`~~ — fixed** in v1.2.0-beta.3; `source.generator.hdtc`
+now records the binary that ran. Original finding:
+
 **hdtc answers no `--version`.** Its clap command sets no `version`, so
 `hdtc --version` exits 2. `source.generator.hdtc` is therefore empty in every
 bundle built today, and "re-derive exactly" is not true without it: the
@@ -358,6 +380,10 @@ commit, so the producing version is what makes a rebuild comparable. The build
 warns rather than passing over it, because a `source` block that quietly omits
 the toolchain looks like provenance while failing at the one thing provenance is
 for. One attribute in hdtc fixes it.
+
+**~~hdtc's façade exposes no sketch or key-set readers~~ — fixed** in
+v1.2.0-beta.3 (`read_sketch_header`, `read_keyset_header`, `KeyRole`,
+`KeysetEncoding`, the path helpers). Original finding:
 
 **hdtc's façade exposes no sketch or key-set readers.** `hdtc::format` re-exports
 section framing, PFC, permutation, graph-index, and text items and nothing for

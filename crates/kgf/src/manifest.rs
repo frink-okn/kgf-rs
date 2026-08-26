@@ -25,11 +25,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use kgf_store::manifest::{
-    ArtifactDigest, ArtifactEntry, ArtifactView, BundleFacts, Capability, Formats, Manifest,
-    ManifestDocument, Publisher, Source, content_digest_preimage, default_predicate_roles,
-    validate_predicate_role_iri,
+    ArtifactDigest, ArtifactEntry, ArtifactView, BundleFacts, Capability, Formats, KeyArtifact,
+    Manifest, ManifestDocument, Publisher, Source, content_digest_preimage,
+    default_predicate_roles, validate_predicate_role_iri,
 };
 use kgf_store::store::artifact;
 use kgf_store::{PublishedBundle, verify_description_artifacts};
@@ -649,13 +649,132 @@ fn verify_text_binding(dir: &Path) -> Result<()> {
 /// not in `kgf-store`: full digests belong to publish and `kgf verify`, never to
 /// the latency-sensitive open path (doc 20 §20.6).
 fn checksum_artifacts(dir: &Path, facts: &BundleFacts) -> Result<Vec<(String, ArtifactEntry)>> {
-    facts
+    let entries: Vec<(String, ArtifactEntry)> = facts
         .artifact_names()
         .map(|name| {
             let path = dir.join(name);
-            Ok((name.to_owned(), checksum_artifact(&path)?))
+            let entry = checksum_artifact(&path)?;
+            let entry = match describe_key_artifact(name, &path)? {
+                Some(keys) => ArtifactEntry::key_artifact(entry.bytes, entry.sha256, keys),
+                None => entry,
+            };
+            Ok((name.to_owned(), entry))
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    verify_key_decomposition(dir, &entries)?;
+    Ok(entries)
+}
+
+/// Read a `filters/` or `keysets/` artifact's own header, if this is one.
+///
+/// hdtc owns these formats and now owns their readers (`hdtc::format`), so this
+/// is a lookup rather than a parse. Both readers verify the CRC32C before
+/// interpreting any field, as `docs/sketch-format.md` §8 and
+/// `docs/keyset-format.md` §4.4 require — a full pass, which is why this lives
+/// in the producer beside the checksum that already reads the file, and not in
+/// `BundleFacts::read`, whose cost must stay independent of bundle size.
+fn describe_key_artifact(name: &str, path: &Path) -> Result<Option<KeyArtifact>> {
+    if artifact::FILTERS.contains(&name) {
+        let header = hdtc::format::read_sketch_header(path)
+            .with_context(|| format!("reading the sketch header of {}", path.display()))?;
+        verify_role_matches_name(name, path, header.role.file_stem())?;
+        return Ok(Some(KeyArtifact {
+            convention_id: header.convention_id,
+            format_version: header.format_version,
+            hash_id: header.hash_id,
+            role: header.role.file_stem().to_owned(),
+            key_count: header.key_count,
+            encoding: None,
+        }));
+    }
+    if artifact::KEYSETS.contains(&name) {
+        let header = hdtc::format::read_keyset_header(path)
+            .with_context(|| format!("reading the key-set header of {}", path.display()))?;
+        verify_role_matches_name(name, path, header.role.file_stem())?;
+        return Ok(Some(KeyArtifact {
+            convention_id: header.convention_id,
+            format_version: header.format_version,
+            hash_id: header.hash_id,
+            role: header.role.file_stem().to_owned(),
+            key_count: header.key_count,
+            encoding: Some(header.encoding.label().to_owned()),
+        }));
+    }
+    Ok(None)
+}
+
+/// A key artifact's declared role must be the one its file name says.
+///
+/// Free, and it catches a misplacement the count identity cannot: the identity
+/// compares totals, so a file swapped for another role's — or another bundle's
+/// — passes whenever the numbers happen to line up. This does not make the
+/// stronger content check unnecessary (see `verify_key_decomposition`), but it
+/// is the half that costs nothing.
+fn verify_role_matches_name(name: &str, path: &Path, role: &str) -> Result<()> {
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    ensure!(
+        stem == role,
+        "{} declares role {role:?}, but its name says {stem:?}; the file is in \
+         the wrong place or was copied from another bundle",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Doc 18 §18.4's cross-family identity, checked before a bundle is described.
+///
+/// `shared + subjects-only` must equal the `subjects` filter's `key_count`, and
+/// `shared + objects-only` the `objects` one. `hdtc sketch` and `hdtc keyset`
+/// derive those counts independently from the same dictionary, so a
+/// disagreement means one artifact is wrong.
+///
+/// This is the check that earns its place: doc 18 records a build on 2026-07-30
+/// in which concurrent `hdtc` processes sharing one temp directory produced key
+/// sets that were structurally perfect — correct CRC32C, correct
+/// `source_digest`, strictly ascending keys — and held **another graph's keys**.
+/// Every format-level check passed. Only this one caught it, and a manifest
+/// written over those bytes would have published an overlap that does not exist.
+///
+/// Skipped, not failed, when a bundle carries only part of the decomposition:
+/// doc 18 §18.4 says a missing role file is absent information, never an empty
+/// role, so there is nothing to compare rather than a mismatch to report.
+fn verify_key_decomposition(dir: &Path, entries: &[(String, ArtifactEntry)]) -> Result<()> {
+    let count = |name: &str| -> Option<u64> {
+        entries
+            .iter()
+            .find(|(entry_name, _)| entry_name == name)
+            .and_then(|(_, entry)| entry.keys.as_ref())
+            .map(|keys| keys.key_count)
+    };
+
+    for (role, only) in [("subjects", "subjects-only"), ("objects", "objects-only")] {
+        let filter = format!("filters/{role}.filter");
+        let (Some(shared), Some(directional), Some(whole)) = (
+            count("keysets/shared.keys"),
+            count(&format!("keysets/{only}.keys")),
+            count(&filter),
+        ) else {
+            continue;
+        };
+        let decomposed = shared.checked_add(directional).with_context(|| {
+            format!(
+                "key counts for {only} and shared overflow in {}",
+                dir.display()
+            )
+        })?;
+        ensure!(
+            decomposed == whole,
+            "{}: keysets/shared.keys ({shared}) + keysets/{only}.keys ({directional}) \
+             is {decomposed}, but {filter} counts {whole} keys. hdtc derives these \
+             independently from one dictionary, so one artifact is wrong — rebuild \
+             them, giving each hdtc invocation its own --temp-dir (doc 18 §18.4)",
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// Compute one manifest artifact entry from the bytes at `path`.

@@ -197,6 +197,163 @@ fn a_build_produces_a_bundle_its_own_check_accepts() {
     assert_eq!(input["sha256"], sha256(&source));
 }
 
+/// Doc 17 §17.3 and doc 18 §18.4 require a manifest entry per `filters/` and
+/// `keysets/` file. Without them those bytes sit in the bundle uncovered by
+/// `content_digest`, unverifiable by any mirror — and describing them later
+/// changes that digest, which for an immutable version means a rebuild.
+#[test]
+fn key_artifacts_are_described_per_file_and_cross_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nt");
+    std::fs::write(&source, SOURCE).unwrap();
+    let out = dir.path().join("root/tinykg/2026-06-01");
+
+    kgf(
+        &[
+            "build",
+            "bundle",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    let capabilities = manifest["capabilities"].as_object().unwrap();
+    assert!(capabilities.contains_key("filters"), "{capabilities:?}");
+    assert!(capabilities.contains_key("keysets"), "{capabilities:?}");
+
+    let artifacts = manifest["artifacts"].as_object().unwrap();
+    for name in [
+        "filters/subjects.filter",
+        "filters/subjects.minhash",
+        "filters/objects.filter",
+        "filters/objects.minhash",
+        "keysets/shared.keys",
+        "keysets/subjects-only.keys",
+        "keysets/objects-only.keys",
+    ] {
+        let entry = artifacts
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} is not described"));
+        // The comparability pair, which doc 18 §18.4 says a registry must
+        // verify on ingest, plus the count the identity below rests on.
+        let keys = &entry["keys"];
+        assert_eq!(keys["convention_id"], 1, "{name}");
+        assert_eq!(keys["hash_id"], 1, "{name}");
+        assert!(keys["key_count"].is_u64(), "{name}");
+        assert!(entry["sha256"].is_string(), "{name}");
+    }
+    assert_eq!(
+        artifacts["keysets/shared.keys"]["keys"]["encoding"],
+        "elias-fano"
+    );
+    // Sketches carry no encoding; only key sets do.
+    assert!(artifacts["filters/subjects.filter"]["keys"]["encoding"].is_null());
+
+    let count = |name: &str| artifacts[name]["keys"]["key_count"].as_u64().unwrap();
+    for (whole, only) in [("subjects", "subjects-only"), ("objects", "objects-only")] {
+        assert_eq!(
+            count("keysets/shared.keys") + count(&format!("keysets/{only}.keys")),
+            count(&format!("filters/{whole}.filter")),
+            "doc 18 §18.4 identity must hold for {whole}"
+        );
+    }
+}
+
+/// The identity is worth nothing if it cannot fail. Doc 18 §18.4 records a
+/// build whose key sets were structurally perfect — correct CRC32C, correct
+/// `source_digest`, ascending keys — and held another graph's keys; only this
+/// check caught it.
+#[test]
+fn a_key_set_from_another_bundle_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mine = dir.path().join("mine.nt");
+    let theirs = dir.path().join("theirs.nt");
+    std::fs::write(&mine, SOURCE).unwrap();
+    // One more subject, so the decomposition totals differ.
+    std::fs::write(
+        &theirs,
+        format!(
+            "{SOURCE}<http://example.org/carol> <http://example.org/knows>              <http://example.org/dave> .\n"
+        ),
+    )
+    .unwrap();
+
+    let ours = dir.path().join("root/tinykg/2026-06-01");
+    let other = dir.path().join("root/tinykg/2026-07-01");
+    for (out, input) in [(&ours, &mine), (&other, &theirs)] {
+        kgf(
+            &[
+                "build",
+                "bundle",
+                "--config",
+                "-",
+                "--out",
+                path(out),
+                "--input",
+                path(input),
+                "--hdtc",
+                &hdtc(),
+            ],
+            CONFIG,
+        )
+        .ok();
+    }
+
+    std::fs::copy(
+        other.join("keysets/subjects-only.keys"),
+        ours.join("keysets/subjects-only.keys"),
+    )
+    .unwrap();
+    let stderr = kgf(&["manifest", path(&ours)], "").err();
+    assert!(stderr.contains("doc 18 §18.4"), "{stderr}");
+    assert!(stderr.contains("one artifact is wrong"), "{stderr}");
+}
+
+/// The half the count identity cannot cover: a file whose header names a
+/// different role than its name does is misplaced, whatever the totals say.
+#[test]
+fn a_key_set_stored_under_another_role_name_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nt");
+    std::fs::write(&source, SOURCE).unwrap();
+    let out = dir.path().join("root/tinykg/2026-06-01");
+    kgf(
+        &[
+            "build",
+            "bundle",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+
+    std::fs::copy(
+        out.join("keysets/objects-only.keys"),
+        out.join("keysets/shared.keys"),
+    )
+    .unwrap();
+    let stderr = kgf(&["manifest", path(&out)], "").err();
+    assert!(stderr.contains("declares role"), "{stderr}");
+    assert!(stderr.contains("wrong place"), "{stderr}");
+}
+
 /// A digest the caller asserts is checked against the bytes the build read, so
 /// `--source-sha256` is an integrity check on the download rather than a value
 /// copied into the manifest.

@@ -130,6 +130,18 @@ pub enum Capability {
     Range,
     /// `GET /closure` — transitive expansion; needs the closure sidecar.
     Closure,
+    /// Membership filters and overlap sketches under `filters/` (doc 17).
+    ///
+    /// Unlike the others this gates no operation *here*. It is a federation
+    /// capability: a peer reads a bundle's filters to decide whether asking it
+    /// anything is worthwhile, and a registry reads them to build linksets. It
+    /// is declared because a capability describes what the bundle carries, not
+    /// what this deployment routes (doc 04 §4.3) — and because leaving these
+    /// bytes undeclared would leave them outside `content_digest`, unverifiable
+    /// by any mirror.
+    Filters,
+    /// Exact role key sets under `keysets/` (doc 18).
+    Keysets,
 }
 
 impl Capability {
@@ -145,6 +157,8 @@ impl Capability {
             Self::Labels => "labels",
             Self::Range => "range",
             Self::Closure => "closure",
+            Self::Filters => "filters",
+            Self::Keysets => "keysets",
         }
     }
 }
@@ -264,14 +278,20 @@ fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
     if artifacts.text.is_some() {
         capabilities.insert(Capability::Search);
     }
+    if !artifacts.filters.is_empty() {
+        capabilities.insert(Capability::Filters);
+    }
+    if !artifacts.keysets.is_empty() {
+        capabilities.insert(Capability::Keysets);
+    }
     capabilities
 }
 
 /// The artifact file names present, in the order doc 04 §4.1 lists them.
 ///
 /// **This list must grow with every sidecar.** Doc 04 §4.1 reserves `labels/`,
-/// `ranges/`, `closures/`, `reif/`, `geo/`, `vectors/`, `filters/`,
-/// and `stats/`, none of which has a producer yet; an artifact absent from here
+/// `ranges/`, `closures/`, `reif/`, `geo/` and `vectors/`, none of which has a
+/// producer yet; an artifact absent from here
 /// is absent from the manifest's checksums and therefore from
 /// `content_digest`. Adding a sidecar without adding it here silently narrows a
 /// version's identity.
@@ -296,6 +316,8 @@ fn artifact_names_for(artifacts: &ArtifactSet) -> Vec<&'static str> {
     if let Some(description) = &artifacts.description {
         names.extend(description.paths().map(|(name, _)| name));
     }
+    names.extend(artifacts.filters.iter().copied());
+    names.extend(artifacts.keysets.iter().copied());
     names
 }
 
@@ -375,6 +397,41 @@ pub struct ArtifactEntry {
     /// Contiguous byte ranges for the semantic views in this artifact.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub views: BTreeMap<String, ArtifactView>,
+    /// Convention metadata for a `filters/` or `keysets/` artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<KeyArtifact>,
+}
+
+/// What a membership filter, overlap sketch, or key set says about itself.
+///
+/// Doc 17 §17.3 and doc 18 §18.4 require a manifest entry per file carrying
+/// these fields, and doc 18 says a registry MUST verify them on ingest. They
+/// are read out of the file's own header rather than remembered from the build,
+/// because a summary held in the producing process is gone by the time anyone
+/// reads the bundle.
+///
+/// **`convention_id` and `hash_id` are the comparability pair.** Both formats
+/// say two artifacts may be compared iff those two agree — not
+/// `format_version`, not `role`, not `encoding`. Publishing them is what lets a
+/// consumer refuse a cross-convention intersection instead of computing a
+/// plausible, meaningless number from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyArtifact {
+    /// Semantic convention: which terms qualify and how one becomes a key.
+    pub convention_id: u16,
+    /// Container format version.
+    pub format_version: u16,
+    /// Key-derivation hash. `1` is XXH64 seed 0.
+    pub hash_id: u8,
+    /// The dictionary population these keys were drawn from.
+    pub role: String,
+    /// Distinct qualifying keys — authoritative, and what doc 18 §18.4's
+    /// cross-family identity is checked against.
+    pub key_count: u64,
+    /// Payload encoding. Key sets only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
 }
 
 /// Typed manifest entries consumed by the mapped description reader.
@@ -397,6 +454,15 @@ impl ArtifactEntry {
             parents: Vec::new(),
             max_row_bytes: None,
             views: BTreeMap::new(),
+            keys: None,
+        }
+    }
+
+    /// The same, for a `filters/` or `keysets/` artifact that describes itself.
+    pub fn key_artifact(bytes: u64, sha256: impl Into<String>, keys: KeyArtifact) -> Self {
+        Self {
+            keys: Some(keys),
+            ..Self::checksum(bytes, sha256)
         }
     }
 }
