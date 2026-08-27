@@ -520,8 +520,19 @@ impl VoidGraph {
         self.count(subject, predicate).unwrap_or(0)
     }
 
-    fn maybe_count(&self, subject: &NamedOrBlankNode, predicate: &str) -> Option<u64> {
-        self.count(subject, predicate).ok()
+    /// A count the partition may or may not state.
+    ///
+    /// Absence and malformedness are different answers and must not collapse
+    /// into one. `Ok(None)` means the partition does not state the count, which
+    /// the summary renders by omitting the key; anything present but unusable —
+    /// a non-numeric literal, two conflicting values for one partition — is an
+    /// error, because publishing "never computed" for a value hdtc did compute
+    /// and got wrong is exactly the misreport the summary must not make.
+    fn maybe_count(&self, subject: &NamedOrBlankNode, predicate: &str) -> Result<Option<u64>> {
+        if self.objects(subject, predicate).is_empty() {
+            return Ok(None);
+        }
+        self.count(subject, predicate).map(Some)
     }
 
     fn project(
@@ -546,8 +557,8 @@ impl VoidGraph {
             properties.push(PropertyRow {
                 predicate: predicate.clone(),
                 triples: self.count(&property_node, VOID_TRIPLES)?,
-                distinct_subjects: self.maybe_count(&property_node, VOID_DISTINCT_SUBJECTS),
-                distinct_objects: self.maybe_count(&property_node, VOID_DISTINCT_OBJECTS),
+                distinct_subjects: self.maybe_count(&property_node, VOID_DISTINCT_SUBJECTS)?,
+                distinct_objects: self.maybe_count(&property_node, VOID_DISTINCT_OBJECTS)?,
             });
             self.project_property(
                 &property_node,
@@ -630,8 +641,8 @@ impl VoidGraph {
                 class: class.to_owned(),
                 predicate: predicate.to_owned(),
                 triples: self.count(property_node, VOID_TRIPLES)?,
-                distinct_subjects: self.maybe_count(property_node, VOID_DISTINCT_SUBJECTS),
-                distinct_objects: self.maybe_count(property_node, VOID_DISTINCT_OBJECTS),
+                distinct_subjects: self.maybe_count(property_node, VOID_DISTINCT_SUBJECTS)?,
+                distinct_objects: self.maybe_count(property_node, VOID_DISTINCT_OBJECTS)?,
             });
         }
         for datatype_node in self.children(property_node, VOID_EXT_DATATYPE_PARTITION)? {

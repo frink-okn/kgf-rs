@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 use kgf_store::manifest::{
     ArtifactDigest, ArtifactEntry, ArtifactView, BundleFacts, Capability, Formats, KeyArtifact,
-    Manifest, ManifestDocument, Publisher, Source, content_digest_preimage,
-    default_predicate_roles, validate_predicate_role_iri,
+    KeyEncoding, KeyRole, KeyStructure, Manifest, ManifestDocument, Publisher, Source,
+    content_digest_preimage, default_predicate_roles, validate_predicate_role_iri,
 };
 use kgf_store::store::artifact;
 use kgf_store::{PublishedBundle, verify_description_artifacts};
@@ -111,7 +111,7 @@ pub struct Args {
 /// a no-flag operation.
 ///
 /// It exists so that the two non-CLI callers — the description producer and
-/// `kgf build bundle` — can supply a prefix map they already hold instead of
+/// `kgf build` — can supply a prefix map they already hold instead of
 /// rendering it to `prefix=IRI` strings for this module to parse back.
 #[derive(Debug, Default)]
 pub(crate) struct Requested {
@@ -239,6 +239,9 @@ pub fn run(args: Args) -> Result<()> {
     // placeholder that does not parse is not an error: supplying one is how a
     // bundle gets its first real manifest.
     let document = ManifestDocument::read(&dir)?;
+    if let Some(document) = &document {
+        refuse_unreadable_manifest(&dir, document)?;
+    }
     let manifest = build(
         &Requested::from_args(&args)?,
         &dir,
@@ -267,7 +270,34 @@ pub fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Refresh a manifest after `kgf build stats` publishes a complete description set.
+/// A manifest that names a dataset must parse, or say why it does not.
+///
+/// `ManifestDocument` tolerates an unparseable document because the `{}`
+/// placeholder is one, and writing over a placeholder is the point. But the
+/// same tolerance made *any* malformed field silently become "no previous
+/// manifest", and the consequences were bad in both directions: on a bundle
+/// with a description set the command died blaming
+/// `stats/schema-nodes.tsv` for missing build-produced metadata that was
+/// present and correct, and on a bundle without one it succeeded while quietly
+/// dropping `title`, `license`, `homepage`, `publisher`, `dataset_iri`,
+/// `prefixes`, `predicate_roles` and `previous_version`.
+///
+/// A placeholder declares nothing. A document that declares an `id` is
+/// claiming to describe a dataset, so a parse failure in it is an error with a
+/// cause worth naming rather than a reason to start over.
+fn refuse_unreadable_manifest(dir: &Path, document: &ManifestDocument) -> Result<()> {
+    if document.parsed().is_some() || !document.declares_identity() {
+        return Ok(());
+    }
+    bail!(
+        "manifest {} names a dataset but does not parse: {}. Fix that field, or \
+         replace the file with `{{}}` to build a manifest from the artifacts",
+        manifest_path(dir).display(),
+        document.parse_error().unwrap_or("unknown reason"),
+    )
+}
+
+/// Write the manifest for a bundle whose description set was just produced.
 ///
 /// The ordinary manifest command deliberately cannot invent semantic TSV
 /// ranges. The producer supplies the ranges it measured while writing, and
@@ -663,21 +693,29 @@ fn verify_text_binding(dir: &Path) -> Result<()> {
 /// not in `kgf-store`: full digests belong to publish and `kgf verify`, never to
 /// the latency-sensitive open path (doc 20 §20.6).
 fn checksum_artifacts(dir: &Path, facts: &BundleFacts) -> Result<Vec<(String, ArtifactEntry)>> {
-    // Computed once, not per file: seven sidecars would otherwise rescan the
-    // same HDT seven times to reach the same answer.
-    let identity = hdt_data_digest(&dir.join(artifact::HDT))?;
-    let entries: Vec<(String, ArtifactEntry)> = facts
-        .artifact_names()
-        .map(|name| {
-            let path = dir.join(name);
-            let entry = checksum_artifact(&path)?;
-            let entry = match describe_key_artifact(name, &path, &identity)? {
+    // Computed at most once, and only if a key artifact needs it. Seven
+    // sidecars would otherwise rescan the same HDT seven times for one answer —
+    // and a bundle with no `filters/` or `keysets/` at all would read its
+    // largest file end to end a second time for a value nothing consumes.
+    let mut identity: Option<[u8; 32]> = None;
+    let mut entries: Vec<(String, ArtifactEntry)> = Vec::new();
+    for name in facts.artifact_names() {
+        let path = dir.join(name);
+        let entry = checksum_artifact(&path)?;
+        let entry = if is_key_artifact(name) {
+            let identity = match &identity {
+                Some(digest) => digest,
+                None => identity.insert(hdt_data_digest(&dir.join(artifact::HDT))?),
+            };
+            match describe_key_artifact(name, &path, identity)? {
                 Some(keys) => ArtifactEntry::key_artifact(entry.bytes, entry.sha256, keys),
                 None => entry,
-            };
-            Ok((name.to_owned(), entry))
-        })
-        .collect::<Result<_>>()?;
+            }
+        } else {
+            entry
+        };
+        entries.push((name.to_owned(), entry));
+    }
     verify_key_decomposition(dir, &entries)?;
     Ok(entries)
 }
@@ -690,6 +728,32 @@ fn checksum_artifacts(dir: &Path, facts: &BundleFacts) -> Result<Vec<(String, Ar
 /// `docs/keyset-format.md` §4.4 require — a full pass, which is why this lives
 /// in the producer beside the checksum that already reads the file, and not in
 /// `BundleFacts::read`, whose cost must stay independent of bundle size.
+/// hdtc's role vocabulary, as the manifest spells it.
+///
+/// A total match rather than a string round trip: hdtc's `terms` role has no
+/// KGF spelling (doc 18 §18.4 excludes it from the profile), and this is where
+/// that shows up as a refusal rather than as an unexpected value in a
+/// published manifest.
+fn key_role(role: hdtc::format::KeyRole, path: &Path) -> Result<KeyRole> {
+    Ok(match role {
+        hdtc::format::KeyRole::Subjects => KeyRole::Subjects,
+        hdtc::format::KeyRole::Objects => KeyRole::Objects,
+        hdtc::format::KeyRole::Predicates => KeyRole::Predicates,
+        hdtc::format::KeyRole::Shared => KeyRole::Shared,
+        hdtc::format::KeyRole::SubjectsOnly => KeyRole::SubjectsOnly,
+        hdtc::format::KeyRole::ObjectsOnly => KeyRole::ObjectsOnly,
+        other => bail!(
+            "{} declares role {other:?}, which is not one the KGF profile publishes \
+             (doc 18 §18.4)",
+            path.display()
+        ),
+    })
+}
+
+fn is_key_artifact(name: &str) -> bool {
+    artifact::FILTERS.contains(&name) || artifact::KEYSETS.contains(&name)
+}
+
 fn describe_key_artifact(
     name: &str,
     path: &Path,
@@ -704,8 +768,10 @@ fn describe_key_artifact(
         // a sketch, `variant` for a filter — so a registry can judge
         // compatibility from the manifest without fetching the artifact.
         let (structure, variant, k) = match header.body {
-            hdtc::format::SketchBody::Filter { variant, .. } => ("fuse", Some(variant), None),
-            hdtc::format::SketchBody::MinHash { k, .. } => ("minhash", None, Some(k)),
+            hdtc::format::SketchBody::Filter { variant, .. } => {
+                (KeyStructure::Fuse, Some(variant), None)
+            }
+            hdtc::format::SketchBody::MinHash { k, .. } => (KeyStructure::Minhash, None, Some(k)),
             // `SketchBody` is non-exhaustive, and §17.4 requires the structure
             // and its parameter in the entry. A structure this build cannot
             // name is one it cannot describe, so it refuses rather than
@@ -721,8 +787,8 @@ fn describe_key_artifact(
             convention_id: header.convention_id,
             format_version: header.format_version,
             hash_id: header.hash_id,
-            role: header.role.file_stem().to_owned(),
-            structure: structure.to_owned(),
+            role: key_role(header.role, path)?,
+            structure,
             key_count: header.key_count,
             variant,
             k,
@@ -738,12 +804,19 @@ fn describe_key_artifact(
             convention_id: header.convention_id,
             format_version: header.format_version,
             hash_id: header.hash_id,
-            role: header.role.file_stem().to_owned(),
-            structure: "keyset".to_owned(),
+            role: key_role(header.role, path)?,
+            structure: KeyStructure::Keyset,
             key_count: header.key_count,
             variant: None,
             k: None,
-            encoding: Some(header.encoding.label().to_owned()),
+            encoding: Some(match header.encoding {
+                hdtc::format::KeysetEncoding::EliasFano => KeyEncoding::EliasFano,
+                hdtc::format::KeysetEncoding::Raw => KeyEncoding::Raw,
+                other => bail!(
+                    "{} uses key-set encoding {other:?}, which this build cannot describe",
+                    path.display()
+                ),
+            }),
         }));
     }
     Ok(None)
@@ -1091,7 +1164,7 @@ pub fn content_digest<'a>(
     format!("sha256:{}", hex(&root))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes.iter().fold(String::new(), |mut out, byte| {
         let _ = write!(out, "{byte:02x}");
@@ -1192,8 +1265,8 @@ mod tests {
                     convention_id: 1,
                     format_version: 1,
                     hash_id: 1,
-                    role: "unused".to_owned(),
-                    structure: "unused".to_owned(),
+                    role: KeyRole::Shared,
+                    structure: KeyStructure::Keyset,
                     key_count: count,
                     variant: None,
                     k: None,

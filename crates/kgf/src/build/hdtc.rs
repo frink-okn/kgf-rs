@@ -89,11 +89,75 @@ pub(super) fn render(argv: &[OsString]) -> String {
         .join(" ")
 }
 
+/// One argument, safe to paste into a shell.
+///
+/// An allowlist, not a denylist. `rehearse` calls its output "a script a person
+/// can follow", and an operator pastes it — so a denylist that misses `;`, `&`,
+/// `|`, `#`, `*` or `~` does not merely look wrong, it runs something else:
+/// `&` backgrounds the command, `#` truncates the line, `*` globs against
+/// whatever directory they happen to be in. A dataset IRI with `&` in its query
+/// string is enough to trigger it. Only the characters that are inert in every
+/// shell context go through bare.
 fn quote(argument: &OsStr) -> String {
     let text = argument.to_string_lossy();
-    if text.is_empty() || text.contains(|c: char| c.is_whitespace() || "'\"\\$`".contains(c)) {
-        format!("'{}'", text.replace('\'', r"'\''"))
-    } else {
-        text.into_owned()
+    let inert = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
+    if !text.is_empty() && text.chars().all(inert) {
+        return text.into_owned();
+    }
+    // Single quotes make every other character literal; the only thing that
+    // cannot appear inside them is a single quote, which is closed, escaped,
+    // and reopened.
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rehearsal is printed so an operator can retype it. An argument that
+    /// changes meaning when pasted makes the whole output worse than useless,
+    /// because it no longer describes what `Runner::run` actually executed.
+    #[test]
+    fn every_shell_metacharacter_is_quoted() {
+        for hostile in [
+            "https://e.org/a?x=1&y=2",
+            "a;rm -rf /",
+            "a|b",
+            "a>b",
+            "glob*",
+            "trailing#comment",
+            "~/relative",
+            "(sub)",
+            "back`tick`",
+            "dollar$sign",
+            "with space",
+            "",
+        ] {
+            let quoted = quote(OsStr::new(hostile));
+            assert!(
+                quoted.starts_with('\'') && quoted.ends_with('\''),
+                "{hostile:?} rendered unquoted as {quoted}"
+            );
+        }
+    }
+
+    /// And ordinary arguments stay readable, or the output is unusable noise.
+    #[test]
+    fn inert_arguments_are_left_bare() {
+        for plain in [
+            "hdtc",
+            "--max-literal-bytes",
+            "4096",
+            "/var/bundles/dreamkg/2026-06-01/data.hdt",
+            "subjects-only,objects-only,shared",
+            "elias-fano",
+        ] {
+            assert_eq!(quote(OsStr::new(plain)), plain);
+        }
+    }
+
+    #[test]
+    fn a_single_quote_is_closed_escaped_and_reopened() {
+        assert_eq!(quote(OsStr::new("it's")), r"'it'\''s'");
     }
 }

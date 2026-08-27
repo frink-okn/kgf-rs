@@ -83,7 +83,6 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
         data: staging.path().join(artifact::HDT),
     };
     let inputs = materialize(plan, &runner, &layout)?;
-    verify_asserted_digest(plan, &inputs)?;
 
     for step in sidecar_steps(plan, &layout) {
         runner.run(&step)?;
@@ -126,15 +125,19 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
         );
     }
 
-    // `into_path` because the rename must move the directory, not drop it.
-    let staged = staging.keep();
-    std::fs::rename(&staged, &plan.output).with_context(|| {
+    // Renamed while the temporary directory still owns it, and disarmed only
+    // once the move succeeded. Disarming first left a complete bundle's worth
+    // of bytes in `.kgf-build-*` whenever the rename failed — invisible to
+    // `Catalog::scan`, which skips dot-prefixed names, and with nothing left to
+    // remove it. Retries would have accumulated them on the serving volume.
+    std::fs::rename(staging.path(), &plan.output).with_context(|| {
         format!(
             "publishing {} to {}",
-            staged.display(),
+            staging.path().display(),
             plan.output.display()
         )
     })?;
+    let _ = staging.keep();
     release_adopted_input(plan);
     Ok(Built {
         manifest,
@@ -349,21 +352,24 @@ fn materialize(
             // kace's conversion also writes an HDT-FoQ index, which KGF never
             // reads (doc 20 §20.8). Only the HDT itself is taken.
             let digest = place(path, data, *adopt)?;
-            runner.run(&core_step(plan, layout))?;
-            Ok(vec![SourceInput {
+            let inputs = vec![SourceInput {
                 url: plan.provenance.source_url.clone(),
                 format: "hdt".to_owned(),
                 sha256: digest,
-            }])
+            }];
+            // Before the permutation build, not after. The digest is known as
+            // soon as the bytes are read, and `hdtc perm` over a large HDT is
+            // hours — a corrupt download should not buy them.
+            verify_asserted_digest(plan, &inputs)?;
+            runner.run(&core_step(plan, layout))?;
+            Ok(inputs)
         }
         Input::Rdf { paths } => {
-            runner.run(&core_step(plan, layout))?;
-
             // One `url` for several inputs cannot be apportioned, so it names
             // the first and the rest carry their digests alone. A caller with
             // several sources should be recording several URLs, which is a
             // config-level change rather than a guess made here.
-            paths
+            let inputs = paths
                 .iter()
                 .enumerate()
                 .map(|(index, path)| {
@@ -375,7 +381,12 @@ fn materialize(
                         sha256: hash_file(path)?,
                     })
                 })
-                .collect()
+                .collect::<Result<Vec<_>>>()?;
+            // Hashing the inputs is cheap beside `hdtc create --perm`, so the
+            // assertion is settled first.
+            verify_asserted_digest(plan, &inputs)?;
+            runner.run(&core_step(plan, layout))?;
+            Ok(inputs)
         }
     }
 }
@@ -391,8 +402,9 @@ fn verify_asserted_digest(plan: &BundlePlan, inputs: &[SourceInput]) -> Result<(
     };
     let [only] = inputs else {
         bail!(
-            "--source-sha256 names one digest but this build read {} inputs; \
-             assert per-input digests in the config instead",
+            "--source-sha256 asserts one digest, but this build reads {} inputs and \
+             there is no way to say which it describes. Build from a single --input \
+             or --hdt to assert a digest, or drop the flag",
             inputs.len()
         );
     };
@@ -532,7 +544,7 @@ fn copy_hashing(source: &Path, dest: &Path) -> Result<String> {
     writer
         .flush()
         .with_context(|| format!("flushing {}", dest.display()))?;
-    Ok(hex(&hasher.finalize()))
+    Ok(crate::manifest::hex(&hasher.finalize()))
 }
 
 fn hash_file(path: &Path) -> Result<String> {
@@ -540,15 +552,7 @@ fn hash_file(path: &Path) -> Result<String> {
         std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hasher = Sha256::new();
     std::io::copy(&mut file, &mut hasher).with_context(|| format!("reading {}", path.display()))?;
-    Ok(hex(&hasher.finalize()))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::new(), |mut out, byte| {
-        use std::fmt::Write;
-        let _ = write!(out, "{byte:02x}");
-        out
-    })
+    Ok(crate::manifest::hex(&hasher.finalize()))
 }
 
 /// The per-artifact sizes doc 04 §4.4 asks a build to report.
@@ -573,8 +577,6 @@ pub(super) fn report(built: &Built, output: &Path) -> String {
     );
     for (name, bytes) in &sizes {
         let _ = writeln!(lines, "  {name:<width$}  {}", human(*bytes));
-        // `width` is used by the format string above.
-        let _ = width;
     }
     let _ = writeln!(lines, "  {:<width$}  {}", "total", human(total));
     let _ = writeln!(

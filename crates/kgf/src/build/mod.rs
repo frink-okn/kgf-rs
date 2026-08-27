@@ -152,6 +152,22 @@ fn resolve_build(args: Args, config: ConfigPlan) -> Result<Build> {
     let input = resolve_input(&args)?;
     let provenance = resolve_provenance(&args)?;
 
+    // Checked here rather than in `ConfigPlan::resolve`, and long before the
+    // last hdtc invocation. Not in resolution, because a rendered config names
+    // paths inside the *build container* and registry CI runs `--check-config`
+    // on the host, where `/kgf/prefixes.yaml` legitimately does not exist —
+    // existence is a fact about this machine, not about the config. But not at
+    // the namespace inventory either, which is where it used to surface: a
+    // one-character typo otherwise costs the HDT, permutation, text index,
+    // sketches, key sets and VoID before anyone hears about it.
+    for table in &config.contents.stats.prefix_tables {
+        ensure!(
+            table.is_file(),
+            "contents.stats.prefix_tables names {}, which is not a file on this machine",
+            table.display()
+        );
+    }
+
     Ok(Build {
         plan: BundlePlan {
             config,

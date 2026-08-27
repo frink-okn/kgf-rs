@@ -513,6 +513,50 @@ fn an_asserted_source_digest_must_look_like_one() {
     }
 }
 
+/// A prefix table that does not exist fails the build immediately, not at the
+/// namespace inventory — the last hdtc invocation of the whole pipeline, after
+/// the text index, sketches, key sets and VoID have all been built.
+///
+/// It is checked on the build path and not in `--check-config`, because a
+/// rendered config names paths inside the build container while registry CI
+/// validates it on the host.
+#[test]
+fn a_missing_prefix_table_fails_before_anything_is_built() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nt");
+    std::fs::write(&source, SOURCE).unwrap();
+    let out = dir.path().join("root/tinykg/2026-06-01");
+    let config =
+        format!("{CONFIG}contents: {{stats: {{prefix_tables: ['/nope/missing.json']}}}}\n");
+
+    let stderr = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &config,
+    )
+    .err();
+    assert!(stderr.contains("/nope/missing.json"), "{stderr}");
+    assert!(!out.exists(), "nothing may be published");
+    assert!(
+        !out.parent().unwrap().exists()
+            || std::fs::read_dir(out.parent().unwrap()).unwrap().count() == 0,
+        "the build ran far enough to stage something"
+    );
+
+    // The same config still passes `--check-config`, which cannot know the
+    // paths of the machine that will run the build.
+    kgf(&["build", "--config", "-", "--check-config"], &config).ok();
+}
+
 /// `--adopt` must not cost the caller their input when the build fails.
 ///
 /// Staging is a temporary directory deleted on any error, so moving the source

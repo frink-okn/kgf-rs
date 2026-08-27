@@ -602,6 +602,24 @@ fn non_empty(value: Option<String>, field: &str) -> Result<Option<String>> {
 }
 
 fn resolve_semantics(semantics: config::Semantics) -> Result<Semantics> {
+    // Seeded *before* anything is validated against it. These four are declared
+    // by every manifest whatever the config says, so validating roles or
+    // authoritative namespaces against the config's own map alone would accept
+    // profiles the manifest writer then refuses, and reject namespaces the
+    // resolved plan does declare. Both were real: `roles: {label: [rdfs:label]}`
+    // passed `--check-config` and failed at the manifest step after the whole
+    // bundle had been built, and `authoritative_namespaces: [rdfs]` was refused
+    // as undeclared by the same function that declares it.
+    //
+    // Seeded first rather than merged after, so an explicit binding overrides
+    // rather than collides, exactly as `crate::manifest::prefixes` does. It also
+    // gives the namespace inventory — which runs before any manifest exists and
+    // requires at least one `--prefixes` table — something to pass.
+    let mut prefixes: BTreeMap<String, String> = crate::manifest::WELL_KNOWN_PREFIXES
+        .iter()
+        .map(|(prefix, namespace)| ((*prefix).to_owned(), (*namespace).to_owned()))
+        .collect();
+
     for (prefix, expansion) in &semantics.prefixes {
         ensure!(
             !prefix.is_empty()
@@ -616,6 +634,7 @@ fn resolve_semantics(semantics: config::Semantics) -> Result<Semantics> {
             )
         })?;
     }
+    prefixes.extend(semantics.prefixes);
 
     for (role, predicates) in &semantics.roles {
         ensure!(
@@ -632,7 +651,7 @@ fn resolve_semantics(semantics: config::Semantics) -> Result<Semantics> {
              declaring it empty"
         );
         for predicate in predicates {
-            validate_predicate_role_iri(predicate, &semantics.prefixes).map_err(|error| {
+            validate_predicate_role_iri(predicate, &prefixes).map_err(|error| {
                 anyhow::anyhow!("role {role:?} predicate {predicate:?} is unusable: {error}")
             })?;
         }
@@ -648,26 +667,10 @@ fn resolve_semantics(semantics: config::Semantics) -> Result<Semantics> {
 
     for namespace in &semantics.authoritative_namespaces {
         ensure!(
-            semantics.prefixes.contains_key(namespace),
+            prefixes.contains_key(namespace),
             "authoritative namespace {namespace:?} is not one of the declared prefixes"
         );
     }
-
-    // Seeded with the bindings every manifest declares, so the resolved plan
-    // shows the map the build will actually use. Two reasons this belongs here
-    // rather than being left to the manifest writer: `--check-config` would
-    // otherwise print a prefix map the bundle does not have, and the namespace
-    // inventory runs *before* the manifest exists — `hdtc namespaces` requires
-    // at least one `--prefixes` table, so a config declaring none had nothing
-    // to pass it and failed at the last step of an otherwise valid build.
-    //
-    // Seeded first, so an explicit binding overrides rather than collides,
-    // exactly as `crate::manifest::prefixes` does.
-    let mut prefixes: BTreeMap<String, String> = crate::manifest::WELL_KNOWN_PREFIXES
-        .iter()
-        .map(|(prefix, namespace)| ((*prefix).to_owned(), (*namespace).to_owned()))
-        .collect();
-    prefixes.extend(semantics.prefixes);
 
     Ok(Semantics {
         prefixes,
@@ -937,6 +940,16 @@ mod tests {
             MINIMAL,
             "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\ncontents: {text: {enabled: false}}\n",
             "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\nresources: {memory_limit: 8G}\n",
+            // The two fields validated against the prefix map. Both once
+            // resolved to a plan that would not re-parse, because the
+            // well-known bindings were seeded after they were checked.
+            "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\n\
+             semantics: {roles: {label: ['http://www.w3.org/2000/01/rdf-schema#label']}}\n",
+            "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\n\
+             semantics: {authoritative_namespaces: [rdfs]}\n",
+            "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\n\
+             semantics: {prefixes: {ex: 'http://e.org/'}, \
+             authoritative_namespaces: [ex, xsd]}\n",
         ] {
             let first = resolve(source).unwrap();
             let json = serde_json::to_string(&first).unwrap();
@@ -1045,6 +1058,33 @@ mod tests {
         )
         .expect_err("an empty role must be refused");
         assert!(format!("{empty:#}").contains("declares no predicates"));
+    }
+
+    /// A role or namespace may name a binding the resolver itself adds.
+    ///
+    /// Both of these once failed, in opposite directions: a well-known CURIE in
+    /// a role was accepted and then refused by the manifest writer at the end
+    /// of a completed build, and a well-known prefix in
+    /// `authoritative_namespaces` was refused outright by the same function
+    /// that declares it.
+    #[test]
+    fn the_well_known_prefixes_are_visible_to_every_check() {
+        let curie = resolve(
+            "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\n\
+             semantics: {roles: {label: ['rdfs:label']}}\n",
+        )
+        .expect_err("a well-known CURIE in a role must be refused at resolve, not at publish");
+        assert!(
+            format!("{curie:#}").contains("rdf-schema#label"),
+            "{curie:#}"
+        );
+
+        let namespace = resolve(
+            "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\n\
+             semantics: {authoritative_namespaces: [rdfs]}\n",
+        )
+        .expect("a well-known prefix is declared, so it may be authoritative");
+        assert_eq!(namespace.semantics.authoritative_namespaces, ["rdfs"]);
     }
 
     #[test]

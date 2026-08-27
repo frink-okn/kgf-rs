@@ -439,13 +439,13 @@ pub struct KeyArtifact {
     /// Key-derivation hash. `1` is XXH64 seed 0.
     pub hash_id: u8,
     /// The dictionary population these keys were drawn from.
-    pub role: String,
-    /// What the file is: `fuse`, `minhash`, or `keyset`.
+    pub role: KeyRole,
+    /// What the file is.
     ///
     /// Doc 17 §17.4 requires it of the two sketch families. Key sets carry it
     /// too, which doc 18 §18.4 does not ask for, so that one entry shape
     /// describes all three and nothing has to be inferred from a file name.
-    pub structure: String,
+    pub structure: KeyStructure,
     /// Distinct qualifying keys — authoritative, and what doc 18 §18.4's
     /// cross-family identity is checked against.
     pub key_count: u64,
@@ -457,7 +457,69 @@ pub struct KeyArtifact {
     pub k: Option<u32>,
     /// Payload encoding. Key sets only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encoding: Option<String>,
+    pub encoding: Option<KeyEncoding>,
+}
+
+/// What a key-bearing artifact is.
+///
+/// Closed vocabularies, so a typo is a parse refusal rather than a value that
+/// compares unequal to every real one. `--check` compares these fields against
+/// the file's own header (doc 17 §17.4), and a hand-edited `"fuze"` should say
+/// so where it is written rather than surface later as a mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeyStructure {
+    /// A binary fuse membership filter, `filters/{role}.filter`.
+    Fuse,
+    /// A bottom-k overlap sketch, `filters/{role}.minhash`.
+    Minhash,
+    /// An exact key set, `keysets/{role}.keys`.
+    Keyset,
+}
+
+/// The dictionary population a set of keys was drawn from.
+///
+/// Doc 18 §18.4's six roles. hdtc's experimental `terms` role is deliberately
+/// absent: §18.4 excludes it from the KGF profile, so it is not nameable here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeyRole {
+    /// `Shared ∪ Subjects`.
+    Subjects,
+    /// `Shared ∪ Objects`.
+    Objects,
+    /// The predicate section.
+    Predicates,
+    /// The shared section.
+    Shared,
+    /// The subject-only section.
+    SubjectsOnly,
+    /// The object-only section.
+    ObjectsOnly,
+}
+
+/// A key set's payload encoding (doc 18 §4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeyEncoding {
+    /// Elias-Fano, doc 18 §18.4's standard emission.
+    EliasFano,
+    /// A raw sorted `u64` array.
+    Raw,
+}
+
+impl KeyRole {
+    /// The name this role has in a file name and on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Subjects => "subjects",
+            Self::Objects => "objects",
+            Self::Predicates => "predicates",
+            Self::Shared => "shared",
+            Self::SubjectsOnly => "subjects-only",
+            Self::ObjectsOnly => "objects-only",
+        }
+    }
 }
 
 /// Typed manifest entries consumed by the mapped description reader.
@@ -956,6 +1018,22 @@ impl ManifestDocument {
     /// The manifest file this was read from.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether the document claims to describe a dataset.
+    ///
+    /// The discriminator between a placeholder — `{}`, which is how a bundle
+    /// starts — and a real manifest whose typed parse failed. A producer may
+    /// write over the first, and must not silently start from scratch on the
+    /// second: every descriptive field it would have carried forward is lost
+    /// that way, without a word.
+    pub fn declares_identity(&self) -> bool {
+        self.raw.contains_key("id")
+    }
+
+    /// Why the typed parse failed, when it did.
+    pub fn parse_error(&self) -> Option<&str> {
+        self.parsed.as_ref().err().map(String::as_str)
     }
 
     /// The parsed manifest, if the document is a complete one.
@@ -1516,7 +1594,7 @@ mod tests {
         assert!(error.to_string().contains("found an array"), "{error}");
     }
 
-    /// `source` was an unmodeled field before `kgf build bundle` produced one,
+    /// `source` was an unmodeled field before `kgf build` produced one,
     /// and doc 04 §4.3 still shows the older `{format, sha256, url}` shape. A
     /// document written to that shape must fail loudly rather than parse into
     /// an empty `Source`: silently dropping provenance would leave a manifest

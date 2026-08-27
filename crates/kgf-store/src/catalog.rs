@@ -266,13 +266,13 @@ fn directory_entries(path: &Path) -> Result<Vec<std::fs::DirEntry>> {
 /// Whether a directory entry is a build in progress rather than a publication.
 ///
 /// A producer stages on the same filesystem as its output so that publication
-/// is a `rename` — `kgf build stats` already does, and `kgf build bundle`
-/// does — which puts a half-written directory inside the tree this scan walks.
+/// is a `rename` — `kgf build` does — which puts a half-written directory
+/// inside the tree this scan walks.
 /// Without this rule a server started mid-build lists that directory as a
 /// release, and a request for it fails at open instead of at the catalog.
 ///
 /// A leading `.` is the rule, and it is a rule rather than a convention: it is
-/// the other half of the one `kgf build bundle` enforces on a dataset id and a
+/// the other half of the one `kgf build` enforces on a dataset id and a
 /// version label, which refuse a leading `.` for exactly this reason. Between
 /// them a staging directory can never be mistaken for a published one, in
 /// either direction.
