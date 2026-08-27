@@ -12,6 +12,7 @@
 //! three read the same [`plan::ConfigPlan`].
 
 mod execute;
+mod hdtc;
 
 pub mod config;
 pub mod plan;

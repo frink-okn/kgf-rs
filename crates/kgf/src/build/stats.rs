@@ -14,7 +14,6 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
 use kgf_server::url::Params;
@@ -64,8 +63,9 @@ pub(crate) struct DatasetCard<'a> {
 /// Everything the description producer needs, and nothing about where the
 /// bundle it describes gets its identity from.
 pub(crate) struct Inputs<'a> {
-    /// hdtc executable for the VoID, HDT, permutation and namespace steps.
-    pub(crate) hdtc: &'a Path,
+    /// How to invoke hdtc, carrying the build's configured memory limit and its
+    /// per-invocation temporary directories.
+    pub(crate) runner: &'a super::hdtc::Runner<'a>,
     /// The bundle's `data.hdt`.
     pub(crate) data: &'a Path,
     /// Stable dataset IRI, already validated as an absolute IRI.
@@ -100,7 +100,7 @@ pub(crate) struct Outcome {
 /// place and assembling a new one.
 pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
     let Inputs {
-        hdtc,
+        runner,
         data,
         dataset_iri,
         prefix_tables,
@@ -110,10 +110,10 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
     } = inputs;
 
     let void_nt = work.join("void.nt");
-    run_hdtc(
-        hdtc,
-        "queryable VoID analysis",
-        vec![
+    runner.run(&super::hdtc::Step {
+        name: "queryable VoID analysis",
+        temp: None,
+        args: vec![
             OsString::from("void"),
             data.as_os_str().to_owned(),
             OsString::from("--dataset-uri"),
@@ -125,25 +125,23 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
             // bundle publishes.
             OsString::from("--partition-distinct-counts"),
             OsString::from("dataset-properties"),
-            OsString::from("--quiet"),
         ],
-    )?;
+    })?;
 
     let void_hdt = into.join("void.hdt");
-    run_hdtc(
-        hdtc,
-        "VoID HDT and permutation build",
-        vec![
+    runner.run(&super::hdtc::Step {
+        name: "VoID HDT and permutation build",
+        temp: Some("void-create"),
+        args: vec![
             OsString::from("create"),
             OsString::from("--output"),
             void_hdt.as_os_str().to_owned(),
             OsString::from("--perm"),
             OsString::from("--dataset-uri"),
             OsString::from(dataset_iri),
-            OsString::from("--quiet"),
             void_nt.as_os_str().to_owned(),
         ],
-    )?;
+    })?;
     ensure!(
         into.join("void.hdt.perm").is_file(),
         "hdtc did not produce {}",
@@ -209,10 +207,13 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
         namespaces_path.as_os_str().to_owned(),
         OsString::from("--format"),
         OsString::from("json"),
-        OsString::from("--quiet"),
         data.as_os_str().to_owned(),
     ]);
-    run_hdtc(hdtc, "namespace inventory", namespace_args)?;
+    runner.run(&super::hdtc::Step {
+        name: "namespace inventory",
+        args: namespace_args,
+        temp: None,
+    })?;
     let mut namespaces: Value = serde_json::from_slice(
         &std::fs::read(&namespaces_path)
             .with_context(|| format!("reading {}", namespaces_path.display()))?,
@@ -245,15 +246,6 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
         relation_rows,
         class_property_rows,
     })
-}
-
-fn run_hdtc(hdtc: &Path, step: &str, args: Vec<OsString>) -> Result<()> {
-    let status = Command::new(hdtc)
-        .args(args)
-        .status()
-        .with_context(|| format!("running hdtc for {step}"))?;
-    ensure!(status.success(), "hdtc {step} failed with {status}");
-    Ok(())
 }
 
 fn write(path: &Path, bytes: &[u8]) -> Result<()> {

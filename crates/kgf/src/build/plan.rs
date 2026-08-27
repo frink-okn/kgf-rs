@@ -24,6 +24,16 @@ use serde::Serialize;
 
 use super::config;
 
+/// The MinHash capacity every conforming bundle publishes at (doc 17 §17.2).
+///
+/// Not a default and not a knob. Comparing two sketches truncates both to
+/// `min(k_A, k_B)`, so one bundle publishing at a smaller `k` caps the
+/// resolution of *every pair it participates in*: raising it unilaterally buys
+/// nothing and lowering it degrades other people's numbers. §17.2.1 calls it a
+/// federation constant for exactly that reason, so it is not representable in a
+/// config.
+pub const SKETCH_K: u32 = 65536;
+
 /// The sketch roles a conforming bundle publishes.
 ///
 /// Doc 17 §17.3 makes each family all-or-nothing — both filter roles or
@@ -438,7 +448,7 @@ pub struct Text {
 /// `filters/`.
 #[derive(Debug, Clone, Serialize)]
 pub struct Filters {
-    /// Bottom-k MinHash capacity.
+    /// Bottom-k MinHash capacity. Always [`SKETCH_K`].
     pub k: u32,
     /// Binary fuse fingerprint width.
     pub filter_bits: FilterBits,
@@ -499,8 +509,6 @@ mod defaults {
     pub const MAX_LITERAL_BYTES: u64 = 4096;
     /// hdtc `text --untagged-language`.
     pub const UNTAGGED_LANGUAGE: &str = "en";
-    /// hdtc `sketch --k`; doc 17 §17.4 measures the federation at this value.
-    pub const SKETCH_K: u32 = 65536;
     /// hdtc `sketch --filter-bits`; doc 18 §18.2 sizes the corpus at Fuse16.
     pub const FILTER_BITS: u8 = 16;
     /// hdtc `keyset --encoding`; doc 18 §18.4's `kgf-keyset/1` standard emission.
@@ -645,8 +653,24 @@ fn resolve_semantics(semantics: config::Semantics) -> Result<Semantics> {
         );
     }
 
+    // Seeded with the bindings every manifest declares, so the resolved plan
+    // shows the map the build will actually use. Two reasons this belongs here
+    // rather than being left to the manifest writer: `--check-config` would
+    // otherwise print a prefix map the bundle does not have, and the namespace
+    // inventory runs *before* the manifest exists — `hdtc namespaces` requires
+    // at least one `--prefixes` table, so a config declaring none had nothing
+    // to pass it and failed at the last step of an otherwise valid build.
+    //
+    // Seeded first, so an explicit binding overrides rather than collides,
+    // exactly as `crate::manifest::prefixes` does.
+    let mut prefixes: BTreeMap<String, String> = crate::manifest::WELL_KNOWN_PREFIXES
+        .iter()
+        .map(|(prefix, namespace)| ((*prefix).to_owned(), (*namespace).to_owned()))
+        .collect();
+    prefixes.extend(semantics.prefixes);
+
     Ok(Semantics {
-        prefixes: semantics.prefixes,
+        prefixes,
         roles: semantics.roles,
         authoritative_namespaces: semantics.authoritative_namespaces,
     })
@@ -704,8 +728,18 @@ fn resolve_contents(contents: config::Contents) -> Result<Contents> {
         );
     }
 
+    if let Some(k) = contents.filters.k {
+        ensure!(
+            k == SKETCH_K,
+            "contents.filters.k is {k}, but the KGF profile fixes it at {SKETCH_K} \
+             federation-wide (doc 17 §17.2). Comparing two sketches truncates both to \
+             the smaller `k`, so a bundle published at {k} would cap the resolution of \
+             every pair it takes part in — raising it unilaterally buys nothing and \
+             lowering it degrades other publishers' numbers. Remove the key"
+        );
+    }
     let filters = Filters {
-        k: contents.filters.k.unwrap_or(defaults::SKETCH_K),
+        k: SKETCH_K,
         filter_bits: FilterBits::try_from(
             contents
                 .filters
@@ -714,11 +748,6 @@ fn resolve_contents(contents: config::Contents) -> Result<Contents> {
         )
         .context("contents.filters.filter_bits is unusable")?,
     };
-    ensure!(
-        filters.k.is_power_of_two(),
-        "contents.filters.k must be a power of two; doc 17 §17.4 tabulates the \
-         federation at 65536"
-    );
 
     let keysets = Keysets {
         encoding: contents
@@ -941,6 +970,26 @@ mod tests {
     /// Doc 17 §17.3 makes each family all-or-nothing and doc 18 §18.1 states
     /// key sets are published unconditionally, so there is no key to turn them
     /// off with. `deny_unknown_fields` is what enforces that.
+    /// `k` is representable so it can be *refused with a reason* — doc 17
+    /// §17.2 makes it a federation constant, and someone will reasonably try to
+    /// tune it. It is also why the resolved plan still round-trips.
+    #[test]
+    fn a_minhash_capacity_other_than_the_federation_constant_is_refused() {
+        let error = resolve(
+            "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\n\
+             contents: {filters: {k: 4096}}\n",
+        )
+        .expect_err("a per-bundle k must be refused");
+        assert!(format!("{error:#}").contains("§17.2"), "{error:#}");
+
+        let stated = resolve(
+            "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\n\
+             contents: {filters: {k: 65536}}\n",
+        )
+        .expect("restating the constant is harmless");
+        assert_eq!(stated.contents.filters.k, SKETCH_K);
+    }
+
     #[test]
     fn filters_and_keysets_cannot_be_switched_off() {
         for source in [

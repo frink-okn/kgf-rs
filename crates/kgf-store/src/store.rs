@@ -73,6 +73,17 @@ pub mod artifact {
         "filters/subjects.minhash",
     ];
 
+    /// The same names grouped as doc 17 §17.3's two families.
+    ///
+    /// Membership filters and overlap sketches are *separately* all-or-nothing,
+    /// and §17.3 says so explicitly: "a bundle may publish sketches without
+    /// filters". Grouping them is what lets that stay legal while a half-built
+    /// family does not.
+    pub const FILTER_FAMILIES: [[&str; 2]; 2] = [
+        ["filters/objects.filter", "filters/subjects.filter"],
+        ["filters/objects.minhash", "filters/subjects.minhash"],
+    ];
+
     /// Every `keysets/` file the key-set profile can produce.
     ///
     /// Doc 18 §18.4 publishes the disjoint trio by default but keeps the
@@ -360,7 +371,7 @@ impl ArtifactSet {
             graph_index,
             text: optional_dir(dir, artifact::TEXT)?,
             description: DescriptionArtifacts::resolve(dir)?,
-            filters: present(dir, &artifact::FILTERS)?,
+            filters: complete_families(dir, &artifact::FILTER_FAMILIES)?,
             keysets: present(dir, &artifact::KEYSETS)?,
         })
     }
@@ -530,6 +541,38 @@ fn present(dir: &Path, names: &[&'static str]) -> Result<Vec<&'static str>> {
             found.push(*name);
         }
     }
+    Ok(found)
+}
+
+/// The same, for artifacts that must appear as a complete family or not at all.
+///
+/// Doc 17 §17.3: a bundle publishes both filter roles or neither, and both
+/// sketch roles or neither. A half-built family is refused rather than reported,
+/// because the alternative is a bundle that declares the capability while a
+/// consumer cannot distinguish "this role was not built" from "this role is
+/// empty" — and §17.3's whole point is that an empty role is stated by a file
+/// with `key_count = 0`, never by silence.
+fn complete_families(dir: &Path, families: &[[&'static str; 2]]) -> Result<Vec<&'static str>> {
+    let mut found = Vec::new();
+    for family in families {
+        let members = present(dir, family)?;
+        match members.len() {
+            0 => {}
+            n if n == family.len() => found.extend(members),
+            _ => {
+                let missing = family.iter().find(|name| !members.contains(name));
+                return Err(Error::MissingRequiredArtifact {
+                    bundle: dir.to_path_buf(),
+                    artifact: missing.copied().unwrap_or(family[0]).to_owned(),
+                    remedy: format!(
+                        "hdtc sketch {} (doc 17 §17.3 publishes each family whole)",
+                        dir.join(artifact::HDT).display()
+                    ),
+                });
+            }
+        }
+    }
+    found.sort_unstable();
     Ok(found)
 }
 

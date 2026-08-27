@@ -323,6 +323,49 @@ fn a_key_set_from_another_bundle_is_refused_even_when_the_counts_agree() {
     assert!(stderr.contains("another bundle"), "{stderr}");
 }
 
+/// Doc 17 §17.4: "the manifest mirrors the header, it never overrides it." A
+/// checksum cannot enforce that — the file stays intact while the manifest
+/// misreports what is in it — and §17.4 makes these the values a registry
+/// verifies on ingest, so `--check` has to compare them.
+#[test]
+fn a_manifest_that_misreports_key_metadata_fails_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nt");
+    std::fs::write(&source, SOURCE).unwrap();
+    let out = dir.path().join("root/tinykg/2026-06-01");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    kgf(&["manifest", path(&out), "--check"], "").ok();
+
+    // Every artifact byte is untouched; only the manifest lies.
+    let manifest_path = out.join("manifest.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    document["artifacts"]["keysets/shared.keys"]["keys"]["key_count"] = serde_json::json!(9_999);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&document).unwrap(),
+    )
+    .unwrap();
+
+    let stderr = kgf(&["manifest", path(&out), "--check"], "").err();
+    assert!(stderr.contains("misdescribes"), "{stderr}");
+    assert!(stderr.contains("§17.4"), "{stderr}");
+}
+
 /// The half the count identity cannot cover: a file whose header names a
 /// different role than its name does is misplaced, whatever the totals say.
 #[test]
@@ -468,6 +511,141 @@ fn an_asserted_source_digest_must_look_like_one() {
         .err();
         assert!(stderr.contains("--source-sha256"), "{bad}: {stderr}");
     }
+}
+
+/// `--adopt` must not cost the caller their input when the build fails.
+///
+/// Staging is a temporary directory deleted on any error, so moving the source
+/// into it put the only copy somewhere a later failure would destroy. The
+/// source is linked instead and released only after the publishing rename.
+#[test]
+fn a_failed_adopt_build_leaves_the_input_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nt");
+    std::fs::write(&source, SOURCE).unwrap();
+    let staging = dir.path().join("staging/tinykg/v0");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&staging),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    let hdt = staging.join("data.hdt");
+    let before = std::fs::read(&hdt).unwrap();
+
+    // Fails after the input is in place: the digest is checked once the bytes
+    // have been read, which is downstream of `--adopt`'s move.
+    let out = dir.path().join("root/tinykg/2026-06-01");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--hdt",
+            path(&hdt),
+            "--adopt",
+            "--hdtc",
+            &hdtc(),
+            "--source-sha256",
+            &"0".repeat(64),
+        ],
+        CONFIG,
+    )
+    .err();
+
+    assert!(
+        hdt.exists(),
+        "a failed --adopt build destroyed its own input"
+    );
+    assert_eq!(
+        std::fs::read(&hdt).unwrap(),
+        before,
+        "the input survived but was modified"
+    );
+}
+
+/// And on success it does go away, which is what `--adopt` promises.
+#[test]
+fn a_successful_adopt_build_releases_the_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nt");
+    std::fs::write(&source, SOURCE).unwrap();
+    let staging = dir.path().join("staging/tinykg/v0");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&staging),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    let hdt = staging.join("data.hdt");
+
+    let out = dir.path().join("root/tinykg/2026-06-01");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--hdt",
+            path(&hdt),
+            "--adopt",
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+
+    assert!(!hdt.exists(), "--adopt left the input behind");
+    assert!(out.join("data.hdt").exists());
+}
+
+/// The config schema documented in `notes/build-bundle.md` §3 must be one the
+/// parser accepts.
+///
+/// Written after two keys in that sample had already gone stale — a `stats:
+/// enabled:` that was never modelled, and a `source:` block that became flags —
+/// neither of which anything would have caught. A schema documented wrongly is
+/// worse than one documented not at all: it is what a reader copies.
+#[test]
+fn the_documented_config_sample_parses() {
+    let note = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../notes/build-bundle.md"),
+    )
+    .expect("notes/build-bundle.md is beside the crate it documents");
+    let sample = note
+        .split("```yaml")
+        .map(|block| block.split("```").next().unwrap_or_default())
+        .find(|block| block.trim_start().starts_with("schema: 1"))
+        .expect("§3 documents a complete config, opening with `schema: 1`");
+
+    let stdout = kgf(&["build", "--config", "-", "--check-config"], sample).ok();
+    let plan: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        plan["contents"]["filters"]["k"], 65536,
+        "k is not a config knob"
+    );
 }
 
 /// Doc 04 §4.4's component DAG is not built here, and a config that declares

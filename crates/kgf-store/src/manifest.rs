@@ -278,6 +278,13 @@ fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
     if artifacts.text.is_some() {
         capabilities.insert(Capability::Search);
     }
+    // Doc 17 §17.3 makes each sketch family all-or-nothing: both filter roles
+    // or neither, both sketch roles or neither. A bundle carrying one role of a
+    // family is not a bundle with a partial capability — it is a bundle whose
+    // consumer cannot tell "this role was not built" from "this role is empty",
+    // which is the distinction §17.3 exists to preserve. So the capability is
+    // declared only when every family present is complete, and a family that is
+    // present but partial is refused outright by `ArtifactSet::resolve`.
     if !artifacts.filters.is_empty() {
         capabilities.insert(Capability::Filters);
     }
@@ -414,7 +421,14 @@ pub struct ArtifactEntry {
 /// say two artifacts may be compared iff those two agree — not
 /// `format_version`, not `role`, not `encoding`. Publishing them is what lets a
 /// consumer refuse a cross-convention intersection instead of computing a
-/// plausible, meaningless number from it.
+/// plausible, meaningless number from it. Doc 17 §17.4 lists `hash_id`
+/// explicitly even though `convention_id = 1` implies it, so a registry can
+/// reject an incomparable artifact without fetching it.
+///
+/// **The manifest mirrors the header; it never overrides it.** §17.4 makes that
+/// normative — every value here MUST equal the one in the file's own envelope —
+/// which is why `kgf manifest --check` compares this block and not only the
+/// size and checksum.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyArtifact {
@@ -426,9 +440,21 @@ pub struct KeyArtifact {
     pub hash_id: u8,
     /// The dictionary population these keys were drawn from.
     pub role: String,
+    /// What the file is: `fuse`, `minhash`, or `keyset`.
+    ///
+    /// Doc 17 §17.4 requires it of the two sketch families. Key sets carry it
+    /// too, which doc 18 §18.4 does not ask for, so that one entry shape
+    /// describes all three and nothing has to be inferred from a file name.
+    pub structure: String,
     /// Distinct qualifying keys — authoritative, and what doc 18 §18.4's
     /// cross-family identity is checked against.
     pub key_count: u64,
+    /// BinaryFuse fingerprint width. Membership filters only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<u8>,
+    /// Bottom-k capacity. Overlap sketches only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k: Option<u32>,
     /// Payload encoding. Key sets only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,

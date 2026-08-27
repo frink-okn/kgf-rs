@@ -2,7 +2,7 @@
 
 # One image, both binaries.
 #
-# `kgf build bundle` and `kgf build stats` shell out to `hdtc`, and `kgf-store`
+# `kgf build` shells out to `hdtc`, and `kgf-store`
 # links hdtc as a path dependency, so the two must be the same hdtc. Shipping
 # them separately would let a deployment pair a builder with a format layer it
 # was never tested against — and `.hdt.perm`, the sketch and key-set files, and
@@ -12,7 +12,8 @@
 #
 #   docker build --build-arg HDTC_REF=v1.2.0-beta.3 -t kgf .
 #   docker run --rm -v /bundles:/bundles kgf serve --bundle-root /bundles --bind 0.0.0.0:8080
-#   docker run --rm -v /bundles:/bundles kgf build bundle --config - --out /bundles/dreamkg/2026-06-01 --hdt /in/graph.hdt
+#   docker run --rm -v /bundles:/bundles kgf build --config - \
+#     --out /bundles/dreamkg/2026-06-01 --hdt /in/graph.hdt
 
 # Must match rust-toolchain.toml. The build honours that file regardless, so a
 # mismatch here only costs a second toolchain download inside the image.
@@ -53,7 +54,7 @@ RUN apt-get update \
 COPY --from=build /src/kgf-rs/target/release/kgf /usr/local/bin/kgf
 COPY --from=build /src/hdtc/target/release/hdtc /usr/local/bin/hdtc
 
-# `kgf build bundle` resolves `hdtc` from PATH by default, so the two find each
+# `kgf build` resolves `hdtc` from PATH by default, so the two find each
 # other with no flag.
 USER kgf
 WORKDIR /home/kgf

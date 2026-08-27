@@ -10,10 +10,9 @@
 //! which a scan can see artifacts without the document that describes them.
 
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use kgf_store::manifest::{Generator, Manifest, Source, SourceInput};
@@ -21,6 +20,7 @@ use kgf_store::store::artifact;
 use sha2::{Digest, Sha256};
 
 use super::Build;
+use super::hdtc::{Runner, Step, render};
 use super::plan::{BundlePlan, Input, KEYSET_ROLES, SKETCH_ROLES};
 use crate::build::stats;
 use crate::manifest::Requested;
@@ -102,7 +102,7 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
     };
     let outcome = stats::produce(
         stats::Inputs {
-            hdtc: &build.hdtc,
+            runner: &runner,
             data: &layout.data,
             dataset_iri: plan.config.dataset.iri.as_str(),
             prefix_tables: &plan.config.contents.stats.prefix_tables,
@@ -135,6 +135,7 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
             plan.output.display()
         )
     })?;
+    release_adopted_input(plan);
     Ok(Built {
         manifest,
         description: outcome,
@@ -146,16 +147,6 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
 struct Layout {
     staging: PathBuf,
     data: PathBuf,
-}
-
-/// One hdtc invocation.
-struct Step {
-    /// What this step is called in logs and error messages.
-    name: &'static str,
-    /// The full argument list, less the settings [`Runner`] adds to every step.
-    args: Vec<OsString>,
-    /// A private temporary directory, for the steps that sort to disk.
-    temp: Option<&'static str>,
 }
 
 /// The invocation that produces `data.hdt.perm`, and `data.hdt` with it when
@@ -473,21 +464,48 @@ fn hdtc_version(hdtc: &Path) -> Option<String> {
 /// option overall, since it skips writing a second copy of the file.
 fn place(source: &Path, dest: &Path, adopt: bool) -> Result<String> {
     if adopt {
-        match std::fs::rename(source, dest) {
+        // A hard link, never a rename. Staging is a temporary directory that is
+        // deleted on *any* later failure — a bad digest, a failed sidecar, a
+        // full disk — and a rename would put the caller's only copy of the
+        // input inside it. Linking leaves the source in place until the build
+        // has actually published, so a failed `--adopt` costs nothing.
+        match std::fs::hard_link(source, dest) {
             Ok(()) => return hash_file(dest),
-            // A rename across filesystems is the expected failure and a copy is
-            // the only way through, but every other rename failure is worth one
-            // attempt at a copy too: the fallback is strictly more capable, so
-            // telling the causes apart would only turn recoverable cases into
-            // errors. If the copy also fails, its own message says why.
+            // Across filesystems there is no link to make, and every other
+            // failure is worth one attempt at a copy too: the fallback is
+            // strictly more capable, so telling the causes apart would only
+            // turn recoverable cases into errors.
             Err(error) => tracing::debug!(
                 %error,
                 source = %source.display(),
-                "moving the input failed; copying instead"
+                "linking the input failed; copying instead"
             ),
         }
     }
     copy_hashing(source, dest)
+}
+
+/// Drop the adopted input, once the bundle that replaced it is published.
+///
+/// `--adopt` promises the caller's copy goes away; it does not promise when.
+/// Doing it after the publishing rename is what makes a failed build harmless,
+/// and by then the bundle holds the bytes — under the same inode when the link
+/// succeeded, under its own when the copy fallback ran.
+///
+/// A failure here is reported and not fatal. The bundle is already published
+/// and correct; a leftover input is untidy, not wrong, and unpublishing a good
+/// bundle over it would be the worse trade.
+fn release_adopted_input(plan: &BundlePlan) {
+    let Input::Hdt { path, adopt: true } = &plan.input else {
+        return;
+    };
+    if let Err(error) = std::fs::remove_file(path) {
+        tracing::warn!(
+            %error,
+            source = %path.display(),
+            "the bundle is published, but the adopted input could not be removed"
+        );
+    }
 }
 
 fn copy_hashing(source: &Path, dest: &Path) -> Result<String> {
@@ -531,82 +549,6 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
         out
     })
-}
-
-/// Invokes hdtc with the settings every step shares.
-struct Runner<'a> {
-    hdtc: &'a Path,
-    work: &'a Path,
-    memory_limit: Option<String>,
-}
-
-impl Runner<'_> {
-    /// Run one hdtc step.
-    ///
-    /// `temp` names a private temporary directory for steps that sort to disk.
-    /// It is per invocation and never shared: doc 18 §18.4 records a build in
-    /// which concurrent `hdtc` processes sharing one temp directory produced key
-    /// sets that were structurally perfect — correct checksums, correct source
-    /// digest, ascending keys — and held another graph's keys.
-    fn run(&self, step: &Step) -> Result<()> {
-        if let Some(temp) = step.temp {
-            let dir = self.work.join(temp);
-            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        }
-        let argv = self.hdtc_argv(step);
-        let command = render(&argv);
-
-        tracing::info!(step = step.name, %command, "running hdtc");
-        let started = Instant::now();
-        let status = Command::new(self.hdtc)
-            .args(&argv[1..])
-            .status()
-            .with_context(|| format!("running hdtc for {}: {command}", step.name))?;
-        ensure!(
-            status.success(),
-            "hdtc {} failed with {status}: {command}",
-            step.name
-        );
-        tracing::info!(step = step.name, elapsed = ?started.elapsed(), "hdtc step complete");
-        Ok(())
-    }
-
-    /// The full argument vector: the program, the step, and the settings every
-    /// step shares.
-    ///
-    /// Shared with the rehearsal so `--dry-run` prints the command that would
-    /// actually run rather than a second construction of it that can drift.
-    fn hdtc_argv(&self, step: &Step) -> Vec<OsString> {
-        let mut argv = vec![self.hdtc.as_os_str().to_owned()];
-        argv.extend(step.args.iter().cloned());
-        if let Some(temp) = step.temp {
-            argv.push(OsString::from("--temp-dir"));
-            argv.push(self.work.join(temp).into_os_string());
-        }
-        if let Some(limit) = &self.memory_limit {
-            argv.push(OsString::from("--memory-limit"));
-            argv.push(OsString::from(limit));
-        }
-        argv.push(OsString::from("--quiet"));
-        argv
-    }
-}
-
-/// One invocation, spelled the way a person would retype it.
-fn render(argv: &[OsString]) -> String {
-    argv.iter()
-        .map(|argument| quote(argument))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn quote(argument: &OsStr) -> String {
-    let text = argument.to_string_lossy();
-    if text.is_empty() || text.contains(|c: char| c.is_whitespace() || "'\"\\$`".contains(c)) {
-        format!("'{}'", text.replace('\'', r"'\''"))
-    } else {
-        text.into_owned()
-    }
 }
 
 /// The per-artifact sizes doc 04 §4.4 asks a build to report.

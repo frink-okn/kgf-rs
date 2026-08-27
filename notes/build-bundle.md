@@ -105,12 +105,10 @@ contents:                      # what changes bytes
     index_all_datatypes: false
     untagged_language: en
   filters:                     # hdtc sketch — always built, doc 17 §17.3
-    k: 65536
-    filter_bits: 16
+    filter_bits: 16            # MinHash k is fixed federation-wide, §17.2
   keysets:                     # hdtc keyset — always built, doc 18 §18.4
     encoding: elias-fano
   stats:
-    enabled: true
     prefix_tables: [/etc/kgf/prefixes.yaml]   # layered, later wins
 
 resources:
@@ -118,12 +116,12 @@ resources:
   temp_dir: /scratch
   threads: null
   max_bundle_bytes: null       # refuse rather than fill a PVC
-
-source:                        # recorded, never acted on
-  url: lakefs://dreamkg/<commit>/hdt/graph.hdt
-  format: hdt
-  sha256: …
 ```
+
+Provenance is deliberately **not** here. `--source-url`, `--source-sha256` and
+`--builder-image` are flags, because they change every run, and the digest the
+manifest records is computed from the bytes the build actually read rather than
+copied from a config (§6a).
 
 Two naming decisions worth stating, because both will look arbitrary later.
 
@@ -139,7 +137,9 @@ index, never derived at open. Filters and key sets are required by conformance:
 doc 18 opens by saying a conforming bundle publishes key sets "unconditionally —
 there is no size threshold", and doc 17 §17.3 makes each sketch family
 all-or-nothing. So none of the three carries an enable flag, and none exposes a
-free `roles` list — doc 17 §17.3 forbids publishing one role of a family, and
+free `roles` list or a MinHash `k` — §17.2 fixes `k` at 65 536 federation-wide,
+because comparing two sketches truncates both to the smaller, so one bundle
+publishing low caps every pair it takes part in — doc 17 §17.3 forbids publishing one role of a family, and
 doc 18 §18.4 excludes hdtc's experimental `terms` role from the KGF profile
 outright, because predicate IRIs make every pair of KGs "overlap" through
 `rdfs:label`. Both are made unrepresentable rather than validated. `text` keeps

@@ -196,19 +196,30 @@ impl Default for Text {
 
 /// `filters/`. Always built: doc 17 §17.3, doc 18 §18.1.
 ///
-/// No `roles` key. Doc 17 §17.3 makes each family all-or-nothing — both filter
-/// roles or neither, both sketch roles or neither — so a role list could only
-/// ever express a nonconforming bundle.
+/// No `roles` key and no `k`. Doc 17 §17.3 makes each family all-or-nothing —
+/// both filter roles or neither, both sketch roles or neither — and §17.2 fixes
+/// MinHash `k` at 65 536 federation-wide. Neither could be expressed here
+/// except to express a nonconforming bundle.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Filters {
-    /// Bottom-k MinHash capacity. Doc 17 §17.4 measures the federation at
-    /// 65 536; changing it changes what a cardinality estimate is worth.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub k: Option<u32>,
     /// Binary fuse fingerprint width: 8 or 16.
+    ///
+    /// The one knob here. Doc 17 §17.2 requires BinaryFuse16 and permits
+    /// BinaryFuse8 "but discouraged", so 8 is representable and 16 is the
+    /// default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter_bits: Option<u8>,
+
+    /// Bottom-k MinHash capacity. Recognized, and only ever [`SKETCH_K`].
+    ///
+    /// Named rather than rejected as an unknown field for two reasons. A
+    /// config that sets it should fail with §17.2's reason instead of "unknown
+    /// field `k`" — this is a value someone will reasonably try to tune. And
+    /// the resolved plan prints it, so the plan must parse back as a config for
+    /// its digest to serve as a canonical config identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k: Option<u32>,
 }
 
 /// `keysets/`. Always built: doc 18 §18.1 states it with no size threshold.

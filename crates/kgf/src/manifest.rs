@@ -387,6 +387,20 @@ fn verify_described_artifacts(manifest: &Manifest, dir: &Path, facts: &BundleFac
                 actual.sha256,
             );
         }
+        // Doc 17 §17.4: "the manifest mirrors the header, it never overrides
+        // it." Checksums alone cannot enforce that — the file can be intact
+        // while the manifest misreports its convention, role, or key count, and
+        // §17.4 makes that the value a registry verifies on ingest.
+        if recorded.keys != actual.keys {
+            bail!(
+                "manifest {} misdescribes {name}: it records {:?}, but the file's own \
+                 header says {:?}. The manifest mirrors the header and never overrides \
+                 it (doc 17 §17.4); regenerate it with `{remedy}`",
+                manifest_path(dir).display(),
+                recorded.keys,
+                actual.keys,
+            );
+        }
     }
 
     let digest = content_digest(computed.iter().map(|(name, entry)| (name.as_str(), entry)));
@@ -587,7 +601,7 @@ fn publisher(requested: &Requested, previous: Option<&Manifest>) -> Option<Publi
 /// would be this tool guessing at the dataset's subject matter, and getting a
 /// prefix wrong is worse than omitting it: the manifest is the contract a client
 /// reads to know what it may send.
-const WELL_KNOWN_PREFIXES: [(&str, &str); 4] = [
+pub(crate) const WELL_KNOWN_PREFIXES: [(&str, &str); 4] = [
     ("owl", "http://www.w3.org/2002/07/owl#"),
     ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
     ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
@@ -686,12 +700,32 @@ fn describe_key_artifact(
             .with_context(|| format!("reading the sketch header of {}", path.display()))?;
         verify_role_matches_name(name, path, header.role.file_stem())?;
         verify_binding(path, &header.source_digest, identity)?;
+        // Doc 17 §17.4 wants the structure and its shaping parameter — `k` for
+        // a sketch, `variant` for a filter — so a registry can judge
+        // compatibility from the manifest without fetching the artifact.
+        let (structure, variant, k) = match header.body {
+            hdtc::format::SketchBody::Filter { variant, .. } => ("fuse", Some(variant), None),
+            hdtc::format::SketchBody::MinHash { k, .. } => ("minhash", None, Some(k)),
+            // `SketchBody` is non-exhaustive, and §17.4 requires the structure
+            // and its parameter in the entry. A structure this build cannot
+            // name is one it cannot describe, so it refuses rather than
+            // publishing an entry that omits what a registry verifies.
+            _ => bail!(
+                "{} carries a sketch structure this build does not recognize, so it \
+                 cannot be described as doc 17 §17.4 requires; build the bundle with \
+                 an hdtc this kgf was released against",
+                path.display()
+            ),
+        };
         return Ok(Some(KeyArtifact {
             convention_id: header.convention_id,
             format_version: header.format_version,
             hash_id: header.hash_id,
             role: header.role.file_stem().to_owned(),
+            structure: structure.to_owned(),
             key_count: header.key_count,
+            variant,
+            k,
             encoding: None,
         }));
     }
@@ -705,7 +739,10 @@ fn describe_key_artifact(
             format_version: header.format_version,
             hash_id: header.hash_id,
             role: header.role.file_stem().to_owned(),
+            structure: "keyset".to_owned(),
             key_count: header.key_count,
+            variant: None,
+            k: None,
             encoding: Some(header.encoding.label().to_owned()),
         }));
     }
@@ -1156,7 +1193,10 @@ mod tests {
                     format_version: 1,
                     hash_id: 1,
                     role: "unused".to_owned(),
+                    structure: "unused".to_owned(),
                     key_count: count,
+                    variant: None,
+                    k: None,
                     encoding: None,
                 },
             )
