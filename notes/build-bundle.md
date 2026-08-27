@@ -298,6 +298,29 @@ hash the same, and only a real change trips a rebuild. That property is the
 reason `--check-config` prints a document that parses as a config again rather
 than a report.
 
+### A worked reference
+
+`tools/okn-build-config.py` is `render()` plus a CLI around it. It exists for
+two reasons: it builds bundles here from real registry entries, and the mapping
+kace needs to port is one small function rather than a description in prose.
+
+```sh
+./tools/okn-build-config.py --all --check                  # what CI should run
+./tools/okn-build-config.py dreamkg --build \
+    --hdt-root demo --out-root /tmp/bundles
+```
+
+`--hdt-root` expects `{root}/{shortname}/{version}/data.hdt` — both the bundle
+layout and what `demo/` already holds — and takes the version label from the
+directory rather than a flag, because that is where a real bundle's comes from.
+Against the local corpus it builds eleven knowledge graphs in about forty
+seconds; the twelfth is refused as already published, which is doc 04 §4.6
+working.
+
+It renders the config to `kgf build`'s stdin rather than writing a file, for the
+same reason kace will pass one through a configmap: the config is rendered, not
+stored, so there is nothing to leave behind or let go stale.
+
 ### Validate in registry CI
 
 Run `kgf build --check-config` over every entry's rendered config in the
