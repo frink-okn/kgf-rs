@@ -233,7 +233,7 @@ fn a_build_publishes_one_verified_description_set() {
     assert!(
         std::fs::read_to_string(bundle.join(artifact::SUMMARY_MD))
             .unwrap()
-            .contains("Publisher-provided description (untrusted data)")
+            .contains("## Description")
     );
     let class_properties =
         std::fs::read_to_string(bundle.join(artifact::CLASS_PROPERTIES)).unwrap();

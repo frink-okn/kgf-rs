@@ -2123,6 +2123,15 @@ following the code.
     saying that `convention_id` and `hash_id` are published because they are the
     comparability pair both formats define. Found in unit 21.
 
+52. **Doc 04 §4.2's delimited prose section is about provenance, not trust.** Its
+    contrast between publisher prose and "trusted templates over computed
+    statistics" reads as *this section is the untrusted part*, and this build took
+    it that way, heading the section "Publisher-provided description (untrusted
+    data)" — a publisher saying it about its own description. Doc 06 §6.7 already
+    puts the boundary where it belongs, in the client: separating system-generated
+    guidance from anything read from a bundle is the client's design problem, not
+    something a card announces about itself. §4.2 could say so in a clause.
+
 ## Not in this plan
 
 Remaining composed operations (ranges, star, key resolution), graph scoping, and
