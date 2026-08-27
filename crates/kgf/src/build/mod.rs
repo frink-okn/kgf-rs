@@ -2,8 +2,7 @@
 //!
 //! One command and one config, so that a caller — kace's build job, a
 //! contributor with a `.nt.gz` — learns the artifact ordering once, from here,
-//! rather than reproducing it. Doc 04 §4.4 spells it exactly this way, with no
-//! subcommand; `notes/build-bundle.md` is the design.
+//! rather than reproducing it.
 //!
 //! Three ways in, sharing one resolution: `--check-config` validates and prints
 //! the resolved plan, `--dry-run` prints the commands the plan implies, and a
@@ -133,7 +132,7 @@ fn resolve_build(args: Args, config: ConfigPlan) -> Result<Build> {
 
     ensure!(
         !output.exists(),
-        "{} already exists; a published version is immutable (doc 04 §4.6), so \
+        "{} already exists; a published version is immutable, so \
          a rebuild is a new version directory rather than a rewrite",
         output.display()
     );

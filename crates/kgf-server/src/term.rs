@@ -1,6 +1,6 @@
-//! RDF terms: doc 03 §3.3 syntax in, doc 03 §3.4.1 rows out.
+//! RDF terms: request syntax in, typed response rows out.
 //!
-//! This is the boundary doc 20 §20.5 names. A request arrives carrying terms as
+//! This is the string/id-space boundary. A request arrives carrying terms as
 //! text; they are resolved to ids once, here; everything below runs over ids;
 //! and strings reappear only while a response is serialized. Nothing between
 //! those two edges should hold a term.
@@ -11,12 +11,12 @@
 //!
 //! | syntax | example | who writes it |
 //! |---|---|---|
-//! | request | `mondo:0005015`, `<http://…>`, `"42"^^xsd:integer` | clients (§3.3) |
+//! | request | `mondo:0005015`, `<http://…>`, `"42"^^xsd:integer` | clients |
 //! | dictionary | `http://…/MONDO_0005015`, `"42"^^<http://…#integer>` | hdtc |
-//! | response | `{"type": "iri", "value": "http://…"}` | this crate (§3.4.1) |
+//! | response | `{"type": "iri", "value": "http://…"}` | this crate |
 //!
-//! Request syntax abbreviates through the manifest's prefix map, and brackets
-//! an IRI so that neither form can be read as the other (§3.3, and see
+//! Request syntax abbreviates through the manifest's prefix map and brackets
+//! an IRI so that neither form can be read as the other (see
 //! [`Term::parse`]). Dictionary syntax never abbreviates,
 //! and brackets a datatype but not a term. Conflating the two is the bug that
 //! returns an empty page for data that is present, so the conversions are
@@ -35,7 +35,7 @@
 //! contain an IRI that no validator would pass, and every OKN-scale graph
 //! contains some. Refusing such a term at the edge would make data that is
 //! present unreachable, with no way for a client to ask for it: the same
-//! failure that requiring brackets (§3.3) was introduced to remove.
+//! failure that requiring brackets was introduced to remove.
 //!
 //! The two errors are not symmetric. Rejecting wrongly loses data permanently;
 //! accepting wrongly costs a less specific answer — "no rows" instead of "that
@@ -51,8 +51,8 @@
 //!
 //! # Percent-encoding is not handled here
 //!
-//! Doc 03 §3.3 requires IRIs in GET URLs to be percent-encoded, but decoding
-//! belongs to the query-string parser in unit 13: a value that arrives already
+//! IRIs in GET URLs must be percent-encoded, but decoding belongs to the
+//! query-string parser: a value that arrives already
 //! decoded and is decoded again turns `%2520` into a space, and a term
 //! containing a literal `%20` becomes a different term. [`Term::parse`] takes
 //! text that has been decoded exactly once.
@@ -166,14 +166,14 @@ impl<'a> Literal<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Request syntax (doc 03 §3.3)
+// Request syntax
 // ---------------------------------------------------------------------------
 
 /// The manifest's prefix map.
 ///
 /// Requests expand CURIEs through the forward map. HTML result pages use the
 /// reverse map to make RDF terms readable; canonical JSON responses still
-/// carry IRIs in full (§3.4.1). Both directions are built once per immutable
+/// carry IRIs in full. Both directions are built once per immutable
 /// bundle release and shared with every request against it.
 #[derive(Debug, Clone, Default)]
 pub struct PrefixMap(Arc<Prefixes>);
@@ -246,14 +246,14 @@ impl FromIterator<(String, String)> for PrefixMap {
 
 /// Why a request parameter is not a term.
 ///
-/// One variant per way of being wrong, because §3.6 makes error messages agent
-/// UX: an agent that is told which of these happened can fix its request, while
+/// One variant per way of being wrong, because actionable error messages are
+/// part of the agent UX: an agent told which of these happened can fix its request, while
 /// one told `bad_term_syntax` can only guess. All of them are that code on the
 /// wire.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TermSyntaxError {
     /// A parameter was present but empty. An *absent* parameter is a variable
-    /// (§3.3) and never reaches here.
+    /// and never reaches here.
     #[error("empty term; omit the parameter entirely to leave the position unbound")]
     Empty,
 
@@ -363,7 +363,7 @@ pub enum TermSyntaxError {
 }
 
 impl<'a> Term<'a> {
-    /// Parse doc 03 §3.3 request syntax.
+    /// Parse KGF request-term syntax.
     ///
     /// `text` must already be percent-decoded — exactly once; see the module
     /// documentation.
@@ -372,13 +372,12 @@ impl<'a> Term<'a> {
     /// token containing `:` is a CURIE and nothing else, and its prefix must be
     /// declared or the term is refused. This is Turtle's and SPARQL's rule, and
     /// it is not optional decoration — a parameter accepting both forms without
-    /// a delimiter has to guess, and no guess is right. §3.3 said the opposite
-    /// until this unit; `notes/plan.md` decision 10 records why it changed, of
-    /// which the sharpest case is that an undeclared prefix would otherwise
+    /// a delimiter has to guess, and no guess is right. The sharpest case is
+    /// that an undeclared prefix would otherwise
     /// become a URI scheme, answering a typo with "no such term".
     ///
-    /// A leading `_:` is a blank node, which §3.3 still does not mention — see
-    /// `notes/plan.md`, "Questions for `../kgf`".
+    /// A leading `_:` is a blank node, allowing every returned blank node to be
+    /// used in a later request.
     pub fn parse(text: &'a str, prefixes: &PrefixMap) -> Result<Self, TermSyntaxError> {
         if text.is_empty() {
             return Err(TermSyntaxError::Empty);
@@ -409,8 +408,8 @@ impl<'a> Term<'a> {
     /// a stored `"x"@EN` reads back as `@en` and a stored
     /// `"a"^^<…XMLSchema#string>` reads back as plain. That is deliberate:
     /// every response carries one spelling of a term, whichever bundle answered.
-    /// Doc 05's federated clients compare terms across endpoints, and a bundle
-    /// that spelled a language tag differently would look like it held a
+    /// Federated clients compare terms across endpoints, and a bundle that
+    /// spelled a language tag differently would look like it held a
     /// different term rather than the same one — the comparison silently fails
     /// instead of erroring.
     ///
@@ -423,7 +422,7 @@ impl<'a> Term<'a> {
     /// too. Serving it verbatim instead would trade that for incoherent output
     /// across a federation, which is worse and harder to notice. Detecting it
     /// is an offline job for `kgf manifest --check`, which can afford the
-    /// `O(dictionary)` scan that `Store::open` cannot (doc 20 §20.6).
+    /// `O(dictionary)` scan that `Store::open` cannot.
     pub fn from_dictionary(term: &'a str) -> Self {
         match parse_literal(term.as_bytes()) {
             Some(literal) => {
@@ -465,7 +464,7 @@ impl<'a> Term<'a> {
         }
     }
 
-    /// Spell this term the way a request must write it (§3.3), for building a
+    /// Spell this term in request syntax, for building a
     /// link back into this API.
     ///
     /// The inverse of [`parse`](Term::parse), and the direction a *page* needs:
@@ -682,19 +681,18 @@ fn parse_literal_syntax<'a>(
 }
 
 // ---------------------------------------------------------------------------
-// Response syntax (doc 03 §3.4.1)
+// Response syntax
 // ---------------------------------------------------------------------------
 
 impl Serialize for Term<'_> {
-    /// Doc 03 §3.4.1's term object, written straight into the serializer.
+    /// The response term object, written straight into the serializer.
     ///
     /// No intermediate `Value`: a page is `limit` rows of up to three terms, and
     /// a map allocated per term is a map allocated per term.
     ///
-    /// The keys are §3.4.1's — `iri` and `lang`. SPARQL Results JSON spells
+    /// The keys are `iri` and `lang`. SPARQL Results JSON spells
     /// those `uri` and `xml:lang`, so this is *not* SRJ despite the resemblance;
-    /// `format=srj` is a separate serialization and belongs to unit 14. See
-    /// `notes/plan.md`, "Questions for `../kgf`".
+    /// `format=srj` is a separate serialization.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         match self {
@@ -725,16 +723,15 @@ impl Serialize for Term<'_> {
 }
 
 impl<'a> Term<'a> {
-    /// Read the term-object form doc 03 §3.3 accepts in request bodies.
+    /// Read the term-object form accepted in request bodies.
     ///
     /// No prefix map: the term object is the form responses use, where IRIs are
-    /// always full, and §3.3 offers it as the way out of escaping and ambiguity.
+    /// always full; this is the unambiguous alternative to compact text syntax.
     /// Re-admitting CURIEs here would put the ambiguity back.
     ///
     /// Every key must be one this understands. Ignoring the rest is what turns
     /// a SPARQL Results JSON object — `xml:lang` rather than `lang` — into a
-    /// *different term* that resolves and answers, rather than into an error;
-    /// §3.4.1's claim of SRJ compatibility guarantees clients will send them.
+    /// *different term* that resolves and answers rather than into an error.
     pub fn from_json(value: &'a serde_json::Value) -> Result<Self, TermSyntaxError> {
         let malformed = |detail: &str| TermSyntaxError::MalformedTermObject {
             detail: detail.to_owned(),
@@ -754,8 +751,8 @@ impl<'a> Term<'a> {
         let value = string("value")?.ok_or_else(|| malformed("no `value`"))?;
 
         // A term object is closed. The two SRJ spellings get their own remedy,
-        // since a client sending them is not confused, just reading the other
-        // spec (see `notes/plan.md`, question 9).
+        // since a client sending them is not confused, just using the other
+        // format's field names.
         let permitted: &[&str] = match kind {
             "literal" => &["type", "value", "lang", "datatype"],
             _ => &["type", "value"],
@@ -839,8 +836,8 @@ fn role_name(role: Role) -> &'static str {
 /// predicate is shared by most of them — so the same PFC block is otherwise
 /// decoded once per occurrence rather than once per term.
 ///
-/// This lives here and not in [`kgf_store`] on purpose (doc 20 §20.5, and the
-/// crate's rule 4): a cache inside `Store` would be shared across threads and
+/// This lives here and not in [`kgf_store`] on purpose: a cache inside `Store`
+/// would be shared across threads and
 /// would need a lock on the read path. One per request needs neither, because
 /// it is owned by the request.
 ///
@@ -890,10 +887,10 @@ impl TermCache {
         Ok(self.measured(dictionary, role, id)?.0)
     }
 
-    /// The same term, with the bytes its term object occupies (§3.4.1).
+    /// The same term, with the bytes its term object occupies.
     ///
     /// Memoized with the term rather than computed per use, which is the whole
-    /// point of measuring here: doc 03 §3.5's `max_response_bytes` has to be
+    /// point of measuring here: `max_response_bytes` has to be
     /// weighed once per *row*, and a page repeats terms heavily — `s ? ?` has
     /// one subject for every row and a predicate shared by most of them. A page
     /// of 10 000 rows over 500 distinct terms serializes 500 term objects to
@@ -1042,10 +1039,10 @@ mod tests {
         assert!(Arc::ptr_eq(&prefixes.0, &cloned.0));
     }
 
-    /// Write a term in doc 03 §3.3 request syntax.
+    /// Write a term in KGF request syntax.
     ///
     /// The test oracle, so deliberately not [`Term::to_dictionary`] nor anything
-    /// else the module under test uses: this is a second reading of §3.3, and a
+    /// else the module under test uses: this is an independent implementation, and a
     /// round trip is only evidence if the two directions were written
     /// independently.
     fn as_request_syntax(term: &Term<'_>) -> String {
@@ -1124,8 +1121,8 @@ mod tests {
 
             // Out to the client and back through request syntax.
             let request = as_request_syntax(&term);
-            // And the crate's own writer agrees with that independent reading
-            // of §3.3, which is what makes a link on a page a valid request.
+            // The crate's own writer agrees with that independent implementation,
+            // which is what makes a link on a page a valid request.
             assert_eq!(term.to_request(), request, "to_request for {stored}");
             let reparsed = Term::parse(&request, &prefixes)
                 .unwrap_or_else(|error| panic!("{request} does not parse back: {error}"));
@@ -1207,9 +1204,8 @@ mod tests {
 
     #[test]
     fn a_prefix_named_for_a_scheme_is_no_longer_a_hazard() {
-        // §3.3 advises datasets not to declare a prefix that collides with a
-        // URI scheme, because under its rule the declaration would capture
-        // every IRI using that scheme. Requiring brackets removes the hazard
+        // Requiring brackets prevents a declared prefix from capturing every
+        // IRI that uses the same spelling as a URI scheme.
         // rather than warning about it: the two forms cannot be confused, so
         // both spellings stay available and mean different things.
         let prefixes = prefixes(&[("http", "http://example.org/broken#")]);
@@ -1307,7 +1303,7 @@ mod tests {
     fn a_stored_term_is_reported_in_canonical_form() {
         // Reading the dictionary canonicalizes rather than echoing bytes, so
         // one term has one spelling in a response whichever bundle answered —
-        // doc 05's clients compare terms across endpoints. hdtc-built bundles
+        // federated clients compare terms across endpoints. hdtc-built bundles
         // are already canonical, so this is checked directly rather than
         // through a fixture, which cannot produce the non-canonical input.
         let folded = Term::from_dictionary("\"x\"@EN");
@@ -1423,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    fn a_term_object_is_written_the_way_doc_03_writes_one() {
+    fn a_term_object_uses_the_protocol_field_names() {
         let json = |term: &Term<'_>| serde_json::to_string(term).unwrap();
 
         assert_eq!(

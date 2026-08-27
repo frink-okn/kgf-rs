@@ -1,7 +1,7 @@
 //! The page a browser gets, for every resource that has one.
 //!
-//! Doc 01 argues for an interface an agent can use without a client library;
-//! the same argument applies to a person with a browser, and the two need not
+//! The API is usable by an agent without a client library; the same should be
+//! true for a person with a browser, and the two need not
 //! be different endpoints. Every route here answers both, chosen by `Accept`
 //! alone (see [`crate::representation`]) — a page when a browser navigates to
 //! it, JSON when anything else fetches it, at one URL.
@@ -52,7 +52,7 @@ pub const SITE: &str = "Knowledge Graph Fragments";
 
 /// A resource this server can serve in every representation it offers.
 pub trait Resource {
-    /// The canonical machine-readable form (doc 03 §3.4.1).
+    /// The canonical machine-readable form.
     ///
     /// [`Bytes`] rather than `Vec<u8>` so a resource that already holds its
     /// serialization — the bundle manifest holds the published file — hands it
@@ -65,8 +65,8 @@ pub trait Resource {
 
 /// Serialize a `#[derive(Serialize)]` document as a response body.
 ///
-/// Pretty-printed: these documents are read by people as often as by programs —
-/// doc 03 §3.1 makes the descriptors the thing a client reads first — and a
+/// Pretty-printed: these documents are read by people as often as by programs,
+/// and descriptors are the first resource a client reads. A
 /// `curl` of a one-line 4 KB manifest is not that.
 pub fn json_body(value: &impl serde::Serialize) -> Bytes {
     let mut body = serde_json::to_vec_pretty(value)

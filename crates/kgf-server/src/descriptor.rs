@@ -1,10 +1,10 @@
 //! The three documents that describe a deployment, and the bundle manifest.
 //!
-//! Doc 04 §4.3 splits them by mutability — the service descriptor at `/` is
+//! They are split by mutability: the service descriptor at `/` is
 //! host-specific, the dataset descriptor at `/{dataset}` is the logical
 //! dataset's release history, and the bundle manifest at
-//! `/{dataset}/v/{version}/manifest` is immutable and checksum-identified. Doc
-//! 03 §3.1 principle 4 makes the set of them the whole of self-description: a
+//! `/{dataset}/v/{version}/manifest` is immutable and checksum-identified.
+//! Together they provide complete self-description: a
 //! client that fetches them knows the capabilities, caps, prefixes and versions
 //! without being told anything out of band.
 //!
@@ -14,11 +14,11 @@
 //! # The manifest is served as published
 //!
 //! [`BundleManifest`]'s JSON is the *bytes on disk*, not a re-serialization of
-//! the parse. Doc 04 §4.3's manifest grows over time and a bundle may have been
+//! the parse. The manifest schema grows over time and a bundle may have been
 //! written by a newer builder; round-tripping it through this build's
 //! [`Manifest`] would silently drop `source`, `components`, a capability's
-//! configuration body — everything doc 04 defines that unit 9's writer does not
-//! yet model. It is also what makes the served document byte-identical to the
+//! configuration body — everything a newer writer may define that this build
+//! does not yet model. It is also what makes the served document byte-identical to the
 //! one the `content_digest` was taken over. The parse is used for the page and
 //! for the ETag, where a structured view is what is wanted.
 
@@ -35,27 +35,25 @@ use crate::service::{Dataset, PredicateRoles, Service};
 use crate::url;
 use maud::html;
 
-/// The KGF protocol version this server speaks (doc 04 §4.3).
+/// The KGF protocol version this server speaks.
 pub const PROTOCOL_VERSION: &str = "1";
 
 // ---------------------------------------------------------------------------
 // `/` — the service descriptor
 // ---------------------------------------------------------------------------
 
-/// This deployment: what it hosts and the limits it applies (doc 04 §4.3).
+/// This deployment: what it hosts and the limits it applies.
 ///
 /// The caps and budgets published here are the same values the operations
 /// enforce — one [`Config`](crate::Config), read by both — rather than a
-/// documented number beside a separate constant. Doc 03 §3.1 principle 1 tells
-/// clients to read them instead of assuming, which only works if reading them
-/// is reading the truth.
+/// documented number beside a separate constant. Clients can therefore rely on
+/// discovery instead of assumptions.
 ///
-/// `datasets` carries a summary per dataset rather than doc 04 §4.3's bare
-/// name list: title, description, triple count, capabilities and the current
+/// `datasets` carries a summary rather than a bare name per dataset: title,
+/// description, triple count, capabilities and the current
 /// version, all read once at startup from manifests already in memory. A
 /// catalog a client can *choose from* needs one round trip, not one per
-/// dataset — the same argument doc 03 §3.1 makes for self-description.
-/// Recorded as a spec question in `notes/plan.md`, "Questions for `../kgf`".
+/// dataset. This keeps catalog discovery to one round trip.
 #[derive(Debug, Serialize)]
 pub struct ServiceDescriptor<'a> {
     datasets: Vec<DatasetSummary<'a>>,
@@ -257,7 +255,7 @@ impl Resource for ServiceDescriptor<'_> {
 // `/{dataset}` — the dataset descriptor
 // ---------------------------------------------------------------------------
 
-/// One logical dataset and its release history (doc 04 §4.3).
+/// One logical dataset and its release history.
 #[derive(Debug, Serialize)]
 pub struct DatasetDescriptor<'a> {
     id: &'a str,
@@ -287,8 +285,8 @@ pub struct ReleaseEntry<'a> {
     content_digest: &'a str,
     /// Where the bundle is served, as a path relative to this origin.
     ///
-    /// Doc 04 §4.3's example shows an absolute URL. This server is not told its
-    /// own public origin — it may be behind any number of proxies — and a
+    /// This server is not necessarily told its own public origin — it may be
+    /// behind any number of proxies — and a
     /// relative reference resolves against the request URI to the same place,
     /// so it says what it knows rather than guessing at a hostname.
     url: String,
@@ -460,7 +458,7 @@ fn release_links(dataset: &str, version: &str, release: &crate::service::Release
 // `/{dataset}/v/{version}/manifest` — the bundle manifest
 // ---------------------------------------------------------------------------
 
-/// A bundle's published manifest (doc 03 §3.4.10, doc 04 §4.3).
+/// A bundle's published manifest.
 #[derive(Debug)]
 pub struct BundleManifest {
     dataset: String,
@@ -801,8 +799,8 @@ mod tests {
         assert!(page.contains("sha256:0123456789abcdef0123456789abcdef"));
         // Counts, grouped for reading.
         assert!(page.contains("606\u{202f}342\u{202f}307"));
-        // Capabilities and prefixes: the two things §3.3 and §3.4 make a
-        // request's validity depend on.
+        // Capabilities and prefixes: the two manifest properties on which a
+        // request's validity depends.
         assert!(page.contains("sample"));
         assert!(page.contains("http://www.w3.org/2000/01/rdf-schema#"));
         // Navigation up to the dataset, and across to the previous release.

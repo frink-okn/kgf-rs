@@ -11,8 +11,8 @@ is the reference: `render()` below is the whole mapping, and porting it is
 copying one function rather than rediscovering which registry field becomes
 which config key.
 
-`notes/build-bundle.md` §6 is the design and explains why this rendering belongs
-in the build workflow rather than in committed config files.
+Keeping this rendering in the build workflow avoids duplicating generated
+configuration in committed files.
 
     ./tools/okn-build-config.py dreamkg                     # render one config
     ./tools/okn-build-config.py --all --check               # what registry CI runs
@@ -184,8 +184,7 @@ def build(
 def check(config: dict[str, Any], kgf: str) -> tuple[bool, str]:
     """Validate one rendered config with the real validator.
 
-    Not a reimplementation of the schema in Python — that is exactly the split
-    `notes/build-bundle.md` §6 argues against. `--check-config` needs no output
+    Not a reimplementation of the schema in Python: `--check-config` needs no output
     directory and no input, which is what lets this run over the whole registry.
     """
     result = subprocess.run(

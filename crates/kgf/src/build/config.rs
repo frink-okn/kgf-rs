@@ -8,7 +8,7 @@
 //! program's problem, so it is where strings become types.
 //!
 //! Unknown fields are rejected. A build config is machine-rendered from a
-//! registry entry (`notes/build-bundle.md` §6), and the failure mode that
+//! registry entry, and the failure mode that
 //! matters is a key silently doing nothing across forty knowledge graphs.
 //! `schema` exists so that a config written for a later `kgf` fails with that
 //! sentence rather than with a list of unrecognised keys.
@@ -43,17 +43,17 @@ pub struct Config {
     #[serde(default)]
     pub resources: Resources,
 
-    /// Derived-triple components (doc 04 §4.4). Recognized, not yet supported.
+    /// Derived-triple components. Recognized, not yet supported.
     ///
     /// Named rather than left to `deny_unknown_fields` so that a config written
-    /// against doc 04's component DAG fails with an explanation instead of
+    /// against the planned component DAG fails with an explanation instead of
     /// "unknown field `components`". Claiming the key now stays additive: when
     /// the DAG lands, the refusal becomes an implementation and no config that
     /// works today breaks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub components: Option<serde_norway::Value>,
 
-    /// Which components merge into `data.hdt` (doc 04 §4.4). As above.
+    /// Which components merge into `data.hdt`. As above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish: Option<serde_norway::Value>,
 }
@@ -61,9 +61,8 @@ pub struct Config {
 /// Identity and description.
 ///
 /// `id` and `iri` are identity and cannot be defaulted. The rest is description
-/// that a bundle is better for carrying and still valid without: doc 04 §4.3
-/// puts it in the manifest so a bundle copied away from its host still says what
-/// it is.
+/// that a bundle is better for carrying and still valid without. It lives in
+/// the manifest so a bundle copied away from its host still says what it is.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Dataset {
@@ -101,19 +100,19 @@ pub struct Publisher {
 
 /// An interpretation of the data, frozen into this version's manifest.
 ///
-/// None of it changes a byte of any artifact — see `notes/build-bundle.md` §7 on
-/// why labels are resolved live — but all of it changes what an answer means, so
+/// None of it changes a byte of any artifact, but all of it changes what an
+/// answer means, so
 /// it is versioned with the data rather than overlaid at serve time.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Semantics {
-    /// Prefix bindings for CURIE syntax in parameters (doc 03 §3.3). Layered
+    /// Prefix bindings for CURIE syntax in parameters. Layered
     /// last over `contents.stats.prefix_tables`, so a per-KG binding wins over
     /// the shared table.
     #[serde(default)]
     pub prefixes: BTreeMap<String, String>,
 
-    /// Predicate roles, strongest first, as full IRIs (doc 19 §19.1).
+    /// Predicate roles, strongest first, as full IRIs.
     ///
     /// Omitted entirely, the manifest's standard profile applies. Present, it
     /// replaces that profile rather than extending it: a KG whose labels are on
@@ -129,7 +128,7 @@ pub struct Semantics {
 
 /// What the bundle carries, and the knobs that change those bytes.
 ///
-/// Keys are named for bundle directory entries (doc 04 §4.1), not for the hdtc
+/// Keys are named for bundle directory entries, not for the hdtc
 /// subcommands that produce them today. The config describes the bundle; which
 /// tool builds it is this program's business.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -194,27 +193,26 @@ impl Default for Text {
     }
 }
 
-/// `filters/`. Always built: doc 17 §17.3, doc 18 §18.1.
+/// `filters/`. Always built as complete role families.
 ///
-/// No `roles` key and no `k`. Doc 17 §17.3 makes each family all-or-nothing —
-/// both filter roles or neither, both sketch roles or neither — and §17.2 fixes
-/// MinHash `k` at 65 536 federation-wide. Neither could be expressed here
+/// No `roles` key and no `k`. Each family is all-or-nothing — both filter roles
+/// or neither, both sketch roles or neither — and MinHash `k` is fixed at 65,536
+/// federation-wide. Neither could be expressed here
 /// except to express a nonconforming bundle.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Filters {
     /// Binary fuse fingerprint width: 8 or 16.
     ///
-    /// The one knob here. Doc 17 §17.2 requires BinaryFuse16 and permits
-    /// BinaryFuse8 "but discouraged", so 8 is representable and 16 is the
-    /// default.
+    /// The one knob here. BinaryFuse16 is the default; BinaryFuse8 is supported
+    /// but discouraged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter_bits: Option<u8>,
 
     /// Bottom-k MinHash capacity. Recognized, and only ever [`SKETCH_K`].
     ///
     /// Named rather than rejected as an unknown field for two reasons. A
-    /// config that sets it should fail with §17.2's reason instead of "unknown
+    /// config that sets it should fail with the invariant's reason instead of "unknown
     /// field `k`" — this is a value someone will reasonably try to tune. And
     /// the resolved plan prints it, so the plan must parse back as a config for
     /// its digest to serve as a canonical config identity.
@@ -222,10 +220,10 @@ pub struct Filters {
     pub k: Option<u32>,
 }
 
-/// `keysets/`. Always built: doc 18 §18.1 states it with no size threshold.
+/// `keysets/`. Always built, with no size threshold.
 ///
-/// No `roles` key, for a second reason on top of the one above: doc 18 §18.4
-/// fixes the KGF profile at the disjoint trio and excludes hdtc's experimental
+/// No `roles` key, for a second reason on top of the one above: the KGF profile
+/// fixes the disjoint trio and excludes hdtc's experimental
 /// `terms` role, because predicate IRIs would make every pair of knowledge
 /// graphs "overlap" through `rdfs:label`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -255,8 +253,8 @@ pub struct Resources {
     pub memory_limit: Option<String>,
     /// Parent for the per-invocation temporary directories.
     ///
-    /// Per invocation, never shared: doc 18 §18.4 records a build that shared
-    /// one temp directory across concurrent `hdtc` processes and produced key
+    /// Per invocation, never shared: sharing one temp directory across
+    /// concurrent `hdtc` processes has produced key
     /// sets that were structurally perfect and held another graph's keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temp_dir: Option<PathBuf>,

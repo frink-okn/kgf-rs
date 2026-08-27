@@ -99,6 +99,20 @@ afterwards, so where the two disagree about what exists, `plan.md` and the code 
 - Do not optimize only for the smallest patch. Weigh narrow changes against the clean
   long-term design, and prefer APIs that make the intended architecture explicit.
 
+### Code comments
+
+Code and configuration comments must be self-contained: explain behavior, invariants,
+and rationale in terms of this implementation and its artifacts. Do not cite the
+`../kgf` design documents by document or section number, or treat a cross-reference to
+them as an explanation. When implementation work changes or questions the design,
+record that in `notes/plan.md`'s **Questions for `../kgf`** or update the relevant
+design document, while still documenting the resulting code locally in its own terms.
+
+Precise citations to external standards such as RFCs and to hdtc's normative
+byte-format documents are allowed where they identify a protocol or on-disk
+contract. The hdtc rule below still applies: cite those format documents rather than
+restating their byte layouts.
+
 ### The one reviewed exception to `unsafe`
 
 `kgf-store::map` maps files and hands out `&[u8]`. It is the *only* module permitted

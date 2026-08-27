@@ -2,7 +2,7 @@
 //!
 //! Every step writes into a staging directory beside the output, and the last
 //! thing that happens is a `rename`. Nothing is ever written into a directory a
-//! running server may have mapped (doc 04 §4.6), and a build that fails at any
+//! running server may have mapped, and a build that fails at any
 //! step leaves the bundle root exactly as it found it.
 //!
 //! The manifest is written last, inside staging, so a directory that appears at
@@ -53,7 +53,7 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
 
     // Scratch lives outside staging: anything inside it would be published by
     // the rename. hdtc's own temp directories hang off this, one per
-    // invocation — never shared, per doc 18 §18.4.
+    // invocation — never shared, because sharing can mix another build's files.
     let work = match &plan.config.resources.temp_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir)
@@ -208,9 +208,9 @@ fn core_step(plan: &BundlePlan, layout: &Layout) -> Step {
 
 /// The sidecar steps, in the order they run.
 ///
-/// The `--roles` lists are stated rather than left to hdtc's defaults. Doc 17
-/// §17.3 makes each sketch family all-or-nothing and doc 18 §18.4 fixes the
-/// key-set trio, so these are the KGF profile and not hdtc's preference: a
+/// The `--roles` lists are stated rather than left to hdtc's defaults. Each
+/// sketch family is all-or-nothing and the key-set trio is fixed, so these are
+/// the KGF profile and not hdtc's preference: a
 /// future hdtc changing a default must not quietly change what a bundle
 /// publishes.
 fn sidecar_steps(plan: &BundlePlan, layout: &Layout) -> Vec<Step> {
@@ -350,7 +350,7 @@ fn materialize(
     match &plan.input {
         Input::Hdt { path, adopt } => {
             // kace's conversion also writes an HDT-FoQ index, which KGF never
-            // reads (doc 20 §20.8). Only the HDT itself is taken.
+            // reads. Only the HDT itself is taken.
             let digest = place(path, data, *adopt)?;
             let inputs = vec![SourceInput {
                 url: plan.provenance.source_url.clone(),
@@ -555,7 +555,7 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(crate::manifest::hex(&hasher.finalize()))
 }
 
-/// The per-artifact sizes doc 04 §4.4 asks a build to report.
+/// The per-artifact sizes reported after a build.
 pub(super) fn report(built: &Built, output: &Path) -> String {
     use std::fmt::Write;
 

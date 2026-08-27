@@ -33,8 +33,8 @@ impl Runner<'_> {
     /// Run one hdtc step.
     ///
     /// `temp` names a private temporary directory for steps that sort to disk.
-    /// It is per invocation and never shared: doc 18 §18.4 records a build in
-    /// which concurrent `hdtc` processes sharing one temp directory produced key
+    /// It is per invocation and never shared: concurrent `hdtc` processes using
+    /// one temp directory have produced key
     /// sets that were structurally perfect — correct checksums, correct source
     /// digest, ascending keys — and held another graph's keys.
     pub(crate) fn run(&self, step: &Step) -> Result<()> {

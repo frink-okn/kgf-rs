@@ -1,4 +1,4 @@
-//! Doc 03 §3.4's read operations, against the store's own answers.
+//! HTTP read operations checked against the store's own answers.
 //!
 //! Headless on purpose. `kgf-store` is already differential against `hdtc
 //! search`, so what is worth checking here is the layer unit 14 added — term
@@ -46,10 +46,10 @@ const GRAPH: &str = concat!(
 
 #[test]
 fn every_pattern_shape_answers_what_the_store_answers() {
-    // The property the plan asks for: for every one of doc 20 §20.2's eight
-    // shapes, over every term in the bundle, `/fragment` returns the store's
+    // For each of the eight shapes and every term in the bundle, `/fragment`
+    // returns the store's
     // rows and `/count` returns their number. Every term is written back into
-    // the request in §3.3 syntax and parsed again, so the trip through the
+    // the request in request syntax and parsed again, so the trip through the
     // dictionary and back is part of what is under test.
     let served = Served::new();
     let store = served.store();
@@ -111,8 +111,8 @@ fn every_pattern_shape_answers_what_the_store_answers() {
 
 #[test]
 fn exhaustive_paging_at_adversarial_sizes_yields_each_row_once() {
-    // Doc 20 §20.9's paging property, driven through real cursor tokens rather
-    // than through positions: 1 and 2 are the sizes an off-by-one survives, 3
+    // The paging property, driven through real cursor tokens rather than raw
+    // positions: 1 and 2 are the sizes an off-by-one survives, 3
     // is prime, and 10 000 is the cap — a page that ends exactly at the last
     // row must say `complete`, not hand out a cursor to nothing.
     let served = Served::new();
@@ -684,8 +684,8 @@ fn a_sample_draws_real_members_and_draws_them_the_same_way_twice() {
             "a sample must not repeat a member"
         );
         assert!(drawn.iter().all(|row| everything.contains(row)), "n={n}");
-        // §3.4.7: deterministic for a given seed and version, which is what
-        // lets the response carry an immutable validator at all.
+        // Deterministic for a given seed and version, which lets the response
+        // carry an immutable validator at all.
         assert_eq!(
             drawn,
             rows(&served.sample(store, &format!("n={n}&seed=42")))
@@ -704,7 +704,7 @@ fn a_sample_draws_real_members_and_draws_them_the_same_way_twice() {
     assert_eq!(all["complete"], serde_json::json!(true));
     assert_eq!(all["next"], serde_json::json!(null));
 
-    // `s ? o` samples from the bounded probe run once (§3.4.7's exception).
+    // `s ? o` samples from the bounded probe run once.
     let loop_query = "s=%3Chttp%3A%2F%2Fexample.org%2Falice%3E\
                       &o=%3Chttp%3A%2F%2Fexample.org%2Falice%3E&n=5";
     let looped = served.sample(store, loop_query);
@@ -714,8 +714,8 @@ fn a_sample_draws_real_members_and_draws_them_the_same_way_twice() {
 
 #[test]
 fn a_response_stops_at_the_byte_budget_and_resumes_from_where_it_stopped() {
-    // §3.5's `max_response_bytes`, and the reason it cannot be a cap: "a row
-    // cap is not a byte cap (one legal literal can be megabytes)". `limit`
+    // Exercise `max_response_bytes`, which cannot be replaced by a row cap:
+    // one legal literal can be megabytes. `limit`
     // bounds rows and nothing bounds what a row weighs, so a bundle of long
     // literals answers a legal request with an illegal response — which is the
     // bounded-cost thesis failing, not a rounding error.
@@ -776,10 +776,10 @@ fn a_response_stops_at_the_byte_budget_and_resumes_from_where_it_stopped() {
 
 #[test]
 fn a_sample_that_spends_the_byte_budget_says_so_and_offers_no_cursor() {
-    // §3.4.7 draws `n` members and never pages, so there is no position for a
+    // Sampling draws `n` members and never pages, so there is no position for a
     // cursor to name — and the budget can still bite, because a bundle may hold
     // a literal of any size. Returning fewer members and calling it complete
-    // would be the silent truncation §3.6 prohibits, so it reports the reason
+    // would be silent truncation, so it reports the reason
     // with no `next`, the shape `cell_overflow` already uses.
     let served = Served::new();
     let store = served.store();
@@ -963,8 +963,8 @@ fn every_operation_renders_a_page_as_well_as_json() {
 
 #[test]
 fn a_text_constraint_ranks_literals_and_resolves_them_through_the_permutations() {
-    // Doc 19 §19.2.2's composition: the index returns object dictionary ids,
-    // and the statements come from the permutations the store already has. So
+    // The index returns object dictionary ids, and the statements come from the
+    // permutations the store already has. So
     // what this checks is that the two halves line up — every row's object is a
     // literal the query matched, and every statement of a matched literal is
     // there.
@@ -976,7 +976,7 @@ fn a_text_constraint_ranks_literals_and_resolves_them_through_the_permutations()
     assert!(!matched.is_empty(), "the fixture holds \"Alice\"");
     assert_eq!(answer["vars"], serde_json::json!(["s", "p", "o"]));
 
-    // §3.4.1 echoes the constraint in the position it constrains.
+    // The request echo puts the constraint in the position it constrains.
     assert_eq!(
         answer["pattern"],
         serde_json::json!({"s": null, "p": null, "o": {"text": "Alice"}})
@@ -1016,8 +1016,8 @@ fn a_text_constraint_ranks_literals_and_resolves_them_through_the_permutations()
 
 #[test]
 fn a_ranked_page_resumes_where_it_stopped_at_every_size() {
-    // The property doc 20 §20.9 asks of every enumeration, over the one whose
-    // position is not an enumeration order at all. Two things make it hard: a
+    // The paging property over the result whose position is not a triple
+    // enumeration order at all. Two things make it hard: a
     // hit fans out, so a page can stop inside one; and `s ? ?` with a text
     // constraint resolves per hit to `s ? o`, whose positions are predicate
     // ids rather than offsets. Both shapes are here.
@@ -1138,7 +1138,7 @@ fn o_text_needs_an_index_and_will_not_share_the_object_position() {
 
 #[test]
 fn a_tight_candidate_budget_pages_to_its_bound_and_then_stops() {
-    // Two promises, and the first is the one that broke. §3.5's budget bounds
+    // Two promises, and the first is the one that broke. The budget bounds
     // what one *request* examines, not how far a client may page. Read the
     // other way — as a ceiling on the rank a request may reach — paging stops
     // dead the moment a client arrives at the budget: the search returns at
@@ -1317,8 +1317,8 @@ fn a_ranked_row_says_which_class_its_score_belongs_to() {
     // hdtc ranks exact matches as a class ahead of stemmed ones and its scores
     // are comparable only within a class, so a stemmed row can carry a higher
     // number than the exact row above it. Without the class, a client sorting
-    // the page by `score` — which doc 06 §6.2.1 tells federated clients to do —
-    // undoes the ranking the server computed.
+    // the page by `score` while merging endpoints would undo the ranking the
+    // server computed.
     let served = Served::with_text();
     let store = served.store();
 
@@ -1901,7 +1901,7 @@ impl Served {
         String::from_utf8(rendered.body.to_vec()).expect("a UTF-8 body")
     }
 
-    /// Every term of the bundle, per role, in §3.3 request syntax.
+    /// Every term of the bundle, per role, in request syntax.
     fn terms(&self, store: &Store) -> Terms {
         let dictionary = store.dict();
         let mut scratch = Vec::new();
@@ -2045,7 +2045,7 @@ fn options(terms: &Terms, role: Role) -> Vec<Option<usize>> {
 
 /// The query string a client would write for this pattern.
 ///
-/// Each bound position goes out in §3.3 request syntax and percent-encoded, so
+/// Each bound position goes out in request syntax and percent-encoded, so
 /// the round trip through the term parser and the dictionary is inside what is
 /// being compared rather than beside it.
 fn pattern_query(
@@ -2121,9 +2121,9 @@ fn describe_rows(answer: &serde_json::Value) -> Vec<(String, String, String, Str
 
 /// A term object, written the way the dictionary holds it.
 ///
-/// The oracle side of the comparison, so this is a second reading of doc 03
-/// §3.4.1 and hdtc's dictionary encoding rather than a call into the code under
-/// test.
+/// The oracle side of the comparison, so this independently implements the
+/// response shape and hdtc's dictionary encoding rather than calling the code
+/// under test.
 fn dictionary_spelling(term: &serde_json::Value) -> String {
     let value = term["value"].as_str().expect("a term value");
     match term["type"].as_str().expect("a term type") {

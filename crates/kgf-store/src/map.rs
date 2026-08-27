@@ -1,15 +1,15 @@
 //! Memory mapping and typed views over mapped regions.
 //!
-//! **This is the only module in the crate allowed to write `unsafe`.** Doc 20
-//! §20.9 makes that an obligation: the mapping surface is small and audited, and
+//! **This is the only module in the crate allowed to write `unsafe`.** Keeping
+//! the mapping surface small and audited means
 //! everything above it is safe code over `&[u8]`.
 //!
 //! # The soundness argument
 //!
 //! `mmap` of a file is unsound in general, because another process can truncate
 //! or rewrite the file underneath a live `&[u8]`. KGF relies on the property
-//! that makes it sound here: **a published bundle version is immutable** (doc 04
-//! §4.6). Versions are written once under a fresh directory and never edited in
+//! that makes it sound here: **a published bundle version is immutable**.
+//! Versions are written once under a fresh directory and never edited in
 //! place; an update is a new version and a new catalog entry. On top of that,
 //! [`crate::store::Store::open`] checks each sidecar's binding to its HDT before
 //! any query view is exposed, so mismatched artifacts are refused at open.
@@ -217,7 +217,7 @@ impl Mapping {
     /// concurrent write is a data race and a truncation is a fault.
     ///
     /// KGF satisfies this by construction — a published bundle version is
-    /// immutable (doc 04 §4.6), written once under a fresh directory and
+    /// immutable, written once under a fresh directory and
     /// replaced only by a new version under a new name. A caller mapping
     /// anything else has to establish the equivalent.
     pub unsafe fn open(path: &Path) -> Result<Self> {
@@ -283,8 +283,8 @@ impl Mapping {
 /// Map one artifact from a published, immutable bundle version.
 ///
 /// This is the crate-private boundary used by [`Store`](crate::store::Store):
-/// callers of the safe store API name a bundle version, and doc 04 §4.6 makes
-/// immutability part of what a published version means. Keeping the one unsafe
+/// callers of the safe store API name a bundle version whose publication
+/// contract includes immutability. Keeping the one unsafe
 /// acknowledgement here preserves this module as the complete audited surface.
 pub(crate) fn open_published(bundle: &PublishedBundle, path: &Path) -> Result<Mapping> {
     let relative = path.strip_prefix(bundle.path()).unwrap_or_else(|_| {

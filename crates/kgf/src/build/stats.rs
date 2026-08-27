@@ -769,7 +769,7 @@ impl Summary {
                 entry.insert("predicate".into(), json!(row.predicate));
                 entry.insert("triples".into(), json!(row.triples));
                 // Omitted rather than nulled when the partition does not state
-                // them, matching the class-properties projection (doc 03 §3.6).
+                // them, matching the class-properties projection.
                 for (key, value) in [
                     ("distinct_subjects", row.distinct_subjects),
                     ("distinct_objects", row.distinct_objects),

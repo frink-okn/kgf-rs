@@ -2,7 +2,7 @@
 //!
 //! A server points at a directory of bundles and serves all of them. The
 //! catalog scans at startup and **opens nothing**; a version opens on its first
-//! request, and opening is cheap enough that this is invisible (doc 20 §20.6).
+//! request, and opening is cheap enough that this is invisible.
 //!
 //! # Why this is only a map
 //!

@@ -1,6 +1,6 @@
 [package]
 name = "kgf-store"
-description = "Memory-mapped read layer over KGF bundles (KGF doc 20)"
+description = "Memory-mapped read layer over KGF bundles"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,7 +19,7 @@ oxiri.workspace = true
 tempfile = { version = "3", optional = true }
 
 [features]
-# Exposes `kgf_store::testing`: the hdtc-built golden bundles (doc 20 §20.9).
+# Exposes `kgf_store::testing`: the hdtc-built golden bundles.
 # Dependents enable it in `dev-dependencies` only — it is test support, not a
 # runtime surface.
 testing = ["dep:tempfile"]

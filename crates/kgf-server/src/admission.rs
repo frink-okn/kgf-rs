@@ -9,7 +9,7 @@
 //! Waiting is bounded separately from execution. A request first tries the
 //! active gate without waiting, then claims one of a fixed number of queue
 //! slots and waits for at most the configured interval. A full queue or an
-//! expired wait returns doc 03 §3.6.1's `rate_limited` problem with
+//! expired wait returns a `rate_limited` problem with
 //! `Retry-After`; no query work has begun, so this is an error response rather
 //! than an incomplete result with a cursor.
 

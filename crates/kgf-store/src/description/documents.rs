@@ -2,7 +2,7 @@
 //!
 //! Namespace inventory fields have a published shape and are parsed into
 //! borrowed domain types on demand. Summary JSON deliberately has no field
-//! model yet in doc 04, so publication verifies only that it is a JSON object;
+//! model yet, so publication verifies only that it is a JSON object;
 //! serving preserves its exact bytes rather than inventing a schema here.
 
 use std::borrow::Cow;

@@ -1,8 +1,8 @@
-//! Completeness, cardinality and errors: doc 03 §3.6's uniform vocabulary.
+//! Completeness, cardinality, and the API's uniform error vocabulary.
 //!
-//! Every response says whether it is the whole answer. That is the promise the
-//! project rests on — §3.6 puts it as "silent truncation is prohibited", which
-//! is what makes "trust the result" a client decision rather than a guess — and
+//! Every response says whether it is the whole answer. Silent truncation is
+//! prohibited, which makes "trust the result" a client decision rather than a
+//! guess, and
 //! it is a promise about a *combination of fields*, so it is kept here by types
 //! rather than by remembering to set them.
 //!
@@ -21,7 +21,7 @@
 //! the compiler decides it, not an assertion.
 //!
 //! *May*, not *must*, and the difference is one operation. `/sample` draws `n`
-//! members and never pages (§3.4.7), so a byte budget can stop it while there
+//! members and never pages, so a byte budget can stop it while there
 //! is no position for a cursor to name. Its constructor is separate and says so
 //! ([`Completeness::budget_exhausted_without_resume`]), which keeps forgetting
 //! a cursor impossible for the operations that have one.
@@ -35,8 +35,8 @@
 //!
 //! # Both channels, always
 //!
-//! §3.6 requires the same metadata in the body *and* on the response headers,
-//! because CSV, Parquet, Arrow and the RDF serializations have nowhere in the
+//! The same metadata is emitted in the body *and* on the response headers,
+//! because CSV, Parquet, Arrow, and RDF serializations have nowhere in the
 //! body to put it. That duplication is a correctness obligation rather than a
 //! convenience: a CSV response that loses `complete` is a protocol violation,
 //! not a cosmetic gap. [`Completeness::headers`] and the [`serde::Serialize`]
@@ -47,9 +47,8 @@
 //!
 //! [`TruncationReason::PageLimit`] and [`TruncationReason::ResponseBytes`]. The
 //! second was expected to wait for M2's interruptible scans and does not,
-//! because it is the one composite budget no cap can bound: §3.5 pairs
-//! `max_response_bytes` with the observation that "one legal literal can be
-//! megabytes", so a page of `limit` rows is bounded in rows and unbounded in
+//! because it is the one composite budget no cap can bound: one legal literal
+//! can be megabytes, so a page of `limit` rows is bounded in rows and unbounded in
 //! bytes, and a plain `/fragment` reaches it on real data.
 //!
 //! `candidate_budget` is also emitted by `o.text` scans. `time_budget`,
@@ -64,10 +63,9 @@ use serde::ser::{Serialize, SerializeMap, Serializer};
 // Completeness
 // ---------------------------------------------------------------------------
 
-/// Why a response carries less than the whole answer (doc 03 §3.6).
+/// Why a response carries less than the whole answer.
 ///
-/// Closed. A truncation this does not name is a truncation a client cannot
-/// reason about, which is the thing §3.6 forbids.
+/// Closed. A truncation this does not name is one a client cannot reason about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TruncationReason {
     /// The page filled: `limit` rows were returned and more match.
@@ -85,7 +83,7 @@ pub enum TruncationReason {
 }
 
 impl TruncationReason {
-    /// The token §3.6 puts on the wire.
+    /// The token written on the wire.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::PageLimit => "page_limit",
@@ -106,7 +104,7 @@ impl TruncationReason {
     /// client that pages on those would loop, so they must never carry one.
     ///
     /// May, not must. An operation without positions can still exhaust a
-    /// budget — `/sample` draws `n` members and never pages (§3.4.7) — and then
+    /// budget — `/sample` draws `n` members and never pages — and then
     /// the reason is honest while the cursor does not exist. So this bounds
     /// which truncations a cursor is *permitted* on; whether a given response
     /// has one is [`Completeness`]'s business, and its constructors decide it.
@@ -190,15 +188,14 @@ impl Completeness {
     /// A budget stopped an operation that has nowhere to resume from.
     ///
     /// Two operations are in this position and neither is an oversight.
-    /// `/sample` draws `n` members and never pages (§3.4.7), so a response-byte
+    /// `/sample` draws `n` members and never pages, so a response-byte
     /// stop has no position to name. A partial relevance window likewise has no
     /// cursor beyond the candidates it retained: recreating a global rank at
     /// arbitrary depth would require unbounded scoring and memory. Reporting
-    /// either stop is the alternative to calling a partial result complete,
-    /// which is the silent truncation §3.6 prohibits.
+    /// either stop is the alternative to calling a partial result complete.
     ///
-    /// The wire shape — incomplete, a reason, no `next` — is one §3.6 already
-    /// defines and clients already handle, since `cell_overflow` and
+    /// The wire shape — incomplete, a reason, no `next` — is one clients
+    /// already handle, since `cell_overflow` and
     /// `partial_failure` produce it too.
     ///
     /// Separate from [`budget_exhausted`](Self::budget_exhausted) so that
@@ -254,7 +251,7 @@ impl Completeness {
         }
     }
 
-    /// The `KGF-*` headers carrying this to formats whose bodies cannot (§3.6).
+    /// The `KGF-*` headers carrying this to formats whose bodies cannot.
     ///
     /// Same information as the JSON, in the channel a Parquet or CSV response
     /// has. Emitted for every format, including JSON: a client should not have
@@ -280,9 +277,8 @@ impl Completeness {
 impl Serialize for Completeness {
     /// The three envelope fields, for `#[serde(flatten)]` into a response.
     ///
-    /// `next` is always present, null when there is none, following §3.4.1's
-    /// example; `truncation_reason` appears only when there is one, which the
-    /// same example implies by omitting it. See `notes/plan.md`, question 14.
+    /// `next` is always present and null when there is none;
+    /// `truncation_reason` appears only when there is one.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("complete", &self.is_complete())?;
@@ -298,10 +294,10 @@ impl Serialize for Completeness {
 // Cardinality
 // ---------------------------------------------------------------------------
 
-/// How many rows match, and how well the server knows (doc 03 §3.4.1).
+/// How many rows match, and how well the server knows.
 ///
-/// Opaque for [`Completeness`]'s reason: the pieces §3.4.1 and §3.4.4 attach to
-/// a count constrain each other, and a struct of public fields cannot say so.
+/// Opaque for [`Completeness`]'s reason: the pieces attached to a count constrain
+/// each other, and a struct of public fields cannot say so.
 /// An exact count takes no lower bound, because it *is* its own bound; a lower
 /// bound cannot exceed the estimate it bounds; and `distinct_objects` is exact
 /// even on a response whose `value` is not.
@@ -325,7 +321,7 @@ impl Cardinality {
         Self(Count::Exact(value))
     }
 
-    /// An estimate, as text and range constraints give (§3.4.1).
+    /// An estimate, as text and range constraints give.
     pub fn estimated(value: u64) -> Self {
         Self(Count::Estimated {
             value,
@@ -334,7 +330,7 @@ impl Cardinality {
         })
     }
 
-    /// Record a count actually reached before a scan was interrupted (§3.4.4).
+    /// Record a count actually reached before a scan was interrupted.
     ///
     /// Raises `value` to `min` when the scan overshot the estimate. The two
     /// numbers come from different computations — one counted, one guessed — so
@@ -362,7 +358,7 @@ impl Cardinality {
         }
     }
 
-    /// Record the exact number of distinct matching objects (§3.4.1).
+    /// Record the exact number of distinct matching objects.
     ///
     /// A range reports two quantities at once: `value` stays an estimate,
     /// because summing occurrences over the slice is O(slice), while the count
@@ -439,27 +435,27 @@ impl Serialize for Cardinality {
 /// document [`Problem`] serializes are decided in one place.
 pub const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 
-/// A machine-readable error code (doc 03 §3.6.1).
+/// A machine-readable error code.
 ///
 /// Enumerated, and one code is one status: a condition that needs a different
 /// status is a different code, not the same code carrying a status beside it.
-/// That is what lets a client branch on `code` alone and lets §3.6.1 be a
-/// table — `unsupported_format`, `not_acceptable` and `unsupported_media_type`
+/// That lets a client branch on `code` alone. `unsupported_format`,
+/// `not_acceptable`, and `unsupported_media_type`
 /// are three ways to fail content negotiation with three remedies, and merging
-/// them would leave an agent unable to tell which applies. Doc 03 permits a
-/// server to add codes for conditions its normative table does not cover;
+/// them would leave an agent unable to tell which applies. The protocol permits
+/// server-specific codes for otherwise uncovered conditions;
 /// [`PreconditionFailed`](Self::PreconditionFailed) is such an extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
-    /// A term parameter is not a term (§3.3).
+    /// A term parameter is not a term.
     BadTermSyntax,
     /// A parameter is missing, repeated, or unparseable.
     MalformedRequest,
-    /// A parameter exceeds a published cap (§3.5).
+    /// A parameter exceeds a published cap.
     CapExceeded,
-    /// A cursor is for a different version, operation or request (§3.6).
+    /// A cursor is for a different version, operation, or request.
     StaleCursor,
-    /// `format=` names a serialization this operation does not offer (§3.4.1).
+    /// `format=` names a serialization this operation does not offer.
     UnsupportedFormat,
     /// No such dataset or version.
     NotFound,
@@ -467,29 +463,29 @@ pub enum ErrorCode {
     NotAcceptable,
     /// `If-None-Match` was false for a method other than GET or HEAD.
     PreconditionFailed,
-    /// The method is not one this resource takes (§3.6.1).
+    /// The method is not one this resource takes.
     ///
     /// Unavoidable rather than chosen: any HTTP server must answer a POST to a
-    /// read-only resource, and §3.6.1 requires every error response to carry a
-    /// code. What makes it worth having is the other direction — a client
+    /// read-only resource, and every error response must carry a code. What
+    /// makes it worth having is the other direction — a client
     /// probing whether this server speaks RFC 10008 QUERY gets a coded answer
     /// with an `Allow` header rather than an empty 405.
     MethodNotAllowed,
-    /// A request body's media type is not supported (`Accept-Query`, §3.6).
+    /// A request body's media type is not supported; see `Accept-Query`.
     UnsupportedMediaType,
-    /// Serialized request input exceeds `max_request_bytes` (§3.5).
+    /// Serialized request input exceeds `max_request_bytes`.
     PayloadTooLarge,
-    /// The server's current rate or concurrent-work capacity is exhausted (§3.6).
+    /// The server's current rate or concurrent-work capacity is exhausted.
     RateLimited,
-    /// The bundle does not offer what the request needs (§3.4, §3.7).
+    /// The bundle does not offer what the request needs.
     CapabilityNotAvailable,
     /// The server failed. Not the client's mistake, and still coded, so a
-    /// client never has to fall back to reading statuses (§3.6.1).
+    /// client never has to fall back to reading statuses.
     InternalError,
 }
 
 impl ErrorCode {
-    /// Every code, in §3.6.1's order.
+    /// Every code, in stable protocol order.
     ///
     /// Exists so the test that transcribes that table can prove it transcribed
     /// *all* of it. Without it the test passes by covering the codes someone
@@ -512,8 +508,7 @@ impl ErrorCode {
         Self::CapabilityNotAvailable,
     ];
 
-    /// This code's row of §3.6.1: wire token, status, and the status's reason
-    /// phrase.
+    /// This code's wire token, status, and the status's reason phrase.
     ///
     /// One match over the enum rather than three, and in particular the phrase
     /// is *not* derived by matching on the status: that would check
@@ -544,7 +539,7 @@ impl ErrorCode {
         self.row().0
     }
 
-    /// The HTTP status this code is reported with (§3.6.1).
+    /// The HTTP status this code is reported with.
     ///
     /// Every client mistake is 400 except the ones that are not mistakes of
     /// that kind: a bundle that does not publish a capability answers **501**,
@@ -558,8 +553,8 @@ impl ErrorCode {
     ///
     /// §4.2.1 requires this when `type` is `about:blank`, which it is here (see
     /// [`Problem`]). A KGF-specific phrase would be more informative and would
-    /// also be a conformance bug, and it is not needed: `code` is what §3.6
-    /// tells agents to read, and `detail` is what tells a human what happened.
+    /// also be a conformance bug. `code` is what agents branch on, and `detail`
+    /// is what tells a human what happened.
     pub fn title(self) -> &'static str {
         self.row().2
     }
@@ -568,8 +563,8 @@ impl ErrorCode {
 impl ErrorCode {
     /// The code for an error response some other layer produced.
     ///
-    /// A backstop, not a lookup table: §3.6.1 says *every* error response
-    /// carries a code, and this crate does not raise every error response. A
+    /// A backstop, not a lookup table: *every* error response carries a code,
+    /// and this crate does not raise every error response. A
     /// `tower` layer can answer before any handler runs — the body limit does —
     /// and future ones will. Rather than teach the renderer about each, an
     /// error that arrives with no [`Problem`] attached is given one from its
@@ -611,8 +606,7 @@ pub fn reflected(text: &str) -> String {
 /// dereferenceable type URI, and `title` is therefore the status reason phrase
 /// that section requires alongside it. Minting `https://…/problems/{code}`
 /// URIs would claim a namespace nothing currently serves, and §4.2.1 asks a
-/// type URI to document itself when dereferenced. Doc 03 §3.6.1 records both
-/// the choice and the way out of it.
+/// type URI to document itself when dereferenced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Problem {
     code: ErrorCode,
@@ -625,7 +619,7 @@ impl Problem {
     /// A problem of `code`, with `detail` saying what specifically went wrong.
     ///
     /// `detail` is the part an agent acts on, so it should name the offending
-    /// value and the fix — §3.6's "error messages are agent UX". The
+    /// value and the fix because error messages are agent UX. The
     /// [`TermSyntaxError`](crate::term::TermSyntaxError) messages are written to
     /// that standard and convert directly.
     pub fn new(code: ErrorCode, detail: impl Into<String>) -> Self {
@@ -713,7 +707,7 @@ impl std::fmt::Display for Problem {
 impl std::error::Error for Problem {}
 
 impl From<crate::term::TermSyntaxError> for Problem {
-    /// Every way a term can be malformed is one code on the wire (§3.6), with
+    /// Every way a term can be malformed is one code on the wire, with
     /// the variant's message as `detail` — which is why those messages name the
     /// offending token and the remedy rather than restating the code.
     fn from(error: crate::term::TermSyntaxError) -> Self {
@@ -743,8 +737,8 @@ impl crate::html::Resource for Problem {
 
     /// The same failure, for someone who arrived in a browser.
     ///
-    /// Worth having rather than letting a person read raw JSON: doc 03 §3.6
-    /// calls error messages agent UX, and the human case is the same argument.
+    /// Worth having rather than letting a person read raw JSON: error messages
+    /// are agent UX, and the human case is the same argument.
     /// `detail` already names the offending value and the remedy, so the page
     /// is mostly a frame around it.
     fn to_html(&self) -> String {
@@ -816,8 +810,8 @@ mod tests {
 
     #[test]
     fn a_response_is_complete_or_says_why_not() {
-        // §3.6's prohibition on silent truncation, as a property: there is no
-        // constructor for the combinations in between, so this checks that the
+        // The no-silent-truncation rule as a property: there is no constructor
+        // for the combinations in between, so this checks that the
         // ones that exist stay on the two legal shapes.
         for completeness in every_shape() {
             match completeness.truncation_reason() {
@@ -932,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn the_wire_form_is_the_one_doc_03_shows() {
+    fn the_wire_form_has_the_expected_fields() {
         assert_eq!(
             serde_json::to_string(&Completeness::complete()).unwrap(),
             r#"{"complete":true,"next":null}"#
@@ -1000,13 +994,13 @@ mod tests {
             json(Cardinality::estimated(17)),
             r#"{"value":17,"exact":false}"#
         );
-        // §3.4.4's interrupted count: the estimate, plus what was actually
+        // An interrupted count: the estimate, plus what was actually
         // reached before the budget ran out.
         assert_eq!(
             json(Cardinality::estimated(40).at_least(31)),
             r#"{"value":40,"exact":false,"min":31}"#
         );
-        // §3.4.1's range: `value` stays an estimate because summing occurrences
+        // A range count: `value` stays an estimate because summing occurrences
         // over the slice is O(slice), while the distinct-object count is exact
         // from two binary searches. One response, two qualities of knowledge.
         assert_eq!(
@@ -1063,8 +1057,7 @@ mod tests {
 
     #[test]
     fn every_code_has_its_normative_or_extended_wire_mapping() {
-        // §3.6.1 is normative for the codes it names and permits additions for
-        // uncovered conditions. This is its table plus this server's RFC 9110
+        // This table covers the protocol codes plus this server's RFC 9110
         // precondition extension. An implementation that drifts from either
         // makes agents' self-correction wrong in a way no other test notices.
         let table = [
@@ -1092,8 +1085,8 @@ mod tests {
             ),
         ];
 
-        // The transcription must cover the whole enum, or a code added without
-        // a row here is a code no test compares against the spec.
+        // The table must cover the whole enum, or a newly added code has no
+        // asserted wire mapping.
         assert_eq!(
             table.map(|(code, _, _)| code).as_slice(),
             ErrorCode::ALL,

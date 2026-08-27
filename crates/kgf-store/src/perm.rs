@@ -9,7 +9,7 @@
 //! It **reads the section directory through `hdtc::format`** and then maps the
 //! regions itself. hdtc's [`PermutationIndex`]
 //! owns the header parse, the version and flag checks, and the binding to the
-//! HDT; duplicating that here is the drift risk docs 17–18 already record. Its
+//! HDT; duplicating that here would let the mapped and seek-based readers drift. Its
 //! `triples()` path is a seek-based reader for hdtc's CLI and is not used.
 //!
 //! Section payloads are bare packed regions at 64-byte-aligned absolute
@@ -143,7 +143,7 @@ impl Permutations {
     /// The header and directory are parsed by hdtc, which also verifies the
     /// binding to the HDT (suffix length, triple count, dictionary counts).
     /// Full CRC verification is off the open path by design — it belongs to
-    /// publish and to `kgf verify` (doc 20 §20.6).
+    /// publication and `kgf verify`.
     ///
     /// The caller must have created both mappings under the immutable-file
     /// obligation documented by [`Mapping::open`](crate::map::Mapping::open).
@@ -195,7 +195,7 @@ impl Permutations {
     /// count as its sentinel entry. This is bounded, size-independent open-time
     /// I/O, rather than a payload scan; it prevents a malformed bundle from
     /// moving its failure into a request.
-    /// Payload CRCs are deliberately off the open path (doc 20 §20.6), so
+    /// Payload CRCs are deliberately off the open path, so
     /// without this check a bundle whose directory disagrees with the
     /// dictionary opens cleanly and then panics inside a request.
     fn check_level1_key_spaces(&self) -> Result<()> {
@@ -234,8 +234,7 @@ impl Permutations {
     /// *predicate-filtered* resolution — `(?, p ∈ roles, o)` for `/search` hit
     /// resolution, the `/labels` cascade, `ranges/` row recovery, and reverse
     /// star hydration. OSP degrades that to a scan of all subjects of the
-    /// object, unbounded on exactly the hub literals where bounds matter most
-    /// (doc 20 §20.2).
+    /// object, unbounded on exactly the hub literals where bounds matter most.
     pub fn ops(&self) -> BitmapTriples<'_> {
         self.ops.view(&self.sidecar, &self.sidecar)
     }
@@ -277,7 +276,7 @@ impl Permutations {
 
     /// The dictionary's per-role term counts, from the four PFC preambles.
     ///
-    /// Public because a manifest records these (doc 04 §4.3) and
+    /// Public because a manifest records these counts and
     /// [`crate::manifest::BundleFacts`] must reach them without a `Store`, which
     /// would require the manifest it is being used to write.
     pub fn dict_counts(&self) -> &crate::dict::DictCounts {
@@ -475,7 +474,7 @@ mod tests {
 
     #[test]
     fn a_directory_that_disagrees_with_the_dictionary_is_refused_at_open() {
-        // Payload CRCs are off the open path (doc 20 §20.6), so a directory
+        // Payload CRCs are off the open path, so a directory
         // that no longer describes its bitmap opens cleanly unless something
         // cheap catches it. Overwriting POS's superrank sentinel — the entry
         // `count()` reads — is exactly that case: without the check the bundle

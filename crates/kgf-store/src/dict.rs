@@ -2,8 +2,8 @@
 //!
 //! # No sidecar is needed here
 //!
-//! Standard HDT already supports everything doc 20 §20.5 asks of the
-//! dictionary. Each Plain Front Coding section stores its terms in
+//! Standard HDT already supports every dictionary operation needed here. Each
+//! Plain Front Coding section stores its terms in
 //! lexicographic order in blocks of `block_size` (16 by default), preceded by a
 //! `LogArray` of block start offsets with a sentinel. So:
 //!
@@ -194,7 +194,7 @@ impl SectionTermId {
 ///
 /// The block-offset array is a [`PackedSpec`] mapped in place rather than a
 /// materialized `Vec`: on a large dictionary it runs to millions of entries, and
-/// reading it at open is the cost doc 20 §20.4 forbids.
+/// reading it at open would make startup proportional to dictionary size.
 #[derive(Debug, Clone, Copy)]
 pub struct PfcLayout {
     terms: u64,
@@ -338,7 +338,7 @@ impl DictionaryLayout {
 /// Literal metadata — language tag, datatype — is parsed from these bytes at
 /// the serialization edge. The dictionary imposes no order on suffixes, which
 /// is why `o.lang` and `o.dt` filtering is a candidate-budgeted scan rather
-/// than a range (doc 03 §3.5 prices it).
+/// than a range.
 pub type TermBytes<'a> = &'a [u8];
 
 /// A projected random-access view of one PFC section.

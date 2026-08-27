@@ -1,7 +1,7 @@
 //! `Accept` negotiation, differentially against an independent implementation.
 //!
-//! Doc 20 §20.9's rule — the tests that matter compare against something that
-//! did not come from the same head — applied to the one piece of RFC parsing
+//! The test compares against an implementation that did not come from the same
+//! code path, applied to the one piece of RFC parsing
 //! this crate could not get from a library. `headers-accept` is a separate
 //! reading of RFC 9110 §12.5.1 by a separate author; where the two agree, both
 //! are probably right, and where they differ this file says which of us is and

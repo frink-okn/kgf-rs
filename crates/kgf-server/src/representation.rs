@@ -1,8 +1,7 @@
 //! Which serialization a response carries, and how it may be cached.
 //!
-//! Two things doc 03 ties together and this module keeps together: one URL
-//! serves many formats (§3.1), so the choice of format is part of the response's
-//! identity — which is why §3.6 makes `ETag` representation-specific and pairs
+//! One URL serves many formats, so the choice of format is part of the
+//! response's identity. `ETag` is therefore representation-specific and paired
 //! it with `Vary: Accept`. An `ETag` that ignored the representation would let a
 //! cache answer a CSV request from a JSON entry.
 //!
@@ -28,7 +27,7 @@
 //! beats its own `*/*;q=0.8`, and everything else ties at `*/*` and takes JSON.
 //! That is the LDF/QPF behaviour (a page in the browser, data from `curl`) with
 //! the machine-readable form as the default rather than the exception, which is
-//! the right way round for an API doc 01 argues should be agent-friendly.
+//! the useful default for an agent-friendly API.
 //!
 //! Additional CSV/Parquet/Arrow and bulk RDF serializations arrive with M2. Because the choice
 //! is an enum, adding one is a change the compiler routes through every place a
@@ -49,7 +48,7 @@ use crate::envelope::{ErrorCode, Problem, reflected};
 /// `Accept: */*` is answered with JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Representation {
-    /// KGF's own JSON envelope (doc 03 §3.4.1), and the manifest as published.
+    /// KGF's own JSON envelope, and the manifest as published.
     Json,
     /// A page, for reading the same resource in a browser.
     Html,
@@ -123,7 +122,7 @@ impl Representation {
         }
     }
 
-    /// The token `format=` names it by (doc 03 §3.1).
+    /// The token by which `format=` names it.
     ///
     /// Also the discriminator in an [`ETag`], which is why it must be stable and
     /// header-safe: changing it silently invalidates every cached entry, and a
@@ -174,13 +173,13 @@ impl Representation {
     }
 }
 
-/// Choose the representation to answer with (doc 03 §3.1).
+/// Choose the representation to answer with.
 ///
 /// `offered` is the operation's own list, most-preferred first; `/manifest`
 /// offers JSON alone, while unit 14's operations will offer several.
 ///
 /// **`format=` wins outright when present.** It is the client naming a
-/// serialization, not expressing a preference, and §3.6.1 gives the two failures
+/// serialization, not expressing a preference, and the two failures have
 /// different codes and statuses — `unsupported_format` 400 for a `format=` this
 /// operation does not offer, `not_acceptable` 406 for an `Accept` nothing
 /// satisfies — which only makes sense if they are evaluated separately. So a
@@ -373,11 +372,11 @@ fn acceptability(ranges: &[MediaRange], media_type: &MediaType<'_>) -> Option<u3
 // Caching
 // ---------------------------------------------------------------------------
 
-/// How long a response may be reused (doc 03 §3.6).
+/// How long a response may be reused.
 ///
 /// Three policies, because the URL space has exactly three kinds of resource: a
-/// versioned bundle URL, whose bytes cannot change while the version exists
-/// (doc 04 §4.6); a mutable document — the descriptors and the `latest`
+/// versioned bundle URL, whose bytes cannot change while the version exists; a
+/// mutable document — the descriptors and the `latest`
 /// redirect — which is a snapshot of something that moves; and an error, which
 /// describes this attempt rather than a resource.
 ///
@@ -386,10 +385,10 @@ fn acceptability(ranges: &[MediaRange], media_type: &MediaType<'_>) -> Option<u3
 /// server's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachePolicy {
-    /// A versioned GET. §3.6: "versioned GETs immutable".
+    /// A versioned GET whose representation is immutable.
     Immutable,
-    /// A document that can change under the same URL. §3.6 fixes `max-age=300`
-    /// for the `latest` redirect; the descriptors take the same window because
+    /// A document that can change under the same URL. The `latest` redirect and
+    /// descriptors use a five-minute window because
     /// they change on the same event — a new version being published.
     Mutable,
     /// A problem document. Caching one would answer a later, different request
@@ -398,10 +397,10 @@ pub enum CachePolicy {
 }
 
 impl CachePolicy {
-    /// A year, the longest `max-age` §3.6 names.
+    /// A year for immutable versioned resources.
     const A_YEAR: Duration = Duration::from_secs(31_536_000);
     /// Long enough that a `latest` redirect is not re-resolved per request,
-    /// short enough that a new release is picked up in minutes (§3.6).
+    /// short enough that a new release is picked up in minutes.
     const A_WHILE: Duration = Duration::from_secs(300);
 
     /// The typed `Cache-Control` header this policy sends.
@@ -422,9 +421,9 @@ impl CachePolicy {
 /// The entity tag for a bundle version rendered as one representation by this
 /// deployment.
 ///
-/// Doc 03 §3.6 makes the ETag the artifact checksum and requires it to be
-/// representation-specific, and those two are the first and last components
-/// here. The middle one is what §3.6 leaves out and a **strong** validator
+/// The ETag includes the artifact checksum and is representation-specific;
+/// those are the first and last components here. The middle component is what a
+/// **strong** validator
 /// cannot: a response's bytes are a function of the data, the *configuration*
 /// and the *code*, not of the data alone.
 ///
@@ -495,8 +494,7 @@ pub fn etag_for_body(
     })
 }
 
-/// A bundle version's canonical identity: `sha256:` and lowercase hex
-/// (doc 04 §4.3).
+/// A bundle version's canonical identity: `sha256:` and lowercase hex.
 ///
 /// Parsed rather than carried as a string because it is put in an `ETag`, and a
 /// header value has a grammar: a digest containing a quote or a control
@@ -511,8 +509,8 @@ pub struct ContentDigest(String);
 impl ContentDigest {
     /// Parse `{algorithm}:{lowercase hex}`.
     ///
-    /// The algorithm is not restricted to `sha256`: doc 04 §4.3 prefixes the
-    /// digest with its algorithm precisely so it can change, and nothing here
+    /// The algorithm is not restricted to `sha256`: the digest carries its
+    /// algorithm prefix so it can change, and nothing here
     /// recomputes it — this layer only carries and compares it.
     pub fn parse(text: &str) -> Option<Self> {
         let (algorithm, hex) = text.split_once(':')?;
@@ -538,7 +536,7 @@ impl ContentDigest {
     /// Enough for an [`etag`]'s deployment component, which distinguishes one
     /// build-and-configuration from another in a cache key. Not a substitute
     /// for [`as_str`](Self::as_str) anywhere identity matters: a prefix is a
-    /// prefix, and doc 04 §4.3's `content_digest` is the whole thing.
+    /// prefix, and `content_digest` is the whole value.
     pub fn short(&self) -> &str {
         let hex = self
             .0
@@ -719,7 +717,7 @@ mod tests {
     #[test]
     fn format_decides_alone_when_it_is_present() {
         // The two failures are different codes with different statuses and
-        // different remedies (§3.6.1), which is only coherent if `format=` and
+        // different remedies, which is only coherent if `format=` and
         // `Accept` are evaluated separately rather than intersected.
         assert_eq!(
             negotiate(Some("json"), Some("text/csv"), JSON),
@@ -760,12 +758,12 @@ mod tests {
         let other = ContentDigest::parse("sha256:0000000000000000abcdef0123456789").unwrap();
         assert_ne!(tag, etag(&other, &deployment, Representation::Json));
 
-        // The half §3.6 asks for by name. Without it a shared cache holding the
+        // The representation-specific half. Without it a shared cache holding the
         // page could answer an agent's `Accept: application/json` from it, and
         // `Vary: Accept` alone would not stop that — the tags would be equal.
         assert_ne!(tag, etag(&digest(), &deployment, Representation::Html));
 
-        // And the half §3.6 leaves out. A response is a function of the data,
+        // The deployment-specific half. A response is a function of the data,
         // the configuration *and* the code: `GET /fragment` with no `limit`
         // returns `default_limit` rows, so raising it changes the bytes at a
         // URL whose data did not move. Under `immutable` and a year of
@@ -844,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_policies_are_the_ones_doc_03_names() {
+    fn the_cache_policies_have_the_expected_directives() {
         // Asserted on the directives rather than on the rendered string: the
         // header is `headers`' to format, and pinning its token order here
         // would be testing that crate rather than this decision.

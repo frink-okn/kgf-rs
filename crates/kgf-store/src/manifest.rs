@@ -1,4 +1,4 @@
-//! The bundle manifest (doc 04 §4.3).
+//! The bundle manifest.
 //!
 //! The manifest is the immutable half of the three-document split: content
 //! identity, counts, capabilities, and the immutable request profile (prefixes
@@ -47,7 +47,7 @@ use crate::indexed::IndexedHdt;
 use crate::map::{PublishedBundle, open_published};
 use crate::store::{ArtifactSet, artifact};
 
-/// The manifest format version this build reads and writes (doc 04 §4.3).
+/// The manifest format version this build reads and writes.
 pub const MANIFEST_FORMAT: &str = "1";
 
 /// The bundle layout version this build reads and writes.
@@ -99,13 +99,13 @@ pub fn validate_predicate_role_iri(
     Ok(())
 }
 
-/// An operation family a bundle's artifacts can support (doc 03 §3.4).
+/// An operation family a bundle's artifacts can support.
 ///
 /// A capability describes the *bundle*, not the deployment: it says the bytes
 /// needed to answer are present, while whether a given server routes the
-/// operation is the service descriptor's business (doc 04 §4.3). Declaring one
-/// commits to that capability's full contract — methods, formats, and response
-/// metadata (doc 03 §3.1) — so nothing here is declared speculatively.
+/// operation is the service descriptor's business. Declaring one commits to
+/// that capability's full contract — methods, formats, and response metadata —
+/// so nothing here is declared speculatively.
 ///
 /// The core profile (`fragment`, `count`, `describe`, and the description
 /// surface) is mandatory and therefore absent from this enum: it is not a
@@ -130,22 +130,22 @@ pub enum Capability {
     Range,
     /// `GET /closure` — transitive expansion; needs the closure sidecar.
     Closure,
-    /// Membership filters and overlap sketches under `filters/` (doc 17).
+    /// Membership filters and overlap sketches under `filters/`.
     ///
     /// Unlike the others this gates no operation *here*. It is a federation
     /// capability: a peer reads a bundle's filters to decide whether asking it
     /// anything is worthwhile, and a registry reads them to build linksets. It
     /// is declared because a capability describes what the bundle carries, not
-    /// what this deployment routes (doc 04 §4.3) — and because leaving these
+    /// what this deployment routes — and because leaving these
     /// bytes undeclared would leave them outside `content_digest`, unverifiable
     /// by any mirror.
     Filters,
-    /// Exact role key sets under `keysets/` (doc 18).
+    /// Exact role key sets under `keysets/`.
     Keysets,
 }
 
 impl Capability {
-    /// The name this capability has as a manifest key and in doc 03.
+    /// The name this capability has as a manifest key and in the HTTP API.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Star => "star",
@@ -187,7 +187,7 @@ impl BundleFacts {
     /// [`Store::open`](crate::store::Store::open).
     ///
     /// Constructing the [`PublishedBundle`] capability is where the caller
-    /// accepts doc 04 §4.6's immutability obligation, exactly as for the store.
+    /// accepts the bundle's immutability obligation, exactly as for the store.
     ///
     /// Every check [`Store::open`](crate::store::Store::open) makes is made
     /// here except the manifest's existence, so that a bundle this describes is
@@ -253,7 +253,7 @@ impl BundleFacts {
 
 /// Which capabilities an artifact set supports.
 ///
-/// Four of doc 03's optional capabilities need nothing beyond the artifacts
+/// Four optional capabilities need nothing beyond the artifacts
 /// every bundle is required to carry: `star` and `sample` are compositions of
 /// triple patterns, `terms` reads the dictionary already in `data.hdt`, and
 /// `export` serves the files themselves. The rest are gated on sidecars — the
@@ -261,9 +261,9 @@ impl BundleFacts {
 /// therefore never derived here, since a bundle cannot acquire them without
 /// acquiring an artifact.
 ///
-/// `terms` is declared bare rather than with doc 04's `resolve_keys` option:
+/// `terms` is declared without the `resolve_keys` option:
 /// key resolution is a separate contract, and declaring an option the artifacts
-/// do not support would be exactly the speculative claim doc 03 §3.1 forbids.
+/// do not support would be a speculative capability claim.
 fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
     let mut capabilities = BTreeSet::from([
         Capability::Star,
@@ -278,11 +278,11 @@ fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
     if artifacts.text.is_some() {
         capabilities.insert(Capability::Search);
     }
-    // Doc 17 §17.3 makes each sketch family all-or-nothing: both filter roles
-    // or neither, both sketch roles or neither. A bundle carrying one role of a
+    // Each sketch family is all-or-nothing: both filter roles or neither, both
+    // sketch roles or neither. A bundle carrying one role of a
     // family is not a bundle with a partial capability — it is a bundle whose
     // consumer cannot tell "this role was not built" from "this role is empty",
-    // which is the distinction §17.3 exists to preserve. So the capability is
+    // which is the distinction this invariant preserves. So the capability is
     // declared only when every family present is complete, and a family that is
     // present but partial is refused outright by `ArtifactSet::resolve`.
     if !artifacts.filters.is_empty() {
@@ -294,9 +294,9 @@ fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
     capabilities
 }
 
-/// The artifact file names present, in the order doc 04 §4.1 lists them.
+/// The artifact file names present, in canonical bundle-layout order.
 ///
-/// **This list must grow with every sidecar.** Doc 04 §4.1 reserves `labels/`,
+/// **This list must grow with every sidecar.** Reserved future locations include `labels/`,
 /// `ranges/`, `closures/`, `reif/`, `geo/` and `vectors/`, none of which has a
 /// producer yet; an artifact absent from here
 /// is absent from the manifest's checksums and therefore from
@@ -305,10 +305,9 @@ fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
 ///
 /// Files a bundle may carry that are deliberately *not* artifacts of this list
 /// are a separate matter: `data.hdt.index.v1-1` is optional and never read
-/// (doc 04 §4.1, doc 20 §20.8), so a bundle carrying one is conforming and must
-/// not be refused. Whether it should nonetheless be checksummed — doc 04 §4.3
-/// wants `content_digest` usable for mirror verification, which argues yes — is
-/// an open question for the design docs, not something to settle here.
+/// and intentionally ignored, so a bundle carrying one must not be refused.
+/// Whether it should nonetheless be checksummed for mirror verification is an
+/// open design question, not something to settle here.
 fn artifact_names_for(artifacts: &ArtifactSet) -> Vec<&'static str> {
     let mut names = vec![artifact::HDT, artifact::PERM];
     if artifacts.graphs.is_some() {
@@ -330,8 +329,8 @@ fn artifact_names_for(artifacts: &ArtifactSet) -> Vec<&'static str> {
 
 /// Structural counts over the merged, queryable graph.
 ///
-/// Doc 03 §3.4.10 makes these load-bearing rather than decorative: the VoID
-/// document's numbers must equal `/count` results, and these are where it gets
+/// These counts are load-bearing rather than decorative: the VoID document's
+/// numbers must equal `/count` results, and these are where it gets
 /// them. `subjects` and `objects` are id-space sizes — each counts the shared
 /// section once, so they overlap and do not sum to a distinct-term total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,7 +345,7 @@ pub struct Counts {
     pub objects: u64,
 }
 
-/// Format versions the bundle declares (doc 04 §4.3).
+/// Format versions the bundle declares.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Formats {
     /// Bundle layout version.
@@ -411,8 +410,8 @@ pub struct ArtifactEntry {
 
 /// What a membership filter, overlap sketch, or key set says about itself.
 ///
-/// Doc 17 §17.3 and doc 18 §18.4 require a manifest entry per file carrying
-/// these fields, and doc 18 says a registry MUST verify them on ingest. They
+/// Every filter, sketch, and key-set file has a manifest entry carrying these
+/// fields, and registries verify them on ingest. They
 /// are read out of the file's own header rather than remembered from the build,
 /// because a summary held in the producing process is gone by the time anyone
 /// reads the bundle.
@@ -421,13 +420,13 @@ pub struct ArtifactEntry {
 /// say two artifacts may be compared iff those two agree — not
 /// `format_version`, not `role`, not `encoding`. Publishing them is what lets a
 /// consumer refuse a cross-convention intersection instead of computing a
-/// plausible, meaningless number from it. Doc 17 §17.4 lists `hash_id`
-/// explicitly even though `convention_id = 1` implies it, so a registry can
+/// plausible, meaningless number from it. `hash_id` is explicit even though
+/// `convention_id = 1` implies it, so a registry can
 /// reject an incomparable artifact without fetching it.
 ///
-/// **The manifest mirrors the header; it never overrides it.** §17.4 makes that
-/// normative — every value here MUST equal the one in the file's own envelope —
-/// which is why `kgf manifest --check` compares this block and not only the
+/// **The manifest mirrors the header; it never overrides it.** Every value here
+/// must equal the one in the file's own envelope, which is why `kgf manifest
+/// --check` compares this block and not only the
 /// size and checksum.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -442,12 +441,11 @@ pub struct KeyArtifact {
     pub role: KeyRole,
     /// What the file is.
     ///
-    /// Doc 17 §17.4 requires it of the two sketch families. Key sets carry it
-    /// too, which doc 18 §18.4 does not ask for, so that one entry shape
+    /// Both sketch families require it. Key sets carry it too, so one entry shape
     /// describes all three and nothing has to be inferred from a file name.
     pub structure: KeyStructure,
-    /// Distinct qualifying keys — authoritative, and what doc 18 §18.4's
-    /// cross-family identity is checked against.
+    /// Distinct qualifying keys, authoritative and used for the cross-family
+    /// identity check.
     pub key_count: u64,
     /// BinaryFuse fingerprint width. Membership filters only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -464,7 +462,7 @@ pub struct KeyArtifact {
 ///
 /// Closed vocabularies, so a typo is a parse refusal rather than a value that
 /// compares unequal to every real one. `--check` compares these fields against
-/// the file's own header (doc 17 §17.4), and a hand-edited `"fuze"` should say
+/// the file's own header, and a hand-edited `"fuze"` should say
 /// so where it is written rather than surface later as a mismatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -479,8 +477,8 @@ pub enum KeyStructure {
 
 /// The dictionary population a set of keys was drawn from.
 ///
-/// Doc 18 §18.4's six roles. hdtc's experimental `terms` role is deliberately
-/// absent: §18.4 excludes it from the KGF profile, so it is not nameable here.
+/// The six supported key-set roles. hdtc's experimental `terms` role is
+/// deliberately absent, so it is not nameable here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KeyRole {
@@ -498,11 +496,11 @@ pub enum KeyRole {
     ObjectsOnly,
 }
 
-/// A key set's payload encoding (doc 18 §4.1).
+/// A key set's payload encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KeyEncoding {
-    /// Elias-Fano, doc 18 §18.4's standard emission.
+    /// Elias-Fano, the standard bundle emission.
     EliasFano,
     /// A raw sorted `u64` array.
     Raw,
@@ -562,8 +560,8 @@ impl ArtifactEntry {
 /// keeps `created` fixed while the artifacts are unchanged — `kgf manifest`
 /// does — therefore regenerates byte-identically, which is what lets a manifest
 /// be diffed across versions and keeps
-/// [`content_digest`](Self::content_digest) usable as the canonical identity
-/// doc 04 §4.3 makes it.
+/// [`content_digest`](Self::content_digest) usable as the canonical bundle
+/// identity.
 ///
 /// Unknown fields are accepted and dropped rather than refused: the manifest
 /// grows over time, `formats.manifest` is what versions it, and a bundle written
@@ -605,7 +603,7 @@ pub struct Manifest {
     pub publisher: Option<Publisher>,
     /// Structural counts over the queryable graph.
     pub counts: Counts,
-    /// Declared capabilities, keyed by the names in doc 03 §3.4.
+    /// Declared capabilities, keyed by their HTTP API names.
     ///
     /// Values are untyped because a capability's configuration is defined by the
     /// sidecar behind it — `search`'s exclusion lists, `range`'s families — and
@@ -613,7 +611,7 @@ pub struct Manifest {
     /// a schema ahead of the thing it describes.
     #[serde(default)]
     pub capabilities: BTreeMap<String, serde_json::Value>,
-    /// Prefix map for CURIE syntax in parameters (doc 03 §3.3).
+    /// Prefix map for CURIE syntax in parameters.
     #[serde(default)]
     pub prefixes: BTreeMap<String, String>,
     /// Frozen predicate-role profile for this published version.
@@ -639,7 +637,7 @@ pub struct Manifest {
 /// Provenance: what this bundle was built from, and by what.
 ///
 /// **Not identity.** `content_digest` is a Merkle root over *published bytes*,
-/// and doc 04 §4.3 is emphatic that it is not a digest of build inputs — two
+/// not a digest of build inputs; two
 /// builds from one source may legitimately differ. So nothing here participates
 /// in the digest, and none of it is verified at open. It answers "what would I
 /// run to get a bundle like this one again", which matters when a serving volume
@@ -650,9 +648,8 @@ pub struct Source {
     /// What the bundle was built from, in the order the builder read them.
     ///
     ///
-    /// A list rather than doc 04 §4.3's single object: building from several
-    /// files is ordinary, and per-input blank-node disambiguation (§4.4 step 1)
-    /// already makes the order meaningful.
+    /// A list because building from several files is ordinary and per-input
+    /// blank-node disambiguation already makes the order meaningful.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<SourceInput>,
     /// What built it.
@@ -670,8 +667,8 @@ pub struct SourceInput {
     pub url: Option<String>,
     /// Its serialization: `hdt`, `n-triples`, `turtle`, …
     ///
-    /// `hdt` is a legitimate value. Doc 04 §4.4 assumes RDF in, but a pipeline
-    /// that already normalized and built one is the ordinary OKN case.
+    /// `hdt` is a legitimate value because an ordinary OKN pipeline may already
+    /// have normalized and built the input.
     pub format: String,
     /// Lowercase hex SHA-256 of the bytes the builder actually read.
     pub sha256: String,
@@ -679,8 +676,8 @@ pub struct SourceInput {
 
 /// What produced a bundle.
 ///
-/// Doc 04 §4.3 hangs `generator` off each *component*, which leaves a bundle
-/// with no derived components — every OKN bundle today — with nowhere to record
+/// Generator provenance belongs to the bundle as a whole because a bundle with
+/// no derived components — every OKN bundle today — still needs to record
 /// which toolchain built it. Without that, "re-derive exactly" is not true:
 /// the permutation, sketch, and text formats are pinned by convention rather
 /// than by commit, so the producing version is what makes a rebuild comparable.
@@ -911,14 +908,13 @@ impl Manifest {
     /// A manifest is written once and read forever, so the failure that matters
     /// is not a corrupt file but a stale one: artifacts rebuilt without
     /// regenerating the manifest. Left unchecked that surfaces as a `/void`
-    /// document quietly disagreeing with `/count` — the one invariant doc 03
-    /// §3.4.10 states outright — so it is refused here instead, naming the
+    /// document quietly disagreeing with `/count`, so it is refused here
+    /// instead, naming the
     /// command that repairs it.
     ///
     /// Counts are the whole check: they are free to obtain and no rebuild
     /// preserves all four by accident. Checksums are not verified, because that
-    /// is a full read of every artifact and belongs to publish and `kgf verify`
-    /// (doc 20 §20.6).
+    /// is a full read of every artifact and belongs to publication and `kgf verify`.
     pub fn verify_against(&self, facts: &BundleFacts, bundle_dir: &Path) -> Result<()> {
         let actual = facts.counts();
         for (field, recorded, actual) in [
@@ -950,7 +946,7 @@ impl Manifest {
 ///
 /// Rewriting a manifest is not the same operation as reading one. A writer that
 /// deserializes into [`Manifest`] and serializes back **deletes every field this
-/// build does not model** — doc 04 §4.3's `source` and `components`, a
+/// build does not model** — including `source`, `components`, a
 /// capability's configuration body, anything a newer builder added. That is
 /// silent data loss in a file whose whole job is to be the record.
 ///
@@ -1152,7 +1148,7 @@ pub struct ArtifactDigest {
 /// among them — it carries the digest, so hashing it would be circular.
 ///
 /// Returning the preimage rather than the digest keeps SHA-256 out of the read
-/// layer: this crate never hashes a file, by design (doc 20 §20.6).
+/// layer: this crate never hashes a file by design.
 pub fn content_digest_preimage(artifacts: &[ArtifactDigest]) -> Vec<u8> {
     let mut sorted: Vec<&ArtifactDigest> = artifacts.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1594,9 +1590,8 @@ mod tests {
         assert!(error.to_string().contains("found an array"), "{error}");
     }
 
-    /// `source` was an unmodeled field before `kgf build` produced one,
-    /// and doc 04 §4.3 still shows the older `{format, sha256, url}` shape. A
-    /// document written to that shape must fail loudly rather than parse into
+    /// `source` was an unmodeled field before `kgf build` produced one. A
+    /// document using the superseded `{format, sha256, url}` shape must fail loudly rather than parse into
     /// an empty `Source`: silently dropping provenance would leave a manifest
     /// that looks like it records where the bundle came from and does not.
     #[test]
@@ -1617,8 +1612,8 @@ mod tests {
     fn rewriting_replaces_modeled_fields_and_keeps_everything_else() {
         let dir = tempfile::tempdir().unwrap();
 
-        // A document carrying a doc 04 §4.3 field this build does not model,
-        // plus one from a newer writer.
+        // A document carrying one field this build does not model, plus one
+        // from a newer writer.
         let mut json = serde_json::to_value(sample_manifest(sample_counts())).unwrap();
         json["components"] = serde_json::json!([{"id": "canonical", "role": "source"}]);
         json["something_newer"] = serde_json::json!(["a", "b"]);

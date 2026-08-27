@@ -24,24 +24,23 @@ use serde::Serialize;
 
 use super::config;
 
-/// The MinHash capacity every conforming bundle publishes at (doc 17 §17.2).
+/// The MinHash capacity every conforming bundle publishes.
 ///
 /// Not a default and not a knob. Comparing two sketches truncates both to
 /// `min(k_A, k_B)`, so one bundle publishing at a smaller `k` caps the
 /// resolution of *every pair it participates in*: raising it unilaterally buys
-/// nothing and lowering it degrades other people's numbers. §17.2.1 calls it a
-/// federation constant for exactly that reason, so it is not representable in a
-/// config.
+/// nothing and lowering it degrades other people's numbers. It is therefore a
+/// federation constant rather than a configurable value.
 pub const SKETCH_K: u32 = 65536;
 
 /// The sketch roles a conforming bundle publishes.
 ///
-/// Doc 17 §17.3 makes each family all-or-nothing — both filter roles or
-/// neither, both sketch roles or neither — so this is the profile rather than a
+/// Each family is all-or-nothing — both filter roles or neither, both sketch
+/// roles or neither — so this is the profile rather than a
 /// default, and it is not configurable.
 pub const SKETCH_ROLES: &str = "subjects,objects";
 
-/// The key-set roles the `kgf-keyset/1` profile fixes (doc 18 §18.4).
+/// The key-set roles fixed by the `kgf-keyset/1` profile.
 ///
 /// The disjoint trio rather than the overlapping pair: measured across the 40
 /// OKN graphs it costs 2.53 GB against 3.87 GB, and every composite view is a
@@ -249,7 +248,7 @@ impl PositionMap {
 pub enum FilterBits {
     /// BinaryFuse8: about half the bytes, a 1/256 false-positive rate.
     Eight,
-    /// BinaryFuse16, the KGF emission (doc 18 §18.2).
+    /// BinaryFuse16, the standard KGF emission.
     Sixteen,
 }
 
@@ -277,7 +276,7 @@ impl TryFrom<u8> for FilterBits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KeysetEncoding {
-    /// Elias-Fano, ~4.4–5.8 bytes per key. Doc 18 §18.4's standard emission.
+    /// Elias-Fano, ~4.4–5.8 bytes per key and the standard KGF emission.
     EliasFano,
     /// A raw sorted `u64` array, 8 bytes per key.
     Raw,
@@ -501,17 +500,16 @@ pub struct ConfigPlan {
 }
 
 /// hdtc's own defaults, restated here so a resolved plan is complete rather than
-/// partly deferred to whichever hdtc happens to run. Where a value is also a KGF
-/// convention rather than merely a default, the doc that fixes it is cited: a
-/// future hdtc changing its default must not silently change a bundle.
+/// partly deferred to whichever hdtc happens to run. KGF conventions are fixed
+/// here so a future hdtc default change cannot silently change a bundle.
 mod defaults {
     /// hdtc `text --max-literal-bytes`.
     pub const MAX_LITERAL_BYTES: u64 = 4096;
     /// hdtc `text --untagged-language`.
     pub const UNTAGGED_LANGUAGE: &str = "en";
-    /// hdtc `sketch --filter-bits`; doc 18 §18.2 sizes the corpus at Fuse16.
+    /// hdtc `sketch --filter-bits`; KGF uses Fuse16.
     pub const FILTER_BITS: u8 = 16;
-    /// hdtc `keyset --encoding`; doc 18 §18.4's `kgf-keyset/1` standard emission.
+    /// hdtc `keyset --encoding`; the `kgf-keyset/1` standard emission.
     pub const KEYSET_ENCODING: &str = "elias-fano";
 }
 
@@ -527,8 +525,8 @@ impl ConfigPlan {
 
         // Refused rather than ignored. A bundle whose config declares components
         // and whose artifacts contain none would be described as a plain bundle
-        // — the statistics, the graph identities, and the entailment flags doc
-        // 04 §4.3 hangs off each component all silently absent.
+        // — its statistics, graph identities, and entailment flags would all
+        // be silently absent.
         for (field, value) in [
             ("components", &config.components),
             ("publish", &config.publish),
@@ -537,7 +535,7 @@ impl ConfigPlan {
                 value.is_none(),
                 "build config declares `{field}`, but this build has no component \
                  DAG: it merges no derived components, binds no per-component graph \
-                 identity, and produces no per-component statistics (doc 04 §4.4). \
+                 identity, and produces no per-component statistics. \
                  Remove it, or build the components with their own tools and pass \
                  the merged result as `--input`"
             );
@@ -642,8 +640,8 @@ fn resolve_semantics(semantics: config::Semantics) -> Result<Semantics> {
                 && role
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
-            "role name {role:?} must be a lowercase token; it is spelled into `role=` \
-             on the wire (doc 19 §19.1)"
+            "role name {role:?} must be a lowercase token because it is spelled into \
+             `role=` on the wire"
         );
         ensure!(
             !predicates.is_empty(),
@@ -735,7 +733,7 @@ fn resolve_contents(contents: config::Contents) -> Result<Contents> {
         ensure!(
             k == SKETCH_K,
             "contents.filters.k is {k}, but the KGF profile fixes it at {SKETCH_K} \
-             federation-wide (doc 17 §17.2). Comparing two sketches truncates both to \
+             federation-wide. Comparing two sketches truncates both to \
              the smaller `k`, so a bundle published at {k} would cap the resolution of \
              every pair it takes part in — raising it unilaterally buys nothing and \
              lowering it degrades other publishers' numbers. Remove the key"
@@ -834,9 +832,8 @@ pub enum Input {
     },
 }
 
-/// Recorded in the manifest, never acted on. Provenance, not identity: doc 04
-/// §4.3 is emphatic that `content_digest` covers published bytes and not build
-/// inputs.
+/// Recorded in the manifest, never acted on. This is provenance, not identity:
+/// `content_digest` covers published bytes rather than build inputs.
 #[derive(Debug, Clone, Serialize)]
 pub struct Provenance {
     /// Where the input came from. Unverifiable here, and passed through.
@@ -980,11 +977,10 @@ mod tests {
         assert!(again.contents.text.is_none());
     }
 
-    /// Doc 17 §17.3 makes each family all-or-nothing and doc 18 §18.1 states
-    /// key sets are published unconditionally, so there is no key to turn them
-    /// off with. `deny_unknown_fields` is what enforces that.
-    /// `k` is representable so it can be *refused with a reason* — doc 17
-    /// §17.2 makes it a federation constant, and someone will reasonably try to
+    /// Each filter family is all-or-nothing and key sets are published
+    /// unconditionally, so there is no key to turn them off with.
+    /// `deny_unknown_fields` enforces that. `k` is representable so it can be
+    /// *refused with a reason*: it is a federation constant, and someone will reasonably try to
     /// tune it. It is also why the resolved plan still round-trips.
     #[test]
     fn a_minhash_capacity_other_than_the_federation_constant_is_refused() {
@@ -993,7 +989,10 @@ mod tests {
              contents: {filters: {k: 4096}}\n",
         )
         .expect_err("a per-bundle k must be refused");
-        assert!(format!("{error:#}").contains("§17.2"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("federation-wide"),
+            "{error:#}"
+        );
 
         let stated = resolve(
             "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\n\
