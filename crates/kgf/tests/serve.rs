@@ -1472,6 +1472,35 @@ fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() 
         entry.header("x-robots-tag").is_none(),
         "an operation's entry point is finite and stays discoverable"
     );
+    // Which is why its fan-out is marked per link instead. Every drill-down and
+    // continuation from this page leads into the narrowed space, and a narrowed
+    // page is served `noindex`, so following one can never reach anything an
+    // index would keep. A page-wide directive would have taken the breadcrumbs
+    // with it, and those are the links tying an operation to its dataset.
+    let entry_links = links(&entry.text());
+    assert!(
+        entry_links
+            .iter()
+            .filter(|(href, _)| href.contains("/describe?"))
+            .count()
+            >= 3,
+        "the entry page fans out into term links: {entry_links:?}"
+    );
+    for (href, nofollow) in &entry_links {
+        assert_eq!(
+            *nofollow,
+            href.contains('?'),
+            "{href} leads {} the data space, so nofollow should be {}",
+            if href.contains('?') { "into" } else { "out of" },
+            href.contains('?')
+        );
+    }
+    assert!(
+        entry_links
+            .iter()
+            .any(|(href, nofollow)| href == "/tox" && !nofollow),
+        "the breadcrumb back to the dataset stays followable: {entry_links:?}"
+    );
     let page_etag = html.header("etag").expect("a page carries an ETag");
     let page_revalidated = server.request(
         "GET",
@@ -1934,6 +1963,24 @@ impl Server {
         }
         Response::parse(&raw, method)
     }
+}
+
+/// Every `<a>` in a rendered page, as its href and whether it is `nofollow`.
+///
+/// Hand-scanned rather than parsed: the assertion is about two attributes on
+/// one element, and a dependency on an HTML parser would be a larger surface
+/// than the thing under test.
+fn links(html: &str) -> Vec<(String, bool)> {
+    let mut found = Vec::new();
+    for tag in html.split("<a ").skip(1) {
+        let tag = &tag[..tag.find('>').expect("an opening tag is closed")];
+        let Some((_, after)) = tag.split_once("href=\"") else {
+            continue;
+        };
+        let href = after.split('"').next().expect("a quoted href");
+        found.push((href.to_owned(), tag.contains("rel=\"nofollow\"")));
+    }
+    found
 }
 
 struct Response {

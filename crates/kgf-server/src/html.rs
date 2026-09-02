@@ -208,7 +208,9 @@ fn page_document(
                             h1 { (title) }
                         }
                         @if let Some(machine) = &machine {
-                            a."json-action" href=(machine) { "View " (alternate.label()) }
+                            a."json-action" href=(machine) rel="nofollow" {
+                                "View " (alternate.label())
+                            }
                         }
                     }
                     (body)
@@ -216,7 +218,9 @@ fn page_document(
                 footer {
                     div."footer-inner" {
                         @if let Some(machine) = &machine {
-                            a href=(machine) { "This page as " (alternate.label()) }
+                            a href=(machine) rel="nofollow" {
+                                "This page as " (alternate.label())
+                            }
                             span."sep" { "·" }
                         }
                         span { "one URL for people and software, selected by Accept" }
@@ -297,7 +301,7 @@ impl maud::Render for Value<'_> {
                 Value::Number(number) => (group_digits(*number)),
                 Value::Link { href, label } => a href=(href) { (label) },
                 Value::TermLink { href, term } => {
-                    a."term" href=(href) title=[term.full_iri] {
+                    a."term" href=(href) rel="nofollow" title=[term.full_iri] {
                         (term.primary)
                         @if let Some(qualifier) = term.qualifier {
                             span."t-qual" { (qualifier) }
@@ -373,6 +377,21 @@ fn table_markup(headers: &[&str], rows: &[Vec<Value<'_>>], wide: bool) -> Markup
             }
         }
     }
+}
+
+/// A link that leads further into the data: a continuation, or the same query
+/// carried to another operation.
+///
+/// Marked `nofollow` for the reason a term link is. Everything such a link
+/// reaches narrows the resource, and a narrowed page is served `noindex`, so
+/// following one can never arrive anywhere an index would keep it — the fetch
+/// is spent for nothing. Carrying the mark on the link rather than on the
+/// response is what makes it usable here at all: a page-wide directive would
+/// take the breadcrumbs and the catalog links with it, and those are the ones
+/// worth following, being how an operation page is tied to the dataset it
+/// belongs to.
+pub fn pager(href: &str, label: &str) -> Markup {
+    html! { p."pager" { a href=(href) rel="nofollow" { (label) } } }
 }
 
 /// An aside: the explanation under a heading, in smaller type.

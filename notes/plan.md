@@ -2155,6 +2155,25 @@ following the code.
     header, so it bought little, and it put a "not worth following" signal on the
     exact bytes an agent client reads.
 
+    The header is not the whole instrument, because a page's links are not
+    homogeneous. Every drill-down link an operation page renders — a term to its
+    `/describe` neighborhood, a literal to the triples carrying it — and every
+    continuation and alternate-representation link now carries `rel="nofollow"`, while
+    breadcrumbs, the brand link and links to catalog documents do not. That is what
+    lets an entry point stay followable at all: a bare `/fragment` page renders up to
+    `caps.default_limit` rows of three linked terms each and a bare `/schema` up to
+    `caps.max_schema_items`, so without it a crawler walks thousands of `/describe`
+    executions that no index could ever keep, having arrived at pages served
+    `noindex`. Marking the links rather than the response is also what keeps the
+    breadcrumbs: a page-wide `nofollow` would sever every operation page from the
+    dataset it belongs to, which is the one link on the page worth following.
+
+    The two layers cover each other. `rel="nofollow"` is a hint rather than a
+    directive, so a crawler may take one anyway — and arrives at a narrowed page the
+    header serves `noindex`, spending a fetch and gaining nothing. The header is
+    binding but page-wide, so it is reserved for the responses where losing every link
+    costs nothing.
+
     Two consequences worth recording. The `latest` redirect and error responses carry
     no directive and need none: a `307` is not itself indexed and its target derives
     the policy on arrival, and error statuses are not indexed at all. And this remains
