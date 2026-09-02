@@ -232,7 +232,11 @@ async fn bundle_manifest(
     // ones, so there is nothing left to check: opening the bundle first would
     // make a client's cheapest possible request pay for a cold mmap.
     if wants.already_has(&validator) {
-        return not_modified(CachePolicy::Immutable, validator);
+        return not_modified(
+            CachePolicy::Immutable,
+            RobotsPolicy::Discoverable,
+            validator,
+        );
     }
 
     let resource = BundleManifest::new(
@@ -838,7 +842,11 @@ where
         representation,
     );
     if wants.already_has(&validator) {
-        return not_modified(CachePolicy::Immutable, validator);
+        return not_modified(
+            CachePolicy::Immutable,
+            RobotsPolicy::NoIndexNoFollow,
+            validator,
+        );
     }
 
     let target = Target::get(
@@ -899,7 +907,11 @@ where
         representation,
     );
     if wants.already_has(&validator) {
-        return not_modified(CachePolicy::Immutable, validator);
+        return not_modified(
+            CachePolicy::Immutable,
+            RobotsPolicy::NoIndexNoFollow,
+            validator,
+        );
     }
 
     let target = Target::get(
@@ -1027,7 +1039,7 @@ where
     );
     if wants.already_has(&validator) {
         return match method {
-            BodyMethod::Query => not_modified(cache, validator),
+            BodyMethod::Query => not_modified(cache, RobotsPolicy::NoIndexNoFollow, validator),
             BodyMethod::Post => Err(Problem::new(
                 ErrorCode::PreconditionFailed,
                 "If-None-Match matches the representation this POST would return; remove the \
@@ -1290,7 +1302,7 @@ fn respond(
     if let Some(validator) = &etag
         && wants.already_has(validator)
     {
-        return not_modified(cache, validator.clone());
+        return not_modified(cache, RobotsPolicy::Discoverable, validator.clone());
     }
 
     let body = match representation {
@@ -1305,6 +1317,7 @@ fn respond(
         Some(representation),
         Body::from(body),
         cache,
+        RobotsPolicy::Discoverable,
         etag,
     )
 }
@@ -1325,6 +1338,7 @@ fn respond_rendered(
         Some(representation),
         Body::from(rendered.body),
         cache,
+        RobotsPolicy::NoIndexNoFollow,
         Some(validator),
     )?;
     // The same metadata appears in headers and the body so that a
@@ -1342,14 +1356,43 @@ fn respond_rendered(
 
 /// RFC 9110 §15.4.5's 304: no body, and the validator and freshness the
 /// response would have carried.
-fn not_modified(cache: CachePolicy, validator: ETag) -> Result<Response, Problem> {
+fn not_modified(
+    cache: CachePolicy,
+    robots: RobotsPolicy,
+    validator: ETag,
+) -> Result<Response, Problem> {
     finish(
         StatusCode::NOT_MODIFIED,
         None,
         Body::empty(),
         cache,
+        robots,
         Some(validator),
     )
+}
+
+/// Whether cooperative crawlers should treat a response as public discovery.
+///
+/// Service, dataset, and manifest documents form a finite catalog. Versioned
+/// operations form an effectively unbounded graph through term drill-down and
+/// continuation links, so their responses must neither be indexed nor used as
+/// sources of more links. The HTTP header applies uniformly to pages and
+/// machine representations without duplicating the rule in each serializer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RobotsPolicy {
+    Discoverable,
+    NoIndexNoFollow,
+}
+
+impl RobotsPolicy {
+    fn apply(self, headers: &mut HeaderMap) {
+        if self == Self::NoIndexNoFollow {
+            headers.insert(
+                HeaderName::from_static("x-robots-tag"),
+                HeaderValue::from_static("noindex, nofollow"),
+            );
+        }
+    }
 }
 
 fn finish(
@@ -1357,6 +1400,7 @@ fn finish(
     representation: Option<Representation>,
     body: Body,
     cache: CachePolicy,
+    robots: RobotsPolicy,
     etag: Option<ETag>,
 ) -> Result<Response, Problem> {
     let mut response = Response::builder()
@@ -1371,6 +1415,7 @@ fn finish(
         );
     }
     headers.typed_insert(cache.header());
+    robots.apply(headers);
     // One URL serves many formats, so a cache that ignored `Accept` would
     // hand a page to an agent. Always, including on responses with no `ETag`.
     headers.insert(VARY, HeaderValue::from_static("Accept"));

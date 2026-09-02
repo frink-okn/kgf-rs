@@ -89,6 +89,10 @@ fn the_url_space_answers_over_a_real_listener() {
     root.assert_status(200);
     root.assert_cache_control(&["public", "max-age=300"]);
     root.assert_varies_on_accept();
+    assert!(
+        root.header("x-robots-tag").is_none(),
+        "the finite service catalog remains discoverable"
+    );
     let descriptor = root.json();
     // The catalog: a summary per dataset, so choosing one is one round trip.
     let datasets = descriptor["datasets"].as_array().unwrap();
@@ -106,6 +110,10 @@ fn the_url_space_answers_over_a_real_listener() {
     // `/{dataset}` — the release history, and which release is current.
     let dataset = server.get("/tox");
     dataset.assert_status(200);
+    assert!(
+        dataset.header("x-robots-tag").is_none(),
+        "the finite release catalog remains discoverable"
+    );
     let descriptor = dataset.json();
     assert_eq!(descriptor["current"], "2026-06-01");
     assert_eq!(descriptor["releases"].as_array().unwrap().len(), 2);
@@ -608,6 +616,7 @@ fn void_and_summary_serve_the_published_description_in_every_format() {
     let turtle = server.get("/tox/v/v1/void?format=ttl");
     turtle.assert_status(200);
     turtle.assert_header("content-type", "text/turtle; charset=utf-8");
+    turtle.assert_header("x-robots-tag", "noindex, nofollow");
     turtle.assert_header("kgf-complete", "true");
     assert!(String::from_utf8_lossy(&turtle.body).contains("@prefix kgfbn:"));
     let turtle_quads = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
@@ -646,6 +655,7 @@ fn void_and_summary_serve_the_published_description_in_every_format() {
     let markdown = server.get("/tox/v/v1/summary");
     markdown.assert_status(200);
     markdown.assert_header("content-type", "text/markdown; charset=utf-8");
+    markdown.assert_header("x-robots-tag", "noindex, nofollow");
     assert_eq!(markdown.body, b"# Summary\n");
 
     let json = server.get("/tox/v/v1/summary?format=json");
@@ -1387,6 +1397,7 @@ fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() 
     page.assert_header("content-type", "application/json");
     page.assert_cache_control(&["public", "max-age=31536000", "immutable"]);
     page.assert_varies_on_accept();
+    page.assert_header("x-robots-tag", "noindex, nofollow");
 
     // The body says it is truncated, and so do the headers. Both are required
     // both, because a CSV or Parquet body has nowhere to put it.
@@ -1415,13 +1426,13 @@ fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() 
     // A versioned operation is a deterministic function of immutable bytes, so
     // it revalidates like `/manifest` does.
     let etag = page.header("etag").expect("an operation carries an ETag");
-    server
-        .request(
-            "GET",
-            &format!("{base}/fragment?limit=2"),
-            &[("If-None-Match", etag.as_str())],
-        )
-        .assert_status(304);
+    let not_modified = server.request(
+        "GET",
+        &format!("{base}/fragment?limit=2"),
+        &[("If-None-Match", etag.as_str())],
+    );
+    not_modified.assert_status(304);
+    not_modified.assert_header("x-robots-tag", "noindex, nofollow");
 
     // And the same URL is a page in a browser.
     let html = server.request(
@@ -1430,6 +1441,7 @@ fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() 
         &[("Accept", "text/html")],
     );
     html.assert_header("content-type", "text/html; charset=utf-8");
+    html.assert_header("x-robots-tag", "noindex, nofollow");
     let html_text = html.text();
     assert!(html_text.contains("Next page"));
     assert!(html_text.contains("<summary>Fragment</summary>"));
@@ -1481,6 +1493,10 @@ fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() 
         "GET",
         &format!("{base}/manifest"),
         &[("Accept", "text/html")],
+    );
+    assert!(
+        manifest.header("x-robots-tag").is_none(),
+        "the finite version manifest remains discoverable"
     );
     let manifest_html = manifest.text();
     for operation in ["fragment", "count", "describe", "sample"] {

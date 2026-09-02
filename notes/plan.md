@@ -2132,6 +2132,17 @@ following the code.
     guidance from anything read from a bundle is the client's design problem, not
     something a card announces about itself. §4.2 could say so in a clause.
 
+53. **Public crawler behavior needs an explicit recommendation.** The service,
+    dataset, and manifest documents form a finite discovery catalog, but versioned
+    operations form an effectively unbounded graph through term drill-down and
+    continuation links. This server sends `X-Robots-Tag: noindex, nofollow` on every
+    successful operation response, including machine representations and conditional
+    `304` responses, while leaving the finite catalog crawlable. This is a request to
+    cooperative crawlers, not access control or load protection; admission limits
+    remain necessary for clients that ignore it. Doc 03 should say whether this is a
+    core server behavior or a recommended deployment policy. A host-wide `robots.txt`
+    remains a deployment concern because one origin may serve more than KGF.
+
 ## Not in this plan
 
 Remaining composed operations (ranges, star, key resolution), graph scoping, and
