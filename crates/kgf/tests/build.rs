@@ -2,9 +2,8 @@
 //!
 //! The resolution rules themselves are unit-tested beside them in
 //! `build::plan`. What is tested here is the seam kace meets — a config
-//! on stdin, a resolved plan on stdout, and refusals that name the fix — because
-//! that surface is the contract `notes/build-bundle.md` §6 asks a build workflow
-//! to depend on.
+//! on stdin, a resolved plan on stdout, and refusals that name the fix. That is
+//! the stable surface a build workflow depends on.
 
 use std::io::Write;
 use std::path::Path;
@@ -58,8 +57,8 @@ fn a_build_without_an_input_says_which_flags_supply_one() {
     );
 }
 
-/// Doc 04 §4.6: a published version is immutable, so a rebuild is a new
-/// directory rather than a rewrite of a live one a server may have mapped.
+/// A published version is immutable, so a rebuild is a new directory rather
+/// than a rewrite of a live one a server may have mapped.
 #[test]
 fn an_existing_output_directory_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -109,8 +108,8 @@ fn an_output_path_disagreeing_with_the_config_is_refused() {
 }
 
 /// The whole command, end to end: RDF in, a bundle `kgf manifest --check`
-/// accepts out. Doc 20 §20.9's golden-bundle rule — hdtc builds the artifacts,
-/// so what is checked is a producer's output rather than this crate's guess.
+/// accepts out. hdtc builds the artifacts, so what is checked is a producer's
+/// output rather than this crate's guess.
 #[test]
 fn a_build_produces_a_bundle_its_own_check_accepts() {
     let dir = tempfile::tempdir().unwrap();
@@ -144,8 +143,8 @@ fn a_build_produces_a_bundle_its_own_check_accepts() {
         "the report totals them:\n{stdout}"
     );
 
-    // Every family a conforming bundle publishes, including the two nothing
-    // reads yet (doc 17 §17.3, doc 18 §18.1).
+    // Every family a conforming bundle publishes, including the two that
+    // nothing reads yet.
     for entry in [
         "manifest.json",
         "data.hdt",
@@ -186,8 +185,8 @@ fn a_build_produces_a_bundle_its_own_check_accepts() {
     assert_eq!(input["sha256"], sha256(&source));
 }
 
-/// Doc 17 §17.3 and doc 18 §18.4 require a manifest entry per `filters/` and
-/// `keysets/` file. Without them those bytes sit in the bundle uncovered by
+/// Every `filters/` and `keysets/` file requires a manifest entry. Without one,
+/// those bytes sit in the bundle uncovered by
 /// `content_digest`, unverifiable by any mirror — and describing them later
 /// changes that digest, which for an immutable version means a rebuild.
 #[test]
@@ -232,8 +231,8 @@ fn key_artifacts_are_described_per_file_and_cross_checked() {
         let entry = artifacts
             .get(name)
             .unwrap_or_else(|| panic!("{name} is not described"));
-        // The comparability pair, which doc 18 §18.4 says a registry must
-        // verify on ingest, plus the count the identity below rests on.
+        // The comparability pair a registry verifies on ingest, plus the count
+        // on which the identity below rests.
         let keys = &entry["keys"];
         assert_eq!(keys["convention_id"], 1, "{name}");
         assert_eq!(keys["hash_id"], 1, "{name}");
@@ -252,13 +251,13 @@ fn key_artifacts_are_described_per_file_and_cross_checked() {
         assert_eq!(
             count("keysets/shared.keys") + count(&format!("keysets/{only}.keys")),
             count(&format!("filters/{whole}.filter")),
-            "doc 18 §18.4 identity must hold for {whole}"
+            "the key-count identity must hold for {whole}"
         );
     }
 }
 
-/// The case the doc 18 §18.4 count identity cannot catch: a key set from
-/// another bundle whose totals happen to agree. Both fixtures here have two
+/// The case the count identity cannot catch: a key set from another bundle
+/// whose totals happen to agree. Both fixtures here have two
 /// shared keys, so the identity holds and only the `source_digest` binding
 /// separates them.
 #[test]
@@ -323,10 +322,9 @@ fn a_key_set_from_another_bundle_is_refused_even_when_the_counts_agree() {
     assert!(stderr.contains("another bundle"), "{stderr}");
 }
 
-/// Doc 17 §17.4: "the manifest mirrors the header, it never overrides it." A
-/// checksum cannot enforce that — the file stays intact while the manifest
-/// misreports what is in it — and §17.4 makes these the values a registry
-/// verifies on ingest, so `--check` has to compare them.
+/// The manifest mirrors the header; it never overrides it. A checksum cannot
+/// enforce that because the file stays intact while the manifest misreports
+/// what is in it, so `--check` must compare the values a registry verifies.
 #[test]
 fn a_manifest_that_misreports_key_metadata_fails_check() {
     let dir = tempfile::tempdir().unwrap();
@@ -363,7 +361,7 @@ fn a_manifest_that_misreports_key_metadata_fails_check() {
 
     let stderr = kgf(&["manifest", path(&out), "--check"], "").err();
     assert!(stderr.contains("misdescribes"), "{stderr}");
-    assert!(stderr.contains("§17.4"), "{stderr}");
+    assert!(stderr.contains("never overrides"), "{stderr}");
 }
 
 /// The half the count identity cannot cover: a file whose header names a
@@ -665,8 +663,7 @@ fn a_successful_adopt_build_releases_the_input() {
     assert!(out.join("data.hdt").exists());
 }
 
-/// The config schema documented in `notes/build-bundle.md` §3 must be one the
-/// parser accepts.
+/// The config sample in `notes/build-bundle.md` must be one the parser accepts.
 ///
 /// Written after two keys in that sample had already gone stale — a `stats:
 /// enabled:` that was never modelled, and a `source:` block that became flags —
@@ -682,7 +679,7 @@ fn the_documented_config_sample_parses() {
         .split("```yaml")
         .map(|block| block.split("```").next().unwrap_or_default())
         .find(|block| block.trim_start().starts_with("schema: 1"))
-        .expect("§3 documents a complete config, opening with `schema: 1`");
+        .expect("the note documents a complete config opening with `schema: 1`");
 
     let stdout = kgf(&["build", "--config", "-", "--check-config"], sample).ok();
     let plan: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -692,8 +689,8 @@ fn the_documented_config_sample_parses() {
     );
 }
 
-/// Doc 04 §4.4's component DAG is not built here, and a config that declares
-/// one is refused with that reason rather than with "unknown field". The
+/// The component DAG is not built here, and a config that declares one is
+/// refused with that reason rather than with "unknown field". The
 /// failure mode this prevents is quiet: a bundle whose config named components
 /// and whose artifacts contain none would be described as an ordinary bundle,
 /// with every per-component statistic and graph identity silently absent.
@@ -705,7 +702,7 @@ fn a_config_declaring_components_is_refused_with_a_reason() {
             &format!("{MINIMAL}{field}: []\n"),
         )
         .err();
-        assert!(stderr.contains("doc 04 §4.4"), "{field}: {stderr}");
+        assert!(stderr.contains("no component DAG"), "{field}: {stderr}");
         assert!(stderr.contains("--input"), "{field}: {stderr}");
     }
 }

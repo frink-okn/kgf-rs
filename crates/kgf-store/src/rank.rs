@@ -30,7 +30,7 @@
 //! [`select1`](RankedBitmap::select1) is `O(log(L / B))` for a binary search over
 //! superblocks, then a bounded search within one superblock, then a scan of at
 //! most one subblock. Version 1 stores no select samples; if select ever
-//! profiles hot, the format reserves the extension point (doc 20 §20.10).
+//! profiles hot, the format reserves the extension point.
 //!
 //! # Malformed files
 //!
@@ -38,7 +38,7 @@
 //! that the directory and the bitmap describe the same data, and will panic
 //! rather than return a wrong answer if they do not — a directory that
 //! disagrees with its bitmap is a corrupt artifact, not a query-time condition.
-//! Detecting that is `kgf verify`'s job, off the read path (doc 20 §20.6).
+//! Detecting that is `kgf verify`'s job, off the read path.
 
 use crate::error::{Error, Result};
 use crate::map::{BitmapSpec, BitmapView, Mapping, PackedArray, PackedSpec};
@@ -172,7 +172,7 @@ impl Geometry {
 /// Natural widths of the two directory arrays (`permutation-index-format.md`
 /// §7.2). A directory at any other width is a different structure being read as
 /// this one, which the entry counts alone would not catch — and since open
-/// deliberately skips CRC verification (doc 20 §20.6), cheap structural checks
+/// deliberately skips CRC verification, so cheap structural checks
 /// are what stand between a misparsed sidecar and wrong answers.
 const SUPERRANK_WIDTH: u8 = 64;
 const SUBRANK_WIDTH: u8 = 16;

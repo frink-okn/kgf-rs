@@ -7,8 +7,7 @@
 # them separately would let a deployment pair a builder with a format layer it
 # was never tested against — and `.hdt.perm`, the sketch and key-set files, and
 # the text index are pinned by convention rather than by commit, so that
-# mismatch produces plausible artifacts rather than an error
-# (`../kgf/docs/gcp-deployment-plan.md` §3.3).
+# mismatch produces plausible artifacts rather than an error.
 #
 #   docker build --build-arg HDTC_REF=v1.2.0-beta.3 -t kgf .
 #   docker run --rm -v /bundles:/bundles kgf serve --bundle-root /bundles --bind 0.0.0.0:8080
@@ -59,8 +58,8 @@ COPY --from=build /src/hdtc/target/release/hdtc /usr/local/bin/hdtc
 USER kgf
 WORKDIR /home/kgf
 
-# The service descriptor at `/` is the health probe: it opens no bundle
-# (`gcp-deployment-plan.md` §3.5), so no `/healthz` is needed.
+# The service descriptor at `/` is the health probe: it opens no bundle, so no
+# `/healthz` is needed.
 EXPOSE 8080
 ENTRYPOINT ["kgf"]
 CMD ["--help"]

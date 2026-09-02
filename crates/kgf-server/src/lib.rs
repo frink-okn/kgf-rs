@@ -1,6 +1,6 @@
 //! The KGF HTTP API.
 //!
-//! This crate implements **KGF doc 03** over [`kgf_store`]. The split is the
+//! This crate implements the KGF HTTP API over [`kgf_store`]. The split is the
 //! point: HTTP semantics — caps, budgets, the truncation vocabulary,
 //! serialization formats, cursor tokens — must not leak into storage code, and
 //! the store must stay testable headless against fixture bundles.
@@ -30,7 +30,7 @@
 //!
 //! Units 10–19 in `notes/plan.md` are implemented: [`cursor`], [`term`],
 //! [`envelope`], the URL space with `latest`, caching and content negotiation,
-//! and doc 03 §3.4's read operations `/fragment`, `/count`, `/describe`, `/sample`
+//! and the read operations `/fragment`, `/count`, `/describe`, `/sample`
 //! and `/schema`, the `/void` and `/summary` description resources, plus bindings
 //! QUERY/POST for fragment and count in [`request`] and [`answer`].
 
@@ -64,8 +64,8 @@ pub use admission::Admission;
 
 /// Server configuration.
 ///
-/// Its caps and budgets are also published at `/`: doc 03 §3.1 tells clients
-/// to read those values rather than assume them, which is only true if the
+/// Its caps and budgets are also published at `/`, allowing clients to discover
+/// them instead of assuming values. That is only useful if the
 /// values they read are the values applied. Admission is host policy rather
 /// than a per-request cost promise; clients encounter it through the standard
 /// `rate_limited` problem and `Retry-After`.
@@ -75,8 +75,8 @@ pub struct Config {
     ///
     /// A [`PublishedRoot`] rather than a path: mapping a file that another
     /// process can truncate is undefined behaviour, and this capability is
-    /// where a caller records that the tree is published and immutable (doc 04
-    /// §4.6). Taking a `&Path` here would make that promise on the operator's
+    /// where a caller records that the tree is published and immutable. Taking
+    /// a `&Path` here would make that promise on the operator's
     /// behalf, from a library that can be embedded anywhere.
     pub bundle_root: PublishedRoot,
     /// Address to bind.
@@ -89,17 +89,17 @@ pub struct Config {
     /// IRIs emitted in a response. Leave this unset for direct plain-HTTP
     /// service, where the request's `Host` is authoritative.
     pub public_origin: Option<PublicOrigin>,
-    /// The largest values a request may ask for (doc 03 §3.5).
+    /// The largest values a request may ask for.
     pub caps: Caps,
-    /// The work one response may cost (doc 03 §3.5).
+    /// The work one response may cost.
     pub budgets: Budgets,
     /// Deployment-wide admission limits for active and waiting bundle work.
     pub admission: Admission,
 }
 
 impl Config {
-    /// A configuration serving `bundle_root` on `bind`, with doc 03 §3.5's
-    /// default caps and budgets.
+    /// A configuration serving `bundle_root` on `bind`, with the default caps
+    /// and budgets.
     pub fn new(bundle_root: PublishedRoot, bind: std::net::SocketAddr) -> Self {
         Self {
             bundle_root,
@@ -167,7 +167,7 @@ impl std::str::FromStr for PublicOrigin {
 )]
 pub struct PublicOriginError;
 
-/// The largest values a request may ask for (doc 03 §3.5).
+/// The largest values a request may ask for.
 ///
 /// A request above a cap is refused with `cap_exceeded` rather than quietly
 /// reduced: a client that asked for 50 000 rows and got 10 000 without being
@@ -178,14 +178,13 @@ pub struct Caps {
     pub max_limit: u32,
     /// Rows per page when a request does not ask for a number.
     ///
-    /// Not one of doc 03 §3.5's caps, and published beside them because a
-    /// client cannot otherwise know how large `GET /fragment` is: §3.5 fixes
-    /// the ceiling and leaves the default to the server, so the default is
-    /// something a server has to say. Small on purpose — an agent's first
+    /// Published beside the hard caps because a client cannot otherwise know
+    /// how large `GET /fragment` is when `limit` is omitted. Small on purpose —
+    /// an agent's first
     /// request to an unfamiliar endpoint should be cheap, and `next` says
-    /// there is more. See `notes/plan.md`, "Questions for `../kgf`".
+    /// there is more.
     pub default_limit: u32,
-    /// Members drawn by one `/sample` (doc 03 §3.5's `n ≤ 1000`).
+    /// Members drawn by one `/sample`; `n` may not exceed 1,000.
     pub max_sample: u32,
     /// Input rows in a bindings QUERY.
     pub max_bindings: u32,
@@ -204,7 +203,7 @@ pub struct Caps {
 }
 
 impl Caps {
-    /// Doc 03 §3.5's defaults.
+    /// The default request caps.
     ///
     /// `const` so that a caller — or a test of the parsing these bound — can
     /// name them without building a [`Config`], which needs a capability over a
@@ -231,7 +230,7 @@ impl Default for Caps {
     }
 }
 
-/// The published numbers a request is read against (doc 03 §3.5).
+/// The published numbers a request is read against.
 ///
 /// Borrowed together because they are read together: a term parameter is
 /// checked against a budget and a page size against a cap, and an operation
@@ -247,18 +246,16 @@ pub struct Limits<'a> {
 impl Limits<'_> {
     /// Refuse a deployment whose caps let a request outrun its own budgets.
     ///
-    /// Doc 03 §3.5 has caps bound what a client may ask for and budgets bound
-    /// what a response may cost, and it is the operator who has to keep the two
-    /// consistent — nothing in the table does. A `max_limit` above
+    /// Caps bound what a client may ask for and budgets bound what a response
+    /// may cost, so the operator must keep the two consistent. A `max_limit` above
     /// `max_output_rows` is a server that publishes a page size it will not
-    /// honour, and the choice then is to truncate silently, to truncate loudly
-    /// on every large request, or to refuse to start. Doc 20 §20.8's "no
-    /// degraded mode" picks the third, and it buys something concrete:
+    /// honour. Refusing to start avoids either silent or routine truncation and
+    /// buys something concrete:
     /// [`crate::answer`] does not check the row and term budgets per request,
     /// because a configuration that passes here cannot reach them.
     ///
     /// `max_response_bytes` is deliberately not in this list. No cap bounds it
-    /// — §3.5 says so directly, "one legal literal can be megabytes" — so it is
+    /// because one legal literal can be megabytes, so it is
     /// the one composite budget that has to be applied while a response is
     /// built.
     pub fn validate(&self) -> Result<(), String> {
@@ -331,12 +328,12 @@ impl Limits<'_> {
     }
 }
 
-/// The work one response may cost (doc 03 §3.5's composite budgets).
+/// The work one response may cost.
 ///
 /// Separate from [`Caps`] because cap *products* can still be operationally
 /// large, and a row cap is not a byte cap — one legal literal can be megabytes.
 /// Exhausting a budget is never an error: the response is marked incomplete and
-/// carries a cursor where the operation has a resumable position (§3.6).
+/// carries a cursor where the operation has a resumable position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Budgets {
     /// Rows per response, any operation.
@@ -357,7 +354,7 @@ pub struct Budgets {
 }
 
 impl Budgets {
-    /// Doc 03 §3.5's suggested defaults.
+    /// The suggested default budgets.
     pub const fn new() -> Self {
         Self {
             max_output_rows: 100_000,
@@ -495,9 +492,8 @@ mod tests {
     #[test]
     fn a_cap_that_outruns_a_budget_stops_the_server() {
         // The reason `crate::answer` does not check the row and term budgets
-        // per request: a configuration that reaches them cannot start. §3.5
-        // leaves the two tables independent and doc 20 §20.8 refuses degraded
-        // modes, so the inconsistency is an operator's to fix, loudly.
+        // per request: a configuration that reaches them cannot start. The
+        // independent tables must be consistent, and that is an operator error.
         let over_rows = Caps {
             max_limit: 200_000,
             ..Caps::new()
@@ -576,8 +572,8 @@ mod tests {
 
     #[test]
     fn max_response_bytes_is_deliberately_not_validated() {
-        // It cannot be. §3.5 says a row cap is not a byte cap because "one
-        // legal literal can be megabytes", so no combination of caps bounds it
+        // It cannot be: a row cap is not a byte cap because one legal literal
+        // can be megabytes, so no combination of caps bounds it
         // and it has to be applied while a response is built. Pinned here so
         // that adding it to `validate` — which would look like tidiness — has
         // to argue with this comment first.

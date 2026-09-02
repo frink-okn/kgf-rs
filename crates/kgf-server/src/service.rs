@@ -1,25 +1,25 @@
 //! What this deployment serves: datasets, their versions, and how a URL
 //! resolves to one.
 //!
-//! Doc 03 §3.2's URL space has two halves. `/{dataset}/v/{version}/…` addresses
+//! The URL space has two halves. `/{dataset}/v/{version}/…` addresses
 //! an immutable bundle, and the catalog ([`kgf_store::catalog`]) already knows
 //! those. `/`, `/{dataset}` and `/{dataset}/latest/…` address things that
-//! *move*, and nothing below this layer knows about them — doc 04 §4.3 splits
-//! the three descriptors by mutability precisely so that a host can change its
+//! *move*, and nothing below this layer knows about them. Splitting the three
+//! descriptors by mutability lets a host change its
 //! mind without a new data version.
 //!
 //! # Where `current` comes from
 //!
-//! Doc 04 §4.3 puts `current` in the dataset descriptor, which it calls mutable
-//! and host-independent. This server has no such document to read: a deployment
+//! `current` is mutable, host-level dataset metadata. This server has no such
+//! document to read: a deployment
 //! is a directory of bundles, and nothing in the toolchain writes one. So the
 //! descriptor is **derived** from the bundle manifests, which carry every field
 //! it needs — `dataset_iri`, `title`, `publisher`, `version`, `content_digest`,
 //! `created`.
 //!
 //! `current` is then the greatest release under one total order: by `created`,
-//! then by version label. Not by label alone, which doc 03 §3.2 allows to be "a
-//! content hash prefix" — hash labels have no order, and a `latest` that
+//! then by version label. Not by label alone, because labels may be content-hash
+//! prefixes with no useful order, and a `latest` that
 //! redirects to an arbitrary version is worse than one that does not exist. The
 //! comparison is over parsed instants rather than the strings, because RFC 3339
 //! lets the same instant be written several ways and two of them sort wrongly:
@@ -36,7 +36,7 @@
 //! A manifest that does not parse, carries a digest that is not a digest, or
 //! names a version other than its own directory stops the server with the path
 //! in the message. The alternative — dropping that version from the catalog and
-//! serving the rest — is the degraded mode doc 20 §20.8 refuses: a silently
+//! serving the rest — is a degraded mode: a silently
 //! missing version answers 404 for data that is on disk, and an operator who
 //! deployed it has no way to see that.
 
@@ -103,8 +103,8 @@ impl Service {
     /// Scan the configured root, read every manifest, and derive the
     /// descriptors.
     ///
-    /// Reading N small JSON files is not the bundle opening that doc 20 §20.6
-    /// keeps off the startup path: no artifact is mapped and no payload is
+    /// Reading N small JSON files does not violate the bounded-startup rule: no
+    /// artifact is mapped and no payload is
     /// touched. It is the minimum needed to answer `/` and `/{dataset}` and to
     /// resolve `latest`, all of which must work before any bundle is opened.
     pub fn build(config: Config) -> Result<Self, ServiceError> {
@@ -176,7 +176,7 @@ impl Service {
     ///
     /// **Blocking**: the first call for a version maps its artifacts and faults
     /// their preambles, so this belongs on a blocking pool and never on the
-    /// async reactor (doc 20 §20.4).
+    /// async reactor.
     ///
     /// An open failure is [`ErrorCode::InternalError`] rather than a 4xx: the
     /// request is well formed, and what went wrong is that this deployment
@@ -255,7 +255,7 @@ fn descriptor_digest(config: &Config, datasets: &Datasets) -> ContentDigest {
 ///
 /// Both, because they answer different questions. The bytes are what
 /// `/manifest` serves, so that a document written by a newer builder keeps the
-/// fields this build does not model (doc 04 §4.3). The parse is what the page,
+/// fields this build does not model. The parse is what the page,
 /// the release ordering and the `ETag` are built from.
 #[derive(Debug, Clone)]
 pub struct PublishedManifest {
@@ -268,8 +268,8 @@ impl PublishedManifest {
     /// Read `manifest.json` from a bundle directory.
     ///
     /// The file is read twice — once for the bytes, once through
-    /// [`Manifest::read`], which is what applies doc 04 §4.3's
-    /// `formats.manifest` check. Two reads of a few kilobytes, once per bundle
+    /// [`Manifest::read`], which applies the `formats.manifest` check. Two reads
+    /// of a few kilobytes, once per bundle
     /// at startup, is worth not duplicating that check here.
     fn read(bundle_dir: &Path) -> Result<Self, String> {
         let path = bundle_dir.join(artifact::MANIFEST);
@@ -522,7 +522,7 @@ impl Dataset {
             .map(|(version, release)| (version.as_str(), release))
     }
 
-    /// The dataset's globally stable identity (doc 04 §4.3), if it declares one.
+    /// The dataset's globally stable identity, if it declares one.
     ///
     /// Taken from the current release: identity is a property of the logical
     /// dataset, and the newest release is this deployment's best statement of
@@ -642,7 +642,7 @@ pub struct Release {
 }
 
 impl Release {
-    /// The version's canonical identity (doc 04 §4.3), and the ETag's data half.
+    /// The version's canonical identity and the ETag's data half.
     pub fn digest(&self) -> &ContentDigest {
         &self.version_digest
     }
@@ -657,7 +657,7 @@ impl Release {
         &self.manifest
     }
 
-    /// The CURIE prefixes this version's parameters accept (doc 03 §3.3).
+    /// The CURIE prefixes this version's parameters accept.
     pub fn prefixes(&self) -> &PrefixMap {
         &self.prefixes
     }
@@ -677,7 +677,7 @@ impl Release {
             .expect("a parsed content digest is a cursor binding")
     }
 
-    /// Whether this bundle declares `capability` (doc 04 §4.3).
+    /// Whether this bundle declares `capability`.
     pub fn declares(&self, capability: Capability) -> bool {
         self.manifest.parsed.declares(capability)
     }
@@ -704,8 +704,8 @@ impl Release {
 /// That is not pedantry: `+25:00` is not an offset, and jiff reads it as one
 /// and lands a day earlier — a manifest with a typo in its timestamp would sort
 /// as a release from the previous day and could take `current` from the version
-/// that should have it. Startup is meant to stop on a manifest like that
-/// (§20.8), so it does. The rest of RFC 3339 — the calendar, the leap day, the
+/// that should have it. Startup therefore stops on a manifest like that. The
+/// rest of RFC 3339 — the calendar, the leap day, the
 /// fractional second — stays jiff's, because that is the part worth ninety
 /// lines to get wrong.
 fn parse_rfc3339(text: &str) -> Option<Instant> {
@@ -779,8 +779,7 @@ mod tests {
     #[test]
     fn current_is_the_most_recently_created_release() {
         // Labels that sort the wrong way round, so this can only pass by
-        // reading `created` — doc 03 §3.2 allows "a content hash prefix" as a
-        // version label, and those have no order at all.
+        // reading `created`; content-hash version labels have no order at all.
         let datasets = Datasets::derive([
             (
                 id("tox", "aa11"),
@@ -867,7 +866,7 @@ mod tests {
         assert_eq!(json["current"], "new");
         assert!(
             json.get("latest").is_none(),
-            "doc 04 names the machine-readable field `current`"
+            "the machine-readable field is `current`"
         );
         assert_eq!(json["title"], "Tox as of new");
         assert_eq!(json["dataset_iri"], "https://okn.example/id/tox");
@@ -889,7 +888,7 @@ mod tests {
         );
 
         // The human page calls the movable selection `latest`, matching its
-        // `/{dataset}/latest/…` URL, while the JSON above keeps doc 04's field.
+        // `/{dataset}/latest/…` URL, while the JSON above keeps `current`.
         let page = descriptor.to_html();
         assert!(page.contains("href=\"/tox/v/new/manifest\""));
         assert!(page.contains("href=\"/tox/v/old/manifest\""));

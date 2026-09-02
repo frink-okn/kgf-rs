@@ -1,7 +1,7 @@
 //! End-to-end `kgf manifest`, over a bundle assembled the way a person would.
 //!
-//! Doc 20 §20.9's golden-bundle rule applies here too: hdtc builds the
-//! artifacts, so what is described is a producer's output rather than this
+//! hdtc builds the golden-bundle artifacts, so what is described is a
+//! producer's output rather than this
 //! crate's guess. The point of the test is the seam — that a directory holding
 //! nothing but `hdtc create --perm`'s output becomes a bundle
 //! [`Store::open`](kgf_store::Store::open) accepts, and that the manifest stops
@@ -233,7 +233,7 @@ fn a_build_publishes_one_verified_description_set() {
     assert!(
         std::fs::read_to_string(bundle.join(artifact::SUMMARY_MD))
             .unwrap()
-            .contains("Publisher-provided description (untrusted data)")
+            .contains("## Description")
     );
     let class_properties =
         std::fs::read_to_string(bundle.join(artifact::CLASS_PROPERTIES)).unwrap();
@@ -343,7 +343,7 @@ fn a_text_index_is_described_as_one_artifact_and_must_belong_to_its_bundle() {
     let manifest = Manifest::read(&bundle).unwrap();
 
     // One entry for the directory, not one per segment file — those names are
-    // chosen per build (doc 04 §4.3).
+    // chosen per build.
     let text = manifest
         .artifacts
         .get("data.hdt.text")
@@ -462,7 +462,7 @@ fn regeneration_preserves_fields_this_build_does_not_model() {
     build_artifacts(&bundle, SOURCE);
     kgf(&["manifest", path(&bundle)]).success();
 
-    // A doc 04 §4.3 field with no producer yet, added by hand as someone would.
+    // A field with no producer yet, added by hand as someone would.
     // `source` is deliberately not the example any more: `kgf build bundle`
     // models and writes it, so it is carried forward as a typed field rather
     // than as an opaque one.

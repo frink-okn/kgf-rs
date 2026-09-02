@@ -83,8 +83,8 @@ fn the_url_space_answers_over_a_real_listener() {
     deployment.publish("atlas", "v1", TINY_NT, "2020-01-01T00:00:00Z");
     let server = deployment.serve();
 
-    // `/` — the service descriptor: what is hosted, and the caps a client is
-    // told to read rather than assume (doc 03 §3.1).
+    // `/` — the service descriptor: what is hosted, and the caps a client reads
+    // rather than assumes.
     let root = server.get("/");
     root.assert_status(200);
     root.assert_cache_control(&["public", "max-age=300"]);
@@ -745,7 +745,7 @@ fn latest_redirects_to_the_current_version_and_keeps_the_method() {
 
     let redirect = server.get("/tox/latest/manifest");
     // 307, not 302: a 302 may be rewritten to GET by an intermediary, which
-    // would silently turn a body-carrying QUERY into something else (§3.2).
+    // would silently turn a body-carrying QUERY into something else.
     redirect.assert_status(307);
     redirect.assert_header("location", "/tox/v/2026-06-01/manifest");
     redirect.assert_cache_control(&["public", "max-age=300"]);
@@ -787,7 +787,7 @@ fn an_extension_method_reaches_the_router_with_its_name_intact() {
             response.json()["detail"].as_str().unwrap().contains(method),
             "the problem must name the method that was refused",
         );
-        // §3.6.1 says every error carries a code; RFC 9110 §15.5.6 says a 405
+        // Every error carries a code; RFC 9110 §15.5.6 says a 405
         // carries `Allow`. Both, not one.
         let allow = response.header("allow").expect("405 requires Allow");
         assert!(allow.contains("GET"), "{allow}");
@@ -1115,7 +1115,7 @@ fn one_url_serves_a_page_to_a_browser_and_data_to_everything_else() {
 
 #[test]
 fn every_error_response_carries_a_code() {
-    // §3.6.1 says every one, which includes the ones an off-the-shelf router
+    // Every error carries a code, including the ones an off-the-shelf router
     // answers on its own. `/%FF` is a path segment that is not UTF-8 once
     // decoded, and reaches axum's extractor before any handler runs.
     let deployment = Deployment::new();
@@ -1190,7 +1190,7 @@ fn negotiation_and_parameter_failures_are_told_apart() {
     let server = deployment.serve();
 
     // Three ways to fail at choosing a representation, three codes, three
-    // statuses, three remedies (§3.6.1).
+    // statuses, three remedies.
     let unsupported = server.get("/tox/v/v1/manifest?format=parquet");
     unsupported.assert_status(400);
     assert_eq!(unsupported.json()["code"], "unsupported_format");
@@ -1274,7 +1274,7 @@ fn the_descriptors_can_be_revalidated_too() {
 #[test]
 fn an_error_no_handler_raised_still_carries_a_code() {
     // The request-body limit answers before any of this crate's code runs.
-    // §3.6.1 says every error response carries a code, which has to include
+    // Every error response carries a code, including
     // the ones a `tower` layer produces.
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
@@ -1322,8 +1322,8 @@ fn a_bundle_that_cannot_be_opened_answers_rather_than_panics() {
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
 
     // Remove the required permutation sidecar *after* the manifest is written,
-    // so the version is scanned and described but cannot be served. Doc 20
-    // §20.8: there is no fallback, so the bundle is refused at open.
+    // so the version is scanned and described but cannot be served. There is
+    // no fallback, so the bundle is refused at open.
     std::fs::remove_file(deployment.bundle("tox", "v1").join("data.hdt.perm")).unwrap();
     let server = deployment.serve();
 
@@ -1349,7 +1349,7 @@ fn a_bundle_that_cannot_be_opened_answers_rather_than_panics() {
 
 #[test]
 fn a_manifest_that_disagrees_with_its_directory_stops_startup() {
-    // Loud rather than degraded (doc 20 §20.8): the alternative is a version
+    // Loud rather than degraded: the alternative is a version
     // that is on disk and 404s, which an operator has no way to notice.
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
@@ -1374,7 +1374,7 @@ fn a_manifest_that_disagrees_with_its_directory_stops_startup() {
 #[test]
 fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() {
     // `operations.rs` checks what the read operations *answer*, headless. What
-    // only a socket can show is the rest of the response: §3.6's metadata in
+    // only a socket can show is the rest of the response: completeness metadata in
     // both channels, an immutable validator on a versioned GET, and a page for
     // a browser at the same URL.
     let deployment = Deployment::new();
@@ -1388,7 +1388,7 @@ fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() 
     page.assert_cache_control(&["public", "max-age=31536000", "immutable"]);
     page.assert_varies_on_accept();
 
-    // The body says it is truncated, and so do the headers — §3.6 requires
+    // The body says it is truncated, and so do the headers. Both are required
     // both, because a CSV or Parquet body has nowhere to put it.
     let body = page.json();
     assert_eq!(body["complete"], serde_json::json!(false));
@@ -1546,7 +1546,7 @@ fn a_validator_moves_when_the_configuration_does() {
 
 #[test]
 fn an_operation_a_bundle_does_not_declare_is_refused_before_it_is_opened() {
-    // §3.4.7 is an optional capability, so a bundle that does not declare it is
+    // Sampling is optional, so a bundle that does not declare it is
     // answered 501 — the request is well formed and the shortfall is what this
     // bundle offers, which is exactly what `capability_not_available` says.
     let deployment = Deployment::new();
@@ -1966,7 +1966,7 @@ impl Response {
 
     /// `Vary` is a list, and the CORS layer legitimately adds its own tokens to
     /// it. What matters is that a shared cache keys on `Accept`, since one URL
-    /// serves both a page and JSON (doc 03 §3.6).
+    /// serves both a page and JSON.
     #[track_caller]
     fn assert_varies_on_accept(&self) {
         let vary = self.header("vary").unwrap_or_default();

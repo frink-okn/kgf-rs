@@ -1,8 +1,8 @@
 //! The KGF read layer: bundles on disk, answers in id space.
 //!
-//! This crate is the implementation of **KGF doc 20**. It opens a published
-//! bundle, memory-maps its artifacts, and answers triple patterns at the bounds
-//! doc 03 §3.5 promises. It contains no HTTP, no async, and no locks on the read
+//! This crate opens a published bundle, memory-maps its artifacts, and answers
+//! triple patterns within fixed, published cost bounds. It contains no HTTP,
+//! no async, and no locks on the read
 //! path; the server holds an [`Arc<Store>`](std::sync::Arc) per request and calls
 //! synchronous methods from a blocking pool.
 //!
@@ -11,7 +11,7 @@
 //! **Open has bounded, size-independent I/O.** Opening maps files, parses
 //! headers, and reads a fixed number of rank-directory sentinels. It never scans
 //! payloads, rebuilds indexes, hashes whole files, or materializes structures
-//! proportional to bundle size (doc 20 §20.3). An open-but-idle bundle therefore
+//! proportional to bundle size. An open-but-idle bundle therefore
 //! costs address space plus a small fixed metadata working set, which is what
 //! makes lazy multi-tenant serving work.
 //!
@@ -21,7 +21,7 @@
 //! server, not here.
 //!
 //! **One implementation per operation.** There is no fallback path for a missing
-//! or superseded index (doc 20 §20.8). A bundle without `data.hdt.perm` is
+//! or superseded index. A bundle without `data.hdt.perm` is
 //! refused at open; `.hdt.index.v1-1` is never read; `data.hdt.graphs` and
 //! `data.hdt.graphs.idx` must occur together. What looks like a fallback in [`pattern`] —
 //! `s ? o` probing whichever endpoint is smaller — is one algorithm making a
@@ -38,8 +38,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-// The only module permitted to map memory. Keeping the `unsafe` surface to one
-// audited file is a doc 20 §20.9 obligation, not a style preference.
+// The only module permitted to map memory. Keeping the `unsafe` surface in one
+// audited file makes the external immutability assumption reviewable.
 #[allow(unsafe_code)]
 pub mod map;
 
@@ -57,7 +57,7 @@ pub mod store;
 
 // Golden-bundle fixtures. Behind a feature rather than `cfg(test)` because
 // `kgf-server` and the `kgf` binary need the same hdtc-built bundles, and a
-// second copy of the build recipe is the drift doc 20 §20.9 warns about.
+// second copy of the build recipe could drift from the producer-backed fixtures.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 

@@ -1,11 +1,11 @@
-//! `kgf serve` — run the doc 03 API over a directory of bundles.
+//! `kgf serve` — run the KGF API over a directory of bundles.
 //!
 //! # Where the mmap promise is made
 //!
 //! [`kgf_store::map`] confines the `unsafe` that *maps* a file. What it cannot
 //! confine is the promise that makes mapping sound: that the files under the
 //! bundle root are published and will not be modified or truncated while the
-//! server holds them (doc 04 §4.6). No library can establish that — it is a
+//! server holds them. No library can establish that — it is a
 //! fact about a deployment — so [`PublishedBundle::new`] and
 //! [`PublishedRoot::new`] are `unsafe` constructors whose entire purpose is to
 //! be called from outside `kgf-store`, by the layer that knows.
@@ -75,8 +75,7 @@ pub fn run(args: Args) -> Result<()> {
     };
 
     // A current-thread runtime would serialize every request behind the one
-    // that is faulting a page. The blocking pool that store work runs on is
-    // this runtime's (doc 20 §20.4).
+    // that is faulting a page. Store work uses this runtime's blocking pool.
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -105,8 +104,8 @@ pub fn published_root(root: &Path) -> Result<PublishedRoot> {
         );
     }
 
-    // SAFETY: the caller of `kgf serve` has published this tree. Doc 04 §4.6
-    // makes a published bundle version immutable: its artifacts are written
+    // SAFETY: the caller of `kgf serve` has published this tree. A published
+    // bundle version is immutable: its artifacts are written
     // once, before the directory is served, and a new release is a new version
     // directory rather than an edit. Adding version directories beneath the
     // root while running is explicitly permitted by this constructor, and is

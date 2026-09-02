@@ -38,8 +38,8 @@ pub mod artifact {
     ///
     /// **A directory, not a file** — the only artifact that is. Its bytes are
     /// Tantivy's rather than hdtc's (`hdtc/docs/text-index-format.md` §1.1), so
-    /// it is a set of segment files whose names the build chooses. Doc 04 §4.1
-    /// places it and §4.3 says how one entry checksums the whole directory.
+    /// it is a set of segment files whose names the build chooses. One manifest
+    /// entry checksums the whole directory.
     pub const TEXT: &str = "data.hdt.text";
     /// VoID description graph as standard HDT. Part of the tier-1 description set.
     pub const VOID_HDT: &str = "stats/void.hdt";
@@ -63,8 +63,8 @@ pub mod artifact {
     /// Enumerated rather than discovered by listing the directory, because a
     /// manifest's artifact set must be a closed vocabulary: a stray file in
     /// `filters/` is not an artifact, and checksumming whatever happens to be
-    /// there would let one appear in `content_digest`. Doc 17 §17.3 restricts
-    /// the sketch families to the subject and object roles, so this is the
+    /// there would let one appear in `content_digest`. Sketch families are
+    /// restricted to the subject and object roles, so this is the
     /// complete space; which of them a bundle carries is discovered.
     pub const FILTERS: [&str; 4] = [
         "filters/objects.filter",
@@ -73,12 +73,11 @@ pub mod artifact {
         "filters/subjects.minhash",
     ];
 
-    /// The same names grouped as doc 17 §17.3's two families.
+    /// The same names grouped into the two all-or-nothing families.
     ///
-    /// Membership filters and overlap sketches are *separately* all-or-nothing,
-    /// and §17.3 says so explicitly: "a bundle may publish sketches without
-    /// filters". Grouping them is what lets that stay legal while a half-built
-    /// family does not.
+    /// Membership filters and overlap sketches are *separately* all-or-nothing.
+    /// Grouping them permits sketches without filters while refusing a
+    /// half-built family.
     pub const FILTER_FAMILIES: [[&str; 2]; 2] = [
         ["filters/objects.filter", "filters/subjects.filter"],
         ["filters/objects.minhash", "filters/subjects.minhash"],
@@ -86,11 +85,10 @@ pub mod artifact {
 
     /// Every `keysets/` file the key-set profile can produce.
     ///
-    /// Doc 18 §18.4 publishes the disjoint trio by default but keeps the
-    /// composite roles available, and says consumers "must not assume exactly
-    /// two key-set files per bundle" — so all six roles are listed and presence
-    /// decides. hdtc's experimental `terms` role is deliberately absent: doc 18
-    /// §18.4 excludes it from the KGF profile.
+    /// The disjoint trio is built by default, while the composite roles remain
+    /// available. All six supported roles are listed and presence decides.
+    /// hdtc's experimental `terms` role is deliberately absent because it is
+    /// not part of the bundle profile.
     pub const KEYSETS: [&str; 6] = [
         "keysets/objects-only.keys",
         "keysets/objects.keys",
@@ -117,7 +115,7 @@ pub mod artifact {
 /// size-independent opening.
 ///
 /// Full digest and checksum verification deliberately does not belong here: it
-/// runs at publish/registry ingest and through `kgf verify` (doc 20 §20.6).
+/// runs at publication or registry ingest and through `kgf verify`.
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct OpenOptions {}
@@ -162,14 +160,14 @@ impl Store {
     /// `data.hdt.graphs` and `data.hdt.graphs.idx` is present, or if a published
     /// description set cannot be bound to its manifest view directory. There
     /// is no degraded mode: the error names the command that produces a missing
-    /// required artifact (doc 20 §20.8).
+    /// required artifact.
     ///
-    /// Constructing [`PublishedBundle`] is where the caller acknowledges doc 04
-    /// §4.6's external immutability requirement. This method is safe because it
+    /// Constructing [`PublishedBundle`] is where the caller acknowledges the
+    /// external immutability requirement. This method is safe because it
     /// cannot be called with an unqualified path.
     pub fn open(bundle: &PublishedBundle, _opts: OpenOptions) -> Result<Self> {
         let dir = bundle.path();
-        // The manifest is what makes an artifact set a *bundle* (doc 04 §4.1),
+        // The manifest is what makes an artifact set a *bundle*,
         // so it is required here and not by `ArtifactSet::resolve`, which the
         // manifest generator uses on a bundle that does not have one yet.
         require_file(dir, artifact::MANIFEST, "kgf manifest")?;
@@ -281,8 +279,8 @@ impl Store {
     ///
     /// The returned [`Selection`] borrows this store, which is what makes
     /// "resolved against a different bundle" unrepresentable. Query execution is
-    /// synchronous within one blocking task holding an `Arc<Store>` (doc 20
-    /// §20.4), so nothing needs to outlive the borrow; resumption goes through
+    /// synchronous within one blocking task holding an `Arc<Store>`, so nothing
+    /// needs to outlive the borrow; resumption goes through
     /// an encoded cursor token, not a live `Selection`.
     pub fn resolve(&self, pattern: IdPattern) -> Result<Selection<'_>> {
         self.data.resolve(pattern)
@@ -297,7 +295,7 @@ pub(crate) fn description_set_disagreement(dir: &Path, detail: &str) -> Error {
 }
 
 /// The artifact paths a bundle directory provides, resolved and checked against
-/// doc 04 §4.1's required set.
+/// the required artifact set.
 ///
 /// Deliberately says nothing about `manifest.json`. A bundle needs one to be
 /// servable, but [`crate::manifest`] reads these same artifacts in order to
@@ -337,7 +335,7 @@ impl ArtifactSet {
     /// The graph sidecar and its index must occur together: an index without
     /// its parent is malformed, and a parent without its index would leave the
     /// three index-side patterns to a per-candidate probe this crate does not
-    /// implement (doc 20 §20.7, §20.8).
+    /// implement.
     pub(crate) fn resolve(dir: &Path) -> Result<Self> {
         let hdt = require_file(dir, artifact::HDT, "kgf build")?;
         let perm = require_file(dir, artifact::PERM, format!("hdtc perm {}", hdt.display()))?;
@@ -397,11 +395,11 @@ impl ArtifactSet {
     /// other sidecar carries cheap source metadata — `.hdt.perm` has dictionary
     /// counts, a triple count and a suffix length — so a foreign one is refused
     /// for the price of a header read. A text index records only a SHA-256 over
-    /// the HDT payload, so verifying it is a pass over the whole file, which
-    /// doc 20 §20.3 keeps off the open path. It is checked where the other
+    /// the HDT payload, so verifying it is a pass over the whole file and stays
+    /// off the open path. It is checked where the other
     /// whole-file digests are, by `kgf manifest` and `kgf verify`, and a bundle
-    /// this server was pointed at is one whose publication it is trusting
-    /// already (doc 04 §4.6).
+    /// this server was pointed at is one whose immutable publication it already
+    /// trusts.
     ///
     /// What *is* established here is that the index opens and its manifest
     /// parses, so a broken one is refused at open rather than on the first
@@ -425,9 +423,9 @@ impl ArtifactSet {
 
     /// Refuse a graph index that does not belong to this HDT.
     ///
-    /// `verify_binding` rather than `open`: graph scoping is a later milestone,
-    /// so what open owes a bundle today is a refusal when its index does not
-    /// bind (doc 20 §20.8). Opening the index would additionally build its two
+    /// `verify_binding` rather than `open`: graph scoping is not implemented,
+    /// so opening only needs to refuse an index that does not bind. Opening the
+    /// index would additionally build its two
     /// per-query layer readers — a file handle each — and then drop them.
     ///
     /// Shared with [`crate::manifest::BundleFacts::read`] so that the two paths
@@ -467,7 +465,7 @@ impl DescriptionArtifacts {
     /// Carrying none of these files is a valid tier-0 bundle. Once any one is
     /// present, every one is required: publishing a partial set would either
     /// make a mandatory route lie about its availability or create a fallback
-    /// path, both forbidden by docs 03 and 20.
+    /// path.
     fn resolve(dir: &Path) -> Result<Option<Self>> {
         let paths: Vec<Option<PathBuf>> = artifact::DESCRIPTION
             .iter()
@@ -533,7 +531,7 @@ fn require_file(dir: &Path, name: &str, remedy: impl Into<String>) -> Result<Pat
 /// Existence only. These files are validated when a producer reads their
 /// headers to describe them, which costs a full pass for the CRC32C the two
 /// formats require before any field may be interpreted — far outside what an
-/// open may spend (doc 20 §20.6).
+/// open may spend.
 fn present(dir: &Path, names: &[&'static str]) -> Result<Vec<&'static str>> {
     let mut found = Vec::new();
     for name in names {
@@ -546,12 +544,12 @@ fn present(dir: &Path, names: &[&'static str]) -> Result<Vec<&'static str>> {
 
 /// The same, for artifacts that must appear as a complete family or not at all.
 ///
-/// Doc 17 §17.3: a bundle publishes both filter roles or neither, and both
-/// sketch roles or neither. A half-built family is refused rather than reported,
+/// A bundle publishes both filter roles or neither, and both sketch roles or
+/// neither. A half-built family is refused rather than reported,
 /// because the alternative is a bundle that declares the capability while a
 /// consumer cannot distinguish "this role was not built" from "this role is
-/// empty" — and §17.3's whole point is that an empty role is stated by a file
-/// with `key_count = 0`, never by silence.
+/// empty". An empty role is stated by a file with `key_count = 0`, never by
+/// silence.
 fn complete_families(dir: &Path, families: &[[&'static str; 2]]) -> Result<Vec<&'static str>> {
     let mut found = Vec::new();
     for family in families {
@@ -565,7 +563,7 @@ fn complete_families(dir: &Path, families: &[[&'static str; 2]]) -> Result<Vec<&
                     bundle: dir.to_path_buf(),
                     artifact: missing.copied().unwrap_or(family[0]).to_owned(),
                     remedy: format!(
-                        "hdtc sketch {} (doc 17 §17.3 publishes each family whole)",
+                        "hdtc sketch {} (both roles in a family must be published together)",
                         dir.join(artifact::HDT).display()
                     ),
                 });
@@ -580,7 +578,7 @@ fn optional_file(dir: &Path, name: &str) -> Result<Option<PathBuf>> {
     optional(dir, name, false)
 }
 
-/// The one artifact shape that is a directory (doc 04 §4.1): `data.hdt.text`.
+/// The one artifact represented by a directory: `data.hdt.text`.
 fn optional_dir(dir: &Path, name: &str) -> Result<Option<PathBuf>> {
     optional(dir, name, true)
 }

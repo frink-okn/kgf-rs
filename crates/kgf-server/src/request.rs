@@ -1,4 +1,4 @@
-//! What the client asked for: doc 03 §3.4's parameters, parsed into types.
+//! What the client asked for, parsed from parameters into domain types.
 //!
 //! Pure — no store, no HTTP. Everything a request can be refused for that does
 //! not need the bundle is refused here, which is what lets a handler negotiate,
@@ -10,7 +10,7 @@
 //! answer:
 //!
 //! - one the operation takes — parsed, and refused if it will not parse;
-//! - one doc 03 defines but this deployment cannot answer — refused
+//! - one the protocol defines but this deployment cannot answer — refused
 //!   `capability_not_available` (501), naming the capability;
 //! - anything else — refused `malformed_request`, listing what the operation
 //!   does take.
@@ -65,7 +65,7 @@ use crate::url::Params;
 // ---------------------------------------------------------------------------
 
 /// A triple position, which is also the parameter that binds it and the key a
-/// row reports it under (doc 03 §3.4.1).
+/// row reports it under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Position {
     /// `s`.
@@ -144,14 +144,14 @@ pub struct BoundTerm {
 }
 
 impl BoundTerm {
-    /// Parse §3.3 request syntax from the parameter named `parameter`.
+    /// Parse request-term syntax from the parameter named `parameter`.
     fn parse(
         parameter: &str,
         text: &str,
         limits: Limits<'_>,
         prefixes: &PrefixMap,
     ) -> Result<Self, Problem> {
-        // §3.5's `max_term_bytes`, applied where a term enters. Published, so
+        // `max_term_bytes`, applied where a term enters. Published, so
         // enforced: a cap a server advertises and does not apply is worse than
         // no cap, because a client sizes its requests by it.
         let max = limits.budgets.max_term_bytes;
@@ -177,7 +177,7 @@ impl BoundTerm {
         })
     }
 
-    /// Parse either §3.3's compact string or its JSON term-object form.
+    /// Parse either compact request syntax or the JSON term-object form.
     fn parse_body(
         parameter: &str,
         value: WireTerm,
@@ -327,7 +327,7 @@ impl BoundTerm {
     }
 }
 
-/// A triple pattern, as far as it can be read without a bundle (§3.4.1).
+/// A triple pattern, as far as it can be read without a bundle.
 ///
 /// An omitted or empty parameter is a variable. Empty is accepted because it is
 /// what an ordinary HTML form sends for an untouched optional control, and no
@@ -365,8 +365,8 @@ impl Pattern {
                 });
             }
         }
-        // Part of the pattern rather than beside it, which is how §3.4.1 echoes
-        // it — the constraint sits in the object position it constrains. An
+        // Part of the pattern rather than beside it: the constraint sits in
+        // the object position it constrains. An
         // operation that does not offer `o.text` has already refused it in
         // `accept_only`, so this is unreachable for those.
         pattern.text = TextFilter::parse(params, &pattern, limits)?;
@@ -395,7 +395,7 @@ impl Pattern {
         }
     }
 
-    /// The positions a row carries: the unbound ones (§3.4.1).
+    /// The positions a row carries: the unbound ones.
     ///
     /// `o.text` leaves the object *unbound* — it ranks candidates rather than
     /// naming one — so a text-filtered row still reports its object, which is
@@ -420,12 +420,12 @@ impl Pattern {
 }
 
 impl Serialize for Pattern {
-    /// §3.4.1's echo: the three positions, `null` where unbound, and each bound
+    /// The request echo: all three positions, `null` where unbound, and each bound
     /// one spelled the way the client sent it.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(Position::ALL.len()))?;
         for position in Position::ALL {
-            // §3.4.1: a constrained object echoes as `{"text": "…"}` in the
+            // A constrained object echoes as `{"text": "…"}` in the
             // position it constrains, where a bound one echoes as its term.
             match (position, &self.text) {
                 (Position::Object, Some(text)) => map.serialize_entry("o", text)?,
@@ -439,7 +439,7 @@ impl Serialize for Pattern {
     }
 }
 
-/// A text constraint on the object position (§3.4.1, doc 19 §19.3).
+/// A ranked text constraint on the object position.
 ///
 /// Ranked rather than filtering: the index orders the *literals* that match,
 /// and the pattern around it decides which of their statements come back. That
@@ -474,7 +474,7 @@ impl TextFilter {
             ));
         }
         // The same budget a term parameter is held to: this is text a client
-        // sends, and §3.5 caps what one of those may weigh.
+        // sends, and the term-byte budget caps what one may weigh.
         let max = limits.budgets.max_term_bytes;
         if text.len() as u64 > max {
             return Err(Problem::new(
@@ -523,8 +523,8 @@ impl TextFilter {
     ///
     /// One place rather than one per caller: `/fragment` and `/count` must ask
     /// the *same* question, and [`TextQuery`] carries knobs — match mode,
-    /// fuzziness, prefix, language ranges — that doc 03 §3.4.5 and doc 19 §19.3
-    /// will expose later. Wiring one of those into the enumeration and
+    /// fuzziness, prefix, and language ranges — that may be exposed later.
+    /// Wiring one of those into the enumeration and
     /// forgetting the count would report the unfiltered figure for a filtered
     /// page, which is a wrong number that looks right.
     pub fn to_query(&self) -> TextQuery {
@@ -700,7 +700,7 @@ fn profile_terms(profile: &PredicateRoles, role: &str) -> Vec<BoundTerm> {
 }
 
 impl Serialize for TextFilter {
-    /// §3.4.1 echoes the constraint inside the pattern's object position, as
+    /// The request echo puts the constraint inside the pattern's object position, as
     /// `{"text": "atrazine"}`.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(1))?;
@@ -709,7 +709,7 @@ impl Serialize for TextFilter {
     }
 }
 
-/// Which side of a resource's neighborhood `/describe` walks (§3.4.6).
+/// Which side of a resource's neighborhood `/describe` walks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     /// Triples with the resource as subject.
@@ -741,8 +741,8 @@ impl Direction {
     }
 
     fn parse(params: &Params) -> Result<Self, Problem> {
-        // `both` by default: §3.4.6 calls the operation a resource
-        // *neighborhood*, and half a neighborhood is a surprising default for a
+        // `both` by default: the operation returns a resource neighborhood, and
+        // half a neighborhood is a surprising default for a
         // client that did not choose.
         let Some(text) = params.get("direction") else {
             return Ok(Self::Both);
@@ -772,11 +772,11 @@ impl Serialize for Direction {
 // The four requests
 // ---------------------------------------------------------------------------
 
-/// The one composite budget a response has to carry with it (§3.5).
+/// The one composite budget a response has to carry with it.
 ///
 /// The caps bound what a client may *ask for*; the budgets bound what a
-/// response may *cost*, and §3.5 is explicit that the two are not the same
-/// thing — "a row cap is not a byte cap (one legal literal can be megabytes)".
+/// response may *cost*. A row cap is not a byte cap because one legal literal
+/// can be megabytes.
 /// For M1's operations that difference reduces to exactly one number:
 /// [`Limits::validate`] refuses at startup any
 /// deployment whose caps could outrun `max_output_rows` or `max_output_terms`,
@@ -789,15 +789,15 @@ impl Serialize for Direction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseBytes(pub u64);
 
-/// §3.5's `candidate_budget`: rows or postings a filtered operation may
+/// The `candidate_budget`: rows or postings a filtered operation may
 /// *examine*, independently of how many it returns.
 ///
 /// A separate budget from [`ResponseBytes`] because it bounds a different
 /// thing. A text-filtered pattern examines one ranked literal per candidate and
 /// may keep none of them — `? p ?` discards every match that does not occur
 /// with `p` — so the work has no relation to the page size, and `limit` bounds
-/// nothing. Exhausting it is not an error: §3.5 says the response comes back
-/// short and marked `candidate_budget`, with a cursor when its scan order has a
+/// nothing. Exhausting it is not an error: the response comes back short and
+/// marked `candidate_budget`, with a cursor when its scan order has a
 /// resumable position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Candidates(pub u64);
@@ -1645,7 +1645,7 @@ impl<'de> Visitor<'de> for WireTermVisitor {
     }
 }
 
-/// `GET /fragment` — a triple pattern, paged (§3.4.1).
+/// `GET /fragment` — a paged triple pattern.
 #[derive(Debug)]
 pub struct Fragment {
     /// The pattern to enumerate, text constraint included.
@@ -1760,7 +1760,7 @@ impl Fragment {
     }
 }
 
-/// `GET /count` — a cardinality and nothing else (§3.4.4).
+/// `GET /count` — a cardinality and nothing else.
 #[derive(Debug)]
 pub struct Count {
     /// The pattern to count, text constraint included.
@@ -1805,7 +1805,7 @@ impl Count {
     }
 }
 
-/// `GET /describe` — a resource's neighborhood, paged (§3.4.6).
+/// `GET /describe` — a resource's neighborhood, paged.
 #[derive(Debug)]
 pub struct Describe {
     /// The resource whose edges are wanted.
@@ -1840,7 +1840,7 @@ impl Describe {
                  as `iri=<http://example.org/a>` or `iri=ex:a`",
             ));
         };
-        // Named `iri` by §3.4.6, and any term is accepted: a blank node has a
+        // Named `iri` for compatibility, but any term is accepted: a blank node has a
         // neighborhood, and so does a literal, which has incoming edges like
         // any other object. Refusing them would make part of a bundle
         // unreachable to answer a question nobody asked.
@@ -1944,7 +1944,7 @@ impl SchemaSelection {
 /// One valid immediate-child collection request.
 ///
 /// The variants pair a collection with the only selector shapes under which
-/// doc 03 permits it, so parsing cannot produce (for example) languages below
+/// the API permits, so parsing cannot produce (for example) languages below
 /// a property or classes below a class.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaChildren {
@@ -2137,7 +2137,7 @@ impl SchemaQuery {
     }
 }
 
-/// `GET /schema` — one bounded description drill-down (§3.4.10).
+/// `GET /schema` — one bounded description drill-down.
 #[derive(Debug)]
 pub struct Schema {
     /// The description layer whose numbers are selected.
@@ -2448,7 +2448,7 @@ impl SchemaSelection {
     }
 }
 
-/// `GET /sample` — pseudo-random members of a pattern's result set (§3.4.7).
+/// `GET /sample` — pseudo-random members of a pattern's result set.
 #[derive(Debug)]
 pub struct Sample {
     /// The pattern to sample.
@@ -2646,26 +2646,23 @@ impl GetRequest for Search {
 // Shared parameter reading
 // ---------------------------------------------------------------------------
 
-/// Parameters doc 03 defines for these operations that this deployment does not
+/// Protocol parameters for these operations that this deployment does not
 /// answer, and the capability each one needs.
 ///
 /// Refused, never ignored, and `g` is why the rule is absolute rather than
 /// pragmatic: a request scoped to one named graph and answered from the whole
-/// dataset is a wrong answer that carries no sign of being wrong. §3.6.1 codes
-/// these `capability_not_available` and gives it **501** — the request is well
+/// dataset is a wrong answer that carries no sign of being wrong. These are
+/// coded `capability_not_available` with **501**: the request is well
 /// formed, and the shortfall is the server's.
-/// Which operations doc 03 defines each one *for* is the third column, and it
+/// Which operations define each one *for* is the third column, and it
 /// is load-bearing rather than documentation: `g=` on a `/sample` is not a
-/// graph-scoped sample this deployment cannot run, it is a parameter §3.4.7
-/// does not have. Answering that 501 would send an agent to look for a bundle
-/// declaring `graphs`, where the identical request would fail again — and §3.6
-/// makes the remedy the whole point of a code.
+/// graph-scoped sample this deployment cannot run; it is not a sample
+/// parameter. Answering that 501 would send an agent to look for a bundle
+/// declaring `graphs`, where the identical request would fail again.
 ///
-/// The column transcribes: §3.4.1's parameter table for `/fragment`; §3.4.4's
-/// filtered counts, which give `/count` the same filters and no `labels` (a
-/// count has no rows to label); §3.5's
-/// `labels=true` modifier row for the operations that return rows; and §3.5's
-/// `fragment +g scope` and `count +g scope` rows for `g`.
+/// The table gives `/fragment` and `/count` the same filters but no `labels` on
+/// a count, since it has no rows to label. `labels=true` applies to operations
+/// that return rows, while graph scope applies only to fragment and count.
 const NOT_OFFERED: &[(&str, Option<Capability>, &[&str])] = &[
     ("o.lang", None, &[FRAGMENT, COUNT]),
     ("o.dt", None, &[FRAGMENT, COUNT]),
@@ -2697,7 +2694,7 @@ fn accept_only(params: &Params, operation: &str, accepted: &[&str]) -> Result<()
         if accepted.contains(&name) {
             continue;
         }
-        // The more specific answer first: a parameter doc 03 defines *for this
+        // The more specific answer first: a parameter defined *for this
         // operation* and this deployment cannot honour is not the same mistake
         // as a typo, and the two have different remedies.
         if let Some((_, capability, _)) = NOT_OFFERED
@@ -2837,9 +2834,8 @@ fn malformed_term_list(name: &str) -> Problem {
 
 /// Read `/sample`'s seed.
 ///
-/// **Zero by default, not random.** §3.4.7 makes a sample "deterministic for a
-/// given seed + version, hence cacheable", and a versioned GET is immutable
-/// (§3.6) — so a response that varied per request would make both statements
+/// **Zero by default, not random.** A sample is deterministic for a given seed
+/// and version, and a versioned GET is immutable, so varying per request would make both properties
 /// false, and would put a validator on bytes that change. A client that wants a
 /// different draw asks for one.
 fn seed(params: &Params) -> Result<u64, Problem> {
@@ -3226,7 +3222,7 @@ mod tests {
     fn a_parameter_this_deployment_cannot_honour_is_refused_and_not_dropped() {
         // The sharpest case: `g=` scopes a request to one named graph, so
         // answering it from the whole dataset is wrong in a way the client
-        // cannot see. §3.6.1 gives it 501 — the request is fine, the server
+        // cannot see. It gets 501: the request is fine, the server
         // is not.
         for (query, expected) in [
             ("p=ex:a&g=%3Chttp%3A%2F%2Fexample.org%2Fg%3E", "graphs"),
@@ -3261,10 +3257,9 @@ mod tests {
     #[test]
     fn a_parameter_is_classified_against_the_operation_it_was_sent_to() {
         // 501 says "another bundle could answer this", so it is only the right
-        // answer where doc 03 defines the parameter for the operation. `g=` is
-        // §3.5's `fragment +g scope` and `count +g scope` and nothing else, so
-        // a graph-scoped `/sample` is not a capability this deployment lacks —
-        // it is a parameter §3.4.7 does not have, and sending an agent to look
+        // answer where the parameter is defined for the operation. `g=` belongs
+        // to fragment and count only, so a graph-scoped `/sample` is not a
+        // capability this deployment lacks; it is not a sample parameter, and sending an agent to look
         // for a bundle declaring `graphs` would waste its next request.
         let scoped = "g=%3Chttp%3A%2F%2Fexample.org%2Fg%3E";
         assert_eq!(
@@ -3282,10 +3277,10 @@ mod tests {
                 .unwrap_err()
                 .code(),
             ErrorCode::MalformedRequest,
-            "§3.4.7 defines no graph scoping, so `g` is simply not its parameter"
+            "sample defines no graph scoping, so `g` is simply not its parameter"
         );
 
-        // `labels` runs the other way: §3.5's modifier row is about responses
+        // `labels` runs the other way: it applies to responses
         // that carry rows, so a count does not take one.
         assert_eq!(
             fragment("labels=true").unwrap_err().code(),
@@ -3307,7 +3302,7 @@ mod tests {
 
         // And an object filter belongs to the two operations that take a
         // pattern *and* report on objects. `o.text` is answered rather than
-        // refused — §3.4.4 defines counts for text constraints, so `/count`
+        // refused: `/count` supports text constraints, so it
         // accepts the filter even though other operations do not.
         assert!(Count::parse(&params("o.text=atrazine"), limits(), &prefixes(), &bundle()).is_ok());
         assert_eq!(
@@ -3320,7 +3315,7 @@ mod tests {
             .unwrap_err()
             .code(),
             ErrorCode::MalformedRequest,
-            "§3.4.6 takes a resource, not a pattern"
+            "describe takes a resource, not a pattern"
         );
     }
 
@@ -3330,7 +3325,7 @@ mod tests {
         assert_eq!(fragment("limit=1").unwrap().limit, 1);
         assert_eq!(fragment("limit=10000").unwrap().limit, 10_000);
         // And the one composite budget a page has to carry with it, since
-        // nothing a cap can express bounds it (§3.5).
+        // nothing a cap can express bounds it.
         assert_eq!(
             fragment("").unwrap().bytes,
             ResponseBytes(BUDGETS.max_response_bytes)
@@ -3760,7 +3755,7 @@ mod tests {
         assert_eq!(
             parse("n=1001").unwrap_err().code(),
             ErrorCode::CapExceeded,
-            "§3.5 caps a sample at 1000 members"
+            "a sample is capped at 1000 members"
         );
         assert_eq!(
             parse("seed=x").unwrap_err().code(),

@@ -1,5 +1,5 @@
 # The golden-bundle tests are differential: hdtc builds the fixtures and
-# `hdtc search` answers them independently (doc 20 §20.9). That only means
+# `hdtc search` answers them independently. That only means
 # anything if the hdtc under test is the current one, so CI checks out the
 # sibling repo and builds it here rather than trusting a developer's stale
 # `../hdtc/target`. The layout matches what `Cargo.toml`'s `path = "../hdtc"`

@@ -5,7 +5,7 @@
 //! `ArrayY`/`BitmapY` hold each subject's predicates, `ArrayZ`/`BitmapZ` hold
 //! each (subject, predicate) group's objects, sorted within every group.
 //!
-//! POS and OPS in `data.hdt.perm` have exactly this shape (doc 20 §20.2), which
+//! POS and OPS in `data.hdt.perm` have exactly this shape, which
 //! is why [`BitmapTriples`] serves all three and [`crate::perm`] only supplies
 //! the differently-sourced views. What is *not* shared is the framing: sections
 //! here carry preambles and sit at unaligned offsets, so they are located by
@@ -159,7 +159,7 @@ impl HdtLayout {
     /// Walk a mapped HDT and record where everything is.
     ///
     /// Preambles only: **no payload byte is read**, which keeps this part of
-    /// opening independent of the HDT's size (doc 20 §20.1). The walk itself is
+    /// opening independent of the HDT's size. The walk itself is
     /// hdtc's — one implementation of "where is `BitmapY`" for the builder and
     /// every reader — and this adds what a mapped reader needs on top: each
     /// located region becomes a spec validated against `mapping`, so a file that
@@ -172,7 +172,7 @@ impl HdtLayout {
 
         // Trailing bytes mean this is not the file its own headers describe —
         // most likely a different artifact under the name, since a published
-        // bundle version is immutable (doc 04 §4.6).
+        // bundle version is immutable.
         let file_len = mapping.as_bytes().len() as u64;
         if sections.end() != file_len {
             return Err(malformed(

@@ -1,4 +1,4 @@
-//! Reading and writing the URLs of doc 03 §3.2's space.
+//! Reading and writing the KGF URL space.
 //!
 //! Separate from the router because both directions have callers that are not
 //! the router: [`crate::html`] writes links into pages, and unit 14's
@@ -64,8 +64,8 @@ pub fn dataset(name: &str) -> String {
 
 /// A request's query parameters, each appearing at most once.
 ///
-/// Doc 03 §3.6.1 makes "a parameter is missing, **repeated**, or unparseable" a
-/// `malformed_request`, and this is where repetition is caught. It has to be
+/// A missing, repeated, or unparseable parameter is a `malformed_request`, and
+/// this is where repetition is caught. It has to be
 /// caught: the alternative is a rule about which of `?limit=10&limit=99999`
 /// wins, which differs between the server, an intermediary, and the client's
 /// own URL builder — so a request that looks capped to one of them is
@@ -151,8 +151,7 @@ impl Params {
     ///
     /// **Normalized**: names are sorted and every value is escaped by the same
     /// rule, so two requests that differ only in parameter order produce one
-    /// URL. Doc 03 §3.6 asks for exactly that — "normalized parameter ordering
-    /// documented so caches hit" — and a next-page link is where this server
+    /// URL. This normalization ensures caches hit, and a next-page link is where this server
     /// gets to choose the spelling.
     pub fn to_query(&self) -> String {
         self.0
@@ -191,8 +190,8 @@ fn malformed(pair: &str) -> Problem {
 pub fn decode_component(text: &str) -> Option<String> {
     // The `+`-for-space convention of form encoding, applied before decoding so
     // that an escaped `%2B` stays a plus. HTML forms produce it, so a browser's
-    // address bar can, and doc 03 §3.3 lists `+` among the characters a term
-    // must escape — which is only necessary if a bare one means something else.
+    // address bar can. A literal plus in a term must be escaped because a bare
+    // one means a space in this encoding.
     let text = if text.contains('+') {
         std::borrow::Cow::Owned(text.replace('+', " "))
     } else {
@@ -237,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn the_url_space_is_doc_03_s() {
+    fn the_url_space_uses_the_expected_routes() {
         assert_eq!(dataset("tox"), "/tox");
         assert_eq!(bundle_base("tox", "2026-06-01"), "/tox/v/2026-06-01/");
         assert_eq!(

@@ -10,9 +10,9 @@
 //! Everything structural comes from the bundle: counts from
 //! [`kgf_store::BundleFacts`], capabilities from which sidecars are
 //! present, sizes and checksums from the files, and `content_digest` from those
-//! checksums. Those are the fields that cannot be written by hand correctly, and
-//! the ones that rot silently when artifacts are rebuilt — doc 03 §3.4.10 makes
-//! the counts load-bearing, since the VoID document's numbers must equal
+//! checksums. Those are the fields that cannot be written by hand correctly and
+//! the ones that rot silently when artifacts are rebuilt. The counts are
+//! load-bearing because the VoID document's numbers must equal
 //! `/count` results.
 //!
 //! What is asked for is identity and description: `--id`, `--version`, prefixes,
@@ -348,7 +348,7 @@ struct BundleInspection {
 /// command over a directory the operator named, holding the mappings only for
 /// the duration of this call and writing nothing but `manifest.json`, which is
 /// not among the mapped artifacts. Establishing that obligation explicitly is
-/// what the capability exists for (doc 20 §20.9); the rest of this crate keeps
+/// what the capability exists for; the rest of this crate keeps
 /// `unsafe` denied.
 #[allow(unsafe_code)]
 fn inspect_bundle(dir: &Path) -> Result<BundleInspection> {
@@ -361,7 +361,7 @@ fn inspect_bundle(dir: &Path) -> Result<BundleInspection> {
 /// in cardinality.
 ///
 /// `Manifest::verify_against` compares counts, which is all the read layer can
-/// afford — full digests are off the open path by design (doc 20 §20.6). But
+/// afford; full digests are off the open path by design. But
 /// counts are a weak witness for a rebuild: editing one literal leaves all four
 /// unchanged and rewrites every artifact, so a counts-only check passes a
 /// manifest whose `content_digest` is stale. That digest is a version's
@@ -417,15 +417,15 @@ fn verify_described_artifacts(manifest: &Manifest, dir: &Path, facts: &BundleFac
                 actual.sha256,
             );
         }
-        // Doc 17 §17.4: "the manifest mirrors the header, it never overrides
-        // it." Checksums alone cannot enforce that — the file can be intact
+        // The manifest mirrors the header; it never overrides it. Checksums
+        // alone cannot enforce that: the file can be intact
         // while the manifest misreports its convention, role, or key count, and
-        // §17.4 makes that the value a registry verifies on ingest.
+        // registries must verify those values on ingest.
         if recorded.keys != actual.keys {
             bail!(
                 "manifest {} misdescribes {name}: it records {:?}, but the file's own \
                  header says {:?}. The manifest mirrors the header and never overrides \
-                 it (doc 17 §17.4); regenerate it with `{remedy}`",
+                 it; regenerate it with `{remedy}`",
                 manifest_path(dir).display(),
                 recorded.keys,
                 actual.keys,
@@ -620,10 +620,10 @@ fn publisher(requested: &Requested, previous: Option<&Manifest>) -> Option<Publi
 
 /// Prefixes every bundle declares unless it says otherwise.
 ///
-/// Doc 03 §3.3 makes a CURIE resolvable only against a declared prefix, and an
-/// undeclared one an error — so a bundle declaring nothing accepts no CURIE at
-/// all, and even §3.4's own examples (`p=rdfs:label`, `o.ge="100.0"^^xsd:double`)
-/// fail against it. These four are not a guess about the data: they are fixed by
+/// A CURIE resolves only against a declared prefix, and an undeclared one is an
+/// error. A bundle declaring nothing would therefore accept no CURIE at all,
+/// including common requests such as `p=rdfs:label` and
+/// `o.ge="100.0"^^xsd:double`. These four are not a guess about the data: they are fixed by
 /// the W3C specs that define RDF itself, so declaring them asserts nothing about
 /// the dataset that is not already true everywhere.
 ///
@@ -666,8 +666,8 @@ fn prefixes(
 /// here rather than at open. Every other sidecar carries cheap source metadata,
 /// so `Store::open` rejects a foreign one for the price of a header read; a
 /// text index records only a SHA-256 over the HDT payload, and verifying that
-/// is a pass over the whole file — exactly the work doc 20 §20.3 keeps off the
-/// open path. So the server trusts a described bundle, and this is where a
+/// is a pass over the whole file, which must stay off the open path. So the
+/// server trusts a described bundle, and this is where a
 /// bundle becomes described.
 ///
 /// The failure it prevents is the quiet kind: a hit is an object dictionary id,
@@ -690,8 +690,8 @@ fn verify_text_binding(dir: &Path) -> Result<()> {
 /// Size and SHA-256 every artifact the bundle declares.
 ///
 /// The one place in KGF that reads whole artifacts. That is why it is here and
-/// not in `kgf-store`: full digests belong to publish and `kgf verify`, never to
-/// the latency-sensitive open path (doc 20 §20.6).
+/// not in `kgf-store`: full digests belong to publication and `kgf verify`,
+/// never to the latency-sensitive open path.
 fn checksum_artifacts(dir: &Path, facts: &BundleFacts) -> Result<Vec<(String, ArtifactEntry)>> {
     // Computed at most once, and only if a key artifact needs it. Seven
     // sidecars would otherwise rescan the same HDT seven times for one answer —
@@ -731,7 +731,7 @@ fn checksum_artifacts(dir: &Path, facts: &BundleFacts) -> Result<Vec<(String, Ar
 /// hdtc's role vocabulary, as the manifest spells it.
 ///
 /// A total match rather than a string round trip: hdtc's `terms` role has no
-/// KGF spelling (doc 18 §18.4 excludes it from the profile), and this is where
+/// KGF spelling because it is outside the bundle profile, and this is where
 /// that shows up as a refusal rather than as an unexpected value in a
 /// published manifest.
 fn key_role(role: hdtc::format::KeyRole, path: &Path) -> Result<KeyRole> {
@@ -743,8 +743,7 @@ fn key_role(role: hdtc::format::KeyRole, path: &Path) -> Result<KeyRole> {
         hdtc::format::KeyRole::SubjectsOnly => KeyRole::SubjectsOnly,
         hdtc::format::KeyRole::ObjectsOnly => KeyRole::ObjectsOnly,
         other => bail!(
-            "{} declares role {other:?}, which is not one the KGF profile publishes \
-             (doc 18 §18.4)",
+            "{} declares role {other:?}, which is not one the KGF profile publishes",
             path.display()
         ),
     })
@@ -764,21 +763,21 @@ fn describe_key_artifact(
             .with_context(|| format!("reading the sketch header of {}", path.display()))?;
         verify_role_matches_name(name, path, header.role.file_stem())?;
         verify_binding(path, &header.source_digest, identity)?;
-        // Doc 17 §17.4 wants the structure and its shaping parameter — `k` for
-        // a sketch, `variant` for a filter — so a registry can judge
+        // Record the structure and its shaping parameter — `k` for a sketch,
+        // `variant` for a filter — so a registry can judge
         // compatibility from the manifest without fetching the artifact.
         let (structure, variant, k) = match header.body {
             hdtc::format::SketchBody::Filter { variant, .. } => {
                 (KeyStructure::Fuse, Some(variant), None)
             }
             hdtc::format::SketchBody::MinHash { k, .. } => (KeyStructure::Minhash, None, Some(k)),
-            // `SketchBody` is non-exhaustive, and §17.4 requires the structure
-            // and its parameter in the entry. A structure this build cannot
+            // `SketchBody` is non-exhaustive, and the manifest entry requires
+            // the structure and its parameter. A structure this build cannot
             // name is one it cannot describe, so it refuses rather than
             // publishing an entry that omits what a registry verifies.
             _ => bail!(
                 "{} carries a sketch structure this build does not recognize, so it \
-                 cannot be described as doc 17 §17.4 requires; build the bundle with \
+                 cannot be described completely; build the bundle with \
                  an hdtc this kgf was released against",
                 path.display()
             ),
@@ -848,15 +847,15 @@ fn hdt_data_digest(hdt: &Path) -> Result<[u8; 32]> {
 
 /// A key artifact must be bound to *this* bundle's HDT.
 ///
-/// The formats call `source_digest` advisory, and for a *consumer* it is: doc 18
-/// §4.1 forbids letting it gate comparability, because a rebuild changes the
+/// The formats call `source_digest` advisory, and for a *consumer* it is:
+/// letting it gate comparability would be wrong because a rebuild changes the
 /// digest without changing what the keys mean. A producer describing its own
 /// bundle is the opposite case — here a mismatch says this file was built from
 /// different bytes than the ones beside it, which is precisely the staleness
 /// the digest exists to detect, and the same rule `verify_text_binding` applies
 /// to the text index.
 ///
-/// This is the content check the doc 18 §18.4 count identity cannot make. That
+/// This is the content check the cross-family count identity cannot make. That
 /// identity compares totals, so a file swapped for another bundle's passes
 /// whenever the numbers happen to agree — which two of this repo's own fixtures
 /// do.
@@ -893,23 +892,23 @@ fn verify_role_matches_name(name: &str, path: &Path, role: &str) -> Result<()> {
     Ok(())
 }
 
-/// Doc 18 §18.4's cross-family identity, checked before a bundle is described.
+/// The cross-family count identity, checked before a bundle is described.
 ///
 /// `shared + subjects-only` must equal the `subjects` filter's `key_count`, and
 /// `shared + objects-only` the `objects` one. `hdtc sketch` and `hdtc keyset`
 /// derive those counts independently from the same dictionary, so a
 /// disagreement means one artifact is wrong.
 ///
-/// This is the check that earns its place: doc 18 records a build on 2026-07-30
-/// in which concurrent `hdtc` processes sharing one temp directory produced key
+/// This check caught a real failure on 2026-07-30: concurrent `hdtc` processes
+/// sharing one temp directory produced key
 /// sets that were structurally perfect — correct CRC32C, correct
 /// `source_digest`, strictly ascending keys — and held **another graph's keys**.
 /// Every format-level check passed. Only this one caught it, and a manifest
 /// written over those bytes would have published an overlap that does not exist.
 ///
 /// Skipped, not failed, when a bundle carries only part of the decomposition:
-/// doc 18 §18.4 says a missing role file is absent information, never an empty
-/// role, so there is nothing to compare rather than a mismatch to report.
+/// a missing role file is absent information, never an empty role, so there is
+/// nothing to compare rather than a mismatch to report.
 fn verify_key_decomposition(dir: &Path, entries: &[(String, ArtifactEntry)]) -> Result<()> {
     let count = |name: &str| -> Option<u64> {
         entries
@@ -939,7 +938,7 @@ fn verify_key_decomposition(dir: &Path, entries: &[(String, ArtifactEntry)]) -> 
             "{}: keysets/shared.keys ({shared}) + keysets/{only}.keys ({directional}) \
              is {decomposed}, but {filter} counts {whole} keys. hdtc derives these \
              independently from one dictionary, so one artifact is wrong — rebuild \
-             them, giving each hdtc invocation its own --temp-dir (doc 18 §18.4)",
+             them, giving each hdtc invocation its own --temp-dir",
             dir.display()
         );
     }
@@ -1069,7 +1068,7 @@ fn carry_artifact_metadata(
     Ok(())
 }
 
-/// Size and digest a directory artifact as one entry (doc 04 §4.3).
+/// Size and digest a directory artifact as one manifest entry.
 ///
 /// `data.hdt.text` is the only one, and it is a directory because its bytes are
 /// Tantivy's. The digest is the same preimage `content_digest` is built from —
@@ -1149,7 +1148,7 @@ fn sha256_file(path: &Path) -> Result<(u64, String)> {
     Ok((bytes, hex(&hasher.finalize())))
 }
 
-/// Compute the bundle content digest over its artifact entries (doc 04 §4.3).
+/// Compute the bundle content digest over its artifact entries.
 pub fn content_digest<'a>(
     artifacts: impl IntoIterator<Item = (&'a str, &'a ArtifactEntry)>,
 ) -> String {
@@ -1247,13 +1246,13 @@ mod tests {
         requested(bindings, &[])
     }
 
-    /// The doc 18 §18.4 identity, exercised directly.
+    /// The cross-family count identity, exercised directly.
     ///
     /// Unit rather than end-to-end because the `source_digest` binding now
     /// refuses a foreign key set before the counts are ever compared, which
     /// leaves this check guarding a narrower case: artifacts that do belong to
-    /// this HDT and still disagree — an hdtc bug, or the concurrent-temp-dir
-    /// corruption doc 18 §18.4 records. That case cannot be staged by copying
+    /// this HDT and still disagree — an hdtc bug or the known
+    /// concurrent-temp-directory corruption. That case cannot be staged by copying
     /// files around, so it is staged here.
     #[test]
     fn the_key_decomposition_identity_is_checked_both_ways() {
@@ -1298,8 +1297,8 @@ mod tests {
             .expect_err("an objects-side disagreement must be refused");
         assert!(format!("{objects_wrong:#}").contains("objects-only"));
 
-        // A missing role is absent information, never an empty role
-        // (doc 18 §18.4), so there is nothing to compare rather than a
+        // A missing role is absent information, never an empty role, so there
+        // is nothing to compare rather than a
         // mismatch to report.
         let partial = vec![("filters/subjects.filter".to_owned(), entry(9))];
         assert!(verify_key_decomposition(dir, &partial).is_ok());
@@ -1456,7 +1455,7 @@ mod tests {
     #[test]
     fn the_well_known_prefixes_are_declared_and_overridable() {
         // Without these a freshly described bundle accepts no CURIE at all,
-        // since doc 03 §3.3 resolves one only against a declared prefix.
+        // because resolution requires a declared prefix.
         let fresh = prefixes(&args(&[]), None).unwrap();
         assert_eq!(
             fresh.get("xsd").map(String::as_str),

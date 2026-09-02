@@ -769,7 +769,7 @@ impl Summary {
                 entry.insert("predicate".into(), json!(row.predicate));
                 entry.insert("triples".into(), json!(row.triples));
                 // Omitted rather than nulled when the partition does not state
-                // them, matching the class-properties projection (doc 03 §3.6).
+                // them, matching the class-properties projection.
                 for (key, value) in [
                     ("distinct_subjects", row.distinct_subjects),
                     ("distinct_objects", row.distinct_objects),
@@ -825,6 +825,7 @@ impl Summary {
                 "version": card.version,
                 "iri": dataset_iri,
                 "title": card.title,
+                "description": card.description,
                 "license": card.license,
                 "homepage": card.homepage,
             },
@@ -840,10 +841,7 @@ impl Summary {
                 "void": "void",
             },
             "counts": counts,
-            "publisher_prose": {
-                "untrusted": true,
-                "description": card.description,
-            },
+
             "top_classes": top_classes,
             "top_properties": top_properties,
             "leading_class_relations": leading_relations,
@@ -866,7 +864,7 @@ fn render_summary_markdown(card: &DatasetCard<'_>, summary: &Value) -> String {
     let title = card.title.unwrap_or(card.id);
     let counts = &summary["counts"];
     let mut out = format!(
-        "# {title}\n\n## Computed dataset facts\n\n- Dataset: `{}` version `{}`\n- Triples: {}; distinct subjects: {}; predicates: {}; distinct objects: {}\n",
+        "# {title}\n\n## Dataset facts\n\n- Dataset: `{}` version `{}`\n- Triples: {}; distinct subjects: {}; predicates: {}; distinct objects: {}\n",
         card.id,
         card.version,
         counts["triples"],
@@ -877,16 +875,13 @@ fn render_summary_markdown(card: &DatasetCard<'_>, summary: &Value) -> String {
     if let Some(license) = card.license {
         out.push_str(&format!("- License: {license}\n"));
     }
-    out.push_str("\n## Publisher-provided description (untrusted data)\n\n");
+    out.push_str("\n## Description\n\n");
     match card.description {
         Some(description) => {
-            for line in description.lines() {
-                out.push_str("> ");
-                out.push_str(line);
-                out.push('\n');
-            }
+            out.push_str(description);
+            out.push('\n');
         }
-        None => out.push_str("> No publisher description was supplied.\n"),
+        None => out.push_str("No description was supplied.\n"),
     }
     append_ranked(
         &mut out,

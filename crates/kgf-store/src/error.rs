@@ -1,7 +1,7 @@
 //! Store errors.
 //!
 //! The distinction that matters here is between *this bundle is not servable*
-//! and *this request cannot be answered*. Doc 20 §20.8 makes the first case
+//! and *this request cannot be answered*. The first case
 //! loud: a bundle missing a required artifact is refused at open with a message
 //! naming what to build, because there is no degraded mode to fall into.
 
@@ -15,7 +15,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// A required artifact is absent. There is no fallback: the bundle is not
-    /// servable until it is built (doc 04 §4.1, doc 20 §20.8).
+    /// servable until it is built.
     #[error("bundle {bundle} is missing required artifact {artifact}; build it with `{remedy}`")]
     MissingRequiredArtifact {
         /// The bundle directory.
@@ -104,7 +104,7 @@ pub enum Error {
         source: Arc<Error>,
     },
 
-    /// A manifest is not JSON, or not the shape doc 04 §4.3 fixes.
+    /// A manifest is not JSON or does not have the required schema.
     #[error("manifest {path} is not a readable bundle manifest: {detail}")]
     ManifestSyntax {
         /// The manifest file.
@@ -162,7 +162,7 @@ impl Error {
     /// Whether this failure could resolve on its own, without the bundle
     /// changing.
     ///
-    /// A published version is immutable (doc 04 §4.6), so a failure about the
+    /// A published version is immutable, so a failure about the
     /// *bytes* — a truncated sidecar, a header that disagrees with its own file
     /// — can never heal; a caller that caches failures should keep it until the
     /// entry is evicted. A failure about this process's ability to read at all

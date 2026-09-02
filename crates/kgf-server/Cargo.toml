@@ -1,6 +1,6 @@
 [package]
 name = "kgf-server"
-description = "The KGF HTTP API over kgf-store (KGF doc 03)"
+description = "The KGF HTTP API over kgf-store"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,8 @@ repository.workspace = true
 [dependencies]
 kgf-store.workspace = true
 # `hdtc::format::{encode_literal, parse_literal}`: how a term is spelled once it
-# is in the dictionary. Resolving a request term to an id happens here, at the
-# boundary doc 20 §20.5 names, so this is where that spelling has to be right —
+# is in the dictionary. Resolving a request term to an id happens at this
+# boundary, so this is where that spelling has to be right —
 # and getting it wrong loses rows silently rather than failing.
 hdtc.workspace = true
 anyhow.workspace = true
@@ -46,5 +46,5 @@ headers-accept = "0.3"
 # crate choose a shipped dependency's version is the tail wagging the dog.
 mediatype_021 = { package = "mediatype", version = "0.21" }
 # The hdtc-built golden bundles, so cursor resumption is checked against real
-# enumerations rather than a hand-written stand-in (doc 20 §20.9).
+# enumerations rather than a hand-written stand-in.
 kgf-store = { workspace = true, features = ["testing"] }

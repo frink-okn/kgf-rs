@@ -724,7 +724,7 @@ impl DescriptionStore {
 
     /// Exact published bytes of `stats/summary.json`.
     ///
-    /// Doc 04 does not yet fix a field schema for this document, so the store
+    /// The summary document has no fixed field schema, so the store
     /// preserves it rather than parsing and reserializing it. Publication
     /// verification requires a JSON object.
     pub fn summary_json(&self) -> &[u8] {

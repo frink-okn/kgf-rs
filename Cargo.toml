@@ -14,7 +14,7 @@ kgf-store = { path = "crates/kgf-store" }
 kgf-server = { path = "crates/kgf-server" }
 
 # hdtc owns every byte format a bundle contains; `hdtc::format` is the curated
-# surface we depend on (KGF doc 20 §20.4). A path dependency on the sibling
+# surface we depend on. A path dependency on the sibling
 # checkout while both move together; pinned to a git rev at release.
 hdtc = { path = "../hdtc" }
 
@@ -37,8 +37,8 @@ oxrdfio = "0.2"
 spargebra = "0.4"
 tempfile = "3"
 
-# The HTTP stack (unit 13). axum is doc 20 §20.4's suggestion and survives the
-# QUERY support: hyper parses the extension method and axum routes it through
+# The HTTP stack supports QUERY: hyper parses the extension method and axum
+# routes it through
 # the custom-method fallback used by the body-carrying operations.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "original-uri"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros", "sync", "time"] }
@@ -47,8 +47,8 @@ tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
 # and Cache-Control. Already in axum's tree through axum-extra.
 headers = "0.4"
 axum-extra = { version = "0.10", default-features = false, features = ["typed-header"] }
-# Already in axum's tree; named directly because this crate uses them for the
-# two things doc 03 leaves to RFC 3986 and RFC 9110 — percent-encoding, and
+# Already in axum's tree; named directly because this crate uses them for
+# percent-encoding and
 # parsing the media ranges in an `Accept` header.
 # `mediatype` and not `mime`: `mime` rejects the optional whitespace RFC 9110
 # §5.6.3 allows around a parameter's `;`, which silently drops a legal media
@@ -69,4 +69,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [profile.release]
 lto = true
 codegen-units = 1
-debug = 1          # keep frames: every latency number in doc 07 §7.2 comes from a profile
+debug = 1          # keep frames so latency profiles remain actionable

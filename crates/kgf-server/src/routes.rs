@@ -1,4 +1,4 @@
-//! Doc 03 §3.2's URL space, mounted.
+//! The KGF URL space, mounted.
 //!
 //! The thin adapter: every rule it applies is decided in a module that does not
 //! know what HTTP is — [`crate::service`] resolves a URL to a release,
@@ -62,14 +62,14 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/", read(get(service_descriptor)))
         .route("/{dataset}", read(get(dataset_descriptor)))
         // Method-preserving by construction: `any` hands every method to the
-        // same handler, which answers 307 (§3.2). A router that matched only
+        // same handler, which answers 307. A router that matched only
         // GET here would answer a QUERY with 405 and hide the redirect.
         .route("/{dataset}/latest/{*rest}", any(latest_redirect))
         .route(
             "/{dataset}/v/{version}/manifest",
             read(get(bundle_manifest)),
         )
-        // §3.4's read operations. Bindings use QUERY canonically and POST as a
+        // Read operations. Bindings use QUERY canonically and POST as a
         // compatibility fallback on `/fragment` and `/count`.
         .route(
             "/{dataset}/v/{version}/fragment",
@@ -112,7 +112,7 @@ pub fn router(service: Arc<Service>) -> Router {
         .layer(RequestBodyLimitLayer::new(body_limit))
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(middleware::from_fn(render_problems))
-        // §3.6: permissive, because the data is public and browser and WASM
+        // Permissive CORS, because the data is public and browser and WASM
         // clients are a target. `QUERY` is listed explicitly — a preflight that
         // omitted it would leave the canonical method unusable from a browser.
         .layer(
@@ -134,7 +134,7 @@ fn query_method() -> Method {
 /// Mount a read-only route: the given methods, and a coded 405 for the rest.
 ///
 /// axum supplies the `Allow` header for a method fallback, so what is added
-/// here is the problem document — §3.6.1 says *every* error response carries a
+/// here is the problem document: *every* error response carries a
 /// code, and an empty 405 body is the one an off-the-shelf router gives away.
 fn read(method_router: MethodRouter<Arc<Service>>) -> MethodRouter<Arc<Service>> {
     method_router.fallback(method_not_allowed)
@@ -265,7 +265,7 @@ async fn bundle_manifest(
 }
 
 // ---------------------------------------------------------------------------
-// The §3.4 operations
+// Operations
 // ---------------------------------------------------------------------------
 
 async fn fragment(
@@ -556,7 +556,7 @@ async fn sample(
         "sample",
         wants,
         |params, limits, release, _representation| {
-            // §3.4.7 is an optional capability, so a bundle that does not
+            // Sampling is optional, so a bundle that does not
             // declare one is refused rather than served from artifacts it
             // never promised — and refused *here*, before the open, because
             // the manifest is already in memory.
@@ -750,7 +750,7 @@ async fn labels_operation(
 /// Refuse `o.text` against a bundle that publishes no text index.
 ///
 /// The same gate `/sample` gets, and in the same place: before the open, off
-/// the manifest already in memory. §3.6.1 codes it 501 because the request is
+/// the manifest already in memory. It is coded 501 because the request is
 /// well formed and the identical one against a bundle declaring `search`
 /// succeeds — the shortfall is what this bundle carries.
 fn declares_search(release: &Release, wanted: bool) -> Result<(), Problem> {
@@ -763,7 +763,7 @@ fn declares_search(release: &Release, wanted: bool) -> Result<(), Problem> {
     Ok(())
 }
 
-/// The shape every §3.4 operation has.
+/// The shape every operation has.
 ///
 /// Read in order, because the order is the decision: negotiate, resolve the
 /// version, read the parameters, evaluate the precondition, and only then open
@@ -828,8 +828,8 @@ where
     let request = parse(&params, service.config().limits(), release, representation)?;
     let work_class = request.work_class();
 
-    // A versioned operation is a deterministic function of immutable bytes
-    // (doc 04 §4.6), so the URL and the representation fix the response
+    // A versioned operation is a deterministic function of immutable bytes,
+    // so the URL and the representation fix the response
     // exactly — which is what makes a strong validator honest here and not
     // only on `/manifest`.
     let validator = etag(
@@ -858,8 +858,8 @@ where
     let opened = Arc::clone(&service);
     let rendered = blocking(&service, work_class, move || {
         let store = opened.open(target.id())?;
-        // Serialized in here, not outside: doc 20 §20.5 materializes strings
-        // only while writing them, and the term cache that makes that cheap is
+        // Serialized in here, not outside: strings are materialized only while
+        // writing them, and the term cache that makes that cheap is
         // deliberately not `Send`.
         let mut answer = execute(&store, target, &request)?;
         labels.hydrate(&store, &mut answer)?;
@@ -1082,8 +1082,8 @@ async fn latest_redirect(
     };
 
     // 307, not 308: `latest` moves, and a permanent redirect invites a client
-    // to remember it. §3.2 requires one of the two that preserve the method —
-    // a 302 may be rewritten to GET by intermediaries, which would silently
+    // to remember it. The redirect must preserve the method; a 302 may be
+    // rewritten to GET by intermediaries, which would silently
     // turn a body-carrying QUERY into something else.
     let mut response = Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
@@ -1110,8 +1110,8 @@ fn unreachable_route(path: &str) -> Problem {
 /// `axum::extract::Path` rejects with its own plain-text 400, which is
 /// reachable from a URL as ordinary as `/%FF`: a segment that is not UTF-8 once
 /// decoded. That response has no `code`, no `Vary`, and is never a page, so it
-/// is the one hole in §3.6.1's "every error response carries a code" — and one
-/// this crate argued into the spec. Wrapping the extractor closes it.
+/// would violate the rule that every error response carries a code. Wrapping
+/// the extractor closes it.
 struct Path<T>(T);
 
 impl<S, T> FromRequestParts<S> for Path<T>
@@ -1311,9 +1311,9 @@ fn respond(
 
 /// Serve a body an operation already rendered.
 ///
-/// Separate from [`respond`] because the §3.4 operations serialize inside the
-/// blocking task rather than handing back a [`Resource`] — and because they are
-/// the only responses that carry §3.6's completeness metadata.
+/// Separate from [`respond`] because operations serialize inside the blocking
+/// task rather than handing back a [`Resource`] and because they are the only
+/// responses that carry completeness metadata.
 fn respond_rendered(
     rendered: Rendered,
     representation: Representation,
@@ -1327,13 +1327,13 @@ fn respond_rendered(
         cache,
         Some(validator),
     )?;
-    // §3.6 requires the same metadata on the headers as in the body, so that a
+    // The same metadata appears in headers and the body so that a
     // serialization whose body has nowhere to put it still carries it, and so
     // an intermediary can read it without parsing a response.
     let headers = response.headers_mut();
     for (name, value) in rendered.completeness.headers() {
         headers.insert(
-            HeaderName::from_bytes(name.as_bytes()).expect("§3.6's field names are field names"),
+            HeaderName::from_bytes(name.as_bytes()).expect("completeness field names are valid"),
             header(value)?,
         );
     }
@@ -1371,7 +1371,7 @@ fn finish(
         );
     }
     headers.typed_insert(cache.header());
-    // §3.6: one URL serves many formats, so a cache that ignored `Accept` would
+    // One URL serves many formats, so a cache that ignored `Accept` would
     // hand a page to an agent. Always, including on responses with no `ETag`.
     headers.insert(VARY, HeaderValue::from_static("Accept"));
     if let Some(etag) = etag {
@@ -1421,7 +1421,7 @@ impl IntoResponse for Problem {
 /// [`Problem`] a handler or an extractor raised arrives as an empty response
 /// carrying itself, and is rendered here. But a `tower` layer can answer
 /// *before* any of this crate's code runs — the body limit below does — and
-/// §3.6.1 says every error response carries a code, including those. So an
+/// Every error response carries a code, including those. So an
 /// error that arrives unattributed is given a problem from its status rather
 /// than shipped as whatever the layer produced.
 async fn render_problems(request: Request, next: Next) -> Response {
@@ -1484,7 +1484,7 @@ fn advertises_query(path: &str) -> bool {
 /// `None` for a success, and for a status this crate cannot attribute — 400 in
 /// particular, which five codes share, so guessing would tell a client the
 /// wrong thing to fix. Anything unattributable is logged, because it means a
-/// layer is answering in a shape §3.6.1 does not cover.
+/// layer is answering in a shape the normal problem mapping does not cover.
 fn unattributed_error(response: &Response) -> Option<Problem> {
     let status = response.status();
     if !status.is_client_error() && !status.is_server_error() {
@@ -1508,7 +1508,7 @@ fn unattributed_error(response: &Response) -> Option<Problem> {
 // The blocking boundary
 // ---------------------------------------------------------------------------
 
-/// Run store work on the blocking pool (doc 20 §20.4).
+/// Run store work on the blocking pool.
 ///
 /// A cold read of a mapped bundle faults pages, and a page fault stalls the
 /// thread it happens on. On the async reactor that is not one slow request but
@@ -1553,7 +1553,7 @@ mod tests {
     #[test]
     fn the_query_method_is_a_method() {
         // If this ever stops holding, RFC 10008 is not expressible on this
-        // stack and the choice of stack has to be revisited (doc 03 §3.1).
+        // stack and the choice of stack has to be revisited.
         assert_eq!(query_method().as_str(), "QUERY");
         assert!(!query_method().is_safe() || query_method().is_idempotent());
     }

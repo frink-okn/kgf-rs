@@ -1,5 +1,4 @@
-//! What the server sends back: doc 03 §3.4's read operations, executed and
-//! rendered.
+//! What the server sends back: read operations, executed and rendered.
 //!
 //! Each is thin, because units 10–13 did the work: parse terms to ids, resolve
 //! a [`Selection`], page it, serialize. What is left here is the part that
@@ -9,11 +8,11 @@
 //!
 //! # Strings are materialized while serializing, and nowhere else
 //!
-//! Doc 20 §20.5's rule has a consequence for the blocking boundary: the whole
+//! Keeping strings at the serialization edge has a consequence for the blocking boundary: the whole
 //! of an operation, *including writing the response body*, runs inside the task
 //! that holds the [`Store`]. [`Answer`] holds `Rc<str>` handed out by the
 //! request's [`TermCache`], so it is deliberately not `Send`; what crosses back
-//! is [`Rendered`] — bytes, and the §3.6 metadata the headers repeat.
+//! is [`Rendered`] — bytes and the completeness metadata the headers repeat.
 //!
 //! Doing it the other way — returning rows of owned `String`s and serializing
 //! on the reactor — would allocate a string per term per row for no reason
@@ -208,7 +207,7 @@ impl Target {
         vec![
             Crumb::to(&self.id.dataset, url::dataset(&self.id.dataset)),
             // There is no landing page for a version, so the version step goes
-            // to the one document doc 03 §3.2 does define for it.
+            // to its manifest, the version's canonical descriptive document.
             Crumb::to(
                 &self.id.version,
                 url::operation(&self.id.dataset, &self.id.version, "manifest"),
@@ -274,7 +273,7 @@ fn query(base: String, params: &Params) -> String {
     }
 }
 
-/// A serialized response, and the metadata §3.6 requires on its headers.
+/// A serialized response and the metadata repeated on its headers.
 ///
 /// The pair is the reason this type exists: the body is produced inside the
 /// blocking task, and the headers are set outside it, so the completeness has
@@ -324,32 +323,31 @@ pub trait Renders {
 /// The key `/describe` reports an edge's side under.
 const DIRECTION: &str = "direction";
 
-/// The key a text-ranked row reports its relevance under (doc 03 §3.4.1).
+/// The key under which a text-ranked row reports its relevance.
 const SCORE: &str = "score";
 
-/// The key a text-ranked row reports *how* it matched under (doc 03 §3.4.5).
+/// The key under which a text-ranked row reports *how* it matched.
 const MATCH_KIND: &str = "match_kind";
 
-/// The input-row index carried by a bindings result (§3.4.2).
+/// The input-row index carried by a bindings result.
 const BINDING: &str = "binding";
 
-/// How a text hit matched, in §3.4.5's vocabulary.
+/// How a text hit matched, in the public response vocabulary.
 ///
 /// Emitted beside `score` because without it the score is misleading. hdtc
 /// ranks exact matches as a class ahead of stemmed ones and its BM25 figures
 /// are comparable only *within* a class, so a stemmed row can carry a higher
 /// number than the exact row above it — and a client that sorts a page by
-/// `score`, which doc 06 §6.2.1 tells it to do when merging endpoints, would
+/// `score` while merging endpoints would
 /// undo the ranking the server computed. With the class present, "by class,
 /// then rank" reproduces the order this server sent.
 ///
-/// The two vocabularies do not line up, and this reports §3.4.5's because that
-/// is the one clients branch on: it names `exact | normalized | prefix |
+/// The index and response vocabularies do not line up, so this reports the
+/// public one clients branch on: `exact | normalized | prefix |
 /// fuzzy`, while hdtc classifies a hit as exact or stemmed and treats prefix
 /// and fuzzy as query *modes* rather than per-hit outcomes. Stemming is a
-/// normalization, so `normalized` is the honest member of the published set —
-/// but it is wider than what is being said. See `notes/plan.md`, "Questions for
-/// `../kgf`".
+/// normalization, so `normalized` is the honest member of the published set,
+/// though it is wider than what is being said.
 fn match_kind(kind: hdtc::format::MatchKind) -> &'static str {
     match kind {
         hdtc::format::MatchKind::Exact => "exact",
@@ -381,7 +379,7 @@ pub struct Ranking {
 }
 
 impl Serialize for Row {
-    /// §3.4.1's row: one key per variable, each a term object.
+    /// One key per variable, each a term object.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         if let Some(binding) = self.binding {
@@ -529,7 +527,7 @@ enum Echo {
     },
 }
 
-/// A page of rows: doc 03 §3.4.1's envelope, shared by `/fragment`,
+/// A page of rows in the envelope shared by `/fragment`,
 /// `/describe` and `/sample`.
 #[derive(Debug, Clone, Serialize)]
 pub struct Answer {
@@ -541,12 +539,11 @@ pub struct Answer {
     /// Which bound parameters name terms this bundle's dictionary does not
     /// hold.
     ///
-    /// Not in doc 03, and worth having: an empty answer because a term is
-    /// absent and an empty answer because the pattern has no matches are the
+    /// This diagnostic distinguishes an empty answer caused by an absent term
+    /// from one caused by a pattern with no matches. They are the
     /// same response with very different remedies, and only the server can tell
-    /// them apart. Unit 11 promised this diagnostic when it decided *not* to
-    /// reject unusual IRIs at the edge. See `notes/plan.md`, "Questions for
-    /// `../kgf`".
+    /// them apart, so unusual but valid IRIs are accepted at the edge and
+    /// reported here if absent.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     absent_terms: Vec<&'static str>,
     vars: Vec<Position>,
@@ -576,9 +573,8 @@ pub struct Answer {
     /// being rendered as HTML — a reading affordance, never response data.
     ///
     /// Keyed by dictionary spelling. Empty for JSON, where a client hydrates
-    /// labels itself through `/labels` (and where a future `labels=true`
-    /// parameter would put them in the envelope — see `notes/plan.md`,
-    /// "Questions for `../kgf`").
+    /// labels itself through `/labels`; a future `labels=true` parameter would
+    /// put them in this same envelope field.
     #[serde(skip)]
     page_labels: HashMap<String, String>,
     /// The described term's dictionary spelling, so the page can resolve and
@@ -710,8 +706,7 @@ impl Answer {
     ///
     /// Worst case is `Z·(1 + log limit)` serialized bytes: one complete
     /// candidate document plus bounded complete-prefix probes. RDF fragments
-    /// are admitted as heavy work; doc 03's stale fragment cost rows are
-    /// tracked in `notes/plan.md` question 45.
+    /// are therefore admitted as heavy work.
     fn fit_fragment_rdf(&mut self, format: GraphFormat) -> Result<Bytes, Problem> {
         let body = self.fragment_rdf(format)?;
         if body.len() as u64 <= self.byte_budget || self.rows.len() <= 1 {
@@ -1042,13 +1037,13 @@ fn metadata_blank_node(stem: &str, used: &mut HashSet<String>) -> BlankNode {
     BlankNode::new(label).expect("the metadata blank-node stem is a valid RDF blank-node label")
 }
 
-/// `GET /count`'s envelope (§3.4.4).
+/// `GET /count`'s envelope.
 ///
-/// `count` is an object rather than §3.4.4's first example's bare integer, so
-/// that it is the same shape as §3.4.1's `cardinality` and the shape an
+/// `count` is an object rather than a bare integer so that it has the same
+/// shape as row-page `cardinality` and can represent an
 /// interrupted text count needs: `{"value": n, "exact": false, "min": n}`.
 /// One field with two shapes would be a client-breaking change waiting to
-/// happen. See `notes/plan.md`, "Questions for `../kgf`".
+/// happen.
 #[derive(Debug, Serialize)]
 pub struct CountAnswer {
     dataset: String,
@@ -1080,7 +1075,7 @@ struct PerBindingCount {
     count: Cardinality,
 }
 
-/// `QUERY|POST /count`'s per-binding response (§3.4.4).
+/// `QUERY|POST /count`'s per-binding response.
 #[derive(Debug, Serialize)]
 pub struct BindingCountAnswer {
     dataset: String,
@@ -2528,7 +2523,7 @@ fn rdf_text(bytes: &[u8]) -> Result<&str, Problem> {
 // ---------------------------------------------------------------------------
 
 /// `GET /schema` — one selected partition, one shallow edge, or the persisted
-/// flat class-relation projection (§3.4.10).
+/// flat class-relation projection.
 pub fn schema(
     store: &Store,
     target: Target,
@@ -3154,7 +3149,7 @@ fn with_optional_param(params: &Params, name: &str, value: Option<&str>) -> Para
     value.map_or_else(|| params.clone(), |value| params.with(name, value))
 }
 
-/// `GET /fragment` — enumerate a triple pattern (§3.4.1).
+/// `GET /fragment` — enumerate a triple pattern.
 pub fn get_fragment(
     store: &Store,
     target: Target,
@@ -3252,7 +3247,7 @@ fn searcher<'a>(store: &'a Store, target: &Target) -> Result<&'a TextSearcher, P
     })
 }
 
-/// `GET /count` — a pattern's cardinality (§3.4.4).
+/// `GET /count` — a pattern's cardinality.
 pub fn count(
     store: &Store,
     target: Target,
@@ -3271,7 +3266,7 @@ pub fn count(
     ) {
         // Exact and free of the enumeration: a range width after bounded
         // descent for seven shapes, and for `s ? o` the same bounded
-        // predicate-group probe the enumeration would run (doc 20 §20.2.1).
+        // predicate-group probe the enumeration would run.
         (Resolved::Ids(ids), None) => (
             Cardinality::exact(select(store, ids)?.count().value),
             Completeness::complete(),
@@ -3801,16 +3796,16 @@ fn text_count(
     ))
 }
 
-/// `GET /describe` — a resource's neighborhood (§3.4.6).
+/// `GET /describe` — a resource's neighborhood.
 ///
 /// Two enumerations behind one envelope, out-edges first, and a row says which
-/// it came from. That column is this crate's, not §3.4.6's, and it earns its
-/// place on the one triple the two halves share: `<a> p <a>` is genuinely an
+/// it came from. The column earns its place on the one triple the two halves
+/// share: `<a> p <a>` is genuinely an
 /// out-edge *and* an in-edge, so it appears twice, and without the column the
 /// second copy reads as a duplicate rather than as the other half of the
-/// answer. Deduplicating instead would cost an `s ? o` probe per request to
-/// keep `cardinality` equal to the enumerated length, which is a cost §3.5's
-/// "describe | 2 × fragment" does not budget for.
+/// answer. Deduplicating instead would cost an `s ? o` probe per request and
+/// exceed the operation's two-fragment cost bound just to keep `cardinality`
+/// equal to the enumerated length.
 pub fn describe(
     store: &Store,
     target: Target,
@@ -3887,7 +3882,7 @@ pub fn describe(
     Ok(answer)
 }
 
-/// `GET /sample` — pseudo-random members of a pattern's results (§3.4.7).
+/// `GET /sample` — pseudo-random members of a pattern's results.
 pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Result<Answer, Problem> {
     let dictionary = store.dict();
     let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
@@ -3941,7 +3936,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         // it returns unless the bundle's own literals spend the byte budget
         // first — and then it says so, because there is no cursor to offer and
         // returning fewer members while claiming completeness is the silent
-        // truncation §3.6 prohibits.
+        // truncation the protocol prohibits.
         completeness: match spent_at {
             None => Completeness::complete(),
             Some(_) => Completeness::budget_exhausted_without_resume(BudgetReason::ResponseBytes),
@@ -4068,8 +4063,8 @@ impl Step {
 /// whole number.
 ///
 /// Two fields rather than one, because a count taken under a budget is not the
-/// same claim as a count taken to the end: §3.4.1's `distinct_objects` is
-/// documented as *exact*, so a figure that stopped at the budget has to be
+/// same claim as a count taken to the end: `distinct_objects` is exact, so a
+/// figure that stopped at the budget has to be
 /// reported as a lower bound instead of quietly standing in for one.
 #[derive(Debug, Clone, Copy)]
 struct MatchingLiterals {
@@ -4101,15 +4096,15 @@ enum Spent {
 
 /// Enumerate a pattern whose object is constrained by a text query.
 ///
-/// The composition doc 19 §19.2.2 is built for: a hit is an object dictionary
-/// id, so each one becomes `IdPattern { .., object: Some(id) }` and resolves
+/// A text hit is an object dictionary id, so each one becomes
+/// `IdPattern { .., object: Some(id) }` and resolves
 /// through permutations this store already holds. There is no text-specific
 /// enumeration — only a different way of choosing which objects to enumerate,
 /// and a different order to do it in.
 ///
 /// # What bounds it
 ///
-/// §3.5 budgets filtered operations on *candidates examined*, independently of
+/// Filtered operations are budgeted on *candidates examined*, independently of
 /// `limit`, because a hit need not contribute a row: `? p ?` with a text
 /// constraint discards every matching literal that does not occur with `p`.
 /// The index therefore scores at most `candidate_budget` documents and retains
@@ -4182,7 +4177,7 @@ fn ranked(
         )?;
         // The position *inside* a hit is a position in that hit's own space,
         // not a row count: `s ? ?` with a text constraint resolves to `s ? o`,
-        // whose positions are predicate ids (doc 20 §20.2.1). Reusing the same
+        // whose positions are predicate ids. Reusing the same
         // pairing the pattern walk uses is what keeps the two readings from
         // drifting — and `s ? ?` + `o.text` is the only shape where they
         // differ, which is exactly the shape a special case would get wrong.
@@ -4546,7 +4541,7 @@ fn rdf_projection_cardinality(
     Ok(Cardinality::estimated(total.min(base_count)))
 }
 
-/// Finish a text-filtered page (§3.4.1).
+/// Finish a text-filtered page.
 ///
 /// The same materializing, byte budget and cursor as a pattern page — only the
 /// steps came from a ranking, which adds a third way to stop and makes the
@@ -4666,7 +4661,7 @@ fn finish(
     })
 }
 
-/// How many rows a text-filtered pattern matches (§3.4.1).
+/// How many rows a text-filtered pattern matches.
 ///
 /// A page that started at the beginning and ran out is the whole answer, so the
 /// rows *are* the count and it is exact. Saying "about 4" over five rows a
@@ -4819,7 +4814,7 @@ fn walk_start(
 ///
 /// The running position *before* each row, in whichever space this phase counts
 /// in: an offset for the three permutation spaces, and for `s ? o` the previous
-/// row's predicate id — route-independent (doc 20 §20.2.1) and strictly
+/// row's predicate id — route-independent and strictly
 /// increasing, since one (s, p, o) occurs at most once.
 fn positioned<'a>(
     selection: &'a Selection<'a>,
@@ -4863,7 +4858,7 @@ fn resume_position(cursor: &Cursor, phase: &Phase<'_>, predicates: u64) -> Resul
     within.then_some(cursor.position).ok_or_else(stale)
 }
 
-/// Turn ids into terms, once per distinct term (doc 20 §20.5), within
+/// Turn ids into terms once per distinct term, within
 /// `max_response_bytes`.
 ///
 /// Returns the rows and, if the byte budget stopped it, the index of the first
@@ -4871,17 +4866,15 @@ fn resume_position(cursor: &Cursor, phase: &Phase<'_>, predicates: u64) -> Resul
 ///
 /// # Why the budget lands here
 ///
-/// §3.5 publishes `max_response_bytes` and says in the same breath that a row
-/// cap is not a byte cap, "one legal literal can be megabytes" — and bundles
+/// A row cap is not a byte cap because one legal literal can be megabytes, and bundles
 /// really do hold them, so `limit` alone leaves a response unbounded, which is
 /// the one thing this project exists to prevent. Applying it while rows are
 /// built rather than after they are serialized also bounds what a page costs in
 /// *memory*: the terms are in hand at this point, and a page assembled first
 /// and measured second would have to fit before it could be refused.
 ///
-/// The measure is each row's compact JSON — exact for the serialization §3.4.1
-/// defines, and conservative for the page, which is not one of §3.4.1's formats
-/// at all. It is *counted* rather than produced: [`TermCache`] weighs each
+/// The measure is each row's compact JSON, exact for the JSON serialization and
+/// conservative for other representations. It is *counted* rather than produced: [`TermCache`] weighs each
 /// distinct term once and [`Row::new`] adds the map's fixed punctuation, so a
 /// page pays per term rather than per row. Serializing every row to size it
 /// cost a third of what rendering the response costs (10 000 rows: 1.0 ms of
@@ -4973,7 +4966,7 @@ fn sample_positions(count: u64, n: u64, seed: u64) -> Vec<u64> {
 
     let mut random = SplitMix64::seeded(seed);
     let mut positions: Vec<u64> = if count <= n.saturating_mul(2) {
-        // Dense. `count` is under twice `n`, so under twice §3.5's cap, and a
+        // Dense. `count` is under twice `n`, so under twice the sample cap, and a
         // partial Fisher–Yates over the whole range is bounded work — whereas
         // rejecting collisions is a coupon-collector loop at this density.
         let mut pool: Vec<u64> = (0..count).collect();
@@ -5000,12 +4993,12 @@ fn sample_positions(count: u64, n: u64, seed: u64) -> Vec<u64> {
 /// Draw `n` members, and report how many there were to draw from.
 ///
 /// The cardinality comes back with the sample because for `s ? o` the two are
-/// the *same work*: §3.4.7 has the server "run its bounded smaller-endpoint
-/// probe once, hold the resulting predicate-id set in request-local memory, and
-/// sample positions from that set", and `Selection::count` is that probe. Asking
+/// the *same work*: the server runs its bounded smaller-endpoint probe once,
+/// holds the resulting predicate-id set in request-local memory, and samples
+/// positions from that set. `Selection::count` is that probe. Asking
 /// for the count first and the members afterwards runs it twice — which is what
-/// this did until the review caught it, and what doc 20 §20.2.1 budgets exactly
-/// one of.
+/// this did until the review caught it, despite the operation budgeting exactly
+/// one such probe.
 ///
 /// For the seven contiguous shapes there is nothing to hold: the count is a
 /// range width and `Selection::at` is a rank descent, so each is paid once.
@@ -5030,9 +5023,8 @@ fn draw(selection: &Selection<'_>, n: u64, seed: u64) -> (u64, Vec<IdTriple>) {
 
 /// SplitMix64.
 ///
-/// Written out rather than taken from a crate, because §3.4.7 makes the draw
-/// part of the response's contract — "deterministic for a given seed +
-/// version, hence cacheable" — and a generator whose stream may change between
+/// Written out rather than taken from a crate because the draw is deterministic
+/// for a given seed and version, hence cacheable. A generator whose stream may change between
 /// releases of someone else's crate cannot back a contract like that. Six
 /// lines, fixed forever, and the algorithm is named so a client could
 /// reproduce it.
@@ -5832,7 +5824,7 @@ impl Answer {
     }
 }
 
-/// The one line a page says about §3.6's completeness, honestly: the actual
+/// The one line a page says about completeness, honestly: the actual
 /// truncation reason rather than a guess at it.
 fn completeness_text(completeness: &Completeness) -> &'static str {
     match completeness.truncation_reason() {
@@ -6383,7 +6375,7 @@ mod tests {
 
     #[test]
     fn a_draw_is_uniform_deterministic_and_free_of_repeats() {
-        // The contract §3.4.7 states: the same seed and version draw the same
+        // The sampling contract: the same seed and version draw the same
         // members. Everything else here is what makes that draw worth having.
         let dense = sample_positions(10, 4, 42);
         assert_eq!(dense, sample_positions(10, 4, 42));

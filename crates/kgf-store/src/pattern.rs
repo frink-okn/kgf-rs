@@ -1,4 +1,4 @@
-//! Pattern resolution: the doc 20 §20.2 table, implemented.
+//! Pattern resolution over the eight possible bound/unbound triple patterns.
 //!
 //! | pattern | permutation | resolution | count |
 //! |---|---|---|---|
@@ -12,13 +12,13 @@
 //! | `? ? o` | OPS | level-1 seek | range width (exact) |
 //!
 //! **The order of this table is the enumeration order**, and cursors are
-//! positions in it (doc 20 §20.7). Changing which permutation serves a pattern
+//! positions in it. Changing which permutation serves a pattern
 //! is a breaking change to every outstanding cursor, not an optimization.
 //!
 //! Every count but `s ? o` is a range width after bounded rank/select descent.
 //! That is what backs `cardinality.exact = true` on plain patterns, per-binding
-//! `/count` at `O(log N)`, and doc 04's invariant that top-level VoID numbers
-//! equal `/count` results.
+//! `/count` at `O(log N)`, and the invariant that top-level VoID numbers equal
+//! `/count` results.
 
 use std::ops::Range;
 
@@ -59,7 +59,7 @@ pub struct Count {
     ///
     /// Both are exact. This distinguishes the `s ? o` case, which is exact but
     /// costs what enumeration costs — acceptable only because the answer is
-    /// bounded by the dataset's distinct predicate count (doc 20 §20.2.1).
+    /// bounded by the dataset's distinct predicate count.
     pub arithmetic: bool,
 }
 
@@ -142,8 +142,7 @@ impl<'a> Selection<'a> {
     /// For contiguous selections, `from` is the zero-based result offset. For
     /// `s ? o`, `from` is the last predicate id returned, with zero denoting the
     /// beginning. The latter is deliberately route-independent, so a later page
-    /// may choose either endpoint without changing cursor semantics (doc 20
-    /// §20.2.1).
+    /// may choose either endpoint without changing cursor semantics.
     pub fn page(&self, from: u64, limit: usize) -> impl Iterator<Item = IdTriple> + '_ {
         SelectionPage::new(&self.plan, from, limit)
     }
@@ -186,7 +185,7 @@ impl<'a> Selection<'a> {
 /// How `s ? o` will be answered.
 ///
 /// Not a fallback: one algorithm choosing the cheaper of two routes to the same
-/// answer, in the same order (doc 20 §20.8). Both routes enumerate in ascending
+/// answer, in the same order. Both routes enumerate in ascending
 /// predicate id, because level 2 is predicate-sorted in SPO and OPS alike, so
 /// the cursor is identical and a planner may switch routes between pages
 /// without violating no-loss/no-duplication.
@@ -207,7 +206,7 @@ pub enum SubjectObjectRoute {
 /// Borrows the permutations it resolved against, which is the whole point of
 /// the lifetime: a `Selection` that outlived its store would be reading a
 /// mapping that had been unmapped. [`Store::resolve`](crate::store::Store::resolve)
-/// is the entry point callers use; this is where the §20.2 dispatch lives.
+/// is the entry point callers use; this is where the pattern table is dispatched.
 pub fn resolve(perms: &Permutations, pattern: IdPattern) -> Result<Selection<'_>> {
     validate_pattern(perms.dict_counts(), pattern)?;
 

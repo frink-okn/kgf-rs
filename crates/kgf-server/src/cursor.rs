@@ -2,10 +2,10 @@
 //!
 //! **A cursor is a position**, not a snapshot. There is no server-side state: a
 //! token names where an enumeration stopped, and resuming seeks straight there.
-//! No-loss and no-duplication (doc 03 §3.6) follow from positional resume
+//! No-loss and no-duplication follow from positional resume
 //! against immutable data, and rank on the permutation's bitmaps re-derives
 //! group context in `O(1)` — which is precisely why the rank directories are
-//! persisted (doc 20 §20.7).
+//! persisted.
 //!
 //! # Why a token rather than `offset=`
 //!
@@ -26,11 +26,10 @@
 //! - **Opacity.** A published offset becomes a contract clients index into, and
 //!   random access has a different cost profile from paging —
 //!   [`Selection::at`](kgf_store::pattern::Selection::at) for `s ? o` walks the
-//!   whole bounded probe, which is why doc 03 §3.4.7 forbids `/sample` from
-//!   calling it per sample.
+//!   whole bounded probe, so `/sample` must not call it once per sample.
 //!
 //! [`Cursor::digest_prefix`] is the weakest of the four and is documented as
-//! such rather than as the reason: doc 04 §4.6 makes versioned URLs immutable,
+//! such rather than as the reason: versioned URLs are immutable,
 //! so a client paging `/{dataset}/v/{version}/…` cannot drift onto other data.
 //! What it still catches is a client that rebuilds page-two URLs from `latest/`
 //! rather than from the resolved version, and a resume against a mirror serving
@@ -38,13 +37,12 @@
 //!
 //! # Revisability
 //!
-//! Doc 20 §20.7 calls the token stable from the first release. No release has
-//! happened, and the service is expected to run for a long time before one
-//! does, so this encoding is *documented* rather than frozen — the leading
+//! No release has happened, so this encoding is *documented* rather than
+//! frozen — the leading
 //! version byte is how it moves once tokens are outstanding, and until then a
 //! format change is a format change. What must not drift meanwhile is the
-//! enumeration order the position indexes, which doc 20 §20.2's table fixes and
-//! `kgf-store` implements.
+//! enumeration order the position indexes, which `kgf-store` implements as a
+//! stable contract.
 
 use std::collections::BTreeMap;
 
@@ -62,14 +60,14 @@ const FIXED_LEN: usize = 29;
 /// A token that does not address this data and this request.
 ///
 /// Lives here rather than in `kgf_store`: a cursor is HTTP-facing state, and
-/// the crate boundary exists to keep that vocabulary out of storage code (doc
-/// 20 §20.4). The store has no notion of a token to go stale — it enumerates
+/// the crate boundary exists to keep that vocabulary out of storage code. The
+/// store has no notion of a token to go stale — it enumerates
 /// from a position it is handed.
 ///
 /// Every way a token can be rejected is this one condition, deliberately: a
 /// malformed token, a token for another bundle version, a token for another
 /// operation, and a token for another request are all answered `stale_cursor`
-/// (doc 03 §3.6) rather than distinguished, so that a client learns nothing
+/// rather than distinguished, so that a client learns nothing
 /// about data it did not query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("stale cursor")]
@@ -80,10 +78,10 @@ pub struct StaleCursor;
 /// Carried so that a token cannot be replayed against a different operation
 /// over the same data and request shape. `/sample` is deliberately absent: it
 /// draws `n` members of a result set and never pages, so it has no position to
-/// resume from (doc 03 §3.4.7).
+/// resume from.
 ///
-/// **These discriminants are wire values.** `Count` issues a token for the
-/// budgeted text scans of doc 03 §3.4.4.
+/// **These discriminants are wire values.** `Count` issues a token for
+/// budgeted text scans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum Operation {
@@ -117,8 +115,8 @@ impl Operation {
 /// What a cursor's [`position`](Cursor::position) counts.
 ///
 /// Not "which permutation the request used": for `s ? o` the planner may probe
-/// either endpoint and both routes emit in ascending predicate order (doc 20
-/// §20.2.1), so recording the route would make a legitimate route switch look
+/// either endpoint and both routes emit in ascending predicate order, so
+/// recording the route would make a legitimate route switch look
 /// like a mismatch. What matters is the *space the number lives in*, and for
 /// `s ? o` that is the predicate id space rather than any permutation's
 /// enumeration.
@@ -146,7 +144,7 @@ pub enum PositionSpace {
     /// Rank in a text query's hit list, with the offset inside one hit's
     /// statements in [`Cursor::scan_position`].
     ///
-    /// The one space that is not a position in doc 20 §20.2's enumeration
+    /// The one space that is not a position in the store's triple enumeration
     /// order, because a ranked result has none: BM25 orders literals, not
     /// triples. It resumes safely for the reason the order is stable anyway —
     /// a published index is immutable and hdtc breaks score ties on ascending
@@ -225,9 +223,8 @@ impl PositionSpace {
 ///   a position does not depend on it; `format`, which selects a serialization
 ///   of the same rows; and `cursor` itself.
 ///
-/// Doc 03 §3.6 requires the binding without enumerating its contents, so this
-/// rule is a decision recorded here — see `notes/plan.md`, Questions for
-/// `../kgf` item 7. It matters beyond this implementation only if resuming
+/// The binding intentionally excludes `limit`, representation, and the cursor
+/// itself. This matters beyond this implementation only if resuming
 /// against a *mirror* is meant to work, since two servers would then have to
 /// canonicalize identically.
 ///
@@ -312,7 +309,7 @@ impl CursorBinding {
 
 /// The bundle-version half of a binding, derived once at open.
 ///
-/// A manifest's `content_digest` is `algorithm:hex` (doc 04 §4.3) and the token
+/// A manifest's `content_digest` is `algorithm:hex`, and the token
 /// carries a prefix of the digest itself, so the hex is decoded once here rather
 /// than on every request. A digest that will not parse is a malformed manifest,
 /// which is worth failing on at open rather than per request.
@@ -348,7 +345,7 @@ impl BundleBinding {
 ///
 /// Only [`Cursor::encode`] builds one, so it is always non-empty URL-safe
 /// base64 — safe in a query string and safe as a header value, which matters
-/// because `KGF-Next-Cursor` (doc 03 §3.6) puts it in one. An arbitrary string
+/// because `KGF-Next-Cursor` puts it in one. An arbitrary string
 /// there could be empty, giving a client a continuation that continues nothing,
 /// or could carry CR/LF, which is header injection.
 ///
@@ -789,8 +786,8 @@ mod tests {
         }
     }
 
-    /// The property doc 20 §20.9 asks for, composed with the codec: for every
-    /// pattern shape and every stopping point, a token round-trips to a position
+    /// The central cursor property, composed with the codec: for every pattern
+    /// shape and every stopping point, a token round-trips to a position
     /// that resumes with exactly the remaining rows.
     ///
     /// `kgf-store` already proves that positional resume yields the suffix. What

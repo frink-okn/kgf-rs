@@ -72,7 +72,7 @@ pub(crate) fn published_root(path: &std::path::Path) -> crate::map::PublishedRoo
 }
 
 /// The golden fixture graph: small enough to reason about, wide enough to
-/// exercise the structures (doc 20 §20.9).
+/// exercise the structures.
 ///
 /// Chosen so that every case the dictionary and the permutations distinguish is
 /// present: terms that are both subject and object (`alice`, `bob` — the shared
@@ -199,12 +199,12 @@ pub fn tiny_id_triples(dictionary: &crate::dict::Dictionary<'_>) -> Vec<crate::I
 
 /// A bundle built by hdtc into a temporary directory.
 ///
-/// Doc 20 §20.9's golden bundle: the fixture RDF is checked in and hdtc builds
-/// the binary artifacts, so the bytes under test are the bytes a real bundle
+/// The fixture RDF is checked in and hdtc builds the binary artifacts, so the
+/// bytes under test are the bytes a real bundle
 /// has. Nothing here writes an HDT, permutation, graph, or text-index byte — a
 /// hand-written fixture would be this crate's own guess at hdtc's format rather
-/// than the producer's output. The description fixture adds only doc 04's
-/// transparent TSV/JSON documents around an hdtc-built VoID pair; publication
+/// than the producer's output. The description fixture adds only transparent
+/// TSV/JSON documents around an hdtc-built VoID pair; publication
 /// verification independently proves those recoverable projections against
 /// the graph before any cross-crate test serves them.
 pub struct Fixture {
@@ -215,7 +215,7 @@ impl Fixture {
     /// Build a bundle from N-Triples source.
     ///
     /// Runs the `hdtc` binary from the sibling checkout, with `--perm` because
-    /// `data.hdt.perm` is a required artifact (doc 04 §4.1) and hdtc does not
+    /// `data.hdt.perm` is a required artifact and hdtc does not
     /// emit it by default. Panics with the command to run if the binary is not
     /// built: a fixture that silently skipped would leave every differential
     /// test in this crate passing vacuously.
@@ -291,7 +291,7 @@ impl Fixture {
     ///
     /// A second `hdtc` invocation rather than a flag on the first, because that
     /// is how a bundle acquires one: `hdtc text` runs over a built HDT, and its
-    /// default output path is the bundle's `data.hdt.text` (doc 04 §4.1). A
+    /// default output path is the bundle's `data.hdt.text`. A
     /// separate step is also what lets a test have the same graph with and
     /// without `search`, which is what the capability gate needs.
     #[must_use]
@@ -390,7 +390,7 @@ impl Fixture {
             std::fs::copy(self.dir.path().join(name), destination.join(name))
                 .unwrap_or_else(|error| panic!("copy fixture artifact {name}: {error}"));
         }
-        // The one artifact that is a directory (doc 04 §4.1).
+        // The one artifact represented by a directory rather than a file.
         let text = self.dir.path().join(TEXT);
         if text.is_dir() {
             copy_dir(&text, &destination.join(TEXT));
@@ -608,17 +608,17 @@ impl Fixture {
     }
 }
 
-/// Exact selector-index header from doc 04 §4.2.
+/// Exact selector-index header required by the reader.
 #[cfg(test)]
 pub(crate) const SCHEMA_NODES_HEADER: &[u8] =
     b"view\tkind\tclass\tpredicate\tdatatype\tsubject_id\n";
 
-/// Exact class-relation header from doc 04 §4.2.
+/// Exact class-relation header required by the reader.
 #[cfg(test)]
 pub(crate) const CLASS_RELATIONS_HEADER: &[u8] =
     b"view\tsubject_class\tpredicate\tobject_class\ttriples\n";
 
-/// Exact class-property header from doc 04 §4.2.
+/// Exact class-property header required by the reader.
 #[cfg(test)]
 pub(crate) const CLASS_PROPERTIES_HEADER: &[u8] =
     b"view\tclass\tpredicate\ttriples\tdistinct_subjects\tdistinct_objects\n";
