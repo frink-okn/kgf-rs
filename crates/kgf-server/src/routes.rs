@@ -232,7 +232,11 @@ async fn bundle_manifest(
     // ones, so there is nothing left to check: opening the bundle first would
     // make a client's cheapest possible request pay for a cold mmap.
     if wants.already_has(&validator) {
-        return not_modified(CachePolicy::Immutable, validator);
+        return not_modified(
+            CachePolicy::Immutable,
+            RobotsPolicy::for_request(representation, wants.params()),
+            validator,
+        );
     }
 
     let resource = BundleManifest::new(
@@ -837,8 +841,11 @@ where
         service.descriptor_digest(),
         representation,
     );
+    // Computed once and used by both exits, so the `304` a client revalidates
+    // with carries the directives of the `200` it stands in for.
+    let robots = RobotsPolicy::for_request(representation, wants.params());
     if wants.already_has(&validator) {
-        return not_modified(CachePolicy::Immutable, validator);
+        return not_modified(CachePolicy::Immutable, robots, validator);
     }
 
     let target = Target::get(
@@ -867,7 +874,13 @@ where
     })
     .await?;
 
-    respond_rendered(rendered, representation, CachePolicy::Immutable, validator)
+    respond_rendered(
+        rendered,
+        representation,
+        CachePolicy::Immutable,
+        robots,
+        validator,
+    )
 }
 
 /// Run a versioned operation whose representation set is not the ordinary
@@ -898,8 +911,11 @@ where
         service.descriptor_digest(),
         representation,
     );
+    // Computed once and used by both exits, so the `304` a client revalidates
+    // with carries the directives of the `200` it stands in for.
+    let robots = RobotsPolicy::for_request(representation, wants.params());
     if wants.already_has(&validator) {
-        return not_modified(CachePolicy::Immutable, validator);
+        return not_modified(CachePolicy::Immutable, robots, validator);
     }
 
     let target = Target::get(
@@ -917,7 +933,13 @@ where
     })
     .await?;
 
-    respond_rendered(rendered, representation, CachePolicy::Immutable, validator)
+    respond_rendered(
+        rendered,
+        representation,
+        CachePolicy::Immutable,
+        robots,
+        validator,
+    )
 }
 
 /// What an HTML render needs to annotate its IRIs with display labels: the
@@ -1025,9 +1047,10 @@ where
         representation,
         &body,
     );
+    let robots = RobotsPolicy::for_request(representation, wants.params());
     if wants.already_has(&validator) {
         return match method {
-            BodyMethod::Query => not_modified(cache, validator),
+            BodyMethod::Query => not_modified(cache, robots, validator),
             BodyMethod::Post => Err(Problem::new(
                 ErrorCode::PreconditionFailed,
                 "If-None-Match matches the representation this POST would return; remove the \
@@ -1052,7 +1075,7 @@ where
     })
     .await?;
 
-    respond_rendered(rendered, representation, cache, validator)
+    respond_rendered(rendered, representation, cache, robots, validator)
 }
 
 async fn latest_redirect(
@@ -1284,13 +1307,14 @@ fn respond(
     cache: CachePolicy,
     etag: Option<ETag>,
 ) -> Result<Response, Problem> {
+    let robots = RobotsPolicy::for_request(representation, wants.params());
     // The backstop. A handler that can skip real work by checking earlier does
     // so itself; this is here so that no route can serve a full body to a
     // client that already holds it just because its handler did not ask.
     if let Some(validator) = &etag
         && wants.already_has(validator)
     {
-        return not_modified(cache, validator.clone());
+        return not_modified(cache, robots, validator.clone());
     }
 
     let body = match representation {
@@ -1305,6 +1329,7 @@ fn respond(
         Some(representation),
         Body::from(body),
         cache,
+        robots,
         etag,
     )
 }
@@ -1318,6 +1343,7 @@ fn respond_rendered(
     rendered: Rendered,
     representation: Representation,
     cache: CachePolicy,
+    robots: RobotsPolicy,
     validator: ETag,
 ) -> Result<Response, Problem> {
     let mut response = finish(
@@ -1325,6 +1351,7 @@ fn respond_rendered(
         Some(representation),
         Body::from(rendered.body),
         cache,
+        robots,
         Some(validator),
     )?;
     // The same metadata appears in headers and the body so that a
@@ -1342,14 +1369,71 @@ fn respond_rendered(
 
 /// RFC 9110 §15.4.5's 304: no body, and the validator and freshness the
 /// response would have carried.
-fn not_modified(cache: CachePolicy, validator: ETag) -> Result<Response, Problem> {
+fn not_modified(
+    cache: CachePolicy,
+    robots: RobotsPolicy,
+    validator: ETag,
+) -> Result<Response, Problem> {
     finish(
         StatusCode::NOT_MODIFIED,
         None,
         Body::empty(),
         cache,
+        robots,
         Some(validator),
     )
+}
+
+/// Whether cooperative crawlers should treat a response as public discovery.
+///
+/// Two conditions, and a response is marked only when both hold.
+///
+/// The representation must be the page. Indexing is the only thing the
+/// directive governs and the page is the only representation an indexer
+/// consumes, while every machine representation is the client surface: a
+/// fragment client walks `hydra:next` to exhaustion by design, and nothing on
+/// the bytes it reads may suggest that chain is not worth following.
+///
+/// And the request must narrow the resource. A bare operation URL is one
+/// document per release; the same operation under a bound term, a projection
+/// or a cursor spans a graph large enough that enumerating it is the crawl
+/// this discourages. `format` alone does not narrow anything — it picks a
+/// serialization of the same document — so it does not count.
+///
+/// Derived from the request rather than chosen per route, which is what keeps
+/// it honest: a `304` and the `200` it revalidates cannot disagree, a resource
+/// that is finite by construction is never marked whatever helper serves it,
+/// and a new route inherits the rule instead of a classification someone has to
+/// remember to make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RobotsPolicy {
+    Discoverable,
+    NoIndexNoFollow,
+}
+
+impl RobotsPolicy {
+    fn for_request(representation: Representation, params: &Params) -> Self {
+        let narrowed = params.names().any(|name| name != "format");
+        if representation == Representation::Html && narrowed {
+            Self::NoIndexNoFollow
+        } else {
+            Self::Discoverable
+        }
+    }
+
+    /// Matched rather than compared, so a policy added later cannot silently
+    /// serve no directive at all.
+    fn apply(self, headers: &mut HeaderMap) {
+        match self {
+            Self::Discoverable => {}
+            Self::NoIndexNoFollow => {
+                headers.insert(
+                    HeaderName::from_static("x-robots-tag"),
+                    HeaderValue::from_static("noindex, nofollow"),
+                );
+            }
+        }
+    }
 }
 
 fn finish(
@@ -1357,6 +1441,7 @@ fn finish(
     representation: Option<Representation>,
     body: Body,
     cache: CachePolicy,
+    robots: RobotsPolicy,
     etag: Option<ETag>,
 ) -> Result<Response, Problem> {
     let mut response = Response::builder()
@@ -1371,6 +1456,7 @@ fn finish(
         );
     }
     headers.typed_insert(cache.header());
+    robots.apply(headers);
     // One URL serves many formats, so a cache that ignored `Accept` would
     // hand a page to an agent. Always, including on responses with no `ETag`.
     headers.insert(VARY, HeaderValue::from_static("Accept"));
@@ -1566,6 +1652,54 @@ mod tests {
             response.extensions().get::<Problem>().is_some(),
             "the middleware has nothing to render without it"
         );
+    }
+
+    #[test]
+    fn only_a_narrowed_page_is_withheld_from_crawlers() {
+        let policy = |representation, query| {
+            RobotsPolicy::for_request(representation, &Params::parse(Some(query)).unwrap())
+        };
+
+        // An entry point is one document per release however it is addressed,
+        // and `format` picks a serialization of that same document.
+        for query in ["", "format=html"] {
+            assert_eq!(
+                policy(Representation::Html, query),
+                RobotsPolicy::Discoverable,
+                "{query:?}"
+            );
+        }
+
+        // Narrowed by a term, a projection or a cursor: the page is one of far
+        // too many to enumerate.
+        for query in [
+            "s=ex:alice",
+            "limit=2",
+            "cursor=abc",
+            "projection=class-relations",
+        ] {
+            assert_eq!(
+                policy(Representation::Html, query),
+                RobotsPolicy::NoIndexNoFollow,
+                "{query:?}"
+            );
+        }
+
+        // No machine representation is ever marked, however narrow the request.
+        // A fragment client pages a continuation to exhaustion, and RDF carries
+        // the `hydra:next` that continuation is spelled with.
+        for representation in [
+            Representation::Json,
+            Representation::Turtle,
+            Representation::JsonLd,
+            Representation::Markdown,
+        ] {
+            assert_eq!(
+                policy(representation, "s=ex:alice&cursor=abc"),
+                RobotsPolicy::Discoverable,
+                "{representation:?}"
+            );
+        }
     }
 
     #[test]

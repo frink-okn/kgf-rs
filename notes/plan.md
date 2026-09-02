@@ -2132,6 +2132,63 @@ following the code.
     guidance from anything read from a bundle is the client's design problem, not
     something a card announces about itself. §4.2 could say so in a clause.
 
+53. **Public crawler behavior needs an explicit recommendation.** Entry points — the
+    service and dataset descriptors, a manifest, a description document, and any
+    operation addressed without narrowing parameters — are one document per release
+    and form a finite discovery catalog. The same operations under a bound term, a
+    projection or a cursor span a graph large enough that enumerating it is exactly
+    the crawl worth discouraging. This server sends `X-Robots-Tag: noindex, nofollow`
+    when, and only when, the negotiated representation is the page **and** the request
+    carries a parameter other than `format`; conditional `304` responses derive the
+    same policy from the same request, so a revalidation cannot disagree with the
+    response it stands in for.
+
+    The rule is deliberately confined to the page. Indexing is the only thing the
+    directive governs and the page is the only representation an indexer consumes,
+    whereas every machine representation is the client surface. A fragment client
+    walks `hydra:next` to exhaustion by design — exhaustive paging is a correctness
+    property this workspace tests, not a tolerated edge case — so no JSON, Turtle,
+    JSON-LD or Markdown response is ever marked, whatever it is narrowed by. An
+    earlier revision marked machine representations too, on the reasoning that
+    `hydra:next` is itself a link graph an RDF harvester can walk. That trade was
+    rejected: the harvesters in question key on `robots.txt` far more than on this
+    header, so it bought little, and it put a "not worth following" signal on the
+    exact bytes an agent client reads.
+
+    The header is not the whole instrument, because a page's links are not
+    homogeneous. Every drill-down link an operation page renders — a term to its
+    `/describe` neighborhood, a literal to the triples carrying it — and every
+    continuation and alternate-representation link now carries `rel="nofollow"`, while
+    breadcrumbs, the brand link and links to catalog documents do not. That is what
+    lets an entry point stay followable at all: a bare `/fragment` page renders up to
+    `caps.default_limit` rows of three linked terms each and a bare `/schema` up to
+    `caps.max_schema_items`, so without it a crawler walks thousands of `/describe`
+    executions that no index could ever keep, having arrived at pages served
+    `noindex`. Marking the links rather than the response is also what keeps the
+    breadcrumbs: a page-wide `nofollow` would sever every operation page from the
+    dataset it belongs to, which is the one link on the page worth following.
+
+    The two layers cover each other. `rel="nofollow"` is a hint rather than a
+    directive, so a crawler may take one anyway — and arrives at a narrowed page the
+    header serves `noindex`, spending a fetch and gaining nothing. The header is
+    binding but page-wide, so it is reserved for the responses where losing every link
+    costs nothing.
+
+    Two consequences worth recording. The `latest` redirect and error responses carry
+    no directive and need none: a `307` is not itself indexed and its target derives
+    the policy on arrival, and error statuses are not indexed at all. And this remains
+    a request to cooperative crawlers rather than access control or load protection —
+    a crawler must fetch a URL to read the header, so admission limits stay the only
+    thing that bounds cost.
+
+    Doc 03 should say whether this is a core server behavior or a recommended
+    deployment policy. If it recommends `robots.txt`, it should say so *instead* of
+    this header on the same paths rather than alongside it: a `Disallow` prevents the
+    fetch that would reveal `noindex`, so the two do not compose — a disallowed URL
+    can still be listed from an external link, with no content and no way to suppress
+    the entry. A host-wide `robots.txt` also remains a deployment concern because one
+    origin may serve more than KGF.
+
 ## Not in this plan
 
 Remaining composed operations (ranges, star, key resolution), graph scoping, and

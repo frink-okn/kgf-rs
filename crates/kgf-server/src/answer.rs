@@ -66,7 +66,7 @@ use crate::envelope::{
 use crate::forms;
 use crate::html::{
     Crumb, Resource, TermText, Value, fields, group_digits, json_body, note, operation_page,
-    operation_page_with_format, page, results_table, stats, table,
+    operation_page_with_format, page, pager, results_table, stats, table,
 };
 use crate::rdf::{GraphFormat, serialize_graph};
 use crate::representation::Representation;
@@ -5215,7 +5215,7 @@ impl SchemaNavigationAnswer {
                 }
                 @if let Some(token) = self.completeness.next_cursor() {
                     @if let Some(next) = self.target.next(token) {
-                        p."pager" { a href=(next) { "Next page →" } }
+                        (pager(&next, "Next page →"))
                     }
                 }
             },
@@ -5349,7 +5349,7 @@ impl SchemaRelationsAnswer {
                 }
                 @if let Some(token) = self.completeness.next_cursor() {
                     @if let Some(next) = self.target.next(token) {
-                        p."pager" { a href=(next) { "Next page →" } }
+                        (pager(&next, "Next page →"))
                     }
                 }
             },
@@ -5451,7 +5451,7 @@ impl SchemaClassPropertiesAnswer {
                 }
                 @if let Some(token) = self.completeness.next_cursor() {
                     @if let Some(next) = self.target.next(token) {
-                        p."pager" { a href=(next) { "Next page →" } }
+                        (pager(&next, "Next page →"))
                     }
                 }
             },
@@ -5650,7 +5650,7 @@ impl Resource for Answer {
 
                 @if let Some(token) = self.completeness.next_cursor() {
                     @if let Some(next) = self.target.next(token) {
-                        p."pager" { a href=(next) { "Next page →" } }
+                        (pager(&next, "Next page →"))
                     } @else {
                         p."note" {
                             "Put cursor " code { (token) }
@@ -6032,15 +6032,16 @@ impl Resource for CountAnswer {
                          cursor until the count is exact."
                     ))
                 }
-                p."pager" {
-                    a href=(query(
+                (pager(
+                    &query(
                         url::operation(&self.target.id.dataset, &self.target.id.version, "fragment"),
                         &self.target.params.without("cursor"),
-                    )) { "The rows themselves →" }
-                }
+                    ),
+                    "The rows themselves →",
+                ))
                 @if let Some(token) = self.completeness.next_cursor() {
                     @if let Some(next) = self.target.next(token) {
-                        p."pager" { a href=(next) { "Continue counting →" } }
+                        (pager(&next, "Continue counting →"))
                     }
                 }
             },
