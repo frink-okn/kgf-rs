@@ -2132,16 +2132,43 @@ following the code.
     guidance from anything read from a bundle is the client's design problem, not
     something a card announces about itself. §4.2 could say so in a clause.
 
-53. **Public crawler behavior needs an explicit recommendation.** The service,
-    dataset, and manifest documents form a finite discovery catalog, but versioned
-    operations form an effectively unbounded graph through term drill-down and
-    continuation links. This server sends `X-Robots-Tag: noindex, nofollow` on every
-    successful operation response, including machine representations and conditional
-    `304` responses, while leaving the finite catalog crawlable. This is a request to
-    cooperative crawlers, not access control or load protection; admission limits
-    remain necessary for clients that ignore it. Doc 03 should say whether this is a
-    core server behavior or a recommended deployment policy. A host-wide `robots.txt`
-    remains a deployment concern because one origin may serve more than KGF.
+53. **Public crawler behavior needs an explicit recommendation.** Entry points — the
+    service and dataset descriptors, a manifest, a description document, and any
+    operation addressed without narrowing parameters — are one document per release
+    and form a finite discovery catalog. The same operations under a bound term, a
+    projection or a cursor span a graph large enough that enumerating it is exactly
+    the crawl worth discouraging. This server sends `X-Robots-Tag: noindex, nofollow`
+    when, and only when, the negotiated representation is the page **and** the request
+    carries a parameter other than `format`; conditional `304` responses derive the
+    same policy from the same request, so a revalidation cannot disagree with the
+    response it stands in for.
+
+    The rule is deliberately confined to the page. Indexing is the only thing the
+    directive governs and the page is the only representation an indexer consumes,
+    whereas every machine representation is the client surface. A fragment client
+    walks `hydra:next` to exhaustion by design — exhaustive paging is a correctness
+    property this workspace tests, not a tolerated edge case — so no JSON, Turtle,
+    JSON-LD or Markdown response is ever marked, whatever it is narrowed by. An
+    earlier revision marked machine representations too, on the reasoning that
+    `hydra:next` is itself a link graph an RDF harvester can walk. That trade was
+    rejected: the harvesters in question key on `robots.txt` far more than on this
+    header, so it bought little, and it put a "not worth following" signal on the
+    exact bytes an agent client reads.
+
+    Two consequences worth recording. The `latest` redirect and error responses carry
+    no directive and need none: a `307` is not itself indexed and its target derives
+    the policy on arrival, and error statuses are not indexed at all. And this remains
+    a request to cooperative crawlers rather than access control or load protection —
+    a crawler must fetch a URL to read the header, so admission limits stay the only
+    thing that bounds cost.
+
+    Doc 03 should say whether this is a core server behavior or a recommended
+    deployment policy. If it recommends `robots.txt`, it should say so *instead* of
+    this header on the same paths rather than alongside it: a `Disallow` prevents the
+    fetch that would reveal `noindex`, so the two do not compose — a disallowed URL
+    can still be listed from an external link, with no content and no way to suppress
+    the entry. A host-wide `robots.txt` also remains a deployment concern because one
+    origin may serve more than KGF.
 
 ## Not in this plan
 

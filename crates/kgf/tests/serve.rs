@@ -616,7 +616,10 @@ fn void_and_summary_serve_the_published_description_in_every_format() {
     let turtle = server.get("/tox/v/v1/void?format=ttl");
     turtle.assert_status(200);
     turtle.assert_header("content-type", "text/turtle; charset=utf-8");
-    turtle.assert_header("x-robots-tag", "noindex, nofollow");
+    assert!(
+        turtle.header("x-robots-tag").is_none(),
+        "a description document narrows nothing and stays discoverable"
+    );
     turtle.assert_header("kgf-complete", "true");
     assert!(String::from_utf8_lossy(&turtle.body).contains("@prefix kgfbn:"));
     let turtle_quads = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
@@ -655,7 +658,10 @@ fn void_and_summary_serve_the_published_description_in_every_format() {
     let markdown = server.get("/tox/v/v1/summary");
     markdown.assert_status(200);
     markdown.assert_header("content-type", "text/markdown; charset=utf-8");
-    markdown.assert_header("x-robots-tag", "noindex, nofollow");
+    assert!(
+        markdown.header("x-robots-tag").is_none(),
+        "a description document narrows nothing and stays discoverable"
+    );
     assert_eq!(markdown.body, b"# Summary\n");
 
     let json = server.get("/tox/v/v1/summary?format=json");
@@ -1237,13 +1243,16 @@ fn a_revalidation_does_not_open_the_bundle_it_is_revalidating() {
 
     std::fs::remove_file(deployment.bundle("tox", "v1").join("data.hdt.perm")).unwrap();
     let server = deployment.serve();
-    server
-        .request(
-            "GET",
-            "/tox/v/v1/manifest",
-            &[("If-None-Match", etag.as_str())],
-        )
-        .assert_status(304);
+    let revalidated = server.request(
+        "GET",
+        "/tox/v/v1/manifest",
+        &[("If-None-Match", etag.as_str())],
+    );
+    revalidated.assert_status(304);
+    assert!(
+        revalidated.header("x-robots-tag").is_none(),
+        "a manifest narrows nothing, on the 304 as on the 200"
+    );
     // And the unconditional request against the same bundle still fails, so the
     // 304 above was not simply a bundle that happens to open.
     server.get("/tox/v/v1/manifest").assert_status(500);
@@ -1263,9 +1272,12 @@ fn the_descriptors_can_be_revalidated_too() {
         first.assert_status(200);
         let etag = first.header("etag").unwrap_or_else(|| panic!("{path}"));
 
-        server
-            .request("GET", path, &[("If-None-Match", etag.as_str())])
-            .assert_status(304);
+        let revalidated = server.request("GET", path, &[("If-None-Match", etag.as_str())]);
+        revalidated.assert_status(304);
+        assert!(
+            revalidated.header("x-robots-tag").is_none(),
+            "{path} is catalog, on the 304 as on the 200"
+        );
         // RFC 9110 §13.1.2's wildcard: the resource exists, so it is unchanged.
         server
             .request("GET", path, &[("If-None-Match", "*")])
@@ -1397,7 +1409,10 @@ fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() 
     page.assert_header("content-type", "application/json");
     page.assert_cache_control(&["public", "max-age=31536000", "immutable"]);
     page.assert_varies_on_accept();
-    page.assert_header("x-robots-tag", "noindex, nofollow");
+    assert!(
+        page.header("x-robots-tag").is_none(),
+        "a machine representation is the client surface, never a crawl target"
+    );
 
     // The body says it is truncated, and so do the headers. Both are required
     // both, because a CSV or Parquet body has nowhere to put it.
@@ -1432,7 +1447,10 @@ fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() 
         &[("If-None-Match", etag.as_str())],
     );
     not_modified.assert_status(304);
-    not_modified.assert_header("x-robots-tag", "noindex, nofollow");
+    assert!(
+        not_modified.header("x-robots-tag").is_none(),
+        "a 304 carries the directives of the 200 it stands in for"
+    );
 
     // And the same URL is a page in a browser.
     let html = server.request(
@@ -1442,6 +1460,30 @@ fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() 
     );
     html.assert_header("content-type", "text/html; charset=utf-8");
     html.assert_header("x-robots-tag", "noindex, nofollow");
+    // And the same operation's entry point is not: it is one page per release,
+    // linking into the narrowed space a crawler is asked to stop at.
+    let entry = server.request(
+        "GET",
+        &format!("{base}/fragment"),
+        &[("Accept", "text/html")],
+    );
+    entry.assert_status(200);
+    assert!(
+        entry.header("x-robots-tag").is_none(),
+        "an operation's entry point is finite and stays discoverable"
+    );
+    let page_etag = html.header("etag").expect("a page carries an ETag");
+    let page_revalidated = server.request(
+        "GET",
+        &format!("{base}/fragment?limit=2"),
+        &[
+            ("Accept", "text/html"),
+            ("If-None-Match", page_etag.as_str()),
+        ],
+    );
+    page_revalidated.assert_status(304);
+    page_revalidated.assert_header("x-robots-tag", "noindex, nofollow");
+
     let html_text = html.text();
     assert!(html_text.contains("Next page"));
     assert!(html_text.contains("<summary>Fragment</summary>"));
@@ -1945,8 +1987,11 @@ impl Response {
         }
     }
 
+    /// Lowercased on the way in as well as on the way out. Several assertions
+    /// here are about a header being *absent*, and a case-sensitive lookup
+    /// would let one of those pass against a header that is present.
     fn header(&self, name: &str) -> Option<String> {
-        self.headers.get(name).cloned()
+        self.headers.get(&name.to_ascii_lowercase()).cloned()
     }
 
     fn text(&self) -> String {
