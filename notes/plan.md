@@ -1506,6 +1506,30 @@ manifest` stays, because `--check` is a verifier rather than a stop-gap.
 fields, so a config written against the DAG fails with an explanation; claiming the
 keys keeps adding them additive.
 
+### 22. Request logging — the access record
+
+Not started. `notes/request-logging.md` is the design and the handoff: one JSON
+record per response, shape tier by default and a raw tier behind `--log-raw` per
+`../kgf` doc 12 §12.1, assembled by an outermost layer plus an `Observation` the
+handlers attach, with `KGF-Request-Id` on every response as the join key to client
+receipts. It is the deployment plan's §3.5, and the reason it is next is that the GCP
+trial is the first real traffic and doc 12's census cannot start without it. The note
+carries its own **Questions for `../kgf`**, to be merged into the list below when the
+unit lands.
+
+### 23. `--public-base` — serving under a path prefix
+
+Not started. `notes/public-base.md` is the design and the handoff. FRINK mounts every
+service under a path on one shared hostname, with the gateway stripping the prefix
+before the pod sees it, and the trial deployment will live at
+`https://apps.okn.us/kgf/`. Today `PublicOrigin` refuses a path and every generated
+link is root-relative, so page two of a fragment would land on the Ubergraph QLever
+route. The unit generalizes the origin into a base, threads the prefix through the
+three URL builders via a `Mount` value on `Target`, and prefixes the redirect and the
+two root links; the ETag digest already covers it and no bundle artifact changes. Half
+a day. The note also says to send QUERY through the gateway in the same session,
+since that transport check has never been run.
+
 ### What the implementation still is not
 
 **The mandatory core profile is now implemented; M1 alone was not that profile.** Doc
