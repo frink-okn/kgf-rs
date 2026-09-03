@@ -1510,19 +1510,21 @@ keys keeps adding them additive.
 ### 22. Request logging — the access record
 
 One JSON object is now emitted per response to stdout by default from `kgf serve`;
-`--access-log off` disables the sink and `--log-raw` opts into the request target and
-typed search string. The library surface takes an optional `Arc<dyn AccessLog>`, so
-embedders and real-listener tests can consume the same typed `AccessRecord` without
+`--access-log off` disables the sink and `--log-raw` opts into the request target,
+typed search string, User-Agent, and inbound request id. The library surface takes an
+optional `Arc<dyn AccessLog>`, so embedders and real-listener tests can consume the
+same typed `AccessRecord` without
 scraping output. Diagnostics remain on stderr.
 
 The outermost router middleware owns the clock, request id, matched route, method,
-body-size hints, response status and size, pseudonymous peer identities, and bounded
-client headers. It emits after CORS, body limiting, problem rendering and handlers
-have all answered, which gives exactly one record for successes, revalidations,
+body-size hints, response status and size, pseudonymous peer identities, and a coarse
+client class. Raw client headers are retained only in the opt-in tier. It emits after
+CORS, body limiting, problem rendering and handlers have all answered, which gives
+exactly one record for successes, revalidations,
 redirects, router errors and pre-handler failures. Every response receives a
-server-minted `KGF-Request-Id`; an inbound `X-Request-Id` is retained separately and
-never trusted as that identity. Client hashes use a process-random `RandomState`, so
-they join traffic within one process lifetime and rotate on restart.
+server-minted `KGF-Request-Id`; an inbound `X-Request-Id` is retained separately only
+in the raw tier and never trusted as that identity. Client hashes use a process-random
+`RandomState`, so they join traffic within one process lifetime and rotate on restart.
 
 Handlers attach an `Observation` containing only facts known after parsing and release
 resolution: dataset/version, representation, transport, typed request shape, cursor
@@ -1531,6 +1533,12 @@ catalog lookups additionally report open time and the deliberately racy observat
 `first_open` probe. `Rendered` now carries row count and cardinality beside completeness,
 so the record and `KGF-*` headers are derived from the same answer rather than by parsing
 serialized output. A resolved identifier is logged only after catalog lookup succeeds.
+
+A review hardened four boundary cases: raw User-Agent and inbound request ids moved
+behind `--log-raw`; a rendered problem's representation overrides the handler's
+requested representation; successful open timing survives later execution, hydration,
+or rendering errors; and `latest` derives its transport from the method its 307
+preserves.
 
 The shape types contain term kinds and magnitudes, never term values. `BoundTerm`
 therefore retains the kind established by its original parse instead of re-parsing a

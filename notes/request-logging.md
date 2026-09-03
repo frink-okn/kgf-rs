@@ -49,10 +49,11 @@ JSON object on one line. Two tiers, following doc 12 §12.1 exactly:
 
 - **Shape tier (default).** Operation, structure, magnitudes, timings, outcome,
   pseudonymous client. Nothing the client typed.
-- **Raw tier (`--log-raw`, off by default).** Adds the raw request target and the
-  search string. Doc 12 asks that this be opt-in per deployment, access-controlled,
-  and retained briefly (~30 days); retention is the deployment's job (a Cloud Logging
-  bucket policy), the flag is ours.
+- **Raw tier (`--log-raw`, off by default).** Adds the raw request target, search
+  string, truncated User-Agent, and truncated inbound `X-Request-Id`. Doc 12 asks
+  that this be opt-in per deployment, access-controlled, and retained briefly (~30
+  days); retention is the deployment's job (a Cloud Logging bucket policy), the flag
+  is ours.
 
 **Never logged in either tier:** request bodies, response bodies, `Problem`'s
 `detail` (it reflects up to 200 characters of whatever the client sent —
@@ -89,8 +90,8 @@ the line is also readable by eye.
 | `open_ms`, `first_open` | integer or `null`, bool | §8 | shape |
 | `client_hash`, `forwarded_hash` | 16 hex chars | §4 | shape |
 | `client_class` | `comunica` / `browser` / `curl` / `python` / `node` / `kgf` / `unknown` | §4 | shape |
-| `user_agent` | truncated to 200 bytes | header | shape |
-| `client_request_id` | truncated inbound `X-Request-Id`, if any | header | shape |
+| `user_agent` | truncated to 200 bytes | header | **raw** |
+| `client_request_id` | truncated inbound `X-Request-Id`, if any | header | **raw** |
 | `shape` | object, per operation — §2.2 | typed request | shape |
 | `target` | raw path and query | request | **raw** |
 | `q` | the search string | typed request | **raw** |
@@ -128,12 +129,15 @@ One `middleware::from_fn_with_state` added as the **last** `.layer` in
 the layer sees every response including CORS preflights and the body-limit 413.
 
 On the way in: start the clock, mint `request_id` (§4), read method, `User-Agent`,
-peer address, inbound `X-Request-Id`, `Content-Length`. On the way out: read
+peer address, inbound `X-Request-Id`, `Content-Length`; classify the User-Agent but
+retain the two raw headers only when `--log-raw` is enabled. On the way out: read
 `status`, `code` (§3.2), `bytes_out` from `body.size_hint().exact()` — every body
 this server builds is `Body::from(Bytes)` or `Body::empty()`, so the hint is exact
 and nothing is buffered; a streamed body, should one ever exist, logs `null`. Then
 take the handler's `Observation` out of the response extensions, merge, and hand the
 record to the sink (§6). Set `KGF-Request-Id` on the response before returning it.
+When problem rendering selected the response representation, that rendered value wins
+over the operation representation retained in the handler observation.
 
 `route` and `operation` come from axum's `MatchedPath` extension, which needs the
 `matched-path` feature on the workspace's `axum` dependency (currently `http1`,
@@ -171,12 +175,14 @@ Two plumbing changes make that possible:
 - **`blocking` returns timings** (`routes.rs:1608`). Measure `admission.enter` as
   `queue_ms` and time the closure body as `work_ms`; `total_ms` is the layer's.
   Pool scheduling delay is whatever is left, and it is worth seeing on the
-  shared-storage gate. The three callers destructure a pair; that is the whole
-  ripple.
+  shared-storage gate. Once a bundle opens, `Opened<T>` carries `OpenTiming` beside
+  the remaining operation result so a later execution, hydration, or rendering
+  failure cannot erase the successful open.
 
 The 304 path (`not_modified`, `routes.rs:1372`) and the redirect (`latest_redirect`)
 insert an `Observation` too — without timings or rows, but with operation, dataset
-and version. A 304 is the cache-hit signal doc 12's cacheability row wants, and it
+and version. The redirect derives transport from the method it preserves rather than
+assuming GET. A 304 is the cache-hit signal doc 12's cacheability row wants, and it
 must not be the one response that goes unrecorded.
 
 ### 3.4 `Rendered` gains `rows` and `cardinality`
@@ -215,8 +221,9 @@ later refinement if that ever proves false; do not build it first.
 `urllib`), `node` (`node`, `undici`), `kgf` (the client library and `kgfq`, once
 they exist — **they should send `User-Agent: kgf-client/<version>`**, and this note
 is where that requirement is recorded until doc 06 says it), else `unknown`. Keep
-the truncated raw UA beside the class; the classifier will need refining once real
-clients appear, and doc 12 §12.5.2 shows how much a UA fingerprint can identify.
+the truncated raw UA only in the raw tier; the classifier will need refining from
+access-controlled samples once real clients appear, and doc 12 §12.5.2 shows how
+much a UA fingerprint can identify.
 
 **`request_id`.** `{process_nonce:016x}-{counter:08x}`: the same per-process nonce
 and an `AtomicU64`. Unique across restarts by the nonce, ordered within one by the
@@ -227,7 +234,7 @@ MCP transcripts under-reporting endpoint traffic by 1.8× and concluded transcri
 must be joined to endpoint logs; doc 06 §6.2.1's receipts already carry "canonical
 request + request hash". A receipt that also carries the server's `request_id`s
 makes that join exact rather than heuristic. An inbound `X-Request-Id` from a client
-is logged as `client_request_id`, truncated, and never adopted as ours.
+is logged as raw-tier `client_request_id`, truncated, and never adopted as ours.
 
 ## 5. Hygiene: the two judgment calls
 
@@ -283,8 +290,9 @@ this unit. Verify both behaviours against the cluster's actual agent before rely
 on them — this is from documentation, not from a test on FRINK.
 
 **Flags on `kgf serve`** (`crates/kgf/src/serve.rs`): `--access-log stdout|off`
-(default `stdout`) and `--log-raw` (default off). A file path can come later if a
-deployment wants one; the container runtime is the log shipper today.
+(default `stdout`) and `--log-raw` (default off). The latter governs the request
+target, search string, User-Agent, and inbound request id together. A file path can
+come later if a deployment wants one; the container runtime is the log shipper today.
 
 **Throughput.** The benchmark saturated at ~5,000 req/s. A ~600-byte line per request
 is ~3 MB/s through a locked stdout, written synchronously on the request's async
@@ -334,8 +342,9 @@ active, 128 queued, 500 ms) fit the cluster.
 
 - **Shape tier leaks nothing.** Build records from requests carrying a distinctive
   token in every content position — `q=SECRET`, `s=<http://x/SECRET>`, a bindings
-  body with `"SECRET"`, a 404 path `/SECRET` — serialize, and assert the byte string
-  `SECRET` does not appear. Then the same with `--log-raw` and assert where it does.
+  body with `"SECRET"`, a 404 path `/SECRET`, `User-Agent`, and `X-Request-Id` —
+  serialize, and assert the byte string `SECRET` does not appear. Then the same with
+  `--log-raw` and assert where it does.
   This is the test that makes doc 12 §12.1 a property rather than a review item.
 - **One record per response**, over the real listener (`tests/serve.rs`).
   `Deployment::serve_config` (`serve.rs:1845`) builds `Config` directly, so it can

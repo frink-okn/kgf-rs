@@ -42,7 +42,7 @@ use mediatype::{MediaTypeBuf, names};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::access::{AccessOperation, Observation, Timed, Transport, millis};
+use crate::access::{AccessOperation, Observation, OpenTiming, Timed, Transport, millis};
 use crate::admission::WorkClass;
 use crate::answer::{self, Rendered, Renders, Target};
 use crate::descriptor::{BundleManifest, DatasetDescriptor, ServiceDescriptor};
@@ -920,24 +920,22 @@ where
     let opened = Arc::clone(&service);
     let timed = blocking(&service, work_class, move || {
         let (store, open) = opened.open_observed(target.id())?;
-        // Serialized in here, not outside: strings are materialized only while
-        // writing them, and the term cache that makes that cheap is
-        // deliberately not `Send`.
-        let mut answer = execute(&store, target, &request)?;
-        labels.hydrate(&store, &mut answer)?;
-        answer
-            .render(representation)
-            .map(|rendered| (rendered, open))
+        Ok(Opened::run(open, || {
+            // Serialized in here, not outside: strings are materialized only
+            // while writing them, and the term cache that makes that cheap is
+            // deliberately not `Send`.
+            let mut answer = execute(&store, target, &request)?;
+            labels.hydrate(&store, &mut answer)?;
+            answer.render(representation)
+        }))
     })
     .await;
     observation.queue_ms = Some(timed.queue_ms);
     observation.work_ms = timed.work_ms;
-    let (rendered, open) = match timed.result {
-        Ok(answer) => answer,
+    let rendered = match record_open(&mut observation, timed.result) {
+        Ok(rendered) => rendered,
         Err(problem) => return observed_result(Err(problem), observation),
     };
-    observation.open_ms = Some(open.open_ms);
-    observation.first_open = Some(open.first_open);
     observation.rendered(&rendered);
 
     observed_result(
@@ -1008,17 +1006,17 @@ where
     let opened = Arc::clone(&service);
     let timed = blocking(&service, work_class, move || {
         let (store, open) = opened.open_observed(target.id())?;
-        execute(&store, target, &request, representation).map(|rendered| (rendered, open))
+        Ok(Opened::run(open, || {
+            execute(&store, target, &request, representation)
+        }))
     })
     .await;
     observation.queue_ms = Some(timed.queue_ms);
     observation.work_ms = timed.work_ms;
-    let (rendered, open) = match timed.result {
-        Ok(answer) => answer,
+    let rendered = match record_open(&mut observation, timed.result) {
+        Ok(rendered) => rendered,
         Err(problem) => return observed_result(Err(problem), observation),
     };
-    observation.open_ms = Some(open.open_ms);
-    observation.first_open = Some(open.first_open);
     observation.rendered(&rendered);
 
     observed_result(
@@ -1179,21 +1177,19 @@ where
     let opened = Arc::clone(&service);
     let timed = blocking(&service, WorkClass::Heavy, move || {
         let (store, open) = opened.open_observed(target.id())?;
-        let mut answer = execute(&store, target, &request)?;
-        labels.hydrate(&store, &mut answer)?;
-        answer
-            .render(representation)
-            .map(|rendered| (rendered, open))
+        Ok(Opened::run(open, || {
+            let mut answer = execute(&store, target, &request)?;
+            labels.hydrate(&store, &mut answer)?;
+            answer.render(representation)
+        }))
     })
     .await;
     observation.queue_ms = Some(timed.queue_ms);
     observation.work_ms = timed.work_ms;
-    let (rendered, open) = match timed.result {
-        Ok(answer) => answer,
+    let rendered = match record_open(&mut observation, timed.result) {
+        Ok(rendered) => rendered,
         Err(problem) => return observed_result(Err(problem), observation),
     };
-    observation.open_ms = Some(open.open_ms);
-    observation.first_open = Some(open.first_open);
     observation.rendered(&rendered);
 
     observed_result(
@@ -1205,12 +1201,13 @@ where
 async fn latest_redirect(
     State(service): State<Arc<Service>>,
     Path((dataset, _rest)): Path<(String, String)>,
+    method: Method,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, Problem> {
     let current = service.datasets().get(&dataset)?.current();
     let observation = Observation {
         operation: Some(AccessOperation::Latest),
-        transport: Some(Transport::Get),
+        transport: transport_for_method(&method),
         dataset: Some(dataset.clone()),
         version: Some(current.to_owned()),
         shape: Some(crate::access::RequestShape::Empty {}),
@@ -1254,6 +1251,18 @@ async fn latest_redirect(
 fn unreachable_route(path: &str) -> Problem {
     tracing::error!(path, "a matched route did not have the shape it matched on");
     Problem::new(ErrorCode::InternalError, "the request could not be routed")
+}
+
+fn transport_for_method(method: &Method) -> Option<Transport> {
+    if method == Method::GET || method == Method::HEAD {
+        Some(Transport::Get)
+    } else if method == Method::POST {
+        Some(Transport::Post)
+    } else if method == query_method() {
+        Some(Transport::Query)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1754,6 +1763,34 @@ fn unattributed_error(response: &Response) -> Option<Problem> {
 // The blocking boundary
 // ---------------------------------------------------------------------------
 
+/// Work attempted after a bundle was opened successfully.
+///
+/// The open timing is carried beside the result so a later execution,
+/// hydration, or serialization failure cannot erase the successful open.
+struct Opened<T> {
+    result: Result<T, Problem>,
+    timing: OpenTiming,
+}
+
+impl<T> Opened<T> {
+    fn run(timing: OpenTiming, work: impl FnOnce() -> Result<T, Problem>) -> Self {
+        Self {
+            result: work(),
+            timing,
+        }
+    }
+}
+
+fn record_open<T>(
+    observation: &mut Observation,
+    opened: Result<Opened<T>, Problem>,
+) -> Result<T, Problem> {
+    let opened = opened?;
+    observation.open_ms = Some(opened.timing.open_ms);
+    observation.first_open = Some(opened.timing.first_open);
+    opened.result
+}
+
 /// Run store work on the blocking pool.
 ///
 /// A cold read of a mapped bundle faults pages, and a page fault stalls the
@@ -1894,5 +1931,22 @@ mod tests {
             response.extensions().get::<Problem>().map(Problem::code),
             Some(ErrorCode::RateLimited)
         );
+    }
+
+    #[test]
+    fn successful_open_timing_survives_later_work_failure() {
+        let mut observation = Observation::default();
+        let opened = Opened::run(
+            OpenTiming {
+                open_ms: 17,
+                first_open: true,
+            },
+            || Err::<(), _>(Problem::new(ErrorCode::InternalError, "later work failed")),
+        );
+
+        let problem = record_open(&mut observation, Ok(opened)).unwrap_err();
+        assert_eq!(problem.code(), ErrorCode::InternalError);
+        assert_eq!(observation.open_ms, Some(17));
+        assert_eq!(observation.first_open, Some(true));
     }
 }

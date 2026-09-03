@@ -103,7 +103,8 @@ pub struct Config {
     /// `None` disables record emission. Server-minted request identifiers are
     /// still returned so an embedder can correlate its own instrumentation.
     pub access_log: Option<Arc<dyn AccessLog>>,
-    /// Whether records include the raw request target and typed search string.
+    /// Whether records include the raw request target, typed search string,
+    /// User-Agent, and inbound request identifier.
     ///
     /// Off by default because these fields contain client-supplied content;
     /// the ordinary shape tier contains only parsed structure and magnitudes.

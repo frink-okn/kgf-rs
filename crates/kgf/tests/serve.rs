@@ -1179,6 +1179,15 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
     oversized.assert_status(413);
     let latest = server.get("/tox/latest/fragment?limit=2");
     latest.assert_status(307);
+    let malformed_rdf = server.request(
+        "GET",
+        "/tox/v/v1/fragment?s=%3Cbroken",
+        &[("Accept", "text/turtle")],
+    );
+    malformed_rdf.assert_status(400);
+    malformed_rdf.assert_header("content-type", "application/problem+json");
+    let latest_query = server.request("QUERY", "/tox/latest/fragment", &[]);
+    latest_query.assert_status(307);
 
     let responses = [
         &page,
@@ -1187,6 +1196,8 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
         &wrong_method,
         &oversized,
         &latest,
+        &malformed_rdf,
+        &latest_query,
     ];
     let records = records.records();
     assert_eq!(records.len(), responses.len());
@@ -1231,7 +1242,8 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
         page_record.client_class,
         kgf_server::access::ClientClass::Curl
     );
-    assert_eq!(page_record.client_request_id.as_deref(), Some("client-17"));
+    assert!(page_record.user_agent.is_none());
+    assert!(page_record.client_request_id.is_none());
     assert_eq!(page_record.client_hash.len(), 16);
     assert_eq!(
         page_record.forwarded_hash.as_deref().map(str::len),
@@ -1266,6 +1278,12 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
     );
     assert_eq!(records[5].dataset.as_deref(), Some("tox"));
     assert_eq!(records[5].version.as_deref(), Some("v1"));
+    assert_eq!(records[6].code, Some("bad_term_syntax"));
+    assert_eq!(records[6].representation.as_deref(), Some("json"));
+    assert_eq!(
+        records[7].transport,
+        Some(kgf_server::access::Transport::Query)
+    );
 }
 
 #[test]
@@ -1277,11 +1295,17 @@ fn shape_logging_excludes_content_and_raw_logging_is_explicit() {
     let records = RecordingAccessLog::default();
     let server = deployment.serve_with_access(Arc::new(records.clone()), false);
 
+    let fragment = format!(
+        "/tox/v/v1/fragment?s={}",
+        kgf_server::url::encode_value(&format!("<http://example.org/{SECRET}>"))
+    );
+    let user_agent = format!("curl/{SECRET}");
     server
-        .get(&format!(
-            "/tox/v/v1/fragment?s={}",
-            kgf_server::url::encode_value(&format!("<http://example.org/{SECRET}>"))
-        ))
+        .request(
+            "GET",
+            &fragment,
+            &[("User-Agent", &user_agent), ("X-Request-Id", SECRET)],
+        )
         .assert_status(200);
     server
         .get(&format!("/tox/v/v1/search?q={SECRET}&predicate=ex%3Aname"))
@@ -1351,12 +1375,18 @@ fn shape_logging_excludes_content_and_raw_logging_is_explicit() {
     let raw_records = RecordingAccessLog::default();
     let raw_server = deployment.serve_with_access(Arc::new(raw_records.clone()), true);
     raw_server
-        .get(&format!("/tox/v/v1/search?q={SECRET}&predicate=ex%3Aname"))
+        .request(
+            "GET",
+            &format!("/tox/v/v1/search?q={SECRET}&predicate=ex%3Aname"),
+            &[("User-Agent", &user_agent), ("X-Request-Id", SECRET)],
+        )
         .assert_status(200);
     let raw = raw_records.records();
     assert_eq!(raw.len(), 1);
     assert!(raw[0].target.as_deref().unwrap().contains(SECRET));
     assert_eq!(raw[0].q.as_deref(), Some(SECRET));
+    assert_eq!(raw[0].user_agent.as_deref(), Some(user_agent.as_str()));
+    assert_eq!(raw[0].client_request_id.as_deref(), Some(SECRET));
 }
 
 #[test]

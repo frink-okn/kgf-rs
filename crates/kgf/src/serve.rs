@@ -66,7 +66,7 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = AccessLogOutput::Stdout)]
     pub access_log: AccessLogOutput,
 
-    /// Include the raw request target and search string in access records.
+    /// Include raw target, search text, User-Agent, and client request id.
     #[arg(long)]
     pub log_raw: bool,
 }

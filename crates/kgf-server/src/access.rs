@@ -101,9 +101,11 @@ pub struct AccessRecord {
     pub forwarded_hash: Option<String>,
     /// Coarse user-agent family.
     pub client_class: ClientClass,
-    /// User-Agent truncated to 200 bytes at a UTF-8 boundary.
+    /// Raw-tier User-Agent truncated to 200 bytes at a UTF-8 boundary.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
-    /// Inbound X-Request-Id, truncated rather than trusted as our identifier.
+    /// Raw-tier inbound X-Request-Id, truncated rather than trusted as our identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub client_request_id: Option<String>,
     /// Content-free typed request shape.
     pub shape: Option<RequestShape>,
@@ -456,8 +458,16 @@ pub(crate) async fn record_request(
             .map_or_else(|| request.uri().path().to_owned(), ToString::to_string)
     });
     let bytes_in = content_length(request.headers()).or_else(|| request.body().size_hint().exact());
-    let user_agent = header_text(request.headers(), &USER_AGENT).map(truncate);
-    let client_request_id = header_text(request.headers(), &X_REQUEST_ID).map(truncate);
+    let user_agent_header = header_text(request.headers(), &USER_AGENT);
+    let client_class = classify(user_agent_header);
+    let user_agent = access
+        .raw
+        .then(|| user_agent_header.map(truncate))
+        .flatten();
+    let client_request_id = access
+        .raw
+        .then(|| header_text(request.headers(), &X_REQUEST_ID).map(truncate))
+        .flatten();
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -469,7 +479,6 @@ pub(crate) async fn record_request(
         .filter(|value| !value.is_empty());
     let client_hash = access.hash(&peer);
     let forwarded_hash = forwarded.map(|value| access.hash(value));
-    let client_class = classify(user_agent.as_deref());
     let queued = service.admission().queued_available();
 
     request.extensions_mut().insert(request_id.clone());
@@ -490,9 +499,8 @@ pub(crate) async fn record_request(
     let operation = observation
         .operation
         .or_else(|| route.as_deref().and_then(operation_for_route));
-    let representation = observation
-        .representation
-        .or(problem_representation)
+    let representation = problem_representation
+        .or(observation.representation)
         .map(|value| value.token().to_owned());
     let request_hash = observation.request_hash.map(hex_hash);
     let q = access.raw.then_some(observation.q).flatten();
