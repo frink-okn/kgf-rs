@@ -56,6 +56,7 @@ use kgf_store::manifest::{
 use kgf_store::store::{OpenOptions, Store, artifact};
 
 use crate::Config;
+use crate::access::{AccessState, OpenTiming, millis};
 use crate::admission::AdmissionController;
 use crate::cursor::BundleBinding;
 use crate::envelope::{ErrorCode, Problem, reflected};
@@ -97,6 +98,7 @@ pub struct Service {
     datasets: Datasets,
     descriptors: ContentDigest,
     admission: AdmissionController,
+    access: AccessState,
 }
 
 impl Service {
@@ -135,12 +137,14 @@ impl Service {
         datasets.validate_profile_caps(config.caps.max_search_predicates)?;
         let descriptors = descriptor_digest(&config, &datasets);
         let admission = AdmissionController::new(config.admission);
+        let access = AccessState::new(config.access_log.clone(), config.log_raw);
         Ok(Self {
             config,
             catalog,
             datasets,
             descriptors,
             admission,
+            access,
         })
     }
 
@@ -172,6 +176,11 @@ impl Service {
         &self.admission
     }
 
+    /// Per-process access-record identity and destination.
+    pub(crate) fn access(&self) -> &AccessState {
+        &self.access
+    }
+
     /// Open a bundle, or say why this request cannot be answered.
     ///
     /// **Blocking**: the first call for a version maps its artifacts and faults
@@ -201,6 +210,20 @@ impl Service {
                 ),
             )
         })
+    }
+
+    /// Open a bundle and report whether this lookup performed the first open.
+    pub(crate) fn open_observed(&self, id: &BundleId) -> Result<(Arc<Store>, OpenTiming), Problem> {
+        let first_open = !self.catalog.is_open(id);
+        let started = std::time::Instant::now();
+        let store = self.open(id)?;
+        Ok((
+            store,
+            OpenTiming {
+                open_ms: millis(started.elapsed()),
+                first_open,
+            },
+        ))
     }
 }
 

@@ -28,7 +28,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use kgf_server::{Admission, Config, PublicOrigin};
+use kgf_server::{Admission, Config, PublicOrigin, StdoutAccessLog};
 use kgf_store::map::PublishedRoot;
 
 /// Arguments for `kgf serve`.
@@ -61,6 +61,23 @@ pub struct Args {
     /// Milliseconds a queued request waits before receiving HTTP 429.
     #[arg(long, default_value_t = 500)]
     pub queue_timeout_ms: u64,
+
+    /// Structured access-record destination.
+    #[arg(long, value_enum, default_value_t = AccessLogOutput::Stdout)]
+    pub access_log: AccessLogOutput,
+
+    /// Include the raw request target and search string in access records.
+    #[arg(long)]
+    pub log_raw: bool,
+}
+
+/// Available destinations for structured access records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum AccessLogOutput {
+    /// Write one JSON object per response to standard output.
+    Stdout,
+    /// Disable structured access records.
+    Off,
 }
 
 /// Serve until Ctrl-C or `SIGTERM`.
@@ -73,6 +90,11 @@ pub fn run(args: Args) -> Result<()> {
         max_queued_requests: args.max_queued_requests,
         queue_timeout_ms: args.queue_timeout_ms,
     };
+    config.access_log = match args.access_log {
+        AccessLogOutput::Stdout => Some(std::sync::Arc::new(StdoutAccessLog)),
+        AccessLogOutput::Off => None,
+    };
+    config.log_raw = args.log_raw;
 
     // A current-thread runtime would serialize every request behind the one
     // that is faulting a page. Store work uses this runtime's blocking pool.

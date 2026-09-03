@@ -17,9 +17,10 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–20 are complete: all of M1 plus `o.text`, bindings, entity search,
+Units 1–22 are complete: all of M1 plus `o.text`, bindings, entity search,
 live labels, the browser workbench, the mandatory description surface, standard RDF
-serialization, and stock Comunica TPF/brTPF interoperability. Each completed unit
+serialization, stock Comunica TPF/brTPF interoperability, the bundle builder, and
+structured request logging. Each completed unit
 carries a **What landed** section written after the fact, which is where a unit's plan
 and its outcome are reconciled.
 
@@ -1508,14 +1509,40 @@ keys keeps adding them additive.
 
 ### 22. Request logging — the access record
 
-Not started. `notes/request-logging.md` is the design and the handoff: one JSON
-record per response, shape tier by default and a raw tier behind `--log-raw` per
-`../kgf` doc 12 §12.1, assembled by an outermost layer plus an `Observation` the
-handlers attach, with `KGF-Request-Id` on every response as the join key to client
-receipts. It is the deployment plan's §3.5, and the reason it is next is that the GCP
-trial is the first real traffic and doc 12's census cannot start without it. The note
-carries its own **Questions for `../kgf`**, to be merged into the list below when the
-unit lands.
+One JSON object is now emitted per response to stdout by default from `kgf serve`;
+`--access-log off` disables the sink and `--log-raw` opts into the request target and
+typed search string. The library surface takes an optional `Arc<dyn AccessLog>`, so
+embedders and real-listener tests can consume the same typed `AccessRecord` without
+scraping output. Diagnostics remain on stderr.
+
+The outermost router middleware owns the clock, request id, matched route, method,
+body-size hints, response status and size, pseudonymous peer identities, and bounded
+client headers. It emits after CORS, body limiting, problem rendering and handlers
+have all answered, which gives exactly one record for successes, revalidations,
+redirects, router errors and pre-handler failures. Every response receives a
+server-minted `KGF-Request-Id`; an inbound `X-Request-Id` is retained separately and
+never trusted as that identity. Client hashes use a process-random `RandomState`, so
+they join traffic within one process lifetime and rotate on restart.
+
+Handlers attach an `Observation` containing only facts known after parsing and release
+resolution: dataset/version, representation, transport, typed request shape, cursor
+use and canonical request hash. Bundle work returns queue and worker timings; successful
+catalog lookups additionally report open time and the deliberately racy observational
+`first_open` probe. `Rendered` now carries row count and cardinality beside completeness,
+so the record and `KGF-*` headers are derived from the same answer rather than by parsing
+serialized output. A resolved identifier is logged only after catalog lookup succeeds.
+
+The shape types contain term kinds and magnitudes, never term values. `BoundTerm`
+therefore retains the kind established by its original parse instead of re-parsing a
+string for logging. Integration tests put one distinctive secret in a bound IRI, a
+bindings body, search text and an unknown path, then prove it is absent from the whole
+serialized shape-tier log and present only in the raw tier. The same real-listener test
+covers one-record-per-response, request-id round trips, 200/304/404/405/413/307,
+completeness, row/cardinality fields, and GET, `values=`, QUERY and POST transports.
+
+The default `TraceLayer` and tower-http's `trace` feature are gone: enabling debug
+diagnostics can no longer disclose raw URIs as a second accidental access log.
+`notes/request-logging.md` is the detailed design record for this unit.
 
 ### 23. `--public-base` — serving under a path prefix
 
@@ -2212,6 +2239,26 @@ following the code.
     can still be listed from an external link, with no content and no way to suppress
     the entry. A host-wide `robots.txt` also remains a deployment concern because one
     origin may serve more than KGF.
+
+54. **`kgf serve` is now the primary KGF collection point for the shape census.**
+    Doc 12 §12.1 lists QLever, MCP, TPF and human-UI logs, but not the structured
+    access record emitted by the service whose workload the census is intended to
+    measure. It should name the server record, its shape-default/raw-opt-in split,
+    and its role as the input to the DuckDB analysis.
+55. **Every HTTP response now carries `KGF-Request-Id`.** It is a server-minted,
+    process-unique join key, distinct from an inbound `X-Request-Id`, and belongs in
+    doc 03 §3.6 beside the completeness headers.
+56. **Client receipts should carry the server request ids that produced a table.**
+    Doc 06 §6.2.1 already requires the canonical request and request hash; adding
+    these ids makes the transcript-to-access-log join exact instead of heuristic.
+57. **The canonical 64-bit `request_hash` is in the default shape tier.** It exposes
+    no term directly, but a guessed public request can be checked against it. That
+    trade is intentional because normalized repetition and paging depth are core
+    census measurements; doc 12 should record it explicitly.
+58. **KGF clients need a distinctive User-Agent.** The access record recognizes
+    `kgf-client/<version>` and `kgfq`, but doc 06 does not yet require either client
+    to send one, leaving its client-mix field unable to distinguish them from unknown
+    callers.
 
 ## Not in this plan
 
