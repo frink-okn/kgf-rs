@@ -213,11 +213,20 @@ impl std::str::FromStr for PublicBase {
         {
             return Err(PublicBaseError);
         }
-        // `""` and `/` are the root; `/kgf/` and `/kgf` are the same prefix. An
-        // empty segment anywhere else (`/kgf//x`) would emit links with `//`,
-        // which intermediaries normalize inconsistently, so it is refused too.
+        // `""` and `/` are the root; `/kgf/` and `/kgf` are the same prefix.
+        // Every other segment must be a plain one. An empty segment (`/kgf//x`)
+        // would emit links with `//`, and a dot segment (`/a/../kgf`, or its
+        // percent-encoded spelling) would emit links that a browser normalizes
+        // to a different path from the one the RDF identities carry — so the
+        // same page would be one resource to Hydra and another to a browser.
+        // Both are refused rather than normalized here: the prefix must be
+        // spelled exactly as the gateway matches it.
         let path_prefix = uri.path().trim_end_matches('/');
-        if path_prefix.contains("//") {
+        if path_prefix
+            .split('/')
+            .skip(1)
+            .any(|segment| segment.is_empty() || is_dot_segment(segment))
+        {
             return Err(PublicBaseError);
         }
         Ok(Self {
@@ -229,6 +238,27 @@ impl std::str::FromStr for PublicBase {
             path_prefix: path_prefix.to_owned(),
         })
     }
+}
+
+/// Whether a path segment is `.` or `..` in any percent-encoded spelling
+/// (RFC 3986 §3.3; `%2E` is the same octet as `.`).
+fn is_dot_segment(segment: &str) -> bool {
+    let mut dots = 0usize;
+    let mut rest = segment;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix('.') {
+            rest = after;
+        } else if let Some(after) = rest
+            .strip_prefix("%2E")
+            .or_else(|| rest.strip_prefix("%2e"))
+        {
+            rest = after;
+        } else {
+            return false;
+        }
+        dots += 1;
+    }
+    matches!(dots, 1 | 2)
 }
 
 /// A configured public base is not an HTTP(S) URL a deployment can be mounted at.
@@ -568,6 +598,14 @@ mod tests {
                 .path_prefix(),
             "/a%20b/c"
         );
+        // A segment that merely contains dots is an ordinary segment.
+        assert_eq!(
+            "https://apps.okn.us/v1.2/...x"
+                .parse::<PublicBase>()
+                .unwrap()
+                .path_prefix(),
+            "/v1.2/...x"
+        );
 
         for invalid in [
             "data.example",
@@ -577,6 +615,11 @@ mod tests {
             "https://data.example/#fragment",
             "https://data.example/kgf#f",
             "https://data.example/kgf//x",
+            "https://data.example/a/../kgf",
+            "https://data.example/./kgf",
+            "https://data.example/kgf/..",
+            "https://data.example/%2e%2e/kgf",
+            "https://data.example/a/.%2E/kgf",
             "https://:443",
             "https://user@example.com",
             "https://user@example.com/kgf",

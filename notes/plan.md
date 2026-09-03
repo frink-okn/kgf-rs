@@ -1597,7 +1597,11 @@ server-seen path and query, so the prefix appears exactly once; the `latest`
 redirect's `Location`, the masthead brand link, the service descriptor's canonical
 URL, form actions, crumbs, and term links all carry it. `render_problems` moved to
 `from_fn_with_state` so a problem's `instance` and the fallback 404's message name
-the path as the client spelled it. The descriptor ETag now hashes the whole base, so
+the path as the client spelled it, the dataset and version lookups point at `GET
+{prefix}/` and `GET {prefix}/{dataset}`, and the fallback says when the received path
+still began with the prefix, without accepting it. A base with a dot segment is
+refused, since a browser would normalize the emitted links to a path the RDF
+identities do not carry. The descriptor ETag now hashes the whole base, so
 moving a deployment to another mount invalidates every cached link. JSON
 continuations are cursor tokens, not links, and needed nothing; `stats/summary.json`
 is written with version-relative links and is prefix-safe by construction. No bundle

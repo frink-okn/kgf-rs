@@ -140,13 +140,13 @@ impl Service {
                 })?;
             manifests.push((id, manifest));
         }
-        let datasets = Datasets::derive(manifests)?;
-        datasets.validate_profile_caps(config.caps.max_search_predicates)?;
-        let descriptors = descriptor_digest(&config, &datasets);
         let mount = config
             .public_base
             .as_ref()
             .map_or_else(Mount::default, PublicBase::mount);
+        let datasets = Datasets::derive(manifests, mount.clone())?;
+        datasets.validate_profile_caps(config.caps.max_search_predicates)?;
+        let descriptors = descriptor_digest(&config, &datasets);
         let admission = AdmissionController::new(config.admission);
         let access = AccessState::new(
             config.access_log.clone(),
@@ -388,7 +388,12 @@ fn bytes_digest(bytes: &[u8]) -> ContentDigest {
 
 /// Every dataset this deployment hosts.
 #[derive(Debug, Default)]
-pub struct Datasets(BTreeMap<String, Dataset>);
+pub struct Datasets {
+    entries: BTreeMap<String, Dataset>,
+    /// Where the deployment is mounted, so a lookup failure can name the
+    /// descriptor that lists what does exist as a URL the client can follow.
+    mount: Mount,
+}
 
 impl Datasets {
     /// Build the descriptors from the manifests of every scanned bundle.
@@ -398,6 +403,7 @@ impl Datasets {
     /// testable without a filesystem.
     pub fn derive(
         manifests: impl IntoIterator<Item = (BundleId, PublishedManifest)>,
+        mount: Mount,
     ) -> Result<Self, ServiceError> {
         let mut datasets: BTreeMap<String, BTreeMap<String, Release>> = BTreeMap::new();
 
@@ -452,35 +458,37 @@ impl Datasets {
             );
         }
 
-        Ok(Self(
-            datasets
+        Ok(Self {
+            entries: datasets
                 .into_iter()
                 .map(|(name, releases)| (name, Dataset::assemble(releases)))
                 .collect(),
-        ))
+            mount,
+        })
     }
 
     /// Every dataset name, in the order `/` lists them.
     pub fn names(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.0.keys().map(String::as_str)
+        self.entries.keys().map(String::as_str)
     }
 
     /// Every dataset with its name, in the same order.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &Dataset)> {
-        self.0
+        self.entries
             .iter()
             .map(|(name, dataset)| (name.as_str(), dataset))
     }
 
     /// Look up a dataset, or the 404 that says it is not hosted here.
     pub fn get(&self, dataset: &str) -> Result<&Dataset, Problem> {
-        self.0.get(dataset).ok_or_else(|| {
+        self.entries.get(dataset).ok_or_else(|| {
             Problem::new(
                 ErrorCode::NotFound,
                 format!(
-                    "this server hosts no dataset named {:?}; GET / lists the {} it does host",
+                    "this server hosts no dataset named {:?}; GET {} lists the {} it does host",
                     reflected(dataset),
-                    self.0.len()
+                    self.mount.root(),
+                    self.entries.len()
                 ),
             )
         })
@@ -498,10 +506,10 @@ impl Datasets {
             Problem::new(
                 ErrorCode::NotFound,
                 format!(
-                    "dataset {:?} has no version {:?}; GET /{} lists its releases",
+                    "dataset {:?} has no version {:?}; GET {} lists its releases",
                     reflected(dataset),
                     reflected(version),
-                    reflected(dataset),
+                    reflected(&self.mount.dataset(dataset)),
                 ),
             )
         })
@@ -512,7 +520,7 @@ impl Datasets {
     /// but `/labels` always uses the release profile, so letting an oversized
     /// one start would make every valid labels request fail for server policy.
     fn validate_profile_caps(&self, max_predicates: u32) -> Result<(), ServiceError> {
-        for (dataset, found) in &self.0 {
+        for (dataset, found) in &self.entries {
             for (version, release) in &found.releases {
                 let labels = release.predicate_roles.get("label").unwrap_or_default();
                 if labels.len() > max_predicates as usize {
@@ -828,16 +836,19 @@ mod tests {
     fn current_is_the_most_recently_created_release() {
         // Labels that sort the wrong way round, so this can only pass by
         // reading `created`; content-hash version labels have no order at all.
-        let datasets = Datasets::derive([
-            (
-                id("tox", "aa11"),
-                published("aa11", "1", Some("2026-06-01T14:03:22Z")),
-            ),
-            (
-                id("tox", "bb22"),
-                published("bb22", "2", Some("2026-01-09T09:00:00Z")),
-            ),
-        ])
+        let datasets = Datasets::derive(
+            [
+                (
+                    id("tox", "aa11"),
+                    published("aa11", "1", Some("2026-06-01T14:03:22Z")),
+                ),
+                (
+                    id("tox", "bb22"),
+                    published("bb22", "2", Some("2026-01-09T09:00:00Z")),
+                ),
+            ],
+            Mount::default(),
+        )
         .expect("well-formed manifests");
 
         assert_eq!(datasets.get("tox").unwrap().current(), "aa11");
@@ -849,24 +860,27 @@ mod tests {
         // offset, and a fractional second. As text, "2026-06-01T09:00:00-05:00"
         // sorts before "2026-06-01T13:00:00Z" although it is an hour later, and
         // "…:00.5Z" sorts before "…:00Z" although it is half a second later.
-        let datasets = Datasets::derive([
-            (
-                id("offset", "later"),
-                published("later", "1", Some("2026-06-01T09:00:00-05:00")),
-            ),
-            (
-                id("offset", "earlier"),
-                published("earlier", "2", Some("2026-06-01T13:00:00Z")),
-            ),
-            (
-                id("fraction", "later"),
-                published("later", "3", Some("2026-06-01T13:00:00.5Z")),
-            ),
-            (
-                id("fraction", "earlier"),
-                published("earlier", "4", Some("2026-06-01T13:00:00Z")),
-            ),
-        ])
+        let datasets = Datasets::derive(
+            [
+                (
+                    id("offset", "later"),
+                    published("later", "1", Some("2026-06-01T09:00:00-05:00")),
+                ),
+                (
+                    id("offset", "earlier"),
+                    published("earlier", "2", Some("2026-06-01T13:00:00Z")),
+                ),
+                (
+                    id("fraction", "later"),
+                    published("later", "3", Some("2026-06-01T13:00:00.5Z")),
+                ),
+                (
+                    id("fraction", "earlier"),
+                    published("earlier", "4", Some("2026-06-01T13:00:00Z")),
+                ),
+            ],
+            Mount::default(),
+        )
         .expect("well-formed manifests");
 
         assert_eq!(datasets.get("offset").unwrap().current(), "later");
@@ -875,37 +889,46 @@ mod tests {
 
     #[test]
     fn an_undated_release_loses_to_a_dated_one_and_ties_break_on_the_label() {
-        let datasets = Datasets::derive([
-            (id("tox", "a"), published("a", "1", None)),
-            (id("tox", "b"), published("b", "2", None)),
-            (
-                id("tox", "c"),
-                published("c", "3", Some("2020-01-01T00:00:00Z")),
-            ),
-        ])
+        let datasets = Datasets::derive(
+            [
+                (id("tox", "a"), published("a", "1", None)),
+                (id("tox", "b"), published("b", "2", None)),
+                (
+                    id("tox", "c"),
+                    published("c", "3", Some("2020-01-01T00:00:00Z")),
+                ),
+            ],
+            Mount::default(),
+        )
         .expect("well-formed manifests");
         assert_eq!(datasets.get("tox").unwrap().current(), "c");
 
-        let undated = Datasets::derive([
-            (id("tox", "a"), published("a", "1", None)),
-            (id("tox", "b"), published("b", "2", None)),
-        ])
+        let undated = Datasets::derive(
+            [
+                (id("tox", "a"), published("a", "1", None)),
+                (id("tox", "b"), published("b", "2", None)),
+            ],
+            Mount::default(),
+        )
         .expect("well-formed manifests");
         assert_eq!(undated.get("tox").unwrap().current(), "b");
     }
 
     #[test]
     fn a_dataset_takes_its_identity_from_its_current_release() {
-        let datasets = Datasets::derive([
-            (
-                id("tox", "old"),
-                published("old", "1", Some("2020-01-01T00:00:00Z")),
-            ),
-            (
-                id("tox", "new"),
-                published("new", "2", Some("2026-01-01T00:00:00Z")),
-            ),
-        ])
+        let datasets = Datasets::derive(
+            [
+                (
+                    id("tox", "old"),
+                    published("old", "1", Some("2020-01-01T00:00:00Z")),
+                ),
+                (
+                    id("tox", "new"),
+                    published("new", "2", Some("2026-01-01T00:00:00Z")),
+                ),
+            ],
+            Mount::default(),
+        )
         .expect("well-formed manifests");
 
         let dataset = datasets.get("tox").unwrap();
@@ -947,8 +970,11 @@ mod tests {
 
     #[test]
     fn an_unknown_dataset_and_an_unknown_version_are_different_answers() {
-        let datasets =
-            Datasets::derive([(id("tox", "v1"), published("v1", "1", None))]).expect("well-formed");
+        let datasets = Datasets::derive(
+            [(id("tox", "v1"), published("v1", "1", None))],
+            Mount::default(),
+        )
+        .expect("well-formed");
 
         let no_dataset = datasets.release("nope", "v1").unwrap_err();
         let no_version = datasets.release("tox", "nope").unwrap_err();
@@ -973,9 +999,11 @@ mod tests {
         // It would otherwise be served under this directory's URL, with this
         // directory's label in every cursor and ETag, while saying it is a
         // different release.
-        let error =
-            Datasets::derive([(id("tox", "2026-06-01"), published("2026-03-01", "1", None))])
-                .expect_err("the label and the directory disagree");
+        let error = Datasets::derive(
+            [(id("tox", "2026-06-01"), published("2026-03-01", "1", None))],
+            Mount::default(),
+        )
+        .expect_err("the label and the directory disagree");
         let message = error.to_string();
         assert!(
             message.contains("2026-06-01") && message.contains("2026-03-01"),
@@ -988,15 +1016,21 @@ mod tests {
     fn a_digest_or_timestamp_that_cannot_be_parsed_stops_the_server() {
         let mut bad_digest = (*published("v1", "1", None).parsed()).clone();
         bad_digest.content_digest = "not-a-digest".to_owned();
-        let error = Datasets::derive([(
-            id("tox", "v1"),
-            PublishedManifest::of(bad_digest).expect("serializes"),
-        )])
+        let error = Datasets::derive(
+            [(
+                id("tox", "v1"),
+                PublishedManifest::of(bad_digest).expect("serializes"),
+            )],
+            Mount::default(),
+        )
         .expect_err("bad digest");
         assert!(error.to_string().contains("content_digest"), "{error}");
 
-        let error = Datasets::derive([(id("tox", "v1"), published("v1", "1", Some("June 2026")))])
-            .expect_err("bad timestamp");
+        let error = Datasets::derive(
+            [(id("tox", "v1"), published("v1", "1", Some("June 2026")))],
+            Mount::default(),
+        )
+        .expect_err("bad timestamp");
         assert!(error.to_string().contains("RFC 3339"), "{error}");
     }
 

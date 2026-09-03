@@ -490,16 +490,43 @@ fn a_public_base_with_a_path_prefixes_every_emitted_link() {
         }
     }
 
-    // A problem names the occurrence as the client spelled it.
+    // A problem names the occurrence as the client spelled it, and the
+    // descriptor it points at is a URL the client can follow.
     let missing = server.request_without_host("/nope", &json);
     missing.assert_status(404);
-    assert_eq!(missing.json()["instance"], "/kgf/nope");
+    let problem = missing.json();
+    assert_eq!(problem["instance"], "/kgf/nope");
+    assert!(
+        problem["detail"].as_str().unwrap().contains("GET /kgf/ "),
+        "{}",
+        problem["detail"]
+    );
+    let no_version = server.request_without_host("/tox/v/v9/manifest", &json);
+    no_version.assert_status(404);
+    assert!(
+        no_version.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("GET /kgf/tox "),
+        "{}",
+        no_version.json()["detail"]
+    );
 
     // The server strips nothing itself: a request that still carries the
     // prefix is a misconfigured gateway, and answering it would give one
-    // resource two URLs.
+    // resource two URLs. It cannot tell that case from a client that doubled
+    // the prefix, so it reports the path as received under the mount and says
+    // that the prefix was still present.
     let doubled = server.request_without_host("/kgf/tox", &json);
     doubled.assert_status(404);
+    let problem = doubled.json();
+    assert_eq!(problem["instance"], "/kgf/kgf/tox");
+    let detail = problem["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("already began with the mount prefix"),
+        "{detail}"
+    );
+    assert!(detail.contains("\"/kgf\""), "{detail}");
 }
 
 #[test]

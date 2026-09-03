@@ -176,14 +176,32 @@ async fn no_such_route(
 ) -> Problem {
     let mount = service.mount();
     let prefix = mount.prefix();
+    let path = uri.path();
+    // The server cannot tell a client that doubled the prefix from a gateway
+    // that forgot to strip it, and must not guess by accepting the path: the
+    // diagnostic names both readings and leaves the resolution to whoever
+    // reads it.
+    let unstripped = !prefix.is_empty()
+        && (path == prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/')));
+    let hint = if unstripped {
+        format!(
+            "; the path this server received already began with the mount prefix {prefix:?}, \
+             which the gateway in front of it is expected to remove"
+        )
+    } else {
+        String::new()
+    };
     Problem::new(
         ErrorCode::NotFound,
         format!(
             "no resource at {}; this server serves {prefix}/ (service descriptor), \
              {prefix}/{{dataset}}, and {prefix}/{{dataset}}/v/{{version}}/{{manifest,fragment,\
              count,describe,sample,search,labels,schema,void,summary}}; version resources \
-             are also available under {prefix}/{{dataset}}/latest/",
-            reflected(&mount.public_path(uri.path()))
+             are also available under {prefix}/{{dataset}}/latest/{hint}",
+            reflected(&mount.public_path(path))
         ),
     )
 }
