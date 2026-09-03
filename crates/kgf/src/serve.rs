@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use kgf_server::{AccessLog, Admission, Config, PublicOrigin, StdoutAccessLog};
+use kgf_server::{AccessLog, Admission, Config, PublicBase, StdoutAccessLog};
 use kgf_store::map::PublishedRoot;
 
 /// Arguments for `kgf serve`.
@@ -43,9 +43,10 @@ pub struct Args {
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub bind: SocketAddr,
 
-    /// Trusted external origin for Hydra IRIs when serving behind a TLS or host-rewriting proxy.
-    #[arg(long, value_name = "ORIGIN")]
-    pub public_origin: Option<PublicOrigin>,
+    /// External base URL when serving behind a reverse proxy: scheme, host, and the path prefix
+    /// the proxy strips (e.g. https://apps.okn.us/kgf). Every emitted link and Hydra IRI carries it.
+    #[arg(long, value_name = "URL")]
+    pub public_base: Option<PublicBase>,
 
     /// Concurrent ordinary bundle-work units; heavy requests consume multiple units.
     #[arg(long, default_value_t = 32)]
@@ -100,7 +101,7 @@ impl AccessLogOutput {
 /// Serve until Ctrl-C or `SIGTERM`.
 pub fn run(args: Args) -> Result<()> {
     let mut config = Config::new(published_root(&args.bundle_root)?, args.bind);
-    config.public_origin = args.public_origin;
+    config.public_base = args.public_base;
     config.admission = Admission {
         max_concurrent_work: args.max_concurrent_work,
         heavy_request_weight: args.heavy_request_weight,

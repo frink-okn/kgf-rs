@@ -378,7 +378,7 @@ fn a_trusted_public_origin_drives_hydra_identity_and_continuations() {
 
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
-    let server = deployment.serve_with_public_origin("https://data.example");
+    let server = deployment.serve_with_public_base("https://data.example");
     let target = "/tox/v/v1/fragment?p=ex%3Aknows&limit=1";
     let response = server.request_without_host(target, &[("Accept", "text/turtle")]);
     response.assert_status(200);
@@ -401,6 +401,132 @@ fn a_trusted_public_origin_drives_hydra_identity_and_continuations() {
         quad.predicate.as_str() == HYDRA_TEMPLATE
             && matches!(&quad.object, oxrdf::Term::Literal(value) if value.value() == format!("{dataset}{{?s,p,o}}"))
     }));
+}
+
+#[test]
+fn a_public_base_with_a_path_prefixes_every_emitted_link() {
+    const HYDRA_NEXT: &str = "http://www.w3.org/ns/hydra/core#next";
+    const HYDRA_TEMPLATE: &str = "http://www.w3.org/ns/hydra/core#template";
+
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    // The gateway matched `/kgf` and removed it before forwarding: every
+    // request below arrives without the prefix, as the pod sees it, and every
+    // link in the answers must put it back or the client's next request lands
+    // on whatever else the shared hostname serves at `/tox`.
+    let server = deployment.serve_with_public_base("https://apps.okn.us/kgf");
+    let json = [("Accept", "application/json")];
+
+    // The service descriptor's dataset and release links.
+    let descriptor = server.request_without_host("/", &json);
+    descriptor.assert_status(200);
+    let dataset = &descriptor.json()["datasets"][0];
+    assert_eq!(dataset["url"], "/kgf/tox");
+    for (_, link) in dataset["links"].as_object().unwrap() {
+        let link = link.as_str().unwrap();
+        assert!(link.starts_with("/kgf/tox/v/v1/"), "{link}");
+    }
+
+    // The dataset descriptor's release history.
+    let releases = server.request_without_host("/tox", &json);
+    releases.assert_status(200);
+    assert_eq!(releases.json()["releases"][0]["url"], "/kgf/tox/v/v1/");
+
+    // The `latest` redirect: `Location` is a URL the client will request, and
+    // its requests go through the gateway.
+    let redirect = server.request_without_host("/tox/latest/summary", &[]);
+    redirect.assert_status(307);
+    let location = redirect.header("location").expect("a redirect location");
+    assert!(location.starts_with("/kgf/tox/v/"), "{location}");
+
+    // A JSON continuation is a cursor token the client appends to the URL it
+    // already holds, not a link, so there is nothing to prefix; the check is
+    // that it is still a token and not a path the mount would have to touch.
+    let target = "/tox/v/v1/fragment?p=ex%3Aknows&limit=1";
+    let page_one = server.request_without_host(target, &json);
+    page_one.assert_status(200);
+    let next = page_one.json()["next"].as_str().unwrap().to_owned();
+    assert!(!next.contains('/'), "{next}");
+
+    // The Hydra identities are the whole base followed by the server-seen
+    // path: the prefix once, never twice.
+    let turtle = server.request_without_host(target, &[("Accept", "text/turtle")]);
+    turtle.assert_status(200);
+    let graph: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+        .for_slice(&turtle.body)
+        .collect::<Result<_, _>>()
+        .expect("fragment Turtle parses");
+    let operation = "https://apps.okn.us/kgf/tox/v/v1/fragment";
+    let page = format!("https://apps.okn.us/kgf{target}");
+    assert!(graph.iter().any(|quad| {
+        matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == page)
+            && quad.predicate.as_str() == "http://www.w3.org/ns/hydra/core#totalItems"
+    }));
+    assert!(graph.iter().any(|quad| {
+        quad.predicate.as_str() == HYDRA_NEXT
+            && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str().starts_with(operation))
+    }));
+    assert!(graph.iter().any(|quad| {
+        quad.predicate.as_str() == HYDRA_TEMPLATE
+            && matches!(&quad.object, oxrdf::Term::Literal(value) if value.value() == format!("{operation}{{?s,p,o}}"))
+    }));
+    assert!(
+        !String::from_utf8_lossy(&turtle.body).contains("/kgf/kgf/"),
+        "the prefix was applied twice"
+    );
+
+    // The page: the brand link, the form action, and every root-relative link.
+    let html = server.request_without_host(target, &[("Accept", "text/html")]);
+    html.assert_status(200);
+    let text = html.text();
+    assert!(text.contains("class=\"brand\" href=\"/kgf/\""));
+    assert!(text.contains("action=\"/kgf/tox/v/v1/fragment\""));
+    for (href, _) in links(&text) {
+        if href.starts_with('/') {
+            assert!(
+                href.starts_with("/kgf/"),
+                "root-relative link escapes the mount: {href}"
+            );
+        }
+    }
+
+    // A problem names the occurrence as the client spelled it, and the
+    // descriptor it points at is a URL the client can follow.
+    let missing = server.request_without_host("/nope", &json);
+    missing.assert_status(404);
+    let problem = missing.json();
+    assert_eq!(problem["instance"], "/kgf/nope");
+    assert!(
+        problem["detail"].as_str().unwrap().contains("GET /kgf/ "),
+        "{}",
+        problem["detail"]
+    );
+    let no_version = server.request_without_host("/tox/v/v9/manifest", &json);
+    no_version.assert_status(404);
+    assert!(
+        no_version.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("GET /kgf/tox "),
+        "{}",
+        no_version.json()["detail"]
+    );
+
+    // The server strips nothing itself: a request that still carries the
+    // prefix is a misconfigured gateway, and answering it would give one
+    // resource two URLs. It cannot tell that case from a client that doubled
+    // the prefix, so it reports the path as received under the mount and says
+    // that the prefix was still present.
+    let doubled = server.request_without_host("/kgf/tox", &json);
+    doubled.assert_status(404);
+    let problem = doubled.json();
+    assert_eq!(problem["instance"], "/kgf/kgf/tox");
+    let detail = problem["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("already began with the mount prefix"),
+        "{detail}"
+    );
+    assert!(detail.contains("\"/kgf\""), "{detail}");
 }
 
 #[test]
@@ -2137,11 +2263,11 @@ impl Deployment {
         self.serve_config(caps, budgets, None)
     }
 
-    fn serve_with_public_origin(&self, public_origin: &str) -> Server {
+    fn serve_with_public_base(&self, public_base: &str) -> Server {
         self.serve_config(
             kgf_server::Caps::new(),
             kgf_server::Budgets::new(),
-            Some(public_origin.parse().expect("a valid public origin")),
+            Some(public_base.parse().expect("a valid public base")),
         )
     }
 
@@ -2149,12 +2275,12 @@ impl Deployment {
         &self,
         caps: kgf_server::Caps,
         budgets: kgf_server::Budgets,
-        public_origin: Option<kgf_server::PublicOrigin>,
+        public_base: Option<kgf_server::PublicBase>,
     ) -> Server {
         self.serve_configured(|config| {
             config.caps = caps;
             config.budgets = budgets;
-            config.public_origin = public_origin;
+            config.public_base = public_base;
         })
     }
 

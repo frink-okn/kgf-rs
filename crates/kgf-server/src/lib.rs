@@ -28,7 +28,7 @@
 //!
 //! # Status
 //!
-//! Units 10–22 in `notes/plan.md` are implemented: [`cursor`], [`term`],
+//! Units 10–23 in `notes/plan.md` are implemented: [`cursor`], [`term`],
 //! [`envelope`], the URL space with `latest`, caching and content negotiation,
 //! and the read operations `/fragment`, `/count`, `/describe`, `/sample`
 //! and `/schema`, the `/void` and `/summary` description resources, plus bindings
@@ -84,14 +84,18 @@ pub struct Config {
     pub bundle_root: PublishedRoot,
     /// Address to bind.
     pub bind: std::net::SocketAddr,
-    /// Trusted external origin used for absolute Hydra IRIs when TLS or host
-    /// rewriting happens in a reverse proxy.
+    /// The trusted external base this deployment is reachable at, when TLS
+    /// termination, host rewriting, or path-prefix stripping happens in a
+    /// reverse proxy.
     ///
-    /// Forwarding headers are deliberately not trusted implicitly: an
-    /// untrusted client could otherwise choose the dataset and continuation
-    /// IRIs emitted in a response. Leave this unset for direct plain-HTTP
-    /// service, where the request's `Host` is authoritative.
-    pub public_origin: Option<PublicOrigin>,
+    /// Its origin replaces the request's `Host` in absolute Hydra IRIs, and
+    /// its path — the prefix the proxy removed — is put back on every link the
+    /// server emits. Forwarding headers are deliberately not trusted
+    /// implicitly: an untrusted client could otherwise choose the dataset and
+    /// continuation IRIs emitted in a response. Leave this unset for direct
+    /// plain-HTTP service at a hostname root, where the request's `Host` is
+    /// authoritative and no link needs a prefix.
+    pub public_base: Option<PublicBase>,
     /// The largest values a request may ask for.
     pub caps: Caps,
     /// The work one response may cost.
@@ -126,7 +130,7 @@ impl Config {
         Self {
             bundle_root,
             bind,
-            public_origin: None,
+            public_base: None,
             caps: Caps::default(),
             budgets: Budgets::default(),
             admission: Admission::default(),
@@ -145,52 +149,124 @@ impl Config {
     }
 }
 
-/// A deployment's trusted externally visible scheme and authority.
+/// A deployment's trusted externally visible base: `scheme://authority`, plus
+/// the path prefix a gateway strips before requests reach this server.
 ///
-/// This is an origin, not a base URL: KGF's route paths are appended exactly
-/// as received, so a path, query, or fragment here would produce ambiguous
-/// resource identities.
+/// The path is *what the gateway removed*, nothing more. The router stays
+/// mounted at `/` and never accepts the prefixed spelling; the base only
+/// changes what the server emits — every root-relative link gains the prefix,
+/// and every absolute IRI starts with the whole base. A base with a query,
+/// fragment, or userinfo is refused: none of those can be part of a resource's
+/// identity.
+///
+/// Normalized: `http` or `https`, a non-empty host, no trailing slash, and the
+/// path percent-encoded exactly as typed, because the gateway matched those
+/// bytes and the emitted links must repeat them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublicOrigin(String);
+pub struct PublicBase {
+    /// `scheme://authority`.
+    origin: String,
+    /// `""` or `/segment(/segment)*`.
+    path_prefix: String,
+}
 
-impl PublicOrigin {
-    /// The normalized `scheme://authority` spelling, without a trailing slash.
-    pub fn as_str(&self) -> &str {
-        &self.0
+impl PublicBase {
+    /// The whole base, `scheme://authority[/prefix]`, without a trailing slash.
+    ///
+    /// An absolute IRI is this followed by the server-seen path and query.
+    pub fn as_str(&self) -> String {
+        format!("{}{}", self.origin, self.path_prefix)
+    }
+
+    /// The `scheme://authority` part alone.
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// The path the gateway removes: `""` at a hostname root, else `/kgf`.
+    ///
+    /// Never a bare `/`, so `format!("{prefix}/{dataset}")` is right in both
+    /// cases.
+    pub fn path_prefix(&self) -> &str {
+        &self.path_prefix
+    }
+
+    /// The mount every emitted link is built against.
+    pub fn mount(&self) -> url::Mount {
+        url::Mount::with_prefix(&self.path_prefix)
     }
 }
 
-impl std::str::FromStr for PublicOrigin {
-    type Err = PublicOriginError;
+impl std::str::FromStr for PublicBase {
+    type Err = PublicBaseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if value.contains('#') {
-            return Err(PublicOriginError);
+            return Err(PublicBaseError);
         }
-        let uri: axum::http::Uri = value.parse().map_err(|_| PublicOriginError)?;
-        let authority = uri.authority().ok_or(PublicOriginError)?;
+        let uri: axum::http::Uri = value.parse().map_err(|_| PublicBaseError)?;
+        let authority = uri.authority().ok_or(PublicBaseError)?;
         if !matches!(uri.scheme_str(), Some("http" | "https"))
             || authority.host().is_empty()
             || authority.as_str().contains('@')
-            || !matches!(uri.path(), "" | "/")
             || uri.query().is_some()
         {
-            return Err(PublicOriginError);
+            return Err(PublicBaseError);
         }
-        Ok(Self(format!(
-            "{}://{}",
-            uri.scheme_str().expect("checked above"),
-            authority
-        )))
+        // `""` and `/` are the root; `/kgf/` and `/kgf` are the same prefix.
+        // Every other segment must be a plain one. An empty segment (`/kgf//x`)
+        // would emit links with `//`, and a dot segment (`/a/../kgf`, or its
+        // percent-encoded spelling) would emit links that a browser normalizes
+        // to a different path from the one the RDF identities carry — so the
+        // same page would be one resource to Hydra and another to a browser.
+        // Both are refused rather than normalized here: the prefix must be
+        // spelled exactly as the gateway matches it.
+        let path_prefix = uri.path().trim_end_matches('/');
+        if path_prefix
+            .split('/')
+            .skip(1)
+            .any(|segment| segment.is_empty() || is_dot_segment(segment))
+        {
+            return Err(PublicBaseError);
+        }
+        Ok(Self {
+            origin: format!(
+                "{}://{}",
+                uri.scheme_str().expect("checked above"),
+                authority
+            ),
+            path_prefix: path_prefix.to_owned(),
+        })
     }
 }
 
-/// A configured public origin is not an HTTP(S) origin.
+/// Whether a path segment is `.` or `..` in any percent-encoded spelling
+/// (RFC 3986 §3.3; `%2E` is the same octet as `.`).
+fn is_dot_segment(segment: &str) -> bool {
+    let mut dots = 0usize;
+    let mut rest = segment;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix('.') {
+            rest = after;
+        } else if let Some(after) = rest
+            .strip_prefix("%2E")
+            .or_else(|| rest.strip_prefix("%2e"))
+        {
+            rest = after;
+        } else {
+            return false;
+        }
+        dots += 1;
+    }
+    matches!(dots, 1 | 2)
+}
+
+/// A configured public base is not an HTTP(S) URL a deployment can be mounted at.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error(
-    "expected an absolute http:// or https:// origin with a host and no userinfo, path, query, or fragment"
+    "expected an absolute http:// or https:// base with a host, an optional path prefix, and no userinfo, query, or fragment"
 )]
-pub struct PublicOriginError;
+pub struct PublicBaseError;
 
 /// The largest values a request may ask for.
 ///
@@ -496,24 +572,59 @@ mod tests {
     }
 
     #[test]
-    fn public_origins_are_typed_and_normalized() {
+    fn public_bases_are_typed_and_normalized() {
+        let root = "https://data.example:8443/".parse::<PublicBase>().unwrap();
+        assert_eq!(root.as_str(), "https://data.example:8443");
+        assert_eq!(root.origin(), "https://data.example:8443");
+        assert_eq!(root.path_prefix(), "");
+        assert_eq!(root.mount(), url::Mount::default());
+
+        // A path is the prefix a gateway strips; with or without the trailing
+        // slash it is the same deployment.
+        let mounted = "https://apps.okn.us/kgf".parse::<PublicBase>().unwrap();
+        assert_eq!(mounted.as_str(), "https://apps.okn.us/kgf");
+        assert_eq!(mounted.origin(), "https://apps.okn.us");
+        assert_eq!(mounted.path_prefix(), "/kgf");
+        assert_eq!(mounted.mount().dataset("tox"), "/kgf/tox");
         assert_eq!(
-            "https://data.example:8443/"
-                .parse::<PublicOrigin>()
-                .unwrap()
-                .as_str(),
-            "https://data.example:8443"
+            "https://apps.okn.us/kgf/".parse::<PublicBase>().unwrap(),
+            mounted
         );
+        // Spelled as typed: the gateway matched these bytes.
+        assert_eq!(
+            "https://apps.okn.us/a%20b/c"
+                .parse::<PublicBase>()
+                .unwrap()
+                .path_prefix(),
+            "/a%20b/c"
+        );
+        // A segment that merely contains dots is an ordinary segment.
+        assert_eq!(
+            "https://apps.okn.us/v1.2/...x"
+                .parse::<PublicBase>()
+                .unwrap()
+                .path_prefix(),
+            "/v1.2/...x"
+        );
+
         for invalid in [
             "data.example",
             "ftp://data.example",
-            "https://data.example/kgf",
             "https://data.example/?tenant=a",
+            "https://data.example/kgf?x",
             "https://data.example/#fragment",
+            "https://data.example/kgf#f",
+            "https://data.example/kgf//x",
+            "https://data.example/a/../kgf",
+            "https://data.example/./kgf",
+            "https://data.example/kgf/..",
+            "https://data.example/%2e%2e/kgf",
+            "https://data.example/a/.%2E/kgf",
             "https://:443",
             "https://user@example.com",
+            "https://user@example.com/kgf",
         ] {
-            assert!(invalid.parse::<PublicOrigin>().is_err(), "{invalid}");
+            assert!(invalid.parse::<PublicBase>().is_err(), "{invalid}");
         }
     }
 

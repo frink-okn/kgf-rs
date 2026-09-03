@@ -1,8 +1,10 @@
 //! Reading and writing the KGF URL space.
 //!
 //! Separate from the router because both directions have callers that are not
-//! the router: [`crate::html`] writes links into pages, and unit 14's
-//! operations read the same query parameters this module parses.
+//! the router: [`crate::html`] writes links into pages, and the operations
+//! read the same query parameters this module parses. Every link written is
+//! built through a [`Mount`], which is how a deployment behind a
+//! prefix-stripping gateway gets its prefix back into what it emits.
 //!
 //! A dataset or version label is a *directory name* on the server, so it can
 //! hold characters that mean something in a URL — a `?` would turn the rest of
@@ -39,23 +41,92 @@ pub fn encode_value(value: &str) -> String {
     utf8_percent_encode(value, RESERVED_IN_SEGMENT).to_string()
 }
 
-/// The base of a bundle version: `/{dataset}/v/{version}/`.
-pub fn bundle_base(dataset: &str, version: &str) -> String {
-    format!(
-        "/{}/v/{}/",
-        encode_segment(dataset),
-        encode_segment(version)
-    )
+// ---------------------------------------------------------------------------
+// Writing a link
+// ---------------------------------------------------------------------------
+
+/// Where this deployment is mounted: the path a gateway removes before a
+/// request reaches this server, or nothing.
+///
+/// The router is always mounted at `/`; a mount changes only what the server
+/// *emits*. Behind a gateway that matches `/kgf` and rewrites it away, the
+/// request for `/tox` arrives as `/tox`, and every link the answer carries must
+/// say `/kgf/tox` or the client's next request lands outside the route. The
+/// server never accepts the prefixed spelling itself: one resource has one URL,
+/// and a second accepted path would break cache identity.
+///
+/// The prefix is `""` or `/{segment}(/{segment})*` — never a bare `/` and
+/// never trailing one — so that prefix followed by a root-relative path is a
+/// well-formed path in both cases. Only [`PublicBase`](crate::PublicBase)
+/// produces a non-empty one, from the base an operator configured, so a prefix
+/// is spelled exactly as the operator typed it, which is what the gateway
+/// matched.
+///
+/// Cheap to clone: a request's [`Target`](crate::answer::Target) carries one,
+/// and the string behind it is shared with the service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mount(std::sync::Arc<str>);
+
+impl Default for Mount {
+    /// Mounted at the root: no gateway prefix, every link root-relative.
+    fn default() -> Self {
+        Self(std::sync::Arc::from(""))
+    }
 }
 
-/// An operation under a bundle version: `/{dataset}/v/{version}/{operation}`.
-pub fn operation(dataset: &str, version: &str, operation: &str) -> String {
-    format!("{}{operation}", bundle_base(dataset, version))
-}
+impl Mount {
+    /// A mount under `prefix`, which the caller has already normalized.
+    pub(crate) fn with_prefix(prefix: &str) -> Self {
+        debug_assert!(
+            prefix.is_empty() || (prefix.starts_with('/') && !prefix.ends_with('/')),
+            "a mount prefix is empty or /segment(/segment)*: {prefix:?}"
+        );
+        Self(std::sync::Arc::from(prefix))
+    }
 
-/// A dataset descriptor: `/{dataset}`.
-pub fn dataset(name: &str) -> String {
-    format!("/{}", encode_segment(name))
+    /// The prefix itself: `""` or `/kgf`.
+    pub fn prefix(&self) -> &str {
+        &self.0
+    }
+
+    /// The service descriptor: `/` or `/kgf/`.
+    ///
+    /// With the trailing slash, because `/kgf` alone is what the gateway
+    /// matches and a link that omits the slash depends on the gateway's
+    /// rewrite normalizing it.
+    pub fn root(&self) -> String {
+        format!("{}/", self.0)
+    }
+
+    /// A dataset descriptor: `/{dataset}`.
+    pub fn dataset(&self, name: &str) -> String {
+        format!("{}/{}", self.0, encode_segment(name))
+    }
+
+    /// The base of a bundle version: `/{dataset}/v/{version}/`.
+    pub fn bundle_base(&self, dataset: &str, version: &str) -> String {
+        format!(
+            "{}/{}/v/{}/",
+            self.0,
+            encode_segment(dataset),
+            encode_segment(version)
+        )
+    }
+
+    /// An operation under a bundle version: `/{dataset}/v/{version}/{operation}`.
+    pub fn operation(&self, dataset: &str, version: &str, operation: &str) -> String {
+        format!("{}{operation}", self.bundle_base(dataset, version))
+    }
+
+    /// The public spelling of a path this server received.
+    ///
+    /// For a message or a problem's `instance`: the path the client sent was
+    /// the prefixed one, and echoing the stripped path back names a resource
+    /// the client never asked for. `server_path` is a request path and so
+    /// begins with `/`.
+    pub fn public_path(&self, server_path: &str) -> String {
+        format!("{}{server_path}", self.0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -237,13 +308,51 @@ mod tests {
 
     #[test]
     fn the_url_space_uses_the_expected_routes() {
-        assert_eq!(dataset("tox"), "/tox");
-        assert_eq!(bundle_base("tox", "2026-06-01"), "/tox/v/2026-06-01/");
+        let root = Mount::default();
+        assert_eq!(root.root(), "/");
+        assert_eq!(root.dataset("tox"), "/tox");
+        assert_eq!(root.bundle_base("tox", "2026-06-01"), "/tox/v/2026-06-01/");
         assert_eq!(
-            operation("tox", "2026-06-01", "manifest"),
+            root.operation("tox", "2026-06-01", "manifest"),
             "/tox/v/2026-06-01/manifest"
         );
-        assert_eq!(bundle_base("a b", "c?d"), "/a%20b/v/c%3Fd/");
+        assert_eq!(root.bundle_base("a b", "c?d"), "/a%20b/v/c%3Fd/");
+        assert_eq!(root.public_path("/tox"), "/tox");
+    }
+
+    #[test]
+    fn a_mounted_deployment_prefixes_every_link_and_never_doubles_the_slash() {
+        let mounted = Mount::with_prefix("/kgf");
+        assert_eq!(mounted.root(), "/kgf/");
+        assert_eq!(mounted.dataset("tox"), "/kgf/tox");
+        assert_eq!(
+            mounted.bundle_base("tox", "2026-06-01"),
+            "/kgf/tox/v/2026-06-01/"
+        );
+        assert_eq!(
+            mounted.operation("tox", "2026-06-01", "fragment"),
+            "/kgf/tox/v/2026-06-01/fragment"
+        );
+        assert_eq!(mounted.public_path("/"), "/kgf/");
+        assert_eq!(
+            mounted.public_path("/tox/latest/summary"),
+            "/kgf/tox/latest/summary"
+        );
+
+        // A prefix is spelled as the operator typed it: the gateway matched
+        // those bytes, so the emitted link must repeat them.
+        let nested = Mount::with_prefix("/okn/kg%20f");
+        assert_eq!(nested.dataset("tox"), "/okn/kg%20f/tox");
+
+        for link in [
+            mounted.root(),
+            mounted.dataset("tox"),
+            mounted.bundle_base("tox", "v1"),
+            mounted.operation("tox", "v1", "count"),
+        ] {
+            assert!(link.starts_with("/kgf/"), "{link}");
+            assert!(!link.contains("//"), "{link}");
+        }
     }
 
     #[test]

@@ -82,9 +82,9 @@ than forcing those resources into the default JSON representation.
 returning a plausible wrong answer. Do not replace one with a stub that returns a
 default.
 
-**`notes/plan.md` is the implementation route** — units 1–22, all complete, through
-doc 20 §20.8's M1, search, bindings, the description surface, the bundle builder, and
-request logging, plus the decisions each one had to make and the **Questions for `../kgf`**
+**`notes/plan.md` is the implementation route** — units 1–23, all complete, through
+doc 20 §20.8's M1, search, bindings, the description surface, the bundle builder,
+request logging, and serving under a path prefix, plus the decisions each one had to make and the **Questions for `../kgf`**
 that implementation surfaced. It is kept current; read it before planning work.
 `notes/state.md` is a point-in-time handoff, written at a moment and not maintained
 afterwards, so where the two disagree about what exists, `plan.md` and the code win.

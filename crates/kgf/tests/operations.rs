@@ -1568,6 +1568,7 @@ impl Served {
             operation,
             params(query),
             self.release().prefixes().clone(),
+            kgf_server::url::Mount::default(),
         )
     }
 
@@ -1663,6 +1664,7 @@ impl Served {
                 "fragment",
                 params(""),
                 self.release().prefixes().clone(),
+                kgf_server::url::Mount::default(),
             ),
             &request,
         )
@@ -1691,6 +1693,7 @@ impl Served {
                     "count",
                     params(""),
                     self.release().prefixes().clone(),
+                    kgf_server::url::Mount::default(),
                 ),
                 &request,
             )
@@ -1824,6 +1827,7 @@ impl Served {
                     "labels",
                     params(""),
                     self.release().prefixes().clone(),
+                    kgf_server::url::Mount::default(),
                 ),
                 &request,
             )
@@ -1846,6 +1850,7 @@ impl Served {
             operation,
             params(query),
             self.release().prefixes().clone(),
+            kgf_server::url::Mount::default(),
         );
         let rendered = match operation {
             "fragment" => {
