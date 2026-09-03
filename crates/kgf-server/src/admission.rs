@@ -161,8 +161,13 @@ impl AdmissionController {
         .with_retry_after(self.limits.retry_after_seconds())
     }
 
-    /// Waiting-room slots available at this instant.
-    pub(crate) fn queued_available(&self) -> usize {
+    /// Requests in the waiting room at this instant.
+    pub(crate) fn waiting(&self) -> usize {
+        (self.limits.max_queued_requests as usize).saturating_sub(self.queued.available_permits())
+    }
+
+    #[cfg(test)]
+    fn queued_available(&self) -> usize {
         self.queued.available_permits()
     }
 }

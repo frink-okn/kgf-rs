@@ -1056,6 +1056,7 @@ dependencies = [
  "axum-extra",
  "base64",
  "bytes",
+ "getrandom 0.3.4",
  "hdtc",
  "headers",
  "headers-accept",

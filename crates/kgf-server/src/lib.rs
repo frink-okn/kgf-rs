@@ -72,7 +72,7 @@ pub use admission::Admission;
 /// values they read are the values applied. Admission is host policy rather
 /// than a per-request cost promise; clients encounter it through the standard
 /// `rate_limited` problem and `Retry-After`.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Directory of bundles, laid out as `{root}/{dataset}/{version}`.
     ///
@@ -109,25 +109,14 @@ pub struct Config {
     /// Off by default because these fields contain client-supplied content;
     /// the ordinary shape tier contains only parsed structure and magnitudes.
     pub log_raw: bool,
-}
-
-impl std::fmt::Debug for Config {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Config")
-            .field("bundle_root", &self.bundle_root)
-            .field("bind", &self.bind)
-            .field("public_origin", &self.public_origin)
-            .field("caps", &self.caps)
-            .field("budgets", &self.budgets)
-            .field("admission", &self.admission)
-            .field(
-                "access_log",
-                &self.access_log.as_ref().map(|_| "configured"),
-            )
-            .field("log_raw", &self.log_raw)
-            .finish()
-    }
+    /// Reverse proxies between the listener and its clients that append to
+    /// `X-Forwarded-For`.
+    ///
+    /// Zero, the default, ignores the header: the peer is the client, and a
+    /// caller cannot pick its own pseudonymous identity by sending one. Behind
+    /// one gateway, set one; a record's `forwarded_hash` then names the
+    /// address that gateway received the request from.
+    pub trusted_proxies: u8,
 }
 
 impl Config {
@@ -143,6 +132,7 @@ impl Config {
             admission: Admission::default(),
             access_log: None,
             log_raw: false,
+            trusted_proxies: 0,
         }
     }
 

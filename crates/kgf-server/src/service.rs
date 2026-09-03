@@ -88,6 +88,11 @@ pub enum ServiceError {
     /// The catalog could not scan the bundle root.
     #[error(transparent)]
     Catalog(#[from] kgf_store::Error),
+
+    /// The operating system supplied no randomness for the access log's
+    /// per-process salt and request-id prefix.
+    #[error("could not obtain randomness for access-record identities: {0}")]
+    Entropy(#[from] getrandom::Error),
 }
 
 /// The bundles this process serves, and everything derived from them.
@@ -137,7 +142,11 @@ impl Service {
         datasets.validate_profile_caps(config.caps.max_search_predicates)?;
         let descriptors = descriptor_digest(&config, &datasets);
         let admission = AdmissionController::new(config.admission);
-        let access = AccessState::new(config.access_log.clone(), config.log_raw);
+        let access = AccessState::new(
+            config.access_log.clone(),
+            config.log_raw,
+            config.trusted_proxies,
+        )?;
         Ok(Self {
             config,
             catalog,

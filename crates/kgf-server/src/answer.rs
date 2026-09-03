@@ -3188,7 +3188,9 @@ pub fn get_fragment(
 ) -> Result<Answer, Problem> {
     match request {
         request::GetFragment::Plain(request) => fragment(store, target, request),
-        request::GetFragment::Bindings(request) => binding_fragment(store, target, request),
+        request::GetFragment::Values(request) | request::GetFragment::Variables(request) => {
+            binding_fragment(store, target, request)
+        }
     }
 }
 

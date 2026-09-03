@@ -26,9 +26,10 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use kgf_server::{Admission, Config, PublicOrigin, StdoutAccessLog};
+use kgf_server::{AccessLog, Admission, Config, PublicOrigin, StdoutAccessLog};
 use kgf_store::map::PublishedRoot;
 
 /// Arguments for `kgf serve`.
@@ -69,6 +70,10 @@ pub struct Args {
     /// Include raw target, search text, User-Agent, and client request id.
     #[arg(long)]
     pub log_raw: bool,
+
+    /// Reverse proxies in front of this server that append to X-Forwarded-For; 0 ignores the header.
+    #[arg(long, default_value_t = 0)]
+    pub trusted_proxies: u8,
 }
 
 /// Available destinations for structured access records.
@@ -78,6 +83,18 @@ pub enum AccessLogOutput {
     Stdout,
     /// Disable structured access records.
     Off,
+}
+
+impl AccessLogOutput {
+    /// The sink this destination names, with its writer thread started.
+    pub fn sink(self) -> Result<Option<Arc<dyn AccessLog>>> {
+        Ok(match self {
+            Self::Stdout => Some(Arc::new(
+                StdoutAccessLog::new().context("start the access-log writer")?,
+            )),
+            Self::Off => None,
+        })
+    }
 }
 
 /// Serve until Ctrl-C or `SIGTERM`.
@@ -90,11 +107,9 @@ pub fn run(args: Args) -> Result<()> {
         max_queued_requests: args.max_queued_requests,
         queue_timeout_ms: args.queue_timeout_ms,
     };
-    config.access_log = match args.access_log {
-        AccessLogOutput::Stdout => Some(std::sync::Arc::new(StdoutAccessLog)),
-        AccessLogOutput::Off => None,
-    };
+    config.access_log = args.access_log.sink()?;
     config.log_raw = args.log_raw;
+    config.trusted_proxies = args.trusted_proxies;
 
     // A current-thread runtime would serialize every request behind the one
     // that is faulting a page. Store work uses this runtime's blocking pool.
@@ -133,4 +148,15 @@ pub fn published_root(root: &Path) -> Result<PublishedRoot> {
     // root while running is explicitly permitted by this constructor, and is
     // the only mutation a normal deployment performs.
     Ok(unsafe { PublishedRoot::new(&canonical) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_off_destination_configures_no_sink() {
+        assert!(AccessLogOutput::Off.sink().unwrap().is_none());
+        assert!(AccessLogOutput::Stdout.sink().unwrap().is_some());
+    }
 }

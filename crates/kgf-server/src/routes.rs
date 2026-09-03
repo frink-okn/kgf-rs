@@ -104,6 +104,7 @@ pub fn router(service: Arc<Service>) -> Router {
         // is the whole reason the backstop exists. It must sit *inside* CORS,
         // because it sets `Vary: Accept` with `insert` and CORS appends its own
         // afterwards; the other way round would wipe them.
+        //
         // Two body limits, because they catch different things.
         // `RequestBodyLimitLayer` enforces the published figure on the wire
         // whether or not anything reads the body. `DefaultBodyLimit` is what
@@ -183,9 +184,13 @@ async fn service_descriptor(
     wants: Wants,
 ) -> Result<Response, Problem> {
     let representation = wants.representation()?;
-    let mut observation =
-        Observation::operation(AccessOperation::Service, Transport::Get, representation);
-    observation.shape = Some(crate::access::RequestShape::Empty {});
+    let observation = Observation::operation(
+        service.access(),
+        AccessOperation::Service,
+        Transport::Get,
+        representation,
+    )
+    .empty_shape();
     observed_result(
         respond(
             &ServiceDescriptor::of(&service),
@@ -209,10 +214,14 @@ async fn dataset_descriptor(
 ) -> Result<Response, Problem> {
     let found = service.datasets().get(&dataset)?;
     let representation = wants.representation()?;
-    let mut observation =
-        Observation::operation(AccessOperation::Dataset, Transport::Get, representation)
-            .resolved(&dataset, None);
-    observation.shape = Some(crate::access::RequestShape::Empty {});
+    let observation = Observation::operation(
+        service.access(),
+        AccessOperation::Dataset,
+        Transport::Get,
+        representation,
+    )
+    .resolved(&dataset, None)
+    .empty_shape();
     observed_result(
         respond(
             &DatasetDescriptor::of(&dataset, found),
@@ -241,10 +250,14 @@ async fn bundle_manifest(
     // incomplete is a 500 about the bundle rather than a 400 about the request.
     let representation = wants.representation()?;
     let release = service.datasets().release(&dataset, &version)?;
-    let mut observation =
-        Observation::operation(AccessOperation::Manifest, Transport::Get, representation)
-            .resolved(&dataset, Some(&version));
-    observation.shape = Some(crate::access::RequestShape::Empty {});
+    let mut observation = Observation::operation(
+        service.access(),
+        AccessOperation::Manifest,
+        Transport::Get,
+        representation,
+    )
+    .resolved(&dataset, Some(&version))
+    .empty_shape();
     let validator = etag(
         release.digest(),
         service.descriptor_digest(),
@@ -868,20 +881,19 @@ where
         ));
     }
     let release = service.datasets().release(&id.dataset, &id.version)?;
-    let transport = if wants.params().get("values").is_some() {
-        Transport::GetValues
-    } else {
-        Transport::Get
-    };
-    let mut observation = Observation::operation(operation, transport, representation)
-        .resolved(&id.dataset, Some(&id.version));
+    let mut observation =
+        Observation::operation(service.access(), operation, Transport::Get, representation)
+            .resolved(&id.dataset, Some(&id.version));
     let params = Q::normalize_params(wants.params());
     let request = match parse(&params, service.config().limits(), release, representation) {
         Ok(request) => request,
         Err(problem) => return observed_result(Err(problem), observation),
     };
     let work_class = request.work_class();
-    observe_request(&mut observation, &request, work_class);
+    // The grammar the parser selected says how the request arrived; one that
+    // failed to parse selected none and stays plain GET.
+    observation.transport = Some(request.transport());
+    observation.request(&request, work_class);
 
     // A versioned operation is a deterministic function of immutable bytes,
     // so the URL and the representation fix the response
@@ -905,7 +917,7 @@ where
 
     let target = Target::get(
         id,
-        operation.as_str(),
+        operation.path_segment(),
         params,
         release.prefixes().clone(),
         release.declares(Capability::Search),
@@ -970,15 +982,16 @@ where
 {
     let representation = wants.representation_from(offered)?;
     let release = service.datasets().release(&id.dataset, &id.version)?;
-    let mut observation = Observation::operation(operation, Transport::Get, representation)
-        .resolved(&id.dataset, Some(&id.version));
+    let mut observation =
+        Observation::operation(service.access(), operation, Transport::Get, representation)
+            .resolved(&id.dataset, Some(&id.version));
     let params = Q::normalize_params(wants.params());
     let request = match parse(&params, service.config().limits(), release) {
         Ok(request) => request,
         Err(problem) => return observed_result(Err(problem), observation),
     };
     let work_class = request.work_class();
-    observe_request(&mut observation, &request, work_class);
+    observation.request(&request, work_class);
     let validator = etag(
         release.digest(),
         service.descriptor_digest(),
@@ -997,7 +1010,7 @@ where
 
     let target = Target::get(
         id,
-        operation.as_str(),
+        operation.path_segment(),
         params,
         release.prefixes().clone(),
         release.declares(Capability::Search),
@@ -1135,17 +1148,24 @@ where
     let cache = method.cache();
     let representation = wants.representation()?;
     let release = service.datasets().release(&id.dataset, &id.version)?;
-    let mut observation = Observation::operation(operation, method.transport(), representation)
-        .resolved(&id.dataset, Some(&id.version));
+    let mut observation = Observation::operation(
+        service.access(),
+        operation,
+        method.transport(),
+        representation,
+    )
+    .resolved(&id.dataset, Some(&id.version));
+    // Measured, not declared: the bytes the extractor actually buffered.
+    observation.bytes_in = Some(body.len() as u64);
     let request = match parse(wants.params(), &body, service.config().limits(), release) {
         Ok(request) => request,
         Err(problem) => return observed_result(Err(problem), observation),
     };
-    observe_request(&mut observation, &request, WorkClass::Heavy);
+    observation.request(&request, WorkClass::Heavy);
     let validator = etag_for_body(
         release.digest(),
         service.descriptor_digest(),
-        operation.as_str(),
+        operation.path_segment(),
         representation,
         &body,
     );
@@ -1169,7 +1189,7 @@ where
 
     let target = Target::body(
         id,
-        operation.as_str(),
+        operation.path_segment(),
         wants.params().clone(),
         release.prefixes().clone(),
     );
@@ -1205,14 +1225,10 @@ async fn latest_redirect(
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, Problem> {
     let current = service.datasets().get(&dataset)?.current();
-    let observation = Observation {
-        operation: Some(AccessOperation::Latest),
-        transport: transport_for_method(&method),
-        dataset: Some(dataset.clone()),
-        version: Some(current.to_owned()),
-        shape: Some(crate::access::RequestShape::Empty {}),
-        ..Observation::default()
-    };
+    let mut observation = Observation::new(service.access(), AccessOperation::Latest)
+        .resolved(&dataset, Some(current))
+        .empty_shape();
+    observation.transport = transport_for_method(&method);
 
     // Rewritten on the *raw* path rather than on the decoded captures: whatever
     // encoding the client used for the rest of the path is what the redirect
@@ -1412,19 +1428,11 @@ fn absolute_request_url(
 // Rendering
 // ---------------------------------------------------------------------------
 
-fn observe_request(
-    observation: &mut Observation,
-    request: &impl request::ObservedRequest,
-    work_class: WorkClass,
-) {
-    observation.work_class = Some(work_class);
-    observation.shape = Some(request.shape());
-    observation.cursor = request.resumed();
-    observation.request_hash = request.request_hash();
-    observation.q = request.raw_query().map(str::to_owned);
-}
-
 /// Carry handler metadata outward on both successful and problem responses.
+///
+/// A problem is rendered here rather than returned, so the observation rides
+/// the same response the problem renderer will decorate. Nothing is attached
+/// when no sink will read it.
 fn observed_result(
     result: Result<Response, Problem>,
     observation: Observation,
@@ -1433,7 +1441,9 @@ fn observed_result(
         Ok(response) => response,
         Err(problem) => problem.into_response(),
     };
-    response.extensions_mut().insert(observation);
+    if observation.recording() {
+        response.extensions_mut().insert(observation);
+    }
     Ok(response)
 }
 

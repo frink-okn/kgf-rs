@@ -68,7 +68,7 @@ the line is also readable by eye.
 | field | type | source | tier |
 |---|---|---|---|
 | `time` | RFC 3339, UTC | `jiff::Timestamp::now()` (already a dependency) | shape |
-| `severity` | `"INFO"` | constant; see §6 for why it is there | shape |
+| `severity` | `INFO` / `WARNING` / `ERROR` | derived from `status`, §6 | shape |
 | `request_id` | string | minted by the layer, §4 | shape |
 | `method` | `GET` / `POST` / `QUERY` / `HEAD` / `OPTIONS` / other | request | shape |
 | `route` | the matched route template, e.g. `/{dataset}/v/{version}/fragment`, or `null` for a 404 | axum `MatchedPath`, §3 | shape |
@@ -76,19 +76,19 @@ the line is also readable by eye.
 | `transport` | `get` / `get-values` (brTPF `values=`) / `query` / `post` | handler | shape |
 | `dataset`, `version` | strings, **only once the service has resolved the release** — never a client string the catalog does not know | handler, after `Datasets::release` (`service.rs:447`) | shape |
 | `representation` | `Representation::token()` | handler / problem renderer | shape |
-| `status` | u16 | response | shape |
+| `status` | u16, or `null` when the client went away before a response existed | response, §3.1 | shape |
 | `code` | `ErrorCode::as_str()` or `null` | §3.2 | shape |
 | `work_class` | `ordinary` / `heavy` / `null` (no store work) | `GetRequest::work_class` | shape |
 | `queue_ms`, `work_ms`, `total_ms` | integers | §3.3 | shape |
-| `queued` | admission waiting-room slots available at entry | §9 | shape |
-| `bytes_in`, `bytes_out` | integers or `null` | body size hints | shape |
+| `waiting` | requests in the admission waiting room at entry | §9 | shape |
+| `bytes_in`, `bytes_out` | integers or `null` | `bytes_in` is what a body handler read, never a declared `Content-Length`; `bytes_out` is the response body's exact size hint | shape |
 | `complete`, `truncation_reason` | bool, token or `null` | `Rendered.completeness` | shape |
 | `rows` | integer or `null` | `Rendered.rows` (new, §3.4) | shape |
 | `cardinality`, `exact` | integer or `null`, bool | the answer's `Cardinality` | shape |
 | `cursor` | bool — the request resumed one | typed request | shape |
 | `request_hash` | 16 hex chars or `null` | `CanonicalRequest::hash` where a binding exists, §5 | shape |
 | `open_ms`, `first_open` | integer or `null`, bool | §8 | shape |
-| `client_hash`, `forwarded_hash` | 16 hex chars | §4 | shape |
+| `client_hash`, `forwarded_hash` | 16 hex chars or `null` | §4 | shape |
 | `client_class` | `comunica` / `browser` / `curl` / `python` / `node` / `kgf` / `unknown` | §4 | shape |
 | `user_agent` | truncated to 200 bytes | header | **raw** |
 | `client_request_id` | truncated inbound `X-Request-Id`, if any | header | **raw** |
@@ -129,8 +129,10 @@ One `middleware::from_fn_with_state` added as the **last** `.layer` in
 the layer sees every response including CORS preflights and the body-limit 413.
 
 On the way in: start the clock, mint `request_id` (§4), read method, `User-Agent`,
-peer address, inbound `X-Request-Id`, `Content-Length`; classify the User-Agent but
-retain the two raw headers only when `--log-raw` is enabled. On the way out: read
+peer address, and inbound `X-Request-Id`; classify the User-Agent but retain the two
+raw headers only when `--log-raw` is enabled. `Content-Length` is deliberately not
+read: it is a number the client chose, and `bytes_in` is instead what a body handler
+actually buffered (§3.3), `null` when nothing read a body. On the way out: read
 `status`, `code` (§3.2), `bytes_out` from `body.size_hint().exact()` — every body
 this server builds is `Body::from(Bytes)` or `Body::empty()`, so the hint is exact
 and nothing is buffered; a streamed body, should one ever exist, logs `null`. Then
@@ -138,6 +140,15 @@ take the handler's `Observation` out of the response extensions, merge, and hand
 record to the sink (§6). Set `KGF-Request-Id` on the response before returning it.
 When problem rendering selected the response representation, that rendered value wins
 over the operation representation retained in the handler observation.
+
+The facts gathered on the way in live in an `InFlight` guard whose `Drop` emits the
+record if the handler never returned. That is what happens when a client disconnects
+mid-request: hyper drops the service future, and without the guard the request would
+vanish from the census while the bundle work it admitted ran to completion. Such a
+record has `status: null`, no `Observation`, and the time to the cancellation. When no
+sink is configured the guard mints only the request id, and every `Observation`
+setter is a no-op, so a deployment with `--access-log off` pays for nothing but the
+header.
 
 `route` and `operation` come from axum's `MatchedPath` extension, which needs the
 `matched-path` feature on the workspace's `axum` dependency (currently `http1`,
@@ -202,19 +213,33 @@ routes the change through every answer, which is the reason `Renders` is a trait
 the peer is only available if that becomes
 `router.into_make_service_with_connect_info::<SocketAddr>()`, after which the layer
 reads `ConnectInfo<SocketAddr>` from the request extensions. Behind the FRINK
-gateway the peer is the gateway, and the client is the first hop of
+gateway the peer is the gateway, and the client is the entry the gateway appended to
 `X-Forwarded-For`. The `public_origin` design deliberately does not trust forwarding
-headers for *IRIs*; for a log the only risk is spoofed attribution, so record both:
-`client_hash` over the peer, `forwarded_hash` over the first forwarded hop when the
-header is present. The analyst picks the meaningful one per deployment.
+headers for *IRIs*, and a log cannot either: spoofed attribution is exactly what a
+census of client behaviour must resist, so record both — `client_hash` over the
+peer, `forwarded_hash` over the hop the configured trusted chain reports (below).
 
-**Hashing.** `hex(SHA-256(salt ‖ address))[..16]`, with `salt` random per process.
-`std::hash::RandomState::new()` is seeded randomly per process and hashing a
-constant through it yields 64 bits with no new dependency. Identities are therefore
-stable within a process lifetime and unlinkable across restarts. That is doc 12's
-"hash and rotate" at the coarsest useful granularity: the census rows that need
-identity (sessions, co-access) span hours, not deploys. A daily-rotating salt is a
-later refinement if that ever proves false; do not build it first.
+**Hashing.** `hex(SHA-256(salt ‖ address))[..16]`, with a 32-byte `salt` drawn from
+the operating system (`getrandom`, already in the tree under `rand`) once per
+process. Identities are therefore stable within a process lifetime and unlinkable
+across restarts. That is doc 12's "hash and rotate" at the coarsest useful
+granularity: the census rows that need identity (sessions, co-access) span hours,
+not deploys. A daily-rotating salt is a later refinement if that ever proves false;
+do not build it first. The first implementation hashed addresses through
+`std::hash::RandomState` instead and derived the request-id prefix from the same
+keyed hasher; that published a known-plaintext output of the key protecting a
+2³²-address space on every response, over a hash `std` documents as neither
+cryptographic nor stable across releases. The request-id prefix is now eight
+independent random bytes, and the salt is never printed — `AccessState`'s `Debug`
+omits it.
+
+**Forwarded hops.** `X-Forwarded-For` is only as trustworthy as the proxy that
+appended to it, and its leftmost entry is whatever the caller sent.
+`Config::trusted_proxies` (`kgf serve --trusted-proxies N`, default 0) says how many
+trusted proxies stand in front of the listener; the client is the `N`-th entry from
+the end of the combined list, every header line included, and a list shorter than
+`N` trusts nothing. At the default the header is ignored and `forwarded_hash` is
+`null`, so a caller cannot choose its own identity by sending one.
 
 **`client_class`** from `User-Agent`: `comunica` (contains `Comunica`), `browser`
 (starts `Mozilla/`), `curl`, `python` (`python-requests`, `httpx`, `aiohttp`,
@@ -278,28 +303,34 @@ filtered to it — works, but needs the `json` feature, nests under tracing's ow
 `level`/`target`/`fields` conventions, and is awkward to assert on. Pick the struct.
 
 **Streams.** Access records to **stdout**, diagnostics (everything `tracing` does
-today) to **stderr**, as now. One Cloud Logging detail decides two things: GKE's
-logging agent assigns severity *from the stream* when a JSON line carries no
-`severity` field — stdout lines become INFO, stderr lines become ERROR. So the
-record carries `"severity":"INFO"` (free, harmless elsewhere), and the existing
-startup `info!` lines on stderr will show as ERROR in Cloud Logging until
-`install_logging` (`main.rs:54`) emits JSON with a `severity` field.
-`tracing-subscriber`'s JSON formatter writes `level`, not `severity`, so that needs a
-small custom `FormatEvent` or a stream change; it is cosmetic and **not** part of
-this unit. Verify both behaviours against the cluster's actual agent before relying
-on them — this is from documentation, not from a test on FRINK.
+today) to **stderr**, as now. The record carries a `severity` derived from what the
+server did, in the syslog/OpenTelemetry vocabulary any log system routes on without
+a mapping: `ERROR` for a 5xx, `WARNING` for a 429 (the server refused work it would
+normally do), `INFO` for everything else — a client error is the server answering as
+designed, and an abandoned request (`status: null`) is the client's decision, not a
+fault. Nothing here is specific to one hosting platform; an agent that assigns
+severity from the stream instead will find the field consistent with what it would
+have guessed for stdout. The startup `info!` lines on stderr are still
+`tracing-subscriber`'s text format; making those JSON with the same `severity`
+field is cosmetic and **not** part of this unit.
 
 **Flags on `kgf serve`** (`crates/kgf/src/serve.rs`): `--access-log stdout|off`
 (default `stdout`) and `--log-raw` (default off). The latter governs the request
 target, search string, User-Agent, and inbound request id together. A file path can
 come later if a deployment wants one; the container runtime is the log shipper today.
 
-**Throughput.** The benchmark saturated at ~5,000 req/s. A ~600-byte line per request
-is ~3 MB/s through a locked stdout, written synchronously on the request's async
-task. That is fine. If it ever shows in a profile, the fix is a bounded channel and
-a writer thread (the `tracing-appender` non-blocking shape). Do not build it first,
-and if it is built, drop records rather than block the reactor — a full log channel
-must never become back-pressure on bundle reads.
+**The writer thread.** The benchmark saturated at ~5,000 req/s; a ~600-byte line per
+request is ~3 MB/s, and throughput was never the concern. Blocking was: standard
+output is a pipe, a pipe fills when the log shipper behind it stalls, and a
+synchronous write on the request's async task would then park a tokio worker on a
+process-wide stdout mutex — the same hazard that keeps every `Store` read on
+`spawn_blocking`. So `StdoutAccessLog` serializes the line on the request task and
+hands it to a bounded queue (4,096 lines) drained by one dedicated thread. A full
+queue drops the record and counts it; the writer reports the count on stderr once
+it catches up. Records are lost only while the shipper is stalled, and the server
+keeps answering. `Drop` sends a stop marker and joins the thread, so a graceful
+shutdown flushes what is queued. A full log queue must never become back-pressure
+on bundle reads, and now cannot.
 
 ## 7. What to do with `TraceLayer`
 
@@ -330,13 +361,15 @@ the probe.
 ## 9. Admission
 
 A 429 is a `Problem` with `RateLimited`, so the record gets `code: rate_limited`
-through §3.2, and `queue_ms` says how long the request waited before refusal. Add
-`queued` — the waiting room's available permits at entry — on every record:
-`AdmissionController::queued_available` (`admission.rs:165`) is `cfg(test)` today
-and is a single `Semaphore::available_permits`; make it `pub(crate)`. Together with
-`time` this is the *peak concurrency* row of doc 12 §12.2, and it is what tells the
-operator whether the defaults `Admission::new` chose from the local load pass (32
-active, 128 queued, 500 ms) fit the cluster.
+through §3.2, and `queue_ms` says how long the request waited before refusal. Every
+record also carries `waiting` — the number of requests in the waiting room when this
+one arrived, `max_queued_requests` minus the semaphore's free permits
+(`AdmissionController::waiting`). It is recorded as a count of waiters rather than
+of free slots so that it reads the way its name does: an idle server logs `0`, a
+saturated one logs the configured maximum. Together with `time` this is the *peak
+concurrency* row of doc 12 §12.2, and it is what tells the operator whether the
+defaults `Admission::new` chose from the local load pass (32 active, 128 queued,
+500 ms) fit the cluster.
 
 ## 10. Tests
 
@@ -355,7 +388,17 @@ active, 128 queued, 500 ms) fit the cluster.
   `rows`/`complete`/`truncation_reason` equal to the `KGF-*` headers the existing
   completeness test reads (`serve.rs:1397`).
 - **The id round-trips.** Every response carries `KGF-Request-Id`, distinct per
-  response, equal to its record's `request_id`.
+  response, equal to its record's `request_id` — and is still minted, distinct, and
+  returned when no sink is configured.
+- **An abandoned request is still recorded.** A unit test drops the `InFlight` guard
+  without finishing it and reads back one record with `status: null`.
+- **A stalled writer never blocks a caller.** A unit test gates the writer inside its
+  first write, overfills the queue, and asserts the extra record was dropped and
+  counted while every `push` returned; releasing the gate and dropping the log then
+  drains the queue in order.
+- **Forwarded identity comes from the trusted hop.** Over the real listener with
+  `trusted_proxies = 1`, a caller-prepended entry does not change `forwarded_hash`,
+  the last entry does, and with the default `0` the header is ignored.
 - **Bindings and brTPF transports** are told apart: QUERY, POST, and GET `values=`
   produce `transport` `query`/`post`/`get-values` with `shape.k`.
 - **429 mapping** is a unit test on the layer's `Problem` → record path with a

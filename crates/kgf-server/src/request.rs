@@ -51,7 +51,7 @@ use kgf_store::{
 };
 
 use crate::Limits;
-use crate::access::RequestShape;
+use crate::access::{RequestShape, Transport};
 use crate::admission::WorkClass;
 use crate::cursor::{
     BundleBinding, CanonicalRequest, Cursor, CursorBinding, Operation, StaleCursor,
@@ -1731,7 +1731,9 @@ pub enum GetFragment {
     /// Ordinary TPF/KGF query parameters.
     Plain(Fragment),
     /// A brTPF variable pattern restricted by `values=`.
-    Bindings(BindingFragment),
+    Values(BindingFragment),
+    /// A brTPF variable pattern with no `values=` restriction yet.
+    Variables(BindingFragment),
 }
 
 impl GetFragment {
@@ -1746,7 +1748,7 @@ impl GetFragment {
     ) -> Result<Self, Problem> {
         if params.get("values").is_some() {
             BindingFragment::parse_values(params, limits, prefixes, bundle, rdf_representation)
-                .map(Self::Bindings)
+                .map(Self::Values)
         } else if Position::ALL.into_iter().any(|position| {
             params
                 .get(position.as_str())
@@ -1759,7 +1761,7 @@ impl GetFragment {
                 bundle,
                 rdf_representation,
             )
-            .map(Self::Bindings)
+            .map(Self::Variables)
         } else {
             Fragment::parse_with(params, limits, prefixes, bundle, rdf_representation)
                 .map(Self::Plain)
@@ -1770,7 +1772,7 @@ impl GetFragment {
     pub fn text(&self) -> Option<&TextFilter> {
         match self {
             Self::Plain(request) => request.pattern.text(),
-            Self::Bindings(_) => None,
+            Self::Values(_) | Self::Variables(_) => None,
         }
     }
 }
@@ -2592,6 +2594,12 @@ pub(crate) trait GetRequest: ObservedRequest {
     fn work_class(&self) -> WorkClass {
         WorkClass::Ordinary
     }
+
+    /// How the request arrived, when the grammar its parser selected says
+    /// more than "GET".
+    fn transport(&self) -> Transport {
+        Transport::Get
+    }
 }
 
 impl ObservedRequest for Fragment {
@@ -2616,21 +2624,21 @@ impl ObservedRequest for GetFragment {
     fn shape(&self) -> RequestShape {
         match self {
             Self::Plain(request) => request.shape(),
-            Self::Bindings(request) => request.shape(),
+            Self::Values(request) | Self::Variables(request) => request.shape(),
         }
     }
 
     fn resumed(&self) -> bool {
         match self {
             Self::Plain(request) => request.resumed(),
-            Self::Bindings(request) => request.resumed(),
+            Self::Values(request) | Self::Variables(request) => request.resumed(),
         }
     }
 
     fn request_hash(&self) -> Option<[u8; 8]> {
         match self {
             Self::Plain(request) => request.request_hash(),
-            Self::Bindings(request) => request.request_hash(),
+            Self::Values(request) | Self::Variables(request) => request.request_hash(),
         }
     }
 }
@@ -2830,7 +2838,14 @@ impl GetRequest for GetFragment {
     fn work_class(&self) -> WorkClass {
         match self {
             Self::Plain(request) => request.work_class(),
-            Self::Bindings(_) => WorkClass::Heavy,
+            Self::Values(_) | Self::Variables(_) => WorkClass::Heavy,
+        }
+    }
+
+    fn transport(&self) -> Transport {
+        match self {
+            Self::Values(_) => Transport::GetValues,
+            Self::Plain(_) | Self::Variables(_) => Transport::Get,
         }
     }
 }
@@ -3843,7 +3858,7 @@ mod tests {
         );
         let parsed =
             GetFragment::parse(&params(&query), limits(), &prefixes(), &bundle(), true).unwrap();
-        let GetFragment::Bindings(parsed) = parsed else {
+        let GetFragment::Values(parsed) = parsed else {
             panic!("values= must select the bindings grammar")
         };
         let row = parsed.rows().next().unwrap();
@@ -3868,7 +3883,7 @@ mod tests {
         );
         let parsed =
             GetFragment::parse(&params(&query), limits(), &prefixes(), &bundle(), false).unwrap();
-        let GetFragment::Bindings(parsed) = parsed else {
+        let GetFragment::Values(parsed) = parsed else {
             panic!("values= must select the bindings grammar")
         };
         let mut rows = parsed.rows();
@@ -3893,7 +3908,7 @@ mod tests {
         );
         let parsed =
             GetFragment::parse(&params(&query), limits(), &prefixes(), &bundle(), false).unwrap();
-        let GetFragment::Bindings(parsed) = parsed else {
+        let GetFragment::Values(parsed) = parsed else {
             panic!("values= must select the bindings grammar")
         };
         let literal = parsed

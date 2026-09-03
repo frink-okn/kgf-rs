@@ -1202,7 +1202,7 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
     let records = records.records();
     assert_eq!(records.len(), responses.len());
     for (record, response) in records.iter().zip(responses) {
-        assert_eq!(record.status, response.status);
+        assert_eq!(record.status, Some(response.status));
         assert_eq!(
             response.header("kgf-request-id").as_deref(),
             Some(record.request_id.as_str())
@@ -1244,7 +1244,7 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
     );
     assert!(page_record.user_agent.is_none());
     assert!(page_record.client_request_id.is_none());
-    assert_eq!(page_record.client_hash.len(), 16);
+    assert_eq!(page_record.client_hash.as_deref().map(str::len), Some(16));
     assert_eq!(
         page_record.forwarded_hash.as_deref().map(str::len),
         Some(16)
@@ -1256,7 +1256,7 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
         serde_json::json!({"pattern": "???", "text": false, "limit": 2})
     );
 
-    assert_eq!(records[1].status, 304);
+    assert_eq!(records[1].status, Some(304));
     assert!(records[1].work_class.is_none());
     assert!(records[1].work_ms.is_none());
     assert_eq!(records[2].route, None);
@@ -1360,6 +1360,9 @@ fn shape_logging_excludes_content_and_raw_logging_is_explicit() {
         shape_records[3].transport,
         Some(kgf_server::access::Transport::Post)
     );
+    assert_eq!(shape_records[0].bytes_in, None);
+    assert_eq!(shape_records[2].bytes_in, Some(body.len() as u64));
+    assert_eq!(shape_records[3].bytes_in, Some(body.len() as u64));
     assert_eq!(
         shape_records[4].transport,
         Some(kgf_server::access::Transport::GetValues)
@@ -1387,6 +1390,66 @@ fn shape_logging_excludes_content_and_raw_logging_is_explicit() {
     assert_eq!(raw[0].q.as_deref(), Some(SECRET));
     assert_eq!(raw[0].user_agent.as_deref(), Some(user_agent.as_str()));
     assert_eq!(raw[0].client_request_id.as_deref(), Some(SECRET));
+}
+
+#[test]
+fn request_ids_are_minted_without_an_access_log() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    let first = server.get("/");
+    first.assert_status(200);
+    let second = server.get("/tox/v/v1/fragment?limit=1");
+    second.assert_status(200);
+
+    let first_id = first.header("kgf-request-id").expect("a minted request id");
+    let second_id = second
+        .header("kgf-request-id")
+        .expect("a minted request id");
+    assert_ne!(first_id, second_id);
+    assert_eq!(first_id.len(), "0123456789abcdef-00000000".len());
+}
+
+#[test]
+fn forwarded_identity_comes_from_the_trusted_hop_only() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+
+    let records = RecordingAccessLog::default();
+    let server = deployment.serve_with_access(Arc::new(records.clone()), false);
+    server
+        .request("GET", "/", &[("X-Forwarded-For", "192.0.2.9")])
+        .assert_status(200);
+    server
+        .request("GET", "/", &[("X-Forwarded-For", "10.0.0.1, 192.0.2.9")])
+        .assert_status(200);
+    server
+        .request("GET", "/", &[("X-Forwarded-For", "192.0.2.9, 10.0.0.1")])
+        .assert_status(200);
+    server.get("/").assert_status(200);
+    let records = records.records();
+    assert_eq!(records[0].forwarded_hash.as_deref().map(str::len), Some(16));
+    assert_eq!(
+        records[0].forwarded_hash, records[1].forwarded_hash,
+        "an entry the caller prepended must not change its identity"
+    );
+    assert_ne!(records[0].forwarded_hash, records[2].forwarded_hash);
+    assert_eq!(records[3].forwarded_hash, None);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.client_hash == records[0].client_hash)
+    );
+
+    let unproxied = RecordingAccessLog::default();
+    let direct = deployment.serve_configured(|config| {
+        config.access_log = Some(Arc::new(unproxied.clone()));
+    });
+    direct
+        .request("GET", "/", &[("X-Forwarded-For", "192.0.2.9")])
+        .assert_status(200);
+    assert_eq!(unproxied.records()[0].forwarded_hash, None);
 }
 
 #[test]
@@ -2088,36 +2151,28 @@ impl Deployment {
         budgets: kgf_server::Budgets,
         public_origin: Option<kgf_server::PublicOrigin>,
     ) -> Server {
-        self.serve_config_with_access(caps, budgets, public_origin, None, false)
+        self.serve_configured(|config| {
+            config.caps = caps;
+            config.budgets = budgets;
+            config.public_origin = public_origin;
+        })
     }
 
+    /// Serve with a recording sink behind one trusted forwarding hop.
     fn serve_with_access(&self, access_log: Arc<dyn AccessLog>, log_raw: bool) -> Server {
-        self.serve_config_with_access(
-            kgf_server::Caps::new(),
-            kgf_server::Budgets::new(),
-            None,
-            Some(access_log),
-            log_raw,
-        )
+        self.serve_configured(|config| {
+            config.access_log = Some(access_log);
+            config.log_raw = log_raw;
+            config.trusted_proxies = 1;
+        })
     }
 
-    fn serve_config_with_access(
-        &self,
-        caps: kgf_server::Caps,
-        budgets: kgf_server::Budgets,
-        public_origin: Option<kgf_server::PublicOrigin>,
-        access_log: Option<Arc<dyn AccessLog>>,
-        log_raw: bool,
-    ) -> Server {
+    fn serve_configured(&self, configure: impl FnOnce(&mut kgf_server::Config)) -> Server {
         let mut config = kgf_server::Config::new(
             kgf::serve::published_root(self.root.path()).expect("a published root"),
             "127.0.0.1:0".parse().unwrap(),
         );
-        config.caps = caps;
-        config.budgets = budgets;
-        config.public_origin = public_origin;
-        config.access_log = access_log;
-        config.log_raw = log_raw;
+        configure(&mut config);
         let service = Arc::new(Service::build(config).expect("a servable deployment"));
 
         let runtime = tokio::runtime::Builder::new_multi_thread()

@@ -1521,10 +1521,15 @@ body-size hints, response status and size, pseudonymous peer identities, and a c
 client class. Raw client headers are retained only in the opt-in tier. It emits after
 CORS, body limiting, problem rendering and handlers have all answered, which gives
 exactly one record for successes, revalidations,
-redirects, router errors and pre-handler failures. Every response receives a
+redirects, router errors and pre-handler failures — and, through a drop guard, for
+requests the client abandoned before a response existed (`status: null`). Every
+response receives a
 server-minted `KGF-Request-Id`; an inbound `X-Request-Id` is retained separately only
-in the raw tier and never trusted as that identity. Client hashes use a process-random
-`RandomState`, so they join traffic within one process lifetime and rotate on restart.
+in the raw tier and never trusted as that identity. Client hashes are
+`SHA-256(salt ‖ address)` truncated to 64 bits under a per-process salt from the
+operating system, so they join traffic within one process lifetime and rotate on
+restart; `forwarded_hash` is taken from the hop `--trusted-proxies` names and is
+`null` at the default of zero.
 
 Handlers attach an `Observation` containing only facts known after parsing and release
 resolution: dataset/version, representation, transport, typed request shape, cursor
@@ -1540,13 +1545,31 @@ requested representation; successful open timing survives later execution, hydra
 or rendering errors; and `latest` derives its transport from the method its 307
 preserves.
 
+A second review reworked the parts that had been reasoned about only for throughput
+or only for the happy path. The stdout sink now serializes on the request task and
+writes from its own thread through a bounded queue, dropping and counting rather than
+parking a tokio worker on a stalled log pipe. Client pseudonyms moved from
+`RandomState` to salted SHA-256, with the request-id prefix drawn independently, so
+nothing published on a response is an output of the key that protects addresses.
+`bytes_in` is what a body handler buffered, never the declared `Content-Length`;
+`waiting` counts requests in the admission queue rather than free slots; `severity`
+is derived from the status in the generic syslog vocabulary rather than pinned to one
+platform's stream convention; the brTPF `get-values` transport is reported by the
+grammar `GetFragment::parse` selected (`Values` versus `Variables`) rather than by
+peeking at a raw parameter in the shared GET path; and every `Observation` setter is
+a no-op when no sink is configured, so `--access-log off` costs one header.
+`AccessOperation::path_segment` is the wire spelling that feeds validators and next
+links, kept apart from the census spelling serde writes.
+
 The shape types contain term kinds and magnitudes, never term values. `BoundTerm`
 therefore retains the kind established by its original parse instead of re-parsing a
 string for logging. Integration tests put one distinctive secret in a bound IRI, a
 bindings body, search text and an unknown path, then prove it is absent from the whole
 serialized shape-tier log and present only in the raw tier. The same real-listener test
 covers one-record-per-response, request-id round trips, 200/304/404/405/413/307,
-completeness, row/cardinality fields, and GET, `values=`, QUERY and POST transports.
+completeness, row/cardinality fields, GET, `values=`, QUERY and POST transports,
+measured body sizes, forwarded identity under a trusted hop and under the default,
+and minted request ids with no sink configured.
 
 The default `TraceLayer` and tower-http's `trace` feature are gone: enabling debug
 diagnostics can no longer disclose raw URIs as a second accidental access log.
@@ -2267,6 +2290,12 @@ following the code.
     `kgf-client/<version>` and `kgfq`, but doc 06 does not yet require either client
     to send one, leaving its client-mix field unable to distinguish them from unknown
     callers.
+59. **Forwarded client identity needs a declared proxy depth.** Doc 12's identity
+    rows assume the census can tell clients apart behind a gateway, but
+    `X-Forwarded-For` is caller-writable and `forwarded_hash` is now `null` unless
+    the deployment declares `trusted_proxies`. The deployment plan should state the
+    FRINK gateway's depth (one hop today) beside the other host policy, and doc 12
+    should say that a forwarded identity is a deployment claim, not a server fact.
 
 ## Not in this plan
 
