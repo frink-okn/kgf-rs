@@ -25,6 +25,7 @@
 //! browser with raw JSON.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Request, State};
@@ -40,8 +41,8 @@ use kgf_store::catalog::BundleId;
 use mediatype::{MediaTypeBuf, names};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
-use tower_http::trace::TraceLayer;
 
+use crate::access::{AccessOperation, Observation, OpenTiming, Timed, Transport, millis};
 use crate::admission::WorkClass;
 use crate::answer::{self, Rendered, Renders, Target};
 use crate::descriptor::{BundleManifest, DatasetDescriptor, ServiceDescriptor};
@@ -103,7 +104,7 @@ pub fn router(service: Arc<Service>) -> Router {
         // is the whole reason the backstop exists. It must sit *inside* CORS,
         // because it sets `Vary: Accept` with `insert` and CORS appends its own
         // afterwards; the other way round would wipe them.
-        .layer(TraceLayer::new_for_http())
+        //
         // Two body limits, because they catch different things.
         // `RequestBodyLimitLayer` enforces the published figure on the wire
         // whether or not anything reads the body. `DefaultBodyLimit` is what
@@ -122,6 +123,13 @@ pub fn router(service: Arc<Service>) -> Router {
                 .allow_methods([Method::GET, Method::HEAD, Method::POST, query_method()])
                 .expose_headers(Any),
         )
+        // Axum applies the last layer outermost. Access logging therefore sees
+        // CORS preflights and responses produced by the body limit as well as
+        // ordinary handler responses.
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&service),
+            crate::access::record_request,
+        ))
         .with_state(service)
 }
 
@@ -176,16 +184,26 @@ async fn service_descriptor(
     wants: Wants,
 ) -> Result<Response, Problem> {
     let representation = wants.representation()?;
-    respond(
-        &ServiceDescriptor::of(&service),
+    let observation = Observation::operation(
+        service.access(),
+        AccessOperation::Service,
+        Transport::Get,
         representation,
-        &wants,
-        CachePolicy::Mutable,
-        Some(etag(
-            service.descriptor_digest(),
-            service.descriptor_digest(),
+    )
+    .empty_shape();
+    observed_result(
+        respond(
+            &ServiceDescriptor::of(&service),
             representation,
-        )),
+            &wants,
+            CachePolicy::Mutable,
+            Some(etag(
+                service.descriptor_digest(),
+                service.descriptor_digest(),
+                representation,
+            )),
+        ),
+        observation,
     )
 }
 
@@ -196,16 +214,27 @@ async fn dataset_descriptor(
 ) -> Result<Response, Problem> {
     let found = service.datasets().get(&dataset)?;
     let representation = wants.representation()?;
-    respond(
-        &DatasetDescriptor::of(&dataset, found),
+    let observation = Observation::operation(
+        service.access(),
+        AccessOperation::Dataset,
+        Transport::Get,
         representation,
-        &wants,
-        CachePolicy::Mutable,
-        Some(etag(
-            service.descriptor_digest(),
-            service.descriptor_digest(),
+    )
+    .resolved(&dataset, None)
+    .empty_shape();
+    observed_result(
+        respond(
+            &DatasetDescriptor::of(&dataset, found),
             representation,
-        )),
+            &wants,
+            CachePolicy::Mutable,
+            Some(etag(
+                service.descriptor_digest(),
+                service.descriptor_digest(),
+                representation,
+            )),
+        ),
+        observation,
     )
 }
 
@@ -221,6 +250,14 @@ async fn bundle_manifest(
     // incomplete is a 500 about the bundle rather than a 400 about the request.
     let representation = wants.representation()?;
     let release = service.datasets().release(&dataset, &version)?;
+    let mut observation = Observation::operation(
+        service.access(),
+        AccessOperation::Manifest,
+        Transport::Get,
+        representation,
+    )
+    .resolved(&dataset, Some(&version))
+    .empty_shape();
     let validator = etag(
         release.digest(),
         service.descriptor_digest(),
@@ -232,10 +269,13 @@ async fn bundle_manifest(
     // ones, so there is nothing left to check: opening the bundle first would
     // make a client's cheapest possible request pay for a cold mmap.
     if wants.already_has(&validator) {
-        return not_modified(
-            CachePolicy::Immutable,
-            RobotsPolicy::for_request(representation, wants.params()),
-            validator,
+        return observed_result(
+            not_modified(
+                CachePolicy::Immutable,
+                RobotsPolicy::for_request(representation, wants.params()),
+                validator,
+            ),
+            observation,
         );
     }
 
@@ -254,17 +294,30 @@ async fn bundle_manifest(
     // blocking boundary at all.
     let id = BundleId { dataset, version };
     let opened = Arc::clone(&service);
-    blocking(&service, WorkClass::Ordinary, move || {
-        opened.open(&id).map(|_| ())
+    observation.work_class = Some(WorkClass::Ordinary);
+    let timed = blocking(&service, WorkClass::Ordinary, move || {
+        opened.open_observed(&id).map(|(_, timing)| timing)
     })
-    .await?;
+    .await;
+    observation.queue_ms = Some(timed.queue_ms);
+    observation.work_ms = timed.work_ms;
+    match timed.result {
+        Ok(open) => {
+            observation.open_ms = Some(open.open_ms);
+            observation.first_open = Some(open.first_open);
+        }
+        Err(problem) => return observed_result(Err(problem), observation),
+    }
 
-    respond(
-        &resource,
-        representation,
-        &wants,
-        CachePolicy::Immutable,
-        Some(validator),
+    observed_result(
+        respond(
+            &resource,
+            representation,
+            &wants,
+            CachePolicy::Immutable,
+            Some(validator),
+        ),
+        observation,
     )
 }
 
@@ -281,7 +334,7 @@ async fn fragment(
         operate_represented(
             service,
             BundleId { dataset, version },
-            "fragment",
+            AccessOperation::Fragment,
             wants,
             Representation::FRAGMENT,
             |params, limits, release, representation| {
@@ -313,7 +366,7 @@ async fn count(
         operate(
             service,
             BundleId { dataset, version },
-            "count",
+            AccessOperation::Count,
             wants,
             |params, limits, release, _representation| {
                 let request =
@@ -379,7 +432,7 @@ async fn binding_fragment(
         operate_body(
             service,
             id,
-            "fragment",
+            AccessOperation::Fragment,
             BodyOperation {
                 wants,
                 body,
@@ -452,7 +505,7 @@ async fn binding_count(
         operate_body(
             service,
             id,
-            "count",
+            AccessOperation::Count,
             BodyOperation {
                 wants,
                 body,
@@ -539,7 +592,7 @@ async fn describe(
     operate(
         service,
         BundleId { dataset, version },
-        "describe",
+        AccessOperation::Describe,
         wants,
         |params, limits, release, _representation| {
             request::Describe::parse(params, limits, release.prefixes(), &release.binding())
@@ -557,7 +610,7 @@ async fn sample(
     operate(
         service,
         BundleId { dataset, version },
-        "sample",
+        AccessOperation::Sample,
         wants,
         |params, limits, release, _representation| {
             // Sampling is optional, so a bundle that does not
@@ -586,7 +639,7 @@ async fn search(
     operate(
         service,
         BundleId { dataset, version },
-        "search",
+        AccessOperation::Search,
         wants,
         |params, limits, release, _representation| {
             if !release.declares(Capability::Search) {
@@ -615,7 +668,7 @@ async fn schema(
     operate(
         service,
         BundleId { dataset, version },
-        "schema",
+        AccessOperation::Schema,
         wants,
         |params, limits, release, _representation| {
             let request =
@@ -641,7 +694,7 @@ async fn void(
     operate_special(
         service,
         BundleId { dataset, version },
-        "void",
+        AccessOperation::Void,
         wants,
         Representation::VOID,
         |params, limits, _release| request::Void::parse(params, limits),
@@ -658,7 +711,7 @@ async fn summary(
     operate_special(
         service,
         BundleId { dataset, version },
-        "summary",
+        AccessOperation::Summary,
         wants,
         Representation::SUMMARY,
         |params, _limits, _release| request::Summary::parse(params),
@@ -724,7 +777,7 @@ async fn labels_operation(
         operate_body(
             service,
             id,
-            "labels",
+            AccessOperation::Labels,
             BodyOperation {
                 wants,
                 body,
@@ -777,7 +830,7 @@ fn declares_search(release: &Release, wanted: bool) -> Result<(), Problem> {
 async fn operate<Q, A, P, E>(
     service: Arc<Service>,
     id: BundleId,
-    operation: &'static str,
+    operation: AccessOperation,
     wants: Wants,
     parse: P,
     execute: E,
@@ -804,7 +857,7 @@ where
 async fn operate_represented<Q, A, P, E>(
     service: Arc<Service>,
     id: BundleId,
-    operation: &'static str,
+    operation: AccessOperation,
     wants: Wants,
     offered: &'static [Representation],
     parse: P,
@@ -828,9 +881,19 @@ where
         ));
     }
     let release = service.datasets().release(&id.dataset, &id.version)?;
+    let mut observation =
+        Observation::operation(service.access(), operation, Transport::Get, representation)
+            .resolved(&id.dataset, Some(&id.version));
     let params = Q::normalize_params(wants.params());
-    let request = parse(&params, service.config().limits(), release, representation)?;
+    let request = match parse(&params, service.config().limits(), release, representation) {
+        Ok(request) => request,
+        Err(problem) => return observed_result(Err(problem), observation),
+    };
     let work_class = request.work_class();
+    // The grammar the parser selected says how the request arrived; one that
+    // failed to parse selected none and stays plain GET.
+    observation.transport = Some(request.transport());
+    observation.request(&request, work_class);
 
     // A versioned operation is a deterministic function of immutable bytes,
     // so the URL and the representation fix the response
@@ -845,12 +908,16 @@ where
     // with carries the directives of the `200` it stands in for.
     let robots = RobotsPolicy::for_request(representation, wants.params());
     if wants.already_has(&validator) {
-        return not_modified(CachePolicy::Immutable, robots, validator);
+        observation.work_class = None;
+        return observed_result(
+            not_modified(CachePolicy::Immutable, robots, validator),
+            observation,
+        );
     }
 
     let target = Target::get(
         id,
-        operation,
+        operation.path_segment(),
         params,
         release.prefixes().clone(),
         release.declares(Capability::Search),
@@ -863,23 +930,35 @@ where
         request.labels_requested(),
     );
     let opened = Arc::clone(&service);
-    let rendered = blocking(&service, work_class, move || {
-        let store = opened.open(target.id())?;
-        // Serialized in here, not outside: strings are materialized only while
-        // writing them, and the term cache that makes that cheap is
-        // deliberately not `Send`.
-        let mut answer = execute(&store, target, &request)?;
-        labels.hydrate(&store, &mut answer)?;
-        answer.render(representation)
+    let timed = blocking(&service, work_class, move || {
+        let (store, open) = opened.open_observed(target.id())?;
+        Ok(Opened::run(open, || {
+            // Serialized in here, not outside: strings are materialized only
+            // while writing them, and the term cache that makes that cheap is
+            // deliberately not `Send`.
+            let mut answer = execute(&store, target, &request)?;
+            labels.hydrate(&store, &mut answer)?;
+            answer.render(representation)
+        }))
     })
-    .await?;
+    .await;
+    observation.queue_ms = Some(timed.queue_ms);
+    observation.work_ms = timed.work_ms;
+    let rendered = match record_open(&mut observation, timed.result) {
+        Ok(rendered) => rendered,
+        Err(problem) => return observed_result(Err(problem), observation),
+    };
+    observation.rendered(&rendered);
 
-    respond_rendered(
-        rendered,
-        representation,
-        CachePolicy::Immutable,
-        robots,
-        validator,
+    observed_result(
+        respond_rendered(
+            rendered,
+            representation,
+            CachePolicy::Immutable,
+            robots,
+            validator,
+        ),
+        observation,
     )
 }
 
@@ -888,7 +967,7 @@ where
 async fn operate_special<Q, P, E>(
     service: Arc<Service>,
     id: BundleId,
-    operation: &'static str,
+    operation: AccessOperation,
     wants: Wants,
     offered: &'static [Representation],
     parse: P,
@@ -903,9 +982,16 @@ where
 {
     let representation = wants.representation_from(offered)?;
     let release = service.datasets().release(&id.dataset, &id.version)?;
+    let mut observation =
+        Observation::operation(service.access(), operation, Transport::Get, representation)
+            .resolved(&id.dataset, Some(&id.version));
     let params = Q::normalize_params(wants.params());
-    let request = parse(&params, service.config().limits(), release)?;
+    let request = match parse(&params, service.config().limits(), release) {
+        Ok(request) => request,
+        Err(problem) => return observed_result(Err(problem), observation),
+    };
     let work_class = request.work_class();
+    observation.request(&request, work_class);
     let validator = etag(
         release.digest(),
         service.descriptor_digest(),
@@ -915,30 +1001,46 @@ where
     // with carries the directives of the `200` it stands in for.
     let robots = RobotsPolicy::for_request(representation, wants.params());
     if wants.already_has(&validator) {
-        return not_modified(CachePolicy::Immutable, robots, validator);
+        observation.work_class = None;
+        return observed_result(
+            not_modified(CachePolicy::Immutable, robots, validator),
+            observation,
+        );
     }
 
     let target = Target::get(
         id,
-        operation,
+        operation.path_segment(),
         params,
         release.prefixes().clone(),
         release.declares(Capability::Search),
         wants.request_url.clone(),
     );
     let opened = Arc::clone(&service);
-    let rendered = blocking(&service, work_class, move || {
-        let store = opened.open(target.id())?;
-        execute(&store, target, &request, representation)
+    let timed = blocking(&service, work_class, move || {
+        let (store, open) = opened.open_observed(target.id())?;
+        Ok(Opened::run(open, || {
+            execute(&store, target, &request, representation)
+        }))
     })
-    .await?;
+    .await;
+    observation.queue_ms = Some(timed.queue_ms);
+    observation.work_ms = timed.work_ms;
+    let rendered = match record_open(&mut observation, timed.result) {
+        Ok(rendered) => rendered,
+        Err(problem) => return observed_result(Err(problem), observation),
+    };
+    observation.rendered(&rendered);
 
-    respond_rendered(
-        rendered,
-        representation,
-        CachePolicy::Immutable,
-        robots,
-        validator,
+    observed_result(
+        respond_rendered(
+            rendered,
+            representation,
+            CachePolicy::Immutable,
+            robots,
+            validator,
+        ),
+        observation,
     )
 }
 
@@ -1009,6 +1111,13 @@ impl BodyMethod {
             Self::Post => CachePolicy::Uncacheable,
         }
     }
+
+    const fn transport(self) -> Transport {
+        match self {
+            Self::Query => Transport::Query,
+            Self::Post => Transport::Post,
+        }
+    }
 }
 
 struct BodyOperation {
@@ -1020,13 +1129,13 @@ struct BodyOperation {
 async fn operate_body<Q, A, P, E>(
     service: Arc<Service>,
     id: BundleId,
-    operation: &'static str,
+    operation: AccessOperation,
     submitted: BodyOperation,
     parse: P,
     execute: E,
 ) -> Result<Response, Problem>
 where
-    Q: Send + 'static,
+    Q: request::ObservedRequest + Send + 'static,
     A: Renders,
     P: FnOnce(&Params, &[u8], Limits<'_>, &Release) -> Result<Q, Problem>,
     E: FnOnce(&kgf_store::Store, Target, &Q) -> Result<A, Problem> + Send + 'static,
@@ -1039,51 +1148,87 @@ where
     let cache = method.cache();
     let representation = wants.representation()?;
     let release = service.datasets().release(&id.dataset, &id.version)?;
-    let request = parse(wants.params(), &body, service.config().limits(), release)?;
+    let mut observation = Observation::operation(
+        service.access(),
+        operation,
+        method.transport(),
+        representation,
+    )
+    .resolved(&id.dataset, Some(&id.version));
+    // Measured, not declared: the bytes the extractor actually buffered.
+    observation.bytes_in = Some(body.len() as u64);
+    let request = match parse(wants.params(), &body, service.config().limits(), release) {
+        Ok(request) => request,
+        Err(problem) => return observed_result(Err(problem), observation),
+    };
+    observation.request(&request, WorkClass::Heavy);
     let validator = etag_for_body(
         release.digest(),
         service.descriptor_digest(),
-        operation,
+        operation.path_segment(),
         representation,
         &body,
     );
     let robots = RobotsPolicy::for_request(representation, wants.params());
     if wants.already_has(&validator) {
+        observation.work_class = None;
         return match method {
-            BodyMethod::Query => not_modified(cache, robots, validator),
-            BodyMethod::Post => Err(Problem::new(
-                ErrorCode::PreconditionFailed,
-                "If-None-Match matches the representation this POST would return; remove the \
+            BodyMethod::Query => {
+                observed_result(not_modified(cache, robots, validator), observation)
+            }
+            BodyMethod::Post => observed_result(
+                Err(Problem::new(
+                    ErrorCode::PreconditionFailed,
+                    "If-None-Match matches the representation this POST would return; remove the \
                  precondition or submit a request whose representation is not current",
-            )),
+                )),
+                observation,
+            ),
         };
     }
 
     let target = Target::body(
         id,
-        operation,
+        operation.path_segment(),
         wants.params().clone(),
         release.prefixes().clone(),
     );
     let labels = PageLabelProfile::for_request(&service, release, representation, false);
     let opened = Arc::clone(&service);
-    let rendered = blocking(&service, WorkClass::Heavy, move || {
-        let store = opened.open(target.id())?;
-        let mut answer = execute(&store, target, &request)?;
-        labels.hydrate(&store, &mut answer)?;
-        answer.render(representation)
+    let timed = blocking(&service, WorkClass::Heavy, move || {
+        let (store, open) = opened.open_observed(target.id())?;
+        Ok(Opened::run(open, || {
+            let mut answer = execute(&store, target, &request)?;
+            labels.hydrate(&store, &mut answer)?;
+            answer.render(representation)
+        }))
     })
-    .await?;
+    .await;
+    observation.queue_ms = Some(timed.queue_ms);
+    observation.work_ms = timed.work_ms;
+    let rendered = match record_open(&mut observation, timed.result) {
+        Ok(rendered) => rendered,
+        Err(problem) => return observed_result(Err(problem), observation),
+    };
+    observation.rendered(&rendered);
 
-    respond_rendered(rendered, representation, cache, robots, validator)
+    observed_result(
+        respond_rendered(rendered, representation, cache, robots, validator),
+        observation,
+    )
 }
 
 async fn latest_redirect(
     State(service): State<Arc<Service>>,
     Path((dataset, _rest)): Path<(String, String)>,
+    method: Method,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, Problem> {
     let current = service.datasets().get(&dataset)?.current();
+    let mut observation = Observation::new(service.access(), AccessOperation::Latest)
+        .resolved(&dataset, Some(current))
+        .empty_shape();
+    observation.transport = transport_for_method(&method);
 
     // Rewritten on the *raw* path rather than on the decoded captures: whatever
     // encoding the client used for the rest of the path is what the redirect
@@ -1115,13 +1260,25 @@ async fn latest_redirect(
     let headers = response.headers_mut();
     headers.insert(LOCATION, header(&location)?);
     headers.typed_insert(CachePolicy::Mutable.header());
-    Ok(response)
+    observed_result(Ok(response), observation)
 }
 
 /// The router matched `/{dataset}/latest/{rest}`, so the path has that shape.
 fn unreachable_route(path: &str) -> Problem {
     tracing::error!(path, "a matched route did not have the shape it matched on");
     Problem::new(ErrorCode::InternalError, "the request could not be routed")
+}
+
+fn transport_for_method(method: &Method) -> Option<Transport> {
+    if method == Method::GET || method == Method::HEAD {
+        Some(Transport::Get)
+    } else if method == Method::POST {
+        Some(Transport::Post)
+    } else if method == query_method() {
+        Some(Transport::Query)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1270,6 +1427,25 @@ fn absolute_request_url(
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+
+/// Carry handler metadata outward on both successful and problem responses.
+///
+/// A problem is rendered here rather than returned, so the observation rides
+/// the same response the problem renderer will decorate. Nothing is attached
+/// when no sink will read it.
+fn observed_result(
+    result: Result<Response, Problem>,
+    observation: Observation,
+) -> Result<Response, Problem> {
+    let mut response = match result {
+        Ok(response) => response,
+        Err(problem) => problem.into_response(),
+    };
+    if observation.recording() {
+        response.extensions_mut().insert(observation);
+    }
+    Ok(response)
+}
 
 /// The request's `Accept`, however many field lines it arrived on.
 ///
@@ -1537,6 +1713,7 @@ async fn render_problems(request: Request, next: Next) -> Response {
         accept_header(&headers).ok().flatten()
     };
     let problem = problem.about_unless_set(reflected(uri.path()));
+    let code = problem.code();
     let representation = Representation::for_problem(format.as_deref(), accept.as_deref());
     let (content_type, body) = match representation {
         // RFC 9457 §3 names the media type; it is not `application/json`.
@@ -1558,6 +1735,8 @@ async fn render_problems(request: Request, next: Next) -> Response {
     if advertises_query(uri.path()) {
         add_accept_query(&mut response);
     }
+    response.extensions_mut().insert(code);
+    response.extensions_mut().insert(representation);
     response
 }
 
@@ -1594,6 +1773,34 @@ fn unattributed_error(response: &Response) -> Option<Problem> {
 // The blocking boundary
 // ---------------------------------------------------------------------------
 
+/// Work attempted after a bundle was opened successfully.
+///
+/// The open timing is carried beside the result so a later execution,
+/// hydration, or serialization failure cannot erase the successful open.
+struct Opened<T> {
+    result: Result<T, Problem>,
+    timing: OpenTiming,
+}
+
+impl<T> Opened<T> {
+    fn run(timing: OpenTiming, work: impl FnOnce() -> Result<T, Problem>) -> Self {
+        Self {
+            result: work(),
+            timing,
+        }
+    }
+}
+
+fn record_open<T>(
+    observation: &mut Observation,
+    opened: Result<Opened<T>, Problem>,
+) -> Result<T, Problem> {
+    let opened = opened?;
+    observation.open_ms = Some(opened.timing.open_ms);
+    observation.first_open = Some(opened.timing.first_open);
+    opened.result
+}
+
 /// Run store work on the blocking pool.
 ///
 /// A cold read of a mapped bundle faults pages, and a page fault stalls the
@@ -1605,29 +1812,50 @@ fn unattributed_error(response: &Response) -> Option<Problem> {
 /// convention for a path that is not built, so an unimplemented operation
 /// reached by a client should answer `internal_error` and log, not look like a
 /// network failure.
-async fn blocking<T, F>(service: &Service, class: WorkClass, work: F) -> Result<T, Problem>
+async fn blocking<T, F>(service: &Service, class: WorkClass, work: F) -> Timed<T>
 where
     F: FnOnce() -> Result<T, Problem> + Send + 'static,
     T: Send + 'static,
 {
-    let admitted = service.admission().enter(class).await?;
+    let queue_started = Instant::now();
+    let admitted = match service.admission().enter(class).await {
+        Ok(admitted) => admitted,
+        Err(problem) => {
+            return Timed {
+                result: Err(problem),
+                queue_ms: millis(queue_started.elapsed()),
+                work_ms: None,
+            };
+        }
+    };
+    let queue_ms = millis(queue_started.elapsed());
     match tokio::task::spawn_blocking(move || {
         // A blocking task cannot be cancelled after it starts. Keep its
         // capacity in the task itself, so a disconnected client dropping the
         // awaiting handler does not admit replacement work while this work is
         // still faulting pages or building a response.
         let _admitted = admitted;
-        work()
+        let work_started = Instant::now();
+        let result = work();
+        (result, millis(work_started.elapsed()))
     })
     .await
     {
-        Ok(result) => result,
+        Ok((result, work_ms)) => Timed {
+            result,
+            queue_ms,
+            work_ms: Some(work_ms),
+        },
         Err(error) => {
             tracing::error!(%error, "a request panicked on the blocking pool");
-            Err(Problem::new(
-                ErrorCode::InternalError,
-                "the request failed while reading the bundle",
-            ))
+            Timed {
+                result: Err(Problem::new(
+                    ErrorCode::InternalError,
+                    "the request failed while reading the bundle",
+                )),
+                queue_ms,
+                work_ms: None,
+            }
         }
     }
 }
@@ -1713,5 +1941,22 @@ mod tests {
             response.extensions().get::<Problem>().map(Problem::code),
             Some(ErrorCode::RateLimited)
         );
+    }
+
+    #[test]
+    fn successful_open_timing_survives_later_work_failure() {
+        let mut observation = Observation::default();
+        let opened = Opened::run(
+            OpenTiming {
+                open_ms: 17,
+                first_open: true,
+            },
+            || Err::<(), _>(Problem::new(ErrorCode::InternalError, "later work failed")),
+        );
+
+        let problem = record_open(&mut observation, Ok(opened)).unwrap_err();
+        assert_eq!(problem.code(), ErrorCode::InternalError);
+        assert_eq!(observation.open_ms, Some(17));
+        assert_eq!(observation.first_open, Some(true));
     }
 }

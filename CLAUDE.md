@@ -59,7 +59,9 @@ The mapped description surface answers `/schema`, RDF `/void`, and persisted
 permutation, text, filters, key sets, the eight-artifact description set, and
 the manifest written last — staged beside the output and published by one
 rename. `kgf manifest` describes or `--check`s a bundle assembled by hand.
-`kgf serve` runs it.
+`kgf serve` runs it and emits one shape-only JSON access record per response by
+default, with raw request content available only through the explicit `--log-raw`
+option.
 
 **M1 is not doc 03 §3.1's core profile**, and the two read like the same set. This
 implementation now extends past M1 with bindings QUERY (§3.4.2) and the complete
@@ -80,8 +82,9 @@ than forcing those resources into the default JSON representation.
 returning a plausible wrong answer. Do not replace one with a stub that returns a
 default.
 
-**`notes/plan.md` is the implementation route** — units 1–19, all complete, through
-doc 20 §20.8's M1, search, bindings, and the description surface, plus the decisions each one had to make and the **Questions for `../kgf`**
+**`notes/plan.md` is the implementation route** — units 1–22, all complete, through
+doc 20 §20.8's M1, search, bindings, the description surface, the bundle builder, and
+request logging, plus the decisions each one had to make and the **Questions for `../kgf`**
 that implementation surfaced. It is kept current; read it before planning work.
 `notes/state.md` is a point-in-time handoff, written at a moment and not maintained
 afterwards, so where the two disagree about what exists, `plan.md` and the code win.

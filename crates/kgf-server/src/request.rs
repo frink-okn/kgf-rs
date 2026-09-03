@@ -51,6 +51,7 @@ use kgf_store::{
 };
 
 use crate::Limits;
+use crate::access::{RequestShape, Transport};
 use crate::admission::WorkClass;
 use crate::cursor::{
     BundleBinding, CanonicalRequest, Cursor, CursorBinding, Operation, StaleCursor,
@@ -141,6 +142,32 @@ impl Serialize for Position {
 pub struct BoundTerm {
     requested: String,
     dictionary: String,
+    kind: BoundKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundKind {
+    Iri,
+    Literal,
+    BlankNode,
+}
+
+impl BoundKind {
+    fn of(term: &Term<'_>) -> Self {
+        match term {
+            Term::Iri(_) => Self::Iri,
+            Term::Literal(_) => Self::Literal,
+            Term::BlankNode(_) => Self::BlankNode,
+        }
+    }
+
+    const fn shape(self) -> char {
+        match self {
+            Self::Iri => 'i',
+            Self::Literal => 'l',
+            Self::BlankNode => 'b',
+        }
+    }
 }
 
 impl BoundTerm {
@@ -171,9 +198,11 @@ impl BoundTerm {
                 format!("parameter `{parameter}`: {error}"),
             )
         })?;
+        let kind = BoundKind::of(&term);
         Ok(Self {
             requested: text.to_owned(),
             dictionary: term.to_dictionary().into_owned(),
+            kind,
         })
     }
 
@@ -204,6 +233,7 @@ impl BoundTerm {
         let term = Term::from_json(&value).map_err(|error| {
             Problem::new(ErrorCode::BadTermSyntax, format!("{parameter}: {error}"))
         })?;
+        let kind = BoundKind::of(&term);
         let dictionary = term.to_dictionary().into_owned();
         let max = limits.budgets.max_term_bytes;
         if dictionary.len() as u64 > max {
@@ -219,6 +249,7 @@ impl BoundTerm {
         Ok(Self {
             requested: term.to_request(),
             dictionary,
+            kind,
         })
     }
 
@@ -242,6 +273,7 @@ impl BoundTerm {
                 Term::Literal(literal)
             }
         };
+        let kind = BoundKind::of(&term);
         let dictionary = term.to_dictionary().into_owned();
         let max = limits.budgets.max_term_bytes;
         if dictionary.len() as u64 > max {
@@ -257,6 +289,7 @@ impl BoundTerm {
         Ok(Self {
             requested: term.to_request(),
             dictionary,
+            kind,
         })
     }
 
@@ -290,6 +323,7 @@ impl BoundTerm {
                 Ok(Self {
                     requested: text.to_owned(),
                     dictionary: text.to_owned(),
+                    kind: BoundKind::Iri,
                 })
             }
         }
@@ -305,8 +339,12 @@ impl BoundTerm {
         &self.dictionary
     }
 
+    fn shape(&self) -> char {
+        self.kind.shape()
+    }
+
     fn require_iri(self, parameter: &str) -> Result<Self, Problem> {
-        if matches!(Term::from_dictionary(&self.dictionary), Term::Iri(_)) {
+        if self.kind == BoundKind::Iri {
             Ok(self)
         } else {
             Err(Problem::new(
@@ -323,6 +361,7 @@ impl BoundTerm {
         Self {
             requested: format!("<{iri}>"),
             dictionary: iri.to_owned(),
+            kind: BoundKind::Iri,
         }
     }
 }
@@ -404,6 +443,13 @@ impl Pattern {
         Position::ALL
             .into_iter()
             .filter(|position| self.bound(*position).is_none())
+            .collect()
+    }
+
+    fn shape(&self) -> String {
+        Position::ALL
+            .into_iter()
+            .map(|position| self.bound(position).map_or('?', BoundTerm::shape))
             .collect()
     }
 
@@ -948,6 +994,13 @@ impl BindingPattern {
             .collect()
     }
 
+    fn shape(&self) -> String {
+        Position::ALL
+            .into_iter()
+            .map(|position| self.bound(position).map_or('?', BoundTerm::shape))
+            .collect()
+    }
+
     fn variables(&self) -> impl Iterator<Item = &Variable> {
         self.cells.iter().filter_map(|cell| match cell {
             BindingCell::Variable(variable) => Some(variable),
@@ -1252,6 +1305,14 @@ impl Bindings {
                 columns: &self.columns,
                 values,
             })
+    }
+
+    fn row_count(&self) -> u64 {
+        self.rows.len() as u64
+    }
+
+    fn column_count(&self) -> u64 {
+        self.variables.len() as u64
     }
 
     fn canonicalize(&self, mut output: String) -> String {
@@ -1670,7 +1731,9 @@ pub enum GetFragment {
     /// Ordinary TPF/KGF query parameters.
     Plain(Fragment),
     /// A brTPF variable pattern restricted by `values=`.
-    Bindings(BindingFragment),
+    Values(BindingFragment),
+    /// A brTPF variable pattern with no `values=` restriction yet.
+    Variables(BindingFragment),
 }
 
 impl GetFragment {
@@ -1685,7 +1748,7 @@ impl GetFragment {
     ) -> Result<Self, Problem> {
         if params.get("values").is_some() {
             BindingFragment::parse_values(params, limits, prefixes, bundle, rdf_representation)
-                .map(Self::Bindings)
+                .map(Self::Values)
         } else if Position::ALL.into_iter().any(|position| {
             params
                 .get(position.as_str())
@@ -1698,7 +1761,7 @@ impl GetFragment {
                 bundle,
                 rdf_representation,
             )
-            .map(Self::Bindings)
+            .map(Self::Variables)
         } else {
             Fragment::parse_with(params, limits, prefixes, bundle, rdf_representation)
                 .map(Self::Plain)
@@ -1709,7 +1772,7 @@ impl GetFragment {
     pub fn text(&self) -> Option<&TextFilter> {
         match self {
             Self::Plain(request) => request.pattern.text(),
-            Self::Bindings(_) => None,
+            Self::Values(_) | Self::Variables(_) => None,
         }
     }
 }
@@ -2490,13 +2553,34 @@ impl Sample {
     }
 }
 
+/// Content-free metadata shared by GET and body-carried request types.
+pub(crate) trait ObservedRequest {
+    /// Parsed structure and magnitudes, excluding client-supplied values.
+    fn shape(&self) -> RequestShape;
+
+    /// Whether this request resumes a previous page.
+    fn resumed(&self) -> bool {
+        false
+    }
+
+    /// Canonical request hash used to bind cursors, when this operation has one.
+    fn request_hash(&self) -> Option<[u8; 8]> {
+        None
+    }
+
+    /// Search content for the explicitly enabled raw tier.
+    fn raw_query(&self) -> Option<&str> {
+        None
+    }
+}
+
 /// Normalize the successful controls of one native GET form.
 ///
 /// HTML submits untouched named controls as empty strings. Each request type
 /// owns the decision about which of those controls are genuinely optional, so
 /// the router can apply ordinary form semantics without making empty required,
 /// unknown, cursor, representation, or selection parameters disappear.
-pub(crate) trait GetRequest {
+pub(crate) trait GetRequest: ObservedRequest {
     /// Remove empty controls whose omission selects this request's default.
     fn normalize_params(params: &Params) -> Params;
 
@@ -2509,6 +2593,215 @@ pub(crate) trait GetRequest {
     /// Host admission class for the work this parsed request will perform.
     fn work_class(&self) -> WorkClass {
         WorkClass::Ordinary
+    }
+
+    /// How the request arrived, when the grammar its parser selected says
+    /// more than "GET".
+    fn transport(&self) -> Transport {
+        Transport::Get
+    }
+}
+
+impl ObservedRequest for Fragment {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Pattern {
+            pattern: self.pattern.shape(),
+            text: self.pattern.text().is_some(),
+            limit: Some(self.limit),
+        }
+    }
+
+    fn resumed(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    fn request_hash(&self) -> Option<[u8; 8]> {
+        Some(self.binding.request_hash())
+    }
+}
+
+impl ObservedRequest for GetFragment {
+    fn shape(&self) -> RequestShape {
+        match self {
+            Self::Plain(request) => request.shape(),
+            Self::Values(request) | Self::Variables(request) => request.shape(),
+        }
+    }
+
+    fn resumed(&self) -> bool {
+        match self {
+            Self::Plain(request) => request.resumed(),
+            Self::Values(request) | Self::Variables(request) => request.resumed(),
+        }
+    }
+
+    fn request_hash(&self) -> Option<[u8; 8]> {
+        match self {
+            Self::Plain(request) => request.request_hash(),
+            Self::Values(request) | Self::Variables(request) => request.request_hash(),
+        }
+    }
+}
+
+impl ObservedRequest for Count {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Pattern {
+            pattern: self.pattern.shape(),
+            text: self.pattern.text().is_some(),
+            limit: None,
+        }
+    }
+
+    fn resumed(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    fn request_hash(&self) -> Option<[u8; 8]> {
+        Some(self.binding.request_hash())
+    }
+}
+
+impl ObservedRequest for Describe {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Describe {
+            term: self.resource.shape(),
+            direction: self.direction.as_str(),
+            limit: self.limit,
+        }
+    }
+
+    fn resumed(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    fn request_hash(&self) -> Option<[u8; 8]> {
+        Some(self.binding.request_hash())
+    }
+}
+
+impl ObservedRequest for Schema {
+    fn shape(&self) -> RequestShape {
+        let (selection, children, projection) = match &self.query {
+            SchemaQuery::Node(selection) => (
+                match selection {
+                    SchemaSelection::Dataset => "root",
+                    SchemaSelection::Class { .. } => "class",
+                    SchemaSelection::Property { .. } => "predicate",
+                    SchemaSelection::Datatype { .. } => "datatype",
+                },
+                None,
+                None,
+            ),
+            SchemaQuery::Children(children) => {
+                let selection = match children {
+                    SchemaChildren::Classes | SchemaChildren::DatasetProperties => "root",
+                    SchemaChildren::ClassProperties { .. } => "class",
+                    SchemaChildren::PropertyObjectClasses { .. }
+                    | SchemaChildren::PropertyDatatypes { .. } => "predicate",
+                    SchemaChildren::DatatypeLanguages { .. } => "datatype",
+                };
+                (selection, Some(children.name()), None)
+            }
+            SchemaQuery::ClassRelations(_) => ("root", None, Some("class-relations")),
+            SchemaQuery::ClassProperties(_) => ("root", None, Some("class-properties")),
+        };
+        let view = match &self.view {
+            StatsView::Design => "design",
+            StatsView::Queryable => "queryable",
+            StatsView::Component(_) => "component",
+        };
+        RequestShape::Schema {
+            selection,
+            children,
+            projection,
+            view,
+            limit: self.limit,
+        }
+    }
+
+    fn resumed(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    fn request_hash(&self) -> Option<[u8; 8]> {
+        Some(self.binding.request_hash())
+    }
+}
+
+impl ObservedRequest for Void {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Empty {}
+    }
+}
+
+impl ObservedRequest for Summary {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Empty {}
+    }
+}
+
+impl ObservedRequest for Sample {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Sample {
+            pattern: self.pattern.shape(),
+            n: self.n,
+        }
+    }
+}
+
+impl ObservedRequest for Search {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Search {
+            q_len: self.query.query().len() as u64,
+            roles: self.roles.clone(),
+            predicates: self.predicates.len() as u64,
+            limit: self.limit,
+            labels: self.labels,
+        }
+    }
+
+    fn raw_query(&self) -> Option<&str> {
+        Some(self.query.query())
+    }
+}
+
+impl ObservedRequest for BindingFragment {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Bindings {
+            pattern: self.pattern.shape(),
+            text: false,
+            limit: Some(self.limit),
+            k: self.bindings.row_count(),
+            columns: self.bindings.column_count(),
+        }
+    }
+
+    fn resumed(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    fn request_hash(&self) -> Option<[u8; 8]> {
+        Some(self.binding.request_hash())
+    }
+}
+
+impl ObservedRequest for BindingCount {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Bindings {
+            pattern: self.pattern.shape(),
+            text: false,
+            limit: None,
+            k: self.bindings.row_count(),
+            columns: self.bindings.column_count(),
+        }
+    }
+}
+
+impl ObservedRequest for Labels {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Labels {
+            k: self.iris.len() as u64,
+        }
     }
 }
 
@@ -2545,7 +2838,14 @@ impl GetRequest for GetFragment {
     fn work_class(&self) -> WorkClass {
         match self {
             Self::Plain(request) => request.work_class(),
-            Self::Bindings(_) => WorkClass::Heavy,
+            Self::Values(_) | Self::Variables(_) => WorkClass::Heavy,
+        }
+    }
+
+    fn transport(&self) -> Transport {
+        match self {
+            Self::Values(_) => Transport::GetValues,
+            Self::Plain(_) | Self::Variables(_) => Transport::Get,
         }
     }
 }
@@ -3558,7 +3858,7 @@ mod tests {
         );
         let parsed =
             GetFragment::parse(&params(&query), limits(), &prefixes(), &bundle(), true).unwrap();
-        let GetFragment::Bindings(parsed) = parsed else {
+        let GetFragment::Values(parsed) = parsed else {
             panic!("values= must select the bindings grammar")
         };
         let row = parsed.rows().next().unwrap();
@@ -3583,7 +3883,7 @@ mod tests {
         );
         let parsed =
             GetFragment::parse(&params(&query), limits(), &prefixes(), &bundle(), false).unwrap();
-        let GetFragment::Bindings(parsed) = parsed else {
+        let GetFragment::Values(parsed) = parsed else {
             panic!("values= must select the bindings grammar")
         };
         let mut rows = parsed.rows();
@@ -3608,7 +3908,7 @@ mod tests {
         );
         let parsed =
             GetFragment::parse(&params(&query), limits(), &prefixes(), &bundle(), false).unwrap();
-        let GetFragment::Bindings(parsed) = parsed else {
+        let GetFragment::Values(parsed) = parsed else {
             panic!("values= must select the bindings grammar")
         };
         let literal = parsed
@@ -3780,6 +4080,7 @@ mod tests {
             Some(&BoundTerm {
                 requested: "p=ex:knows".split_once('=').unwrap().1.to_owned(),
                 dictionary: "http://example.org/knows".to_owned(),
+                kind: BoundKind::Iri,
             })
         );
         assert_eq!(
