@@ -28,15 +28,17 @@
 //!
 //! # Status
 //!
-//! Units 10–19 in `notes/plan.md` are implemented: [`cursor`], [`term`],
+//! Units 10–22 in `notes/plan.md` are implemented: [`cursor`], [`term`],
 //! [`envelope`], the URL space with `latest`, caching and content negotiation,
 //! and the read operations `/fragment`, `/count`, `/describe`, `/sample`
 //! and `/schema`, the `/void` and `/summary` description resources, plus bindings
-//! QUERY/POST for fragment and count in [`request`] and [`answer`].
+//! QUERY/POST for fragment and count in [`request`] and [`answer`]. The service
+//! emits typed, content-free access records through [`access`] when configured.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod access;
 mod admission;
 pub mod answer;
 pub mod cursor;
@@ -60,6 +62,7 @@ use serde::Serialize;
 
 use crate::service::Service;
 
+pub use access::{AccessLog, AccessRecord, StdoutAccessLog};
 pub use admission::Admission;
 
 /// Server configuration.
@@ -95,6 +98,25 @@ pub struct Config {
     pub budgets: Budgets,
     /// Deployment-wide admission limits for active and waiting bundle work.
     pub admission: Admission,
+    /// Destination for one structured access record per response.
+    ///
+    /// `None` disables record emission. Server-minted request identifiers are
+    /// still returned so an embedder can correlate its own instrumentation.
+    pub access_log: Option<Arc<dyn AccessLog>>,
+    /// Whether records include the raw request target, typed search string,
+    /// User-Agent, and inbound request identifier.
+    ///
+    /// Off by default because these fields contain client-supplied content;
+    /// the ordinary shape tier contains only parsed structure and magnitudes.
+    pub log_raw: bool,
+    /// Reverse proxies between the listener and its clients that append to
+    /// `X-Forwarded-For`.
+    ///
+    /// Zero, the default, ignores the header: the peer is the client, and a
+    /// caller cannot pick its own pseudonymous identity by sending one. Behind
+    /// one gateway, set one; a record's `forwarded_hash` then names the
+    /// address that gateway received the request from.
+    pub trusted_proxies: u8,
 }
 
 impl Config {
@@ -108,6 +130,9 @@ impl Config {
             caps: Caps::default(),
             budgets: Budgets::default(),
             admission: Admission::default(),
+            access_log: None,
+            log_raw: false,
+            trusted_proxies: 0,
         }
     }
 
@@ -406,9 +431,12 @@ pub async fn serve_on(
     service: Arc<Service>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    axum::serve(listener, routes::router(service))
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(
+        listener,
+        routes::router(service).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
     Ok(())
 }
 

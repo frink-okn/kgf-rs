@@ -305,6 +305,11 @@ impl CursorBinding {
             request_hash: request.hash(),
         }
     }
+
+    /// The canonical request hash carried by every cursor for this binding.
+    pub fn request_hash(&self) -> [u8; 8] {
+        self.request_hash
+    }
 }
 
 /// The bundle-version half of a binding, derived once at open.

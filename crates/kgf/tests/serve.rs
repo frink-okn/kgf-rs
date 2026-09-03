@@ -15,10 +15,11 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use kgf_server::service::Service;
+use kgf_server::{AccessLog, AccessRecord};
 use kgf_store::testing::{Fixture, TINY_NT};
 use sha2::{Digest, Sha256};
 
@@ -1150,6 +1151,308 @@ fn every_error_response_carries_a_code() {
 }
 
 #[test]
+fn access_logging_emits_one_correlated_record_for_every_response() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let records = RecordingAccessLog::default();
+    let server = deployment.serve_with_access(Arc::new(records.clone()), false);
+    let fragment_path = "/tox/v/v1/fragment?limit=2";
+
+    let page = server.request(
+        "GET",
+        fragment_path,
+        &[
+            ("User-Agent", "curl/8.0"),
+            ("X-Request-Id", "client-17"),
+            ("X-Forwarded-For", "192.0.2.8, 192.0.2.9"),
+        ],
+    );
+    page.assert_status(200);
+    let etag = page.header("etag").expect("fragment validator");
+    let not_modified = server.request("GET", fragment_path, &[("If-None-Match", etag.as_str())]);
+    not_modified.assert_status(304);
+    let missing = server.get("/SECRET/nope");
+    missing.assert_status(404);
+    let wrong_method = server.request("PUT", "/tox/v/v1/fragment", &[]);
+    wrong_method.assert_status(405);
+    let oversized = server.request_with_body("POST", "/tox", &[], &vec![b'x'; 2 * 1024 * 1024]);
+    oversized.assert_status(413);
+    let latest = server.get("/tox/latest/fragment?limit=2");
+    latest.assert_status(307);
+    let malformed_rdf = server.request(
+        "GET",
+        "/tox/v/v1/fragment?s=%3Cbroken",
+        &[("Accept", "text/turtle")],
+    );
+    malformed_rdf.assert_status(400);
+    malformed_rdf.assert_header("content-type", "application/problem+json");
+    let latest_query = server.request("QUERY", "/tox/latest/fragment", &[]);
+    latest_query.assert_status(307);
+
+    let responses = [
+        &page,
+        &not_modified,
+        &missing,
+        &wrong_method,
+        &oversized,
+        &latest,
+        &malformed_rdf,
+        &latest_query,
+    ];
+    let records = records.records();
+    assert_eq!(records.len(), responses.len());
+    for (record, response) in records.iter().zip(responses) {
+        assert_eq!(record.status, Some(response.status));
+        assert_eq!(
+            response.header("kgf-request-id").as_deref(),
+            Some(record.request_id.as_str())
+        );
+    }
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| &record.request_id)
+            .collect::<HashSet<_>>()
+            .len(),
+        records.len()
+    );
+
+    let page_record = &records[0];
+    assert_eq!(
+        page_record.route.as_deref(),
+        Some("/{dataset}/v/{version}/fragment")
+    );
+    assert_eq!(
+        page_record.operation,
+        Some(kgf_server::access::AccessOperation::Fragment)
+    );
+    assert_eq!(page_record.dataset.as_deref(), Some("tox"));
+    assert_eq!(page_record.version.as_deref(), Some("v1"));
+    assert_eq!(page_record.representation.as_deref(), Some("json"));
+    assert_eq!(page_record.rows, Some(2));
+    assert_eq!(page_record.complete, Some(false));
+    assert_eq!(page_record.truncation_reason, Some("page_limit"));
+    assert_eq!(page_record.cardinality, Some(8));
+    assert_eq!(page_record.exact, Some(true));
+    assert_eq!(page_record.first_open, Some(true));
+    assert!(page_record.open_ms.is_some());
+    assert!(page_record.queue_ms.is_some());
+    assert!(page_record.work_ms.is_some());
+    assert_eq!(
+        page_record.client_class,
+        kgf_server::access::ClientClass::Curl
+    );
+    assert!(page_record.user_agent.is_none());
+    assert!(page_record.client_request_id.is_none());
+    assert_eq!(page_record.client_hash.as_deref().map(str::len), Some(16));
+    assert_eq!(
+        page_record.forwarded_hash.as_deref().map(str::len),
+        Some(16)
+    );
+    assert!(page_record.target.is_none());
+    assert!(page_record.q.is_none());
+    assert_eq!(
+        serde_json::to_value(page_record).unwrap()["shape"],
+        serde_json::json!({"pattern": "???", "text": false, "limit": 2})
+    );
+
+    assert_eq!(records[1].status, Some(304));
+    assert!(records[1].work_class.is_none());
+    assert!(records[1].work_ms.is_none());
+    assert_eq!(records[2].route, None);
+    assert_eq!(records[2].operation, None);
+    assert_eq!(records[2].code, Some("not_found"));
+    assert_eq!(
+        records[3].route.as_deref(),
+        Some("/{dataset}/v/{version}/fragment")
+    );
+    assert_eq!(
+        records[3].operation,
+        Some(kgf_server::access::AccessOperation::Fragment)
+    );
+    assert_eq!(records[3].code, Some("method_not_allowed"));
+    assert_eq!(records[4].code, Some("payload_too_large"));
+    assert_eq!(
+        records[5].operation,
+        Some(kgf_server::access::AccessOperation::Latest)
+    );
+    assert_eq!(records[5].dataset.as_deref(), Some("tox"));
+    assert_eq!(records[5].version.as_deref(), Some("v1"));
+    assert_eq!(records[6].code, Some("bad_term_syntax"));
+    assert_eq!(records[6].representation.as_deref(), Some("json"));
+    assert_eq!(
+        records[7].transport,
+        Some(kgf_server::access::Transport::Query)
+    );
+}
+
+#[test]
+fn shape_logging_excludes_content_and_raw_logging_is_explicit() {
+    const SECRET: &str = "VERY_DISTINCTIVE_SECRET";
+    let deployment = Deployment::new();
+    deployment.publish_text("tox", "v1", GROWN_NT, "2026-06-01T14:03:22Z");
+    deployment.publish_description("schema", "v1", "2026-08-08T12:00:00Z");
+    let records = RecordingAccessLog::default();
+    let server = deployment.serve_with_access(Arc::new(records.clone()), false);
+
+    let fragment = format!(
+        "/tox/v/v1/fragment?s={}",
+        kgf_server::url::encode_value(&format!("<http://example.org/{SECRET}>"))
+    );
+    let user_agent = format!("curl/{SECRET}");
+    server
+        .request(
+            "GET",
+            &fragment,
+            &[("User-Agent", &user_agent), ("X-Request-Id", SECRET)],
+        )
+        .assert_status(200);
+    server
+        .get(&format!("/tox/v/v1/search?q={SECRET}&predicate=ex%3Aname"))
+        .assert_status(200);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "pattern": {"s": "?person", "p": "ex:knows", "o": "?known"},
+        "bindings": {
+            "vars": ["?person"],
+            "rows": [[format!("<http://example.org/{SECRET}>")]]
+        }
+    }))
+    .unwrap();
+    server
+        .request_with_body(
+            "QUERY",
+            "/tox/v/v1/fragment",
+            &[("Content-Type", "application/json")],
+            &body,
+        )
+        .assert_status(200);
+    server
+        .request_with_body(
+            "POST",
+            "/tox/v/v1/fragment",
+            &[("Content-Type", "application/json")],
+            &body,
+        )
+        .assert_status(200);
+    let values = format!("(?person) {{ (<http://example.org/{SECRET}>) }}");
+    server
+        .get(&format!(
+            "/tox/v/v1/fragment?s=%3Fperson&p=ex%3Aknows&o=%3Fknown&values={}",
+            kgf_server::url::encode_value(&values)
+        ))
+        .assert_status(200);
+    server.get(&format!("/{SECRET}")).assert_status(404);
+    server
+        .get(&format!("/schema/v/v1/schema?view=component%3A{SECRET}"))
+        .assert_status(404);
+
+    let shape_records = records.records();
+    let encoded = serde_json::to_string(&shape_records).unwrap();
+    assert!(
+        !encoded.contains(SECRET),
+        "shape tier leaked request content: {encoded}"
+    );
+    assert_eq!(
+        shape_records[2].transport,
+        Some(kgf_server::access::Transport::Query)
+    );
+    assert_eq!(
+        shape_records[3].transport,
+        Some(kgf_server::access::Transport::Post)
+    );
+    assert_eq!(shape_records[0].bytes_in, None);
+    assert_eq!(shape_records[2].bytes_in, Some(body.len() as u64));
+    assert_eq!(shape_records[3].bytes_in, Some(body.len() as u64));
+    assert_eq!(
+        shape_records[4].transport,
+        Some(kgf_server::access::Transport::GetValues)
+    );
+    assert_eq!(
+        serde_json::to_value(&shape_records[2]).unwrap()["shape"],
+        serde_json::json!({
+            "pattern": "?i?", "text": false, "limit": 100,
+            "k": 1, "columns": 1
+        })
+    );
+
+    let raw_records = RecordingAccessLog::default();
+    let raw_server = deployment.serve_with_access(Arc::new(raw_records.clone()), true);
+    raw_server
+        .request(
+            "GET",
+            &format!("/tox/v/v1/search?q={SECRET}&predicate=ex%3Aname"),
+            &[("User-Agent", &user_agent), ("X-Request-Id", SECRET)],
+        )
+        .assert_status(200);
+    let raw = raw_records.records();
+    assert_eq!(raw.len(), 1);
+    assert!(raw[0].target.as_deref().unwrap().contains(SECRET));
+    assert_eq!(raw[0].q.as_deref(), Some(SECRET));
+    assert_eq!(raw[0].user_agent.as_deref(), Some(user_agent.as_str()));
+    assert_eq!(raw[0].client_request_id.as_deref(), Some(SECRET));
+}
+
+#[test]
+fn request_ids_are_minted_without_an_access_log() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    let first = server.get("/");
+    first.assert_status(200);
+    let second = server.get("/tox/v/v1/fragment?limit=1");
+    second.assert_status(200);
+
+    let first_id = first.header("kgf-request-id").expect("a minted request id");
+    let second_id = second
+        .header("kgf-request-id")
+        .expect("a minted request id");
+    assert_ne!(first_id, second_id);
+    assert_eq!(first_id.len(), "0123456789abcdef-00000000".len());
+}
+
+#[test]
+fn forwarded_identity_comes_from_the_trusted_hop_only() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+
+    let records = RecordingAccessLog::default();
+    let server = deployment.serve_with_access(Arc::new(records.clone()), false);
+    server
+        .request("GET", "/", &[("X-Forwarded-For", "192.0.2.9")])
+        .assert_status(200);
+    server
+        .request("GET", "/", &[("X-Forwarded-For", "10.0.0.1, 192.0.2.9")])
+        .assert_status(200);
+    server
+        .request("GET", "/", &[("X-Forwarded-For", "192.0.2.9, 10.0.0.1")])
+        .assert_status(200);
+    server.get("/").assert_status(200);
+    let records = records.records();
+    assert_eq!(records[0].forwarded_hash.as_deref().map(str::len), Some(16));
+    assert_eq!(
+        records[0].forwarded_hash, records[1].forwarded_hash,
+        "an entry the caller prepended must not change its identity"
+    );
+    assert_ne!(records[0].forwarded_hash, records[2].forwarded_hash);
+    assert_eq!(records[3].forwarded_hash, None);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.client_hash == records[0].client_hash)
+    );
+
+    let unproxied = RecordingAccessLog::default();
+    let direct = deployment.serve_configured(|config| {
+        config.access_log = Some(Arc::new(unproxied.clone()));
+    });
+    direct
+        .request("GET", "/", &[("X-Forwarded-For", "192.0.2.9")])
+        .assert_status(200);
+    assert_eq!(unproxied.records()[0].forwarded_hash, None);
+}
+
+#[test]
 fn a_request_is_refused_before_it_costs_anything() {
     // Two things at once: an unanswerable request is refused for the reason it
     // is unanswerable, and it does not open a cold bundle on the way. The
@@ -1848,13 +2151,28 @@ impl Deployment {
         budgets: kgf_server::Budgets,
         public_origin: Option<kgf_server::PublicOrigin>,
     ) -> Server {
+        self.serve_configured(|config| {
+            config.caps = caps;
+            config.budgets = budgets;
+            config.public_origin = public_origin;
+        })
+    }
+
+    /// Serve with a recording sink behind one trusted forwarding hop.
+    fn serve_with_access(&self, access_log: Arc<dyn AccessLog>, log_raw: bool) -> Server {
+        self.serve_configured(|config| {
+            config.access_log = Some(access_log);
+            config.log_raw = log_raw;
+            config.trusted_proxies = 1;
+        })
+    }
+
+    fn serve_configured(&self, configure: impl FnOnce(&mut kgf_server::Config)) -> Server {
         let mut config = kgf_server::Config::new(
             kgf::serve::published_root(self.root.path()).expect("a published root"),
             "127.0.0.1:0".parse().unwrap(),
         );
-        config.caps = caps;
-        config.budgets = budgets;
-        config.public_origin = public_origin;
+        configure(&mut config);
         let service = Arc::new(Service::build(config).expect("a servable deployment"));
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1879,6 +2197,21 @@ impl Deployment {
             stop: Some(stop),
             runtime: Some(runtime),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct RecordingAccessLog(Arc<Mutex<Vec<AccessRecord>>>);
+
+impl RecordingAccessLog {
+    fn records(&self) -> Vec<AccessRecord> {
+        self.0.lock().expect("access records").clone()
+    }
+}
+
+impl AccessLog for RecordingAccessLog {
+    fn record(&self, record: &AccessRecord) {
+        self.0.lock().expect("access records").push(record.clone());
     }
 }
 

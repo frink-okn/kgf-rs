@@ -284,6 +284,10 @@ pub struct Rendered {
     pub body: Bytes,
     /// `KGF-Complete` and friends.
     pub completeness: Completeness,
+    /// Result items materialized into this response.
+    pub rows: Option<u64>,
+    /// Result cardinality when the operation reports one.
+    pub cardinality: Option<Cardinality>,
 }
 
 /// An answer that can be serialized into either representation.
@@ -590,9 +594,13 @@ impl Renders for Answer {
             Representation::JsonLd => self.fit_fragment_rdf(GraphFormat::JsonLd)?,
             _ => standard_body(&self, representation),
         };
+        let rows = Some(self.rows.len() as u64);
+        let cardinality = Some(self.rdf_cardinality.unwrap_or(self.cardinality));
         Ok(Rendered {
             body,
             completeness: self.completeness,
+            rows,
+            cardinality,
         })
     }
 
@@ -1064,6 +1072,8 @@ impl Renders for CountAnswer {
         Ok(Rendered {
             body,
             completeness: self.completeness,
+            rows: None,
+            cardinality: Some(self.count),
         })
     }
 }
@@ -1234,9 +1244,12 @@ pub struct SearchAnswer {
 impl Renders for SearchAnswer {
     fn render(self, representation: Representation) -> Result<Rendered, Problem> {
         let body = standard_body(&self, representation);
+        let rows = Some(self.results.len() as u64);
         Ok(Rendered {
             body,
             completeness: self.completeness,
+            rows,
+            cardinality: None,
         })
     }
 }
@@ -1291,9 +1304,12 @@ pub struct LabelsAnswer {
 impl Renders for LabelsAnswer {
     fn render(self, representation: Representation) -> Result<Rendered, Problem> {
         let body = standard_body(&self, representation);
+        let rows = Some(self.labels.len() as u64);
         Ok(Rendered {
             body,
             completeness: self.completeness,
+            rows,
+            cardinality: None,
         })
     }
 }
@@ -1301,9 +1317,12 @@ impl Renders for LabelsAnswer {
 impl Renders for BindingCountAnswer {
     fn render(self, representation: Representation) -> Result<Rendered, Problem> {
         let body = standard_body(&self, representation);
+        let rows = Some(self.counts.len() as u64);
         Ok(Rendered {
             body,
             completeness: self.completeness,
+            rows,
+            cardinality: None,
         })
     }
 }
@@ -1768,8 +1787,14 @@ impl Renders for SchemaAnswer {
     fn render(mut self, representation: Representation) -> Result<Rendered, Problem> {
         self.fit_response_bytes(representation);
         let completeness = self.completeness().clone();
+        let rows = Some(self.item_count() as u64);
         let body = standard_body(&self, representation);
-        Ok(Rendered { body, completeness })
+        Ok(Rendered {
+            body,
+            completeness,
+            rows,
+            cardinality: None,
+        })
     }
 
     fn hydrate_labels(
@@ -2299,6 +2324,8 @@ pub fn void(
             return Ok(Rendered {
                 body: Bytes::from(resource.to_html()),
                 completeness,
+                rows: None,
+                cardinality: None,
             });
         }
         Representation::Json | Representation::Markdown => {
@@ -2309,6 +2336,8 @@ pub fn void(
     Ok(Rendered {
         body,
         completeness: void_completeness(complete && emitted == total),
+        rows: None,
+        cardinality: None,
     })
 }
 
@@ -2347,6 +2376,8 @@ pub fn summary(
     Ok(Rendered {
         body,
         completeness: Completeness::complete(),
+        rows: None,
+        cardinality: None,
     })
 }
 
@@ -3157,7 +3188,9 @@ pub fn get_fragment(
 ) -> Result<Answer, Problem> {
     match request {
         request::GetFragment::Plain(request) => fragment(store, target, request),
-        request::GetFragment::Bindings(request) => binding_fragment(store, target, request),
+        request::GetFragment::Values(request) | request::GetFragment::Variables(request) => {
+            binding_fragment(store, target, request)
+        }
     }
 }
 

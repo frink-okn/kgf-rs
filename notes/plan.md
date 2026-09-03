@@ -17,9 +17,10 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–20 are complete: all of M1 plus `o.text`, bindings, entity search,
+Units 1–22 are complete: all of M1 plus `o.text`, bindings, entity search,
 live labels, the browser workbench, the mandatory description surface, standard RDF
-serialization, and stock Comunica TPF/brTPF interoperability. Each completed unit
+serialization, stock Comunica TPF/brTPF interoperability, the bundle builder, and
+structured request logging. Each completed unit
 carries a **What landed** section written after the fact, which is where a unit's plan
 and its outcome are reconciled.
 
@@ -1506,6 +1507,87 @@ manifest` stays, because `--check` is a verifier rather than a stop-gap.
 fields, so a config written against the DAG fails with an explanation; claiming the
 keys keeps adding them additive.
 
+### 22. Request logging — the access record
+
+One JSON object is now emitted per response to stdout by default from `kgf serve`;
+`--access-log off` disables the sink and `--log-raw` opts into the request target,
+typed search string, User-Agent, and inbound request id. The library surface takes an
+optional `Arc<dyn AccessLog>`, so embedders and real-listener tests can consume the
+same typed `AccessRecord` without
+scraping output. Diagnostics remain on stderr.
+
+The outermost router middleware owns the clock, request id, matched route, method,
+body-size hints, response status and size, pseudonymous peer identities, and a coarse
+client class. Raw client headers are retained only in the opt-in tier. It emits after
+CORS, body limiting, problem rendering and handlers have all answered, which gives
+exactly one record for successes, revalidations,
+redirects, router errors and pre-handler failures — and, through a drop guard, for
+requests the client abandoned before a response existed (`status: null`). Every
+response receives a
+server-minted `KGF-Request-Id`; an inbound `X-Request-Id` is retained separately only
+in the raw tier and never trusted as that identity. Client hashes are
+`SHA-256(salt ‖ address)` truncated to 64 bits under a per-process salt from the
+operating system, so they join traffic within one process lifetime and rotate on
+restart; `forwarded_hash` is taken from the hop `--trusted-proxies` names and is
+`null` at the default of zero.
+
+Handlers attach an `Observation` containing only facts known after parsing and release
+resolution: dataset/version, representation, transport, typed request shape, cursor
+use and canonical request hash. Bundle work returns queue and worker timings; successful
+catalog lookups additionally report open time and the deliberately racy observational
+`first_open` probe. `Rendered` now carries row count and cardinality beside completeness,
+so the record and `KGF-*` headers are derived from the same answer rather than by parsing
+serialized output. A resolved identifier is logged only after catalog lookup succeeds.
+
+A review hardened four boundary cases: raw User-Agent and inbound request ids moved
+behind `--log-raw`; a rendered problem's representation overrides the handler's
+requested representation; successful open timing survives later execution, hydration,
+or rendering errors; and `latest` derives its transport from the method its 307
+preserves.
+
+A second review reworked the parts that had been reasoned about only for throughput
+or only for the happy path. The stdout sink now serializes on the request task and
+writes from its own thread through a bounded queue, dropping and counting rather than
+parking a tokio worker on a stalled log pipe. Client pseudonyms moved from
+`RandomState` to salted SHA-256, with the request-id prefix drawn independently, so
+nothing published on a response is an output of the key that protects addresses.
+`bytes_in` is what a body handler buffered, never the declared `Content-Length`;
+`waiting` counts requests in the admission queue rather than free slots; `severity`
+is derived from the status in the generic syslog vocabulary rather than pinned to one
+platform's stream convention; the brTPF `get-values` transport is reported by the
+grammar `GetFragment::parse` selected (`Values` versus `Variables`) rather than by
+peeking at a raw parameter in the shared GET path; and every `Observation` setter is
+a no-op when no sink is configured, so `--access-log off` costs one header.
+`AccessOperation::path_segment` is the wire spelling that feeds validators and next
+links, kept apart from the census spelling serde writes.
+
+The shape types contain term kinds and magnitudes, never term values. `BoundTerm`
+therefore retains the kind established by its original parse instead of re-parsing a
+string for logging. Integration tests put one distinctive secret in a bound IRI, a
+bindings body, search text and an unknown path, then prove it is absent from the whole
+serialized shape-tier log and present only in the raw tier. The same real-listener test
+covers one-record-per-response, request-id round trips, 200/304/404/405/413/307,
+completeness, row/cardinality fields, GET, `values=`, QUERY and POST transports,
+measured body sizes, forwarded identity under a trusted hop and under the default,
+and minted request ids with no sink configured.
+
+The default `TraceLayer` and tower-http's `trace` feature are gone: enabling debug
+diagnostics can no longer disclose raw URIs as a second accidental access log.
+`notes/request-logging.md` is the detailed design record for this unit.
+
+### 23. `--public-base` — serving under a path prefix
+
+Not started. `notes/public-base.md` is the design and the handoff. FRINK mounts every
+service under a path on one shared hostname, with the gateway stripping the prefix
+before the pod sees it, and the trial deployment will live at
+`https://apps.okn.us/kgf/`. Today `PublicOrigin` refuses a path and every generated
+link is root-relative, so page two of a fragment would land on the Ubergraph QLever
+route. The unit generalizes the origin into a base, threads the prefix through the
+three URL builders via a `Mount` value on `Target`, and prefixes the redirect and the
+two root links; the ETag digest already covers it and no bundle artifact changes. Half
+a day. The note also says to send QUERY through the gateway in the same session,
+since that transport check has never been run.
+
 ### What the implementation still is not
 
 **The mandatory core profile is now implemented; M1 alone was not that profile.** Doc
@@ -2188,6 +2270,32 @@ following the code.
     can still be listed from an external link, with no content and no way to suppress
     the entry. A host-wide `robots.txt` also remains a deployment concern because one
     origin may serve more than KGF.
+
+54. **`kgf serve` is now the primary KGF collection point for the shape census.**
+    Doc 12 §12.1 lists QLever, MCP, TPF and human-UI logs, but not the structured
+    access record emitted by the service whose workload the census is intended to
+    measure. It should name the server record, its shape-default/raw-opt-in split,
+    and its role as the input to the DuckDB analysis.
+55. **Every HTTP response now carries `KGF-Request-Id`.** It is a server-minted,
+    process-unique join key, distinct from an inbound `X-Request-Id`, and belongs in
+    doc 03 §3.6 beside the completeness headers.
+56. **Client receipts should carry the server request ids that produced a table.**
+    Doc 06 §6.2.1 already requires the canonical request and request hash; adding
+    these ids makes the transcript-to-access-log join exact instead of heuristic.
+57. **The canonical 64-bit `request_hash` is in the default shape tier.** It exposes
+    no term directly, but a guessed public request can be checked against it. That
+    trade is intentional because normalized repetition and paging depth are core
+    census measurements; doc 12 should record it explicitly.
+58. **KGF clients need a distinctive User-Agent.** The access record recognizes
+    `kgf-client/<version>` and `kgfq`, but doc 06 does not yet require either client
+    to send one, leaving its client-mix field unable to distinguish them from unknown
+    callers.
+59. **Forwarded client identity needs a declared proxy depth.** Doc 12's identity
+    rows assume the census can tell clients apart behind a gateway, but
+    `X-Forwarded-For` is caller-writable and `forwarded_hash` is now `null` unless
+    the deployment declares `trusted_proxies`. The deployment plan should state the
+    FRINK gateway's depth (one hop today) beside the other host policy, and doc 12
+    should say that a forwarded identity is a deployment claim, not a server fact.
 
 ## Not in this plan
 

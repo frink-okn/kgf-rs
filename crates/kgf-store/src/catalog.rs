@@ -128,6 +128,18 @@ impl Catalog {
         self.get_with(id, Store::open)
     }
 
+    /// Whether this catalog currently holds an open store for `id`.
+    ///
+    /// This is an observational probe for request telemetry, not a promise
+    /// that the next [`get`](Self::get) will or will not open: another thread
+    /// may change the state immediately after this call. Unknown bundles and
+    /// cached failures are not open.
+    pub fn is_open(&self, id: &BundleId) -> bool {
+        self.entries
+            .get(id)
+            .is_some_and(|entry| matches!(&*lock(entry), EntryState::Open(_)))
+    }
+
     fn get_with<F>(&self, id: &BundleId, open: F) -> Result<Arc<Store>>
     where
         F: Fn(&PublishedBundle, OpenOptions) -> Result<Store>,
@@ -385,6 +397,8 @@ mod tests {
         let catalog =
             Arc::new(Catalog::scan(published_root(root.path()), OpenOptions::default()).unwrap());
         let bundle = id("dataset", "version");
+        assert!(!catalog.is_open(&bundle));
+        assert!(!catalog.is_open(&id("absent", "version")));
         let barrier = Arc::new(Barrier::new(THREADS));
 
         let handles: Vec<_> = (0..THREADS)
@@ -408,6 +422,7 @@ mod tests {
                 .iter()
                 .all(|store| Arc::ptr_eq(&stores[0], store))
         );
+        assert!(catalog.is_open(&bundle));
     }
 
     #[test]
