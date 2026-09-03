@@ -253,25 +253,15 @@ impl BundleFacts {
 
 /// Which capabilities an artifact set supports.
 ///
-/// Four optional capabilities need nothing beyond the artifacts
-/// every bundle is required to carry: `star` and `sample` are compositions of
-/// triple patterns, `terms` reads the dictionary already in `data.hdt`, and
-/// `export` serves the files themselves. The rest are gated on sidecars — the
-/// graph pair and the text index exist today, and `range` and `closure` are
-/// therefore never derived here, since a bundle cannot acquire them without
-/// acquiring an artifact.
-///
-/// `terms` is declared without the `resolve_keys` option:
-/// key resolution is a separate contract, and declaring an option the artifacts
-/// do not support would be a speculative capability claim.
+/// Two optional capabilities need nothing beyond the artifacts every bundle is
+/// required to carry: `sample` composes triple patterns, and `labels` resolves
+/// the manifest's predicate cascade through the core permutations. `star`,
+/// `terms`, and `export` are not declared until their complete HTTP operations
+/// are implemented. The rest are gated on sidecars — the graph pair and the
+/// text index exist today, and `range` and `closure` are therefore never derived
+/// here, since a bundle cannot acquire them without acquiring an artifact.
 fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
-    let mut capabilities = BTreeSet::from([
-        Capability::Star,
-        Capability::Sample,
-        Capability::Terms,
-        Capability::Export,
-        Capability::Labels,
-    ]);
+    let mut capabilities = BTreeSet::from([Capability::Sample, Capability::Labels]);
     if artifacts.graphs.is_some() {
         capabilities.insert(Capability::Graphs);
     }
@@ -1224,20 +1214,11 @@ mod tests {
     }
 
     #[test]
-    fn a_core_bundle_declares_only_artifact_backed_capabilities() {
+    fn a_core_bundle_declares_only_implemented_capabilities() {
         let fixture = Fixture::build(TINY_NT);
         let capabilities: Vec<_> = facts(&fixture).capabilities().collect();
 
-        assert_eq!(
-            capabilities,
-            vec![
-                Capability::Star,
-                Capability::Sample,
-                Capability::Terms,
-                Capability::Export,
-                Capability::Labels
-            ]
-        );
+        assert_eq!(capabilities, vec![Capability::Sample, Capability::Labels]);
         // Sidecar-gated capabilities are never guessed at.
         assert!(!capabilities.contains(&Capability::Search));
         assert!(!capabilities.contains(&Capability::Range));

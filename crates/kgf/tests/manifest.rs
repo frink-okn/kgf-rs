@@ -97,13 +97,10 @@ fn a_hand_assembled_bundle_becomes_servable_and_stays_honest() {
     assert!(manifest.artifacts.contains_key("data.hdt.perm"));
     assert!(!manifest.artifacts.contains_key("manifest.json"));
 
-    // A core bundle declares only what its artifacts back.
+    // A core bundle declares only the optional operations this build serves.
     let mut capabilities: Vec<&str> = manifest.capabilities.keys().map(String::as_str).collect();
     capabilities.sort_unstable();
-    assert_eq!(
-        capabilities,
-        ["export", "labels", "sample", "star", "terms"]
-    );
+    assert_eq!(capabilities, ["labels", "sample"]);
     assert!(manifest.predicate_roles.contains_key("label"));
 
     kgf(&["manifest", path(&bundle), "--check"]).success();

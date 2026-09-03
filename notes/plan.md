@@ -272,10 +272,14 @@ Three decisions worth naming:
 
 Derived: counts, capabilities, sizes, checksums, `content_digest`. Asked for: identity
 and description, re-read from any manifest already present, so regenerating after a
-rebuild is `kgf manifest <dir>` with no flags. Capabilities are artifact-determined —
-`star`, `sample`, `terms`, `export` need only the required artifacts; `graphs` needs
-the sidecar pair; `search`, `range`, and `closure` are never guessed at, since a bundle
-cannot acquire them without acquiring an artifact.
+rebuild is `kgf manifest <dir>` with no flags. Capabilities are artifact- and
+implementation-determined: `sample` and `labels` need only the required artifacts and
+have complete routes; `graphs` needs the sidecar pair; `search`, `range`, and `closure`
+are never guessed at, since a bundle cannot acquire them without acquiring an artifact.
+`star`, `terms`, and `export` remain undeclared until their complete optional HTTP
+contracts land. Inferring those three merely because the core bytes could support an
+implementation advertised operations that returned 404, contrary to the manifest's
+client-discovery contract.
 
 `created` dates the bundle, not the file, so it carries forward while the digest is
 unchanged. Regeneration over unchanged artifacts is therefore byte-identical.
