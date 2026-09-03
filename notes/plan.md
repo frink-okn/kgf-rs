@@ -1418,10 +1418,11 @@ page/continuation IRIs keyed to the exact request URL. Complete-document byte fi
 retains a first-omitted-row cursor rather than interrupting a serializer. RDF fragment
 requests are admitted as heavy work: complete-document fitting is bounded but has the
 same `Z·(1 + log limit)` worst case that doc 03 already records for schema fitting.
-`kgf serve --public-origin https://…` supplies a typed, trusted external origin for
+`kgf serve --public-origin https://…` supplied a typed, trusted external origin for
 Hydra page, dataset, template, and continuation IRIs behind TLS or host-rewriting
 proxies; forwarded headers remain untrusted unless an embedding deployment handles
-that trust boundary itself.
+that trust boundary itself. Unit 23 generalized the flag into `--public-base`, which
+also carries the path prefix a gateway strips.
 
 GET additionally accepts the variable-preserving URL form emitted by a source typed
 `brtpf` and parses `values=` by wrapping it in a SPARQL query handled by `spargebra`.
@@ -1575,18 +1576,47 @@ The default `TraceLayer` and tower-http's `trace` feature are gone: enabling deb
 diagnostics can no longer disclose raw URIs as a second accidental access log.
 `notes/request-logging.md` is the detailed design record for this unit.
 
-### 23. `--public-base` — serving under a path prefix
+### 23. `--public-base` — serving under a path prefix ✅
 
-Not started. `notes/public-base.md` is the design and the handoff. FRINK mounts every
-service under a path on one shared hostname, with the gateway stripping the prefix
-before the pod sees it, and the trial deployment will live at
-`https://apps.okn.us/kgf/`. Today `PublicOrigin` refuses a path and every generated
-link is root-relative, so page two of a fragment would land on the Ubergraph QLever
-route. The unit generalizes the origin into a base, threads the prefix through the
-three URL builders via a `Mount` value on `Target`, and prefixes the redirect and the
-two root links; the ETag digest already covers it and no bundle artifact changes. Half
-a day. The note also says to send QUERY through the gateway in the same session,
-since that transport check has never been run.
+FRINK mounts every service under a path on one shared hostname, with the gateway
+stripping the prefix before the pod sees it, and the trial deployment will live at
+`https://apps.okn.us/kgf/`. Before this unit `PublicOrigin` refused a path and every
+generated link was root-relative, so page two of a fragment would have landed on the
+Ubergraph QLever route. `notes/public-base.md` is the design record.
+
+**What landed (2026-09-03).** The rule is *the gateway strips, the server emits*: the
+router stays mounted at `/`, a request that still carries the prefix answers the
+ordinary 404, and every URL the server emits carries the base. `PublicOrigin` became
+`PublicBase`, a normalized `scheme://authority[/prefix]` with `origin()`,
+`path_prefix()` (`""` or `/kgf`, never a bare `/`), and `mount()`. The three free URL
+builders in `url` became methods on `url::Mount`, a cheap `Arc<str>` the `Service`
+derives once from the base and hands to every `Target`, descriptor, form, and page
+shell — there is one way to build a production link and it goes through the mount.
+The Hydra page, template, and continuation IRIs are the whole base followed by the
+server-seen path and query, so the prefix appears exactly once; the `latest`
+redirect's `Location`, the masthead brand link, the service descriptor's canonical
+URL, form actions, crumbs, and term links all carry it. `render_problems` moved to
+`from_fn_with_state` so a problem's `instance` and the fallback 404's message name
+the path as the client spelled it. The descriptor ETag now hashes the whole base, so
+moving a deployment to another mount invalidates every cached link. JSON
+continuations are cursor tokens, not links, and needed nothing; `stats/summary.json`
+is written with version-relative links and is prefix-safe by construction. No bundle
+artifact, cursor token, or manifest field changed.
+
+`kgf serve --public-base https://apps.okn.us/kgf` is the flag; there is no
+`--public-origin` alias, since nothing is released. The FRINK route is the QLever
+pattern — `PathPrefix /kgf` with a `ReplacePrefixMatch: /` rewrite — recorded in
+`../kgf/docs/gcp-deployment-plan.md` §6. Still to run once deployed: the external
+verification in `notes/public-base.md` §9, and the QUERY-through-the-gateway
+transport check, which has never been sent through the GKE Gateway.
+
+*Verified by* parser tests on `PublicBase`, byte-for-byte `Mount` tests with an empty
+and a `/kgf` prefix, form and page-shell tests under a mount, and one real-listener
+test that serves `https://apps.okn.us/kgf`, sends every request without the prefix as
+the gateway delivers it, and checks the descriptor links, the redirect, the Turtle
+identities, the page's brand link, form action, and every root-relative link, the
+problem `instance`, and the 404 for the prefixed spelling. The existing root-relative
+assertions in `tests/serve.rs` are the no-base regression suite and needed no edits.
 
 ### What the implementation still is not
 
@@ -2296,6 +2326,20 @@ following the code.
     the deployment declares `trusted_proxies`. The deployment plan should state the
     FRINK gateway's depth (one hop today) beside the other host policy, and doc 12
     should say that a forwarded identity is a deployment claim, not a server fact.
+60. **Doc 03 §3.2 assumed the URL space is rooted at an origin.** A deployment is
+    mounted at exactly one *service base*, which may carry a path; every emitted link
+    (JSON, HTML, Hydra, `Location`) carries it, and the server does not accept the
+    prefixed spelling itself — the gateway strips, the server emits. Unit 23 added the
+    paragraph to §3.2; the one-base rule should stay stated there.
+61. **`Problem.instance` is the public path, not the server-seen one.** RFC 9457
+    leaves `instance` to the server, and behind a prefix-stripping gateway the
+    server-seen path is a URL the client never requested. `kgf serve` now emits the
+    public spelling; doc 03 §3.6 should say so.
+62. **JSON links stay origin-relative rather than absolute.** Descriptor links are
+    root-relative paths under the base and fragment continuations are cursor tokens,
+    not links. That is a decision, not a question, but doc 03 §3.4.10's "typed links"
+    wording should not be read as requiring absolute IRIs outside the RDF
+    representations.
 
 ## Not in this plan
 

@@ -729,9 +729,13 @@ impl From<crate::cursor::StaleCursor> for Problem {
     }
 }
 
-impl crate::html::Resource for Problem {
+/// Rendering. Not a [`Resource`](crate::html::Resource): a problem is not a
+/// route, it is what any route answers when it cannot, and the middleware that
+/// renders it supplies the deployment's mount rather than the problem carrying
+/// one.
+impl Problem {
     /// The RFC 9457 document.
-    fn to_json(&self) -> bytes::Bytes {
+    pub fn to_json(&self) -> bytes::Bytes {
         crate::html::json_body(self)
     }
 
@@ -741,12 +745,14 @@ impl crate::html::Resource for Problem {
     /// are agent UX, and the human case is the same argument.
     /// `detail` already names the offending value and the remedy, so the page
     /// is mostly a frame around it.
-    fn to_html(&self) -> String {
+    pub fn to_html(&self, mount: &crate::url::Mount) -> String {
         use crate::html::{Value, fields, note, page};
 
-        // No crumbs: the masthead's brand already links back to `/`, which is
-        // the one place every error page can honestly point.
+        // No crumbs: the masthead's brand already links back to the service
+        // descriptor, which is the one place every error page can honestly
+        // point.
         page(
+            mount,
             self.code.title(),
             &[],
             None,

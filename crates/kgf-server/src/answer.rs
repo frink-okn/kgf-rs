@@ -76,7 +76,7 @@ use crate::request::{
 };
 use crate::skolem::SkolemScope;
 use crate::term::{LiteralKind, PrefixMap, Term, TermCache};
-use crate::url::{self, Params};
+use crate::url::{self, Mount, Params};
 
 // ---------------------------------------------------------------------------
 // Where a response came from
@@ -94,6 +94,10 @@ pub struct Target {
     operation: &'static str,
     params: Params,
     prefixes: PrefixMap,
+    /// Where the deployment is mounted. Every link this answer renders — the
+    /// canonical URL, the next page, the crumbs, the term links — is built
+    /// against it, from the same place the prefix map is read.
+    mount: Mount,
     body: bool,
     has_search: bool,
     /// The exact absolute GET URL received over HTTP. Hydra metadata keys its
@@ -103,10 +107,17 @@ pub struct Target {
 }
 
 impl Target {
-    /// The version and operation a request addressed, with its parameters and
-    /// the version's immutable prefix map for human-facing result labels.
-    pub fn new(id: BundleId, operation: &'static str, params: Params, prefixes: PrefixMap) -> Self {
-        Self::get(id, operation, params, prefixes, false, None)
+    /// The version and operation a request addressed, with its parameters, the
+    /// version's immutable prefix map for human-facing result labels, and the
+    /// mount its links are built against.
+    pub fn new(
+        id: BundleId,
+        operation: &'static str,
+        params: Params,
+        prefixes: PrefixMap,
+        mount: Mount,
+    ) -> Self {
+        Self::get(id, operation, params, prefixes, mount, false, None)
     }
 
     /// A GET target with the release capabilities its page may expose.
@@ -115,6 +126,7 @@ impl Target {
         operation: &'static str,
         params: Params,
         prefixes: PrefixMap,
+        mount: Mount,
         has_search: bool,
         request_url: Option<String>,
     ) -> Self {
@@ -123,6 +135,7 @@ impl Target {
             operation,
             params,
             prefixes,
+            mount,
             body: false,
             has_search,
             request_url,
@@ -135,12 +148,14 @@ impl Target {
         operation: &'static str,
         params: Params,
         prefixes: PrefixMap,
+        mount: Mount,
     ) -> Self {
         Self {
             id,
             operation,
             params,
             prefixes,
+            mount,
             body: true,
             has_search: false,
             request_url: None,
@@ -152,8 +167,17 @@ impl Target {
         &self.id
     }
 
+    /// The mount this answer's links are built against.
+    pub fn mount(&self) -> &Mount {
+        &self.mount
+    }
+
+    /// This operation's own path, prefix included. Composed with
+    /// [`origin`](Self::origin) for the absolute form: the origin is
+    /// `scheme://authority` alone, so the prefix appears exactly once.
     fn base(&self) -> String {
-        url::operation(&self.id.dataset, &self.id.version, self.operation)
+        self.mount
+            .operation(&self.id.dataset, &self.id.version, self.operation)
     }
 
     /// The origin on which the request arrived.
@@ -198,19 +222,21 @@ impl Target {
     fn ask(&self, operation: &str, parameter: &str, value: &str) -> String {
         format!(
             "{}?{parameter}={}",
-            url::operation(&self.id.dataset, &self.id.version, operation),
+            self.mount
+                .operation(&self.id.dataset, &self.id.version, operation),
             url::encode_value(value)
         )
     }
 
     fn crumbs(&self) -> Vec<Crumb<'_>> {
         vec![
-            Crumb::to(&self.id.dataset, url::dataset(&self.id.dataset)),
+            Crumb::to(&self.id.dataset, self.mount.dataset(&self.id.dataset)),
             // There is no landing page for a version, so the version step goes
             // to its manifest, the version's canonical descriptive document.
             Crumb::to(
                 &self.id.version,
-                url::operation(&self.id.dataset, &self.id.version, "manifest"),
+                self.mount
+                    .operation(&self.id.dataset, &self.id.version, "manifest"),
             ),
             Crumb::here(self.operation),
         ]
@@ -255,6 +281,7 @@ impl Target {
             None
         } else {
             forms::operation_form(
+                &self.mount,
                 &self.id.dataset,
                 &self.id.version,
                 self.operation,
@@ -1960,6 +1987,7 @@ impl VoidResource {
         let context = self.target.context();
         let turtle = String::from_utf8_lossy(&self.turtle);
         operation_page_with_format(
+            &self.target.mount,
             "VoID dataset description",
             &context,
             &self.target.crumbs(),
@@ -2049,6 +2077,7 @@ impl SummaryResource {
         let context = self.target.context();
         let Some(card) = &self.card else {
             return operation_page(
+                &self.target.mount,
                 "Dataset summary",
                 &context,
                 &self.target.crumbs(),
@@ -2110,6 +2139,7 @@ impl SummaryResource {
             .collect();
         let title = card.dataset.title.as_deref().unwrap_or(&card.dataset.id);
         operation_page(
+            &self.target.mount,
             title,
             &context,
             &self.target.crumbs(),
@@ -5182,6 +5212,7 @@ impl SchemaNavigationAnswer {
             .map(String::as_str);
         let crumbs = self.schema_crumbs(details);
         operation_page(
+            &self.target.mount,
             &title,
             &context,
             &crumbs,
@@ -5259,11 +5290,15 @@ impl SchemaNavigationAnswer {
         let mut crumbs = vec![
             Crumb::to(
                 &self.target.id.dataset,
-                url::dataset(&self.target.id.dataset),
+                self.target.mount.dataset(&self.target.id.dataset),
             ),
             Crumb::to(
                 &self.target.id.version,
-                url::operation(&self.target.id.dataset, &self.target.id.version, "manifest"),
+                self.target.mount.operation(
+                    &self.target.id.dataset,
+                    &self.target.id.version,
+                    "manifest",
+                ),
             ),
         ];
         if self.selector.kind() == "dataset" && self.collection.is_none() {
@@ -5274,7 +5309,11 @@ impl SchemaNavigationAnswer {
         crumbs.push(Crumb::to(
             "schema",
             query(
-                url::operation(&self.target.id.dataset, &self.target.id.version, "schema"),
+                self.target.mount.operation(
+                    &self.target.id.dataset,
+                    &self.target.id.version,
+                    "schema",
+                ),
                 &Params::default().with("view", &self.view),
             ),
         ));
@@ -5347,6 +5386,7 @@ impl SchemaRelationsAnswer {
         let canonical = self.target.canonical();
         let context = self.target.context();
         operation_page(
+            &self.target.mount,
             "Class relations",
             &context,
             &self.target.crumbs(),
@@ -5447,6 +5487,7 @@ impl SchemaClassPropertiesAnswer {
             .collect();
         let canonical = self.target.canonical();
         operation_page(
+            &self.target.mount,
             "Class properties",
             &self.target.context(),
             &self.target.crumbs(),
@@ -5638,6 +5679,7 @@ impl Resource for Answer {
         let heading = self.page_heading();
         let context = self.target.context();
         operation_page(
+            &self.target.mount,
             &heading,
             &context,
             &self.target.crumbs(),
@@ -5943,6 +5985,7 @@ impl Resource for SearchAnswer {
         let heading = format!("“{}”", self.query);
         let context = self.target.context();
         operation_page(
+            &self.target.mount,
             &heading,
             &context,
             &self.target.crumbs(),
@@ -5998,6 +6041,7 @@ impl Resource for LabelsAnswer {
             .collect();
         let returned = self.labels.len() as u64;
         page(
+            &self.target.mount,
             &self.target.title(),
             &self.target.crumbs(),
             None,
@@ -6037,6 +6081,7 @@ impl Resource for CountAnswer {
         let canonical = self.target.canonical();
         let context = self.target.context();
         operation_page(
+            &self.target.mount,
             "Pattern count",
             &context,
             &self.target.crumbs(),
@@ -6067,7 +6112,7 @@ impl Resource for CountAnswer {
                 }
                 (pager(
                     &query(
-                        url::operation(&self.target.id.dataset, &self.target.id.version, "fragment"),
+                        self.target.mount.operation(&self.target.id.dataset, &self.target.id.version, "fragment"),
                         &self.target.params.without("cursor"),
                     ),
                     "The rows themselves →",
@@ -6101,6 +6146,7 @@ impl Resource for BindingCountAnswer {
             .collect();
         let canonical = self.target.canonical();
         page(
+            &self.target.mount,
             &self.target.title(),
             &self.target.crumbs(),
             canonical.as_deref(),

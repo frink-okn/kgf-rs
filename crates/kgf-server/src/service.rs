@@ -55,13 +55,14 @@ use kgf_store::manifest::{
 };
 use kgf_store::store::{OpenOptions, Store, artifact};
 
-use crate::Config;
 use crate::access::{AccessState, OpenTiming, millis};
 use crate::admission::AdmissionController;
 use crate::cursor::BundleBinding;
 use crate::envelope::{ErrorCode, Problem, reflected};
 use crate::representation::ContentDigest;
 use crate::term::PrefixMap;
+use crate::url::Mount;
+use crate::{Config, PublicBase};
 
 /// What stops the server from starting.
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +103,7 @@ pub struct Service {
     catalog: Catalog,
     datasets: Datasets,
     descriptors: ContentDigest,
+    mount: Mount,
     admission: AdmissionController,
     access: AccessState,
 }
@@ -141,6 +143,10 @@ impl Service {
         let datasets = Datasets::derive(manifests)?;
         datasets.validate_profile_caps(config.caps.max_search_predicates)?;
         let descriptors = descriptor_digest(&config, &datasets);
+        let mount = config
+            .public_base
+            .as_ref()
+            .map_or_else(Mount::default, PublicBase::mount);
         let admission = AdmissionController::new(config.admission);
         let access = AccessState::new(
             config.access_log.clone(),
@@ -152,9 +158,16 @@ impl Service {
             catalog,
             datasets,
             descriptors,
+            mount,
             admission,
             access,
         })
+    }
+
+    /// Where this deployment is mounted, which every emitted link is built
+    /// against.
+    pub fn mount(&self) -> &Mount {
+        &self.mount
     }
 
     /// A validator for the mutable descriptors at `/` and `/{dataset}`.
@@ -261,12 +274,15 @@ fn descriptor_digest(config: &Config, datasets: &Datasets) -> ContentDigest {
             .expect("budgets serialize")
             .as_slice(),
     );
-    field(
-        config
-            .public_origin
-            .as_ref()
-            .map_or(&[], |origin| origin.as_str().as_bytes()),
-    );
+    // The whole base, prefix included: a deployment moved to another mount
+    // emits different links from the same bundles, and a cached descriptor
+    // from the old mount must not validate.
+    let public_base = config
+        .public_base
+        .as_ref()
+        .map(PublicBase::as_str)
+        .unwrap_or_default();
+    field(public_base.as_bytes());
     field(env!("CARGO_PKG_VERSION").as_bytes());
     for name in datasets.names() {
         field(name.as_bytes());
@@ -893,7 +909,8 @@ mod tests {
         .expect("well-formed manifests");
 
         let dataset = datasets.get("tox").unwrap();
-        let descriptor = DatasetDescriptor::of("tox", dataset);
+        let mount = Mount::default();
+        let descriptor = DatasetDescriptor::of(&mount, "tox", dataset);
         let json: serde_json::Value = serde_json::from_slice(&descriptor.to_json()).unwrap();
         assert_eq!(json["current"], "new");
         assert!(

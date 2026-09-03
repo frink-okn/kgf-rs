@@ -52,7 +52,7 @@ use crate::representation::{CachePolicy, Representation, etag, etag_for_body, ne
 use crate::request;
 use crate::service::{Release, Service};
 use crate::url::{self, Params};
-use crate::{Limits, PublicOrigin};
+use crate::{Limits, PublicBase};
 
 /// The KGF routes over a built service.
 pub fn router(service: Arc<Service>) -> Router {
@@ -112,7 +112,10 @@ pub fn router(service: Arc<Service>) -> Router {
         // `values=` applies the same figure before its SPARQL parser runs.
         .layer(RequestBodyLimitLayer::new(body_limit))
         .layer(DefaultBodyLimit::max(body_limit))
-        .layer(middleware::from_fn(render_problems))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&service),
+            render_problems,
+        ))
         // Permissive CORS, because the data is public and browser and WASM
         // clients are a target. `QUERY` is listed explicitly — a preflight that
         // omitted it would leave the canonical method unusable from a browser.
@@ -162,15 +165,25 @@ fn method_not_allowed_problem(method: Method) -> Problem {
     )
 }
 
-async fn no_such_route(OriginalUri(uri): OriginalUri) -> Problem {
+/// The fallback, in the client's own spelling: behind a prefix-stripping
+/// gateway the path this server saw is not the one the client sent, so both
+/// the missing path and the routes on offer are named under the mount. A
+/// request that arrives *with* the prefix — a gateway that forgot to strip it —
+/// lands here too, and is not rescued: one resource has one URL.
+async fn no_such_route(
+    State(service): State<Arc<Service>>,
+    OriginalUri(uri): OriginalUri,
+) -> Problem {
+    let mount = service.mount();
+    let prefix = mount.prefix();
     Problem::new(
         ErrorCode::NotFound,
         format!(
-            "no resource at {}; this server serves / (service descriptor), \
-             /{{dataset}}, and /{{dataset}}/v/{{version}}/{{manifest,fragment,count,describe,\
-             sample,search,labels,schema,void,summary}}; version resources are also available \
-             under /{{dataset}}/latest/",
-            reflected(uri.path())
+            "no resource at {}; this server serves {prefix}/ (service descriptor), \
+             {prefix}/{{dataset}}, and {prefix}/{{dataset}}/v/{{version}}/{{manifest,fragment,\
+             count,describe,sample,search,labels,schema,void,summary}}; version resources \
+             are also available under {prefix}/{{dataset}}/latest/",
+            reflected(&mount.public_path(uri.path()))
         ),
     )
 }
@@ -224,7 +237,7 @@ async fn dataset_descriptor(
     .empty_shape();
     observed_result(
         respond(
-            &DatasetDescriptor::of(&dataset, found),
+            &DatasetDescriptor::of(service.mount(), &dataset, found),
             representation,
             &wants,
             CachePolicy::Mutable,
@@ -280,6 +293,7 @@ async fn bundle_manifest(
     }
 
     let resource = BundleManifest::new(
+        service.mount().clone(),
         &dataset,
         &version,
         release.manifest().bytes(),
@@ -920,6 +934,7 @@ where
         operation.path_segment(),
         params,
         release.prefixes().clone(),
+        service.mount().clone(),
         release.declares(Capability::Search),
         wants.request_url.clone(),
     );
@@ -1013,6 +1028,7 @@ where
         operation.path_segment(),
         params,
         release.prefixes().clone(),
+        service.mount().clone(),
         release.declares(Capability::Search),
         wants.request_url.clone(),
     );
@@ -1192,6 +1208,7 @@ where
         operation.path_segment(),
         wants.params().clone(),
         release.prefixes().clone(),
+        service.mount().clone(),
     );
     let labels = PageLabelProfile::for_request(&service, release, representation, false);
     let opened = Arc::clone(&service);
@@ -1241,12 +1258,18 @@ async fn latest_redirect(
     let rest = remainder
         .strip_prefix("latest")
         .ok_or_else(|| unreachable_route(path))?;
+    // Under the mount: `Location` is a URL the client will request, and the
+    // client's requests go through the gateway.
+    let prefix = service.mount().prefix();
     let location = match uri.query() {
         Some(query) => format!(
-            "/{raw_dataset}/v/{}{rest}?{query}",
+            "{prefix}/{raw_dataset}/v/{}{rest}?{query}",
             url::encode_segment(current)
         ),
-        None => format!("/{raw_dataset}/v/{}{rest}", url::encode_segment(current)),
+        None => format!(
+            "{prefix}/{raw_dataset}/v/{}{rest}",
+            url::encode_segment(current)
+        ),
     };
 
     // 307, not 308: `latest` moves, and a permanent redirect invites a client
@@ -1398,22 +1421,25 @@ impl FromRequestParts<Arc<Service>> for Wants {
             // §13.1 requires of a precondition a server cannot evaluate: the
             // response is the full one, never a wrong 304.
             if_none_match: parts.headers.typed_get(),
-            request_url: absolute_request_url(parts, service.config().public_origin.as_ref()),
+            request_url: absolute_request_url(parts, service.config().public_base.as_ref()),
         })
     }
 }
 
 /// Reconstruct the absolute request target from HTTP's authority and the
-/// untouched path/query. A configured origin is trusted over request headers;
-/// without one, `kgf serve` is a plain-HTTP listener and `Host` is authoritative.
+/// untouched path/query. A configured base is trusted over request headers,
+/// and its path prefix is what the gateway removed from the path this server
+/// sees, so the two concatenate to the URL the client sent. Without one,
+/// `kgf serve` is a plain-HTTP listener at a hostname root and `Host` is
+/// authoritative.
 fn absolute_request_url(
     parts: &axum::http::request::Parts,
-    public_origin: Option<&PublicOrigin>,
+    public_base: Option<&PublicBase>,
 ) -> Option<String> {
-    if let Some(origin) = public_origin {
+    if let Some(base) = public_base {
         return Some(format!(
             "{}{}",
-            origin.as_str(),
+            base.as_str(),
             parts.uri.path_and_query()?.as_str()
         ));
     }
@@ -1686,7 +1712,11 @@ impl IntoResponse for Problem {
 /// Every error response carries a code, including those. So an
 /// error that arrives unattributed is given a problem from its status rather
 /// than shipped as whatever the layer produced.
-async fn render_problems(request: Request, next: Next) -> Response {
+async fn render_problems(
+    State(service): State<Arc<Service>>,
+    request: Request,
+    next: Next,
+) -> Response {
     // Cloned, not parsed: both are refcounted buffers, and the parsing they
     // feed is only needed by the small minority of requests that fail. Doing it
     // up front cost every successful response a `BTreeMap` and two `String`s.
@@ -1712,7 +1742,11 @@ async fn render_problems(request: Request, next: Next) -> Response {
         }
         accept_header(&headers).ok().flatten()
     };
-    let problem = problem.about_unless_set(reflected(uri.path()));
+    // `instance` names the occurrence in the client's spelling: under a
+    // prefix-stripping gateway the path this server saw is not a URL the
+    // client ever requested.
+    let mount = service.mount();
+    let problem = problem.about_unless_set(reflected(&mount.public_path(uri.path())));
     let code = problem.code();
     let representation = Representation::for_problem(format.as_deref(), accept.as_deref());
     let (content_type, body) = match representation {
@@ -1720,7 +1754,7 @@ async fn render_problems(request: Request, next: Next) -> Response {
         Representation::Json => (PROBLEM_MEDIA_TYPE, problem.to_json()),
         Representation::Html => (
             Representation::Html.content_type(),
-            bytes::Bytes::from(problem.to_html()),
+            bytes::Bytes::from(problem.to_html(mount)),
         ),
         Representation::Turtle | Representation::JsonLd | Representation::Markdown => {
             unreachable!("problem negotiation resolves to JSON or HTML")

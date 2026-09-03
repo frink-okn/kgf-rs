@@ -32,7 +32,7 @@ use crate::html::{
     page, stats, table,
 };
 use crate::service::{Dataset, PredicateRoles, Service};
-use crate::url;
+use crate::url::Mount;
 use maud::html;
 
 /// The KGF protocol version this server speaks.
@@ -56,6 +56,9 @@ pub const PROTOCOL_VERSION: &str = "1";
 /// dataset. This keeps catalog discovery to one round trip.
 #[derive(Debug, Serialize)]
 pub struct ServiceDescriptor<'a> {
+    /// Where the deployment is mounted; a rendering fact, not a published one.
+    #[serde(skip)]
+    mount: &'a Mount,
     datasets: Vec<DatasetSummary<'a>>,
     caps: &'a crate::Caps,
     budgets: &'a crate::Budgets,
@@ -110,7 +113,9 @@ pub struct Implementation {
 impl<'a> ServiceDescriptor<'a> {
     /// Describe a running service.
     pub fn of(service: &'a Service) -> Self {
+        let mount = service.mount();
         Self {
+            mount,
             datasets: service
                 .datasets()
                 .iter()
@@ -121,8 +126,8 @@ impl<'a> ServiceDescriptor<'a> {
                     triples: dataset.triples(),
                     current: dataset.current(),
                     capabilities: dataset.capabilities().collect(),
-                    url: url::dataset(name),
-                    links: release_links(name, dataset.current(), dataset.current_release()),
+                    url: mount.dataset(name),
+                    links: release_links(mount, name, dataset.current(), dataset.current_release()),
                 })
                 .collect(),
             caps: &service.config().caps,
@@ -148,9 +153,10 @@ impl Resource for ServiceDescriptor<'_> {
             .fold(0, u64::saturating_add);
 
         page(
+            self.mount,
             SITE,
             &[],
-            Some("/"),
+            Some(&self.mount.root()),
             html! {
                 section."overview" {
                     p."lede" {
@@ -276,6 +282,9 @@ pub struct DatasetDescriptor<'a> {
     triples: u64,
     #[serde(skip)]
     capabilities: Vec<&'a str>,
+    /// Where the deployment is mounted; a rendering fact, not a published one.
+    #[serde(skip)]
+    mount: &'a Mount,
 }
 
 /// One row of a dataset descriptor's release history.
@@ -295,8 +304,9 @@ pub struct ReleaseEntry<'a> {
 
 impl<'a> DatasetDescriptor<'a> {
     /// Describe one dataset.
-    pub fn of(name: &'a str, dataset: &'a Dataset) -> Self {
+    pub fn of(mount: &'a Mount, name: &'a str, dataset: &'a Dataset) -> Self {
         Self {
+            mount,
             id: name,
             dataset_iri: dataset.dataset_iri(),
             title: dataset.title(),
@@ -309,8 +319,8 @@ impl<'a> DatasetDescriptor<'a> {
                 .map(|(version, release)| ReleaseEntry {
                     version,
                     content_digest: release.content_digest().as_str(),
-                    url: url::bundle_base(name, version),
-                    links: release_links(name, version, release),
+                    url: mount.bundle_base(name, version),
+                    links: release_links(mount, name, version, release),
                 })
                 .collect(),
             triples: dataset.triples(),
@@ -348,7 +358,7 @@ impl Resource for DatasetDescriptor<'_> {
             .map(|release| {
                 vec![
                     Value::self_link(
-                        url::operation(self.id, release.version, "manifest"),
+                        self.mount.operation(self.id, release.version, "manifest"),
                         release.version,
                     ),
                     if release.version == self.current {
@@ -362,9 +372,10 @@ impl Resource for DatasetDescriptor<'_> {
             .collect();
 
         page(
+            self.mount,
             self.title.unwrap_or(self.id),
             &[Crumb::here(self.id)],
-            Some(&url::dataset(self.id)),
+            Some(&self.mount.dataset(self.id)),
             html! {
                 section."overview" {
                     @if let Some(description) = self.description {
@@ -402,7 +413,7 @@ impl Resource for DatasetDescriptor<'_> {
                         (
                             "latest",
                             Value::self_link(
-                                url::operation(self.id, self.current, "manifest"),
+                                self.mount.operation(self.id, self.current, "manifest"),
                                 self.current,
                             ),
                         ),
@@ -431,8 +442,13 @@ impl Resource for DatasetDescriptor<'_> {
     }
 }
 
-fn release_links(dataset: &str, version: &str, release: &crate::service::Release) -> ReleaseLinks {
-    let operation = |name| url::operation(dataset, version, name);
+fn release_links(
+    mount: &Mount,
+    dataset: &str,
+    version: &str,
+    release: &crate::service::Release,
+) -> ReleaseLinks {
+    let operation = |name| mount.operation(dataset, version, name);
     let description = release.carries_description();
     ReleaseLinks {
         manifest: operation("manifest"),
@@ -461,6 +477,7 @@ fn release_links(dataset: &str, version: &str, release: &crate::service::Release
 /// A bundle's published manifest.
 #[derive(Debug)]
 pub struct BundleManifest {
+    mount: Mount,
     dataset: String,
     version: String,
     published: bytes::Bytes,
@@ -470,12 +487,14 @@ pub struct BundleManifest {
 impl BundleManifest {
     /// Pair the bytes as published with the parse the page is rendered from.
     pub fn new(
+        mount: Mount,
         dataset: &str,
         version: &str,
         published: bytes::Bytes,
         parsed: std::sync::Arc<Manifest>,
     ) -> Self {
         Self {
+            mount,
             dataset: dataset.to_owned(),
             version: version.to_owned(),
             published,
@@ -531,12 +550,17 @@ impl Resource for BundleManifest {
             .collect();
 
         page(
+            &self.mount,
             &format!("{} — {}", self.dataset, self.version),
             &[
-                Crumb::to(&self.dataset, url::dataset(&self.dataset)),
+                Crumb::to(&self.dataset, self.mount.dataset(&self.dataset)),
                 Crumb::here(&self.version),
             ],
-            Some(&url::operation(&self.dataset, &self.version, "manifest")),
+            Some(
+                &self
+                    .mount
+                    .operation(&self.dataset, &self.version, "manifest"),
+            ),
             html! {
                 section."overview" {
                     @if let Some(description) = &manifest.description {
@@ -558,7 +582,7 @@ impl Resource for BundleManifest {
                 }
 
                 section."workbench" {
-                    (forms::manifest_forms(&self.dataset, &self.version, manifest))
+                    (forms::manifest_forms(&self.mount, &self.dataset, &self.version, manifest))
                 }
 
                 div."dashboard-grid" {
@@ -571,15 +595,15 @@ impl Resource for BundleManifest {
                         ))
                         (table(
                             &["Operation", "Parameters"],
-                            &operations(&self.dataset, &self.version, manifest),
+                            &operations(&self.mount, &self.dataset, &self.version, manifest),
                         ))
                         pre {
                             code {
-                                "curl \"$KGF" (url::operation(&self.dataset, &self.version, "fragment"))
+                                "curl \"$KGF" (self.mount.operation(&self.dataset, &self.version, "fragment"))
                                 "?limit=25\"\n"
-                                "curl \"$KGF" (url::operation(&self.dataset, &self.version, "count"))
+                                "curl \"$KGF" (self.mount.operation(&self.dataset, &self.version, "count"))
                                 "?p=rdf:type\"\n"
-                                "curl \"$KGF" (url::operation(&self.dataset, &self.version, "describe"))
+                                "curl \"$KGF" (self.mount.operation(&self.dataset, &self.version, "describe"))
                                 "?iri=<https://example.org/resource>\""
                             }
                         }
@@ -613,7 +637,7 @@ impl Resource for BundleManifest {
                                 "previous_version",
                                 manifest.previous_version.as_deref().map_or(Value::Absent, |previous| {
                                     Value::self_link(
-                                        url::operation(&self.dataset, previous, "manifest"),
+                                        self.mount.operation(&self.dataset, previous, "manifest"),
                                         previous,
                                     )
                                 }),
@@ -665,7 +689,12 @@ impl Resource for BundleManifest {
 /// the first page of everything, and every term in it links onwards. `/describe`
 /// needs a resource, so it is listed with the parameter it wants rather than
 /// with a link that would 400.
-fn operations(dataset: &str, version: &str, manifest: &Manifest) -> Vec<Vec<Value<'static>>> {
+fn operations(
+    mount: &Mount,
+    dataset: &str,
+    version: &str,
+    manifest: &Manifest,
+) -> Vec<Vec<Value<'static>>> {
     let search = manifest.declares(Capability::Search);
     let pattern_parameters = if search {
         "s, p, o, o.text, limit, cursor"
@@ -708,7 +737,7 @@ fn operations(dataset: &str, version: &str, manifest: &Manifest) -> Vec<Vec<Valu
             vec![
                 if browsable {
                     Value::Link {
-                        href: url::operation(dataset, version, operation),
+                        href: mount.operation(dataset, version, operation),
                         label: operation,
                     }
                 } else {
@@ -765,6 +794,7 @@ mod tests {
 
     fn bundle_manifest(published: &str) -> BundleManifest {
         BundleManifest::new(
+            Mount::default(),
             "tox",
             "2026-06-01",
             bytes::Bytes::copy_from_slice(published.as_bytes()),
@@ -828,6 +858,7 @@ mod tests {
             );
         }
         let page = BundleManifest::new(
+            Mount::default(),
             "tox",
             "2026-06-01",
             bytes::Bytes::from_static(b"{}"),

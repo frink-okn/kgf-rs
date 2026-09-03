@@ -11,10 +11,15 @@ use kgf_store::Capability;
 use kgf_store::manifest::Manifest;
 use maud::{Markup, html};
 
-use crate::url::{self, Params};
+use crate::url::{Mount, Params};
 
 /// All runnable GET forms for one bundle manifest.
-pub(crate) fn manifest_forms(dataset: &str, version: &str, manifest: &Manifest) -> Markup {
+pub(crate) fn manifest_forms(
+    mount: &Mount,
+    dataset: &str,
+    version: &str,
+    manifest: &Manifest,
+) -> Markup {
     let empty = Params::default();
     let search = manifest.declares(Capability::Search);
 
@@ -25,14 +30,14 @@ pub(crate) fn manifest_forms(dataset: &str, version: &str, manifest: &Manifest) 
             "listed above, bracketed IRIs, blank nodes and quoted literals."
         }
         div."query-stack" {
-            (fragment(dataset, version, &empty, search, true))
-            (count(dataset, version, &empty, search, false))
-            (describe(dataset, version, &empty, false))
+            (fragment(mount, dataset, version, &empty, search, true))
+            (count(mount, dataset, version, &empty, search, false))
+            (describe(mount, dataset, version, &empty, false))
             @if manifest.declares(Capability::Sample) {
-                (sample(dataset, version, &empty, false))
+                (sample(mount, dataset, version, &empty, false))
             }
             @if search {
-                (search_form(dataset, version, &empty, false))
+                (search_form(mount, dataset, version, &empty, false))
             }
         }
     }
@@ -40,6 +45,7 @@ pub(crate) fn manifest_forms(dataset: &str, version: &str, manifest: &Manifest) 
 
 /// The editor shown above an existing GET answer.
 pub(crate) fn operation_form(
+    mount: &Mount,
     dataset: &str,
     version: &str,
     operation: &str,
@@ -47,17 +53,24 @@ pub(crate) fn operation_form(
     has_search: bool,
 ) -> Option<Markup> {
     let form = match operation {
-        "fragment" => Some(fragment(dataset, version, params, has_search, false)),
-        "count" => Some(count(dataset, version, params, has_search, false)),
-        "describe" => Some(describe(dataset, version, params, false)),
-        "sample" => Some(sample(dataset, version, params, false)),
-        "search" => Some(search_form(dataset, version, params, false)),
+        "fragment" => Some(fragment(mount, dataset, version, params, has_search, false)),
+        "count" => Some(count(mount, dataset, version, params, has_search, false)),
+        "describe" => Some(describe(mount, dataset, version, params, false)),
+        "sample" => Some(sample(mount, dataset, version, params, false)),
+        "search" => Some(search_form(mount, dataset, version, params, false)),
         _ => None,
     }?;
     Some(html! { div."query-stack" { (form) } })
 }
 
-fn fragment(dataset: &str, version: &str, params: &Params, has_search: bool, open: bool) -> Markup {
+fn fragment(
+    mount: &Mount,
+    dataset: &str,
+    version: &str,
+    params: &Params,
+    has_search: bool,
+    open: bool,
+) -> Markup {
     let mut controls = vec![
         term_control("fragment", "s", "Subject", params.get("s"), "ex:subject"),
         term_control("fragment", "p", "Predicate", params.get("p"), "rdf:type"),
@@ -90,14 +103,21 @@ fn fragment(dataset: &str, version: &str, params: &Params, has_search: bool, ope
     form(
         "Fragment",
         "Browse one page of a triple pattern. Bind the object or search its text, not both.",
-        url::operation(dataset, version, "fragment"),
+        mount.operation(dataset, version, "fragment"),
         controls,
         "Find triples",
         open,
     )
 }
 
-fn count(dataset: &str, version: &str, params: &Params, has_search: bool, open: bool) -> Markup {
+fn count(
+    mount: &Mount,
+    dataset: &str,
+    version: &str,
+    params: &Params,
+    has_search: bool,
+    open: bool,
+) -> Markup {
     let mut controls = vec![
         term_control("count", "s", "Subject", params.get("s"), "ex:subject"),
         term_control("count", "p", "Predicate", params.get("p"), "rdf:type"),
@@ -122,19 +142,19 @@ fn count(dataset: &str, version: &str, params: &Params, has_search: bool, open: 
     form(
         "Count",
         "Count a triple pattern without transferring its rows.",
-        url::operation(dataset, version, "count"),
+        mount.operation(dataset, version, "count"),
         controls,
         "Count triples",
         open,
     )
 }
 
-fn describe(dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
+fn describe(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
     let direction = params.get("direction").unwrap_or("both");
     form(
         "Describe",
         "Browse the incoming and outgoing statements around one RDF term.",
-        url::operation(dataset, version, "describe"),
+        mount.operation(dataset, version, "describe"),
         vec![
             text_control(
                 "describe",
@@ -168,11 +188,11 @@ fn describe(dataset: &str, version: &str, params: &Params, open: bool) -> Markup
     )
 }
 
-fn sample(dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
+fn sample(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
     form(
         "Sample",
         "Draw deterministic pseudo-random members of a triple pattern.",
-        url::operation(dataset, version, "sample"),
+        mount.operation(dataset, version, "sample"),
         vec![
             term_control("sample", "s", "Subject", params.get("s"), "ex:subject"),
             term_control("sample", "p", "Predicate", params.get("p"), "rdf:type"),
@@ -198,12 +218,12 @@ fn sample(dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
     )
 }
 
-fn search_form(dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
+fn search_form(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
     let labels = params.get("labels").unwrap_or("true");
     form(
         "Search",
         "Find entities through their matching literal values. Roles and predicates are optional scopes.",
-        url::operation(dataset, version, "search"),
+        mount.operation(dataset, version, "search"),
         vec![
             text_control(
                 "search",
@@ -383,7 +403,7 @@ mod tests {
 
     #[test]
     fn manifest_forms_follow_capabilities() {
-        let core = manifest_forms("tox", "v1", &manifest(&[])).into_string();
+        let core = manifest_forms(&Mount::default(), "tox", "v1", &manifest(&[])).into_string();
         assert!(core.contains("class=\"query-stack\""));
         assert!(core.contains("action=\"/tox/v/v1/fragment\""));
         assert!(core.contains("action=\"/tox/v/v1/count\""));
@@ -393,6 +413,7 @@ mod tests {
         assert!(!core.contains("name=\"o.text\""));
 
         let optional = manifest_forms(
+            &Mount::default(),
             "tox",
             "v1",
             &manifest(&[Capability::Sample, Capability::Search]),
@@ -406,7 +427,7 @@ mod tests {
     #[test]
     fn an_answer_form_is_prefilled_but_never_carries_paging_or_format() {
         let params = Params::parse(Some("p=ex%3Aknows&limit=7&cursor=opaque&format=html")).unwrap();
-        let rendered = operation_form("tox", "v1", "fragment", &params, false)
+        let rendered = operation_form(&Mount::default(), "tox", "v1", "fragment", &params, false)
             .unwrap()
             .into_string();
         assert!(rendered.contains("name=\"p\" value=\"ex:knows\""));
@@ -416,9 +437,33 @@ mod tests {
     }
 
     #[test]
+    fn a_mounted_deployment_submits_its_forms_under_the_prefix() {
+        // The action is what the browser requests on submit; under a gateway
+        // that strips `/kgf`, an action without it leaves the route entirely.
+        let mounted = "https://apps.okn.us/kgf"
+            .parse::<crate::PublicBase>()
+            .unwrap()
+            .mount();
+        let rendered = manifest_forms(
+            &mounted,
+            "tox",
+            "v1",
+            &manifest(&[Capability::Sample, Capability::Search]),
+        )
+        .into_string();
+        for operation in ["fragment", "count", "describe", "sample", "search"] {
+            assert!(
+                rendered.contains(&format!("action=\"/kgf/tox/v/v1/{operation}\"")),
+                "{operation}"
+            );
+        }
+        assert!(!rendered.contains("action=\"/tox/"));
+    }
+
+    #[test]
     fn form_values_and_actions_are_escaped_by_maud() {
         let params = Params::parse(Some("s=%22%3E%3Cscript%3E")).unwrap();
-        let rendered = operation_form("a b", "v?1", "fragment", &params, false)
+        let rendered = operation_form(&Mount::default(), "a b", "v?1", "fragment", &params, false)
             .unwrap()
             .into_string();
         assert!(rendered.contains("action=\"/a%20b/v/v%3F1/fragment\""));

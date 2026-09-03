@@ -46,6 +46,7 @@ use bytes::Bytes;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::representation::Representation;
+use crate::url::Mount;
 
 /// What the pages call themselves.
 pub const SITE: &str = "Knowledge Graph Fragments";
@@ -106,17 +107,34 @@ impl<'a> Crumb<'a> {
 
 /// The shared document: everything but the body.
 ///
+/// `mount` is where the deployment lives, which the masthead's brand link
+/// points at; a caller's own links are already built against the same mount.
 /// `canonical` is this resource's own URL, which the footer turns into a link
 /// to its JSON. It is the resource's canonical URL rather than the one the
 /// request arrived on, so a page reached through `latest` links to the version
 /// it actually resolved to.
-pub fn page(title: &str, crumbs: &[Crumb<'_>], canonical: Option<&str>, body: Markup) -> String {
-    page_document(title, None, crumbs, canonical, Representation::Json, body)
+pub fn page(
+    mount: &Mount,
+    title: &str,
+    crumbs: &[Crumb<'_>],
+    canonical: Option<&str>,
+    body: Markup,
+) -> String {
+    page_document(
+        mount,
+        title,
+        None,
+        crumbs,
+        canonical,
+        Representation::Json,
+        body,
+    )
 }
 
 /// An operation page whose route and release are quiet context above the
 /// page's actual subject.
 pub fn operation_page(
+    mount: &Mount,
     title: &str,
     context: &str,
     crumbs: &[Crumb<'_>],
@@ -124,6 +142,7 @@ pub fn operation_page(
     body: Markup,
 ) -> String {
     operation_page_with_format(
+        mount,
         title,
         context,
         crumbs,
@@ -135,6 +154,7 @@ pub fn operation_page(
 
 /// An operation page whose machine-readable alternate is not ordinary JSON.
 pub fn operation_page_with_format(
+    mount: &Mount,
     title: &str,
     context: &str,
     crumbs: &[Crumb<'_>],
@@ -147,10 +167,19 @@ pub fn operation_page_with_format(
         Representation::Html,
         "a page alternate must be a machine representation"
     );
-    page_document(title, Some(context), crumbs, canonical, alternate, body)
+    page_document(
+        mount,
+        title,
+        Some(context),
+        crumbs,
+        canonical,
+        alternate,
+        body,
+    )
 }
 
 fn page_document(
+    mount: &Mount,
     title: &str,
     context: Option<&str>,
     crumbs: &[Crumb<'_>],
@@ -184,7 +213,7 @@ fn page_document(
             body {
                 header."app-header" {
                     nav."crumbs" aria-label="Breadcrumb" {
-                        a."brand" href="/" {
+                        a."brand" href=(mount.root()) {
                             span."brand-mark" aria-hidden="true" { "KGF" }
                             span."brand-name" { (SITE) }
                         }
@@ -874,6 +903,7 @@ mod tests {
         // these pages come from a published bundle's manifest and dictionary.
         let hostile = "<script>alert('x')</script>";
         let rendered = page(
+            &Mount::default(),
             hostile,
             &[Crumb::to(hostile, "/a\"b".to_owned())],
             Some("/a?q=\""),
@@ -937,20 +967,22 @@ mod tests {
 
     #[test]
     fn a_page_is_a_whole_document() {
-        let rendered = page("Title", &[], None, html! {});
+        let rendered = page(&Mount::default(), "Title", &[], None, html! {});
         assert!(rendered.starts_with("<!DOCTYPE html>"));
         assert!(rendered.contains("<meta charset=\"utf-8\">"));
         assert!(rendered.contains("<title>Title — Knowledge Graph Fragments</title>"));
         assert!(rendered.trim_end().ends_with("</html>"));
         // The site's own front page is not "X — X".
         assert!(
-            page(SITE, &[], None, html! {}).contains("<title>Knowledge Graph Fragments</title>")
+            page(&Mount::default(), SITE, &[], None, html! {})
+                .contains("<title>Knowledge Graph Fragments</title>")
         );
     }
 
     #[test]
     fn operation_context_precedes_the_page_subject() {
         let rendered = operation_page(
+            &Mount::default(),
             "circulating cell",
             "Describe · ubergraph 2026-05-31",
             &[],
@@ -967,8 +999,20 @@ mod tests {
     }
 
     #[test]
+    fn the_masthead_brand_points_at_the_mount() {
+        let mounted = "https://apps.okn.us/kgf"
+            .parse::<crate::PublicBase>()
+            .unwrap()
+            .mount();
+        let rendered = page(&mounted, "t", &[], Some("/kgf/tox"), html! {});
+        assert!(rendered.contains("class=\"brand\" href=\"/kgf/\""));
+        assert!(rendered.contains("href=\"/kgf/tox?format=json\""));
+    }
+
+    #[test]
     fn the_masthead_brand_is_the_root_link_and_crumbs_follow_it() {
         let rendered = page(
+            &Mount::default(),
             "fragment — tox v1",
             &[Crumb::to("tox", "/tox".to_owned()), Crumb::here("v1")],
             None,
@@ -983,16 +1027,17 @@ mod tests {
 
     #[test]
     fn the_json_affordance_survives_a_url_that_already_has_a_query() {
-        let plain = page("t", &[], Some("/a/b"), html! {});
+        let plain = page(&Mount::default(), "t", &[], Some("/a/b"), html! {});
         assert!(plain.contains("href=\"/a/b?format=json\""));
 
-        let queried = page("t", &[], Some("/a/b?s=x"), html! {});
+        let queried = page(&Mount::default(), "t", &[], Some("/a/b?s=x"), html! {});
         assert!(queried.contains("href=\"/a/b?s=x&amp;format=json\""));
     }
 
     #[test]
     fn an_operation_can_name_a_non_json_machine_alternate() {
         let rendered = operation_page_with_format(
+            &Mount::default(),
             "VoID",
             "tox v1",
             &[],
