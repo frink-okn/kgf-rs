@@ -1,0 +1,79 @@
+# The script the Deployment's init container runs before the server starts.
+# Kept in a ConfigMap rather than inline so it can be read, diffed, and later
+# lifted verbatim into the sync Job kace submits.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frink-kgf-sync
+  namespace: frink
+  labels:
+    app: frink-kgf-server
+data:
+  sync.sh: |
+    #!/bin/sh
+    # Mirror published bundles from the bucket into the bundle root.
+    #
+    # Layout, identical on both sides:
+    #   {dataset}/{version}/...        the bundle
+    #   {dataset}/{version}.complete   written last by the publisher
+    #
+    # The marker is the publication. A version directory without one is an
+    # upload still in progress and is left alone. Each missing version is copied
+    # into a dot-prefixed staging directory and renamed into place, the same
+    # discipline `kgf build` uses, because the server's catalog treats every
+    # non-dot directory under the root as a released version. Versions already
+    # present are never touched: a published version is immutable, so there is
+    # nothing to refresh.
+    set -eu
+
+    : "${BUCKET:?BUCKET is required}"
+    : "${BUCKET_ENDPOINT:=https://storage.googleapis.com}"
+    : "${BUNDLE_ROOT:=/bundles}"
+
+    s5() { /s5cmd --endpoint-url "$BUCKET_ENDPOINT" "$@"; }
+
+    # `s5cmd ls` prints prefixes as "DIR name/" and objects as "date time size
+    # name"; the name is the last field either way.
+    names() { awk '{print $NF}'; }
+
+    # `s5cmd ls` exits 1 for an empty prefix ("no object found") exactly as it
+    # does for a real failure, so the two are told apart by the message. An
+    # empty bucket is a normal first start; a bad credential or bucket name must
+    # fail the pod rather than look like one.
+    listing() {
+      out=$(s5 ls "$1" 2>&1) && { printf '%s\n' "$out"; return 0; }
+      case $out in
+        *"no object found"*) return 0 ;;
+        *) echo "cannot list $1: $out" >&2; return 1 ;;
+      esac
+    }
+
+    mkdir -p "$BUNDLE_ROOT"
+
+    top=$(listing "s3://$BUCKET/") || exit 1
+
+    fetched=0
+    for ds_dir in $(printf '%s\n' "$top" | names | grep '/$' || true); do
+      ds=${ds_dir%/}
+      inner=$(listing "s3://$BUCKET/$ds/") || exit 1
+      for marker in $(printf '%s\n' "$inner" | names | grep '\.complete$' || true); do
+        ver=${marker%.complete}
+        dest="$BUNDLE_ROOT/$ds/$ver"
+        [ -d "$dest" ] && continue
+        stage="$BUNDLE_ROOT/$ds/.$ver.incoming"
+        rm -rf "$stage"
+        mkdir -p "$stage"
+        echo "fetching $ds/$ver"
+        s5 cp "s3://$BUCKET/$ds/$ver/*" "$stage/"
+        mv "$stage" "$dest"
+        fetched=$((fetched + 1))
+      done
+    done
+
+    echo "fetched $fetched new version(s); bundle root now holds:"
+    for d in "$BUNDLE_ROOT"/*/; do
+      [ -d "$d" ] || continue
+      printf '  %s: ' "$(basename "$d")"
+      ls "$d" | grep -v '^\.' | tr '\n' ' '
+      echo
+    done

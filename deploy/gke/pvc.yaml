@@ -1,0 +1,25 @@
+# The bundle root: a cache of the bucket, not the durable copy. Losing it costs
+# one full resync and nothing else.
+#
+# ReadWriteOnce on pd-ssd, so the server sees a local ext4 filesystem and mmap
+# behaves as it does on a workstation. The price is that one pod at a time can
+# mount it, which is why the Deployment uses the Recreate strategy.
+#
+# 500Gi holds one version of every knowledge graph with room to spare: the
+# latest-tag HDTs total about 88 GB and a bundle is roughly three times its HDT.
+# Grow it in place by raising `storage`; pd-ssd read IOPS scale with size, so a
+# larger disk is also a faster one.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: frink-kgf-bundles
+  namespace: frink
+  labels:
+    app: frink-kgf-server
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: premium-rwo
+  resources:
+    requests:
+      storage: 500Gi

@@ -1,0 +1,158 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frink-kgf-server
+  namespace: frink
+  labels:
+    app: frink-kgf-server
+    kace.frink/role: kgf
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: the bundle PVC is ReadWriteOnce, so a surged
+  # second pod could never mount it and the rollout would deadlock on
+  # Multi-Attach. A publish therefore costs a restart-length gap. That is the
+  # price of local-disk mmap over a shared NFS volume, accepted for now.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: frink-kgf-server
+  template:
+    metadata:
+      labels:
+        app: frink-kgf-server
+        kace.frink/role: kgf
+      annotations:
+        # Change this to force a restart, which is how a newly published bundle
+        # is picked up: the init container fetches it and the server rescans
+        # the root at start. `kubectl rollout restart` does the same thing.
+        kgf.frink/publish: "init"
+    spec:
+      securityContext:
+        # The uid and gid the kgf image runs as. fsGroup hands that group the
+        # volume, so the init container can write it and the server can read
+        # it with no root anywhere in the pod.
+        runAsUser: 10001
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Pulls any published version the root does not yet hold. On a restart
+        # with nothing new this is a listing and a few seconds. Autopilot bills
+        # a pod at max(init, sum(containers)), so keeping this smaller than the
+        # server makes it free.
+        - name: sync
+          image: peakcom/s5cmd:v2.2.2
+          command: ["/bin/sh", "/opt/kgf/sync.sh"]
+          env:
+            - name: BUCKET
+              value: frink-kgf-bundles
+            - name: BUCKET_ENDPOINT
+              value: https://storage.googleapis.com
+            - name: BUNDLE_ROOT
+              value: /bundles
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: kgf-bundles-reader
+                  key: access_key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kgf-bundles-reader
+                  key: secret_key
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+              ephemeral-storage: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: bundles
+              mountPath: /bundles
+            - name: sync-script
+              mountPath: /opt/kgf
+              readOnly: true
+      containers:
+        - name: kgf-server
+          image: ghcr.io/frink-okn/kgf:v0.1.0
+          # The image's entrypoint is `kgf`.
+          args:
+            - serve
+            - --bundle-root=/bundles
+            - --bind=0.0.0.0:8080
+            # The gateway strips /kgf before the request arrives; this puts it
+            # back on every emitted link and Hydra IRI.
+            - --public-base=https://apps.okn.us/kgf
+            # The global external load balancer appends two entries to
+            # X-Forwarded-For, the client it saw and its own address, so the
+            # client is two hops from the right. Only affects the pseudonymous
+            # client hash in access records; confirm against a known request
+            # once traffic flows.
+            - --trusted-proxies=2
+          ports:
+            - name: http
+              containerPort: 8080
+          # `/` is the service descriptor and opens no bundle, so it is the
+          # probe for both kubelet and the gateway's HealthCheckPolicy.
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          # Memory is mostly page cache for the mapped bundles, which the
+          # cgroup charges to this container. Requests equal limits because
+          # Autopilot enforces that anyway; raise both together, keeping memory
+          # within 6.5 GiB per vCPU or Autopilot bumps the CPU to match.
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi
+              ephemeral-storage: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            # Writable, although the server only ever maps files and a published
+            # bundle is immutable by contract. Opening a text index takes
+            # tantivy's meta lock, and acquiring it opens `.tantivy-meta.lock`
+            # for writing; on a read-only mount every bundle with a text index
+            # fails to open ("Failed to acquire Lockfile ... Read-only file
+            # system"). Until hdtc's text reader opens without the lock, the
+            # immutability of this tree is a convention here rather than
+            # something the mount enforces. Nothing else is ever written.
+            - name: bundles
+              mountPath: /bundles
+      volumes:
+        - name: bundles
+          persistentVolumeClaim:
+            claimName: frink-kgf-bundles
+        - name: sync-script
+          configMap:
+            name: frink-kgf-sync
+            defaultMode: 0555
