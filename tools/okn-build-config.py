@@ -90,6 +90,12 @@ LAKEFS_HDT_PATH = "hdt/graph.hdt"
 # The config schema version in `crates/kgf/src/build/config.rs`.
 SCHEMA = 1
 
+# What a registry entry's `frink-options.kgf` block may contain. It is copied
+# into the config verbatim, so what it may say is bounded here rather than
+# trusted: `dataset` is derived from the entry's other fields, and `resources`
+# describe the machine that builds, not the graph.
+REGISTRY_SECTIONS = frozenset({"semantics", "contents"})
+
 _SEMVER = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
 
@@ -110,6 +116,11 @@ def render(kg: dict[str, Any]) -> dict[str, Any]:
       deliberate: the schema is owned by kgf-rs, so a caller copies the subtree
       rather than translating it field by field, and a new config key needs no
       change here or in kace. `kgf build --check-config` is the validator.
+
+    Two things the registry may not say, refused here so `--all --check` in
+    the registry's CI reports them: any section other than those two, and
+    `semantics.prefix_tables`, which names paths on the build machine and is
+    supplied by whoever runs the build.
     """
     shortname = kg.get("shortname")
     if not shortname:
@@ -134,7 +145,22 @@ def render(kg: dict[str, Any]) -> dict[str, Any]:
 
     options = kg.get("frink-options") or {}
     for section, block in (options.get("kgf") or {}).items():
+        if section not in REGISTRY_SECTIONS:
+            raise ValueError(
+                f"{shortname}: frink-options.kgf.{section} is not a registry setting; "
+                f"only {', '.join(sorted(REGISTRY_SECTIONS))} may be set there"
+            )
         config[section] = copy.deepcopy(block)
+
+    # Shared tables are paths on the build machine, supplied at render time
+    # (--prefix-table / --registry-prefixes here, kace's configmap later). A
+    # registry entry naming one would bind every build of that graph to a path
+    # that exists on no machine in particular.
+    if "prefix_tables" in (config.get("semantics") or {}):
+        raise ValueError(
+            f"{shortname}: frink-options.kgf.semantics.prefix_tables names build-machine "
+            "paths and does not belong in the registry; the build supplies the shared table"
+        )
     return config
 
 

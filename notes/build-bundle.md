@@ -287,6 +287,13 @@ the `dataset:` block it derived; its pydantic model needs
 repo. Same pattern as `augmentations:`, minus the part where the schema ends up
 in two languages.
 
+Verbatim is bounded, not trusted. `render()` refuses two things, and kace's port
+must refuse the same: a section other than `semantics` and `contents` (`dataset`
+is derived, `resources` describe the build machine), and
+`semantics.prefix_tables`, which names paths on the build machine and is
+supplied at render time. Refused rather than stripped, so `--all --check` in
+the registry's CI reports the entry instead of quietly building without it.
+
 Per-build values stay flags, never config, because they change every run:
 `--out` (the LakeFS tag), `--source-url` (`lakefs://` pinned to the **commit**,
 not the tag), `--source-sha256`, `--previous-version`.
