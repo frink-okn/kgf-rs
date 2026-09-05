@@ -106,9 +106,21 @@ pub struct Publisher {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Semantics {
-    /// Prefix bindings for CURIE syntax in parameters. Layered
-    /// last over `contents.stats.prefix_tables`, so a per-KG binding wins over
-    /// the shared table.
+    /// Shared prefix tables, layered with later files winning, under
+    /// `prefixes`.
+    ///
+    /// The layered result is the bundle's prefix map: the manifest declares
+    /// it, requests resolve CURIEs against it, pages compact IRIs with it, and
+    /// the namespace inventory counts against it and publishes its digest. A
+    /// flat `prefix: namespace` file, JSON or YAML by extension; the registry's
+    /// shared table is the usual base. Paths on the build machine, read when a
+    /// build starts, not when a config is checked.
+    #[serde(default)]
+    pub prefix_tables: Vec<PathBuf>,
+
+    /// Prefix bindings for CURIE syntax in parameters. Layered last, over
+    /// every table in `prefix_tables`, so a per-KG binding wins over the shared
+    /// table.
     #[serde(default)]
     pub prefixes: BTreeMap<String, String>,
 
@@ -121,7 +133,11 @@ pub struct Semantics {
     #[serde(default)]
     pub roles: BTreeMap<String, Vec<String>>,
 
-    /// Prefixes this dataset is authoritative for, named from `prefixes`.
+    /// Prefixes this dataset is authoritative for, named from `prefixes` in
+    /// this block. A prefix a shared table binds has to be repeated in
+    /// `prefixes` to be named here: tables are read when a build starts, not
+    /// when a config is checked, and the check must give the same answer as
+    /// the build.
     #[serde(default)]
     pub authoritative_namespaces: Vec<String>,
 }
@@ -237,18 +253,7 @@ pub struct Keysets {
 /// `stats/`. Always built: `/void` and `/summary` are core profile.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Stats {
-    /// Prefix tables, layered with later files winning, then
-    /// `semantics.prefixes` last of all.
-    ///
-    /// The layered map is the bundle's prefix map, not only the namespace
-    /// inventory's: the manifest declares it, requests resolve CURIEs against
-    /// it, pages compact IRIs with it, and the inventory counts against it and
-    /// publishes its digest. A flat `prefix: namespace` file, JSON or YAML by
-    /// extension; the registry's shared table is the usual base.
-    #[serde(default)]
-    pub prefix_tables: Vec<PathBuf>,
-}
+pub struct Stats {}
 
 /// Limits handed to the external builders.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

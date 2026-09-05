@@ -27,21 +27,29 @@ pub(crate) fn layered(
     for table in tables {
         merged.extend(load(table)?);
     }
-    merged.extend(
-        declared
-            .iter()
-            .map(|(prefix, namespace)| (prefix.clone(), namespace.clone())),
-    );
+    merged.extend(declared.clone());
     Ok(merged)
 }
 
 /// Hold one binding to the manifest's contract.
 ///
-/// Both halves are published as what a client may send, so both are checked
-/// wherever a binding enters: a prefix name must be spellable in a CURIE and a
-/// namespace must be an IRI. The name rule is stricter than the table files'
-/// own format demands, and deliberately so: an entry the inventory could count
-/// but no request could ever use would be a declaration with no meaning.
+/// The namespace must be an IRI, and the prefix name is held to the ASCII
+/// subset of a Turtle and SPARQL prefix name: letters, digits, `-`, `_` and
+/// `.`. That is a publication rule, not a parsing one. The server's own parser
+/// splits a bare token at its first colon and would resolve any name, so the
+/// rule exists for everywhere else the map goes: declared in the manifest as
+/// what a client may send, shown in the descriptor, and usable as `@prefix`
+/// and `PREFIX` declarations by any representation or client that writes the
+/// prefixes it uses, none of which can carry `a+b:` or a space. The same rule
+/// governed `semantics.prefixes` before shared tables were declared at all,
+/// so one rule covers both.
+///
+/// It is stricter than hdtc's own table loader, which accepts any non-empty
+/// name, and a shared-table entry that fails it stops every build that layers
+/// that table. Loud on purpose: the alternative is a bundle whose declared
+/// prefixes cannot all be written down. The hdtc handoff asks for the two
+/// tools to share one loader and one rule, so the check also runs where the
+/// table is edited.
 pub(crate) fn validate_binding(prefix: &str, namespace: &str) -> Result<()> {
     ensure!(
         !prefix.is_empty()
@@ -60,9 +68,12 @@ pub(crate) fn validate_binding(prefix: &str, namespace: &str) -> Result<()> {
 /// extension.
 ///
 /// The same shapes, told apart the same way, as the tables `hdtc namespaces`
-/// reads. The registry's shared table is the base of every bundle, and a file
-/// that one tool accepted and the other refused would leave the manifest and
-/// the inventory disagreeing about which prefixes exist.
+/// reads, because both tools parse these files today. That is a duplication
+/// this crate's rules forbid for hdtc-owned formats, and it is temporary: the
+/// hdtc handoff asks for the loader and the table digest to be exported from
+/// its façade, at which point this function goes. Until then the shapes must
+/// agree by inspection, and the one deliberate difference is the stricter name
+/// rule in [`validate_binding`].
 fn load(path: &Path) -> Result<BTreeMap<String, String>> {
     let bytes =
         std::fs::read(path).with_context(|| format!("reading prefix table {}", path.display()))?;
@@ -163,6 +174,30 @@ mod tests {
         let error = format!("{:#}", layered(&[bad_iri], &BTreeMap::new()).unwrap_err());
         assert!(error.contains("iri.json"), "{error}");
         assert!(error.contains("not an IRI"), "{error}");
+
+        let empty = table(dir.path(), "empty.yaml", "\"\": \"http://x.example/\"\n");
+        let error = format!("{:#}", layered(&[empty], &BTreeMap::new()).unwrap_err());
+        assert!(error.contains("empty.yaml"), "{error}");
+        assert!(error.contains("usable CURIE prefix"), "{error}");
+    }
+
+    /// hdtc's loader takes any non-empty name; this one does not, on purpose,
+    /// because a declared prefix has to be writable as a Turtle or SPARQL
+    /// prefix name everywhere the map is published.
+    #[test]
+    fn a_name_hdtc_would_accept_is_still_refused_when_it_cannot_be_a_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let plus = table(dir.path(), "plus.json", r#"{"a+b": "http://x.example/"}"#);
+        let error = format!("{:#}", layered(&[plus], &BTreeMap::new()).unwrap_err());
+        assert!(error.contains("plus.json"), "{error}");
+        assert!(error.contains("a+b"), "{error}");
+
+        let fine = table(
+            dir.path(),
+            "fine.json",
+            r#"{"a-b_c.d": "http://x.example/", "v2": "http://y.example/"}"#,
+        );
+        assert_eq!(layered(&[fine], &BTreeMap::new()).unwrap().len(), 2);
     }
 
     #[test]

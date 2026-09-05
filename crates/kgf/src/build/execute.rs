@@ -40,17 +40,6 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
         .output
         .parent()
         .context("--out has no parent directory to stage beside")?;
-
-    // The bundle's prefix map, layered once here for every reader. Read before
-    // anything is created or run, so a malformed table costs nothing: the
-    // namespace inventory that used to be the only reader of these files is
-    // the last step of the pipeline, after the HDT, the permutation, the text
-    // index, the sketches and the key sets.
-    let prefixes = super::prefixes::layered(
-        &plan.config.contents.stats.prefix_tables,
-        &plan.config.semantics.prefixes,
-    )?;
-
     std::fs::create_dir_all(parent)
         .with_context(|| format!("creating dataset directory {}", parent.display()))?;
 
@@ -115,14 +104,15 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
             runner: &runner,
             data: &layout.data,
             dataset_iri: plan.config.dataset.iri.as_str(),
-            prefixes: &prefixes,
+            prefixes: &build.prefixes,
+            prefix_tables: &plan.config.semantics.prefix_tables,
             card,
             work: work.path(),
         },
         &staged_stats,
     )?;
 
-    let requested = requested_manifest(plan, inputs, &build.hdtc, prefixes)?;
+    let requested = requested_manifest(plan, inputs, &build.hdtc, build.prefixes.clone())?;
     let manifest =
         crate::manifest::write_description_manifest(staging.path(), &requested, &outcome.metadata)?;
 
@@ -318,6 +308,12 @@ pub(super) fn rehearse(build: &Build) -> String {
     };
 
     let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# prefix map: {} bindings, {} table(s) layered under the dataset's own",
+        build.prefixes.len(),
+        plan.config.semantics.prefix_tables.len()
+    );
     if let Input::Hdt { path, adopt } = &plan.input {
         let verb = if *adopt { "move" } else { "copy" };
         let _ = writeln!(

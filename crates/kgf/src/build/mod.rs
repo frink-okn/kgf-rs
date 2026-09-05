@@ -18,10 +18,11 @@ pub mod config;
 pub mod plan;
 pub mod stats;
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use plan::{BundlePlan, ConfigPlan, Input, Provenance, VersionLabel};
 
@@ -114,6 +115,12 @@ pub fn run(args: Args) -> Result<()> {
 /// document `--check-config` prints.
 struct Build {
     plan: BundlePlan,
+    /// The bundle's prefix map: the shared tables layered under the plan's own
+    /// bindings. Here and not in the plan because it is read from this
+    /// machine's files, and a plan carrying it would serialize table contents
+    /// into the document `--check-config` prints for a config that names only
+    /// paths.
+    prefixes: BTreeMap<String, String>,
     hdtc: PathBuf,
     dry_run: bool,
 }
@@ -152,20 +159,28 @@ fn resolve_build(args: Args, config: ConfigPlan) -> Result<Build> {
     let input = resolve_input(&args)?;
     let provenance = resolve_provenance(&args)?;
 
-    // Checked here rather than in `ConfigPlan::resolve`, and long before the
-    // last hdtc invocation. Not in resolution, because a rendered config names
-    // paths inside the *build container* and registry CI runs `--check-config`
-    // on the host, where `/kgf/prefixes.yaml` legitimately does not exist —
-    // existence is a fact about this machine, not about the config. But not at
-    // the namespace inventory either, which is where it used to surface: a
+    // The tables are read and layered here, once, for the rehearsal and the
+    // build alike, and long before the last hdtc invocation. Not in
+    // `ConfigPlan::resolve`, because a rendered config names paths inside the
+    // *build container* and registry CI runs `--check-config` on the host,
+    // where `/kgf/prefixes.yaml` legitimately does not exist — the tables are
+    // a fact about this machine, not about the config. But not at the
+    // namespace inventory either, which is where a bad file used to surface: a
     // one-character typo otherwise costs the HDT, permutation, text index,
     // sketches, key sets and VoID before anyone hears about it.
-    for table in &config.contents.stats.prefix_tables {
-        ensure!(
-            table.is_file(),
-            "contents.stats.prefix_tables names {}, which is not a file on this machine",
-            table.display()
-        );
+    let prefixes = prefixes::layered(&config.semantics.prefix_tables, &config.semantics.prefixes)?;
+
+    // The plan checked role predicates against the only map it could read, its
+    // own. A predicate spelled as a CURIE against a *table* prefix passes that
+    // check as an IRI with an unusual scheme and would be frozen into the
+    // manifest verbatim; with the tables in hand, the same rule runs over the
+    // whole map.
+    for (role, predicates) in &config.semantics.roles {
+        for predicate in predicates {
+            kgf_store::manifest::validate_predicate_role_iri(predicate, &prefixes).map_err(
+                |error| anyhow!("role {role:?} predicate {predicate:?} is unusable: {error}"),
+            )?;
+        }
     }
 
     Ok(Build {
@@ -177,6 +192,7 @@ fn resolve_build(args: Args, config: ConfigPlan) -> Result<Build> {
             output,
             provenance,
         },
+        prefixes,
         hdtc: args.hdtc,
         dry_run: args.dry_run,
     })

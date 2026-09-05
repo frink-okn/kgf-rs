@@ -1729,9 +1729,10 @@ other — bindings joins want `RANDOM`, full-page enumeration wants readahead �
 picking without measurement is guessing. Revisit with the §20.6 cold-start numbers.
 
 **The bundle's prefix map is the shared tables layered under the dataset's own
-bindings, built once.** `contents.stats.prefix_tables` used to reach only the
-namespace inventory, while the manifest declared the well-known four plus
-`semantics.prefixes`. Two readers of "the prefixes" with two answers: the
+bindings, built once.** `prefix_tables` — then under `contents.stats`, now
+`semantics.prefix_tables`, renamed the day it started shaping the manifest —
+used to reach only the namespace inventory, while the manifest declared the
+well-known four plus `semantics.prefixes`. Two readers of "the prefixes" with two answers: the
 inventory for biobricks-aopwiki counted 1,149 IRIs under `obo:` while its pages
 rendered every OBO term in full and a request could not write `obo:…`.
 `build/prefixes.rs` now layers the tables in order, later files winning, with the
@@ -1741,10 +1742,22 @@ publishes is the digest of exactly what the manifest declares. The alternative
 of declaring only the table prefixes the data actually uses was rejected: it
 would make the CURIE contract vary by dataset and by version, and an agent that
 learned `obo:` on one KG should be able to use it on the next. Table entries are
-held to the manifest's contract, a CURIE-usable name and an IRI namespace, and
-are read before anything is created or run, so a malformed table fails in
-milliseconds rather than after the text index. Existing bundles gain the map
-only by being rebuilt.
+held to the manifest's contract, a name that is a Turtle/SPARQL prefix name
+and an IRI namespace, and are read in the pre-flight that `--dry-run` shares
+with a real build, so a malformed table fails in milliseconds rather than after
+the text index. The name rule is stricter than hdtc's own loader, on purpose,
+and the loader is a temporary copy of hdtc's until its façade exports one (hdtc
+handoff). Existing bundles gain the map only by being rebuilt.
+
+Two consequences recorded rather than solved. Declaring the federation table
+shadows same-named URI schemes for *bare* tokens — `geo:…` unbracketed is now
+the GeoSPARQL CURIE where it used to be a 400 — which is the reason brackets are
+mandatory and changes nothing for a client that follows the rule. And the RDF
+representations declare only `kgfbn:` today; if the manifest's prefixes are
+ever handed to the serializer, they must first be filtered to the namespaces
+that occur in the triples being written, because oxttl prints every declared
+prefix whether or not the document uses it, and a hundred unused `@prefix`
+lines on every fragment would be the wrong trade.
 
 ## Questions for `../kgf`
 

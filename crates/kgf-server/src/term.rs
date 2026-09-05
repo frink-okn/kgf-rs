@@ -191,11 +191,18 @@ impl PrefixMap {
     /// The prefixes a bundle declares.
     ///
     /// **Bundle-scoped, not request-scoped.** This copies the manifest's map,
-    /// which is cheap once per open and wasteful once per request; a bundle
-    /// declaring the fifty-odd prefixes an OKN graph typically does would
-    /// allocate a hundred strings per request to read something that cannot
-    /// change while the bundle is mapped. Build it beside the `Store` and share
-    /// it.
+    /// which is cheap once per open and wasteful once per request. An OKN
+    /// bundle declares the federation's shared table on top of its own
+    /// bindings, a hundred-odd prefixes and growing, and copying that per
+    /// request would allocate a few hundred strings to read something that
+    /// cannot change while the bundle is mapped. Build it beside the `Store`
+    /// and share it.
+    ///
+    /// [`compact_iri`](Self::compact_iri) is a linear scan of that map per
+    /// rendered IRI. At today's size that is some hundreds of thousands of
+    /// short prefix comparisons on the largest page, a few milliseconds; a
+    /// namespace-keyed index is the change to make if the table grows past
+    /// what that tolerates, not before.
     pub fn from_manifest(manifest: &Manifest) -> Self {
         Self::from_prefixes(manifest.prefixes.clone())
     }

@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use kgf_server::url::Params;
@@ -74,6 +74,10 @@ pub(crate) struct Inputs<'a> {
     /// the namespace inventory counts against, so the identity the inventory
     /// publishes is the digest of exactly what the manifest declares.
     pub(crate) prefixes: &'a BTreeMap<String, String>,
+    /// The files that map was layered from. Named in diagnostics only: the
+    /// inventory reads the finished map from scratch, and scratch is gone by
+    /// the time anyone reads an error about it.
+    pub(crate) prefix_tables: &'a [PathBuf],
     /// What the summary card says about the dataset.
     pub(crate) card: DatasetCard<'a>,
     /// Scratch directory for intermediates that are not published.
@@ -104,6 +108,7 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
         data,
         dataset_iri,
         prefixes,
+        prefix_tables,
         card,
         work,
     } = inputs;
@@ -204,11 +209,28 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
         OsString::from("json"),
         data.as_os_str().to_owned(),
     ];
-    runner.run(&super::hdtc::Step {
-        name: "namespace inventory",
-        args: namespace_args,
-        temp: None,
-    })?;
+    runner
+        .run(&super::hdtc::Step {
+            name: "namespace inventory",
+            args: namespace_args,
+            temp: None,
+        })
+        .with_context(|| {
+            let sources = if prefix_tables.is_empty() {
+                "no shared tables".to_owned()
+            } else {
+                prefix_tables
+                    .iter()
+                    .map(|table| table.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!(
+                "the namespace inventory refused the layered prefix map, built from {sources} \
+                 under the config's own semantics.prefixes; the merged table it read was in \
+                 scratch and is gone once this build unwinds"
+            )
+        })?;
     let mut namespaces: Value = serde_json::from_slice(
         &std::fs::read(&namespaces_path)
             .with_context(|| format!("reading {}", namespaces_path.display()))?,

@@ -157,9 +157,8 @@ fn a_build_publishes_one_verified_description_set() {
                 "  iri: https://example.org/typed-kg\n",
                 "  title: Typed KG\n",
                 "  description: Publisher supplied text.\n",
-                "contents:\n",
-                "  stats:\n",
-                "    prefix_tables: ['{}']\n",
+                "semantics:\n",
+                "  prefix_tables: ['{}']\n",
             ),
             path(table)
         )

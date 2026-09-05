@@ -89,6 +89,7 @@ dataset:                       # identity and description
   publisher: {name: Temple University, contact: mailto:…}
 
 semantics:                     # an interpretation of the data, frozen per version
+  prefix_tables: [/etc/kgf/prefixes.yaml]   # shared tables, later wins, under prefixes
   prefixes: {dream: https://dreamkg.org/}
   roles:
     label: [http://www.w3.org/2004/02/skos/core#prefLabel,
@@ -108,8 +109,7 @@ contents:                      # what changes bytes
     filter_bits: 16            # MinHash k is fixed federation-wide, §17.2
   keysets:                     # hdtc keyset — always built, doc 18 §18.4
     encoding: elias-fano
-  stats:
-    prefix_tables: [/etc/kgf/prefixes.yaml]   # layered, later wins
+  stats: {}                  # always built; no knobs yet
 
 resources:
   memory_limit: 4G
@@ -146,14 +146,28 @@ outright, because predicate IRIs make every pair of KGs "overlap" through
 its flag: `search` is an optional capability and the text index is the expensive
 step.
 
-`semantics.prefixes` layers *last* over `contents.stats.prefix_tables`: the
-shared OKN table is the base and the per-KG block wins. **The layered map is the
+`semantics.prefixes` layers *last* over `semantics.prefix_tables`: the shared
+OKN table is the base and the per-KG block wins. **The layered map is the
 bundle's prefix map** (since 2026-09-05; `build/prefixes.rs`). It is what the
 manifest declares, what requests resolve CURIEs against, what pages compact IRIs
 with, and the one table the namespace inventory counts against, so the digest
 the inventory publishes is the manifest map's identity. Before that fix the
 tables reached only the inventory: a bundle whose inventory counted 1,149 IRIs
 under `obo:` still declared five prefixes and rendered every OBO term in full.
+The key lived under `contents.stats` while that was all it fed; it moved to
+`semantics` the day it started shaping the manifest.
+
+Two rules follow from the tables being machine paths. Their contents are read
+when a build starts — by `--dry-run` as well as a real build — and never by
+`--check-config`, so a shared-table entry that breaks the rule (a name that is
+not a Turtle/SPARQL prefix name, or a namespace that is not an IRI) stops every
+build that layers that table, in milliseconds, and registry CI does not see it
+until the table itself is checked (§6). And anything the check validates
+against declared prefixes is validated against the config's own `prefixes`
+only, so `authoritative_namespaces` may name a shared-table prefix only if the
+config repeats the binding; role predicates, which must be full IRIs, are
+re-checked against the layered map at build time so an `obo:…` slip cannot be
+frozen into a manifest as a scheme IRI.
 
 ## 4. Step order
 
@@ -279,13 +293,19 @@ not the tag), `--source-sha256`, `--previous-version`.
 
 ### The prefix table has to reach the container
 
-`contents.stats.prefix_tables` names a path, and the base table is the
-registry's `docs/registry/prefixes.yaml`. Baking it into the kgf image would pin
-it at image-build time, so a registry prefix addition would not reach a bundle
-until the image was rebuilt. Render it as a second `configmap_overrides` entry
-instead, so the table tracks the registry the way everything else does. `hdtc
-namespaces` records the merged table's sha256 in its output, which keeps a
-bundle auditable against a registry revision.
+`semantics.prefix_tables` names a path, and the base table is the registry's
+`docs/registry/prefixes.yaml`. Baking it into the kgf image would pin it at
+image-build time, so a registry prefix addition would not reach a bundle until
+the image was rebuilt. Render it as a second `configmap_overrides` entry
+instead, so the table tracks the registry the way everything else does.
+
+What the bundle records about the table is the sha256 of the *merged* map —
+tables, then the config's own prefixes, well-known four included — as
+`prefix_table.version` in `stats/namespaces.json`, and the input paths are
+deliberately stripped. That identifies the map this version was built with; it
+does not equal the digest of any registry file, so auditing a bundle against a
+registry revision means re-layering that revision's table under the KG's
+config and comparing the result, not hashing the file.
 
 The table shapes the bundle, not just its statistics: every prefix in it is
 declared in the manifest, so a table edit changes what CURIEs a version accepts
@@ -339,6 +359,14 @@ Run `kgf build --check-config` over every entry's rendered config in the
 registry's own CI. A malformed `kgf:` block then fails in the pull request
 rather than at 3am in a K8s Job, and the validator is the real one instead of a
 pydantic reimplementation of it.
+
+That does not cover `prefixes.yaml`: `--check-config` never reads tables, and a
+bad entry in the shared table fails every KG's build at once. The registry's CI
+needs a check on the table itself, with the same rule the build applies. The
+clean way is for hdtc to export its table loader with that rule and for
+`hdtc namespaces` or a small `kgf` subcommand to run it; see the hdtc handoff.
+Until then, a `--dry-run` against any one KG with the table in place is the
+check.
 
 ### The descriptor closes the loop
 

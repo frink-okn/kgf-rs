@@ -345,7 +345,7 @@ def main() -> int:
     parser.add_argument("--hdtc", help="the hdtc binary kgf build should use")
     parser.add_argument(
         "--prefix-table",
-        help="set contents.stats.prefix_tables to this path or URL; its prefixes are "
+        help="set semantics.prefix_tables to this path or URL; its prefixes are "
         "declared in the manifest and used for CURIEs and display, under the KG's own",
     )
     parser.add_argument(
@@ -440,9 +440,8 @@ def main() -> int:
             continue
 
         if prefix_table is not None:
-            contents = config.setdefault("contents", {})
-            stats = contents.setdefault("stats", {})
-            stats["prefix_tables"] = [str(prefix_table)]
+            # Under semantics, beside the KG's own prefixes it layers under.
+            config.setdefault("semantics", {})["prefix_tables"] = [str(prefix_table)]
 
         resources = {
             "memory_limit": args.memory_limit,

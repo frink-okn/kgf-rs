@@ -380,7 +380,12 @@ pub struct Publisher {
 /// Prefixes, roles and authoritative namespaces, validated against each other.
 #[derive(Debug, Clone, Serialize)]
 pub struct Semantics {
-    /// Prefix bindings for CURIE syntax in parameters.
+    /// Shared prefix tables, layered with later files winning, under
+    /// `prefixes`. Paths on the build machine; the build reads them, the
+    /// config check cannot, so nothing here is resolved from their contents.
+    pub prefix_tables: Vec<PathBuf>,
+    /// Prefix bindings for CURIE syntax in parameters: the well-known four and
+    /// the config's own. The tables layer under these at build time.
     pub prefixes: BTreeMap<String, String>,
     /// Empty means "the manifest's standard profile", not "no roles".
     pub roles: BTreeMap<String, Vec<String>>,
@@ -460,15 +465,11 @@ pub struct Keysets {
     pub encoding: KeysetEncoding,
 }
 
-/// `stats/`.
+/// `stats/`. Always built, and with no knobs yet: the prefix tables that used
+/// to live here shape the whole bundle and moved to `semantics`. Kept so the
+/// key stays where the next statistics setting will go.
 #[derive(Debug, Clone, Serialize)]
-pub struct Stats {
-    /// Prefix tables, layered with later files winning and the plan's own
-    /// `semantics.prefixes` last of all. The layered map is the bundle's prefix
-    /// map: the manifest declares it and the namespace inventory counts
-    /// against it. Paths on the build machine, read at build time, not here.
-    pub prefix_tables: Vec<PathBuf>,
-}
+pub struct Stats {}
 
 /// Limits handed to the external builders.
 #[derive(Debug, Clone, Serialize)]
@@ -660,11 +661,15 @@ fn resolve_semantics(semantics: config::Semantics) -> Result<Semantics> {
     for namespace in &semantics.authoritative_namespaces {
         ensure!(
             prefixes.contains_key(namespace),
-            "authoritative namespace {namespace:?} is not one of the declared prefixes"
+            "authoritative namespace {namespace:?} is not bound in this config's \
+             semantics.prefixes; a prefix a shared table binds has to be repeated \
+             there to be named here, because tables are files on the build machine \
+             and are not read when the config is checked"
         );
     }
 
     Ok(Semantics {
+        prefix_tables: semantics.prefix_tables,
         prefixes,
         roles: semantics.roles,
         authoritative_namespaces: semantics.authoritative_namespaces,
@@ -759,9 +764,7 @@ fn resolve_contents(contents: config::Contents) -> Result<Contents> {
         text,
         filters,
         keysets,
-        stats: Stats {
-            prefix_tables: contents.stats.prefix_tables,
-        },
+        stats: Stats {},
     })
 }
 
