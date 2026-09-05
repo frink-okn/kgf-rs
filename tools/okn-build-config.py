@@ -36,8 +36,10 @@ the latest semver tag (or `--tag`) into that same `--hdt-root` layout, the tag
 becomes the version label, and the manifest records the input as
 `lakefs://{repo}/{commit}/hdt/graph.hdt`, pinned to the commit so the bundle
 says exactly what it was built from. Pass `--builder-image` so it records that
-too. `lakectl` must be on PATH and configured with credentials; only the
-endpoint is set here (`--lakefs-endpoint`).
+too. `lakectl` resolves tags and must be on PATH and configured; the bytes come
+down through `s5cmd` against lakeFS's S3 gateway, using the same credentials
+from `~/.lakectl.yaml` (or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` if set).
+Only the endpoint is set here (`--lakefs-endpoint`).
 
     ./tools/okn-build-config.py dreamkg --build --lakefs \
         --hdt-root /var/kgf/hdt --out-root /var/kgf/bundles \
@@ -259,22 +261,94 @@ def lakefs_release(
     return latest, tags[latest]
 
 
-def lakefs_fetch_hdt(repo: str, tag: str, dest: Path, binary: str, endpoint: str) -> bool:
+def lakectl_credentials() -> tuple[str, str] | None:
+    """The lakeFS key pair lakectl uses, for handing to s5cmd.
+
+    Read from `~/.lakectl.yaml`, the file lakectl itself is configured by, so a
+    machine that can run `lakectl` can run this with nothing else set up. The
+    values only ever go into a child process's environment.
+    """
+    path = Path.home() / ".lakectl.yaml"
+    if not path.is_file():
+        return None
+    document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    credentials = document.get("credentials") or {}
+    key = credentials.get("access_key_id")
+    secret = credentials.get("secret_access_key")
+    return (key, secret) if key and secret else None
+
+
+def s5cmd_download(source: str, dest: Path, binary: str, endpoint: str) -> None:
+    """Fetch one object from lakeFS's S3 gateway with s5cmd.
+
+    The same path kace's own fetch Jobs use. s5cmd downloads in ranged parts,
+    retries each part on its own, and reads through the gateway, so nothing a
+    client holds can expire mid-transfer.
+    """
+    env = dict(os.environ)
+    if not (env.get("AWS_ACCESS_KEY_ID") and env.get("AWS_SECRET_ACCESS_KEY")):
+        pair = lakectl_credentials()
+        if pair is None:
+            raise RuntimeError(
+                "s5cmd needs lakeFS credentials: set AWS_ACCESS_KEY_ID and "
+                "AWS_SECRET_ACCESS_KEY, or configure lakectl in ~/.lakectl.yaml"
+            )
+        env["AWS_ACCESS_KEY_ID"], env["AWS_SECRET_ACCESS_KEY"] = pair
+    result = subprocess.run(
+        [binary, "--endpoint-url", endpoint, "cp", source, str(dest)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"s5cmd cp {source} failed: {detail}")
+
+
+def lakefs_fetch_hdt(
+    repo: str,
+    tag: str,
+    dest: Path,
+    endpoint: str,
+    downloader: str,
+    lakectl_binary: str,
+    s5cmd_binary: str,
+) -> bool:
     """Download `hdt/graph.hdt` at `tag` to `dest` unless it is already there.
 
     Written to a `.part` sibling and renamed, so an interrupted download is
-    never mistaken for the input on the next run. Returns whether a download
-    happened.
+    never mistaken for the input on the next run. A leftover `.part` is removed
+    first rather than resumed: both downloaders preallocate the whole file and
+    fill it in parts, so a partial one is full-sized with holes and nothing
+    about it says which parts landed.
+
+    `s5cmd` is the default. lakectl's own downloader fetches parts from
+    presigned object URLs that expire fifteen minutes after issue; a 30 GB HDT
+    takes longer than that on an ordinary link, and lakectl 1.16 then hangs with
+    no connections open rather than failing. The small graphs finish inside the
+    window, which is why only the large ones stuck. The lakectl path stays as a
+    fallback for a machine without s5cmd, with `--pre-sign=false` so the bytes
+    stream through the server and no URL can expire under it.
+
+    Returns whether a download happened.
     """
     if dest.is_file():
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
-    lakectl(
-        ["fs", "download", f"lakefs://{repo}/{tag}/{LAKEFS_HDT_PATH}", str(part)],
-        binary,
-        endpoint,
-    )
+    part.unlink(missing_ok=True)
+    if downloader == "s5cmd":
+        s5cmd_download(f"s3://{repo}/{tag}/{LAKEFS_HDT_PATH}", part, s5cmd_binary, endpoint)
+    else:
+        lakectl(
+            [
+                "fs", "download", "--pre-sign=false",
+                f"lakefs://{repo}/{tag}/{LAKEFS_HDT_PATH}", str(part),
+            ],
+            lakectl_binary,
+            endpoint,
+        )
     part.replace(dest)
     return True
 
@@ -406,7 +480,15 @@ def main() -> int:
     )
     parser.add_argument("--tag", help="with --lakefs: build this tag instead of the latest")
     parser.add_argument("--lakefs-endpoint", default=LAKEFS_ENDPOINT, help="lakeFS server URL")
-    parser.add_argument("--lakectl", default="lakectl", help="the lakectl binary")
+    parser.add_argument("--lakectl", default="lakectl", help="the lakectl binary (tags)")
+    parser.add_argument(
+        "--downloader",
+        choices=("s5cmd", "lakectl"),
+        default="s5cmd",
+        help="what fetches the HDT bytes: s5cmd through lakeFS's S3 gateway (default), "
+        "or lakectl streaming through the server",
+    )
+    parser.add_argument("--s5cmd", default="s5cmd", help="the s5cmd binary")
     parser.add_argument(
         "--source-url",
         help="with --build for one KG: record this as the input's origin "
@@ -490,7 +572,10 @@ def main() -> int:
                 try:
                     tag, commit = lakefs_release(repo, args.tag, args.lakectl, args.lakefs_endpoint)
                     hdt = args.hdt_root / shortname / tag / "data.hdt"
-                    if lakefs_fetch_hdt(repo, tag, hdt, args.lakectl, args.lakefs_endpoint):
+                    if lakefs_fetch_hdt(
+                        repo, tag, hdt, args.lakefs_endpoint,
+                        args.downloader, args.lakectl, args.s5cmd,
+                    ):
                         print(f"{shortname:<28} fetched {repo}@{tag} -> {hdt}")
                 except RuntimeError as error:
                     print(f"{shortname:<28} FAILED")
