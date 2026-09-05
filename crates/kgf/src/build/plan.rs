@@ -463,7 +463,10 @@ pub struct Keysets {
 /// `stats/`.
 #[derive(Debug, Clone, Serialize)]
 pub struct Stats {
-    /// Prefix tables, layered with later files winning.
+    /// Prefix tables, layered with later files winning and the plan's own
+    /// `semantics.prefixes` last of all. The layered map is the bundle's prefix
+    /// map: the manifest declares it and the namespace inventory counts
+    /// against it. Paths on the build machine, read at build time, not here.
     pub prefix_tables: Vec<PathBuf>,
 }
 
@@ -618,19 +621,10 @@ fn resolve_semantics(semantics: config::Semantics) -> Result<Semantics> {
         .map(|(prefix, namespace)| ((*prefix).to_owned(), (*namespace).to_owned()))
         .collect();
 
+    // The same rule a shared table's entries meet at build time, so a binding
+    // is held to one contract wherever it enters.
     for (prefix, expansion) in &semantics.prefixes {
-        ensure!(
-            !prefix.is_empty()
-                && prefix
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
-            "prefix name {prefix:?} is not a usable CURIE prefix"
-        );
-        oxiri::Iri::parse(expansion.as_str()).map_err(|error| {
-            anyhow::anyhow!(
-                "prefix {prefix:?} expands to {expansion:?}, which is not an IRI: {error}"
-            )
-        })?;
+        super::prefixes::validate_binding(prefix, expansion)?;
     }
     prefixes.extend(semantics.prefixes);
 

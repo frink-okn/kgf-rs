@@ -40,6 +40,17 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
         .output
         .parent()
         .context("--out has no parent directory to stage beside")?;
+
+    // The bundle's prefix map, layered once here for every reader. Read before
+    // anything is created or run, so a malformed table costs nothing: the
+    // namespace inventory that used to be the only reader of these files is
+    // the last step of the pipeline, after the HDT, the permutation, the text
+    // index, the sketches and the key sets.
+    let prefixes = super::prefixes::layered(
+        &plan.config.contents.stats.prefix_tables,
+        &plan.config.semantics.prefixes,
+    )?;
+
     std::fs::create_dir_all(parent)
         .with_context(|| format!("creating dataset directory {}", parent.display()))?;
 
@@ -104,15 +115,14 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
             runner: &runner,
             data: &layout.data,
             dataset_iri: plan.config.dataset.iri.as_str(),
-            prefix_tables: &plan.config.contents.stats.prefix_tables,
-            extra_prefixes: &plan.config.semantics.prefixes,
+            prefixes: &prefixes,
             card,
             work: work.path(),
         },
         &staged_stats,
     )?;
 
-    let requested = requested_manifest(plan, inputs, &build.hdtc)?;
+    let requested = requested_manifest(plan, inputs, &build.hdtc, prefixes)?;
     let manifest =
         crate::manifest::write_description_manifest(staging.path(), &requested, &outcome.metadata)?;
 
@@ -420,6 +430,7 @@ fn requested_manifest(
     plan: &BundlePlan,
     inputs: Vec<SourceInput>,
     hdtc: &Path,
+    prefixes: BTreeMap<String, String>,
 ) -> Result<Requested> {
     Ok(Requested {
         id: Some(plan.config.dataset.id.to_string()),
@@ -442,7 +453,10 @@ fn requested_manifest(
             .as_ref()
             .and_then(|publisher| publisher.contact.clone()),
         previous_version: plan.previous_version.as_ref().map(ToString::to_string),
-        prefixes: plan.config.semantics.prefixes.clone(),
+        // The layered map, not the plan's own: shared tables under the
+        // dataset's bindings, the same map the namespace inventory counted
+        // against.
+        prefixes,
         roles: plan.config.semantics.roles.clone(),
         source: Some(Source {
             inputs,

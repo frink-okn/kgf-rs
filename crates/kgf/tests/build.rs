@@ -5,6 +5,7 @@
 //! on stdin, a resolved plan on stdout, and refusals that name the fix. That is
 //! the stable surface a build workflow depends on.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -553,6 +554,147 @@ fn a_missing_prefix_table_fails_before_anything_is_built() {
     // The same config still passes `--check-config`, which cannot know the
     // paths of the machine that will run the build.
     kgf(&["build", "--config", "-", "--check-config"], &config).ok();
+}
+
+/// The shared tables are the bundle's prefix map, not only the namespace
+/// inventory's: an IRI the inventory counts under `obo:` must also render as
+/// `obo:…` and be writable as one in a request. Both readers get the one
+/// layered map, later tables winning and the dataset's own bindings last, and
+/// the identity the inventory publishes is that map's.
+#[test]
+fn prefix_tables_are_layered_into_the_manifest_and_the_inventory() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nt");
+    std::fs::write(&source, SOURCE).unwrap();
+    let shared = dir.path().join("shared.yaml");
+    std::fs::write(
+        &shared,
+        concat!(
+            "# the federation's table, quoted and commented as the registry writes it\n",
+            "obo: \"http://purl.obolibrary.org/obo/\"\n",
+            "chebi: \"http://old.example/CHEBI_\"\n",
+            "ex: \"http://table.example/\"\n",
+        ),
+    )
+    .unwrap();
+    let local = dir.path().join("local.json");
+    std::fs::write(
+        &local,
+        r#"{"chebi": "http://purl.obolibrary.org/obo/CHEBI_"}"#,
+    )
+    .unwrap();
+    let out = dir.path().join("root/tinykg/2026-06-01");
+    let config = format!(
+        "{CONFIG}contents: {{stats: {{prefix_tables: ['{}', '{}']}}}}\n",
+        path(&shared),
+        path(&local)
+    );
+
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &config,
+    )
+    .ok();
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    let prefixes = manifest["prefixes"].as_object().unwrap();
+    // From the first table.
+    assert_eq!(prefixes["obo"], "http://purl.obolibrary.org/obo/");
+    // A later table wins over an earlier one.
+    assert_eq!(prefixes["chebi"], "http://purl.obolibrary.org/obo/CHEBI_");
+    // The dataset's own binding wins over every table.
+    assert_eq!(prefixes["ex"], "http://example.org/");
+    // The well-known four are declared whatever the tables say.
+    assert_eq!(
+        prefixes["rdf"],
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+    );
+
+    // The inventory counted against the same map. Its published identity is
+    // the canonical digest of the manifest's prefixes, and the dataset's
+    // binding beat the table's there as well.
+    let inventory: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("stats/namespaces.json")).unwrap()).unwrap();
+    let map: BTreeMap<String, String> = prefixes
+        .iter()
+        .map(|(prefix, namespace)| (prefix.clone(), namespace.as_str().unwrap().to_owned()))
+        .collect();
+    assert_eq!(
+        inventory["prefix_table"]["version"],
+        prefix_table_version(&map)
+    );
+    let ex = inventory["namespaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["prefix"] == "ex")
+        .expect("ex occurs in the source and is counted");
+    assert_eq!(ex["namespace"], "http://example.org/");
+}
+
+/// A table entry no request could use is refused, naming the file and the
+/// entry, before anything is created or run. The table used to be read only
+/// by the namespace inventory, the last step of the whole pipeline.
+#[test]
+fn a_malformed_prefix_table_fails_before_anything_is_built() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nt");
+    std::fs::write(&source, SOURCE).unwrap();
+    let table = dir.path().join("bad.yaml");
+    std::fs::write(&table, "\"has space\": \"http://x.example/\"\n").unwrap();
+    let out = dir.path().join("root/tinykg/2026-06-01");
+    let config = format!(
+        "{CONFIG}contents: {{stats: {{prefix_tables: ['{}']}}}}\n",
+        path(&table)
+    );
+
+    let stderr = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &config,
+    )
+    .err();
+    assert!(stderr.contains("bad.yaml"), "{stderr}");
+    assert!(stderr.contains("has space"), "{stderr}");
+    assert!(
+        !out.parent().unwrap().exists(),
+        "the build created its dataset directory before reading the table"
+    );
+}
+
+/// hdtc's identity for a prefix table: every entry in key order, each half
+/// length-prefixed, under SHA-256. Restated here because the bundle publishes
+/// the value and this is the one place two tools must arrive at it identically.
+fn prefix_table_version(prefixes: &BTreeMap<String, String>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (prefix, namespace) in prefixes {
+        hasher.update((prefix.len() as u64).to_le_bytes());
+        hasher.update(prefix.as_bytes());
+        hasher.update((namespace.len() as u64).to_le_bytes());
+        hasher.update(namespace.as_bytes());
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 /// `--adopt` must not cost the caller their input when the build fails.

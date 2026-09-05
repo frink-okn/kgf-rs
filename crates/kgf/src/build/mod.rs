@@ -12,6 +12,7 @@
 
 mod execute;
 mod hdtc;
+mod prefixes;
 
 pub mod config;
 pub mod plan;

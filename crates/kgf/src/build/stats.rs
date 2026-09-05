@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
 use kgf_server::url::Params;
@@ -70,10 +70,10 @@ pub(crate) struct Inputs<'a> {
     pub(crate) data: &'a Path,
     /// Stable dataset IRI, already validated as an absolute IRI.
     pub(crate) dataset_iri: &'a str,
-    /// Prefix tables, layered with later files winning.
-    pub(crate) prefix_tables: &'a [PathBuf],
-    /// Prefixes layered last of all, above every table.
-    pub(crate) extra_prefixes: &'a BTreeMap<String, String>,
+    /// The bundle's prefix map, already layered. Written out as the one table
+    /// the namespace inventory counts against, so the identity the inventory
+    /// publishes is the digest of exactly what the manifest declares.
+    pub(crate) prefixes: &'a BTreeMap<String, String>,
     /// What the summary card says about the dataset.
     pub(crate) card: DatasetCard<'a>,
     /// Scratch directory for intermediates that are not published.
@@ -103,8 +103,7 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
         runner,
         data,
         dataset_iri,
-        prefix_tables,
-        extra_prefixes,
+        prefixes,
         card,
         work,
     } = inputs;
@@ -188,27 +187,23 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
     write(&into.join("class-relations.tsv"), &relations.bytes)?;
     write(&into.join("class-properties.tsv"), &class_properties.bytes)?;
 
-    let mut namespace_tables = prefix_tables.to_vec();
-    if !extra_prefixes.is_empty() {
-        // Layered last, above every table: the shared OKN table is the base and
-        // a per-dataset binding wins over it.
-        let extra = work.join("dataset-prefixes.json");
-        write(&extra, &serde_json::to_vec_pretty(extra_prefixes)?)?;
-        namespace_tables.push(extra);
-    }
+    // One table, the manifest's own map, rather than the configured files and
+    // the dataset's bindings handed over separately. The inventory merges what
+    // it is given and publishes the digest of the result, so giving it the
+    // finished map is what makes that digest the manifest's identity too.
+    let table_path = work.join("prefixes.json");
+    write(&table_path, &serde_json::to_vec_pretty(prefixes)?)?;
     let namespaces_path = into.join("namespaces.json");
-    let mut namespace_args = vec![OsString::from("namespaces")];
-    for table in &namespace_tables {
-        namespace_args.push(OsString::from("--prefixes"));
-        namespace_args.push(table.as_os_str().to_owned());
-    }
-    namespace_args.extend([
+    let namespace_args = vec![
+        OsString::from("namespaces"),
+        OsString::from("--prefixes"),
+        table_path.into_os_string(),
         OsString::from("--output"),
         namespaces_path.as_os_str().to_owned(),
         OsString::from("--format"),
         OsString::from("json"),
         data.as_os_str().to_owned(),
-    ]);
+    ];
     runner.run(&super::hdtc::Step {
         name: "namespace inventory",
         args: namespace_args,

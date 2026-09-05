@@ -1728,6 +1728,24 @@ those follow a profile. This is the innermost read in the system, so it will get
 other — bindings joins want `RANDOM`, full-page enumeration wants readahead — and
 picking without measurement is guessing. Revisit with the §20.6 cold-start numbers.
 
+**The bundle's prefix map is the shared tables layered under the dataset's own
+bindings, built once.** `contents.stats.prefix_tables` used to reach only the
+namespace inventory, while the manifest declared the well-known four plus
+`semantics.prefixes`. Two readers of "the prefixes" with two answers: the
+inventory for biobricks-aopwiki counted 1,149 IRIs under `obo:` while its pages
+rendered every OBO term in full and a request could not write `obo:…`.
+`build/prefixes.rs` now layers the tables in order, later files winning, with the
+resolved plan's own map last, and hands that one map to both the manifest and
+the inventory — the inventory as a single written table, so the identity it
+publishes is the digest of exactly what the manifest declares. The alternative
+of declaring only the table prefixes the data actually uses was rejected: it
+would make the CURIE contract vary by dataset and by version, and an agent that
+learned `obo:` on one KG should be able to use it on the next. Table entries are
+held to the manifest's contract, a CURIE-usable name and an IRI namespace, and
+are read before anything is created or run, so a malformed table fails in
+milliseconds rather than after the text index. Existing bundles gain the map
+only by being rebuilt.
+
 ## Questions for `../kgf`
 
 Things implementing or planning against the design surfaced that the design documents
@@ -2348,6 +2366,21 @@ following the code.
     not links. That is a decision, not a question, but doc 03 §3.4.10's "typed links"
     wording should not be read as requiring absolute IRIs outside the RDF
     representations.
+
+63. **The manifest prefix map is the federation table layered under the dataset's
+    bindings; doc 03 §3.3 and doc 04 §4.3 should say so.** Doc 03 has CURIEs
+    resolve "against a prefix declared in the manifest prefix map" without saying
+    where that map comes from, and doc 04's namespace-inventory paragraph describes
+    the shared table "unioned with any per-dataset `prefixes` from the manifest" as
+    if the two were separate inputs. Since 2026-09-05 they are one map: the
+    configured tables, later winning, then the dataset's own bindings, declared in
+    the manifest and counted by the inventory. Two consequences worth writing down.
+    A shared-table edit changes a version's CURIE contract, so it is a rebuild
+    trigger and not a statistics refresh. And `authoritative_namespaces` is still
+    validated at plan time against the well-known four plus `semantics.prefixes`,
+    because table files are machine paths `--check-config` cannot read, so a
+    dataset that is authoritative for a prefix the shared table already defines
+    must repeat that binding in its own block.
 
 ## Not in this plan
 

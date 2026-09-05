@@ -240,6 +240,12 @@ pub struct Keysets {
 pub struct Stats {
     /// Prefix tables, layered with later files winning, then
     /// `semantics.prefixes` last of all.
+    ///
+    /// The layered map is the bundle's prefix map, not only the namespace
+    /// inventory's: the manifest declares it, requests resolve CURIEs against
+    /// it, pages compact IRIs with it, and the inventory counts against it and
+    /// publishes its digest. A flat `prefix: namespace` file, JSON or YAML by
+    /// extension; the registry's shared table is the usual base.
     #[serde(default)]
     pub prefix_tables: Vec<PathBuf>,
 }

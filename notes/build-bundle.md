@@ -146,9 +146,14 @@ outright, because predicate IRIs make every pair of KGs "overlap" through
 its flag: `search` is an optional capability and the text index is the expensive
 step.
 
-`semantics.prefixes` layers *last* over `contents.stats.prefix_tables`, which is
-what `kgf build stats` already does with the manifest's prefix map
-(`build/stats.rs:220`). The shared OKN table is the base; the per-KG block wins.
+`semantics.prefixes` layers *last* over `contents.stats.prefix_tables`: the
+shared OKN table is the base and the per-KG block wins. **The layered map is the
+bundle's prefix map** (since 2026-09-05; `build/prefixes.rs`). It is what the
+manifest declares, what requests resolve CURIEs against, what pages compact IRIs
+with, and the one table the namespace inventory counts against, so the digest
+the inventory publishes is the manifest map's identity. Before that fix the
+tables reached only the inventory: a bundle whose inventory counted 1,149 IRIs
+under `obo:` still declared five prefixes and rendered every OBO term in full.
 
 ## 4. Step order
 
@@ -278,10 +283,17 @@ not the tag), `--source-sha256`, `--previous-version`.
 registry's `docs/registry/prefixes.yaml`. Baking it into the kgf image would pin
 it at image-build time, so a registry prefix addition would not reach a bundle
 until the image was rebuilt. Render it as a second `configmap_overrides` entry
-instead, so the table tracks the registry the way everything else does — and so
-it falls inside the config hash below automatically. `hdtc namespaces` records
-the table's sha256 in its output, which keeps a bundle auditable against a
-registry revision.
+instead, so the table tracks the registry the way everything else does. `hdtc
+namespaces` records the merged table's sha256 in its output, which keeps a
+bundle auditable against a registry revision.
+
+The table shapes the bundle, not just its statistics: every prefix in it is
+declared in the manifest, so a table edit changes what CURIEs a version accepts
+and how its pages read. That makes the table content part of what should
+retrigger a build, and the resolved plan carries only the table's *path*, so a
+config hash over `--check-config` output does not see it. kace should fold the
+table bytes into whatever it hashes for change detection, or accept that a
+prefix addition reaches a KG at its next data release.
 
 ### Change detection needs the config
 
