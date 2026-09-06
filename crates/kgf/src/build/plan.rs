@@ -104,8 +104,11 @@ impl FromStr for DatasetId {
         // registration order. A dataset spelling one of them would build,
         // publish, and appear in the service descriptor while every URL for it
         // answered something else entirely — a failure with nothing to report.
-        // Refusing the name here is the only place that cannot be reached
-        // around.
+        //
+        // Refused here so no build produces one, and refused again where the
+        // server turns a scanned tree into a URL space, because a bundle root
+        // is a directory and can be filled by something that is not this
+        // toolchain.
         ensure!(
             !kgf_server::routes::RESERVED_DATASET_IDS.contains(&value.as_str()),
             "a dataset id may not be {value:?}; the server answers /{value} \

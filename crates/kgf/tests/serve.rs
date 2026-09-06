@@ -1823,6 +1823,31 @@ fn a_manifest_that_disagrees_with_its_directory_stops_startup() {
 }
 
 #[test]
+fn a_dataset_directory_named_after_a_route_stops_startup() {
+    // `kgf build` refuses to mint this id, so the only way one reaches a bundle
+    // root is the way this test makes it: a directory put there by something
+    // else. Loud rather than degraded, for the same reason a mislabelled
+    // version is — the alternative is a dataset that is on disk, listed in the
+    // service descriptor, and answers the health probe at every one of its URLs.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    std::fs::create_dir_all(deployment.root_path().join("healthz/v1"))
+        .expect("a hand-assembled bundle directory");
+
+    let error = Service::build(kgf_server::Config::new(
+        kgf::serve::published_root(deployment.root_path()).unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    ))
+    .expect_err("a shadowed dataset is not servable");
+    let message = error.to_string();
+    assert!(message.contains("healthz"), "{message}");
+    assert!(
+        message.contains("rename"),
+        "the operator needs the fix: {message}"
+    );
+}
+
+#[test]
 fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() {
     // `operations.rs` checks what the read operations *answer*, headless. What
     // only a socket can show is the rest of the response: completeness metadata in
