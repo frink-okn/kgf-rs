@@ -77,6 +77,82 @@ const SUMMARY_CARD_JSON: &str = r#"{
 "#;
 
 #[test]
+fn a_304_carries_the_encoding_metadata_its_200_would_have_carried() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    let server = deployment.serve();
+    let target = "/tox/v/v1/fragment?limit=100";
+
+    // Compression is negotiated, so the resource varies on the coding and an
+    // encoded body must not claim the identity body's strong validator. The
+    // trap is the `304`: it has no body, so nothing downstream marks it, and
+    // deciding from the response alone answers a revalidation with metadata the
+    // `200` did not send. RFC 9110 §15.4.5 requires the two to agree, and a
+    // cache updating stored headers from a `304` (RFC 9111 §4.3.4) would
+    // otherwise drop the field keeping its stored encoded bytes away from a
+    // request that cannot decode them.
+    for (accept_encoding, weak) in [("gzip", true), ("identity", false)] {
+        let headers = [("accept-encoding", accept_encoding)];
+        let ok = server.request("GET", target, &headers);
+        ok.assert_status(200);
+        let etag = ok.header("etag").expect("a versioned GET carries an ETag");
+        assert_eq!(
+            etag.starts_with("W/"),
+            weak,
+            "{accept_encoding} should{} weaken the validator, got {etag}",
+            if weak { "" } else { " not" }
+        );
+        assert_encoding_vary(&ok, accept_encoding);
+
+        let conditional = server.request(
+            "GET",
+            target,
+            &[
+                ("accept-encoding", accept_encoding),
+                ("if-none-match", &etag),
+            ],
+        );
+        conditional.assert_status(304);
+        assert_eq!(
+            conditional.header("etag").as_deref(),
+            Some(etag.as_str()),
+            "the 304 must carry the validator its 200 sent, for {accept_encoding}"
+        );
+        assert_encoding_vary(&conditional, accept_encoding);
+    }
+
+    // The validator tracks the request rather than what the client happens to
+    // hold, so a stored tag from one coding still revalidates under the other —
+    // `If-None-Match` compares weakly (RFC 9110 §13.1.2).
+    let strong = server
+        .request("GET", target, &[("accept-encoding", "identity")])
+        .header("etag")
+        .expect("an ETag");
+    let crossed = server.request(
+        "GET",
+        target,
+        &[("accept-encoding", "gzip"), ("if-none-match", &strong)],
+    );
+    crossed.assert_status(304);
+    assert!(
+        crossed
+            .header("etag")
+            .is_some_and(|tag| tag.starts_with("W/")),
+        "a gzip revalidation is answered with the weak tag its 200 would send"
+    );
+}
+
+#[track_caller]
+fn assert_encoding_vary(response: &Response, context: &str) {
+    let vary = response.header("vary").unwrap_or_default();
+    assert!(
+        vary.split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("accept-encoding")),
+        "Vary must name accept-encoding for {context}, got {vary:?}"
+    );
+}
+
+#[test]
 fn the_url_space_answers_over_a_real_listener() {
     let deployment = Deployment::new();
     deployment.publish("tox", "2026-01-09", TINY_NT, "2026-01-09T09:00:00Z");

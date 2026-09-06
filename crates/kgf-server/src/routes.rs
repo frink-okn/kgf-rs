@@ -30,7 +30,8 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Request, State};
 use axum::http::header::{
-    ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, LOCATION, RETRY_AFTER, VARY,
+    ACCEPT, ACCEPT_ENCODING, ALLOW, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, LOCATION,
+    RETRY_AFTER, VARY,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
@@ -182,8 +183,9 @@ pub fn router(service: Arc<Service>) -> Router {
                 .compress_when(SizeAbove::new(1024)),
         )
         // Outermost, because it must observe the `Content-Encoding` the layer
-        // below may have added.
-        .layer(middleware::from_fn(weaken_etag_when_encoded))
+        // below may have added — and must also reach the responses that layer
+        // never handles, a `304` in particular.
+        .layer(middleware::from_fn(mark_encoding_negotiated))
         .with_state(service)
 }
 
@@ -1801,30 +1803,41 @@ impl IntoResponse for Problem {
     }
 }
 
-/// Mark a compressed response's validator weak.
+/// Give every response the encoding metadata the negotiated 200 would carry.
 ///
-/// `ETag`s here are strong by construction: `representation::etag` mixes the
-/// negotiated representation into the tag precisely because RFC 9110 §8.8.3
-/// makes each representation its own entity. A content coding is part of that
-/// same identity, so a gzip body carrying the identity body's strong tag is the
-/// one place this server would claim byte-for-byte equality it does not have —
-/// and a cache holding the encoded bytes could then answer an
-/// `Accept-Encoding: identity` revalidation with them.
+/// Two headers, and they have to agree across status codes. Compression is
+/// negotiated, so `Vary` must name `accept-encoding`; and an encoded body is not
+/// byte-identical to the identity body, so it must not claim the identity body's
+/// strong validator. `representation::etag` mixes the negotiated representation
+/// into the tag precisely because RFC 9110 §8.8.3 makes each representation its
+/// own entity, and a content coding is part of that same identity.
 ///
-/// Weakening rather than re-tagging is what keeps revalidation working:
-/// `If-None-Match` is defined to use the weak comparison function (RFC 9110
-/// §13.1.2, and `headers::IfNoneMatch::precondition_passes` implements it), so
-/// `W/"…"` still matches the strong tag a handler recomputes. A fresh tag would
-/// not — the handler cannot know whether the layer above it will compress.
+/// The subtlety is the `304`. It carries no body, so nothing below adds a
+/// `Content-Encoding` or a `Vary` for it, and deciding from the *response* alone
+/// would answer a revalidation with a strong tag and no `accept-encoding` where
+/// the `200` sent a weak tag and one. RFC 9110 §15.4.5 requires a `304` to carry
+/// the `ETag` and `Vary` a `200` to the same request would have — and a cache
+/// updating stored headers from that `304` (RFC 9111 §4.3.4) would drop the
+/// field keeping its stored gzip bytes away from an `Accept-Encoding: identity`
+/// request. So the decision is taken from the *request*, which both statuses
+/// share, and the response's own coding is folded in so an actually-encoded body
+/// is always marked however the request was spelled.
 ///
-/// A 304 carries no body and so no `Content-Encoding`, and is left alone.
-async fn weaken_etag_when_encoded(request: Request, next: Next) -> Response {
+/// Deciding from the request weakens a little more than strictly necessary: a
+/// sub-threshold response to a client offering `gzip` is sent identity but still
+/// tagged weak. That direction is safe and it is free here — nothing in this
+/// server needs a strong validator, which is only required for `Range` and
+/// `If-Match`, neither of which it implements. `If-None-Match` compares weakly
+/// (RFC 9110 §13.1.2), so revalidation is unaffected.
+async fn mark_encoding_negotiated(request: Request, next: Next) -> Response {
+    let negotiated = permits_content_coding(request.headers());
     let mut response = next.run(request).await;
+    declare_encoding_vary(response.headers_mut());
     let encoded = response
         .headers()
         .get(CONTENT_ENCODING)
         .is_some_and(|coding| !coding.as_bytes().eq_ignore_ascii_case(b"identity"));
-    if !encoded {
+    if !encoded && !negotiated {
         return response;
     }
     // Only a strong tag needs weakening, and only a well-formed one is touched:
@@ -1844,6 +1857,52 @@ async fn weaken_etag_when_encoded(request: Request, next: Next) -> Response {
         response.headers_mut().insert(ETAG, value);
     }
     response
+}
+
+/// Append `accept-encoding` to `Vary` unless it is already named.
+///
+/// The compression layer below adds it to the responses it handles; this covers
+/// the ones it never sees, a `304` above all. Appending rather than inserting
+/// keeps the `Accept` and CORS entries other layers contribute.
+fn declare_encoding_vary(headers: &mut HeaderMap) {
+    let already = headers.get_all(VARY).iter().any(|value| {
+        value
+            .as_bytes()
+            .split(|byte| *byte == b',')
+            .any(|field| field.trim_ascii().eq_ignore_ascii_case(b"accept-encoding"))
+    });
+    if !already {
+        headers.append(VARY, HeaderValue::from_static("accept-encoding"));
+    }
+}
+
+/// Whether the request permits a content coding this server might apply.
+///
+/// Only `gzip` is offered, so `gzip` and `*` are the tokens that matter, and
+/// either carries a refusal when its quality is zero. An absent or unreadable
+/// header is a refusal too: leaving the validator strong is the conservative
+/// answer when the coding is in doubt, and an actually-encoded response is
+/// caught by its own `Content-Encoding` regardless.
+fn permits_content_coding(headers: &HeaderMap) -> bool {
+    let Some(field) = headers.get(ACCEPT_ENCODING) else {
+        return false;
+    };
+    let Ok(field) = field.to_str() else {
+        return false;
+    };
+    field.split(',').any(|entry| {
+        let mut parts = entry.split(';').map(str::trim);
+        let coding = parts.next().unwrap_or_default();
+        if !coding.eq_ignore_ascii_case("gzip") && coding != "*" {
+            return false;
+        }
+        !parts.any(|parameter| {
+            parameter.split_once('=').is_some_and(|(key, value)| {
+                key.eq_ignore_ascii_case("q")
+                    && value.parse::<f32>().is_ok_and(|quality| quality <= 0.0)
+            })
+        })
+    })
 }
 
 /// Render every error response in the client's representation, with a code.
