@@ -1034,6 +1034,7 @@ dependencies = [
  "hdtc",
  "kgf-server",
  "kgf-store",
+ "kgf-verbalize",
  "oxiri",
  "oxrdf",
  "oxrdfio",

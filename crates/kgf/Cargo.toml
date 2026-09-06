@@ -17,6 +17,7 @@ path = "src/lib.rs"
 
 [dependencies]
 kgf-server.workspace = true
+kgf-verbalize.workspace = true
 kgf-store.workspace = true
 # `kgf manifest` is the only place in KGF that reads whole artifacts, so it is
 # where a text index's binding to its HDT is checked. `kgf-store` deliberately
