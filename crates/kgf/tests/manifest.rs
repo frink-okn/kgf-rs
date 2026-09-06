@@ -100,7 +100,7 @@ fn a_hand_assembled_bundle_becomes_servable_and_stays_honest() {
     // A core bundle declares only the optional operations this build serves.
     let mut capabilities: Vec<&str> = manifest.capabilities.keys().map(String::as_str).collect();
     capabilities.sort_unstable();
-    assert_eq!(capabilities, ["labels", "sample"]);
+    assert_eq!(capabilities, ["labels", "sample", "verbalize"]);
     assert!(manifest.predicate_roles.contains_key("label"));
 
     kgf(&["manifest", path(&bundle), "--check"]).success();

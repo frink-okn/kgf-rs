@@ -101,6 +101,8 @@ pub struct ReleaseLinks {
     search: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     labels: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verbalize: Option<String>,
 }
 
 /// Which build and protocol answered.
@@ -235,6 +237,7 @@ impl Resource for ServiceDescriptor<'_> {
                             ("max_search_predicates", Value::Number(u64::from(self.caps.max_search_predicates))),
                             ("max_search_results", Value::Number(u64::from(self.caps.max_search_results))),
                             ("max_label_iris", Value::Number(u64::from(self.caps.max_label_iris))),
+                            ("max_verbalize_roots", Value::Number(u64::from(self.caps.max_verbalize_roots))),
                             ("max_schema_items", Value::Number(u64::from(self.caps.max_schema_items))),
                         ]))
                         h2 { "Response budgets" }
@@ -467,6 +470,9 @@ fn release_links(
         labels: release
             .declares(Capability::Labels)
             .then(|| operation("labels")),
+        verbalize: release
+            .declares(Capability::Verbalize)
+            .then(|| operation("verbalize")),
     }
 }
 
@@ -730,6 +736,9 @@ fn operations(
     }
     if manifest.declares(Capability::Labels) {
         operations.push(("labels", "QUERY/POST JSON body: iris", false));
+    }
+    if manifest.declares(Capability::Verbalize) {
+        operations.push(("verbalize", "config, target, iri, n, seed, plan", true));
     }
     operations
         .into_iter()

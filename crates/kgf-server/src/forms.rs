@@ -39,6 +39,9 @@ pub(crate) fn manifest_forms(
             @if search {
                 (search_form(mount, dataset, version, &empty, false))
             }
+            @if manifest.declares(Capability::Verbalize) {
+                (verbalize(mount, dataset, version, &empty, false))
+            }
         }
     }
 }
@@ -58,6 +61,7 @@ pub(crate) fn operation_form(
         "describe" => Some(describe(mount, dataset, version, params, false)),
         "sample" => Some(sample(mount, dataset, version, params, false)),
         "search" => Some(search_form(mount, dataset, version, params, false)),
+        "verbalize" => Some(verbalize(mount, dataset, version, params, false)),
         _ => None,
     }?;
     Some(html! { div."query-stack" { (form) } })
@@ -218,6 +222,61 @@ fn sample(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bo
     )
 }
 
+fn verbalize(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
+    form(
+        "Verbalize",
+        "Render the texts an embedding config would write. A config alone plans every \
+         target: its member count and a few sampled texts. A target samples that one; \
+         IRIs render those roots.",
+        mount.operation(dataset, version, "verbalize"),
+        vec![
+            textarea_control(
+                "verbalize",
+                "config",
+                "Config",
+                params.get("config"),
+                "targets:\n  thing:\n    type: https://example.org/Thing",
+                12,
+                true,
+            ),
+            text_control(
+                "verbalize",
+                "target",
+                "Target",
+                params.get("target"),
+                "a target name from the config",
+                false,
+            ),
+            textarea_control(
+                "verbalize",
+                "iri",
+                "Roots",
+                params.get("iri"),
+                "ex:one ex:two — IRIs to render, separated by spaces or newlines",
+                3,
+                false,
+            ),
+            number_control(
+                "verbalize",
+                "n",
+                "Roots per target",
+                params.get("n"),
+                1,
+                "server default",
+            ),
+            number_control("verbalize", "seed", "Seed", params.get("seed"), 0, "0"),
+            checkbox_control(
+                "verbalize",
+                "plan",
+                "Plan every target",
+                params.get("plan") == Some("true"),
+            ),
+        ],
+        "Render",
+        open,
+    )
+}
+
 fn search_form(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
     let labels = params.get("labels").unwrap_or("true");
     form(
@@ -333,6 +392,41 @@ fn text_control(
                 autocomplete="off"
                 spellcheck="false"
                 required[required];
+        }
+    }
+}
+
+fn textarea_control(
+    operation: &str,
+    name: &str,
+    label: &str,
+    value: Option<&str>,
+    placeholder: &str,
+    rows: u32,
+    required: bool,
+) -> Markup {
+    let id = format!("{operation}-{name}");
+    html! {
+        label for=(id) ."wide" {
+            span."control-label" { (label) " " code { (name) } }
+            textarea
+                id=(id)
+                name=(name)
+                rows=(rows)
+                placeholder=(placeholder)
+                spellcheck="false"
+                required[required]
+            { (value.unwrap_or("")) }
+        }
+    }
+}
+
+fn checkbox_control(operation: &str, name: &str, label: &str, checked: bool) -> Markup {
+    let id = format!("{operation}-{name}");
+    html! {
+        label for=(id) ."check" {
+            input id=(id) type="checkbox" name=(name) value="true" checked[checked];
+            span."control-label" { (label) " " code { (name) } }
         }
     }
 }

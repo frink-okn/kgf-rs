@@ -126,6 +126,10 @@ pub enum Capability {
     Search,
     /// `QUERY /labels`; resolved live from the core permutations.
     Labels,
+    /// `GET|QUERY /verbalize` — a config's texts for a few roots, rendered
+    /// live from the core permutations, for authoring an embedding config
+    /// against a served bundle.
+    Verbalize,
     /// Typed range bounds on objects; needs the range sidecar.
     Range,
     /// `GET /closure` — transitive expansion; needs the closure sidecar.
@@ -155,6 +159,7 @@ impl Capability {
             Self::Graphs => "graphs",
             Self::Search => "search",
             Self::Labels => "labels",
+            Self::Verbalize => "verbalize",
             Self::Range => "range",
             Self::Closure => "closure",
             Self::Filters => "filters",
@@ -253,15 +258,20 @@ impl BundleFacts {
 
 /// Which capabilities an artifact set supports.
 ///
-/// Two optional capabilities need nothing beyond the artifacts every bundle is
-/// required to carry: `sample` composes triple patterns, and `labels` resolves
-/// the manifest's predicate cascade through the core permutations. `star`,
+/// Three optional capabilities need nothing beyond the artifacts every bundle
+/// is required to carry: `sample` composes triple patterns, `labels` resolves
+/// the manifest's predicate cascade through the core permutations, and
+/// `verbalize` walks a root's star through both. `star`,
 /// `terms`, and `export` are not declared until their complete HTTP operations
 /// are implemented. The rest are gated on sidecars — the graph pair and the
 /// text index exist today, and `range` and `closure` are therefore never derived
 /// here, since a bundle cannot acquire them without acquiring an artifact.
 fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
-    let mut capabilities = BTreeSet::from([Capability::Sample, Capability::Labels]);
+    let mut capabilities = BTreeSet::from([
+        Capability::Sample,
+        Capability::Labels,
+        Capability::Verbalize,
+    ]);
     if artifacts.graphs.is_some() {
         capabilities.insert(Capability::Graphs);
     }
@@ -1218,7 +1228,14 @@ mod tests {
         let fixture = Fixture::build(TINY_NT);
         let capabilities: Vec<_> = facts(&fixture).capabilities().collect();
 
-        assert_eq!(capabilities, vec![Capability::Sample, Capability::Labels]);
+        assert_eq!(
+            capabilities,
+            vec![
+                Capability::Sample,
+                Capability::Labels,
+                Capability::Verbalize
+            ]
+        );
         // Sidecar-gated capabilities are never guessed at.
         assert!(!capabilities.contains(&Capability::Search));
         assert!(!capabilities.contains(&Capability::Range));

@@ -9,6 +9,9 @@ repository.workspace = true
 
 [dependencies]
 kgf-store.workspace = true
+# The verbalizer behind `/verbalize`; a peer of the build stage, which calls
+# the same crate without linking this one.
+kgf-verbalize.workspace = true
 # `hdtc::format::{encode_literal, parse_literal}`: how a term is spelled once it
 # is in the dictionary. Resolving a request term to an id happens at this
 # boundary, so this is where that spelling has to be right —
@@ -20,6 +23,9 @@ tracing.workspace = true
 base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `/verbalize` takes its config as text in a GET parameter, YAML or JSON; the
+# same YAML implementation the build config uses, so the two never disagree.
+serde_norway.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
 axum.workspace = true

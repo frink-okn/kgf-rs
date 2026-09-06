@@ -60,6 +60,7 @@ use crate::envelope::{ErrorCode, Problem, reflected};
 use crate::service::PredicateRoles;
 use crate::term::{Literal as KgfLiteral, PrefixMap, Term};
 use crate::url::Params;
+use kgf_verbalize::{Config as VerbalizeConfig, Resolved as VerbalizeResolved};
 
 // ---------------------------------------------------------------------------
 // Positions and terms
@@ -733,6 +734,363 @@ impl Labels {
     /// Submitted IRIs, in input order.
     pub fn iris(&self) -> &[BoundTerm] {
         &self.iris
+    }
+}
+
+/// `GET|QUERY /verbalize` — what a verbalization config would write for a
+/// few roots of a served bundle.
+///
+/// The authoring loop for an embedding config: change a line, look at the
+/// text again. It answers three questions, one per [`VerbalizeMode`], and
+/// takes the config itself in the request so that authoring needs nothing but
+/// a served bundle — no local artifacts, no build.
+#[derive(Debug)]
+pub struct Verbalize {
+    /// The config, validated and defaulted.
+    pub resolved: VerbalizeResolved,
+    /// Which roots to render.
+    pub mode: VerbalizeMode,
+    /// The one target the request is about, by config name, when a mode
+    /// needs one or the request narrowed a plan to one.
+    pub target: Option<String>,
+    /// Roots drawn per target in `sample` and `plan` modes.
+    pub n: u32,
+    /// The draw's seed.
+    pub seed: u64,
+    /// The release's `label` role cascade, behind the config's own.
+    pub label_predicates: Vec<String>,
+    /// Bytes the rendered texts may occupy.
+    pub bytes: ResponseBytes,
+    /// Edges of one root's star the render may read.
+    pub star_budget: u64,
+}
+
+/// Which roots `/verbalize` renders.
+///
+/// Chosen by what the request names: IRIs make it `iris`; a target without
+/// IRIs makes it `sample`; neither makes it `plan`, which `plan=true` can also
+/// ask for by name with a target to narrow it to one.
+#[derive(Debug)]
+pub enum VerbalizeMode {
+    /// These roots, under one target.
+    Iris(Vec<BoundTerm>),
+    /// `n` seeded-uniform members of one target's class.
+    Sample,
+    /// Every target, or the one named: its member count and `n`
+    /// seeded-uniform members' texts, with length statistics.
+    Plan,
+}
+
+impl VerbalizeMode {
+    /// The census spelling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Iris(_) => "iris",
+            Self::Sample => "sample",
+            Self::Plan => "plan",
+        }
+    }
+}
+
+/// Roots drawn per target when a request does not say.
+const VERBALIZE_DEFAULT_N: u32 = 5;
+
+/// The body of a `QUERY|POST /verbalize`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireVerbalize {
+    config: VerbalizeConfig,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    iris: Option<Vec<WireTerm>>,
+    #[serde(default)]
+    n: Option<u32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    plan: Option<bool>,
+}
+
+impl Verbalize {
+    const PARAMETERS: &'static [&'static str] =
+        &["config", "target", "iri", "n", "seed", "plan", "format"];
+
+    /// Parse the GET form: the config as YAML or JSON text in `config`.
+    pub fn parse(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        profile: &PredicateRoles,
+    ) -> Result<Self, Problem> {
+        accept_only(params, VERBALIZE, Self::PARAMETERS)?;
+        let Some(text) = params.get("config") else {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "config is required: the verbalization config, as YAML or JSON",
+            ));
+        };
+        if text.len() as u64 > limits.budgets.max_request_bytes {
+            return Err(Problem::new(
+                ErrorCode::PayloadTooLarge,
+                format!(
+                    "config is {} bytes, over this server's max_request_bytes of {}",
+                    text.len(),
+                    limits.budgets.max_request_bytes
+                ),
+            ));
+        }
+        let config: VerbalizeConfig = serde_norway::from_str(text).map_err(|error| {
+            Problem::new(
+                ErrorCode::MalformedRequest,
+                format!("config does not parse as a verbalization config: {error}"),
+            )
+        })?;
+        let mut iris = Vec::new();
+        if let Some(list) = params.get("iri") {
+            for text in term_list("iri", list)? {
+                iris.push(BoundTerm::parse("iri", text, limits, prefixes)?.require_iri("iri")?);
+            }
+        }
+        let n = match params.get("n") {
+            None => None,
+            Some(_) => Some(page_size(
+                params,
+                "n",
+                VERBALIZE_DEFAULT_N,
+                limits.caps.max_verbalize_roots,
+                "omit n to take the default",
+            )?),
+        };
+        Self::finish(
+            config,
+            params.get("target").map(str::to_owned),
+            iris,
+            n,
+            seed(params)?,
+            boolean(params, "plan", false)?,
+            limits,
+            profile,
+        )
+    }
+
+    /// Parse the JSON body form: the config as an object in `config`.
+    pub fn parse_body(
+        params: &Params,
+        body: &[u8],
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        profile: &PredicateRoles,
+    ) -> Result<Self, Problem> {
+        accept_only(params, VERBALIZE, &["format"])?;
+        let wire: WireVerbalize = parse_body(body)?;
+        let mut iris = Vec::new();
+        for (index, iri) in wire.iris.unwrap_or_default().into_iter().enumerate() {
+            iris.push(
+                BoundTerm::parse_body(&format!("iris[{index}]"), iri, limits, prefixes)?
+                    .require_iri(&format!("iris[{index}]"))?,
+            );
+        }
+        if let Some(n) = wire.n {
+            if n == 0 {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    "n=0 asks for nothing back; omit n to take the default",
+                ));
+            }
+            if n > limits.caps.max_verbalize_roots {
+                return Err(Problem::new(
+                    ErrorCode::CapExceeded,
+                    format!(
+                        "n={n} is over this server's max_verbalize_roots of {}",
+                        limits.caps.max_verbalize_roots
+                    ),
+                ));
+            }
+        }
+        Self::finish(
+            wire.config,
+            wire.target,
+            iris,
+            wire.n,
+            wire.seed.unwrap_or(0),
+            wire.plan.unwrap_or(false),
+            limits,
+            profile,
+        )
+    }
+
+    /// The rules both forms share: which mode the request is, and that it
+    /// fits under the root cap.
+    #[allow(clippy::too_many_arguments)]
+    fn finish(
+        config: VerbalizeConfig,
+        target: Option<String>,
+        iris: Vec<BoundTerm>,
+        n: Option<u32>,
+        seed: u64,
+        plan: bool,
+        limits: Limits<'_>,
+        profile: &PredicateRoles,
+    ) -> Result<Self, Problem> {
+        let resolved = config.resolve().map_err(|error| {
+            Problem::new(
+                ErrorCode::MalformedRequest,
+                format!("config is not a usable verbalization config: {error}"),
+            )
+        })?;
+        let names: Vec<&str> = resolved
+            .targets
+            .iter()
+            .map(|target| target.name.as_str())
+            .collect();
+        if let Some(name) = &target
+            && !names.contains(&name.as_str())
+        {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "target={} is not one the config declares; it declares {}",
+                    reflected(name),
+                    names
+                        .iter()
+                        .map(|name| format!("{name:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+        let cap = limits.caps.max_verbalize_roots;
+
+        let (mode, target, n) = if !iris.is_empty() {
+            if plan || n.is_some() {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    "iri names the roots to render, so n, seed and plan do not apply; send one or the other",
+                ));
+            }
+            if iris.len() > cap as usize {
+                return Err(Problem::new(
+                    ErrorCode::CapExceeded,
+                    format!(
+                        "{} IRIs is over this server's max_verbalize_roots of {cap}",
+                        iris.len()
+                    ),
+                ));
+            }
+            (
+                VerbalizeMode::Iris(iris),
+                Self::one_target(target, &names)?,
+                VERBALIZE_DEFAULT_N,
+            )
+        } else if plan || target.is_none() {
+            let selected = if target.is_some() {
+                1
+            } else {
+                names.len() as u32
+            };
+            // An explicit n is held to the cap; the default fits under it, so
+            // a bare config is always answerable, with fewer roots per target
+            // when the config declares many.
+            let n = match n {
+                Some(n) if n.saturating_mul(selected) > cap => {
+                    return Err(Problem::new(
+                        ErrorCode::CapExceeded,
+                        format!(
+                            "a plan of {selected} targets at n={n} would render {} roots, over \
+                             this server's max_verbalize_roots of {cap}; lower n or name one target",
+                            n.saturating_mul(selected)
+                        ),
+                    ));
+                }
+                Some(n) => n,
+                None => VERBALIZE_DEFAULT_N.min(cap / selected.max(1)).max(1),
+            };
+            (VerbalizeMode::Plan, target, n)
+        } else {
+            (
+                VerbalizeMode::Sample,
+                Self::one_target(target, &names)?,
+                n.unwrap_or(VERBALIZE_DEFAULT_N.min(cap)),
+            )
+        };
+
+        Ok(Self {
+            resolved,
+            mode,
+            target,
+            n,
+            seed,
+            label_predicates: profile
+                .get("label")
+                .map(<[String]>::to_vec)
+                .unwrap_or_default(),
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            star_budget: limits.budgets.candidate_budget,
+        })
+    }
+
+    /// The target a single-target mode is about: the one named, or the only
+    /// one the config declares.
+    fn one_target(target: Option<String>, names: &[&str]) -> Result<Option<String>, Problem> {
+        match (target, names) {
+            (Some(target), _) => Ok(Some(target)),
+            (None, [only]) => Ok(Some((*only).to_owned())),
+            (None, _) => Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "target is required when the config declares more than one; it declares {}",
+                    names
+                        .iter()
+                        .map(|name| format!("{name:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )),
+        }
+    }
+
+    /// The targets this request renders, as indexes into the resolved config.
+    pub fn target_indexes(&self) -> Vec<usize> {
+        match &self.target {
+            Some(name) => self
+                .resolved
+                .targets
+                .iter()
+                .position(|target| target.name == *name)
+                .into_iter()
+                .collect(),
+            None => (0..self.resolved.targets.len()).collect(),
+        }
+    }
+
+    /// Roots this request asked to render.
+    fn requested_roots(&self) -> u64 {
+        match &self.mode {
+            VerbalizeMode::Iris(iris) => iris.len() as u64,
+            VerbalizeMode::Sample => u64::from(self.n),
+            VerbalizeMode::Plan => u64::from(self.n) * self.target_indexes().len() as u64,
+        }
+    }
+}
+
+impl GetRequest for Verbalize {
+    fn normalize_params(params: &Params) -> Params {
+        params.without_empty(&["target", "iri", "n", "seed", "plan"])
+    }
+
+    fn work_class(&self) -> WorkClass {
+        WorkClass::Heavy
+    }
+}
+
+impl ObservedRequest for Verbalize {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Verbalize {
+            mode: self.mode.as_str(),
+            targets: self.resolved.targets.len() as u64,
+            roots: self.requested_roots(),
+        }
     }
 }
 
@@ -2987,6 +3345,7 @@ const VOID: &str = "void";
 const SUMMARY: &str = "summary";
 const SEARCH: &str = "search";
 const LABELS: &str = "labels";
+const VERBALIZE: &str = "verbalize";
 
 /// Refuse anything `operation` does not take.
 fn accept_only(params: &Params, operation: &str, accepted: &[&str]) -> Result<(), Problem> {
