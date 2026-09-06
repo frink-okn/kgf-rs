@@ -29,7 +29,9 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Request, State};
-use axum::http::header::{ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_TYPE, LOCATION, RETRY_AFTER, VARY};
+use axum::http::header::{
+    ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, LOCATION, RETRY_AFTER, VARY,
+};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -39,6 +41,9 @@ use headers::{ETag, HeaderMapExt, Host, IfNoneMatch};
 use kgf_store::Capability;
 use kgf_store::catalog::BundleId;
 use mediatype::{MediaTypeBuf, names};
+use tower_http::CompressionLevel;
+use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::SizeAbove;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -157,6 +162,28 @@ pub fn router(service: Arc<Service>) -> Router {
             Arc::clone(&service),
             crate::access::record_request,
         ))
+        // Compression sits *outside* access logging on purpose, so `bytes_out`
+        // keeps meaning the entity's size rather than the wire's. That is the
+        // number the published response caps bound and the one earlier records
+        // are comparable with; a client that does not negotiate `gzip` receives
+        // exactly those bytes. Outside `render_problems` is also required:
+        // that layer `insert`s `Vary: Accept`, and compression only *appends*
+        // `accept-encoding`, so the reverse order would drop it.
+        //
+        // Fastest, not the default: on a real fragment response level 1 is
+        // 11.3x for ~0.03 ms, where level 6 buys 13.0x for ~0.06 ms. At
+        // roughly 1% of a request's service time the cheap setting is the one
+        // that stays free even when the server is CPU-bound. `SizeAbove`
+        // raises tower-http's 32-byte floor: below about a kilobyte the
+        // framing costs more than the saving.
+        .layer(
+            CompressionLayer::new()
+                .quality(CompressionLevel::Fastest)
+                .compress_when(SizeAbove::new(1024)),
+        )
+        // Outermost, because it must observe the `Content-Encoding` the layer
+        // below may have added.
+        .layer(middleware::from_fn(weaken_etag_when_encoded))
         .with_state(service)
 }
 
@@ -1772,6 +1799,51 @@ impl IntoResponse for Problem {
         response.extensions_mut().insert(self);
         response
     }
+}
+
+/// Mark a compressed response's validator weak.
+///
+/// `ETag`s here are strong by construction: `representation::etag` mixes the
+/// negotiated representation into the tag precisely because RFC 9110 §8.8.3
+/// makes each representation its own entity. A content coding is part of that
+/// same identity, so a gzip body carrying the identity body's strong tag is the
+/// one place this server would claim byte-for-byte equality it does not have —
+/// and a cache holding the encoded bytes could then answer an
+/// `Accept-Encoding: identity` revalidation with them.
+///
+/// Weakening rather than re-tagging is what keeps revalidation working:
+/// `If-None-Match` is defined to use the weak comparison function (RFC 9110
+/// §13.1.2, and `headers::IfNoneMatch::precondition_passes` implements it), so
+/// `W/"…"` still matches the strong tag a handler recomputes. A fresh tag would
+/// not — the handler cannot know whether the layer above it will compress.
+///
+/// A 304 carries no body and so no `Content-Encoding`, and is left alone.
+async fn weaken_etag_when_encoded(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let encoded = response
+        .headers()
+        .get(CONTENT_ENCODING)
+        .is_some_and(|coding| !coding.as_bytes().eq_ignore_ascii_case(b"identity"));
+    if !encoded {
+        return response;
+    }
+    // Only a strong tag needs weakening, and only a well-formed one is touched:
+    // anything else is left exactly as the handler set it.
+    let weakened = response.headers().get(ETAG).and_then(|tag| {
+        let bytes = tag.as_bytes();
+        (bytes.first() == Some(&b'"')).then(|| {
+            let mut value = Vec::with_capacity(bytes.len() + 2);
+            value.extend_from_slice(b"W/");
+            value.extend_from_slice(bytes);
+            value
+        })
+    });
+    if let Some(value) = weakened
+        && let Ok(value) = HeaderValue::from_bytes(&value)
+    {
+        response.headers_mut().insert(ETAG, value);
+    }
+    response
 }
 
 /// Render every error response in the client's representation, with a code.
