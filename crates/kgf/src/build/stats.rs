@@ -120,11 +120,16 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
             OsString::from(dataset_iri),
             OsString::from("--output"),
             void_nt.as_os_str().to_owned(),
-            // Dataset-level property partitions carry exact distinct subject and
-            // object counts; the object side reads `data.hdt.perm`, which every
-            // bundle publishes.
+            // Every partition carries exact distinct subject and object counts,
+            // the class-level ones included: `distinct_subjects` on a
+            // (class, predicate) row is what makes coverage ("59 of 60 sites
+            // have a postal code") and per-subject fanout readable off
+            // `/schema`, which is what authoring an embedding config needs
+            // first. The object side reads `data.hdt.perm`, which every bundle
+            // publishes. The trackers cost a few words per emitted partition,
+            // outside hdtc's memory limit but small beside the analysis index.
             OsString::from("--partition-distinct-counts"),
-            OsString::from("dataset-properties"),
+            OsString::from("all"),
         ],
     })?;
 
