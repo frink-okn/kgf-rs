@@ -5527,13 +5527,21 @@ impl SchemaNavigationAnswer {
             .iter()
             .map(|item| schema_resource_cell(&self.target, item, self.labels.as_ref()))
             .collect();
-        let rows: Vec<Vec<Value<'_>>> = self
-            .items
-            .as_deref()
-            .unwrap_or_default()
+        let items = self.items.as_deref().unwrap_or_default();
+        let per_subject: Vec<Option<String>> = items
+            .iter()
+            .map(|item| {
+                per_subject(
+                    item.counts.triples,
+                    item.counts.distinct_subjects.or(item.counts.entities),
+                )
+            })
+            .collect();
+        let rows: Vec<Vec<Value<'_>>> = items
             .iter()
             .zip(&item_terms)
-            .map(|(item, term)| {
+            .zip(&per_subject)
+            .map(|((item, term), per_subject)| {
                 vec![
                     Value::Text(item.kind),
                     term.value(),
@@ -5541,6 +5549,7 @@ impl SchemaNavigationAnswer {
                     optional_number(item.counts.triples),
                     optional_number(item.counts.distinct_subjects),
                     optional_number(item.counts.distinct_objects),
+                    per_subject.as_deref().map_or(Value::Absent, Value::Text),
                     optional_number(item.counts.properties),
                 ]
             })
@@ -5648,7 +5657,7 @@ impl SchemaNavigationAnswer {
                             (note("No child items."))
                         } @else {
                             (results_table(
-                                &["kind", "term", "entities", "triples", "distinct subjects", "distinct objects", "properties"],
+                                &["kind", "term", "entities", "triples", "distinct subjects", "distinct objects", "per subject", "properties"],
                                 &rows,
                             ))
                         }
@@ -5845,11 +5854,17 @@ impl SchemaClassPropertiesAnswer {
             .items
             .iter()
             .any(|item| item.distinct_subjects.is_some() || item.distinct_objects.is_some());
+        let per_subject: Vec<Option<String>> = self
+            .items
+            .iter()
+            .map(|item| per_subject(Some(item.triples), item.distinct_subjects))
+            .collect();
         let rows: Vec<Vec<Value<'_>>> = self
             .items
             .iter()
             .zip(&terms)
-            .map(|(item, terms)| {
+            .zip(&per_subject)
+            .map(|((item, terms), per_subject)| {
                 let mut row = vec![
                     terms[0].value(),
                     terms[1].value(),
@@ -5858,6 +5873,7 @@ impl SchemaClassPropertiesAnswer {
                 if has_distinct {
                     row.push(optional_number(item.distinct_subjects));
                     row.push(optional_number(item.distinct_objects));
+                    row.push(per_subject.as_deref().map_or(Value::Absent, Value::Text));
                 }
                 row
             })
@@ -5890,7 +5906,7 @@ impl SchemaClassPropertiesAnswer {
                         (note("No matching class properties."))
                     } @else if has_distinct {
                         (results_table(
-                            &["class", "property", "triples", "distinct subjects", "distinct objects"],
+                            &["class", "property", "triples", "distinct subjects", "distinct objects", "per subject"],
                             &rows,
                         ))
                     } @else {
@@ -5912,6 +5928,18 @@ impl SchemaClassPropertiesAnswer {
 
 fn optional_number(number: Option<u64>) -> Value<'static> {
     number.map_or(Value::Absent, Value::Number)
+}
+
+/// Triples per subject, the fanout a page reader wants first: how many values
+/// of this predicate a member of the class carries. Derived here for the page
+/// only; the JSON keeps the two counts it comes from.
+fn per_subject(triples: Option<u64>, subjects: Option<u64>) -> Option<String> {
+    match (triples, subjects) {
+        (Some(triples), Some(subjects)) if subjects > 0 => {
+            Some(format!("{:.1}", triples as f64 / subjects as f64))
+        }
+        _ => None,
+    }
 }
 
 fn schema_resource_cell<'a>(
