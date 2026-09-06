@@ -12,13 +12,26 @@
 # published. A version whose marker already exists is skipped: published
 # versions are immutable, so a rebuild is a new version, never a re-upload.
 #
-# --restart bounces the server afterwards so it fetches and lists the new
-# versions. Uses your own gcloud and kubectl credentials.
+# --restart waits for the server's sync sidecar to mirror exactly the versions
+# this run published, and only then bounces the server so it scans them into its
+# catalog. The wait belongs here rather than in the pod: nothing else in the
+# system knows which versions were just published, so nothing else can wait for
+# the right thing. Restarting first would put the server in front of a fetch it
+# cannot see the end of, which is the outage this pod shape removed. Bouncing
+# mid-fetch would also discard the sidecar's in-flight staging directory and
+# make it start that version over.
+#
+# Uses your own gcloud and kubectl credentials.
 set -eu
 
 BUCKET=${KGF_BUCKET:-gs://frink-kgf-bundles}
 NAMESPACE=${KGF_NAMESPACE:-frink}
 DEPLOYMENT=${KGF_DEPLOYMENT:-frink-kgf-server}
+BUNDLE_ROOT=${KGF_BUNDLE_ROOT:-/bundles}
+# Long enough for the largest bundle at the sidecar's deliberately modest
+# transfer rate; a publish that exceeds it is reported, not restarted.
+WAIT_TIMEOUT=${KGF_WAIT_TIMEOUT:-5400}
+WAIT_INTERVAL=${KGF_WAIT_INTERVAL:-15}
 
 restart=0
 dry=0
@@ -38,6 +51,7 @@ run() {
 }
 
 published=0
+pending=""
 for dir in "$@"; do
   dir=${dir%/}
   if [ ! -f "$dir/manifest.json" ]; then
@@ -70,10 +84,49 @@ for dir in "$@"; do
     echo "$version" | gcloud storage cp - "$marker"
   fi
   published=$((published + 1))
+  pending="$pending $dataset/$version"
 done
 
 echo "published $published version(s) to $BUCKET"
-if [ "$restart" = 1 ] && [ "$published" -gt 0 ]; then
-  run kubectl -n "$NAMESPACE" rollout restart "deploy/$DEPLOYMENT"
-  run kubectl -n "$NAMESPACE" rollout status "deploy/$DEPLOYMENT"
+
+[ "$restart" = 1 ] && [ "$published" -gt 0 ] || exit 0
+
+if [ "$dry" = 1 ]; then
+  echo "+ wait for$pending under $BUNDLE_ROOT, then restart deploy/$DEPLOYMENT"
+  exit 0
 fi
+
+# The sidecar renames each version into place only once its copy has completed,
+# so the directory existing is the whole test: there is no partially populated
+# state to mistake for a finished one.
+on_disk() {
+  kubectl -n "$NAMESPACE" exec "deploy/$DEPLOYMENT" -c sync -- \
+    test -d "$BUNDLE_ROOT/$1" >/dev/null 2>&1
+}
+
+echo "waiting for the sync sidecar to mirror$pending"
+waited=0
+while [ -n "${pending# }" ]; do
+  remaining=""
+  for pair in $pending; do
+    if on_disk "$pair"; then
+      echo "  $pair: on disk"
+    else
+      remaining="$remaining $pair"
+    fi
+  done
+  pending=$remaining
+  [ -n "${pending# }" ] || break
+
+  if [ "$waited" -ge "$WAIT_TIMEOUT" ]; then
+    echo "still missing after ${WAIT_TIMEOUT}s:$pending" >&2
+    echo "not restarting; check: kubectl -n $NAMESPACE logs deploy/$DEPLOYMENT -c sync" >&2
+    exit 1
+  fi
+  sleep "$WAIT_INTERVAL"
+  waited=$((waited + WAIT_INTERVAL))
+done
+
+echo "all published versions are on disk; restarting to adopt them"
+kubectl -n "$NAMESPACE" rollout restart "deploy/$DEPLOYMENT"
+kubectl -n "$NAMESPACE" rollout status "deploy/$DEPLOYMENT"

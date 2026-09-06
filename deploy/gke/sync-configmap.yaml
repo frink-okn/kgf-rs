@@ -1,6 +1,16 @@
-# The script the Deployment's init container runs before the server starts.
-# Kept in a ConfigMap rather than inline so it can be read, diffed, and later
-# lifted verbatim into the sync Job kace submits.
+# The scripts the Deployment's sync sidecar runs.
+#
+# `sync.sh` is one idempotent pass: everything published that is not on disk
+# yet is fetched, and nothing else is touched. `sync-loop.sh` runs that pass
+# forever. They are separate on purpose — the pass is `set -eu` and exits
+# non-zero on the first problem, which is the right behaviour for a script an
+# operator runs by hand or a Job invokes once, while the loop must survive a
+# failed pass rather than take the server's pod down with it. Keeping the pass
+# a standalone program also means each run is a fresh shell, so `set -e` still
+# aborts the pass it belongs to.
+#
+# Kept in a ConfigMap rather than inline so both can be read, diffed, and later
+# lifted verbatim into whatever kace submits.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -9,9 +19,36 @@ metadata:
   labels:
     app: frink-kgf-server
 data:
+  sync-loop.sh: |
+    #!/bin/sh
+    # Run sync.sh forever, one pass at a time, SYNC_INTERVAL seconds apart.
+    #
+    # A failed pass is a log line and a retry, never an exit: this container
+    # shares a pod with the server, and a syncer that dies on a transient bucket
+    # error would put the whole pod into CrashLoopBackOff and take the API down
+    # to fix a problem that only ever delays new bundles. Nothing here is on the
+    # serving path — the server reads the bundle root it scanned at startup and
+    # cannot see anything this fetches until it is restarted.
+    set -u
+
+    : "${SYNC_INTERVAL:=300}"
+
+    # `sleep` as a background child that is then waited on, rather than in the
+    # foreground: a foreground `sleep` swallows SIGTERM until it finishes, which
+    # would stall pod shutdown for up to the interval. `wait` is interruptible,
+    # so the trap fires immediately.
+    trap 'echo "sync loop: stopping"; exit 0' INT TERM
+
+    echo "sync loop: every ${SYNC_INTERVAL}s"
+    while true; do
+      /bin/sh /opt/kgf/sync.sh \
+        || echo "sync loop: pass failed (exit $?); retrying in ${SYNC_INTERVAL}s" >&2
+      sleep "$SYNC_INTERVAL" &
+      wait $!
+    done
   sync.sh: |
     #!/bin/sh
-    # Mirror published bundles from the bucket into the bundle root.
+    # Mirror published bundles from the bucket into the bundle root. One pass.
     #
     # Layout, identical on both sides:
     #   {dataset}/{version}/...        the bundle
@@ -24,13 +61,47 @@ data:
     # non-dot directory under the root as a released version. Versions already
     # present are never touched: a published version is immutable, so there is
     # nothing to refresh.
+    #
+    # This runs while the server is serving. That is sound because the server
+    # fixes its catalog when it scans the root at startup and never rescans, so
+    # a version landing here is invisible until the next restart — there is no
+    # window in which a half-copied bundle can be listed or opened. Adding
+    # version directories under a live bundle root is the one mutation the
+    # server's mapping invariant permits; modifying or truncating a version
+    # already on disk is not, which is why an existing version is skipped rather
+    # than refreshed.
     set -eu
 
     : "${BUCKET:?BUCKET is required}"
     : "${BUCKET_ENDPOINT:=https://storage.googleapis.com}"
     : "${BUNDLE_ROOT:=/bundles}"
 
-    s5() { /s5cmd --endpoint-url "$BUCKET_ENDPOINT" "$@"; }
+    # Transfer shape, and the memory bound that follows from it. s5cmd buffers
+    # up to CONCURRENCY * PART_SIZE_MIB per object in flight and dispatches up
+    # to NUMWORKERS objects at once, so the worst case is their product:
+    # 4 * 2 * 8 MiB = 64 MiB of buffers. s5cmd's own defaults (256 workers, 5
+    # parts, 50 MiB) bound that at 64 GiB, which is not a bound at all — a
+    # bundle holds a handful of objects over the part size, and a few of those
+    # landing in the pool together is enough to exceed any container limit worth
+    # paying for. Raise these together with the container's memory request, and
+    # keep the product well under it.
+    #
+    # Throughput is deliberately not the thing being maximized. Nothing waits
+    # for this pass, and the same bytes compete for page cache and disk IOPS
+    # with the server mapping bundles beside it, so a slower sync is a cheaper
+    # and less disruptive one.
+    : "${NUMWORKERS:=4}"
+    : "${CONCURRENCY:=2}"
+    : "${PART_SIZE_MIB:=8}"
+
+    # Free space to leave unused after a fetch. The bundle root is a cache of
+    # the bucket, but it is also the thing the server is mapping: filling it
+    # breaks the next fetch rather than the current answers, and leaves a
+    # staging directory to clean up. Refusing a version that does not
+    # comfortably fit turns that into a log line.
+    : "${HEADROOM_MIB:=10240}"
+
+    s5() { /s5cmd --endpoint-url "$BUCKET_ENDPOINT" --numworkers "$NUMWORKERS" "$@"; }
 
     # `s5cmd ls` prints prefixes as "DIR name/" and objects as "date time size
     # name"; the name is the last field either way.
@@ -39,7 +110,7 @@ data:
     # `s5cmd ls` exits 1 for an empty prefix ("no object found") exactly as it
     # does for a real failure, so the two are told apart by the message. An
     # empty bucket is a normal first start; a bad credential or bucket name must
-    # fail the pod rather than look like one.
+    # fail the pass rather than look like one.
     listing() {
       out=$(s5 ls "$1" 2>&1) && { printf '%s\n' "$out"; return 0; }
       case $out in
@@ -48,11 +119,25 @@ data:
       esac
     }
 
+    # Sizes are compared in MiB rather than bytes so the arithmetic stays in
+    # range on any shell: a bundle root is O(10^5) MiB and O(10^11) bytes.
+    # Both helpers print nothing if they cannot measure, and the caller then
+    # skips the check rather than guessing.
+    available_mib() {
+      df -Pk "$1" 2>/dev/null | awk 'NR==2 {printf "%d", $4 / 1024}'
+    }
+
+    # `s5cmd du` prints "<bytes> bytes in <n> objects: <url>".
+    remote_mib() {
+      s5 du "$1" 2>/dev/null | awk 'NR==1 {printf "%d", $1 / 1048576}'
+    }
+
     mkdir -p "$BUNDLE_ROOT"
 
     top=$(listing "s3://$BUCKET/") || exit 1
 
     fetched=0
+    skipped=0
     for ds_dir in $(printf '%s\n' "$top" | names | grep '/$' || true); do
       ds=${ds_dir%/}
       inner=$(listing "s3://$BUCKET/$ds/") || exit 1
@@ -60,17 +145,34 @@ data:
         ver=${marker%.complete}
         dest="$BUNDLE_ROOT/$ds/$ver"
         [ -d "$dest" ] && continue
+
+        need=$(remote_mib "s3://$BUCKET/$ds/$ver/*")
+        have=$(available_mib "$BUNDLE_ROOT")
+        if [ -n "$need" ] && [ -n "$have" ] && [ "$have" -lt $((need + HEADROOM_MIB)) ]; then
+          echo "skipping $ds/$ver: needs ${need} MiB plus ${HEADROOM_MIB} MiB headroom, ${have} MiB free" >&2
+          skipped=$((skipped + 1))
+          continue
+        fi
+
         stage="$BUNDLE_ROOT/$ds/.$ver.incoming"
         rm -rf "$stage"
         mkdir -p "$stage"
-        echo "fetching $ds/$ver"
-        s5 cp "s3://$BUCKET/$ds/$ver/*" "$stage/"
+        echo "fetching $ds/$ver (${need:-?} MiB)"
+        s5 cp -c "$CONCURRENCY" -p "$PART_SIZE_MIB" "s3://$BUCKET/$ds/$ver/*" "$stage/"
         mv "$stage" "$dest"
         fetched=$((fetched + 1))
+        echo "fetched $ds/$ver"
       done
     done
 
-    echo "fetched $fetched new version(s); bundle root now holds:"
+    # The inventory is worth printing when it changed and noise when it did not,
+    # because this pass repeats forever.
+    if [ "$fetched" = 0 ] && [ "$skipped" = 0 ]; then
+      echo "no new versions; $(available_mib "$BUNDLE_ROOT") MiB free"
+      exit 0
+    fi
+
+    echo "fetched $fetched new version(s), skipped $skipped; bundle root now holds:"
     for d in "$BUNDLE_ROOT"/*/; do
       [ -d "$d" ] || continue
       printf '  %s: ' "$(basename "$d")"
