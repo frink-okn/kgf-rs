@@ -1,5 +1,10 @@
 # The gateway's own health check, attached to the Service. It probes the pod
-# port directly, so this is 8080 and / as the pod sees them, not /kgf.
+# port directly, so this is 8080 and /healthz as the pod sees them, not /kgf.
+#
+# /healthz rather than /: it opens no bundle, and the server does not write an
+# access record for an uneventful probe. Several probers each poll at
+# checkIntervalSec, so this is the largest single source of requests the
+# deployment sees.
 apiVersion: networking.gke.io/v1
 kind: HealthCheckPolicy
 metadata:
@@ -17,7 +22,7 @@ spec:
       type: HTTP
       httpHealthCheck:
         port: 8080
-        requestPath: /
+        requestPath: /healthz
   targetRef:
     group: ""
     kind: Service

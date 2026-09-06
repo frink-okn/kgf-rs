@@ -38,6 +38,15 @@ const TEXT_LIMIT: usize = 200;
 /// Records the writer thread may fall behind by before new ones are dropped.
 const QUEUE_CAPACITY: usize = 4096;
 
+/// How long a health probe may take and still count as uneventful.
+///
+/// The probe handler does no I/O and touches no bundle, so its own work is
+/// unmeasurable; everything in this budget is the stack around it. Exceeding it
+/// means the runtime could not schedule a trivial handler promptly — thread
+/// starvation, or a process stalled on page faults elsewhere — which is the
+/// condition a probe exists to surface, so a slow one is recorded.
+const PROBE_QUIET: Duration = Duration::from_millis(100);
+
 /// One structured record emitted for one HTTP request.
 ///
 /// Optional fields serialize as `null`. The raw-tier fields — `user_agent`,
@@ -774,8 +783,10 @@ impl InFlight {
         );
         if let Some((sink, pending)) = self.recording.take() {
             let outcome = Outcome::of(&mut response);
-            let request_id = std::mem::take(&mut self.request_id);
-            sink.record(&pending.record(request_id, Some(outcome)));
+            if !pending.is_uneventful_probe(&outcome) {
+                let request_id = std::mem::take(&mut self.request_id);
+                sink.record(&pending.record(request_id, Some(outcome)));
+            }
         }
         response
     }
@@ -810,6 +821,31 @@ impl Outcome {
 }
 
 impl Pending {
+    /// Whether this request was a health probe that went exactly as it should.
+    ///
+    /// Kubelet and the load balancer between them probe several times a
+    /// second, forever, and a successful probe carries nothing this log exists
+    /// to collect: no dataset, no operation, no shape, no representation. Left
+    /// in, they are effectively all of the log on a quiet service, and the real
+    /// requests are unfindable.
+    ///
+    /// The route is matched rather than the User-Agent. Sniffing `kube-probe/`
+    /// and `GoogleHC/` would be a guess about a header any client can send, and
+    /// getting it wrong hides real traffic; a dedicated path is what the probe
+    /// was pointed at, so this is exact.
+    ///
+    /// Only the uneventful ones are dropped. A non-200 is recorded, and so is a
+    /// success too slow to be plausible ([`PROBE_QUIET`]) — those are the
+    /// probes worth having. So is one abandoned before a response: that never
+    /// reaches here, because `Drop` emits it. The census argument for recording
+    /// abandoned requests does not apply either way, since a probe admits no
+    /// bundle work that outlives it.
+    fn is_uneventful_probe(&self, outcome: &Outcome) -> bool {
+        self.route.as_deref() == Some(crate::routes::HEALTH_PATH)
+            && outcome.status == 200
+            && self.started.elapsed() < PROBE_QUIET
+    }
+
     /// The record for a response, or for a request abandoned without one.
     fn record(self, request_id: String, outcome: Option<Outcome>) -> AccessRecord {
         let (status, code, problem_representation, bytes_out, observation) = match outcome {
@@ -1062,6 +1098,68 @@ mod tests {
         assert_ne!(one.pseudonym("192.0.2.8"), two.pseudonym("192.0.2.8"));
         assert_eq!(one.pseudonym("192.0.2.8").len(), 16);
         assert_ne!(one.request_id(), two.request_id());
+    }
+
+    fn probe(route: &str, started: Instant) -> Pending {
+        Pending {
+            started,
+            method: "GET".to_owned(),
+            route: Some(route.to_owned()),
+            target: None,
+            user_agent: None,
+            client_request_id: None,
+            client_class: ClientClass::Unknown,
+            client_hash: None,
+            forwarded_hash: None,
+            waiting: 0,
+        }
+    }
+
+    fn answered(status: u16) -> Outcome {
+        Outcome {
+            status,
+            code: None,
+            representation: None,
+            bytes_out: Some(3),
+            observation: Observation::default(),
+        }
+    }
+
+    #[test]
+    fn only_an_uneventful_health_probe_goes_unrecorded() {
+        let now = Instant::now();
+        let slow = now.checked_sub(PROBE_QUIET * 2).unwrap();
+
+        // The one case worth dropping: the probe that says nothing happened.
+        assert!(probe(crate::routes::HEALTH_PATH, now).is_uneventful_probe(&answered(200)));
+
+        // A probe that failed is the whole point of having probes.
+        for status in [500, 503, 429, 404] {
+            assert!(
+                !probe(crate::routes::HEALTH_PATH, now).is_uneventful_probe(&answered(status)),
+                "{status}"
+            );
+        }
+
+        // A success this slow means the runtime could not schedule a handler
+        // that does no work, which is a finding rather than noise.
+        assert!(!probe(crate::routes::HEALTH_PATH, slow).is_uneventful_probe(&answered(200)));
+
+        // Nothing else is ever dropped, however quiet. The route is matched, so
+        // no client can hide by claiming to be a prober.
+        for route in ["/", "/{dataset}", "/{dataset}/v/{version}/fragment"] {
+            assert!(
+                !probe(route, now).is_uneventful_probe(&answered(200)),
+                "{route}"
+            );
+        }
+        assert!(
+            !Pending {
+                route: None,
+                ..probe("/", now)
+            }
+            .is_uneventful_probe(&answered(200))
+        );
     }
 
     #[test]

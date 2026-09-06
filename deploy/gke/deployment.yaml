@@ -66,8 +66,14 @@ spec:
           ports:
             - name: http
               containerPort: 8080
-          # `/` is the service descriptor and opens no bundle, so it is the
-          # probe for both kubelet and the gateway's HealthCheckPolicy.
+          # `/healthz` for both kubelet and the gateway's HealthCheckPolicy. It
+          # opens no bundle and is not part of the API, which is the point twice
+          # over: a failing probe means this process cannot answer rather than
+          # that some bundle is cold, and the server drops the access record for
+          # an uneventful one. Probing `/` instead put tens of thousands of
+          # identical descriptor records a day into the log and buried real
+          # traffic — and `/` is a resource clients fetch, so it could not be
+          # filtered without losing those too.
           #
           # Deliberately says nothing about the sync sidecar. Readiness is
           # "this process answers", not "the bundle root matches the bucket":
@@ -77,14 +83,14 @@ spec:
           # has, and the rest appear at the next restart.
           readinessProbe:
             httpGet:
-              path: /
+              path: /healthz
               port: http
             initialDelaySeconds: 2
             periodSeconds: 5
             failureThreshold: 6
           livenessProbe:
             httpGet:
-              path: /
+              path: /healthz
               port: http
             initialDelaySeconds: 10
             periodSeconds: 30

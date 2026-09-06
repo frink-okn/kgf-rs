@@ -1074,6 +1074,7 @@ dependencies = [
  "spargebra",
  "thiserror",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
 ]

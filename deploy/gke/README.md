@@ -17,7 +17,7 @@ already running.
 | `deployment.yaml` | Deployment `frink-kgf-server` | `kgf serve` and a `sync` sidecar that mirrors the bucket alongside it. |
 | `service.yaml` | Service `frink-kgf-service` | Port 80 to the pod's 8080. |
 | `httproute.yaml` | HTTPRoute `frink-kgf-route` | `apps.okn.us/kgf` with the prefix stripped. |
-| `healthcheckpolicy.yaml` | HealthCheckPolicy `frink-kgf-health-check` | The gateway probes `/` on 8080. |
+| `healthcheckpolicy.yaml` | HealthCheckPolicy `frink-kgf-health-check` | The gateway probes `/healthz` on 8080. |
 
 Outside this directory and created once by hand: the bucket
 `gs://frink-kgf-bundles` (us-east4, uniform access, no lifecycle rule), the
@@ -108,6 +108,12 @@ kubectl -n frink get httproute frink-kgf-route -o jsonpath='{.status.parents[0].
 curl -si -H 'Accept: application/json' https://apps.okn.us/kgf
 curl -si https://apps.okn.us/kgf/ | head -20
 ```
+
+The server's log is one JSON access record per response, and no longer one per
+health probe: kubelet and the gateway between them poll `/healthz` several times
+a second, and an uneventful probe is not recorded. A probe that failed, or that
+took long enough to suggest the process could not schedule trivial work, still
+is — so an empty probe log means healthy, not blind.
 
 The sync log is a pass every five minutes: `no new versions` when the bucket
 holds nothing the disk does not, and a `fetching`/`fetched` pair plus an

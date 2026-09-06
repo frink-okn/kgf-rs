@@ -57,6 +57,11 @@ pub const KEYSET_ROLES: &str = "subjects-only,objects-only,shared";
 /// into a dot-prefixed sibling of its output, and `Catalog::scan` walks
 /// `{root}/{dataset}/{version}` without knowing which directories are still
 /// being written.
+///
+/// Being the first path component is what makes a handful of names unusable:
+/// the server answers a few static routes directly under the root, and those
+/// win the match against `/{dataset}`. Such an id is refused here rather than
+/// diagnosed at serve time, because by then the bundle exists and is listed.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct DatasetId(String);
@@ -93,7 +98,20 @@ fn parse_path_component(kind: &str, value: &str) -> Result<String> {
 impl FromStr for DatasetId {
     type Err = anyhow::Error;
     fn from_str(value: &str) -> Result<Self> {
-        parse_path_component("dataset id", value).map(Self)
+        let value = parse_path_component("dataset id", value)?;
+        // The server mounts a few static routes directly under the root, and a
+        // static segment beats the `/{dataset}` wildcard whatever the
+        // registration order. A dataset spelling one of them would build,
+        // publish, and appear in the service descriptor while every URL for it
+        // answered something else entirely — a failure with nothing to report.
+        // Refusing the name here is the only place that cannot be reached
+        // around.
+        ensure!(
+            !kgf_server::routes::RESERVED_DATASET_IDS.contains(&value.as_str()),
+            "a dataset id may not be {value:?}; the server answers /{value} \
+             itself, which would leave the dataset published and unreachable"
+        );
+        Ok(Self(value))
     }
 }
 
@@ -1115,6 +1133,26 @@ mod tests {
         );
         assert!("..".parse::<DatasetId>().is_err());
         assert!("".parse::<DatasetId>().is_err());
+    }
+
+    /// A dataset whose id is a route the server already answers would build and
+    /// publish, appear in the service descriptor, and resolve to something else
+    /// at every one of its URLs.
+    #[test]
+    fn a_dataset_may_not_be_named_after_a_root_route() {
+        for reserved in kgf_server::routes::RESERVED_DATASET_IDS {
+            let refused = reserved.parse::<DatasetId>();
+            assert!(refused.is_err(), "{reserved}");
+            assert!(
+                refused.unwrap_err().to_string().contains(reserved),
+                "the message must name the id it refused"
+            );
+            // Only the first path component collides, so the same word is an
+            // ordinary version label under `/{dataset}/v/{version}`.
+            assert!(reserved.parse::<VersionLabel>().is_ok(), "{reserved}");
+        }
+        assert!("healthzz".parse::<DatasetId>().is_ok());
+        assert!("dreamkg".parse::<DatasetId>().is_ok());
     }
 
     #[test]

@@ -29,7 +29,7 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Request, State};
-use axum::http::header::{ACCEPT, ALLOW, CONTENT_TYPE, LOCATION, RETRY_AFTER, VARY};
+use axum::http::header::{ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_TYPE, LOCATION, RETRY_AFTER, VARY};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -54,6 +54,25 @@ use crate::service::{Release, Service};
 use crate::url::{self, Params};
 use crate::{Limits, PublicBase};
 
+/// The health probe's path.
+///
+/// Not a resource in the KGF URL space: it has no representation, no links,
+/// and no descriptor mentions it. It is here so that a probe has a target that
+/// opens no bundle and reads nothing, which is what makes a failing check mean
+/// "this process cannot answer" rather than "a bundle is cold".
+pub const HEALTH_PATH: &str = "/healthz";
+
+/// Dataset ids a build must refuse, because a route at the root already spells
+/// them.
+///
+/// `/{dataset}` is a wildcard directly under the root, so any static route
+/// beside it wins the match and shadows the dataset whose id is that same
+/// segment. The shadowed dataset would be published, listed in the service
+/// descriptor, and unreachable — a failure with no error to report. Enforcing
+/// the list where ids are parsed makes such a bundle impossible to build
+/// rather than merely broken to serve.
+pub const RESERVED_DATASET_IDS: &[&str] = &["healthz"];
+
 /// The KGF routes over a built service.
 pub fn router(service: Arc<Service>) -> Router {
     let body_limit =
@@ -61,6 +80,11 @@ pub fn router(service: Arc<Service>) -> Router {
 
     Router::new()
         .route("/", read(get(service_descriptor)))
+        // Before the dataset wildcard in reading order, though not in
+        // matching order: the router prefers a static segment to a
+        // parameter whatever the registration order, which is exactly why
+        // `healthz` is a reserved dataset id.
+        .route(HEALTH_PATH, read(get(health)))
         .route("/{dataset}", read(get(dataset_descriptor)))
         // Method-preserving by construction: `any` hands every method to the
         // same handler, which answers 307. A router that matched only
@@ -209,6 +233,35 @@ async fn no_such_route(
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
+
+/// Answer that this process is running and able to serve a request.
+///
+/// Deliberately trivial. It opens no bundle, consults no catalog, and
+/// allocates nothing beyond the response, so the only ways it can fail are the
+/// ones a probe is for: the listener is gone, or the runtime cannot schedule a
+/// handler. A probe pointed at a resource would instead report on whichever
+/// bundle that resource happens to touch.
+///
+/// It still sits inside every layer — CORS, the body limit, problem rendering,
+/// access recording — because a probe that bypassed the stack would not be
+/// testing the stack that serves requests.
+///
+/// `no-store` because a cached health check is not a health check; the gateway
+/// and any intermediary must ask the process every time.
+async fn health() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            ),
+            (CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        "ok\n",
+    )
+        .into_response()
+}
 
 async fn service_descriptor(
     State(service): State<Arc<Service>>,
@@ -1915,6 +1968,68 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_health_probe_is_answered_without_touching_a_bundle() {
+        let response = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(health());
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        // A cached probe reports on the cache, not the process.
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+    }
+
+    #[test]
+    fn a_static_root_route_wins_against_the_dataset_wildcard() {
+        // The reserved-id rule exists because of this precedence, and the
+        // precedence is the router's rather than ours. Registered wildcard
+        // first, so the test would fail if matching ever became order-sensitive
+        // instead of static-first.
+        use tower::ServiceExt as _;
+
+        let router: Router = Router::new()
+            .route("/{dataset}", get(|| async { "dataset" }))
+            .route(HEALTH_PATH, get(|| async { "health" }));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let answered = |path: &str| {
+            let response = runtime
+                .block_on(
+                    router
+                        .clone()
+                        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap()),
+                )
+                .unwrap();
+            runtime.block_on(async {
+                let bytes = axum::body::to_bytes(response.into_body(), 64)
+                    .await
+                    .unwrap();
+                String::from_utf8(bytes.to_vec()).unwrap()
+            })
+        };
+
+        assert_eq!(answered(HEALTH_PATH), "health");
+        assert_eq!(answered("/tox"), "dataset");
+    }
+
+    #[test]
+    fn every_static_root_route_is_refused_as_a_dataset_id() {
+        // The two lists are the same fact written twice; nothing else keeps
+        // them together.
+        assert_eq!(
+            HEALTH_PATH.strip_prefix('/'),
+            Some(RESERVED_DATASET_IDS[0]),
+            "the reserved list must name the route that shadows the wildcard"
+        );
+        assert_eq!(RESERVED_DATASET_IDS.len(), 1);
+    }
 
     #[test]
     fn the_query_method_is_a_method() {

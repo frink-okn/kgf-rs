@@ -2395,6 +2395,23 @@ following the code.
     dataset that is authoritative for a prefix the shared table already defines
     must repeat that binding in its own block.
 
+64. **The URL space has room beside it, and the room has to be reserved.** Probing a
+    resource conflates two failures — "this process cannot answer" and "this bundle is
+    cold" — and puts tens of thousands of identical records a day into the shape
+    census, which on a quiet service is substantially all of it. `/` was the probe
+    because it opens no bundle, but it is also a resource clients fetch, so it could
+    not be filtered without losing real traffic. A dedicated `/healthz` fixes both:
+    the probe reads nothing, and the exclusion matches the route rather than sniffing
+    a `User-Agent` any client can send. Two things follow that had to be written down
+    rather than assumed. Doc 03 §3.2's tree is the *client-facing* space, not the set
+    of paths a deployment answers — now stated there, along with the rule that an
+    operational endpoint at the root reserves the dataset id spelling it, since
+    `/{dataset}` is a wildcard a static segment always beats. And the reservation is
+    enforced where ids are parsed, in `kgf build`, because by serve time the bundle
+    exists and is listed. Doc 12 §12.1 gained the matching census rule: exclude
+    uneventful probes, keep the ones that failed or were slow, since those are the
+    findings a probe exists to produce.
+
 ## Not in this plan
 
 Remaining composed operations (ranges, star, key resolution), graph scoping, and
