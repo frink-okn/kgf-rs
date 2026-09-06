@@ -84,62 +84,52 @@ fn a_304_carries_the_encoding_metadata_its_200_would_have_carried() {
     let target = "/tox/v/v1/fragment?limit=100";
 
     // Compression is negotiated, so the resource varies on the coding and an
-    // encoded body must not claim the identity body's strong validator. The
-    // trap is the `304`: it has no body, so nothing downstream marks it, and
-    // deciding from the response alone answers a revalidation with metadata the
-    // `200` did not send. RFC 9110 §15.4.5 requires the two to agree, and a
-    // cache updating stored headers from a `304` (RFC 9111 §4.3.4) would
-    // otherwise drop the field keeping its stored encoded bytes away from a
-    // request that cannot decode them.
-    for (accept_encoding, weak) in [("gzip", true), ("identity", false)] {
-        let headers = [("accept-encoding", accept_encoding)];
-        let ok = server.request("GET", target, &headers);
+    // encoded body must not claim the identity body's strong validator. The trap
+    // is the `304`: it carries no body, so nothing marks it downstream, and
+    // RFC 9110 §15.4.5 still requires it to carry the `ETag` and `Vary` a `200`
+    // to the same request would have sent. A cache updating stored headers from
+    // that `304` (RFC 9111 §4.3.4) would otherwise drop the field keeping its
+    // stored encoded bytes from an `Accept-Encoding: identity` request.
+    //
+    // The spellings matter as much as the statuses. Anything that decided from
+    // the request would have to re-derive the compression layer's own
+    // negotiation, and these are the cases where a narrower reading diverges: a
+    // header split across field lines is one list, `x-gzip` is `gzip`, and a
+    // zero quality is a refusal. The rule here is unconditional, so every
+    // spelling has to come out the same.
+    let spellings: [(&str, &[(&str, &str)]); 6] = [
+        ("absent", &[]),
+        ("identity", &[("accept-encoding", "identity")]),
+        ("gzip", &[("accept-encoding", "gzip")]),
+        ("zero quality", &[("accept-encoding", "gzip;q=0")]),
+        ("x-gzip", &[("accept-encoding", "x-gzip")]),
+        (
+            "split field lines",
+            &[("accept-encoding", "deflate"), ("accept-encoding", "gzip")],
+        ),
+    ];
+
+    for (label, headers) in spellings {
+        let ok = server.request("GET", target, headers);
         ok.assert_status(200);
         let etag = ok.header("etag").expect("a versioned GET carries an ETag");
-        assert_eq!(
+        assert!(
             etag.starts_with("W/"),
-            weak,
-            "{accept_encoding} should{} weaken the validator, got {etag}",
-            if weak { "" } else { " not" }
+            "{label}: a negotiable representation carries a weak validator, got {etag}"
         );
-        assert_encoding_vary(&ok, accept_encoding);
+        assert_encoding_vary(&ok, label);
 
-        let conditional = server.request(
-            "GET",
-            target,
-            &[
-                ("accept-encoding", accept_encoding),
-                ("if-none-match", &etag),
-            ],
-        );
-        conditional.assert_status(304);
+        let mut conditional = headers.to_vec();
+        conditional.push(("if-none-match", etag.as_str()));
+        let revalidated = server.request("GET", target, &conditional);
+        revalidated.assert_status(304);
         assert_eq!(
-            conditional.header("etag").as_deref(),
+            revalidated.header("etag").as_deref(),
             Some(etag.as_str()),
-            "the 304 must carry the validator its 200 sent, for {accept_encoding}"
+            "{label}: the 304 must carry the validator its 200 sent"
         );
-        assert_encoding_vary(&conditional, accept_encoding);
+        assert_encoding_vary(&revalidated, label);
     }
-
-    // The validator tracks the request rather than what the client happens to
-    // hold, so a stored tag from one coding still revalidates under the other —
-    // `If-None-Match` compares weakly (RFC 9110 §13.1.2).
-    let strong = server
-        .request("GET", target, &[("accept-encoding", "identity")])
-        .header("etag")
-        .expect("an ETag");
-    let crossed = server.request(
-        "GET",
-        target,
-        &[("accept-encoding", "gzip"), ("if-none-match", &strong)],
-    );
-    crossed.assert_status(304);
-    assert!(
-        crossed
-            .header("etag")
-            .is_some_and(|tag| tag.starts_with("W/")),
-        "a gzip revalidation is answered with the weak tag its 200 would send"
-    );
 }
 
 #[track_caller]
