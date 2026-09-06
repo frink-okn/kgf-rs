@@ -77,6 +77,72 @@ const SUMMARY_CARD_JSON: &str = r#"{
 "#;
 
 #[test]
+fn a_304_carries_the_encoding_metadata_its_200_would_have_carried() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    let server = deployment.serve();
+    let target = "/tox/v/v1/fragment?limit=100";
+
+    // Compression is negotiated, so the resource varies on the coding and an
+    // encoded body must not claim the identity body's strong validator. The trap
+    // is the `304`: it carries no body, so nothing marks it downstream, and
+    // RFC 9110 §15.4.5 still requires it to carry the `ETag` and `Vary` a `200`
+    // to the same request would have sent. A cache updating stored headers from
+    // that `304` (RFC 9111 §4.3.4) would otherwise drop the field keeping its
+    // stored encoded bytes from an `Accept-Encoding: identity` request.
+    //
+    // The spellings matter as much as the statuses. Anything that decided from
+    // the request would have to re-derive the compression layer's own
+    // negotiation, and these are the cases where a narrower reading diverges: a
+    // header split across field lines is one list, `x-gzip` is `gzip`, and a
+    // zero quality is a refusal. The rule here is unconditional, so every
+    // spelling has to come out the same.
+    let spellings: [(&str, &[(&str, &str)]); 6] = [
+        ("absent", &[]),
+        ("identity", &[("accept-encoding", "identity")]),
+        ("gzip", &[("accept-encoding", "gzip")]),
+        ("zero quality", &[("accept-encoding", "gzip;q=0")]),
+        ("x-gzip", &[("accept-encoding", "x-gzip")]),
+        (
+            "split field lines",
+            &[("accept-encoding", "deflate"), ("accept-encoding", "gzip")],
+        ),
+    ];
+
+    for (label, headers) in spellings {
+        let ok = server.request("GET", target, headers);
+        ok.assert_status(200);
+        let etag = ok.header("etag").expect("a versioned GET carries an ETag");
+        assert!(
+            etag.starts_with("W/"),
+            "{label}: a negotiable representation carries a weak validator, got {etag}"
+        );
+        assert_encoding_vary(&ok, label);
+
+        let mut conditional = headers.to_vec();
+        conditional.push(("if-none-match", etag.as_str()));
+        let revalidated = server.request("GET", target, &conditional);
+        revalidated.assert_status(304);
+        assert_eq!(
+            revalidated.header("etag").as_deref(),
+            Some(etag.as_str()),
+            "{label}: the 304 must carry the validator its 200 sent"
+        );
+        assert_encoding_vary(&revalidated, label);
+    }
+}
+
+#[track_caller]
+fn assert_encoding_vary(response: &Response, context: &str) {
+    let vary = response.header("vary").unwrap_or_default();
+    assert!(
+        vary.split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("accept-encoding")),
+        "Vary must name accept-encoding for {context}, got {vary:?}"
+    );
+}
+
+#[test]
 fn the_url_space_answers_over_a_real_listener() {
     let deployment = Deployment::new();
     deployment.publish("tox", "2026-01-09", TINY_NT, "2026-01-09T09:00:00Z");

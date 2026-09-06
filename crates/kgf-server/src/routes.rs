@@ -29,7 +29,9 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Request, State};
-use axum::http::header::{ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_TYPE, LOCATION, RETRY_AFTER, VARY};
+use axum::http::header::{
+    ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_TYPE, ETAG, LOCATION, RETRY_AFTER, VARY,
+};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -39,6 +41,9 @@ use headers::{ETag, HeaderMapExt, Host, IfNoneMatch};
 use kgf_store::Capability;
 use kgf_store::catalog::BundleId;
 use mediatype::{MediaTypeBuf, names};
+use tower_http::CompressionLevel;
+use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::SizeAbove;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -157,6 +162,29 @@ pub fn router(service: Arc<Service>) -> Router {
             Arc::clone(&service),
             crate::access::record_request,
         ))
+        // Compression sits *outside* access logging on purpose, so `bytes_out`
+        // keeps meaning the entity's size rather than the wire's. That is the
+        // number the published response caps bound and the one earlier records
+        // are comparable with; a client that does not negotiate `gzip` receives
+        // exactly those bytes. Outside `render_problems` is also required:
+        // that layer `insert`s `Vary: Accept`, and compression only *appends*
+        // `accept-encoding`, so the reverse order would drop it.
+        //
+        // Fastest, not the default: on a real fragment response level 1 is
+        // 11.3x for ~0.03 ms, where level 6 buys 13.0x for ~0.06 ms. At
+        // roughly 1% of a request's service time the cheap setting is the one
+        // that stays free even when the server is CPU-bound. `SizeAbove`
+        // raises tower-http's 32-byte floor: below about a kilobyte the
+        // framing costs more than the saving.
+        .layer(
+            CompressionLayer::new()
+                .quality(CompressionLevel::Fastest)
+                .compress_when(SizeAbove::new(1024)),
+        )
+        // Outermost, because it must observe the `Content-Encoding` the layer
+        // below may have added — and must also reach the responses that layer
+        // never handles, a `304` in particular.
+        .layer(middleware::from_fn(mark_encoding_negotiated))
         .with_state(service)
 }
 
@@ -1771,6 +1799,77 @@ impl IntoResponse for Problem {
         }
         response.extensions_mut().insert(self);
         response
+    }
+}
+
+/// Give every response the encoding metadata a negotiated `200` would carry.
+///
+/// Two headers, and they have to agree across status codes. Compression is
+/// negotiated, so `Vary` must name `accept-encoding`; and an encoded body is not
+/// byte-identical to the identity body, so it must not claim the identity body's
+/// strong validator. `representation::etag` mixes the negotiated representation
+/// into the tag precisely because RFC 9110 §8.8.3 makes each representation its
+/// own entity, and a content coding is part of that same identity.
+///
+/// The hard case is the `304`. It carries no body, so nothing below it adds a
+/// `Content-Encoding` or a `Vary`, and RFC 9110 §15.4.5 still requires it to
+/// carry the `ETag` and `Vary` a `200` to the same request would have sent. A
+/// cache updating stored headers from a `304` (RFC 9111 §4.3.4) would otherwise
+/// drop the field keeping its stored encoded bytes away from a request that
+/// cannot decode them, and record a strong validator for bytes that do not
+/// deserve one.
+///
+/// So both are applied unconditionally rather than to the requests predicted to
+/// compress. Predicting means re-deriving the layer below's negotiation, and its
+/// parser is private to that crate: it reads every `Accept-Encoding` field line
+/// as one list, accepts `x-gzip` as `gzip`, and weighs qualities. Every drift
+/// between the two readings lands as a weak `200` answered by a strong `304` —
+/// the exact disagreement this exists to prevent, reachable by nothing worse
+/// than an unusual spelling. An unconditional rule cannot drift.
+///
+/// It costs a strong validator on identity responses, and that is free here.
+/// Strong validators are only required for `Range` and `If-Match`, and this
+/// server implements neither; `If-None-Match` compares weakly (RFC 9110
+/// §13.1.2), so revalidation is unaffected. A weak tag also states the truth
+/// that a shared one asserts: the encoded and identity bodies are semantically
+/// equivalent, not byte-identical. Adding `Range` support later would mean
+/// revisiting this.
+async fn mark_encoding_negotiated(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    declare_encoding_vary(response.headers_mut());
+    // Only a strong tag needs weakening, and only a well-formed one is touched:
+    // anything else is left exactly as the handler set it.
+    let weakened = response.headers().get(ETAG).and_then(|tag| {
+        let bytes = tag.as_bytes();
+        (bytes.first() == Some(&b'"')).then(|| {
+            let mut value = Vec::with_capacity(bytes.len() + 2);
+            value.extend_from_slice(b"W/");
+            value.extend_from_slice(bytes);
+            value
+        })
+    });
+    if let Some(value) = weakened
+        && let Ok(value) = HeaderValue::from_bytes(&value)
+    {
+        response.headers_mut().insert(ETAG, value);
+    }
+    response
+}
+
+/// Append `accept-encoding` to `Vary` unless it is already named.
+///
+/// The compression layer below adds it to the responses it handles; this covers
+/// the ones it never sees, a `304` above all. Appending rather than inserting
+/// keeps the `Accept` and CORS entries other layers contribute.
+fn declare_encoding_vary(headers: &mut HeaderMap) {
+    let already = headers.get_all(VARY).iter().any(|value| {
+        value
+            .as_bytes()
+            .split(|byte| *byte == b',')
+            .any(|field| field.trim_ascii().eq_ignore_ascii_case(b"accept-encoding"))
+    });
+    if !already {
+        headers.append(VARY, HeaderValue::from_static("accept-encoding"));
     }
 }
 
