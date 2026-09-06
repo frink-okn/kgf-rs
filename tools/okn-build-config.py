@@ -43,7 +43,7 @@ Only the endpoint is set here (`--lakefs-endpoint`).
 
     ./tools/okn-build-config.py dreamkg --build --lakefs \
         --hdt-root /var/kgf/hdt --out-root /var/kgf/bundles \
-        --registry-prefixes --builder-image ghcr.io/frink-okn/kgf:v0.1.1
+        --registry-prefixes --builder-image ghcr.io/frink-okn/kgf:v0.1.2
 
 With no --registry it reads the same URL kace does.
 """
@@ -496,7 +496,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--builder-image",
-        help="image reference to record in the manifest, e.g. ghcr.io/frink-okn/kgf:v0.1.1",
+        help="image reference to record in the manifest, e.g. ghcr.io/frink-okn/kgf:v0.1.2",
     )
     parser.add_argument(
         "--check",
