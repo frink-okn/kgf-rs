@@ -75,7 +75,7 @@ use crate::request::{
     ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter,
 };
 use crate::skolem::SkolemScope;
-use crate::term::{LiteralKind, PrefixMap, Term, TermCache};
+use crate::term::{DictionaryTermError, LiteralKind, PrefixMap, Term, TermCache, serialized_bytes};
 use crate::url::{self, Mount, Params};
 
 // ---------------------------------------------------------------------------
@@ -386,12 +386,134 @@ fn match_kind(kind: hdtc::format::MatchKind) -> &'static str {
     }
 }
 
+/// A bound parameter that matched nothing, and why.
+///
+/// Two very different situations produce the same empty answer, and only the
+/// server can tell them apart. "This bundle does not hold that term" is a fact
+/// about the data, remedied by asking a different bundle. "Blank-node syntax
+/// does not address anything here" is a fact about the API, remedied by sending
+/// the scoped IRI the response would have carried — and it is the one a client
+/// is most likely to hit by copying a term out of a browser page, where a blank
+/// node is shown as `_:{section}-{local-id}` for legibility.
+#[derive(Debug, Clone, Copy, Serialize)]
+struct AbsentTerm {
+    parameter: &'static str,
+    reason: AbsentReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AbsentReason {
+    /// A well-formed term whose spelling this bundle's dictionary does not hold.
+    NotInBundle,
+    /// Blank-node syntax, which addresses no term in any bundle by design.
+    BlankNode,
+}
+
+impl AbsentTerm {
+    fn new(parameter: &'static str, term: &BoundTerm) -> Self {
+        Self {
+            parameter,
+            reason: if term.denotes_blank_node() {
+                AbsentReason::BlankNode
+            } else {
+                AbsentReason::NotInBundle
+            },
+        }
+    }
+
+    /// The one sentence a browser page says about it.
+    fn explanation(&self) -> String {
+        match self.reason {
+            AbsentReason::NotInBundle => {
+                format!(
+                    "`{}` names a term this release does not hold",
+                    self.parameter
+                )
+            }
+            AbsentReason::BlankNode => format!(
+                "`{}` is written as a blank node, which addresses nothing here — \
+                 use the scoped IRI this API publishes for it",
+                self.parameter
+            ),
+        }
+    }
+}
+
+/// One term of a row, in both spellings the server needs.
+///
+/// They differ for exactly one term shape. A stored blank node is published as
+/// this bundle's scoped IRI, because a `_:` label means nothing outside the
+/// document it was parsed from — but label lookup still has to find the term in
+/// the dictionary, which knows it only by that label. Holding both is what lets
+/// the response name a node the way the API does while the page still labels it.
+#[derive(Debug, Clone)]
+struct RowTerm {
+    /// What a response carries, and what its byte accounting weighs.
+    published: Rc<str>,
+    /// The dictionary spelling, which `locate` matches and labels key on.
+    stored: Rc<str>,
+}
+
+/// Terms as this API publishes them, memoized for one request.
+///
+/// [`TermCache`] materializes and measures a term as the dictionary spells it.
+/// This adds the one substitution the wire makes, and memoizes that separately
+/// so a blank node repeated down a page is formatted and weighed once rather
+/// than once per row — the same reason the cache underneath it exists.
+struct PublishedTerms {
+    blank_nodes: SkolemScope,
+    published: HashMap<(Role, u64), (Rc<str>, u64)>,
+}
+
+impl PublishedTerms {
+    fn new(blank_nodes: SkolemScope) -> Self {
+        Self {
+            blank_nodes,
+            published: HashMap::new(),
+        }
+    }
+
+    /// The term's two spellings, and the bytes its published term object takes.
+    fn measured(
+        &mut self,
+        cache: &mut TermCache,
+        dictionary: &Dictionary<'_>,
+        role: Role,
+        id: TermId,
+    ) -> Result<(RowTerm, u64), DictionaryTermError> {
+        let (stored, serialized) = cache.measured(dictionary, role, id)?;
+        if let Some((published, serialized)) = self.published.get(&(role, id.0)) {
+            return Ok((
+                RowTerm {
+                    published: Rc::clone(published),
+                    stored,
+                },
+                *serialized,
+            ));
+        }
+        let Some(iri) = self.blank_nodes.iri(role, id, &stored) else {
+            return Ok((
+                RowTerm {
+                    published: Rc::clone(&stored),
+                    stored,
+                },
+                serialized,
+            ));
+        };
+        let published: Rc<str> = Rc::from(iri.as_str());
+        let serialized = serialized_bytes(&Term::Iri(Cow::Borrowed(published.as_ref())));
+        self.published
+            .insert((role, id.0), (Rc::clone(&published), serialized));
+        Ok((RowTerm { published, stored }, serialized))
+    }
+}
+
 /// One result row: a term per variable, and for `/describe` which side of the
 /// neighborhood it came from.
 #[derive(Debug, Clone)]
 pub struct Row {
-    cells: Vec<(Position, Rc<str>)>,
-    triple: IdTriple,
+    cells: Vec<(Position, RowTerm)>,
     binding: Option<u32>,
     direction: Option<Direction>,
     ranking: Option<Ranking>,
@@ -416,8 +538,8 @@ impl Serialize for Row {
         if let Some(binding) = self.binding {
             map.serialize_entry(BINDING, &binding)?;
         }
-        for (position, text) in &self.cells {
-            map.serialize_entry(position.as_str(), &Term::from_dictionary(text))?;
+        for (position, term) in &self.cells {
+            map.serialize_entry(position.as_str(), &Term::from_dictionary(&term.published))?;
         }
         if let Some(direction) = self.direction {
             map.serialize_entry(DIRECTION, &direction)?;
@@ -446,9 +568,8 @@ impl Row {
     /// directly above, which is why the two sit together and why
     /// `a_row_weighs_exactly_what_it_serializes` compares them for every shape.
     fn new(
-        cells: Vec<(Position, Rc<str>)>,
+        cells: Vec<(Position, RowTerm)>,
         terms: u64,
-        triple: IdTriple,
         binding: Option<u32>,
         direction: Option<Direction>,
         ranking: Option<Ranking>,
@@ -478,7 +599,6 @@ impl Row {
         }
         Self {
             cells,
-            triple,
             binding,
             direction,
             ranking,
@@ -576,7 +696,7 @@ pub struct Answer {
     /// them apart, so unusual but valid IRIs are accepted at the edge and
     /// reported here if absent.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    absent_terms: Vec<&'static str>,
+    absent_terms: Vec<AbsentTerm>,
     vars: Vec<Position>,
     rows: Vec<Row>,
     #[serde(skip)]
@@ -658,7 +778,10 @@ impl Renders for Answer {
             }
         }
         for row in &self.rows {
-            for (_, text) in &row.cells {
+            for (_, term) in &row.cells {
+                // The dictionary spelling: a published blank-node IRI is not a
+                // term this bundle holds, so it would never resolve a label.
+                let text = term.stored.as_ref();
                 if named(text) && seen.insert(text) {
                     wanted.push(text);
                 }
@@ -704,14 +827,27 @@ impl Renders for Answer {
         let mut cache = TermCache::new();
         let mut labels = HashMap::new();
         for text in wanted {
-            let Some(subject) = dictionary
-                .locate(Role::Subject, text.as_bytes())
-                .map_err(|error| unreadable("looking a term up", &error))?
-            else {
-                continue;
+            // A blank node reaches this in whichever spelling its position put
+            // on the page: a row cell carries the dictionary label, while a
+            // bound position carries the scoped IRI the request named it by.
+            // Both are the same node, so both must find the same label —
+            // otherwise a term is labelled when a row happens to carry it and
+            // bare when the request asked about it.
+            let subject = match reverse_scoped(&dictionary, &self.blank_nodes, Role::Subject, text)?
+            {
+                Some(id) => id,
+                None => {
+                    let Some(id) = dictionary
+                        .locate(Role::Subject, text.as_bytes())
+                        .map_err(|error| unreadable("looking a term up", &error))?
+                    else {
+                        continue;
+                    };
+                    id.0
+                }
             };
             if let Some(label) =
-                preferred_label(store, &dictionary, &mut cache, subject.0, &predicates)?
+                preferred_label(store, &dictionary, &mut cache, subject, &predicates)?
             {
                 labels.insert(text.to_owned(), label);
             }
@@ -879,19 +1015,15 @@ impl Answer {
                 cell(Position::Predicate).expect("every fragment row binds every triple position");
             let object =
                 cell(Position::Object).expect("every fragment row binds every triple position");
+            // No skolemization here: a row is materialized in its published
+            // spelling, so a data blank node is already the scoped IRI and
+            // these see a named node. That is what keeps the RDF and native
+            // representations naming one node the same way.
             let triple = Triple::new(
-                rdf_fragment_subject(
-                    subject.as_bytes(),
-                    TermId(row.triple.subject),
-                    &self.blank_nodes,
-                )?,
+                rdf_subject(subject.as_bytes())?,
                 NamedNode::new(predicate)
                     .map_err(|error| unreadable("parsing an RDF predicate IRI", &error))?,
-                rdf_fragment_object(
-                    object.as_bytes(),
-                    TermId(row.triple.object),
-                    &self.blank_nodes,
-                )?,
+                rdf_object(object.as_bytes())?,
             );
             if data.insert(triple.clone()) {
                 triples.push(triple);
@@ -1003,6 +1135,11 @@ impl Answer {
     }
 }
 
+/// The term an RDF fragment row carries at `position`, as published.
+///
+/// A bound position is not a row cell — JSON rows carry variables only — so it
+/// comes from the request, which named it in the one spelling that reaches a
+/// blank node: the scoped IRI. Everything else is the row's published spelling.
 fn rdf_fragment_cell<'a>(
     bound: Option<&'a BoundTerm>,
     row: &'a Row,
@@ -1011,7 +1148,7 @@ fn rdf_fragment_cell<'a>(
     bound.map(BoundTerm::dictionary).or_else(|| {
         row.cells
             .iter()
-            .find_map(|(found, value)| (*found == position).then_some(value.as_ref()))
+            .find_map(|(found, term)| (*found == position).then_some(term.published.as_ref()))
     })
 }
 
@@ -1086,7 +1223,7 @@ pub struct CountAnswer {
     pattern: Pattern,
     count: Cardinality,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    absent_terms: Vec<&'static str>,
+    absent_terms: Vec<AbsentTerm>,
     #[serde(flatten)]
     completeness: Completeness,
     #[serde(skip)]
@@ -1266,6 +1403,10 @@ pub struct SearchAnswer {
     completeness: Completeness,
     #[serde(skip)]
     target: Target,
+    /// Only the page needs this: a subject is already published scoped, and
+    /// HTML spells such a term `_:{section}-{local-id}` for its reader.
+    #[serde(skip)]
+    blank_nodes: SkolemScope,
 }
 
 impl Renders for SearchAnswer {
@@ -2521,20 +2662,6 @@ fn rdf_subject(term: &[u8]) -> Result<NamedOrBlankNode, Problem> {
         .map_err(|error| unreadable("parsing a VoID subject IRI", &error))
 }
 
-fn rdf_fragment_subject(
-    term: &[u8],
-    id: TermId,
-    blank_nodes: &SkolemScope,
-) -> Result<NamedOrBlankNode, Problem> {
-    let text = rdf_text(term)?;
-    if let Some(iri) = blank_nodes.iri(Role::Subject, id, text) {
-        return NamedNode::new(iri)
-            .map(Into::into)
-            .map_err(|error| unreadable("skolemizing an RDF blank-node subject", &error));
-    }
-    rdf_subject(term)
-}
-
 fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
     if let Some(literal) = parse_literal(term) {
         let value = rdf_text(literal.value)?.to_owned();
@@ -2559,20 +2686,6 @@ fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
     NamedNode::new(text)
         .map(Into::into)
         .map_err(|error| unreadable("parsing a VoID object IRI", &error))
-}
-
-fn rdf_fragment_object(
-    term: &[u8],
-    id: TermId,
-    blank_nodes: &SkolemScope,
-) -> Result<RdfTerm, Problem> {
-    let text = rdf_text(term)?;
-    if let Some(iri) = blank_nodes.iri(Role::Object, id, text) {
-        return NamedNode::new(iri)
-            .map(Into::into)
-            .map_err(|error| unreadable("skolemizing an RDF blank-node object", &error));
-    }
-    rdf_object(term)
 }
 
 fn rdf_text(bytes: &[u8]) -> Result<&str, Problem> {
@@ -3464,6 +3577,7 @@ pub fn search(
     request: &request::Search,
 ) -> Result<SearchAnswer, Problem> {
     let dictionary = store.dict();
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
     let searcher = searcher(store, &target)?;
     let found = searcher
         .search_up_to(
@@ -3485,6 +3599,7 @@ pub fn search(
     let mut results = Vec::with_capacity(request.limit as usize);
     let mut seen = HashSet::with_capacity(request.limit as usize);
     let mut cache = TermCache::new();
+    let mut published = PublishedTerms::new(blank_nodes.clone());
     let mut resolution_budget = request.candidates.0;
     let mut spent_bytes = 0u64;
     let mut resolution_exhausted = false;
@@ -3520,6 +3635,7 @@ pub fn search(
                     store,
                     &dictionary,
                     &mut cache,
+                    &mut published,
                     &mut seen,
                     &mut results,
                     &mut spent_bytes,
@@ -3566,6 +3682,7 @@ pub fn search(
                         store,
                         &dictionary,
                         &mut cache,
+                        &mut published,
                         &mut seen,
                         &mut results,
                         &mut spent_bytes,
@@ -3615,6 +3732,7 @@ pub fn search(
         results,
         completeness,
         target,
+        blank_nodes,
     })
 }
 
@@ -3623,6 +3741,7 @@ fn push_search_result(
     store: &Store,
     dictionary: &Dictionary<'_>,
     cache: &mut TermCache,
+    published: &mut PublishedTerms,
     seen: &mut HashSet<u64>,
     results: &mut Vec<SearchResult>,
     spent_bytes: &mut u64,
@@ -3636,8 +3755,12 @@ fn push_search_result(
         return Ok(false);
     }
 
-    let (subject, subject_serialized) = cache
-        .measured(dictionary, Role::Subject, TermId(triple.subject))
+    // Published, not stored: a text hit can land on a blank-node subject, and a
+    // result naming it `_:b1` would be a label no client could ask about and
+    // one that collides with every other graph's.
+    let (subject, subject_serialized) = published
+        .measured(cache, dictionary, Role::Subject, TermId(triple.subject))
+        .map(|(term, serialized)| (term.published, serialized))
         .map_err(|error| unreadable("materializing a search subject", &error))?;
     let predicate = cache
         .resolve(dictionary, Role::Predicate, TermId(triple.predicate))
@@ -3913,7 +4036,7 @@ pub fn describe(
     // Absent in the sense that matters for *this* request: the bundle holds no
     // term that could match it in any of the roles the direction walks.
     let absent_terms = if phases.is_empty() {
-        vec!["iri"]
+        vec![AbsentTerm::new("iri", &request.resource)]
     } else {
         Vec::new()
     };
@@ -3979,7 +4102,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         })
         .collect();
 
-    let (rows, spent_at) = materialize(&dictionary, &vars, &steps, request.bytes)?;
+    let (rows, spent_at) = materialize(&dictionary, &blank_nodes, &vars, &steps, request.bytes)?;
     Ok(Answer {
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
@@ -4287,7 +4410,7 @@ fn ranked(
 /// A pattern's ids, or the parameters whose terms the bundle does not hold.
 enum Resolved {
     Ids(IdPattern),
-    Absent(Vec<&'static str>),
+    Absent(Vec<AbsentTerm>),
 }
 
 fn resolve(
@@ -4313,7 +4436,7 @@ fn resolve(
             },
             // Not an error: the term is well formed and simply not in this
             // bundle, so the answer is provably empty rather than unanswerable.
-            None => absent.push(position.as_str()),
+            None => absent.push(AbsentTerm::new(position.as_str(), term)),
         }
     }
     if absent.is_empty() {
@@ -4323,34 +4446,73 @@ fn resolve(
     }
 }
 
+/// Resolve a request term, or `None` when this bundle does not hold it.
+///
+/// Blank-node syntax never resolves, and is never even probed for. A stored
+/// `_:` label belongs to whichever document was loaded, so the same label names
+/// unrelated nodes at different bundles; a lookup that succeeded would join
+/// across knowledge graphs on a coincidence of spelling. Blank nodes are
+/// addressed by the bundle-scoped IRI [`SkolemScope`] mints, whose digest is
+/// what makes the identity refuse to travel. The term is still accepted and
+/// reported as absent rather than rejected, so a client submitting a mixed
+/// batch of IRIs and blank nodes gets one answer instead of a spoiled request.
 fn locate(
     dictionary: &Dictionary<'_>,
     role: Role,
     term: &BoundTerm,
 ) -> Result<Option<u64>, Problem> {
+    if term.denotes_blank_node() {
+        return Ok(None);
+    }
     dictionary
         .locate(role, term.dictionary().as_bytes())
         .map(|found| found.map(|id| id.0))
         .map_err(|error| unreadable("looking a term up", &error))
 }
 
+/// Reverse a scoped blank-node IRI to the dictionary id it names.
+///
+/// The checks are what stop the identity travelling: a URN reverses only
+/// against the bundle whose digest it carries, in a role its section is valid
+/// for, at a local id in range, and only when the term there really is a blank
+/// node. Anything else is an ordinary IRI and resolves — or does not — as one.
+///
+/// Shared by request resolution and by the page's label cascade, because a term
+/// the API names one way has to be recognized the same way wherever it is read.
+fn reverse_scoped(
+    dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    role: Role,
+    text: &str,
+) -> Result<Option<u64>, Problem> {
+    if !matches!(role, Role::Subject | Role::Object) {
+        return Ok(None);
+    }
+    let Some(id) = blank_nodes.role_id(role, text) else {
+        return Ok(None);
+    };
+    let mut buffer = Vec::new();
+    let stored = dictionary
+        .extract(role, id, &mut buffer)
+        .map_err(|error| unreadable("reversing a blank-node IRI", &error))?;
+    Ok(stored.starts_with(b"_:").then_some(id.0))
+}
+
 /// Look up a request term, reversing this HDT's skolem URNs in RDF term roles.
+///
+/// The scoped IRI is the only spelling that reaches a blank node; see
+/// [`locate`], which this shares its refusal with.
 fn locate_scoped(
     dictionary: &Dictionary<'_>,
     blank_nodes: &SkolemScope,
     role: Role,
     term: &BoundTerm,
 ) -> Result<Option<u64>, Problem> {
-    if matches!(role, Role::Subject | Role::Object)
-        && let Some(id) = blank_nodes.role_id(role, term.dictionary())
-    {
-        let mut buffer = Vec::new();
-        let stored = dictionary
-            .extract(role, id, &mut buffer)
-            .map_err(|error| unreadable("reversing a blank-node IRI", &error))?;
-        if stored.starts_with(b"_:") {
-            return Ok(Some(id.0));
-        }
+    if term.denotes_blank_node() {
+        return Ok(None);
+    }
+    if let Some(id) = reverse_scoped(dictionary, blank_nodes, role, term.dictionary())? {
+        return Ok(Some(id));
     }
     dictionary
         .locate(role, term.dictionary().as_bytes())
@@ -4461,7 +4623,7 @@ struct Envelope {
     vars: Vec<Position>,
     directed: bool,
     bindings: bool,
-    absent_terms: Vec<&'static str>,
+    absent_terms: Vec<AbsentTerm>,
     blank_nodes: SkolemScope,
 }
 
@@ -4679,7 +4841,7 @@ fn finish(
     // Materializing is where the bytes appear, so it is where the byte budget
     // applies — before the response exists rather than after, which also bounds
     // the memory a page can take.
-    let (rows, spent_at) = materialize(dictionary, &vars, &steps, paging.bytes)?;
+    let (rows, spent_at) = materialize(dictionary, &blank_nodes, &vars, &steps, paging.bytes)?;
     let row_resumes = steps[..rows.len()].iter().map(Step::row_resume).collect();
 
     // Whichever bound was reached first names the reason and the resume point.
@@ -4954,31 +5116,33 @@ fn resume_position(cursor: &Cursor, phase: &Phase<'_>, predicates: u64) -> Resul
 /// removed without replacing it with an equally explicit memory bound.
 fn materialize(
     dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
     vars: &[Position],
     steps: &[Step],
     bytes: ResponseBytes,
 ) -> Result<(Vec<Row>, Option<usize>), Problem> {
     let mut cache = TermCache::new();
+    let mut published = PublishedTerms::new(blank_nodes.clone());
     let mut rows: Vec<Row> = Vec::with_capacity(steps.len());
     let mut spent = 0u64;
     for (index, step) in steps.iter().enumerate() {
         let mut cells = Vec::with_capacity(vars.len());
         let mut terms = 0u64;
         for position in vars {
-            let (text, serialized) = cache
+            let (term, serialized) = published
                 .measured(
+                    &mut cache,
                     dictionary,
                     position.role(),
                     TermId(position.of(step.triple)),
                 )
                 .map_err(|error| unreadable("materializing a term", &error))?;
             terms += serialized;
-            cells.push((*position, text));
+            cells.push((*position, term));
         }
         let row = Row::new(
             cells,
             terms,
-            step.triple,
             step.binding_index,
             step.direction,
             step.ranking,
@@ -5696,9 +5860,9 @@ impl Resource for Answer {
                 }
                 @if !self.absent_terms.is_empty() {
                     (note(&format!(
-                        "This bundle's dictionary holds no term for {}. The answer is empty for \
-                         that reason, not because the pattern has no matches.",
-                        self.absent_terms.join(", ")
+                        "{}. The answer is empty for that reason, not because the pattern has \
+                         no matches.",
+                        absent_terms_text(&self.absent_terms)
                     )))
                 }
                 @if !self.completeness.is_complete()
@@ -5850,24 +6014,31 @@ impl Answer {
                 if let Some(pattern) = self.fragment_pattern() {
                     // JSON rows carry variables only. A browser page is a
                     // table of triples, so merge the request's bound terms
-                    // back into their fixed positions for display.
+                    // back into their fixed positions for display. A bound term
+                    // has one spelling — the request's, which for a blank node
+                    // is already the scoped IRI, since nothing else resolves.
                     for position in Position::ALL {
-                        let text =
-                            pattern
-                                .bound(position)
-                                .map(BoundTerm::dictionary)
-                                .or_else(|| {
-                                    row.cells
-                                        .iter()
-                                        .find(|(row_position, _)| *row_position == position)
-                                        .map(|(_, text)| text.as_ref())
-                                });
-                        if let Some(text) = text {
-                            cells.push(self.cell(text));
+                        let found = pattern
+                            .bound(position)
+                            .map(|bound| (bound.dictionary(), bound.dictionary()))
+                            .or_else(|| {
+                                row.cells
+                                    .iter()
+                                    .find(|(row_position, _)| *row_position == position)
+                                    .map(|(_, term)| {
+                                        (term.published.as_ref(), term.stored.as_ref())
+                                    })
+                            });
+                        if let Some((published, stored)) = found {
+                            cells.push(self.cell(published, stored));
                         }
                     }
                 } else {
-                    cells.extend(row.cells.iter().map(|(_, text)| self.cell(text)));
+                    cells.extend(
+                        row.cells
+                            .iter()
+                            .map(|(_, term)| self.cell(&term.published, &term.stored)),
+                    );
                 }
                 if let Some(direction) = row.direction {
                     cells.push(Cell::text(direction.as_str().to_owned()));
@@ -5886,17 +6057,29 @@ impl Answer {
     /// This is what makes the page a way *into* the data rather than a dump of
     /// it: a subject, predicate or object links to its own neighborhood, a
     /// literal to every triple carrying it.
-    fn cell<'a>(&'a self, text: &'a str) -> Cell<'a> {
+    /// `published` is what the cell shows and links to; `stored` is the
+    /// dictionary spelling the page's labels were resolved against.
+    fn cell<'a>(&'a self, published: &'a str, stored: &'a str) -> Cell<'a> {
         let mut cell = term_cell(
             &self.target,
-            text,
-            self.page_labels.get(text).map(String::as_str),
+            &self.blank_nodes,
+            published,
+            self.page_labels.get(stored).map(String::as_str),
         );
-        if self.described.as_deref() == Some(text) {
+        if self.described.as_deref() == Some(published) {
             cell.href = None;
         }
         cell
     }
+}
+
+/// The page's sentence about parameters that matched nothing.
+fn absent_terms_text(absent: &[AbsentTerm]) -> String {
+    absent
+        .iter()
+        .map(AbsentTerm::explanation)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The one line a page says about completeness, honestly: the actual
@@ -5927,6 +6110,7 @@ impl Resource for SearchAnswer {
             .map(|result| {
                 term_cell(
                     &self.target,
+                    &self.blank_nodes,
                     &result.subject,
                     result.label.as_ref().and_then(Option::as_deref),
                 )
@@ -5935,7 +6119,14 @@ impl Resource for SearchAnswer {
         let predicates: Vec<_> = self
             .results
             .iter()
-            .map(|result| term_cell(&self.target, &result.evidence.predicate, None))
+            .map(|result| {
+                term_cell(
+                    &self.target,
+                    &self.blank_nodes,
+                    &result.evidence.predicate,
+                    None,
+                )
+            })
             .collect();
         let scores: Vec<String> = self
             .results
@@ -6095,8 +6286,8 @@ impl Resource for CountAnswer {
                 }
                 @if !self.absent_terms.is_empty() {
                     (note(&format!(
-                        "This bundle's dictionary holds no term for {}, so nothing can match.",
-                        self.absent_terms.join(", ")
+                        "{}, so nothing can match.",
+                        absent_terms_text(&self.absent_terms)
                     )))
                 }
                 @if self.pattern.text().is_none() {
@@ -6200,14 +6391,30 @@ fn binding_pattern_fields(pattern: &BindingPattern) -> Vec<(&str, Value<'_>)> {
 /// `/describe` neighborhood; a literal links to every triple carrying it. A
 /// predicate used to link to `/fragment?p=`, but the page a reader wants from
 /// a predicate is what the term *is*, and its usage is one link further.
-fn term_cell<'a>(target: &Target, text: &'a str, annotation: Option<&'a str>) -> Cell<'a> {
+/// One term, and the request that asks about it.
+///
+/// A blank node is shown as `_:{section}-{local-id}` rather than as the scoped
+/// IRI it actually is. `_:` is the one spelling every RDF reader recognizes
+/// without a legend, and the tail is the canonical identity rather than the
+/// parser-local label — but it is a *display* form: nothing expands it and no
+/// parameter accepts it, so the link and the tooltip carry the full IRI, which
+/// is the spelling that works.
+fn term_cell<'a>(
+    target: &Target,
+    blank_nodes: &SkolemScope,
+    text: &'a str,
+    annotation: Option<&'a str>,
+) -> Cell<'a> {
     let term = Term::from_dictionary(text);
     let request = term.to_request();
     let href = match &term {
         Term::Literal(_) => target.ask("fragment", "o", &request),
         _ => target.ask("describe", "iri", &request),
     };
-    let (label, qualifier, full_iri) = term.into_display(&target.prefixes).into_structured();
+    let (label, qualifier, full_iri) = match blank_nodes.display_label(text) {
+        Some(suffix) => (format!("_:{suffix}"), None, Some(Cow::Borrowed(text))),
+        None => term.into_display(&target.prefixes).into_structured(),
+    };
     Cell {
         label,
         qualifier,
@@ -6281,7 +6488,9 @@ mod tests {
     }
 
     #[test]
-    fn fragment_rdf_publishes_data_blank_nodes_as_named_urns() {
+    fn a_published_blank_node_is_a_named_node_in_rdf() {
+        // The materializer is what substitutes the scoped IRI, so by the time
+        // the RDF serializer sees a term there is no blank node left to keep.
         let counts = kgf_store::dict::DictCounts {
             shared: 1,
             subjects: 0,
@@ -6289,18 +6498,18 @@ mod tests {
             predicates: 0,
         };
         let blank_nodes = SkolemScope::new([0xab; 32], counts);
-        let subject = rdf_fragment_subject(b"_:b1", TermId(1), &blank_nodes).unwrap();
-        let object = rdf_fragment_object(b"_:b1", TermId(1), &blank_nodes).unwrap();
-        let expected = blank_nodes.iri(Role::Subject, TermId(1), "_:b1").unwrap();
+        let published = blank_nodes.iri(Role::Subject, TermId(1), "_:b1").unwrap();
 
-        match subject {
-            NamedOrBlankNode::NamedNode(node) => assert_eq!(node.as_str(), expected),
+        match rdf_subject(published.as_bytes()).unwrap() {
+            NamedOrBlankNode::NamedNode(node) => assert_eq!(node.as_str(), published),
             NamedOrBlankNode::BlankNode(_) => panic!("fragment data kept a local blank node"),
         }
-        match object {
-            RdfTerm::NamedNode(node) => assert_eq!(node.as_str(), expected),
+        match rdf_object(published.as_bytes()).unwrap() {
+            RdfTerm::NamedNode(node) => assert_eq!(node.as_str(), published),
             other => panic!("fragment data became {other:?} rather than a named node"),
         }
+        // And the page spells that IRI back as a blank node for a reader.
+        assert_eq!(blank_nodes.display_label(&published), Some("sh-1"));
     }
 
     #[test]
@@ -6353,27 +6562,26 @@ mod tests {
                     ];
                     for score in rankings {
                         for binding in [None, Some(0), Some(12_345)] {
-                            let cells: Vec<(Position, Rc<str>)> = Position::ALL[..width]
+                            let cells: Vec<(Position, RowTerm)> = Position::ALL[..width]
                                 .iter()
-                                .map(|position| (*position, Rc::from(term)))
+                                .map(|position| {
+                                    let text: Rc<str> = Rc::from(term);
+                                    (
+                                        *position,
+                                        RowTerm {
+                                            published: Rc::clone(&text),
+                                            stored: text,
+                                        },
+                                    )
+                                })
                                 .collect();
                             // What the cache would have measured for each cell.
                             let each = serde_json::to_vec(&Term::from_dictionary(term))
                                 .expect("a term serializes")
                                 .len() as u64;
 
-                            let row = Row::new(
-                                cells,
-                                each * width as u64,
-                                IdTriple {
-                                    subject: 1,
-                                    predicate: 1,
-                                    object: 1,
-                                },
-                                binding,
-                                direction,
-                                score,
-                            );
+                            let row =
+                                Row::new(cells, each * width as u64, binding, direction, score);
                             assert_eq!(
                                 row.serialized,
                                 serde_json::to_vec(&row).expect("a row serializes").len() as u64,

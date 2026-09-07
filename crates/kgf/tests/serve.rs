@@ -386,7 +386,10 @@ fn fragment_rdf_is_one_parseable_tpf_graph_in_turtle_and_jsonld() {
 }
 
 #[test]
-fn fragment_json_preserves_blank_node_terms_while_rdf_uses_wire_iris() {
+fn every_representation_names_a_blank_node_the_same_way() {
+    // One node, one name, whatever a client negotiated. The native and RDF
+    // representations must agree exactly, because a client that combines them —
+    // or federates over several bundles — has nothing else to join on.
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
     let server = deployment.serve();
@@ -394,10 +397,12 @@ fn fragment_json_preserves_blank_node_terms_while_rdf_uses_wire_iris() {
 
     let json = server.get(target);
     json.assert_status(200);
-    assert_eq!(
-        json.json()["rows"][0]["s"],
-        serde_json::json!({"type": "bnode", "value": "b1"}),
-        "native term objects preserve the RDF term type and round-trip spelling"
+    let subject = json.json()["rows"][0]["s"].clone();
+    let iri = subject["value"].as_str().expect("a term value").to_owned();
+    assert_eq!(subject["type"], serde_json::json!("iri"));
+    assert!(
+        iri.starts_with("urn:fdc:") && iri.ends_with(":s-1"),
+        "native JSON publishes the scoped IRI, not a dictionary label: {iri}"
     );
 
     let turtle = server.request("GET", target, &[("Accept", "text/turtle")]);
@@ -410,13 +415,165 @@ fn fragment_json_preserves_blank_node_terms_while_rdf_uses_wire_iris() {
         .find(|quad| quad.predicate.as_str() == "http://example.org/type")
         .expect("the fragment contains its data triple")
         .subject;
-    assert!(
-        matches!(
-            data_subject,
-            oxrdf::NamedOrBlankNode::NamedNode(node)
-                if node.as_str().contains(":s-")
+    match data_subject {
+        oxrdf::NamedOrBlankNode::NamedNode(node) => assert_eq!(
+            node.as_str(),
+            iri,
+            "the RDF and native representations name one node identically"
         ),
-        "RDF fragments use the subject-only dictionary-section identity"
+        oxrdf::NamedOrBlankNode::BlankNode(_) => panic!("RDF kept a document-local blank node"),
+    }
+
+    // The scoped IRI is what addresses it, in either spelling a client holds.
+    let asked = server.get(&format!(
+        "/tox/v/v1/fragment?s={}",
+        kgf_server::url::encode_value(&format!("<{iri}>"))
+    ));
+    asked.assert_status(200);
+    assert_eq!(asked.json()["cardinality"]["value"], serde_json::json!(1));
+}
+
+#[test]
+fn blank_node_syntax_addresses_nothing_and_says_so() {
+    // A stored `_:` label is local to whatever document was loaded, so the same
+    // label names unrelated nodes at different bundles. Resolving one would join
+    // across knowledge graphs on a coincidence of spelling — so it never
+    // matches, and is reported rather than rejected so a mixed batch survives.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    let asked = server.get("/tox/v/v1/fragment?s=_%3Ab1");
+    asked.assert_status(200);
+    assert_eq!(asked.json()["rows"], serde_json::json!([]));
+    assert_eq!(
+        asked.json()["absent_terms"],
+        serde_json::json!([{"parameter": "s", "reason": "blank_node"}]),
+        "the diagnostic separates \"not addressable here\" from \"not in this bundle\""
+    );
+    assert_eq!(asked.json()["complete"], serde_json::json!(true));
+}
+
+/// A blank node carrying a label, so the page has something to show for it.
+const LABELLED_BNODE_NT: &str = concat!(
+    "_:b1 <http://example.org/name> \"A blank thing\" .\n",
+    "_:b1 <http://example.org/type> <http://example.org/Thing> .\n",
+    "<http://example.org/alice> <http://example.org/name> \"Alice\" .\n",
+);
+
+#[test]
+fn a_blank_node_is_labelled_however_the_page_reached_it() {
+    // The label cascade runs on whatever spelling a position put on the page:
+    // the dictionary label for a row cell, the scoped IRI for a term the
+    // request bound. They are one node, so one label — otherwise a node is
+    // labelled when a row happens to carry it and bare when you ask about it,
+    // which is the sort of difference nobody can explain from the outside.
+    //
+    // Both requests fix `ex:type`, which keeps the labelling triple out of the
+    // rows: the label text can then only have come from a cell's annotation.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", LABELLED_BNODE_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    const ANNOTATED: &str = "<span class=\"t-label\">A blank thing</span>";
+
+    let found = server.get("/tox/v/v1/fragment?p=ex%3Atype");
+    found.assert_status(200);
+    let iri = found.json()["rows"][0]["s"]["value"]
+        .as_str()
+        .expect("a scoped IRI")
+        .to_owned();
+
+    // Reached as a row cell, where the subject is a variable.
+    let by_row = server.request(
+        "GET",
+        "/tox/v/v1/fragment?p=ex%3Atype",
+        &[("Accept", "text/html")],
+    );
+    by_row.assert_status(200);
+    assert!(
+        by_row.text().contains(ANNOTATED),
+        "a blank node found in a row carries its label"
+    );
+
+    // Reached as the bound term, where the page merges the request back in.
+    let by_request = server.request(
+        "GET",
+        &format!(
+            "/tox/v/v1/fragment?p=ex%3Atype&s={}",
+            kgf_server::url::encode_value(&format!("<{iri}>"))
+        ),
+        &[("Accept", "text/html")],
+    );
+    by_request.assert_status(200);
+    assert!(
+        by_request.text().contains(ANNOTATED),
+        "and the same node carries it when the request is what named it"
+    );
+}
+
+#[test]
+fn a_blank_node_label_cannot_be_smuggled_in_under_an_iri() {
+    // The digest is the whole safety mechanism, so every spelling that omits it
+    // has to miss. A `{"type": "iri"}` term object could otherwise carry a
+    // label straight past the blank-node refusal and resolve to the stored
+    // node, which is a cross-bundle join on a coincidence of spelling.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", LABELLED_BNODE_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    let body = serde_json::json!({
+        "pattern": {"s": {"type": "iri", "value": "_:b1"}, "p": "?p", "o": "?o"},
+        "bindings": {"vars": [], "rows": [[]]}
+    })
+    .to_string();
+    let object_form = server.request_with_body(
+        "POST",
+        "/tox/v/v1/fragment",
+        &[("Content-Type", "application/json")],
+        body.as_bytes(),
+    );
+    object_form.assert_status(400);
+    assert_eq!(object_form.json()["code"], "bad_term_syntax");
+
+    // The query-carried table cannot reach this at all — SPARQL admits no blank
+    // node in `DataBlockValue`, and `<_:b1>`, whose characters do satisfy the
+    // IRIREF grammar, is rejected by the parser as not a valid IRI. Pinned so
+    // the refusal is known to come from somewhere rather than assumed.
+    let values = server.get(&format!(
+        "/tox/v/v1/fragment?values={}",
+        kgf_server::url::encode_value("(?s) { (<_:b1>) }")
+    ));
+    values.assert_status(400);
+    assert_eq!(values.json()["code"], "malformed_request");
+
+    // And the honest spelling still reaches the node these failed to name.
+    let found = server.get("/tox/v/v1/fragment?p=ex%3Atype");
+    assert_eq!(found.json()["rows"].as_array().expect("rows").len(), 1);
+}
+
+#[test]
+fn a_browser_page_spells_a_blank_node_as_one() {
+    // `_:` is the one token an RDF reader recognizes without a legend, so the
+    // page shows the identity's tail that way — while the link and the tooltip
+    // carry the full IRI, which is the spelling any parameter accepts.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    let page = server.request(
+        "GET",
+        "/tox/v/v1/fragment?p=ex%3Atype",
+        &[("Accept", "text/html")],
+    );
+    page.assert_status(200);
+    let html = page.text();
+    assert!(
+        html.contains("_:s-1"),
+        "the page spells the node as a blank node"
+    );
+    assert!(
+        html.contains("urn:fdc:") && html.contains("%3As-1%3E"),
+        "and links it by the IRI that actually resolves"
     );
 }
 

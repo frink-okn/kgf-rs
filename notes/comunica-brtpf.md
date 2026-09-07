@@ -164,11 +164,25 @@ IRIs. Turtle binds `kgfbn:` to the digest-scoped namespace, making the terms
 compact names such as `kgfbn:sh-7`; expanded JSON-LD continues to emit full IRIs.
 Hydra's structural blank nodes remain local metadata nodes. Identical HDT content
 intentionally produces identical skolem identities across endpoints and mirrors.
-Native KGF JSON is not an RDF document serialization: it retains the `bnode` term
-object and dictionary label so the term preserves its RDF type and round-trips against
-the addressed immutable release. Clients combining native results scope those blank
-nodes to their source release; the named wire identity is specifically the TPF RDF
-transport rule.
+
+**Every representation carries this identity, not only the RDF ones.** Native KGF
+JSON emits `{"type": "iri", "value": "urn:fdc:…"}`, and a browser page displays
+`_:{section}-{local-id}` while linking the full IRI. An earlier revision exempted
+native JSON, which left one node with two names at one server depending only on
+`Accept` and handed a federating client a label that collides across graphs — the
+failure this identity exists to prevent. Abbreviation is allowed only where the
+format defines the expansion, which is why Turtle may write `kgfbn:sh-7` and native
+JSON may not.
+
+Ingress matches: the scoped IRI is the only spelling that addresses a blank node.
+Blank-node syntax is parsed and never resolved, with no dictionary probe, since a
+stored label means nothing outside the document it was parsed from and a lookup
+that succeeded would join across knowledge graphs on a coincidence of spelling. It
+is reported as an absent term rather than rejected, so a mixed batch of IRIs and
+blank nodes is answered rather than refused. This costs Comunica nothing: SPARQL's
+`DataBlockValue` admits no blank nodes, so a `values=` table could never carry one
+— and `<_:b1>`, which *is* a well-formed IRIREF, is refused for the same reason a
+`{"type": "iri"}` term object spelling a label is.
 
 ### Target TPF/brTPF now; QPF on the same route later
 

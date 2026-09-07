@@ -21,6 +21,7 @@ use kgf_server::service::{Release, Service};
 use kgf_server::url::Params;
 use kgf_server::{Budgets, Caps, Limits};
 use kgf_store::catalog::BundleId;
+use kgf_store::dict::Section;
 use kgf_store::pattern::IdPattern;
 use kgf_store::testing::Fixture;
 use kgf_store::{IdTriple, Role, Store, TermId};
@@ -656,7 +657,10 @@ fn describe_is_two_enumerations_that_page_as_one() {
     // A resource the bundle does not hold is an empty answer that says why.
     let unknown = served.describe(&store, "iri=%3Chttp%3A%2F%2Fexample.org%2Fnobody%3E");
     assert_eq!(unknown["cardinality"]["value"], serde_json::json!(0));
-    assert_eq!(unknown["absent_terms"], serde_json::json!(["iri"]));
+    assert_eq!(
+        unknown["absent_terms"],
+        serde_json::json!([{"parameter": "iri", "reason": "not_in_bundle"}])
+    );
 
     // A literal has incoming edges like any other object, and a bundle that
     // holds one must be able to answer for it.
@@ -815,13 +819,19 @@ fn an_absent_term_is_an_empty_answer_that_says_which_position() {
     let answer = served.fragment(&store, "s=%3Chttp%3A%2F%2Fexample.org%2Fnobody%3E");
     assert_eq!(answer["cardinality"]["value"], serde_json::json!(0));
     assert_eq!(answer["rows"], serde_json::json!([]));
-    assert_eq!(answer["absent_terms"], serde_json::json!(["s"]));
+    assert_eq!(
+        answer["absent_terms"],
+        serde_json::json!([{"parameter": "s", "reason": "not_in_bundle"}])
+    );
     assert_eq!(answer["complete"], serde_json::json!(true));
 
     // Per role, because a term can be present as one thing and not another:
     // `ex:name` is a predicate and never an object.
     let as_object = served.fragment(&store, "o=%3Chttp%3A%2F%2Fexample.org%2Fname%3E");
-    assert_eq!(as_object["absent_terms"], serde_json::json!(["o"]));
+    assert_eq!(
+        as_object["absent_terms"],
+        serde_json::json!([{"parameter": "o", "reason": "not_in_bundle"}])
+    );
     let as_predicate = served.fragment(&store, "p=%3Chttp%3A%2F%2Fexample.org%2Fname%3E");
     assert!(as_predicate.get("absent_terms").is_none());
 
@@ -1918,9 +1928,14 @@ impl Served {
                     .extract(role, TermId(id), &mut scratch)
                     .expect("a term the dictionary counted");
                 let text = std::str::from_utf8(stored).expect("a UTF-8 term");
+                // Written back the way the server published it. A stored blank
+                // node is asked about by its scoped IRI and by nothing else, so
+                // sending `_:b1` here would test a spelling no client is ever
+                // handed and that deliberately matches nothing.
+                let published = published_spelling(store, role, id, text);
                 terms.push((
                     id,
-                    kgf_server::term::Term::from_dictionary(text).to_request(),
+                    kgf_server::term::Term::from_dictionary(&published).to_request(),
                 ));
             }
             roles.push(terms);
@@ -1949,7 +1964,8 @@ impl Served {
             let bytes = dictionary
                 .extract(role, TermId(id), &mut scratch)
                 .expect("a term");
-            std::str::from_utf8(bytes).expect("UTF-8").to_owned()
+            let stored = std::str::from_utf8(bytes).expect("UTF-8");
+            published_spelling(store, role, id, stored)
         };
         selection
             .page(0, usize::MAX)
@@ -2122,6 +2138,39 @@ fn describe_rows(answer: &serde_json::Value) -> Vec<(String, String, String, Str
             )
         })
         .collect()
+}
+
+/// The name this API publishes for a term the dictionary spells `stored`.
+///
+/// The oracle side of the blank-node rule: a stored `_:` label is never
+/// published, because it means nothing outside the document it was parsed from.
+/// Built here from `kgf_store`'s own section arithmetic and the wire format's
+/// constant prefix rather than by calling the server's own skolemizer, so the
+/// comparison still has two independent sides.
+fn published_spelling(store: &Store, role: Role, id: u64, stored: &str) -> String {
+    if !stored.starts_with("_:") {
+        return stored.to_owned();
+    }
+    let section = store
+        .dict()
+        .counts()
+        .section_id(role, TermId(id))
+        .expect("an id in its role's space");
+    let name = match section.section() {
+        Section::Shared => "sh",
+        Section::Subjects => "s",
+        Section::Objects => "o",
+        Section::Predicates => panic!("a predicate cannot be a blank node"),
+    };
+    let digest = store
+        .hdt_identity_digest()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:{digest}:{name}-{}",
+        section.local_id()
+    )
 }
 
 /// A term object, written the way the dictionary holds it.
