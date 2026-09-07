@@ -171,6 +171,15 @@ impl BoundKind {
 }
 
 impl BoundTerm {
+    /// Whether this term was written in blank-node syntax.
+    ///
+    /// Kept as a parsed kind rather than re-sniffed from the spelling, because
+    /// it decides whether the term may be looked up at all: see
+    /// `answer::locate`.
+    pub fn is_blank_node(&self) -> bool {
+        matches!(self.kind, BoundKind::BlankNode)
+    }
+
     /// Parse request-term syntax from the parameter named `parameter`.
     fn parse(
         parameter: &str,

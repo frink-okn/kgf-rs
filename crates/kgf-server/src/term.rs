@@ -943,7 +943,7 @@ impl TermCache {
 }
 
 /// The bytes a term object occupies, without producing them.
-fn serialized_bytes(term: &Term<'_>) -> u64 {
+pub(crate) fn serialized_bytes(term: &Term<'_>) -> u64 {
     struct Counter(u64);
     impl std::io::Write for Counter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {

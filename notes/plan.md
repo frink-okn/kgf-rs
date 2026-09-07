@@ -1866,7 +1866,10 @@ following the code.
     IRIs, literals and variables only, so `_:b1` would parse as an IRI under the letter
     of the rules. Treating a leading `_:` as a blank node is the only reading that lets a
     client ask about a term the server just returned. Worth one line in §3.3. Found in
-    unit 11.
+    unit 11. *Resolved September 2026:* §3.3 now carries that line, with the
+    justification narrowed by item 65 — `_:` parses so the term can be *reported*, not
+    so it can be matched. What the server returns is the scoped IRI of item 46, which
+    is what a client asks about.
 13. **Does the JSON term-object form expand CURIEs?** §3.3 offers it as "the canonical
     form for terms that are awkward to escape", and it is described as the form "as in
     response rows", where IRIs are always full — so this implementation treats a term
@@ -1996,7 +1999,10 @@ following the code.
     Refusing them makes part of a bundle unreachable, which is the failure requiring
     brackets in §3.3 was introduced to remove. Either §3.4.6 should say "term", or the
     restriction should be stated so implementations agree on it. Found in unit 14's
-    review.
+    review. *Amended September 2026:* the blank-node half of this is now served by the
+    scoped IRI — a row returns one, and `/describe` takes it as the IRI it is — so the
+    argument for "term, not IRI" rests on literals alone. It still holds: `o=` reaches
+    a literal, so `/describe` must too.
 25. **What does a budget truncation look like where there is nothing to resume?** §3.5
     says exhausting any budget returns what completed, "marked `complete: false` with a
     `truncation_reason` and cursor" — but `/sample` draws `n` members and never pages
@@ -2205,26 +2211,57 @@ following the code.
     when filtering partial overlaps before the page limit. The two fragment table rows
     should name both terms; the implementation is bounded and the cost table is the
     stale side of this disagreement.
-46. **Resolved: fragment RDF uses content-scoped blank-node identities.** A stored `_:`
-    label cannot be emitted unchanged in Turtle or JSON-LD pages: RDF scopes that
-    identity to one document, so the same HDT node would become unrelated nodes across
-    pages and a brTPF bind join could return a wrong answer. Fragment RDF now
-    skolemizes data blank nodes as
+46. **Resolved: one blank-node identity, in every representation.** A stored `_:`
+    label cannot be emitted unchanged in Turtle or JSON-LD: RDF scopes that identity to
+    one document, so the same HDT node would become unrelated nodes across pages and a
+    brTPF bind join could return a wrong answer. Fragment responses skolemize data
+    blank nodes as
     `urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:{hdt-data-digest}:{section}-{local-id}`.
     The digest is hdtc's existing identity over the HDT dictionary and triples (not its
-    mutable header). The suffix uses `sh`, `s`, or `o` plus the canonical one-based id
-    within the shared, subjects-only, or objects-only `dictionaryFour` section. A shared
-    node therefore has one identity in subject and object positions without carrying
-    its parser-local label on the wire. Subject/object ingress reverses a URN only when
-    its digest, section, role, range, and referenced blank-node term all agree; a foreign
-    bundle's URN remains an ordinary IRI. Prefix-capable RDF documents bind `kgfbn:` to
-    the digest-scoped namespace. Identical immutable HDT content therefore intentionally
-    gives its blank nodes identical identities across versions, datasets, deployments
-    and mirrors. Native JSON deliberately retains its `bnode` term object and dictionary
-    label: it is not an RDF document, preserves the term's RDF type, and round-trips only
-    in the scope of the addressed immutable release. `../kgf` doc 03 §3.4.1 now
-    makes this wire rule normative; docs 04, 07, 14, 15, 17, and 18 record its storage,
-    lifecycle, sketch, and exact-key-set consequences.
+    mutable header); because that scope is a suffix of `data.hdt` itself, anyone holding
+    the HDT can recompute every one of these names offline, which is what keeps a bulk
+    download and the API telling the same story. The suffix uses `sh`, `s`, or `o` plus
+    the canonical one-based id within the shared, subjects-only, or objects-only
+    `dictionaryFour` section. A shared node therefore has one identity in subject and
+    object positions without carrying its parser-local label on the wire. Identical
+    immutable HDT content intentionally gives its blank nodes identical identities
+    across versions, datasets, deployments and mirrors.
+
+    **This originally exempted native JSON, and that exemption is withdrawn (September
+    2026).** The recorded reasons were that JSON is not an RDF document, that a `bnode`
+    term object preserves the term's RDF type, and that the label round-trips against
+    the addressed release. The first is a statement about which spec text applies rather
+    than about identity; the third is void, since `locate_scoped` reverses the URN on
+    every ingress path and so the scoped IRI round-trips too; only the second had
+    content, and it is a format problem with a format fix. What the exemption cost was
+    real: one node had two names at one server depending only on `Accept`, and a client
+    federating native rows across the ~40 OKN graphs — the deployment this project
+    exists for — would conflate `_:b1` from one bundle with `_:b1` from another. The
+    normative text made that the client's problem ("Clients combining native results
+    MUST scope such blank-node terms to their addressed release"), which is an
+    unverifiable obligation to carry out of band exactly the context the URN carries in
+    band. Native JSON now emits `{"type":"iri","value":"urn:fdc:…"}`.
+
+    **Abbreviation is allowed only where the format defines the expansion.** Turtle
+    binds `kgfbn:` and its parser expands it, so `kgfbn:sh-7` *is* the IRI to every
+    consumer. Native JSON has no such contract, so it carries the full IRI — the same
+    reasoning `Term::to_request` already used to refuse CURIEs in links. `kgfbn` is
+    deliberately not in the manifest prefix map, which is the dataset's published
+    vocabulary: the namespace embeds the bundle's digest, so a client reusing the prefix
+    against another dataset would spell a valid-looking term that names nothing there.
+    It is likewise not accepted as a CURIE prefix in request syntax. Response byte cost
+    is much smaller than it looks, since gzip collapses a constant prefix repeated once
+    per row; what remains is that `max_response_bytes` is counted pre-compression, so a
+    blank-node-heavy page carries fewer rows.
+
+    **HTML displays `_:{section}-{local-id}`.** It is a display form only — nothing
+    expands it and it is not a request spelling — but `_:` is the one token every RDF
+    reader already recognizes, so the page needs no legend for a synthetic prefix, and
+    `sh-7` is the canonical identity component rather than the parser-local label. A
+    CURIE-shaped `kgfbn:sh-7` was rejected for the page precisely because HTML declares
+    nothing: it would imitate a syntax no request honours. The cell's link and tooltip
+    carry the full IRI, which is the spelling that works.
+
 47. **`max_request_bytes` must cover query-carried brTPF input, not only bodies.**
     `values=` is SPARQL syntax in the request target, and parsing the whole table before
     applying `max_bindings` otherwise spends CPU and memory outside the published cost
@@ -2411,6 +2448,35 @@ following the code.
     exists and is listed. Doc 12 §12.1 gained the matching census rule: exclude
     uneventful probes, keep the ones that failed or were slow, since those are the
     findings a probe exists to produce.
+
+65. **Inbound blank-node syntax must never match, and the envelope has to say why.**
+    The scoped IRI is the only spelling that addresses a blank node; `_:label` in a
+    parameter and `{"type":"bnode","value":"label"}` in a body are parsed and then
+    resolved to nothing, with no dictionary probe at all. Not probing is the point
+    rather than an optimization: a stored label is local to whichever document was
+    loaded, so `_:b1` names something in a great many bundles, and a lookup that
+    succeeded would silently join across knowledge graphs — the exact failure the
+    scoped IRI exists to prevent, reintroduced at the request boundary where it
+    produces wrong rows rather than merely ambiguous names. The digest is the whole
+    safety mechanism, so any spelling that omits it must not resolve. `values=` cannot
+    reach this at all: it parses to spargebra `GroundTerm`s, and SPARQL's
+    `DataBlockValue` admits no blank nodes. The live paths are all KGF's own JSON —
+    `bindings.rows`, `pattern.{s,p,o}`, and `labels.iris` — plus `?s=`/`?o=`/`iri=`.
+
+    **Not matching, rather than rejecting**, follows unit 11's call recorded in item 23:
+    a generic tool submitting a mixed batch of IRIs and blank nodes should get one
+    successful response in which the blank nodes matched nothing, not a 400 that spoils
+    the batch. A binding row containing one already drops out through
+    `resolve_binding`'s `Ok(None)`, identically to an unknown IRI, so that path needs no
+    new machinery.
+
+    That leaves one confusing case, and it is the one the HTML display form creates:
+    pasting `_:sh-7` out of a page yields 200 with `absent_terms`, which reads as "this
+    bundle does not have that node" when the truth is "that is not how this API
+    addresses blank nodes." So `absent_terms` should distinguish a term this API cannot
+    address from one this bundle merely does not hold. Doc 03 still has no
+    `absent_terms` field at all (item 23), so both the field and this reason want
+    defining together in §3.4.1's envelope.
 
 ## Not in this plan
 
