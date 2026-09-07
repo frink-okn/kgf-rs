@@ -147,7 +147,7 @@ adopt a hand-built bundle later instead of rebuilding it.
 ```sh
 ./tools/okn-build-config.py dreamkg --build --lakefs \
     --hdt-root /Volumes/ssd/kgf/hdt --out-root /Volumes/ssd/kgf/bundles \
-    --registry-prefixes --builder-image ghcr.io/frink-okn/kgf:v0.1.2 \
+    --registry-prefixes --builder-image ghcr.io/frink-okn/kgf:v0.1.3 \
     --kgf target/release/kgf --hdtc ../hdtc/target/release/hdtc
 ```
 
