@@ -414,7 +414,7 @@ impl AbsentTerm {
     fn new(parameter: &'static str, term: &BoundTerm) -> Self {
         Self {
             parameter,
-            reason: if term.is_blank_node() {
+            reason: if term.denotes_blank_node() {
                 AbsentReason::BlankNode
             } else {
                 AbsentReason::NotInBundle
@@ -4461,7 +4461,7 @@ fn locate(
     role: Role,
     term: &BoundTerm,
 ) -> Result<Option<u64>, Problem> {
-    if term.is_blank_node() {
+    if term.denotes_blank_node() {
         return Ok(None);
     }
     dictionary
@@ -4508,7 +4508,7 @@ fn locate_scoped(
     role: Role,
     term: &BoundTerm,
 ) -> Result<Option<u64>, Problem> {
-    if term.is_blank_node() {
+    if term.denotes_blank_node() {
         return Ok(None);
     }
     if let Some(id) = reverse_scoped(dictionary, blank_nodes, role, term.dictionary())? {

@@ -306,7 +306,16 @@ pub enum TermSyntaxError {
     EmptyIri,
 
     /// `<_:x>`: a blank node wearing an IRI's brackets.
-    #[error("`{token}` brackets a blank node; write it unbracketed, as `_:{label}`")]
+    ///
+    /// The remedy is not "write it unbracketed". A stored blank-node label is
+    /// local to whichever document was loaded, so it addresses nothing here in
+    /// either spelling; sending `_:{label}` would be accepted and then match
+    /// nothing, which is a worse place to leave a client than an error.
+    #[error(
+        "`{token}` brackets the blank node `_:{label}`; a stored label addresses nothing \
+         here, because it means nothing outside the document it was parsed from — ask for \
+         the scoped `urn:fdc:…` IRI this API publishes for that node"
+    )]
     BracketedBlankNode {
         /// The offending token.
         token: String,
@@ -786,6 +795,13 @@ impl<'a> Term<'a> {
             "bnode" if value.starts_with("_:") => {
                 Err(malformed("a `bnode` value is the bare label, without `_:`"))
             }
+            // The mirror of `<_:x>` in request syntax: a spelling the
+            // dictionary can only have written as a blank node, refused where
+            // it is written rather than left to resolve as an IRI.
+            "iri" if value.starts_with("_:") => Err(malformed(
+                "an `iri` value may not be a blank-node label; a blank node is addressed \
+                 by the scoped `urn:fdc:…` IRI this API publishes for it",
+            )),
             "iri" => Ok(Term::Iri(Cow::Borrowed(value))),
             "bnode" => Ok(Term::BlankNode(Cow::Borrowed(value))),
             "literal" => match (string("lang")?, string("datatype")?) {

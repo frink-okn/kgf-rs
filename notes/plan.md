@@ -2463,6 +2463,19 @@ following the code.
     `DataBlockValue` admits no blank nodes. The live paths are all KGF's own JSON —
     `bindings.rows`, `pattern.{s,p,o}`, and `labels.iris` — plus `?s=`/`?o=`/`iri=`.
 
+    **The refusal is anchored on the canonical spelling, not on the parsed kind**,
+    because two forms can carry a label under an IRI's type. A
+    `{"type": "iri", "value": "_:b1"}` term object is one, now refused where it is
+    written, as `<_:x>` already was in request syntax. The other is a CURIE: manifest
+    prefix namespaces are not validated, so a bundle may declare one expanding to
+    blank-node syntax, and `x:b1` then arrives as an `Iri` by kind whose dictionary
+    spelling is `_:b1`. Both would have resolved to the stored node. Nothing
+    legitimate is caught by testing the spelling — an RFC 3986 scheme cannot begin
+    with `_`, so no IRI is written this way, and the dictionary can only have stored
+    such a term as a blank node. A `values=` table cannot reach this at all: SPARQL
+    admits no blank node in `DataBlockValue`, and `<_:b1>`, whose characters do
+    satisfy the IRIREF grammar, is rejected by the parser as not a valid IRI.
+
     **Not matching, rather than rejecting**, follows unit 11's call recorded in item 23:
     a generic tool submitting a mixed batch of IRIs and blank nodes should get one
     successful response in which the blank nodes matched nothing, not a 400 that spoils

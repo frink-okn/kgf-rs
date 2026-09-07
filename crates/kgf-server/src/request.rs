@@ -171,13 +171,21 @@ impl BoundKind {
 }
 
 impl BoundTerm {
-    /// Whether this term was written in blank-node syntax.
+    /// Whether this term denotes a blank node, however it was written.
     ///
-    /// Kept as a parsed kind rather than re-sniffed from the spelling, because
-    /// it decides whether the term may be looked up at all: see
-    /// `answer::locate`.
-    pub fn is_blank_node(&self) -> bool {
-        matches!(self.kind, BoundKind::BlankNode)
+    /// The parsed kind is not enough on its own, because two request forms can
+    /// carry a blank-node label under an IRI's type: a `{"type": "iri"}` term
+    /// object, and a `values=` table, where `<_:b1>` satisfies SPARQL's IRIREF
+    /// grammar and reaches [`BoundTerm::from_ground_term`] as a named node.
+    /// Both canonicalize to the dictionary spelling a lookup would match on, so
+    /// that is where the question is settled. Nothing legitimate is caught: an
+    /// RFC 3986 scheme cannot begin with `_`, so no IRI is spelled this way, and
+    /// the dictionary can only have written such a term as a blank node.
+    ///
+    /// This decides whether the term may be looked up at all; see
+    /// `answer::locate` for why it must never be.
+    pub fn denotes_blank_node(&self) -> bool {
+        matches!(self.kind, BoundKind::BlankNode) || self.dictionary.starts_with("_:")
     }
 
     /// Parse request-term syntax from the parameter named `parameter`.
@@ -3182,6 +3190,35 @@ mod tests {
 
     const CAPS: crate::Caps = crate::Caps::new();
     const BUDGETS: crate::Budgets = crate::Budgets::new();
+
+    #[test]
+    fn a_blank_node_is_recognized_however_its_spelling_arrived() {
+        let limits = Limits {
+            caps: &CAPS,
+            budgets: &BUDGETS,
+        };
+        let bound = |text: &str, prefixes: &PrefixMap| {
+            BoundTerm::parse("s", text, limits, prefixes).expect("a term")
+        };
+        let none = PrefixMap::default();
+
+        assert!(bound("_:b1", &none).denotes_blank_node());
+        assert!(!bound("<http://example.org/a>", &none).denotes_blank_node());
+        assert!(!bound("\"_:b1\"", &none).denotes_blank_node());
+
+        // The path the parsed kind alone would miss. Manifest prefix
+        // namespaces are not validated, so a bundle may declare one that
+        // expands to blank-node syntax; the expansion is an `Iri` by kind and
+        // would otherwise be looked up, matching the stored node and joining
+        // across bundles on a coincidence of spelling.
+        let blank = PrefixMap::from_iter([("x".to_owned(), "_:".to_owned())]);
+        let curie = bound("x:b1", &blank);
+        assert_eq!(curie.dictionary(), "_:b1");
+        assert!(
+            curie.denotes_blank_node(),
+            "an expansion into blank-node syntax is still a blank node"
+        );
+    }
 
     #[test]
     fn predicate_lists_accept_commas_and_whitespace_outside_bracketed_iris() {

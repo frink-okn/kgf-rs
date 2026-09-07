@@ -512,6 +512,46 @@ fn a_blank_node_is_labelled_however_the_page_reached_it() {
 }
 
 #[test]
+fn a_blank_node_label_cannot_be_smuggled_in_under_an_iri() {
+    // The digest is the whole safety mechanism, so every spelling that omits it
+    // has to miss. A `{"type": "iri"}` term object could otherwise carry a
+    // label straight past the blank-node refusal and resolve to the stored
+    // node, which is a cross-bundle join on a coincidence of spelling.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", LABELLED_BNODE_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    let body = serde_json::json!({
+        "pattern": {"s": {"type": "iri", "value": "_:b1"}, "p": "?p", "o": "?o"},
+        "bindings": {"vars": [], "rows": [[]]}
+    })
+    .to_string();
+    let object_form = server.request_with_body(
+        "POST",
+        "/tox/v/v1/fragment",
+        &[("Content-Type", "application/json")],
+        body.as_bytes(),
+    );
+    object_form.assert_status(400);
+    assert_eq!(object_form.json()["code"], "bad_term_syntax");
+
+    // The query-carried table cannot reach this at all — SPARQL admits no blank
+    // node in `DataBlockValue`, and `<_:b1>`, whose characters do satisfy the
+    // IRIREF grammar, is rejected by the parser as not a valid IRI. Pinned so
+    // the refusal is known to come from somewhere rather than assumed.
+    let values = server.get(&format!(
+        "/tox/v/v1/fragment?values={}",
+        kgf_server::url::encode_value("(?s) { (<_:b1>) }")
+    ));
+    values.assert_status(400);
+    assert_eq!(values.json()["code"], "malformed_request");
+
+    // And the honest spelling still reaches the node these failed to name.
+    let found = server.get("/tox/v/v1/fragment?p=ex%3Atype");
+    assert_eq!(found.json()["rows"].as_array().expect("rows").len(), 1);
+}
+
+#[test]
 fn a_browser_page_spells_a_blank_node_as_one() {
     // `_:` is the one token an RDF reader recognizes without a legend, so the
     // page shows the identity's tail that way — while the link and the tooltip
