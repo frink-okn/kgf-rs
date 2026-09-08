@@ -454,12 +454,11 @@ fn tpf_quad_formats_keep_controls_out_of_the_default_graph() {
                 && quad.predicate.as_str() == format!("{VOID}inDataset")
                 && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str() == "http://example.org/dataset/tox")
         }));
-        assert!(quads.iter().any(|quad| {
+        assert!(!quads.iter().any(|quad| {
             matches!(&quad.graph_name, oxrdf::GraphName::NamedNode(node) if node.as_str() == metadata)
                 && matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == "http://example.org/dataset/tox")
                 && quad.predicate.as_str() == "http://www.w3.org/2000/01/rdf-schema#seeAlso"
-                && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str() == format!("http://{}/tox/v/v1/void", server.address))
-        }));
+        }), "{accept} advertised an unavailable VoID description");
         datasets.push(quads);
     }
     assert_eq!(datasets[0], datasets[1]);
@@ -467,6 +466,44 @@ fn tpf_quad_formats_keep_controls_out_of_the_default_graph() {
         datasets[0], datasets[2],
         "JSON-LD must preserve the named control graph"
     );
+
+    let selected = server.get(&format!("{target}&format=nq"));
+    let selected_quads: HashSet<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
+        .for_slice(&selected.body)
+        .collect::<Result<_, _>>()
+        .expect("format-selected N-Quads parses");
+    assert!(selected_quads.iter().any(|quad| {
+        quad.predicate.as_str() == FOAF_PRIMARY_TOPIC
+            && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str() == fragment)
+    }));
+
+    let unavailable = server.get("/tox/v/v1/void");
+    unavailable.assert_status(501);
+}
+
+#[test]
+fn tpf_links_a_void_description_only_when_it_is_published() {
+    let deployment = Deployment::new();
+    deployment.publish_description("tox", "v1", "2026-08-08T12:00:00Z");
+    deployment.set_dataset_iri("tox", "v1", "http://example.org/dataset/tox");
+    let server = deployment.serve();
+
+    server.get("/tox/v/v1/void").assert_status(200);
+    let response = server.request(
+        "GET",
+        "/tox/v/v1/tpf?limit=1",
+        &[("Accept", "application/n-quads")],
+    );
+    response.assert_status(200);
+    let quads: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
+        .for_slice(&response.body)
+        .collect::<Result<_, _>>()
+        .expect("TPF N-Quads parses");
+    assert!(quads.iter().any(|quad| {
+        matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == "http://example.org/dataset/tox")
+            && quad.predicate.as_str() == "http://www.w3.org/2000/01/rdf-schema#seeAlso"
+            && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str() == format!("http://{}/tox/v/v1/void", server.address))
+    }));
 }
 
 #[test]
@@ -500,6 +537,10 @@ fn tpf_and_native_fragment_keep_their_protocols_disjoint() {
             let page = tpf.text();
             assert!(page.contains("format=nq"));
             assert!(!page.contains("format=json"));
+            assert!(page.contains("<dt>subject</dt>"));
+            assert!(page.contains("<dt>predicate</dt>"));
+            assert!(page.contains("<dt>object</dt>"));
+            assert!(!page.contains("<dt>s</dt>"));
         }
 
         let native = server.request(
@@ -529,6 +570,7 @@ fn tpf_and_native_fragment_keep_their_protocols_disjoint() {
         "/tox/v/v1/tpf?s=http%3A%2F%2Fexample.org%2Falice",
         "/tox/v/v1/tpf?page=2",
         "/tox/v/v1/tpf?o.text=alice",
+        "/tox/v/v1/tpf?subject=%3Fx&object=%3Fx",
     ] {
         let refused = server.get(target);
         refused.assert_status(400);
@@ -1089,14 +1131,14 @@ fn tpf_rdf_byte_fitting_keeps_a_complete_parseable_document_and_cursor() {
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
     let unlimited = deployment.serve();
     let target = "/tox/v/v1/tpf?limit=8";
-    let full = unlimited.request("GET", target, &[("Accept", "text/turtle")]);
+    let full = unlimited.request("GET", target, &[("Accept", "application/n-quads")]);
     full.assert_status(200);
     full.assert_header("kgf-complete", "true");
 
     let mut budgets = kgf_server::Budgets::new();
     budgets.max_response_bytes = (full.body.len() - 100) as u64;
     let limited = deployment.serve_with_limits(kgf_server::Caps::new(), budgets);
-    let response = limited.request("GET", target, &[("Accept", "text/turtle")]);
+    let response = limited.request("GET", target, &[("Accept", "application/n-quads")]);
     response.assert_status(200);
     response.assert_header("kgf-complete", "false");
     response.assert_header("kgf-truncation-reason", "response_bytes");
@@ -1107,7 +1149,7 @@ fn tpf_rdf_byte_fitting_keeps_a_complete_parseable_document_and_cursor() {
         budgets.max_response_bytes,
         full.body.len()
     );
-    let graph: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+    let graph: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
         .for_slice(&response.body)
         .collect::<Result<_, _>>()
         .expect("the fitted RDF response is still a complete document");
@@ -1116,6 +1158,15 @@ fn tpf_rdf_byte_fitting_keeps_a_complete_parseable_document_and_cursor() {
             .iter()
             .any(|quad| { quad.predicate.as_str() == "http://www.w3.org/ns/hydra/core#next" })
     );
+    let data_items = graph
+        .iter()
+        .filter(|quad| quad.graph_name == oxrdf::GraphName::DefaultGraph)
+        .count();
+    assert!(data_items < 8, "the byte budget should shorten the page");
+    assert!(graph.iter().any(|quad| {
+        quad.predicate.as_str() == "http://www.w3.org/ns/hydra/core#itemsPerPage"
+            && matches!(&quad.object, oxrdf::Term::Literal(value) if value.value() == data_items.to_string())
+    }));
 }
 
 #[test]

@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
+use kgf_server::access::AccessOperation;
 use kgf_server::answer::{self, Target};
 use kgf_server::representation::Representation;
 use kgf_server::request;
@@ -1575,7 +1576,7 @@ impl Served {
     fn target(&self, operation: &'static str, query: &str) -> Target {
         Target::new(
             self.id(),
-            operation,
+            access_operation(operation),
             params(query),
             self.release().prefixes().clone(),
             kgf_server::url::Mount::default(),
@@ -1671,7 +1672,7 @@ impl Served {
             store,
             Target::body(
                 self.id(),
-                "fragment",
+                AccessOperation::Fragment,
                 params(""),
                 self.release().prefixes().clone(),
                 kgf_server::url::Mount::default(),
@@ -1700,7 +1701,7 @@ impl Served {
                 store,
                 Target::body(
                     self.id(),
-                    "count",
+                    AccessOperation::Count,
                     params(""),
                     self.release().prefixes().clone(),
                     kgf_server::url::Mount::default(),
@@ -1834,7 +1835,7 @@ impl Served {
                 store,
                 Target::body(
                     self.id(),
-                    "labels",
+                    AccessOperation::Labels,
                     params(""),
                     self.release().prefixes().clone(),
                     kgf_server::url::Mount::default(),
@@ -1857,7 +1858,7 @@ impl Served {
 
         let target = Target::new(
             self.id(),
-            operation,
+            access_operation(operation),
             params(query),
             self.release().prefixes().clone(),
             kgf_server::url::Mount::default(),
@@ -2095,6 +2096,21 @@ fn pattern_query(
 
 fn params(query: &str) -> Params {
     Params::parse(Some(query)).unwrap_or_else(|error| panic!("query {query:?}: {error}"))
+}
+
+fn access_operation(operation: &str) -> AccessOperation {
+    match operation {
+        "fragment" => AccessOperation::Fragment,
+        "count" => AccessOperation::Count,
+        "describe" => AccessOperation::Describe,
+        "sample" => AccessOperation::Sample,
+        "search" => AccessOperation::Search,
+        "schema" => AccessOperation::Schema,
+        "void" => AccessOperation::Void,
+        "summary" => AccessOperation::Summary,
+        "labels" => AccessOperation::Labels,
+        other => panic!("no such test operation: {other}"),
+    }
 }
 
 fn json(

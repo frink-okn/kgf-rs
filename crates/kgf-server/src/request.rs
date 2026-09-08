@@ -91,7 +91,7 @@ impl Position {
     }
 
     /// The conventional TPF query parameter for this position.
-    fn tpf_parameter(self) -> &'static str {
+    pub(crate) fn tpf_parameter(self) -> &'static str {
         match self {
             Self::Subject => "subject",
             Self::Predicate => "predicate",
@@ -330,18 +330,12 @@ impl BoundTerm {
                 ErrorCode::BadTermSyntax,
                 format!(
                     "parameter `{parameter}`: {detail}; this is the TPF route, where IRIs and \
-                     datatype IRIs are bare — angle brackets and CURIE expansion belong to \
-                     `/fragment`"
+                     datatype IRIs are bare — angle brackets belong to `/fragment`, and prefix \
+                     expansion never occurs here"
                 ),
             )
         };
         let iri = |value: &str| -> Result<String, Problem> {
-            let scheme = value.split_once(':').map(|(scheme, _)| scheme);
-            if scheme.is_some_and(|scheme| matches!(scheme, "rdf" | "rdfs" | "xsd" | "owl")) {
-                return Err(syntax(
-                    "a vocabulary CURIE is not an ExplicitRepresentation IRI",
-                ));
-            }
             NamedNode::new(value)
                 .map(NamedNode::into_string)
                 .map_err(|error| syntax(&format!("{value:?} is not an absolute IRI ({error})")))
@@ -473,6 +467,7 @@ impl Pattern {
 
     fn parse_tpf(params: &Params, limits: Limits<'_>) -> Result<Self, Problem> {
         let mut pattern = Self::default();
+        let mut variables = BTreeSet::new();
         for position in Position::ALL {
             if let Some(text) = params
                 .get(position.tpf_parameter())
@@ -488,7 +483,10 @@ impl Pattern {
                 .get(position.tpf_parameter())
                 .filter(|text| text.starts_with('?'))
             {
-                Variable::parse(variable, position.tpf_parameter())?;
+                let variable = Variable::parse(variable, position.tpf_parameter())?;
+                if !variables.insert(variable.clone()) {
+                    return Err(unbounded_plain_tpf_variable(&variable));
+                }
             }
         }
         Ok(pattern)
@@ -1444,6 +1442,17 @@ fn unbounded_repeated_variable(variable: &Variable) -> Problem {
     )
 }
 
+fn unbounded_plain_tpf_variable(variable: &Variable) -> Problem {
+    Problem::new(
+        ErrorCode::MalformedRequest,
+        format!(
+            "repeated variable {} on /tpf needs an equality scan that is not bounded by the page \
+             limit; bind it in every row of a values= table",
+            reflected(variable.as_str())
+        ),
+    )
+}
+
 /// `QUERY|POST /fragment` — a pattern restricted by an input binding table.
 #[derive(Debug)]
 pub struct BindingFragment {
@@ -1509,19 +1518,6 @@ impl BindingFragment {
         limits: Limits<'_>,
         bundle: &BundleBinding,
     ) -> Result<Self, Problem> {
-        accept_only(
-            params,
-            TPF,
-            &[
-                "subject",
-                "predicate",
-                "object",
-                "values",
-                "limit",
-                "cursor",
-                "format",
-            ],
-        )?;
         let pattern = BindingPattern::parse_tpf(params, limits)?;
         let values = params.get("values").expect("the caller selected values=");
         let bindings = Bindings::parse_values(values, &pattern, limits)?;
@@ -3374,6 +3370,7 @@ mod tests {
             ("http://example.org/bar", "http://example.org/bar"),
             ("urn:uuid:12345678", "urn:uuid:12345678"),
             ("doi:10.1000/x", "doi:10.1000/x"),
+            ("rdfs:label", "rdfs:label"),
             (
                 "urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:abc:s-1",
                 "urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:abc:s-1",
@@ -3384,18 +3381,14 @@ mod tests {
                 "\"42\"^^http://www.w3.org/2001/XMLSchema#integer",
                 "\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>",
             ),
+            ("\"a\"^^xsd:date", "\"a\"^^<xsd:date>"),
             ("\"a\"^^http://www.w3.org/2001/XMLSchema#string", "\"a\""),
         ] {
             let parsed = BoundTerm::parse_tpf("object", text, limits()).unwrap();
             assert_eq!(parsed.dictionary(), dictionary, "{text}");
         }
 
-        for invalid in [
-            "<http://example.org/bar>",
-            "rdfs:label",
-            "\"a\"^^xsd:date",
-            "\"unclosed",
-        ] {
+        for invalid in ["<http://example.org/bar>", "\"unclosed"] {
             let error = BoundTerm::parse_tpf("object", invalid, limits()).unwrap_err();
             assert_eq!(error.code(), ErrorCode::BadTermSyntax, "{invalid}");
             assert!(
@@ -3411,6 +3404,25 @@ mod tests {
         };
         assert_eq!(unbound.pattern.bound(Position::Subject), None);
         assert_eq!(unbound.pattern.bound(Position::Predicate), None);
+    }
+
+    #[test]
+    fn plain_tpf_refuses_an_unbounded_repeated_variable() {
+        let error = tpf("subject=%3Fx&object=%3Fx").unwrap_err();
+        assert_eq!(error.code(), ErrorCode::MalformedRequest);
+        assert!(
+            serde_json::to_value(error).unwrap()["detail"]
+                .as_str()
+                .unwrap()
+                .contains("repeated variable")
+        );
+    }
+
+    #[test]
+    fn an_explicit_empty_tpf_values_table_is_not_silently_ignored() {
+        let normalized = Tpf::normalize_params(&params("values="));
+        let error = Tpf::parse(&normalized, limits(), &bundle()).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::MalformedRequest);
     }
 
     #[test]
@@ -4024,7 +4036,10 @@ mod tests {
 
     #[test]
     fn brtpf_values_are_parsed_by_sparql_and_keep_variable_names() {
-        let values = "(?person ?known) { (<http://example.org/alice> UNDEF) (UNDEF \"x\"@en) }";
+        // Stock brTPF clients carry upstream variables beside the variables
+        // consumed by this triple pattern. Preserve those columns as relation
+        // context while requiring at least one column to join this pattern.
+        let values = "(?person ?known ?upstream) { (<http://example.org/alice> UNDEF <http://example.org/context>) (UNDEF \"x\"@en UNDEF) }";
         let query = format!(
             "subject=%3Fperson&predicate={}&object=%3Fknown&values={}",
             crate::url::encode_value("http://example.org/knows"),

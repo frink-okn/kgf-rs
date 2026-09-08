@@ -59,6 +59,7 @@ use kgf_store::{
     Store, TermId,
 };
 
+use crate::access::AccessOperation;
 use crate::cursor::{Cursor, CursorBinding, CursorToken, PositionSpace, StaleCursor};
 use crate::envelope::{
     BudgetReason, Cardinality, Completeness, ErrorCode, Problem, TruncationReason,
@@ -91,7 +92,7 @@ use crate::url::{self, Mount, Params};
 #[derive(Debug, Clone)]
 pub struct Target {
     id: BundleId,
-    operation: &'static str,
+    operation: AccessOperation,
     params: Params,
     prefixes: PrefixMap,
     /// Where the deployment is mounted. Every link this answer renders — the
@@ -100,12 +101,19 @@ pub struct Target {
     mount: Mount,
     body: bool,
     has_search: bool,
-    /// Logical dataset identity from the immutable manifest, when declared.
-    dataset_iri: Option<String>,
+    /// Logical dataset identity and the description link this release can
+    /// actually answer, from the immutable manifest.
+    dataset: Option<DatasetMetadata>,
     /// The exact absolute GET URL received over HTTP. Hydra metadata keys its
     /// page controls by this IRI, so a merely equivalent canonical URL is not
     /// enough for an LDF client looking up controls for its request URL.
     request_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DatasetMetadata {
+    iri: String,
+    void_available: bool,
 }
 
 impl Target {
@@ -114,7 +122,7 @@ impl Target {
     /// mount its links are built against.
     pub fn new(
         id: BundleId,
-        operation: &'static str,
+        operation: AccessOperation,
         params: Params,
         prefixes: PrefixMap,
         mount: Mount,
@@ -125,7 +133,7 @@ impl Target {
     /// A GET target with the release capabilities its page may expose.
     pub(crate) fn get(
         id: BundleId,
-        operation: &'static str,
+        operation: AccessOperation,
         params: Params,
         prefixes: PrefixMap,
         mount: Mount,
@@ -141,20 +149,28 @@ impl Target {
             body: false,
             has_search,
             request_url,
-            dataset_iri: None,
+            dataset: None,
         }
     }
 
-    /// Attach the release's logical dataset identity for TPF metadata.
-    pub(crate) fn with_dataset_iri(mut self, dataset_iri: Option<&str>) -> Self {
-        self.dataset_iri = dataset_iri.map(str::to_owned);
+    /// Attach the release's logical dataset identity and whether its VoID
+    /// description is a real published capability.
+    pub(crate) fn with_dataset_metadata(
+        mut self,
+        dataset_iri: Option<&str>,
+        void_available: bool,
+    ) -> Self {
+        self.dataset = dataset_iri.map(|iri| DatasetMetadata {
+            iri: iri.to_owned(),
+            void_available,
+        });
         self
     }
 
     /// A body-addressed operation, whose request cannot be reconstructed as a link.
     pub fn body(
         id: BundleId,
-        operation: &'static str,
+        operation: AccessOperation,
         params: Params,
         prefixes: PrefixMap,
         mount: Mount,
@@ -168,7 +184,7 @@ impl Target {
             body: true,
             has_search: false,
             request_url: None,
-            dataset_iri: None,
+            dataset: None,
         }
     }
 
@@ -186,8 +202,11 @@ impl Target {
     /// [`origin`](Self::origin) for the absolute form: the origin is
     /// `scheme://authority` alone, so the prefix appears exactly once.
     fn base(&self) -> String {
-        self.mount
-            .operation(&self.id.dataset, &self.id.version, self.operation)
+        self.mount.operation(
+            &self.id.dataset,
+            &self.id.version,
+            self.operation.path_segment(),
+        )
     }
 
     /// The origin on which the request arrived.
@@ -225,7 +244,7 @@ impl Target {
                 let raw_name = pair.split_once('=').map_or(*pair, |(name, _)| name);
                 !matches!(
                     url::decode_component(raw_name).as_deref(),
-                    Some("cursor" | "limit")
+                    Some("cursor" | "limit" | "format")
                 )
             })
             .collect::<Vec<_>>()
@@ -247,7 +266,7 @@ impl Target {
     }
 
     fn is_tpf(&self) -> bool {
-        self.operation == "tpf"
+        self.operation == AccessOperation::Tpf
     }
 
     /// This response's URL, with the representation selector removed.
@@ -287,14 +306,16 @@ impl Target {
                 self.mount
                     .operation(&self.id.dataset, &self.id.version, "manifest"),
             ),
-            Crumb::here(self.operation),
+            Crumb::here(self.operation.path_segment()),
         ]
     }
 
     fn title(&self) -> String {
         format!(
             "{} — {} {}",
-            self.operation, self.id.dataset, self.id.version
+            self.operation.path_segment(),
+            self.id.dataset,
+            self.id.version
         )
     }
 
@@ -313,15 +334,20 @@ impl Target {
 
     fn operation_label(&self) -> &'static str {
         match self.operation {
-            "fragment" => "Fragment",
-            "tpf" => "Triple Pattern Fragment",
-            "count" => "Count",
-            "describe" => "Describe",
-            "sample" => "Sample",
-            "search" => "Search",
-            "schema" => "Schema",
-            "labels" => "Labels",
-            operation => operation,
+            AccessOperation::Fragment => "Fragment",
+            AccessOperation::Tpf => "Triple Pattern Fragment",
+            AccessOperation::Count => "Count",
+            AccessOperation::Describe => "Describe",
+            AccessOperation::Sample => "Sample",
+            AccessOperation::Search => "Search",
+            AccessOperation::Schema => "Schema",
+            AccessOperation::Labels => "Labels",
+            AccessOperation::Void => "void",
+            AccessOperation::Summary => "summary",
+            AccessOperation::Manifest => "manifest",
+            AccessOperation::Service => "service",
+            AccessOperation::Dataset => "dataset",
+            AccessOperation::Latest => "latest",
         }
     }
 
@@ -334,7 +360,7 @@ impl Target {
                 &self.mount,
                 &self.id.dataset,
                 &self.id.version,
-                self.operation,
+                self.operation.path_segment(),
                 &self.params,
                 self.has_search,
             )
@@ -759,8 +785,6 @@ pub struct Answer {
     rdf_cardinality: Option<Cardinality>,
     #[serde(skip)]
     byte_budget: u64,
-    #[serde(skip)]
-    page_limit: u32,
     #[serde(flatten)]
     completeness: Completeness,
     #[serde(skip)]
@@ -933,6 +957,11 @@ const HYDRA_VARIABLE_REPRESENTATION: &str =
 const HYDRA_EXPLICIT_REPRESENTATION: &str =
     "http://www.w3.org/ns/hydra/core#ExplicitRepresentation";
 
+struct TpfMetadata {
+    graph_name: NamedNode,
+    triples: Vec<Triple>,
+}
+
 impl Answer {
     /// Fit a finished RDF document, Hydra metadata included, to the response
     /// budget. One indivisible row may exceed the budget so a client can
@@ -1093,44 +1122,37 @@ impl Answer {
             }
         }
 
-        let metadata = if self.target.is_tpf() {
-            self.tpf_metadata(next_cursor)?
-        } else {
-            Vec::new()
-        };
+        let items_per_page = triples.len();
+        let metadata = self
+            .target
+            .is_tpf()
+            .then(|| self.tpf_metadata(next_cursor, items_per_page))
+            .transpose()?;
         let prefixes = [("kgfbn", self.blank_nodes.iri_prefix())];
         let serialized = match representation {
             Representation::Turtle => {
                 let mut graph = triples;
-                graph.extend(metadata);
+                if let Some(metadata) = metadata {
+                    graph.reserve(metadata.triples.len());
+                    graph.extend(metadata.triples);
+                }
                 serialize_graph(GraphFormat::Turtle, &graph, &prefixes)
             }
             Representation::NQuads | Representation::TriG | Representation::JsonLd => {
-                let graph_name = if self.target.is_tpf() {
-                    Some(metadata_iri(
-                        &format!(
-                            "{}#metadata",
-                            self.target.request_url.as_deref().ok_or_else(|| {
-                                Problem::new(
-                                    ErrorCode::InternalError,
-                                    "a TPF response needs the absolute request URL",
-                                )
-                            })?
-                        ),
-                        "the TPF metadata graph IRI",
-                    )?)
-                } else {
-                    None
-                };
-                let mut quads = Vec::with_capacity(triples.len() + metadata.len());
+                let metadata_len = metadata.as_ref().map_or(0, |value| value.triples.len());
+                let mut quads = Vec::with_capacity(triples.len() + metadata_len);
                 quads.extend(
                     triples
                         .into_iter()
                         .map(|triple| triple.in_graph(GraphName::DefaultGraph)),
                 );
-                if let Some(graph_name) = graph_name {
+                if let Some(metadata) = metadata {
+                    let TpfMetadata {
+                        graph_name,
+                        triples,
+                    } = metadata;
                     quads.extend(
-                        metadata
+                        triples
                             .into_iter()
                             .map(|triple| triple.in_graph(graph_name.clone())),
                     );
@@ -1155,7 +1177,11 @@ impl Answer {
     /// Build the TPF control graph. The caller decides whether the syntax can
     /// preserve its graph name; Turtle necessarily flattens these triples into
     /// its one graph, while N-Quads, TriG, and JSON-LD keep them named.
-    fn tpf_metadata(&self, next_cursor: Option<&str>) -> Result<Vec<Triple>, Problem> {
+    fn tpf_metadata(
+        &self,
+        next_cursor: Option<&str>,
+        items_per_page: usize,
+    ) -> Result<TpfMetadata, Problem> {
         let page = metadata_iri(
             self.target.request_url.as_deref().ok_or_else(|| {
                 Problem::new(
@@ -1212,7 +1238,7 @@ impl Answer {
         ];
         let mut triples = Vec::with_capacity(24);
         triples.push(Triple::new(
-            metadata_graph,
+            metadata_graph.clone(),
             metadata_iri(FOAF_PRIMARY_TOPIC, "foaf:primaryTopic")?,
             fragment.clone(),
         ));
@@ -1280,7 +1306,9 @@ impl Answer {
         triples.push(Triple::new(
             page.clone(),
             metadata_iri(HYDRA_ITEMS_PER_PAGE, "hydra:itemsPerPage")?,
-            Literal::from(u64::from(self.page_limit)),
+            Literal::from(
+                u64::try_from(items_per_page).expect("a page length is representable as u64"),
+            ),
         ));
         if let Some(cursor) = next_cursor {
             triples.push(Triple::new(
@@ -1297,28 +1325,33 @@ impl Answer {
                 )?,
             ));
         }
-        if let Some(dataset_iri) = &self.target.dataset_iri {
-            let logical = metadata_iri(dataset_iri, "the manifest dataset IRI")?;
+        if let Some(dataset_metadata) = &self.target.dataset {
+            let logical = metadata_iri(&dataset_metadata.iri, "the manifest dataset IRI")?;
             triples.push(Triple::new(
-                page,
+                page.clone(),
                 metadata_iri(VOID_IN_DATASET, "void:inDataset")?,
                 logical.clone(),
             ));
-            triples.push(Triple::new(
-                logical,
-                metadata_iri(RDFS_SEE_ALSO, "rdfs:seeAlso")?,
-                metadata_iri(
-                    &self.target.absolute_void().ok_or_else(|| {
-                        Problem::new(
-                            ErrorCode::InternalError,
-                            "a TPF description link needs the request origin",
-                        )
-                    })?,
-                    "the VoID description URL",
-                )?,
-            ));
+            if dataset_metadata.void_available {
+                triples.push(Triple::new(
+                    logical,
+                    metadata_iri(RDFS_SEE_ALSO, "rdfs:seeAlso")?,
+                    metadata_iri(
+                        &self.target.absolute_void().ok_or_else(|| {
+                            Problem::new(
+                                ErrorCode::InternalError,
+                                "a TPF description link needs the request origin",
+                            )
+                        })?,
+                        "the VoID description URL",
+                    )?,
+                ));
+            }
         }
-        Ok(triples)
+        Ok(TpfMetadata {
+            graph_name: metadata_graph,
+            triples,
+        })
     }
 }
 
@@ -4308,7 +4341,6 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         row_binding: None,
         rdf_cardinality: None,
         byte_budget: request.bytes.0,
-        page_limit: request.n,
         vars,
         // A sample stops for one reason only. It is not paged, so `n` is what
         // it returns unless the bundle's own literals spend the byte budget
@@ -5067,7 +5099,6 @@ fn finish(
         row_binding: Some(paging.binding.clone()),
         rdf_cardinality: None,
         byte_budget: paging.bytes.0,
-        page_limit: paging.limit,
         vars,
         completeness,
         directed,
@@ -6143,12 +6174,14 @@ impl Answer {
     /// The fields above the table: what was asked, and how much of it came back.
     fn summary<'a>(&'a self, completeness: &'a str) -> Vec<(&'a str, Value<'a>)> {
         let mut summary = match &self.echo {
-            Echo::Fragment { pattern } => pattern_fields(pattern),
-            Echo::BindingsFragment { pattern } => binding_pattern_fields(pattern),
+            Echo::Fragment { pattern } => pattern_fields(pattern, self.target.operation),
+            Echo::BindingsFragment { pattern } => {
+                binding_pattern_fields(pattern, self.target.operation)
+            }
             Echo::Describe { direction, .. } => {
                 vec![("direction", Value::Text(direction.as_str()))]
             }
-            Echo::Sample { pattern, .. } => pattern_fields(pattern),
+            Echo::Sample { pattern, .. } => pattern_fields(pattern, self.target.operation),
         };
         summary.push(("cardinality", Value::Number(self.cardinality.value())));
         summary.push(("returned", Value::Number(self.rows.len() as u64)));
@@ -6461,7 +6494,7 @@ impl Resource for CountAnswer {
     }
 
     fn to_html(&self) -> String {
-        let mut summary = pattern_fields(&self.pattern);
+        let mut summary = pattern_fields(&self.pattern, self.target.operation);
         summary.push(("count", Value::Number(self.count.value())));
         summary.push((
             "exact",
@@ -6542,7 +6575,7 @@ impl Resource for BindingCountAnswer {
             canonical.as_deref(),
             html! {
                 div."answer-summary" {
-                    (fields(&binding_pattern_fields(&self.pattern)))
+                    (fields(&binding_pattern_fields(&self.pattern, self.target.operation)))
                 }
                 section."section-block" {
                     h2 { "Counts" }
@@ -6558,12 +6591,12 @@ impl Resource for BindingCountAnswer {
 }
 
 /// The three pattern positions, as page fields.
-fn pattern_fields(pattern: &Pattern) -> Vec<(&str, Value<'_>)> {
+fn pattern_fields(pattern: &Pattern, operation: AccessOperation) -> Vec<(&str, Value<'_>)> {
     let mut fields: Vec<_> = Position::ALL
         .into_iter()
         .map(|position| {
             (
-                position.as_str(),
+                pattern_parameter(position, operation),
                 pattern
                     .bound(position)
                     .map_or(Value::Text("(any)"), |term| Value::Code(term.requested())),
@@ -6576,11 +6609,27 @@ fn pattern_fields(pattern: &Pattern) -> Vec<(&str, Value<'_>)> {
     fields
 }
 
-fn binding_pattern_fields(pattern: &BindingPattern) -> Vec<(&str, Value<'_>)> {
+fn binding_pattern_fields(
+    pattern: &BindingPattern,
+    operation: AccessOperation,
+) -> Vec<(&str, Value<'_>)> {
     Position::ALL
         .into_iter()
-        .map(|position| (position.as_str(), Value::Code(pattern.requested(position))))
+        .map(|position| {
+            (
+                pattern_parameter(position, operation),
+                Value::Code(pattern.requested(position)),
+            )
+        })
         .collect()
+}
+
+fn pattern_parameter(position: Position, operation: AccessOperation) -> &'static str {
+    if operation == AccessOperation::Tpf {
+        position.tpf_parameter()
+    } else {
+        position.as_str()
+    }
 }
 
 /// Render one RDF term with this release's prefix map and the same drill-down

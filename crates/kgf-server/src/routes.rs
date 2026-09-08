@@ -1043,14 +1043,14 @@ where
 
     let target = Target::get(
         id,
-        operation.path_segment(),
+        operation,
         params,
         release.prefixes().clone(),
         service.mount().clone(),
         release.declares(Capability::Search),
         wants.request_url.clone(),
     )
-    .with_dataset_iri(release.dataset_iri());
+    .with_dataset_metadata(release.dataset_iri(), release.carries_description());
     let labels = PageLabelProfile::for_request(
         &service,
         release,
@@ -1138,14 +1138,14 @@ where
 
     let target = Target::get(
         id,
-        operation.path_segment(),
+        operation,
         params,
         release.prefixes().clone(),
         service.mount().clone(),
         release.declares(Capability::Search),
         wants.request_url.clone(),
     )
-    .with_dataset_iri(release.dataset_iri());
+    .with_dataset_metadata(release.dataset_iri(), release.carries_description());
     let opened = Arc::clone(&service);
     let timed = blocking(&service, work_class, move || {
         let (store, open) = opened.open_observed(target.id())?;
@@ -1319,7 +1319,7 @@ where
 
     let target = Target::body(
         id,
-        operation.path_segment(),
+        operation,
         wants.params().clone(),
         release.prefixes().clone(),
         service.mount().clone(),

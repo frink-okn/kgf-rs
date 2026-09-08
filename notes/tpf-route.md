@@ -108,7 +108,7 @@ layer, as it does today.
 
 | Value | Term |
 |---|---|
-| empty, or `?` followed by word characters | variable (the TPF spec's two spellings) |
+| empty, or `?` followed by a SPARQL variable name | variable (the TPF spec's two spellings) |
 | `"lex"` | plain literal |
 | `"lex"@tag` | language-tagged literal; the tag is validated as today |
 | `"lex"^^IRI` | typed literal, datatype **bare**; `^^http://www.w3.org/2001/XMLSchema#string` folds to plain as `KgfLiteral::typed` already does |
@@ -116,10 +116,13 @@ layer, as it does today.
 
 Rules that follow from "nothing else":
 
-- No CURIEs. The prefix map is not consulted on this route, so `urn:…`, `doi:…`,
-  `mailto:…`, and KGF's own `urn:fdc:…` skolem IRIs parse as the IRIs they are.
+- No CURIE expansion. The prefix map is not consulted on this route, so every token
+  accepted by `NamedNode::new` is interpreted literally as an absolute IRI. That
+  includes `urn:…`, `doi:…`, `mailto:…`, KGF's own `urn:fdc:…` skolem IRIs, and
+  syntactically indistinguishable spellings such as `rdfs:label` or `ex:knows`.
 - No brackets. An IRI cannot contain `<`, so `<http://…>` fails `NamedNode::new` and the
-  400 says so: "this is the TPF route; angle brackets and CURIEs belong to `/fragment`".
+  400 says so: "this is the TPF route; angle brackets belong to `/fragment`, and prefix
+  expansion never occurs here".
 - The lexical form is everything between the opening quote and the closing quote that
   precedes `@`, `^^`, or the end of the value. Hydra says the form "requires no
   escaping"; a value that opens a quote and never closes it is a 400.
@@ -134,7 +137,13 @@ being ignored, and the brTPF distinct-RDF projection is the only projection this
 has (`distinct_rdf` is always true here; native JSON's binding relation is a
 `/fragment` body-transport concern). Extra columns are retained because Comunica sends
 upstream join variables alongside the column used by the current pattern; they cannot
-affect the distinct-RDF result.
+affect the distinct-RDF result. An explicitly present but empty `values=` is malformed
+rather than silently normalized away: no submitted constraint is ignored.
+
+A repeated variable in a plain pattern (for example `subject=?x&object=?x`) is refused:
+testing equality would require an unbudgeted scan through rejected candidates. The
+same shape is accepted through `values=` only when every input row binds the repeated
+variable, which reduces it to an ordinary bounded lookup.
 
 ### Representations
 
@@ -154,7 +163,7 @@ Data triples in the default graph. Metadata and controls in one named graph,
 
 ```
 <U#metadata> {
-  <U#metadata>  foaf:primaryTopic  <F> .            # F = U without cursor and limit; on a first page F = U
+  <U#metadata>  foaf:primaryTopic  <F> .            # F = U without cursor, limit, or format
   <F>           void:subset        <U> .
   <D>           void:subset        <F> .            # D = the tpf resource of this release
   <D>           a void:Dataset ;
@@ -166,10 +175,10 @@ Data triples in the default graph. Metadata and controls in one named graph,
                                 [ hydra:variable "object" ;    hydra:property rdf:object ]
                 ] .
   <U>           hydra:totalItems  N ;                 # exact, as today; the brTPF estimate rule unchanged
-                hydra:itemsPerPage limit ;
+                hydra:itemsPerPage returned ;          # distinct data triples actually serialized
                 hydra:next        <U'> .              # present only when the page is incomplete
-  <U>           void:inDataset    <dataset_iri> .     # the manifest's dataset IRI, which /void describes
-  <dataset_iri> rdfs:seeAlso      <…/void> .
+  <U>           void:inDataset    <dataset_iri> .     # when the manifest declares an identity
+  <dataset_iri> rdfs:seeAlso      <…/void> .          # only when /void is published
 }
 ```
 
@@ -230,8 +239,9 @@ Each step is a mergeable unit with its own tests; none needs a fixture change.
    spec's own examples (`http://example.org/bar`, `"my text"`, `"my text"@en-gb`,
    `"42"^^http://www.w3.org/2001/XMLSchema#integer`); `?s` and empty as variables;
    `urn:uuid:…`, `doi:10.1000/x`, and a `urn:fdc:…` skolem IRI as IRIs; `<http://…>`,
-   `rdfs:label`, `"a"^^xsd:date`, and an unclosed quote as 400s with the route-specific
-   hint; `"a"^^http://www.w3.org/2001/XMLSchema#string` folding to plain; the term cap.
+   and an unclosed quote as 400s with the route-specific hint; `rdfs:label` and
+   `"a"^^xsd:date` as literal absolute-IRI spellings with no prefix expansion;
+   `"a"^^http://www.w3.org/2001/XMLSchema#string` folding to plain; the term cap.
 2. **Quad formats** — `rdf.rs` gains `DatasetFormat::{NQuads, TriG, JsonLd}` and
    `serialize_dataset`; `representation.rs` gains the two variants; the round-trip test
    parses every format back through `oxrdfio::RdfParser` including the named graph.

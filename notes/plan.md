@@ -1671,6 +1671,17 @@ representation, refuses GET variables and `values=`, and emits data-only RDF. Pr
 names that collide with the URI schemes listed in the work plan are refused when a
 manifest is opened.
 
+Post-implementation review tightened the boundary without changing the route shape:
+plain repeated variables are refused unless `values=` bounds them; TPF terms are any
+literal absolute IRI accepted by the RDF library (including CURIE-looking schemes,
+which are never expanded); the fragment identity excludes `format` as well as paging
+controls; `hydra:itemsPerPage` reports the distinct data triples actually serialized;
+and `rdfs:seeAlso` is emitted only when the release really publishes `/void`.
+`Target` now carries the typed operation, and the metadata graph IRI is constructed
+once and reused for serialization. Published manifests remain validated at the server
+catalog boundary; `Store` deliberately continues to admit the `{}` placeholder used
+while an offline bundle is being assembled.
+
 *Verified by* the parser's specification-example tests, `oxrdfio` round trips of every
 format including JSON-LD's named graph, real-listener tests of the document, route
 separation, cursor separation, and `/fragment` refusals, plus the pinned Comunica suite
@@ -2566,7 +2577,11 @@ following the code.
     that bare IRIs are the TPF route's grammar; §3.5 should carry `/tpf` with
     `/fragment`'s cost and question 45's RDF-fitting term; and doc 06 §6.4 should type
     Comunica sources as `brtpf` on `…/tpf` and describe `void:inDataset` discovery for
-    the selectivity actor. Found by the public-deployment evaluation in `../kgf-sparql`.
+    the selectivity actor. The grammar should say that CURIE-looking strings such as
+    `rdfs:label` are valid absolute IRIs by syntax and are taken literally: without a
+    prefix map, `ExplicitRepresentation` cannot distinguish them from custom URI
+    schemes, and `/tpf` deliberately performs no prefix expansion. Found by the
+    public-deployment evaluation in `../kgf-sparql` and implementation review.
 
 ## Not in this plan
 
