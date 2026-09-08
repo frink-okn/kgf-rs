@@ -1388,6 +1388,18 @@ mod tests {
     }
 
     #[test]
+    fn scheme_named_prefixes_remain_valid_bundle_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        for prefix in ["doi", "urn", "tag", "data", "file", "geo"] {
+            let mut manifest = sample_manifest(sample_counts());
+            manifest
+                .prefixes
+                .insert(prefix.to_owned(), "http://example.org/".to_owned());
+            manifest.validate(dir.path()).unwrap();
+        }
+    }
+
+    #[test]
     fn description_view_directories_are_typed_and_all_or_none() {
         let dir = tempfile::tempdir().unwrap();
         let mut manifest = sample_manifest(sample_counts());

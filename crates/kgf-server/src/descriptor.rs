@@ -87,6 +87,7 @@ pub struct DatasetSummary<'a> {
 pub struct ReleaseLinks {
     manifest: String,
     fragment: String,
+    tpf: String,
     count: String,
     describe: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -398,6 +399,9 @@ impl Resource for DatasetDescriptor<'_> {
                         a href=(&current_links.fragment) {
                             "Browse the data →"
                         }
+                        a href=(&current_links.tpf) {
+                            "Use TPF →"
+                        }
                         a href=(&current_links.manifest) {
                             "Latest manifest →"
                         }
@@ -453,6 +457,7 @@ fn release_links(
     ReleaseLinks {
         manifest: operation("manifest"),
         fragment: operation("fragment"),
+        tpf: operation("tpf"),
         count: operation("count"),
         describe: operation("describe"),
         summary: description.then(|| operation("summary")),
@@ -708,6 +713,11 @@ fn operations(
     };
     let mut operations = vec![
         ("fragment", pattern_parameters, true),
+        (
+            "tpf",
+            "subject, predicate, object, values, limit, cursor",
+            true,
+        ),
         ("count", count_parameters, true),
         ("describe", "iri, direction, limit, cursor", false),
     ];
@@ -841,6 +851,7 @@ mod tests {
         // And onward into the data: a browser needs one link that works with
         // no arguments, or the API is only reachable by typing URLs.
         assert!(page.contains("href=\"/tox/v/2026-06-01/fragment\""));
+        assert!(page.contains("href=\"/tox/v/2026-06-01/tpf\""));
         assert!(page.contains("href=\"/tox/v/2026-06-01/count\""));
         // `/describe` is named without a link, because it needs a resource and
         // a link that 400s is worse than none.

@@ -31,6 +31,7 @@ pub(crate) fn manifest_forms(
         }
         div."query-stack" {
             (fragment(mount, dataset, version, &empty, search, true))
+            (tpf(mount, dataset, version, &empty, false))
             (count(mount, dataset, version, &empty, search, false))
             (describe(mount, dataset, version, &empty, false))
             @if manifest.declares(Capability::Sample) {
@@ -54,6 +55,7 @@ pub(crate) fn operation_form(
 ) -> Option<Markup> {
     let form = match operation {
         "fragment" => Some(fragment(mount, dataset, version, params, has_search, false)),
+        "tpf" => Some(tpf(mount, dataset, version, params, false)),
         "count" => Some(count(mount, dataset, version, params, has_search, false)),
         "describe" => Some(describe(mount, dataset, version, params, false)),
         "sample" => Some(sample(mount, dataset, version, params, false)),
@@ -61,6 +63,48 @@ pub(crate) fn operation_form(
         _ => None,
     }?;
     Some(html! { div."query-stack" { (form) } })
+}
+
+fn tpf(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
+    let controls = vec![
+        term_control(
+            "tpf",
+            "subject",
+            "Subject",
+            params.get("subject"),
+            "http://example.org/subject",
+        ),
+        term_control(
+            "tpf",
+            "predicate",
+            "Predicate",
+            params.get("predicate"),
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+        ),
+        term_control(
+            "tpf",
+            "object",
+            "Object",
+            params.get("object"),
+            "http://example.org/object or \"text\"@en",
+        ),
+        number_control(
+            "tpf",
+            "limit",
+            "Rows",
+            params.get("limit"),
+            1,
+            "server default",
+        ),
+    ];
+    form(
+        "TPF",
+        "Browse the standard Triple Pattern Fragments interface. IRIs are bare, not CURIEs or angle-bracketed.",
+        mount.operation(dataset, version, "tpf"),
+        controls,
+        "Find triples",
+        open,
+    )
 }
 
 fn fragment(
@@ -406,6 +450,7 @@ mod tests {
         let core = manifest_forms(&Mount::default(), "tox", "v1", &manifest(&[])).into_string();
         assert!(core.contains("class=\"query-stack\""));
         assert!(core.contains("action=\"/tox/v/v1/fragment\""));
+        assert!(core.contains("action=\"/tox/v/v1/tpf\""));
         assert!(core.contains("action=\"/tox/v/v1/count\""));
         assert!(core.contains("action=\"/tox/v/v1/describe\""));
         assert!(!core.contains("action=\"/tox/v/v1/sample\""));
@@ -451,7 +496,7 @@ mod tests {
             &manifest(&[Capability::Sample, Capability::Search]),
         )
         .into_string();
-        for operation in ["fragment", "count", "describe", "sample", "search"] {
+        for operation in ["fragment", "tpf", "count", "describe", "sample", "search"] {
             assert!(
                 rendered.contains(&format!("action=\"/kgf/tox/v/v1/{operation}\"")),
                 "{operation}"

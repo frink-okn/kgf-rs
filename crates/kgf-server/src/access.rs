@@ -295,6 +295,8 @@ impl Drop for QueuedLines {
 pub enum AccessOperation {
     /// Triple-pattern enumeration.
     Fragment,
+    /// Triple Pattern Fragments compatibility resource.
+    Tpf,
     /// Cardinality lookup.
     Count,
     /// Resource neighborhood.
@@ -330,6 +332,7 @@ impl AccessOperation {
     pub fn path_segment(self) -> &'static str {
         match self {
             Self::Fragment => "fragment",
+            Self::Tpf => "tpf",
             Self::Count => "count",
             Self::Describe => "describe",
             Self::Sample => "sample",
@@ -985,6 +988,7 @@ fn operation_for_route(route: &str) -> Option<AccessOperation> {
         "/{dataset}/latest/{*rest}" => Some(AccessOperation::Latest),
         "/{dataset}/v/{version}/manifest" => Some(AccessOperation::Manifest),
         "/{dataset}/v/{version}/fragment" => Some(AccessOperation::Fragment),
+        "/{dataset}/v/{version}/tpf" => Some(AccessOperation::Tpf),
         "/{dataset}/v/{version}/count" => Some(AccessOperation::Count),
         "/{dataset}/v/{version}/describe" => Some(AccessOperation::Describe),
         "/{dataset}/v/{version}/sample" => Some(AccessOperation::Sample),

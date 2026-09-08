@@ -40,6 +40,15 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 use crate::envelope::{ErrorCode, Problem, reflected};
+use crate::rdf::{DatasetFormat, GraphFormat};
+
+/// Whether an RDF representation serializes one graph or a dataset whose
+/// graph names remain visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RdfSyntax {
+    Graph(GraphFormat),
+    Dataset(DatasetFormat),
+}
 
 /// A serialization this server can produce.
 ///
@@ -50,6 +59,10 @@ use crate::envelope::{ErrorCode, Problem, reflected};
 pub enum Representation {
     /// KGF's own JSON envelope, and the manifest as published.
     Json,
+    /// N-Quads RDF dataset.
+    NQuads,
+    /// TriG RDF dataset.
+    TriG,
     /// A page, for reading the same resource in a browser.
     Html,
     /// Turtle RDF, serialized by `oxrdfio` from the resource's RDF graph.
@@ -67,9 +80,21 @@ impl Representation {
     /// The native and RDF representations of the fragment resource.
     ///
     /// JSON remains first so an unconstrained client still receives KGF's
-    /// richer envelope. TPF/brTPF clients name an RDF media type explicitly.
+    /// richer envelope.
     pub const FRAGMENT: &'static [Representation] = &[
         Representation::Json,
+        Representation::NQuads,
+        Representation::TriG,
+        Representation::Turtle,
+        Representation::JsonLd,
+        Representation::Html,
+    ];
+
+    /// The TPF document, with quad syntaxes preferred so clients can separate
+    /// control metadata from result data.
+    pub const TPF: &'static [Representation] = &[
+        Representation::NQuads,
+        Representation::TriG,
         Representation::Turtle,
         Representation::JsonLd,
         Representation::Html,
@@ -89,10 +114,31 @@ impl Representation {
         Representation::Html,
     ];
 
+    /// Whether this representation is an RDF graph or dataset syntax.
+    pub const fn is_rdf(self) -> bool {
+        self.rdf_syntax().is_some()
+    }
+
+    /// The RDF serializer selected by this representation.
+    pub(crate) const fn rdf_syntax(self) -> Option<RdfSyntax> {
+        match self {
+            Self::NQuads => Some(RdfSyntax::Dataset(DatasetFormat::NQuads)),
+            Self::TriG => Some(RdfSyntax::Dataset(DatasetFormat::TriG)),
+            Self::Turtle => Some(RdfSyntax::Graph(GraphFormat::Turtle)),
+            // Fragment JSON-LD is dataset-shaped so a TPF control graph keeps
+            // its name. Graph-only resources still select GraphFormat
+            // directly at their own boundary.
+            Self::JsonLd => Some(RdfSyntax::Dataset(DatasetFormat::JsonLd)),
+            Self::Json | Self::Html | Self::Markdown => None,
+        }
+    }
+
     /// The media type `Accept` names it by, without parameters.
     pub fn media_type(self) -> &'static str {
         match self {
             Self::Json => "application/json",
+            Self::NQuads => "application/n-quads",
+            Self::TriG => "application/trig",
             Self::Html => "text/html",
             Self::Turtle => "text/turtle",
             Self::JsonLd => "application/ld+json",
@@ -115,6 +161,8 @@ impl Representation {
     pub fn content_type(self) -> &'static str {
         match self {
             Self::Json => "application/json",
+            Self::NQuads => "application/n-quads; charset=utf-8",
+            Self::TriG => "application/trig; charset=utf-8",
             Self::Html => "text/html; charset=utf-8",
             Self::Turtle => "text/turtle; charset=utf-8",
             Self::JsonLd => "application/ld+json",
@@ -130,6 +178,8 @@ impl Representation {
     pub fn token(self) -> &'static str {
         match self {
             Self::Json => "json",
+            Self::NQuads => "nq",
+            Self::TriG => "trig",
             Self::Html => "html",
             Self::Turtle => "ttl",
             Self::JsonLd => "jsonld",
@@ -141,6 +191,8 @@ impl Representation {
     pub fn label(self) -> &'static str {
         match self {
             Self::Json => "JSON",
+            Self::NQuads => "N-Quads",
+            Self::TriG => "TriG",
             Self::Html => "HTML",
             Self::Turtle => "Turtle",
             Self::JsonLd => "JSON-LD",
@@ -152,6 +204,8 @@ impl Representation {
     fn from_token(token: &str) -> Option<Self> {
         match token {
             "json" => Some(Self::Json),
+            "nq" => Some(Self::NQuads),
+            "trig" => Some(Self::TriG),
             "html" => Some(Self::Html),
             "ttl" => Some(Self::Turtle),
             "jsonld" => Some(Self::JsonLd),
@@ -569,6 +623,10 @@ mod tests {
         assert_eq!(negotiate(None, None, JSON), Ok(Representation::Json));
         assert_eq!(negotiate(None, Some(""), JSON), Ok(Representation::Json));
         assert_eq!(negotiate(None, Some("*/*"), JSON), Ok(Representation::Json));
+        assert_eq!(
+            negotiate(None, Some("*/*"), Representation::TPF),
+            Ok(Representation::NQuads)
+        );
     }
 
     #[test]
@@ -734,6 +792,8 @@ mod tests {
         );
 
         for (token, expected, offered) in [
+            ("nq", Representation::NQuads, Representation::TPF),
+            ("trig", Representation::TriG, Representation::TPF),
             ("ttl", Representation::Turtle, Representation::VOID),
             ("jsonld", Representation::JsonLd, Representation::VOID),
             ("html", Representation::Html, Representation::VOID),
@@ -815,8 +875,16 @@ mod tests {
             "b3:00112233445566778899aabbccddeeff",
         ] {
             let digest = ContentDigest::parse(text).expect(text);
-            for representation in Representation::ALL {
-                let tag = etag(&digest, &digest, *representation);
+            for representation in [
+                Representation::Json,
+                Representation::NQuads,
+                Representation::TriG,
+                Representation::Html,
+                Representation::Turtle,
+                Representation::JsonLd,
+                Representation::Markdown,
+            ] {
+                let tag = etag(&digest, &digest, representation);
                 headers::HeaderMapExt::typed_insert(&mut map, tag.clone());
                 assert_eq!(
                     headers::HeaderMapExt::typed_get::<ETag>(&map).as_ref(),

@@ -107,6 +107,7 @@ pub fn router(service: Arc<Service>) -> Router {
                 .post(fragment_bindings_post)
                 .fallback(fragment_fallback),
         )
+        .route("/{dataset}/v/{version}/tpf", read(get(tpf)))
         .route(
             "/{dataset}/v/{version}/count",
             get(count)
@@ -250,7 +251,7 @@ async fn no_such_route(
         ErrorCode::NotFound,
         format!(
             "no resource at {}; this server serves {prefix}/ (service descriptor), \
-             {prefix}/{{dataset}}, and {prefix}/{{dataset}}/v/{{version}}/{{manifest,fragment,\
+             {prefix}/{{dataset}}, and {prefix}/{{dataset}}/v/{{version}}/{{manifest,fragment,tpf,\
              count,describe,sample,search,labels,schema,void,summary}}; version resources \
              are also available under {prefix}/{{dataset}}/latest/{hint}",
             reflected(&mount.public_path(path))
@@ -451,23 +452,44 @@ async fn fragment(
             wants,
             Representation::FRAGMENT,
             |params, limits, release, representation| {
-                let request = request::GetFragment::parse(
+                let request = request::Fragment::parse_represented(
                     params,
                     limits,
                     release.prefixes(),
                     &release.binding(),
-                    matches!(
-                        representation,
-                        Representation::Turtle | Representation::JsonLd
-                    ),
+                    representation.is_rdf(),
                 )?;
-                declares_search(release, request.text().is_some())?;
+                declares_search(release, request.pattern.text().is_some())?;
                 Ok(request)
             },
-            answer::get_fragment,
+            answer::fragment,
         )
         .await,
     )
+}
+
+async fn tpf(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate_represented(
+        service,
+        BundleId { dataset, version },
+        AccessOperation::Tpf,
+        wants,
+        Representation::TPF,
+        |params, limits, release, representation| {
+            request::Tpf::parse_represented(
+                params,
+                limits,
+                &release.binding(),
+                representation.is_rdf(),
+            )
+        },
+        answer::tpf,
+    )
+    .await
 }
 
 async fn count(
@@ -983,14 +1005,10 @@ where
     E: FnOnce(&kgf_store::Store, Target, &Q) -> Result<A, Problem> + Send + 'static,
 {
     let representation = wants.representation_from(offered)?;
-    if matches!(
-        representation,
-        Representation::Turtle | Representation::JsonLd
-    ) && wants.request_url.is_none()
-    {
+    if operation == AccessOperation::Tpf && representation.is_rdf() && wants.request_url.is_none() {
         return Err(Problem::new(
             ErrorCode::MalformedRequest,
-            "an RDF fragment request requires an absolute request target or a valid Host header",
+            "a TPF RDF request requires an absolute request target or a valid Host header",
         ));
     }
     let release = service.datasets().release(&id.dataset, &id.version)?;
@@ -1030,13 +1048,14 @@ where
 
     let target = Target::get(
         id,
-        operation.path_segment(),
+        operation,
         params,
         release.prefixes().clone(),
         service.mount().clone(),
         release.declares(Capability::Search),
         wants.request_url.clone(),
-    );
+    )
+    .with_dataset_metadata(release.dataset_iri(), release.carries_description());
     let labels = PageLabelProfile::for_request(
         &service,
         release,
@@ -1124,13 +1143,14 @@ where
 
     let target = Target::get(
         id,
-        operation.path_segment(),
+        operation,
         params,
         release.prefixes().clone(),
         service.mount().clone(),
         release.declares(Capability::Search),
         wants.request_url.clone(),
-    );
+    )
+    .with_dataset_metadata(release.dataset_iri(), release.carries_description());
     let opened = Arc::clone(&service);
     let timed = blocking(&service, work_class, move || {
         let (store, open) = opened.open_observed(target.id())?;
@@ -1304,7 +1324,7 @@ where
 
     let target = Target::body(
         id,
-        operation.path_segment(),
+        operation,
         wants.params().clone(),
         release.prefixes().clone(),
         service.mount().clone(),
@@ -1464,7 +1484,7 @@ pub struct Wants {
     accept: Option<String>,
     if_none_match: Option<IfNoneMatch>,
     /// Exact absolute URL as the client addressed it, when the request carries
-    /// a usable authority. Fragment RDF needs this for Hydra's page subject.
+    /// a usable authority. TPF RDF needs this for Hydra's page subject.
     request_url: Option<String>,
 }
 
@@ -1621,7 +1641,11 @@ fn respond(
     let body = match representation {
         Representation::Json => resource.to_json(),
         Representation::Html => bytes::Bytes::from(resource.to_html()),
-        Representation::Turtle | Representation::JsonLd | Representation::Markdown => {
+        Representation::NQuads
+        | Representation::TriG
+        | Representation::Turtle
+        | Representation::JsonLd
+        | Representation::Markdown => {
             unreachable!("Resource responses negotiate only JSON and HTML")
         }
     };
@@ -1926,7 +1950,11 @@ async fn render_problems(
             Representation::Html.content_type(),
             bytes::Bytes::from(problem.to_html(mount)),
         ),
-        Representation::Turtle | Representation::JsonLd | Representation::Markdown => {
+        Representation::NQuads
+        | Representation::TriG
+        | Representation::Turtle
+        | Representation::JsonLd
+        | Representation::Markdown => {
             unreachable!("problem negotiation resolves to JSON or HTML")
         }
     };
@@ -2184,6 +2212,8 @@ mod tests {
         // the `hydra:next` that continuation is spelled with.
         for representation in [
             Representation::Json,
+            Representation::NQuads,
+            Representation::TriG,
             Representation::Turtle,
             Representation::JsonLd,
             Representation::Markdown,

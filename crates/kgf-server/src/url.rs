@@ -11,7 +11,9 @@
 //! the path into a query string, a `#` would truncate it at the client, and a
 //! `%` would make the next two characters an escape.
 
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use percent_encoding::{
+    AsciiSet, CONTROLS, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode,
+};
 
 use crate::envelope::{ErrorCode, Problem, reflected};
 
@@ -39,6 +41,30 @@ pub fn encode_segment(segment: &str) -> String {
 /// one as a space. Everything else the set escapes is escaped for free.
 pub fn encode_value(value: &str) -> String {
     utf8_percent_encode(value, RESERVED_IN_SEGMENT).to_string()
+}
+
+/// Make an absolute HTTP request URL safe to use as an RDF IRI.
+///
+/// HTTP request targets admitted by the URI parser may still contain ASCII
+/// characters that RDF's IRI grammar excludes. Preserve the client's page
+/// identity while escaping only those characters; existing percent escapes
+/// remain untouched.
+const RDF_IRI_UNSAFE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+pub(crate) fn encode_rdf_iri(value: &str) -> String {
+    utf8_percent_encode(value, RDF_IRI_UNSAFE).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +409,14 @@ mod tests {
 
         assert_eq!(Params::parse(None).unwrap().get("s"), None);
         assert_eq!(Params::parse(Some("")).unwrap().get("s"), None);
+    }
+
+    #[test]
+    fn request_urls_are_escaped_only_where_rdf_iri_syntax_requires_it() {
+        assert_eq!(
+            encode_rdf_iri("http://example.org/tpf?values=(?o){(\"[x]\")}&x=%5Bok%5D"),
+            "http://example.org/tpf?values=(?o)%7B(%22%5Bx%5D%22)%7D&x=%5Bok%5D"
+        );
     }
 
     #[test]
