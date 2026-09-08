@@ -52,7 +52,8 @@ cache), `envelope` (§3.6's completeness vocabulary and RFC 9457 errors),
 `representation` (negotiation, caching, ETags), `html`, and `request` (§3.4's parameters
 in, typed requests out) — over a real axum listener serving doc 03 §3.2's URL space:
 `/`, `/{dataset}`, the `latest` redirect, `/manifest`, and the four read operations
-`/fragment`, `/count`, `/describe` and `/sample` in `answer`. Bindings-restricted
+`/fragment`, `/count`, `/describe` and `/sample` in `answer`, plus the dedicated
+`/tpf` route carrying TPF and brTPF. Bindings-restricted
 QUERY and POST are implemented on `/fragment`, with per-binding QUERY/POST `/count`.
 The mapped description surface answers `/schema`, RDF `/void`, and persisted
 `/summary`. `kgf build` assembles a whole bundle from one config — HDT and
@@ -82,9 +83,10 @@ than forcing those resources into the default JSON representation.
 returning a plausible wrong answer. Do not replace one with a stub that returns a
 default.
 
-**`notes/plan.md` is the implementation route** — units 1–23, all complete, through
+**`notes/plan.md` is the implementation route** — units 1–25, all complete, through
 doc 20 §20.8's M1, search, bindings, the description surface, the bundle builder,
-request logging, and serving under a path prefix, plus the decisions each one had to make and the **Questions for `../kgf`**
+request logging, serving under a path prefix, the dedicated `/tpf` route, and the
+admission policy, plus the decisions each one had to make and the **Questions for `../kgf`**
 that implementation surfaced. It is kept current; read it before planning work.
 `notes/state.md` is a point-in-time handoff, written at a moment and not maintained
 afterwards, so where the two disagree about what exists, `plan.md` and the code win.

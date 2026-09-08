@@ -965,8 +965,15 @@ impl Answer {
     /// always advance past it.
     ///
     /// Worst case is `Z·(1 + log limit)` serialized bytes: one complete
-    /// candidate document plus bounded complete-prefix probes. RDF fragments
-    /// are therefore admitted as heavy work.
+    /// candidate document plus bounded complete-prefix probes. In practice the
+    /// probes never run at the default budgets, because [`materialize`] has
+    /// already trimmed the page to `max_response_bytes` measured as compact
+    /// JSON and every RDF serialization of those rows is smaller than that
+    /// measure — so the first complete document fits and returns. The search
+    /// below is the guard for the case where it does not: an operator holding
+    /// `max_response_bytes` low enough that it, rather than `limit`, is what
+    /// ends a page. Admission classes this operation by its page, not by this
+    /// worst case; see `WorkClass`.
     fn fit_fragment_rdf(&mut self, representation: Representation) -> Result<Bytes, Problem> {
         let metadata = self
             .target

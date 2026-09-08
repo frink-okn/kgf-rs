@@ -17,10 +17,11 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–24 are complete: all of M1 plus `o.text`, bindings, entity search,
+Units 1–25 are complete: all of M1 plus `o.text`, bindings, entity search,
 live labels, the browser workbench, the mandatory description surface, standard RDF
-serialization, stock Comunica TPF/brTPF interoperability, the bundle builder, and
-structured request logging, public-base mounting, and the dedicated `/tpf` route. Each completed unit
+serialization, stock Comunica TPF/brTPF interoperability, the bundle builder,
+structured request logging, public-base mounting, the dedicated `/tpf` route, and an
+admission policy measured against the work it classes. Each completed unit
 carries a **What landed** section written after the fact, which is where a unit's plan
 and its outcome are reconciled.
 
@@ -2359,16 +2360,22 @@ following the code.
     should specify this as the TPF ingress grammar rather than weakening §3.3 for every
     route.
     Found by the pinned Comunica 5.3.0 conformance test in unit 20.
-45. **Doc 03 §3.5 understates RDF fragment cost.** Its fragment rows describe selection
-    and paging as `O(log N + limit)` (or `O(k·log N + limit)` for bindings), but a
-    complete Turtle or JSON-LD document cannot be interrupted at the byte boundary.
-    The implementation uses the same bounded complete-prefix fitting already specified
-    for `/schema`, whose worst case is `Z·(1 + log limit)`, and admits RDF fragments as
-    heavy work. brTPF's distinct union also examines at most `candidate_budget`
-    compatibility rows against at most `k` restrictions after `O(k²)` normalization
-    when filtering partial overlaps before the page limit. The two fragment table rows
-    should name both terms; the implementation is bounded and the cost table is the
-    stale side of this disagreement.
+45. **Doc 03 §3.5 should name brTPF's union term; its RDF-fitting half is withdrawn.**
+    As first raised, this said the fragment rows understate RDF cost: a complete Turtle
+    or JSON-LD document cannot be interrupted at the byte boundary, so the
+    implementation fits it with the same bounded complete-prefix search specified for
+    `/schema`, worst case `Z·(1 + log limit)`. **That half is withdrawn** — unit 25
+    measured it. The search is unreachable at the default budgets, because a page is
+    already trimmed to `max_response_bytes` measured as compact JSON and every RDF
+    serialization of those rows is 2–3× smaller than that measure, so the first
+    complete document fits and returns. Doc 03's representation-independent
+    `O(log N + limit)` was right and the implementation's heavy classification of RDF
+    fragments was the stale side; the classification is gone.
+    What stands is the other term: brTPF's distinct union examines at most
+    `candidate_budget` compatibility rows against at most `k` restrictions after
+    `O(k²)` normalization when filtering partial overlaps before the page limit, and
+    that is genuinely not bounded by the page. The bindings row should name it, and
+    `/tpf` with `values=` carries the same cost.
 46. **Resolved: one blank-node identity, in every representation.** A stored `_:`
     label cannot be emitted unchanged in Turtle or JSON-LD: RDF scopes that identity to
     one document, so the same HDT node would become unrelated nodes across pages and a
@@ -2659,7 +2666,8 @@ following the code.
     `GET /tpf` should be normative for the grammar, the document, and the `values=`
     transport, with §3.8's TPF entry pointing at it; §3.3 should say in one sentence
     that bare IRIs are the TPF route's grammar; §3.5 should carry `/tpf` with
-    `/fragment`'s cost and question 45's RDF-fitting term; and doc 06 §6.4 should type
+    `/fragment`'s cost — representation-independent, per question 45 — plus that
+    question's union term where `values=` is present; and doc 06 §6.4 should type
     Comunica sources as `brtpf` on `…/tpf` and describe `void:inDataset` discovery for
     the selectivity actor. The grammar should say that CURIE-looking strings such as
     `rdfs:label` are valid absolute IRIs by syntax and are taken literally: without a
