@@ -159,7 +159,8 @@ serialized bytes and needs no change beyond taking a `DatasetFormat`.
 ### The document
 
 Data triples in the default graph. Metadata and controls in one named graph,
-`<U#metadata>`, where `U` is the exact request URL:
+`<U#metadata>`, where `U` is the request URL with characters outside RDF's IRI
+grammar percent-encoded:
 
 ```
 <U#metadata> {
@@ -175,7 +176,7 @@ Data triples in the default graph. Metadata and controls in one named graph,
                                 [ hydra:variable "object" ;    hydra:property rdf:object ]
                 ] .
   <U>           hydra:totalItems  N ;                 # exact, as today; the brTPF estimate rule unchanged
-                hydra:itemsPerPage returned ;          # distinct data triples actually serialized
+                hydra:itemsPerPage limit ;             # effective requested page size
                 hydra:next        <U'> .              # present only when the page is incomplete
   <U>           void:inDataset    <dataset_iri> .     # when the manifest declares an identity
   <dataset_iri> rdfs:seeAlso      <…/void> .          # only when /void is published
@@ -219,16 +220,12 @@ at `/tpf`, so that a source configured as `brtpf@…/fragment` migrates by itsel
   cursor`; the HTML workbench links to it beside `fragment`.
 - **Cursors.** A new `Operation::Tpf` in the canonical request, so a `/tpf` cursor is
   refused on `/fragment` and vice versa even though both lower to the same selection.
-- **Admission and access log.** `AccessOperation::Tpf`, admitted as heavy work exactly
-  as RDF fragments are today; the observation records the route so the census can tell
-  TPF traffic from native traffic.
+- **Admission and access log.** `AccessOperation::Tpf`; RDF and bindings-restricted
+  requests are admitted as heavy work, while a plain HTML view is ordinary. The
+  observation records the route so the census can tell TPF traffic from native traffic.
 - **Caching.** ETags already carry the representation token; the two new tokens are
   header-safe. `Vary` is unchanged.
 - **Manifest.** Nothing. No capability, no prefix-map involvement.
-- **Manifest validation (native side, independent of the route).** Refuse a prefix whose
-  name is a registered URI scheme in use in RDF data (`http`, `https`, `urn`, `mailto`,
-  `doi`, `tag`, `data`, `file`, `ftp`), so a native CURIE can never be mistaken for an
-  IRI even in a body from a confused client.
 
 ## Sequence
 

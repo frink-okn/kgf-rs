@@ -35,7 +35,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use oxrdf::{BlankNode as RdfBlankNode, NamedNode, VariableRef as SparqlVariableRef};
+use oxrdf::VariableRef as SparqlVariableRef;
 use serde::Deserialize;
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::ser::{Serialize, SerializeMap, Serializer};
@@ -180,6 +180,32 @@ impl BoundKind {
 }
 
 impl BoundTerm {
+    fn from_canonical_term(
+        parameter: &str,
+        requested: String,
+        term: Term<'_>,
+        limits: Limits<'_>,
+    ) -> Result<Self, Problem> {
+        let kind = BoundKind::of(&term);
+        let dictionary = term.to_dictionary().into_owned();
+        let max = limits.budgets.max_term_bytes;
+        if dictionary.len() as u64 > max {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "the term in `{parameter}` is {} bytes in canonical form, over this \
+                     server's max_term_bytes of {max}",
+                    dictionary.len()
+                ),
+            ));
+        }
+        Ok(Self {
+            requested,
+            dictionary,
+            kind,
+        })
+    }
+
     /// Whether this term denotes a blank node, however it was written.
     ///
     /// The parsed kind is not enough on its own, because two request forms can
@@ -259,24 +285,7 @@ impl BoundTerm {
         let term = Term::from_json(&value).map_err(|error| {
             Problem::new(ErrorCode::BadTermSyntax, format!("{parameter}: {error}"))
         })?;
-        let kind = BoundKind::of(&term);
-        let dictionary = term.to_dictionary().into_owned();
-        let max = limits.budgets.max_term_bytes;
-        if dictionary.len() as u64 > max {
-            return Err(Problem::new(
-                ErrorCode::CapExceeded,
-                format!(
-                    "the term in `{parameter}` is {} bytes in canonical form, over this \
-                     server's max_term_bytes of {max}",
-                    dictionary.len()
-                ),
-            ));
-        }
-        Ok(Self {
-            requested: term.to_request(),
-            dictionary,
-            kind,
-        })
+        Self::from_canonical_term(parameter, term.to_request(), term, limits)
     }
 
     /// Convert a term already parsed by SPARQL without formatting and parsing
@@ -299,24 +308,7 @@ impl BoundTerm {
                 Term::Literal(literal)
             }
         };
-        let kind = BoundKind::of(&term);
-        let dictionary = term.to_dictionary().into_owned();
-        let max = limits.budgets.max_term_bytes;
-        if dictionary.len() as u64 > max {
-            return Err(Problem::new(
-                ErrorCode::CapExceeded,
-                format!(
-                    "the term in `{parameter}` is {} bytes in canonical form, over this \
-                     server's max_term_bytes of {max}",
-                    dictionary.len()
-                ),
-            ));
-        }
-        Ok(Self {
-            requested: term.to_request(),
-            dictionary,
-            kind,
-        })
+        Self::from_canonical_term(parameter, term.to_request(), term, limits)
     }
 
     /// Parse Hydra `ExplicitRepresentation`, used only by `/tpf`.
@@ -325,73 +317,17 @@ impl BoundTerm {
     /// on this route, so the resulting dictionary spelling depends only on the
     /// request itself rather than on a bundle's prefix map.
     fn parse_tpf(parameter: &str, text: &str, limits: Limits<'_>) -> Result<Self, Problem> {
-        let syntax = |detail: &str| {
+        let term = Term::parse_explicit(text).map_err(|error| {
             Problem::new(
                 ErrorCode::BadTermSyntax,
                 format!(
-                    "parameter `{parameter}`: {detail}; this is the TPF route, where IRIs and \
+                    "parameter `{parameter}`: {error}; this is the TPF route, where IRIs and \
                      datatype IRIs are bare — angle brackets belong to `/fragment`, and prefix \
                      expansion never occurs here"
                 ),
             )
-        };
-        let iri = |value: &str| -> Result<String, Problem> {
-            NamedNode::new(value)
-                .map(NamedNode::into_string)
-                .map_err(|error| syntax(&format!("{value:?} is not an absolute IRI ({error})")))
-        };
-
-        let term = if let Some(label) = text.strip_prefix("_:") {
-            RdfBlankNode::new(label)
-                .map_err(|error| syntax(&format!("{text:?} is not a blank node ({error})")))?;
-            Term::BlankNode(label.to_owned().into())
-        } else if text.starts_with('"') {
-            let Some(close) = text.rfind('"').filter(|close| *close > 0) else {
-                return Err(syntax("the literal opens a quote but never closes it"));
-            };
-            let value = &text[1..close];
-            let suffix = &text[close + 1..];
-            let literal = if suffix.is_empty() {
-                KgfLiteral::plain(value.to_owned())
-            } else if let Some(language) = suffix.strip_prefix('@') {
-                if language.is_empty() {
-                    return Err(syntax("the literal has an empty language tag"));
-                }
-                oxrdf::Literal::new_language_tagged_literal("", language)
-                    .map_err(|error| syntax(&format!("the language tag is invalid ({error})")))?;
-                KgfLiteral::tagged(value.to_owned(), language.to_owned())
-            } else if let Some(datatype) = suffix.strip_prefix("^^") {
-                if datatype.is_empty() {
-                    return Err(syntax("the literal has an empty datatype IRI"));
-                }
-                KgfLiteral::typed(value.to_owned(), iri(datatype)?)
-            } else {
-                return Err(syntax(
-                    "text after the closing quote must be `@language` or `^^datatype-IRI`",
-                ));
-            };
-            Term::Literal(literal)
-        } else {
-            Term::Iri(iri(text)?.into())
-        };
-        let kind = BoundKind::of(&term);
-        let dictionary = term.to_dictionary().into_owned();
-        let max = limits.budgets.max_term_bytes;
-        if dictionary.len() as u64 > max {
-            return Err(Problem::new(
-                ErrorCode::CapExceeded,
-                format!(
-                    "the term in `{parameter}` is {} bytes in canonical form, over this server's \
-                     max_term_bytes of {max}",
-                    dictionary.len()
-                ),
-            ));
-        }
-        Ok(Self {
-            requested: text.to_owned(),
-            dictionary,
-            kind,
-        })
+        })?;
+        Self::from_canonical_term(parameter, text.to_owned(), term, limits)
     }
 
     /// The term as the request wrote it.
@@ -462,33 +398,6 @@ impl Pattern {
         // operation that does not offer `o.text` has already refused it in
         // `accept_only`, so this is unreachable for those.
         pattern.text = TextFilter::parse(params, &pattern, limits)?;
-        Ok(pattern)
-    }
-
-    fn parse_tpf(params: &Params, limits: Limits<'_>) -> Result<Self, Problem> {
-        let mut pattern = Self::default();
-        let mut variables = BTreeSet::new();
-        for position in Position::ALL {
-            if let Some(text) = params
-                .get(position.tpf_parameter())
-                .filter(|text| !text.is_empty() && !text.starts_with('?'))
-            {
-                *pattern.slot(position) = Some(BoundTerm::parse_tpf(
-                    position.tpf_parameter(),
-                    text,
-                    limits,
-                )?);
-            }
-            if let Some(variable) = params
-                .get(position.tpf_parameter())
-                .filter(|text| text.starts_with('?'))
-            {
-                let variable = Variable::parse(variable, position.tpf_parameter())?;
-                if !variables.insert(variable.clone()) {
-                    return Err(unbounded_plain_tpf_variable(&variable));
-                }
-            }
-        }
         Ok(pattern)
     }
 
@@ -1013,8 +922,9 @@ impl BindingPattern {
     /// Read the variable-preserving pattern a brTPF client puts in the three
     /// conventional TPF parameters.
     /// Comunica includes variable names on a bindings-restricted request so
-    /// the `values=` table can be joined to positions; ordinary TPF omits
-    /// unbound positions and never takes this path.
+    /// the `values=` table can be joined to positions; plain TPF clients may
+    /// also name variables, which are anonymous after their boundedness has
+    /// been checked.
     fn parse_tpf(params: &Params, limits: Limits<'_>) -> Result<Self, Problem> {
         let mut cells = Vec::with_capacity(3);
         for position in Position::ALL {
@@ -1088,6 +998,19 @@ impl BindingPattern {
         self.variables()
             .filter(|variable| !seen.insert(*variable))
             .collect()
+    }
+
+    fn into_plain_tpf(self) -> Result<Pattern, Problem> {
+        if let Some(variable) = self.repeated_variables().into_iter().next().cloned() {
+            return Err(unbounded_plain_tpf_variable(&variable));
+        }
+        let mut pattern = Pattern::default();
+        for (position, cell) in Position::ALL.into_iter().zip(self.cells) {
+            if let BindingCell::Term(term) = cell {
+                *pattern.slot(position) = Some(term);
+            }
+        }
+        Ok(pattern)
     }
 
     fn canonicalize(&self, mut output: String) -> String {
@@ -1515,10 +1438,10 @@ impl BindingFragment {
     /// the `VALUES` keyword.
     fn parse_values(
         params: &Params,
+        pattern: BindingPattern,
         limits: Limits<'_>,
         bundle: &BundleBinding,
     ) -> Result<Self, Problem> {
-        let pattern = BindingPattern::parse_tpf(params, limits)?;
         let values = params.get("values").expect("the caller selected values=");
         let bindings = Bindings::parse_values(values, &pattern, limits)?;
         let limit = page_size(
@@ -1850,12 +1773,25 @@ impl Tpf {
         limits: Limits<'_>,
         bundle: &BundleBinding,
     ) -> Result<Self, Problem> {
+        Self::parse_represented(params, limits, bundle, true)
+    }
+
+    /// Parse the TPF request with the serialization cost selected during
+    /// content negotiation.
+    pub fn parse_represented(
+        params: &Params,
+        limits: Limits<'_>,
+        bundle: &BundleBinding,
+        rdf_serialization: bool,
+    ) -> Result<Self, Problem> {
         accept_only(params, TPF, Self::PARAMETERS)?;
+        let pattern = BindingPattern::parse_tpf(params, limits)?;
         if params.get("values").is_some() {
-            return BindingFragment::parse_values(params, limits, bundle).map(Self::Values);
+            return BindingFragment::parse_values(params, pattern, limits, bundle)
+                .map(Self::Values);
         }
 
-        let pattern = Pattern::parse_tpf(params, limits)?;
+        let pattern = pattern.into_plain_tpf()?;
         let limit = page_size(
             params,
             "limit",
@@ -1874,7 +1810,7 @@ impl Tpf {
             candidates: Candidates(limits.budgets.candidate_budget),
             cursor: resume(params, &binding)?,
             binding,
-            rdf_serialization: true,
+            rdf_serialization,
         }))
     }
 }
@@ -2892,7 +2828,12 @@ impl GetRequest for Tpf {
     }
 
     fn work_class(&self) -> WorkClass {
-        WorkClass::Heavy
+        match self {
+            Self::Plain(request) => request.work_class(),
+            // brTPF projects a distinct RDF relation and is bounded by a
+            // candidate budget in every representation.
+            Self::Values(_) => WorkClass::Heavy,
+        }
     }
 
     fn transport(&self) -> Transport {
@@ -3317,6 +3258,23 @@ mod tests {
             Tpf::parse(&params(""), limits(), &bundle())
                 .unwrap()
                 .work_class(),
+            WorkClass::Heavy
+        );
+        assert_eq!(
+            Tpf::parse_represented(&params(""), limits(), &bundle(), false)
+                .unwrap()
+                .work_class(),
+            WorkClass::Ordinary
+        );
+        assert_eq!(
+            Tpf::parse_represented(
+                &params("subject=%3Fs&values=%28%3Fs%29%7B%28%3Chttp%3A%2F%2Fexample.org%2Falice%3E%29%7D"),
+                limits(),
+                &bundle(),
+                false,
+            )
+            .unwrap()
+            .work_class(),
             WorkClass::Heavy
         );
         assert_eq!(

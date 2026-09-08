@@ -60,6 +60,7 @@
 use hdtc::format::{XSD_STRING, encode_literal, parse_literal};
 use kgf_store::dict::Dictionary;
 use kgf_store::{Manifest, Role, TermId};
+use oxrdf::{BlankNodeRef, Literal as RdfLiteral, NamedNodeRef};
 use serde::ser::{Serialize, SerializeMap, Serializer};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -354,6 +355,34 @@ pub enum TermSyntaxError {
         token: String,
     },
 
+    /// An IRI in Hydra ExplicitRepresentation that RDF cannot represent.
+    #[error("`{token}` is not an absolute RDF IRI ({detail})")]
+    InvalidExplicitIri {
+        /// The offending token.
+        token: String,
+        /// The RDF parser's reason.
+        detail: String,
+    },
+
+    /// A blank-node label in Hydra ExplicitRepresentation that RDF cannot
+    /// represent.
+    #[error("`{token}` is not a valid RDF blank node ({detail})")]
+    InvalidBlankNode {
+        /// The offending token.
+        token: String,
+        /// The RDF parser's reason.
+        detail: String,
+    },
+
+    /// A language tag that cannot be represented as an RDF literal.
+    #[error("`{token}` has an invalid language tag ({detail})")]
+    InvalidLanguageTag {
+        /// The offending token.
+        token: String,
+        /// The RDF parser's reason.
+        detail: String,
+    },
+
     /// Something followed the closing quote that is neither `@` nor `^^`.
     #[error("`{token}` has `{suffix}` after its closing quote; expected `@lang` or `^^datatype`")]
     LiteralSuffix {
@@ -399,7 +428,8 @@ impl<'a> Term<'a> {
             return Err(TermSyntaxError::Empty);
         }
         if text.starts_with('"') {
-            return parse_literal_syntax(text, prefixes).map(Term::Literal);
+            return parse_literal_syntax(text, |datatype| parse_iri_syntax(datatype, prefixes))
+                .map(Term::Literal);
         }
         if let Some(label) = text.strip_prefix("_:") {
             if label.is_empty() {
@@ -410,6 +440,30 @@ impl<'a> Term<'a> {
             return Ok(Term::BlankNode(Cow::Borrowed(label)));
         }
         parse_iri_syntax(text, prefixes).map(Term::Iri)
+    }
+
+    /// Parse Hydra ExplicitRepresentation, whose IRIs are bare and never
+    /// expanded through the manifest prefix map.
+    pub fn parse_explicit(text: &'a str) -> Result<Self, TermSyntaxError> {
+        if text.is_empty() {
+            return Err(TermSyntaxError::Empty);
+        }
+        if text.starts_with('"') {
+            return parse_literal_syntax(text, parse_explicit_iri).map(Term::Literal);
+        }
+        if let Some(label) = text.strip_prefix("_:") {
+            if label.is_empty() {
+                return Err(TermSyntaxError::EmptyBlankNodeLabel {
+                    token: text.to_owned(),
+                });
+            }
+            BlankNodeRef::new(label).map_err(|error| TermSyntaxError::InvalidBlankNode {
+                token: text.to_owned(),
+                detail: error.to_string(),
+            })?;
+            return Ok(Term::BlankNode(Cow::Borrowed(label)));
+        }
+        parse_explicit_iri(text).map(Term::Iri)
     }
 
     /// Read a term out of the bytes the dictionary stores.
@@ -661,7 +715,7 @@ fn parse_iri_syntax<'a>(
 /// through a response and back into a request comes out different.
 fn parse_literal_syntax<'a>(
     text: &'a str,
-    prefixes: &PrefixMap,
+    parse_datatype: impl FnOnce(&'a str) -> Result<Cow<'a, str>, TermSyntaxError>,
 ) -> Result<Literal<'a>, TermSyntaxError> {
     let Some(close) = text.rfind('"').filter(|close| *close > 0) else {
         return Err(TermSyntaxError::UnterminatedLiteral {
@@ -680,6 +734,12 @@ fn parse_literal_syntax<'a>(
                 token: text.to_owned(),
             });
         }
+        RdfLiteral::new_language_tagged_literal("", language).map_err(|error| {
+            TermSyntaxError::InvalidLanguageTag {
+                token: text.to_owned(),
+                detail: error.to_string(),
+            }
+        })?;
         return Ok(Literal::tagged(value, language));
     }
     if let Some(datatype) = suffix.strip_prefix("^^") {
@@ -688,12 +748,20 @@ fn parse_literal_syntax<'a>(
                 token: text.to_owned(),
             });
         }
-        return Ok(Literal::typed(value, parse_iri_syntax(datatype, prefixes)?));
+        return Ok(Literal::typed(value, parse_datatype(datatype)?));
     }
     Err(TermSyntaxError::LiteralSuffix {
         token: text.to_owned(),
         suffix: suffix.to_owned(),
     })
+}
+
+fn parse_explicit_iri(value: &str) -> Result<Cow<'_, str>, TermSyntaxError> {
+    NamedNodeRef::new(value).map_err(|error| TermSyntaxError::InvalidExplicitIri {
+        token: value.to_owned(),
+        detail: error.to_string(),
+    })?;
+    Ok(Cow::Borrowed(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,6 +1388,19 @@ mod tests {
                 .to_dictionary(),
             "\"x\"@en-gb"
         );
+    }
+
+    #[test]
+    fn both_request_grammars_validate_language_tags_in_one_parser() {
+        let prefixes = PrefixMap::default();
+        assert!(matches!(
+            Term::parse("\"x\"@not a tag", &prefixes),
+            Err(TermSyntaxError::InvalidLanguageTag { .. })
+        ));
+        assert!(matches!(
+            Term::parse_explicit("\"x\"@not a tag"),
+            Err(TermSyntaxError::InvalidLanguageTag { .. })
+        ));
     }
 
     #[test]

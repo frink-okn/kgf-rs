@@ -479,8 +479,13 @@ async fn tpf(
         AccessOperation::Tpf,
         wants,
         Representation::TPF,
-        |params, limits, release, _representation| {
-            request::Tpf::parse(params, limits, &release.binding())
+        |params, limits, release, representation| {
+            request::Tpf::parse_represented(
+                params,
+                limits,
+                &release.binding(),
+                representation.is_rdf(),
+            )
         },
         answer::tpf,
     )

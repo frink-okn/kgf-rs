@@ -45,7 +45,9 @@ use std::rc::Rc;
 
 use bytes::Bytes;
 use maud::html;
-use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Term as RdfTerm, Triple};
+use oxrdf::{
+    BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term as RdfTerm, Triple,
+};
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 
@@ -69,8 +71,8 @@ use crate::html::{
     Crumb, Resource, TermText, Value, fields, group_digits, json_body, note, operation_page,
     operation_page_with_format, page, pager, results_table, stats, table,
 };
-use crate::rdf::{DatasetFormat, GraphFormat, serialize_dataset, serialize_graph};
-use crate::representation::Representation;
+use crate::rdf::{GraphFormat, serialize_dataset, serialize_graph};
+use crate::representation::{RdfSyntax, Representation};
 use crate::request::{
     self, BindingPattern, BindingRow, BoundTerm, Candidates, Direction, Pattern, Position,
     ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter,
@@ -231,29 +233,21 @@ impl Target {
         Some(format!("{}{}", self.origin()?, self.next(token)?))
     }
 
-    /// The TPF fragment identity: the exact request URL without controls that
-    /// select a page size or resume position.
+    fn tpf_page_url(&self) -> Option<String> {
+        self.request_url.as_deref().map(url::encode_rdf_iri)
+    }
+
+    /// The canonical TPF fragment identity: the request parameters without
+    /// controls that select a representation, page size, or resume position.
+    /// Page one and every continuation therefore name the same fragment even
+    /// when the client ordered or escaped its original parameters differently.
     fn tpf_fragment_url(&self) -> Option<String> {
-        let request = self.request_url.as_deref()?;
-        let Some((base, query)) = request.split_once('?') else {
-            return Some(request.to_owned());
-        };
-        let query = query
-            .split('&')
-            .filter(|pair| {
-                let raw_name = pair.split_once('=').map_or(*pair, |(name, _)| name);
-                !matches!(
-                    url::decode_component(raw_name).as_deref(),
-                    Some("cursor" | "limit" | "format")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("&");
-        Some(if query.is_empty() {
-            base.to_owned()
-        } else {
-            format!("{base}?{query}")
-        })
+        let params = self
+            .params
+            .without("cursor")
+            .without("limit")
+            .without("format");
+        Some(format!("{}{}", self.origin()?, query(self.base(), &params)))
     }
 
     fn absolute_void(&self) -> Option<String> {
@@ -783,6 +777,10 @@ pub struct Answer {
     /// relation keeps its independently exact row count in `cardinality`.
     #[serde(skip)]
     rdf_cardinality: Option<Cardinality>,
+    /// The effective row limit selected for this request, before byte fitting
+    /// or distinct RDF projection shortens the serialized page.
+    #[serde(skip)]
+    page_limit: u32,
     #[serde(skip)]
     byte_budget: u64,
     #[serde(flatten)]
@@ -812,12 +810,10 @@ pub struct Answer {
 
 impl Renders for Answer {
     fn render(mut self, representation: Representation) -> Result<Rendered, Problem> {
-        let body = match representation {
-            Representation::NQuads
-            | Representation::TriG
-            | Representation::Turtle
-            | Representation::JsonLd => self.fit_fragment_rdf(representation)?,
-            _ => standard_body(&self, representation),
+        let body = if representation.rdf_syntax().is_some() {
+            self.fit_fragment_rdf(representation)?
+        } else {
+            standard_body(&self, representation)
         };
         let rows = Some(self.rows.len() as u64);
         let cardinality = Some(self.rdf_cardinality.unwrap_or(self.cardinality));
@@ -958,8 +954,9 @@ const HYDRA_EXPLICIT_REPRESENTATION: &str =
     "http://www.w3.org/ns/hydra/core#ExplicitRepresentation";
 
 struct TpfMetadata {
+    page: NamedNode,
     graph_name: NamedNode,
-    triples: Vec<Triple>,
+    quads: Vec<Quad>,
 }
 
 impl Answer {
@@ -971,7 +968,12 @@ impl Answer {
     /// candidate document plus bounded complete-prefix probes. RDF fragments
     /// are therefore admitted as heavy work.
     fn fit_fragment_rdf(&mut self, representation: Representation) -> Result<Bytes, Problem> {
-        let body = self.fragment_rdf(representation)?;
+        let metadata = self
+            .target
+            .is_tpf()
+            .then(|| self.tpf_metadata())
+            .transpose()?;
+        let body = self.fragment_rdf(representation, metadata.as_ref())?;
         if body.len() as u64 <= self.byte_budget || self.rows.len() <= 1 {
             return Ok(body);
         }
@@ -979,7 +981,7 @@ impl Answer {
         let total = self.rows.len();
         let encode_prefix = |keep: usize| {
             let next = self.rdf_row_cursor(keep)?;
-            self.fragment_rdf_prefix(representation, keep, Some(next.as_str()))
+            self.fragment_rdf_prefix(representation, keep, Some(next.as_str()), metadata.as_ref())
         };
 
         // Grow from one row until the first complete document that does not
@@ -1059,11 +1061,16 @@ impl Answer {
         Ok(resume.cursor(binding))
     }
 
-    fn fragment_rdf(&self, representation: Representation) -> Result<Bytes, Problem> {
+    fn fragment_rdf(
+        &self,
+        representation: Representation,
+        metadata: Option<&TpfMetadata>,
+    ) -> Result<Bytes, Problem> {
         self.fragment_rdf_prefix(
             representation,
             self.rows.len(),
             self.completeness.next_cursor(),
+            metadata,
         )
     }
 
@@ -1072,7 +1079,14 @@ impl Answer {
         representation: Representation,
         keep: usize,
         next_cursor: Option<&str>,
+        metadata: Option<&TpfMetadata>,
     ) -> Result<Bytes, Problem> {
+        let syntax = representation.rdf_syntax().ok_or_else(|| {
+            Problem::new(
+                ErrorCode::InternalError,
+                "the caller selected a non-RDF fragment representation",
+            )
+        })?;
         if matches!(self.echo, Echo::Describe { .. } | Echo::Sample { .. }) {
             return Err(Problem::new(
                 ErrorCode::InternalError,
@@ -1122,51 +1136,48 @@ impl Answer {
             }
         }
 
-        let items_per_page = triples.len();
-        let metadata = self
-            .target
-            .is_tpf()
-            .then(|| self.tpf_metadata(next_cursor, items_per_page))
-            .transpose()?;
+        let next = match (metadata, next_cursor) {
+            (Some(metadata), Some(cursor)) => Some(self.tpf_next(metadata, cursor)?),
+            _ => None,
+        };
         let prefixes = [("kgfbn", self.blank_nodes.iri_prefix())];
-        let serialized = match representation {
-            Representation::Turtle => {
+        let serialized = match syntax {
+            RdfSyntax::Graph(format) => {
                 let mut graph = triples;
                 if let Some(metadata) = metadata {
-                    graph.reserve(metadata.triples.len());
-                    graph.extend(metadata.triples);
+                    graph.reserve(metadata.quads.len() + usize::from(next.is_some()));
+                    graph.extend(metadata.quads.iter().map(|quad| {
+                        Triple::new(
+                            quad.subject.clone(),
+                            quad.predicate.clone(),
+                            quad.object.clone(),
+                        )
+                    }));
                 }
-                serialize_graph(GraphFormat::Turtle, &graph, &prefixes)
+                graph.extend(next);
+                serialize_graph(format, &graph, &prefixes)
             }
-            Representation::NQuads | Representation::TriG | Representation::JsonLd => {
-                let metadata_len = metadata.as_ref().map_or(0, |value| value.triples.len());
-                let mut quads = Vec::with_capacity(triples.len() + metadata_len);
+            RdfSyntax::Dataset(format) => {
+                let metadata_len = metadata.as_ref().map_or(0, |value| value.quads.len());
+                let mut quads =
+                    Vec::with_capacity(triples.len() + metadata_len + usize::from(next.is_some()));
                 quads.extend(
                     triples
                         .into_iter()
                         .map(|triple| triple.in_graph(GraphName::DefaultGraph)),
                 );
                 if let Some(metadata) = metadata {
-                    let TpfMetadata {
-                        graph_name,
-                        triples,
-                    } = metadata;
-                    quads.extend(
-                        triples
-                            .into_iter()
-                            .map(|triple| triple.in_graph(graph_name.clone())),
-                    );
+                    quads.extend(metadata.quads.iter().cloned());
                 }
-                let format = match representation {
-                    Representation::NQuads => DatasetFormat::NQuads,
-                    Representation::TriG => DatasetFormat::TriG,
-                    Representation::JsonLd => DatasetFormat::JsonLd,
-                    _ => unreachable!("the outer match selected a dataset syntax"),
-                };
+                quads.extend(next.map(|triple| {
+                    triple.in_graph(
+                        metadata
+                            .expect("a TPF next triple has invariant metadata")
+                            .graph_name
+                            .clone(),
+                    )
+                }));
                 serialize_dataset(format, &quads, &prefixes)
-            }
-            Representation::Json | Representation::Html | Representation::Markdown => {
-                unreachable!("the caller selected an RDF representation")
             }
         };
         serialized
@@ -1177,13 +1188,9 @@ impl Answer {
     /// Build the TPF control graph. The caller decides whether the syntax can
     /// preserve its graph name; Turtle necessarily flattens these triples into
     /// its one graph, while N-Quads, TriG, and JSON-LD keep them named.
-    fn tpf_metadata(
-        &self,
-        next_cursor: Option<&str>,
-        items_per_page: usize,
-    ) -> Result<TpfMetadata, Problem> {
+    fn tpf_metadata(&self) -> Result<TpfMetadata, Problem> {
         let page = metadata_iri(
-            self.target.request_url.as_deref().ok_or_else(|| {
+            &self.target.tpf_page_url().ok_or_else(|| {
                 Problem::new(
                     ErrorCode::InternalError,
                     "a TPF response needs the absolute request URL",
@@ -1306,25 +1313,8 @@ impl Answer {
         triples.push(Triple::new(
             page.clone(),
             metadata_iri(HYDRA_ITEMS_PER_PAGE, "hydra:itemsPerPage")?,
-            Literal::from(
-                u64::try_from(items_per_page).expect("a page length is representable as u64"),
-            ),
+            Literal::from(u64::from(self.page_limit)),
         ));
-        if let Some(cursor) = next_cursor {
-            triples.push(Triple::new(
-                page.clone(),
-                metadata_iri(HYDRA_NEXT, "hydra:next")?,
-                metadata_iri(
-                    &self.target.absolute_next(cursor).ok_or_else(|| {
-                        Problem::new(
-                            ErrorCode::InternalError,
-                            "a TPF continuation needs the request origin",
-                        )
-                    })?,
-                    "the TPF continuation URL",
-                )?,
-            ));
-        }
         if let Some(dataset_metadata) = &self.target.dataset {
             let logical = metadata_iri(&dataset_metadata.iri, "the manifest dataset IRI")?;
             triples.push(Triple::new(
@@ -1348,10 +1338,31 @@ impl Answer {
                 ));
             }
         }
+        let quads = triples
+            .into_iter()
+            .map(|triple| triple.in_graph(metadata_graph.clone()))
+            .collect();
         Ok(TpfMetadata {
+            page,
             graph_name: metadata_graph,
-            triples,
+            quads,
         })
+    }
+
+    fn tpf_next(&self, metadata: &TpfMetadata, cursor: &str) -> Result<Triple, Problem> {
+        Ok(Triple::new(
+            metadata.page.clone(),
+            metadata_iri(HYDRA_NEXT, "hydra:next")?,
+            metadata_iri(
+                &self.target.absolute_next(cursor).ok_or_else(|| {
+                    Problem::new(
+                        ErrorCode::InternalError,
+                        "a TPF continuation needs the request origin",
+                    )
+                })?,
+                "the TPF continuation URL",
+            )?,
+        ))
     }
 }
 
@@ -3555,6 +3566,16 @@ fn with_optional_param(params: &Params, name: &str, value: Option<&str>) -> Para
 
 /// `GET /tpf` — enumerate a TPF or bindings-restricted TPF pattern.
 pub fn tpf(store: &Store, target: Target, request: &request::Tpf) -> Result<Answer, Problem> {
+    if !target.is_tpf() {
+        tracing::error!(
+            operation = ?target.operation,
+            "a typed TPF request was paired with a non-TPF response target"
+        );
+        return Err(Problem::new(
+            ErrorCode::InternalError,
+            "the TPF request was routed to the wrong response target",
+        ));
+    }
     match request {
         request::Tpf::Plain(request) => fragment(store, target, request),
         request::Tpf::Values(request) => binding_fragment(store, target, request),
@@ -4340,6 +4361,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         row_resumes: Vec::new(),
         row_binding: None,
         rdf_cardinality: None,
+        page_limit: request.n,
         byte_budget: request.bytes.0,
         vars,
         // A sample stops for one reason only. It is not paged, so `n` is what
@@ -5098,6 +5120,7 @@ fn finish(
         row_resumes,
         row_binding: Some(paging.binding.clone()),
         rdf_cardinality: None,
+        page_limit: paging.limit,
         byte_budget: paging.bytes.0,
         vars,
         completeness,

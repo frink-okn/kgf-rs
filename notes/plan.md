@@ -1659,28 +1659,31 @@ with typed-literal, skolem-subject, and no-control-leak assertions; the
 `../kgf-sparql` corpus rerun as the external gate; and the documents. Outbound spec
 edits are question 66.
 
-**What landed.** `/tpf` is a GET-only heavy operation with its own request and cursor
-operation types, access-log identity, descriptor links, and workbench form. Its parser
+**What landed.** `/tpf` is a GET-only operation with its own request and cursor
+operation types, access-log identity, descriptor links, and workbench form. RDF and
+bindings-restricted requests are admitted as heavy work; the plain HTML view is
+ordinary. Its parser
 uses conventional `subject`/`predicate`/`object` names and Hydra
 `ExplicitRepresentation`; brTPF `values=` is still parsed by `spargebra`, now rejects
 tables with no pattern column while retaining Comunica's upstream join-context columns,
 and always projects distinct RDF. N-Quads, TriG, and JSON-LD put
 data in the default graph and the complete control document in `<U#metadata>`; Turtle
 necessarily flattens the two. `/fragment` now uses the native grammar for every
-representation, refuses GET variables and `values=`, and emits data-only RDF. Prefix
-names that collide with the URI schemes listed in the work plan are refused when a
-manifest is opened.
+representation, refuses GET variables and `values=`, and emits data-only RDF. Manifest
+prefixes remain bundle metadata: TPF never consults them, while native terms keep IRIs
+and CURIEs disjoint by requiring brackets around an IRI.
 
 Post-implementation review tightened the boundary without changing the route shape:
 plain repeated variables are refused unless `values=` bounds them; TPF terms are any
 literal absolute IRI accepted by the RDF library (including CURIE-looking schemes,
-which are never expanded); the fragment identity excludes `format` as well as paging
-controls; `hydra:itemsPerPage` reports the distinct data triples actually serialized;
-and `rdfs:seeAlso` is emitted only when the release really publishes `/void`.
-`Target` now carries the typed operation, and the metadata graph IRI is constructed
-once and reused for serialization. Published manifests remain validated at the server
-catalog boundary; `Store` deliberately continues to admit the `{}` placeholder used
-while an offline bundle is being assembled.
+which are never expanded); the canonical fragment identity excludes `format` as well
+as paging controls; `hydra:itemsPerPage` reports the effective request limit; and
+`rdfs:seeAlso` is emitted only when the release really publishes `/void`. `Target`
+now carries the typed operation, request URLs are escaped into legal RDF IRIs, and
+invariant metadata is constructed once before byte-fitting probes. `Store` deliberately
+continues to admit the `{}` placeholder used while an offline bundle is being assembled,
+and manifests with scheme-named prefixes remain valid because the TPF grammar never
+consults them.
 
 *Verified by* the parser's specification-example tests, `oxrdfio` round trips of every
 format including JSON-LD's named graph, real-listener tests of the document, route

@@ -40,6 +40,15 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 use crate::envelope::{ErrorCode, Problem, reflected};
+use crate::rdf::{DatasetFormat, GraphFormat};
+
+/// Whether an RDF representation serializes one graph or a dataset whose
+/// graph names remain visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RdfSyntax {
+    Graph(GraphFormat),
+    Dataset(DatasetFormat),
+}
 
 /// A serialization this server can produce.
 ///
@@ -107,10 +116,21 @@ impl Representation {
 
     /// Whether this representation is an RDF graph or dataset syntax.
     pub const fn is_rdf(self) -> bool {
-        matches!(
-            self,
-            Self::NQuads | Self::TriG | Self::Turtle | Self::JsonLd
-        )
+        self.rdf_syntax().is_some()
+    }
+
+    /// The RDF serializer selected by this representation.
+    pub(crate) const fn rdf_syntax(self) -> Option<RdfSyntax> {
+        match self {
+            Self::NQuads => Some(RdfSyntax::Dataset(DatasetFormat::NQuads)),
+            Self::TriG => Some(RdfSyntax::Dataset(DatasetFormat::TriG)),
+            Self::Turtle => Some(RdfSyntax::Graph(GraphFormat::Turtle)),
+            // Fragment JSON-LD is dataset-shaped so a TPF control graph keeps
+            // its name. Graph-only resources still select GraphFormat
+            // directly at their own boundary.
+            Self::JsonLd => Some(RdfSyntax::Dataset(DatasetFormat::JsonLd)),
+            Self::Json | Self::Html | Self::Markdown => None,
+        }
     }
 
     /// The media type `Accept` names it by, without parameters.

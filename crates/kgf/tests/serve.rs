@@ -507,6 +507,78 @@ fn tpf_links_a_void_description_only_when_it_is_published() {
 }
 
 #[test]
+fn tpf_escapes_raw_query_punctuation_in_its_page_iri() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let target = "/tox/v/v1/tpf?object=%3Fo&values=(%3Fo)%20{%20(%22[x]%22)%20}";
+    let response = server.request("GET", target, &[("Accept", "application/n-quads")]);
+    response.assert_status(200);
+
+    let quads: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
+        .for_slice(&response.body)
+        .collect::<Result<_, _>>()
+        .expect("the response with escaped page metadata parses");
+    let page = format!(
+        "http://{}/tox/v/v1/tpf?object=%3Fo&values=(%3Fo)%20%7B%20(%22%5Bx%5D%22)%20%7D",
+        server.address
+    );
+    assert!(quads.iter().any(|quad| {
+        matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == page)
+            && quad.predicate.as_str() == "http://www.w3.org/ns/hydra/core#itemsPerPage"
+    }));
+}
+
+#[test]
+fn every_tpf_page_names_one_canonical_fragment() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let target =
+        "/tox/v/v1/tpf?subject=%3Fs&predicate=http%3A%2F%2Fexample.org%2Fknows&object=%3Fo&limit=1";
+
+    let first = server.request("GET", target, &[("Accept", "application/n-quads")]);
+    first.assert_status(200);
+    let first_quads: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
+        .for_slice(&first.body)
+        .collect::<Result<_, _>>()
+        .expect("the first page parses");
+    let object_for = |quads: &[oxrdf::Quad], predicate: &str| {
+        quads.iter().find_map(|quad| {
+            (quad.predicate.as_str() == predicate)
+                .then(|| match &quad.object {
+                    oxrdf::Term::NamedNode(node) => Some(node.as_str().to_owned()),
+                    _ => None,
+                })
+                .flatten()
+        })
+    };
+    let primary_topic = "http://xmlns.com/foaf/0.1/primaryTopic";
+    let next_predicate = "http://www.w3.org/ns/hydra/core#next";
+    let fragment = object_for(&first_quads, primary_topic).expect("page names its fragment");
+    assert_eq!(
+        fragment,
+        format!(
+            "http://{}/tox/v/v1/tpf?object=%3Fo&predicate=http%3A%2F%2Fexample.org%2Fknows&subject=%3Fs",
+            server.address
+        )
+    );
+    let next = object_for(&first_quads, next_predicate).expect("first page has a continuation");
+    let origin = format!("http://{}", server.address);
+    let second = server.request(
+        "GET",
+        next.strip_prefix(&origin).unwrap(),
+        &[("Accept", "application/n-quads")],
+    );
+    second.assert_status(200);
+    let second_quads: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
+        .for_slice(&second.body)
+        .collect::<Result<_, _>>()
+        .expect("the second page parses");
+    assert_eq!(object_for(&second_quads, primary_topic), Some(fragment));
+}
+
+#[test]
 fn tpf_and_native_fragment_keep_their_protocols_disjoint() {
     const HYDRA: &str = "http://www.w3.org/ns/hydra/core#";
 
@@ -1165,7 +1237,7 @@ fn tpf_rdf_byte_fitting_keeps_a_complete_parseable_document_and_cursor() {
     assert!(data_items < 8, "the byte budget should shorten the page");
     assert!(graph.iter().any(|quad| {
         quad.predicate.as_str() == "http://www.w3.org/ns/hydra/core#itemsPerPage"
-            && matches!(&quad.object, oxrdf::Term::Literal(value) if value.value() == data_items.to_string())
+            && matches!(&quad.object, oxrdf::Term::Literal(value) if value.value() == "8")
     }));
 }
 

@@ -47,6 +47,16 @@ impl GraphFormat {
     }
 }
 
+fn serializer(format: RdfFormat, prefixes: &[(&str, &str)]) -> io::Result<RdfSerializer> {
+    let mut serializer = RdfSerializer::from_format(format);
+    for &(name, iri) in prefixes {
+        serializer = serializer
+            .with_prefix(name, iri)
+            .map_err(io::Error::other)?;
+    }
+    Ok(serializer)
+}
+
 /// Serialize a complete RDF graph document.
 ///
 /// `finish` is part of the operation: JSON-LD and the grouped Turtle writer
@@ -57,13 +67,7 @@ pub(crate) fn serialize_graph(
     triples: &[Triple],
     prefixes: &[(&str, &str)],
 ) -> io::Result<Vec<u8>> {
-    let mut serializer = RdfSerializer::from_format(format.rdf_format());
-    for &(name, iri) in prefixes {
-        serializer = serializer
-            .with_prefix(name, iri)
-            .map_err(io::Error::other)?;
-    }
-    let mut serializer = serializer.for_writer(Vec::new());
+    let mut serializer = serializer(format.rdf_format(), prefixes)?.for_writer(Vec::new());
     for triple in triples {
         serializer.serialize_triple(triple)?;
     }
@@ -79,13 +83,7 @@ pub(crate) fn serialize_dataset(
     quads: &[Quad],
     prefixes: &[(&str, &str)],
 ) -> io::Result<Vec<u8>> {
-    let mut serializer = RdfSerializer::from_format(format.rdf_format());
-    for &(name, iri) in prefixes {
-        serializer = serializer
-            .with_prefix(name, iri)
-            .map_err(io::Error::other)?;
-    }
-    let mut serializer = serializer.for_writer(Vec::new());
+    let mut serializer = serializer(format.rdf_format(), prefixes)?.for_writer(Vec::new());
     for quad in quads {
         serializer.serialize_quad(quad)?;
     }
