@@ -93,6 +93,8 @@ pub enum Operation {
     Describe = 3,
     /// `GET /schema`.
     Schema = 4,
+    /// `GET /tpf`.
+    Tpf = 5,
 }
 
 impl Operation {
@@ -107,6 +109,7 @@ impl Operation {
             2 => Some(Self::Count),
             3 => Some(Self::Describe),
             4 => Some(Self::Schema),
+            5 => Some(Self::Tpf),
             _ => None,
         }
     }

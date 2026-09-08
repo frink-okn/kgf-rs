@@ -3,13 +3,26 @@ import { QueryEngine } from '@comunica/query-sparql';
 
 const endpoint = process.argv[2];
 const remoteEndpoint = process.argv[3];
-assert(endpoint, 'usage: node test.mjs http://host/dataset/v/version/fragment');
-assert(remoteEndpoint, 'a second KGF fragment endpoint is required for federation');
+assert(endpoint, 'usage: node test.mjs http://host/dataset/v/version/tpf');
+assert(remoteEndpoint, 'a second KGF TPF endpoint is required for federation');
 
 const engine = new QueryEngine();
 const context = {
   sources: [{ type: 'brtpf', value: endpoint }],
 };
+
+const negotiated = await fetch(endpoint, {
+  headers: {
+    accept: 'application/n-quads, application/trig;q=0.95, application/ld+json;q=0.9, application/n-triples;q=0.8, text/turtle;q=0.6',
+  },
+});
+assert.equal(negotiated.status, 200);
+assert.equal(
+  negotiated.headers.get('content-type'),
+  'application/n-quads; charset=utf-8',
+  'Comunica\'s RDF preference list must negotiate N-Quads',
+);
+await negotiated.arrayBuffer();
 
 async function rows(query, variables) {
   const stream = await engine.queryBindings(query, context);
@@ -46,6 +59,16 @@ assert.deepEqual(
   'stock Comunica must complete its bind join through brTPF values= requests',
 );
 
+assert.deepEqual(
+  await rows(`
+    SELECT ?person WHERE {
+      ?person <http://example.org/born> "1998-04-20"^^<http://www.w3.org/2001/XMLSchema#date>
+    }
+  `, ['person']),
+  [{ person: 'http://example.org/alice' }],
+  'a TPF typed literal keeps its bare datatype IRI through brTPF ingress',
+);
+
 const blankNodeJoin = await rows(`
   SELECT ?node ?kind WHERE {
     ?node <http://example.org/type> <http://example.org/Thing> .
@@ -62,6 +85,14 @@ assert.match(
   blankNodeJoin[0].node,
   /^urn:fdc:frink-okn\.github\.io:20260818:kgf:bnode:v1:sha256:[0-9a-f]{64}:(?:sh|s|o)-[1-9][0-9]*$/,
   'fragment data blank nodes must have stable content-scoped identities',
+);
+
+assert.deepEqual(
+  await rows(`
+    SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }
+  `, ['n']),
+  [{ n: '9' }],
+  'the default graph must contain exactly the nine fixture triples and no controls',
 );
 
 const federatedStream = await engine.queryBindings(`
@@ -85,4 +116,4 @@ assert.deepEqual(
   'stock Comunica must join bindings across two KGF brTPF endpoints',
 );
 
-console.log('Comunica 5.3.0 TPF paging, brTPF bind join, blank-node identity, and federation passed');
+console.log('Comunica 5.3.0 TPF grammar, paging, graph split, bind joins, and federation passed');

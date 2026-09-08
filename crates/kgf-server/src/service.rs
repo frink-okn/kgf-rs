@@ -735,6 +735,11 @@ impl Release {
         &self.manifest
     }
 
+    /// The logical dataset identity declared by this immutable release.
+    pub fn dataset_iri(&self) -> Option<&str> {
+        self.manifest.parsed.dataset_iri.as_deref()
+    }
+
     /// The CURIE prefixes this version's parameters accept.
     pub fn prefixes(&self) -> &PrefixMap {
         &self.prefixes

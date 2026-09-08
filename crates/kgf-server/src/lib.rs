@@ -28,9 +28,9 @@
 //!
 //! # Status
 //!
-//! Units 10–23 in `notes/plan.md` are implemented: [`cursor`], [`term`],
+//! Units 10–24 in `notes/plan.md` are implemented: [`cursor`], [`term`],
 //! [`envelope`], the URL space with `latest`, caching and content negotiation,
-//! and the read operations `/fragment`, `/count`, `/describe`, `/sample`
+//! and the read operations `/fragment`, `/tpf`, `/count`, `/describe`, `/sample`
 //! and `/schema`, the `/void` and `/summary` description resources, plus bindings
 //! QUERY/POST for fragment and count in [`request`] and [`answer`]. The service
 //! emits typed, content-free access records through [`access`] when configured.

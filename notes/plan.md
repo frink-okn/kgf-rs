@@ -17,10 +17,10 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–22 are complete: all of M1 plus `o.text`, bindings, entity search,
+Units 1–24 are complete: all of M1 plus `o.text`, bindings, entity search,
 live labels, the browser workbench, the mandatory description surface, standard RDF
 serialization, stock Comunica TPF/brTPF interoperability, the bundle builder, and
-structured request logging. Each completed unit
+structured request logging, public-base mounting, and the dedicated `/tpf` route. Each completed unit
 carries a **What landed** section written after the fact, which is where a unit's plan
 and its outcome are reconciled.
 
@@ -1626,14 +1626,65 @@ identities, the page's brand link, form action, and every root-relative link, th
 problem `instance`, and the 404 for the prefixed spelling. The existing root-relative
 assertions in `tests/serve.rs` are the no-base regression suite and needed no edits.
 
+### 24. `/tpf` — a spec-exact Triple Pattern Fragments route ✅
+
+**Implemented 2026-09-08; the work plan is [`notes/tpf-route.md`](tpf-route.md).** This
+reverses unit 20's first paragraph and `notes/comunica-brtpf.md`: TPF and brTPF stop
+being representations of `/fragment` and become a route of their own,
+`GET /{dataset}/v/{version}/tpf{?subject,predicate,object}`, whose term grammar is Hydra
+`ExplicitRepresentation` verbatim (bare IRIs, `"lex"`, `"lex"@tag`, `"lex"^^IRI`,
+nothing else) and whose document puts metadata and controls in a named graph, served as
+N-Quads and TriG first. JSON-LD also preserves that named graph rather than flattening
+controls into its default graph. `/fragment` becomes strictly doc 03 §3.3 in every
+representation, loses `BoundTerm::parse_fragment`, GET `?name` variables and GET
+`values=`, and its RDF representations carry data only.
+
+Why, in one paragraph: the public deployment's Comunica evaluation
+(`../kgf-sparql/docs/public-deployment-comunica-evaluation.md`) found that the
+representation-selected fallback of question 44 accepts bare IRIs but not the bare
+datatype IRI inside a typed literal that the TPF specification prescribes and Comunica
+sends, which 400s and kills the client process on three corpus tasks; that a `values=`
+table with no pattern variable is silently ignored; that Comunica's default `Accept`
+lands on JSON-LD, the one format it parses slowly and with a known streaming bug; and
+that in any single-graph format Comunica cannot separate the Hydra controls from the
+data, so `SELECT ?s ?p ?o` returns them as rows. Selecting the grammar by route rather
+than by `Accept` removes the whole class instead of patching the fallback.
+
+Eight steps, each mergeable: the `ExplicitRepresentation` parser; N-Quads and TriG
+through `oxrdfio`; the two-graph document with `foaf:primaryTopic`/`void:subset`,
+exactly three mappings, `hydra:variableRepresentation`, `hydra:itemsPerPage`, and a
+`void:inDataset` link; the route, `Operation::Tpf`, `AccessOperation::Tpf`, descriptor
+links; stripping `/fragment`; the Comunica conformance harness retargeted to `/tpf`
+with typed-literal, skolem-subject, and no-control-leak assertions; the
+`../kgf-sparql` corpus rerun as the external gate; and the documents. Outbound spec
+edits are question 66.
+
+**What landed.** `/tpf` is a GET-only heavy operation with its own request and cursor
+operation types, access-log identity, descriptor links, and workbench form. Its parser
+uses conventional `subject`/`predicate`/`object` names and Hydra
+`ExplicitRepresentation`; brTPF `values=` is still parsed by `spargebra`, now rejects
+tables with no pattern column while retaining Comunica's upstream join-context columns,
+and always projects distinct RDF. N-Quads, TriG, and JSON-LD put
+data in the default graph and the complete control document in `<U#metadata>`; Turtle
+necessarily flattens the two. `/fragment` now uses the native grammar for every
+representation, refuses GET variables and `values=`, and emits data-only RDF. Prefix
+names that collide with the URI schemes listed in the work plan are refused when a
+manifest is opened.
+
+*Verified by* the parser's specification-example tests, `oxrdfio` round trips of every
+format including JSON-LD's named graph, real-listener tests of the document, route
+separation, cursor separation, and `/fragment` refusals, plus the pinned Comunica suite
+against `/tpf`. The `../kgf-sparql` corpus rerun remains the external deployment gate;
+it is not part of this repository's local test suite.
+
 ### What the implementation still is not
 
 **The mandatory core profile is now implemented; M1 alone was not that profile.** Doc
 20 §20.8's M1 omitted bindings-restricted fragments, `/void`, and `/summary`, while
 adding optional `/sample`. Unit 16 supplied the bindings operation, unit 19 supplied
 the complete description surface, and unit 20 made the same `/fragment` operation a
-standard TPF/brTPF RDF source. A current deployment therefore answers `fragment`
-(plain, QUERY/POST bindings, and Comunica's GET `values=` transport), `count`,
+standard TPF/brTPF RDF source (unit 24 moves that surface to its own `/tpf` route). A current deployment therefore answers `fragment`
+(plain plus QUERY/POST bindings), `tpf` (plain plus Comunica's GET `values=` transport), `count`,
 `describe`, `manifest`, `void`, and `summary`. `/sample` and `o.text` remain optional
 extensions rather than conformance requirements.
 
@@ -1758,6 +1809,18 @@ ever handed to the serializer, they must first be filtered to the namespaces
 that occur in the triples being written, because oxttl prints every declared
 prefix whether or not the document uses it, and a hundred unused `@prefix`
 lines on every fragment would be the wrong trade.
+
+**The term grammar is selected by route, never by `Accept`.** Doc 03 §3.3 brackets
+IRIs and reserves bare tokens for CURIEs; the TPF specification and Hydra's
+`ExplicitRepresentation` require bare IRIs and bare datatype IRIs. Unit 20 reconciled
+them on one URL with a representation-selected fallback (question 44), which covered
+whole-value IRIs and nothing else, so the spec's own typed-literal example was a 400
+that terminated the client. Unit 24 gives each grammar its own route: `/fragment` is
+§3.3 in every representation, `/tpf` is `ExplicitRepresentation` in every
+representation, and a value that belongs to the other route is refused with a hint
+naming it. One URL means one grammar, and a client's `Accept` header chooses a
+serialization, not a language. `notes/tpf-route.md` is the design record.
+
 
 ## Questions for `../kgf`
 
@@ -2490,6 +2553,20 @@ following the code.
     address from one this bundle merely does not hold. Doc 03 still has no
     `absent_terms` field at all (item 23), so both the field and this reason want
     defining together in §3.4.1's envelope.
+
+66. **A `/tpf` route replaces question 44's TPF ingress grammar on `/fragment`.** Unit
+    24 (`notes/tpf-route.md`) moves TPF and brTPF to `GET /{dataset}/v/{version}/tpf`
+    with Hydra `ExplicitRepresentation` as its only grammar, quad formats first, and
+    metadata and controls in a named graph in N-Quads, TriG, and JSON-LD; `/fragment` is §3.3 only, in every
+    representation, and its RDF is data without hypermedia. Doc 03 §3.2 should add the
+    route to the URL tree; §3.4.1 should lose the sentences making `/fragment`'s RDF the
+    TPF surface (the TPF data rule paragraph moves with them); a new §3.4 entry for
+    `GET /tpf` should be normative for the grammar, the document, and the `values=`
+    transport, with §3.8's TPF entry pointing at it; §3.3 should say in one sentence
+    that bare IRIs are the TPF route's grammar; §3.5 should carry `/tpf` with
+    `/fragment`'s cost and question 45's RDF-fitting term; and doc 06 §6.4 should type
+    Comunica sources as `brtpf` on `…/tpf` and describe `void:inDataset` discovery for
+    the selectivity actor. Found by the public-deployment evaluation in `../kgf-sparql`.
 
 ## Not in this plan
 

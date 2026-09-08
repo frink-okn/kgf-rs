@@ -1,9 +1,14 @@
 # Serving Comunica as a bindings-restricted TPF/QPF source
 
-Status: implemented and externally verified, revised 2026-08-18. This records what Comunica
-5.3.0 requires of a brTPF source and the resulting design decision: **TPF and
-brTPF are first-class representations of the one `/fragment` operation**, not a
-compatibility route beside it. KGF is a bounded, extended fragment protocol;
+Status: implemented and externally verified on 2026-08-18, then **superseded on
+2026-09-07 by [`tpf-route.md`](tpf-route.md):** the decision below that TPF and brTPF
+are representations of `/fragment` with no `/tpf` alias is reversed, for the reasons
+recorded there (the representation-selected term grammar was an accidental fallback
+that rejects the TPF spec's own typed-literal form, and single-graph formats let Hydra
+controls leak into Comunica's results). The wire observations below remain accurate,
+but its route decision is historical. This note records what Comunica 5.3.0 requires
+of a brTPF source and the former decision that **TPF and brTPF were first-class
+representations of the one `/fragment` operation**. KGF is a bounded, extended fragment protocol;
 stock Comunica supplies complete SPARQL evaluation and federation over one or
 more KGF endpoints. QPF remains the graph-aware extension of the same route,
 but its four-position form waits for the graph read semantics reserved by doc

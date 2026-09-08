@@ -1,5 +1,12 @@
 # Where kgf-rs stands — 2026-08-01 (unit 9 landed)
 
+> Later handoff, 2026-09-08: unit 24 is implemented. TPF and brTPF now use the
+> dedicated GET-only `/tpf` route with Hydra `ExplicitRepresentation`; N-Quads,
+> TriG, and JSON-LD keep controls in `<request-URL#metadata>`, while `/fragment`
+> uses only the native grammar and emits data-only RDF. `notes/plan.md` and
+> `notes/tpf-route.md` carry the current detail; the snapshot below remains
+> intentionally historical.
+
 A point-in-time handoff. `CLAUDE.md` has the conventions and the design rules,
 `notes/plan.md` has the unit-by-unit route through M1 plus the decisions and the open
 questions for the design docs, `../kgf/docs/20-read-layer.md` is the spec. This file is

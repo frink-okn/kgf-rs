@@ -712,7 +712,32 @@ impl Manifest {
     /// same checks to an existing document. The path is used only to identify
     /// `manifest.json` in an error.
     pub fn validate(&self, bundle_dir: &Path) -> Result<()> {
+        self.validate_prefixes(bundle_dir)?;
         self.validate_description_artifacts(bundle_dir)
+    }
+
+    /// Keep native CURIE syntax disjoint from absolute IRIs a client may send
+    /// to the TPF route. URI schemes are case-insensitive, so the comparison is
+    /// too; accepting one as a prefix would give the same bare token two
+    /// meanings at the service boundary.
+    fn validate_prefixes(&self, bundle_dir: &Path) -> Result<()> {
+        const RESERVED_URI_SCHEMES: &[&str] = &[
+            "http", "https", "urn", "mailto", "doi", "tag", "data", "file", "ftp",
+        ];
+        if let Some(prefix) = self
+            .prefixes
+            .keys()
+            .find(|prefix| RESERVED_URI_SCHEMES.contains(&prefix.to_ascii_lowercase().as_str()))
+        {
+            return Err(Error::ManifestSyntax {
+                path: bundle_dir.join(artifact::MANIFEST),
+                detail: format!(
+                    "prefix name {prefix:?} is a registered URI scheme used by RDF data; choose \
+                     a different CURIE prefix so a bare absolute IRI cannot be reinterpreted"
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Serialize to the canonical on-disk bytes: two-space indent, trailing
@@ -1385,6 +1410,33 @@ mod tests {
         assert_eq!(parsed.to_json_bytes().unwrap(), bytes);
         assert!(parsed.declares(Capability::Sample));
         assert!(!parsed.declares(Capability::Search));
+    }
+
+    #[test]
+    fn uri_schemes_cannot_be_manifest_prefix_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for prefix in [
+            "http", "HTTPS", "urn", "mailto", "doi", "tag", "data", "file", "ftp",
+        ] {
+            let mut manifest = sample_manifest(sample_counts());
+            manifest
+                .prefixes
+                .insert(prefix.to_owned(), "http://example.org/".to_owned());
+            match manifest.validate(dir.path()).unwrap_err() {
+                Error::ManifestSyntax { path, detail } => {
+                    assert_eq!(path, dir.path().join(artifact::MANIFEST));
+                    assert!(detail.contains(prefix), "{detail}");
+                    assert!(detail.contains("URI scheme"), "{detail}");
+                }
+                other => panic!("unexpected error for {prefix}: {other}"),
+            }
+        }
+
+        let mut manifest = sample_manifest(sample_counts());
+        manifest
+            .prefixes
+            .insert("ex".to_owned(), "http://example.org/".to_owned());
+        manifest.validate(dir.path()).unwrap();
     }
 
     #[test]
