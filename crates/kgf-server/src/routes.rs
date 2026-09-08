@@ -451,13 +451,12 @@ async fn fragment(
             AccessOperation::Fragment,
             wants,
             Representation::FRAGMENT,
-            |params, limits, release, representation| {
-                let request = request::Fragment::parse_represented(
+            |params, limits, release| {
+                let request = request::Fragment::parse(
                     params,
                     limits,
                     release.prefixes(),
                     &release.binding(),
-                    representation.is_rdf(),
                 )?;
                 declares_search(release, request.pattern.text().is_some())?;
                 Ok(request)
@@ -479,14 +478,7 @@ async fn tpf(
         AccessOperation::Tpf,
         wants,
         Representation::TPF,
-        |params, limits, release, representation| {
-            request::Tpf::parse_represented(
-                params,
-                limits,
-                &release.binding(),
-                representation.is_rdf(),
-            )
-        },
+        |params, limits, release| request::Tpf::parse(params, limits, &release.binding()),
         answer::tpf,
     )
     .await
@@ -503,7 +495,7 @@ async fn count(
             BundleId { dataset, version },
             AccessOperation::Count,
             wants,
-            |params, limits, release, _representation| {
+            |params, limits, release| {
                 let request =
                     request::Count::parse(params, limits, release.prefixes(), &release.binding())?;
                 declares_search(release, request.pattern.text().is_some())?;
@@ -729,7 +721,7 @@ async fn describe(
         BundleId { dataset, version },
         AccessOperation::Describe,
         wants,
-        |params, limits, release, _representation| {
+        |params, limits, release| {
             request::Describe::parse(params, limits, release.prefixes(), &release.binding())
         },
         answer::describe,
@@ -747,7 +739,7 @@ async fn sample(
         BundleId { dataset, version },
         AccessOperation::Sample,
         wants,
-        |params, limits, release, _representation| {
+        |params, limits, release| {
             // Sampling is optional, so a bundle that does not
             // declare one is refused rather than served from artifacts it
             // never promised — and refused *here*, before the open, because
@@ -776,7 +768,7 @@ async fn search(
         BundleId { dataset, version },
         AccessOperation::Search,
         wants,
-        |params, limits, release, _representation| {
+        |params, limits, release| {
             if !release.declares(Capability::Search) {
                 return Err(Problem::new(
                     ErrorCode::CapabilityNotAvailable,
@@ -805,7 +797,7 @@ async fn schema(
         BundleId { dataset, version },
         AccessOperation::Schema,
         wants,
-        |params, limits, release, _representation| {
+        |params, limits, release| {
             let request =
                 request::Schema::parse(params, limits, release.prefixes(), &release.binding())?;
             if request.labels && !release.declares(Capability::Labels) {
@@ -973,7 +965,7 @@ async fn operate<Q, A, P, E>(
 where
     Q: request::GetRequest + Send + 'static,
     A: Renders,
-    P: FnOnce(&Params, Limits<'_>, &Release, Representation) -> Result<Q, Problem>,
+    P: FnOnce(&Params, Limits<'_>, &Release) -> Result<Q, Problem>,
     E: FnOnce(&kgf_store::Store, Target, &Q) -> Result<A, Problem> + Send + 'static,
 {
     operate_represented(
@@ -1001,7 +993,7 @@ async fn operate_represented<Q, A, P, E>(
 where
     Q: request::GetRequest + Send + 'static,
     A: Renders,
-    P: FnOnce(&Params, Limits<'_>, &Release, Representation) -> Result<Q, Problem>,
+    P: FnOnce(&Params, Limits<'_>, &Release) -> Result<Q, Problem>,
     E: FnOnce(&kgf_store::Store, Target, &Q) -> Result<A, Problem> + Send + 'static,
 {
     let representation = wants.representation_from(offered)?;
@@ -1016,7 +1008,7 @@ where
         Observation::operation(service.access(), operation, Transport::Get, representation)
             .resolved(&id.dataset, Some(&id.version));
     let params = Q::normalize_params(wants.params());
-    let request = match parse(&params, service.config().limits(), release, representation) {
+    let request = match parse(&params, service.config().limits(), release) {
         Ok(request) => request,
         Err(problem) => return observed_result(Err(problem), observation),
     };

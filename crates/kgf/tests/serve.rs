@@ -1816,6 +1816,70 @@ fn every_error_response_carries_a_code() {
 }
 
 #[test]
+fn a_page_is_admitted_the_same_way_in_every_representation_it_offers() {
+    // Admission classes what bounds the work, not how the answer is spelled.
+    // A page costs its `limit` rows in JSON, in RDF and in HTML alike, so
+    // charging the RDF forms a heavy permit priced the format rather than the
+    // work — and priced it backwards, since the HTML page resolves a label per
+    // distinct term and the Turtle page resolves none.
+    let deployment = Deployment::new();
+    deployment.publish_text("tox", "v1", GROWN_NT, "2026-06-01T14:03:22Z");
+    let records = RecordingAccessLog::default();
+    let server = deployment.serve_with_access(Arc::new(records.clone()), false);
+
+    let representations = [
+        "application/json",
+        "text/turtle",
+        "application/n-quads",
+        "application/trig",
+        "application/ld+json",
+        "text/html",
+    ];
+    for accept in representations {
+        server
+            .request("GET", "/tox/v/v1/fragment?limit=2", &[("Accept", accept)])
+            .assert_status(200);
+    }
+    // `/tpf` offers no JSON, so every machine representation of it is RDF.
+    for accept in representations
+        .iter()
+        .filter(|accept| **accept != "application/json")
+    {
+        server
+            .request("GET", "/tox/v/v1/tpf?limit=2", &[("Accept", *accept)])
+            .assert_status(200);
+    }
+    // The one thing on these routes that does leave the page behind.
+    server
+        .request(
+            "GET",
+            "/tox/v/v1/fragment?o.text=Alice",
+            &[("Accept", "text/turtle")],
+        )
+        .assert_status(200);
+
+    let records = records.records();
+    let (pages, filtered) = records
+        .split_last()
+        .map(|(filtered, pages)| (pages, filtered))
+        .expect("one record per request");
+    assert_eq!(pages.len(), representations.len() * 2 - 1);
+    for record in pages {
+        assert_eq!(
+            record.work_class,
+            Some(kgf_server::access::AccessWorkClass::Ordinary),
+            "{:?} in {:?} is a page, not candidate-sized work",
+            record.operation,
+            record.representation
+        );
+    }
+    assert_eq!(
+        filtered.work_class,
+        Some(kgf_server::access::AccessWorkClass::Heavy)
+    );
+}
+
+#[test]
 fn access_logging_emits_one_correlated_record_for_every_response() {
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");

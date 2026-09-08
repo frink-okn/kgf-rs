@@ -17,10 +17,11 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–24 are complete: all of M1 plus `o.text`, bindings, entity search,
+Units 1–25 are complete: all of M1 plus `o.text`, bindings, entity search,
 live labels, the browser workbench, the mandatory description surface, standard RDF
-serialization, stock Comunica TPF/brTPF interoperability, the bundle builder, and
-structured request logging, public-base mounting, and the dedicated `/tpf` route. Each completed unit
+serialization, stock Comunica TPF/brTPF interoperability, the bundle builder,
+structured request logging, public-base mounting, the dedicated `/tpf` route, and an
+admission policy measured against the work it classes. Each completed unit
 carries a **What landed** section written after the fact, which is where a unit's plan
 and its outcome are reconciled.
 
@@ -1420,9 +1421,10 @@ JSON-LD for both `/void` and `/fragment`; handwritten RDF escaping is gone. Frag
 RDF carries a three-mapping Hydra form, exact ordinary-pattern count, and absolute
 page/continuation IRIs keyed to the exact request URL. Complete-document byte fitting
 retains a first-omitted-row cursor rather than interrupting a serializer. RDF fragment
-requests are admitted as heavy work: complete-document fitting is bounded but has the
-same `Z·(1 + log limit)` worst case that doc 03 already records for schema fitting.
-`kgf serve --public-origin https://…` supplied a typed, trusted external origin for
+requests were admitted as heavy work on the reasoning that complete-document fitting
+carries the same `Z·(1 + log limit)` worst case as schema fitting; that classification
+was **withdrawn after measurement** — see "Admission does not price the
+representation" below. `kgf serve --public-origin https://…` supplied a typed, trusted external origin for
 Hydra page, dataset, template, and continuation IRIs behind TLS or host-rewriting
 proxies; forwarded headers remain untrusted unless an embedding deployment handles
 that trust boundary itself. Unit 23 generalized the flag into `--public-base`, which
@@ -1661,8 +1663,8 @@ edits are question 66.
 
 **What landed.** `/tpf` is a GET-only operation with its own request and cursor
 operation types, access-log identity, descriptor links, and workbench form. RDF and
-bindings-restricted requests are admitted as heavy work; the plain HTML view is
-ordinary. Its parser
+bindings-restricted requests were admitted as heavy work with the plain HTML view
+ordinary; only the bindings half of that survived measurement, below. Its parser
 uses conventional `subject`/`predicate`/`object` names and Hydra
 `ExplicitRepresentation`; brTPF `values=` is still parsed by `spargebra`, now rejects
 tables with no pattern column while retaining Comunica's upstream join-context columns,
@@ -1709,6 +1711,86 @@ rather than implements.
 The corresponding decisions recorded below still need to be applied to the sibling
 `../kgf` specifications so the working design and this implementation say the same
 thing.
+
+### 25. Admission does not price the representation ✅
+
+Two rules had accumulated in `GetRequest::work_class` that classed a request by how
+its answer would be spelled: a `/fragment` was heavy in any RDF representation, and
+since `/tpf` offers no JSON, every machine representation of that route was heavy.
+The stated reason was `fit_fragment_rdf`, which binary-searches complete-document
+serializations to fit `max_response_bytes` and so costs `Z·(1 + log limit)` in the
+worst case. Measurement retired the rule on three independent grounds.
+
+**The worst case is unreachable at the default budgets.** `materialize` already trims
+a page to `max_response_bytes` measured as compact JSON, *before* anything is
+serialized. The fitting loop runs only if the RDF document then exceeds that same
+budget — that is, only if RDF is larger than the JSON measure of the identical rows.
+It is not: over a 10 000-row page of DREAM-KG, Turtle came out 3.2× smaller than the
+JSON envelope, N-Quads 2.1×, JSON-LD 2.4×. Reaching the loop needs rows big enough to
+fill 64 MiB (huge literals, where JSON's per-term overhead is proportionally
+smallest) *and* RDF larger than JSON (short IRIs against a long graph name) at the
+same time, which are opposing requirements. The loop is a correct guard and stays;
+`tpf_rdf_byte_fitting_keeps_a_complete_parseable_document_and_cursor` still reaches
+it, by setting `max_response_bytes` a hundred bytes under one page.
+
+**The measured cost is a small constant, and the rule had its sign wrong.** Median
+service time, warm, keep-alive, same page:
+
+| page | JSON | Turtle | N-Quads | JSON-LD | HTML |
+|---|---:|---:|---:|---:|---:|
+| `limit=100` | 0.19 ms | 0.28 ms | 0.29 ms | 0.40 ms | **0.68 ms** |
+| `limit=1000` | 0.89 ms | 1.34 ms | 1.43 ms | 1.77 ms | **4.89 ms** |
+| `limit=10000` | 8.96 ms | 14.69 ms | 14.60 ms | 19.19 ms | — |
+
+RDF costs 1.0–2.1× the JSON page, never the 4× a heavy permit charges, and at the
+default page size the spread across all of them is a few hundred microseconds. The
+HTML page — which resolves a display label per distinct term, real random dictionary
+and index work — costs 2.4–3.6× the Turtle page and was classed ordinary throughout.
+The rule charged the cheapest representation four permits and the most expensive one.
+
+**The gate it entered was not protecting anything.** Driving `/tpf?limit=10000` in
+Turtle at concurrency 32 against the defaults, the request spent p50 52 ms queueing
+for a permit against 17 ms of work, with 23 of 128 waiting slots occupied, while an
+identically sized JSON page queued zero. Reclassifying moves that contention into the
+blocking pool rather than removing it — goodput went 440/s → 522/s at concurrency 16
+and was unchanged at 32, with a longer tail — which is the honest result: the gate was
+reshaping latency for the same throughput, not rationing a scarce resource. It matches
+what `../kgf docs/gcp-deployment-plan.md` §6.0c found from the other direction, that
+heavy traffic starves ordinary traffic *downstream* of the semaphore, so widening the
+heavy class buys no protection.
+
+Doc 03 §3.5 is on the same side: its `fragment` GET row is `O(log N + limit)` with no
+representation term, and `Z·(1 + log limit)` appears only on the `schema` rows. The
+code had grown a cost class the normative table does not carry.
+
+**What landed.** `Fragment::work_class` is heavy iff the pattern carries a text
+constraint, matching `/count`; `Tpf::Plain` delegates to it and `Tpf::Values` stays
+heavy, because brTPF's distinct union really is bounded by `candidate_budget` and
+`O(k²)` normalization rather than by its page. `Fragment::rdf_serialization`,
+`Fragment::parse_represented`, and `Tpf::parse_represented` are deleted; with no
+request type left reading the negotiated representation, the `Representation`
+argument threaded into every `operate`/`operate_represented` parse closure went with
+them. `WorkClass` now states the criterion it is classifying on — *what bounds the
+work*, not what it costs in the large — so the next operation is not argued into the
+class on the strength of feeling expensive.
+
+*Verified by* the request-layer class tests and a new
+`a_page_is_admitted_the_same_way_in_every_representation_it_offers`, which drives one
+page through all six representations of `/fragment` and all five of `/tpf` and asserts
+every access record reads `ordinary`, with a text-filtered fragment beside them
+reading `heavy`.
+
+Two adjacent inconsistencies this surfaced and did **not** fix, both worth their own
+decision:
+
+- `operate_body` hardcodes `WorkClass::Heavy` for every body request rather than
+  deriving it, so `/labels` — a batch dictionary lookup — is classed with a bindings
+  QUERY, and body requests have no `work_class()` at all. Classification lives in two
+  places.
+- If large pages should cost more, `limit` predicts service time far better than the
+  representation does: a JSON page at 10 000 rows costs 32× a Turtle page at 100, and
+  both are ordinary. That would be a uniform rule across representations, and needs
+  its own justification and measurement rather than being smuggled in here.
 
 ## Testing spine
 
@@ -2278,16 +2360,22 @@ following the code.
     should specify this as the TPF ingress grammar rather than weakening §3.3 for every
     route.
     Found by the pinned Comunica 5.3.0 conformance test in unit 20.
-45. **Doc 03 §3.5 understates RDF fragment cost.** Its fragment rows describe selection
-    and paging as `O(log N + limit)` (or `O(k·log N + limit)` for bindings), but a
-    complete Turtle or JSON-LD document cannot be interrupted at the byte boundary.
-    The implementation uses the same bounded complete-prefix fitting already specified
-    for `/schema`, whose worst case is `Z·(1 + log limit)`, and admits RDF fragments as
-    heavy work. brTPF's distinct union also examines at most `candidate_budget`
-    compatibility rows against at most `k` restrictions after `O(k²)` normalization
-    when filtering partial overlaps before the page limit. The two fragment table rows
-    should name both terms; the implementation is bounded and the cost table is the
-    stale side of this disagreement.
+45. **Doc 03 §3.5 should name brTPF's union term; its RDF-fitting half is withdrawn.**
+    As first raised, this said the fragment rows understate RDF cost: a complete Turtle
+    or JSON-LD document cannot be interrupted at the byte boundary, so the
+    implementation fits it with the same bounded complete-prefix search specified for
+    `/schema`, worst case `Z·(1 + log limit)`. **That half is withdrawn** — unit 25
+    measured it. The search is unreachable at the default budgets, because a page is
+    already trimmed to `max_response_bytes` measured as compact JSON and every RDF
+    serialization of those rows is 2–3× smaller than that measure, so the first
+    complete document fits and returns. Doc 03's representation-independent
+    `O(log N + limit)` was right and the implementation's heavy classification of RDF
+    fragments was the stale side; the classification is gone.
+    What stands is the other term: brTPF's distinct union examines at most
+    `candidate_budget` compatibility rows against at most `k` restrictions after
+    `O(k²)` normalization when filtering partial overlaps before the page limit, and
+    that is genuinely not bounded by the page. The bindings row should name it, and
+    `/tpf` with `values=` carries the same cost.
 46. **Resolved: one blank-node identity, in every representation.** A stored `_:`
     label cannot be emitted unchanged in Turtle or JSON-LD: RDF scopes that identity to
     one document, so the same HDT node would become unrelated nodes across pages and a
@@ -2578,7 +2666,8 @@ following the code.
     `GET /tpf` should be normative for the grammar, the document, and the `values=`
     transport, with §3.8's TPF entry pointing at it; §3.3 should say in one sentence
     that bare IRIs are the TPF route's grammar; §3.5 should carry `/tpf` with
-    `/fragment`'s cost and question 45's RDF-fitting term; and doc 06 §6.4 should type
+    `/fragment`'s cost — representation-independent, per question 45 — plus that
+    question's union term where `values=` is present; and doc 06 §6.4 should type
     Comunica sources as `brtpf` on `…/tpf` and describe `void:inDataset` discovery for
     the selectivity actor. The grammar should say that CURIE-looking strings such as
     `rdfs:label` are valid absolute IRIs by syntax and are taken literally: without a
