@@ -220,9 +220,11 @@ at `/tpf`, so that a source configured as `brtpf@…/fragment` migrates by itsel
   cursor`; the HTML workbench links to it beside `fragment`.
 - **Cursors.** A new `Operation::Tpf` in the canonical request, so a `/tpf` cursor is
   refused on `/fragment` and vice versa even though both lower to the same selection.
-- **Admission and access log.** `AccessOperation::Tpf`; RDF and bindings-restricted
-  requests are admitted as heavy work, while a plain HTML view is ordinary. The
-  observation records the route so the census can tell TPF traffic from native traffic.
+- **Admission and access log.** `AccessOperation::Tpf`; bindings-restricted requests
+  are admitted as heavy work and plain patterns are ordinary in every representation.
+  (As built, RDF was heavy too; unit 25 in `plan.md` withdrew that after measuring it.)
+  The observation records the route so the census can tell TPF traffic from native
+  traffic.
 - **Caching.** ETags already carry the representation token; the two new tokens are
   header-safe. `Vary` is unchanged.
 - **Manifest.** Nothing. No capability, no prefix-map involvement.

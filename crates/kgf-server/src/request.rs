@@ -1694,8 +1694,6 @@ pub struct Fragment {
     pub cursor: Option<Cursor>,
     /// What a cursor this request issues must match.
     pub binding: CursorBinding,
-    /// RDF fitting performs bounded repeated complete-document serialization.
-    rdf_serialization: bool,
 }
 
 impl Fragment {
@@ -1708,18 +1706,6 @@ impl Fragment {
         limits: Limits<'_>,
         prefixes: &PrefixMap,
         bundle: &BundleBinding,
-    ) -> Result<Self, Problem> {
-        Self::parse_represented(params, limits, prefixes, bundle, false)
-    }
-
-    /// Read a native fragment request and retain whether RDF byte fitting will
-    /// be required after execution.
-    pub(crate) fn parse_represented(
-        params: &Params,
-        limits: Limits<'_>,
-        prefixes: &PrefixMap,
-        bundle: &BundleBinding,
-        rdf_representation: bool,
     ) -> Result<Self, Problem> {
         accept_only(params, FRAGMENT, Self::PARAMETERS)?;
         let pattern = Pattern::parse(params, limits, prefixes)?;
@@ -1741,7 +1727,6 @@ impl Fragment {
             candidates: Candidates(limits.budgets.candidate_budget),
             cursor: resume(params, &binding)?,
             binding,
-            rdf_serialization: rdf_representation,
         })
     }
 }
@@ -1773,17 +1758,6 @@ impl Tpf {
         limits: Limits<'_>,
         bundle: &BundleBinding,
     ) -> Result<Self, Problem> {
-        Self::parse_represented(params, limits, bundle, true)
-    }
-
-    /// Parse the TPF request with the serialization cost selected during
-    /// content negotiation.
-    pub fn parse_represented(
-        params: &Params,
-        limits: Limits<'_>,
-        bundle: &BundleBinding,
-        rdf_serialization: bool,
-    ) -> Result<Self, Problem> {
         accept_only(params, TPF, Self::PARAMETERS)?;
         let pattern = BindingPattern::parse_tpf(params, limits)?;
         if params.get("values").is_some() {
@@ -1810,7 +1784,6 @@ impl Tpf {
             candidates: Candidates(limits.budgets.candidate_budget),
             cursor: resume(params, &binding)?,
             binding,
-            rdf_serialization,
         }))
     }
 }
@@ -2813,8 +2786,13 @@ impl GetRequest for Fragment {
         normalize_pattern_params(params, &["o.text", "limit"])
     }
 
+    /// A text constraint is the only thing that takes this operation off its
+    /// page: it spends the candidate budget ranking literals, while an
+    /// ordinary pattern descends an index and materializes `limit` rows.
+    /// Every representation of that page — JSON, RDF, HTML — costs within a
+    /// small constant of the others, so none of them changes the class.
     fn work_class(&self) -> WorkClass {
-        if self.pattern.text().is_some() || self.rdf_serialization {
+        if self.pattern.text().is_some() {
             WorkClass::Heavy
         } else {
             WorkClass::Ordinary
@@ -3254,27 +3232,11 @@ mod tests {
     #[test]
     fn candidate_and_random_access_requests_are_admitted_as_heavy_work() {
         assert_eq!(fragment("").unwrap().work_class(), WorkClass::Ordinary);
+        assert_eq!(tpf("").unwrap().work_class(), WorkClass::Ordinary);
         assert_eq!(
-            Tpf::parse(&params(""), limits(), &bundle())
+            tpf("subject=%3Fs&values=%28%3Fs%29%7B%28%3Chttp%3A%2F%2Fexample.org%2Falice%3E%29%7D")
                 .unwrap()
                 .work_class(),
-            WorkClass::Heavy
-        );
-        assert_eq!(
-            Tpf::parse_represented(&params(""), limits(), &bundle(), false)
-                .unwrap()
-                .work_class(),
-            WorkClass::Ordinary
-        );
-        assert_eq!(
-            Tpf::parse_represented(
-                &params("subject=%3Fs&values=%28%3Fs%29%7B%28%3Chttp%3A%2F%2Fexample.org%2Falice%3E%29%7D"),
-                limits(),
-                &bundle(),
-                false,
-            )
-            .unwrap()
-            .work_class(),
             WorkClass::Heavy
         );
         assert_eq!(

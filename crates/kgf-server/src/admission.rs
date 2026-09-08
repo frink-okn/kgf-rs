@@ -87,6 +87,21 @@ impl Default for Admission {
 }
 
 /// The two cost classes the first admission policy distinguishes.
+///
+/// The dividing question is **what bounds the work**, not how expensive it
+/// feels: heavy is for requests whose cost is bounded by something other than
+/// the page they return — the candidate budget, a random draw, an index scan,
+/// or a whole unpaged document. Everything proportional to `limit` is
+/// ordinary, however many rows that is, because `limit` is already a published
+/// cap and the gate would be pricing the same bound twice.
+///
+/// Serialization format is deliberately *not* an input. Measured over a page
+/// of 10 000 rows, Turtle and N-Quads cost 1.6× the equivalent JSON page and
+/// JSON-LD 2.1×, while the HTML page — which resolves a display label per
+/// distinct term — costs more than any of them; at the default page size all
+/// four are within a few hundred microseconds of each other. A rule keyed on
+/// representation charged the cheapest bytes on the wire four times an
+/// ordinary permit and the most expensive one a single permit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkClass {
     /// Bounded index descent and row materialization.
