@@ -17,11 +17,14 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–25 are complete: all of M1 plus `o.text`, bindings, entity search,
+Units 1–28 are complete: all of M1 plus `o.text`, bindings, entity search,
 live labels, the browser workbench, the mandatory description surface, standard RDF
 serialization, stock Comunica TPF/brTPF interoperability, the bundle builder,
-structured request logging, public-base mounting, the dedicated `/tpf` route, and an
-admission policy measured against the work it classes. Each completed unit
+structured request logging, public-base mounting, the dedicated `/tpf` route, an
+admission policy measured against the work it classes, the sorted dictionary as an
+operation, a capability gate that fires only where an artifact can be absent, and a
+prefix count that reports every position it was measured cheap enough to report. Each
+completed unit
 carries a **What landed** section written after the fact, which is where a unit's plan
 and its outcome are reconciled.
 
@@ -1704,10 +1707,12 @@ standard TPF/brTPF RDF source (unit 24 moves that surface to its own `/tpf` rout
 `describe`, `manifest`, `void`, and `summary`. `/sample` and `o.text` remain optional
 extensions rather than conformance requirements.
 
-What remains is beyond that core profile: graph-scoped reads and their four-position
-QPF form; later composed operations such as ranges, stars, and key resolution; and
-doc 04 §4.4's component DAG, which unit 21's `kgf build` recognizes and refuses
-rather than implements.
+M2's read operations are complete with unit 26's `/terms`, whose prefix scan was the
+last of them needing no artifact a bundle does not already carry. What remains is beyond
+the core profile: graph-scoped reads and their four-position QPF form; later composed
+operations such as ranges, stars, and key resolution — the last of which is the half of
+§3.4.8 that needs an index no bundle carries, question 67; and doc 04 §4.4's component
+DAG, which unit 21's `kgf build` recognizes and refuses rather than implements.
 The corresponding decisions recorded below still need to be applied to the sibling
 `../kgf` specifications so the working design and this implementation say the same
 thing.
@@ -1791,6 +1796,213 @@ decision:
   representation does: a JSON page at 10 000 rows costs 32× a Turtle page at 100, and
   both are ordinary. That would be a uniform rule across representations, and needs
   its own justification and measurement rather than being smuggled in here.
+
+### 26. `GET /terms` — the sorted dictionary as an operation ✅
+
+**Implemented 2026-09-08.** The last M2 read operation, and the only remaining one that
+needs no artifact a bundle does not already carry: every published release answers it
+against the PFC sections standard HDT already stores sorted. Two shapes at one URL —
+`GET /terms{?prefix,role,count,limit,labels,cursor}` returns a lexicographic page of
+the terms starting with a byte prefix, or with `count=true` their exact number without
+enumerating any of them.
+
+Why this one next, of everything left: the count is the cheapest useful question in the
+protocol. Two binary searches bracket a prefix, so "does this KG use MONDO at all, and
+in which positions" is `O(log D)` per dataset — measured at **1 ms for the whole
+dictionary** of a 95 000-triple release, and unchanged by how many terms match. Fanned
+across the federation that is one round trip per KG to decide which ones are worth
+asking anything else, and until now a client could only approximate it by guessing a
+full IRI and calling `/count`, which tests one term rather than a namespace. The page
+half is the same index read as IRI autocompletion.
+
+Unit 4 left the store side half-built on purpose and said so: `Dictionary::prefix_bounds`
+has been there since M1, unused, with the note that "the server will merge the two
+sorted runs when it implements `/terms`". This is that merge.
+
+**What landed, store side.** `Dictionary::terms(ScanRole, prefix)` brackets each covered
+section and returns a `TermScan`; `TermScan::page` merges the runs and hands each term to
+a visitor, `TermScan::count` answers the count without one. Three decisions carried the
+design:
+
+- **One order over several sections, not several sections in a row.** A subject or
+  object role spans the shared and role-only sections, and `role=any` spans all four.
+  Each is sorted independently, so a lexicographic answer is a merge — and a merge needs
+  the strings, which is why the scan decodes once and visits rather than yielding ids for
+  a caller to re-decode. Set semantics fall out of it: a term in several sections is one
+  row, and *the sections it occupied come free from the same step*. That is what lets a
+  row report `roles: ["subject", "object"]` at no cost, which is more than doc 03 asks
+  for and is the answer to the question a namespace probe is really asking.
+- **A cursor names the last term delivered, not the next positions.** Resuming a merge
+  needs every run advanced past a common boundary, and the boundary is one term. So the
+  token carries one `DictPosition` — a term's position over the four sections taken in
+  order, which is the one number that names a stored term independently of role, since a
+  `TermId` means different terms in different id spaces. Resume costs one block decode
+  plus a binary search per section, and every run skips past the term itself, which is
+  what keeps a multi-section term one row across a page boundary. A set of per-run
+  offsets would have needed one wire field per run and would have let an edited token
+  pair them inconsistently.
+- **The count is exact, including for `role=any`, and says what that costs.** The
+  shared, subject-only, and object-only sections partition their terms by construction,
+  so a single role's count is arithmetic on searches already done. Predicates are the one
+  section whose string can repeat one of the others, so an exact distinct count probes
+  each matching predicate against the rest — bounded by the bundle's published predicate
+  count rather than by the page. That shape was first classed as heavy work on the
+  strength of the bound alone; unit 28 measured it and retracted the class.
+
+**What landed, server side.** `Operation::Terms`, `PositionSpace::DictionaryPrefix`,
+`AccessOperation::Terms`, a `RequestShape::Terms` whose census fields are the prefix's
+*length* and never its bytes, the route, descriptor links, the manifest operation table,
+and a workbench form. `prefix` is deliberately a bare byte prefix rather than a §3.3
+term — question 10 settled that when it required brackets on an IRI — so a leading `<`
+is refused by naming the bare spelling instead of matching nothing. `labels` defaults on
+as it does for `/search`: an unlabelled page of opaque identifiers answers "which terms"
+without answering "which things", and a term the scan met only as a predicate is looked
+up in the subject sections it never read, so a predicate carries its `rdfs:label` like
+anything else. Label bytes are weighed into `max_response_bytes` with the row, and the
+first row of a page is served whatever it costs, for the reason `materialize` has always
+kept its first row: a page that carries nothing hands back a cursor that resumes where it
+was issued.
+
+`count=true` refuses `limit`, `labels`, and `cursor` rather than ignoring them, and the
+form therefore has no count control — the count is reached from the answer page, by a
+link built from the two parameters that determine it. `Capability::Terms` is now derived
+for every bundle, as `sample` and `labels` are, and it is scoped in its own
+documentation to the prefix half: key resolution shares the path in the protocol but
+needs a derived key-to-id index no bundle carries, and QUERY on the route is a plain
+405. The route is not gated on that declaration, for the reason unit 27 gives.
+
+*Verified by* a differential store test that compares all four roles over seven prefixes
+against hdtc's own independent sequential PFC reader, including the term that is both a
+predicate and a shared subject; exhaustive paging at six page sizes per role per prefix,
+asserting the concatenation is the whole scan term for term; refusal of resume points
+naming a term outside the prefix, outside the role, or past the dictionary; the visitor's
+reject path resuming at the term it dropped; and at the HTTP layer, the same
+differential against the dictionary, cursor binding to one prefix and one role, the byte
+budget's truncation reason, and the page's links. On the live demo corpus, `count=true`
+agreed with exhaustive enumeration for every role and prefix tried, paging was identical
+at limits 1, 2, 7, 13 and 97, a 10 000-term page took 20 ms, and the whole-dictionary
+distinct count took 1 ms.
+
+### 27. A capability gate belongs where an artifact can be absent ✅
+
+**Implemented 2026-09-08, out of unit 26's review.** `/terms` was first gated on
+`Capability::Terms` the way `/sample` and `/labels` were gated on theirs, and the
+question that broke it was direct: why is a declaration the authority when the operation
+needs no additional file? It is not, and the rule was imprecise rather than the new
+operation being special.
+
+**What the field is.** The whole capability set is derived from which artifact files a
+bundle carries, so it tells a server holding that bundle nothing it could not work out
+itself. Its audience is the consumer that has the *manifest* and not the bundle — a
+registry building linksets, a mirror verifying a copy, a client choosing among forty
+endpoints — which is why `filters` is declared at all despite gating no operation here.
+
+**What follows.** `search`, `graphs`, and the sketch families stay gated: an artifact
+can genuinely be absent, and answering `g=` from a bundle with no graph sidecar is a
+wrong answer carrying no sign of being wrong. `sample`, `labels`, and `terms` are not
+gated any more. Each composes artifacts every bundle is *required* to carry, so no
+published bundle exists that cannot answer them, their manifest entries restate "yes,
+always", and the only thing such a check can do is fail — suppressing work the bytes
+support because the metadata is older than the code. The demo corpus shows the staleness
+runs both ways: `demo/dreamkg/0.0.5` declares `star` and `export`, which this build does
+not route at all, so a client trusting that list gets a bare 404.
+
+The two questions were being answered by one field, and they are now answered separately.
+The manifest says what the bundle *carries*; the service descriptor's release links say
+what this deployment *routes*, and `sample`, `terms`, and `labels` appear there
+unconditionally. Both `DatasetSummary::capabilities` and `ReleaseLinks` now document
+which of the two they are, because they sit next to each other in one JSON object and
+legitimately disagree in both directions.
+
+One consequence not fixed here: serve startup validates a manifest's id, version, and
+description-artifact set but never its capability list, so an out-of-date list is silent
+rather than loud. `kgf manifest --check` compares declared against derived and demands
+equality, but only when someone runs it. A startup check could derive the expected set
+from the manifest's own `artifacts` map with no I/O at all, which would catch both the
+under- and over-declaring cases without touching the lazy-open design. That is its own
+unit.
+
+Why this could not be fixed by reading the derived set instead: the gate runs in the
+parse closure, *before* the bundle is opened and deliberately so — a refusal must not
+cost an open, still less the fd and eviction machinery on a cold bundle. The manifest is
+the only thing available at that point. So for the artifact-free capabilities the answer
+is not a better source of truth but no check: the build implementing the operation is the
+whole of the fact, and it needs neither.
+
+*Verified by* `an_operation_whose_artifact_a_bundle_lacks_is_refused_before_it_is_opened`
+(withdraw `search` from a text bundle's manifest; `/search` and `o.text` both 501 while
+`/fragment` is untouched) and its counterpart
+`an_operation_needing_no_sidecar_is_not_gated_on_its_declaration` (withdraw all three
+artifact-free entries; `/sample`, `/terms`, `/terms?labels=true` and `QUERY /labels` all
+answer, and all three stay advertised in the descriptor's links).
+
+### 28. What a prefix scan should say, and what it should cost ✅
+
+**Implemented 2026-09-08, out of three questions against unit 26.** All three had the
+same answer and it was measurement, not argument.
+
+**The count was not heavy work.** `Terms::work_class` classed a `role=any` count as heavy
+because its cost is bounded by the bundle's predicate count rather than by a page — the
+letter of unit 25's criterion. Measured against the four widest predicate sets in the
+corpus, warm, median of 25:
+
+| bundle | predicates | `count` `role=any` | `count` `role=subject` | page 100 | page 10 000 | `/fragment` 10 000 |
+|---|---:|---:|---:|---:|---:|---:|
+| climatemodelskg | 119 | **0.36 ms** | 0.20 ms | 0.30 ms | 6.58 ms | 9.66 ms |
+| biobricks-aopwiki | 68 | **0.30 ms** | 0.24 ms | 2.96 ms | 18.28 ms | 8.78 ms |
+| ruralkg | 57 | **0.27 ms** | 0.23 ms | 0.32 ms | 10.17 ms | 7.92 ms |
+| rdkg | 22 | **0.22 ms** | 0.19 ms | 0.29 ms | 7.05 ms | 6.23 ms |
+
+The deduplication probe adds about a tenth of a millisecond at 119 predicates, while an
+*ordinary* page of the same operation costs fifty times the whole request. Four permits
+for the cheapest shape and one for the dearest is the inversion unit 25 found in the
+representation rule and removed; this reproduced it from the other direction, so
+`Terms::work_class` is gone and every shape of `/terms` is ordinary.
+
+`WorkClass`'s own documentation is what allowed it, and now carries the missing half: **a
+different bound is not automatically a large one.** `candidate_budget` is deliberately
+large and a `values=` union is quadratic in its input; a published per-bundle count of a
+few hundred is not a bound worth rationing. The class is a claim about contention, and
+contention is observable — so measure before classifying.
+
+**A page states its own cardinality.** `/fragment` has always returned the exact size of
+the result set beside its rows; `/terms` did not, so a paging client could not tell how
+far through a scan it was without a second request. It does now, exactly, in every role —
+which the measurement above is what made affordable, since exactness in the `any` case is
+the same probe that was mistaken for heavy work. Bracketing the prefix is what produced
+the page, so the number was already in hand.
+
+**A count answers every position, not the one that was asked.** The question behind this
+operation is not "how many MONDO terms" but *how* a dataset uses a namespace, and the
+four numbers fall out of the same four bracketing searches — three of them free. So a
+count response carries `counts: {subject, predicate, object, any}` always, beside the
+requested role's `count` in the shape `/count` uses. `role` keeps its meaning rather than
+being refused on a count, because `?prefix=X&role=predicate&count=true` is what a client
+naturally writes; the breakdown is additive to it. `any` is not the sum of the other
+three and the response says so, in the JSON note and in the HTML table.
+
+Fanned across the demo corpus, one request per dataset, this is the difference between
+knowing a namespace is present and knowing what it is doing there:
+
+```text
+=== http://purl.obolibrary.org/obo/
+  biobricks-aopwiki      subject=    800 predicate=  14 object=   1138 distinct=   1149
+  rdkg                   subject=  33884 predicate=   0 object=  28913 distinct=  33884
+  phaseskg               subject=    176 predicate=  24 object=    161 distinct=    242
+  (12 datasets in 13 ms, one request each)
+```
+
+`rdkg` carries 33 884 OBO terms and no OBO predicates — it uses the ontology as an
+identifier scheme. `phaseskg` carries 24 OBO predicates — it uses it as a vocabulary. A
+single `any` number cannot tell a planner which, and both readings change what a join
+against that dataset should look like.
+
+*Verified by* a store test that checks the breakdown against each role counted alone over
+every fixture prefix, including the term stored as both a shared subject and a predicate;
+the HTTP differential extended to assert the page's cardinality and every number of the
+breakdown against the dictionary; a fixture whose positions add up to more than its
+distinct total, so a regression to summing would fail; and the work-class test extended
+over five `/terms` shapes, all ordinary.
 
 ## Testing spine
 
@@ -2674,6 +2886,60 @@ following the code.
     prefix map, `ExplicitRepresentation` cannot distinguish them from custom URI
     schemes, and `/tpf` deliberately performs no prefix expansion. Found by the
     public-deployment evaluation in `../kgf-sparql` and implementation review.
+67. **§3.4.8's `terms` capability covers two operations, and only one of them can be
+    declared from a bundle's bytes.** The prefix scan and its count need nothing beyond
+    the sorted dictionary every bundle carries, so unit 26 derives `terms` for every
+    release. Key resolution needs the derived key-to-id index §3.4.8 itself describes,
+    which no bundle carries and which doc 07 §7.5 item 19 has not yet decided is
+    mandatory. One capability name therefore cannot mean both without a client that reads
+    `terms` from a manifest being wrong about half of it. The proposal is to let `terms`
+    mean the prefix scan and gate key resolution on `keysets` — the capability it exists
+    to complete, and the one whose artifacts imply the index — rather than mint a third
+    name. Meanwhile QUERY on the route is a plain 405 with `Allow`.
+68. **§3.4.8's `O(log D)` count holds per role; `role=any` carries one more term.** The
+    shared, subject-only, and object-only sections partition their terms, so those counts
+    are arithmetic on the two bracketing searches. Predicates are the one section whose
+    string may repeat one of the others, so an exact distinct count over `any` probes each
+    matching predicate against the rest: `O(P·log D)` where `P` is the bundle's published
+    predicate count. §3.4.8's "regardless of how many terms match" is still true — the
+    bound is in the schema, not the match set — and §3.5's `terms` row should carry the
+    extra term rather than leave the reading to a server. It should *not* imply a cost
+    class: unit 28 measured that term at a tenth of a millisecond against the corpus's
+    widest predicate set, where an ordinary page of the same operation costs fifty times
+    the whole request. The alternative, an estimate for `any`, is worse still: the whole
+    point of the operation is that the number is exact.
+69. **`role=any` needs a stated meaning, and a row can afford to say more than doc 03
+    asks.** §3.4.8 lists `any` among the roles without saying whether a term occupying
+    several positions is one row or several. Unit 26 answers one row, because a merge that
+    is already ordering strings deduplicates for free — and because "how many distinct
+    terms are in this namespace" is the question a federation probe is asking. The same
+    step yields *which* positions the term occupies at no extra cost, so each row carries
+    `roles`, and §3.4.8 should specify both: the response shape (a term object, its
+    `roles`, and its `label` when asked), and that `roles` is complete for `any` while for
+    a single role it reports only the sections that role reads. Predicate membership is
+    the one thing a subject or object scan cannot report without an unbounded skip over a
+    section it is not returning from. Two further shape additions belong with it, both
+    from unit 28 and both free: a page states the exact `cardinality` of the scan it is
+    paging, as every other row operation does, and a count carries `counts` for all four
+    positions rather than only the one requested — because "does this dataset use MONDO"
+    is answered by *how*, and one probe should not have to be sent four times to find
+    out.
+70. **§3.4.8 gives `terms` a `limit` but no continuation, and `limit` is a page size
+    everywhere else.** Unit 26 issues a cursor, since a truncated page that offered
+    nothing to resume would be the silent truncation §3.6 prohibits. Doc 03 should say so,
+    and §3.5's `terms` row should read `O(log D + limit)` per page rather than per
+    request. The cursor is a dictionary position over the four sections in order — the one
+    number that names a stored term independently of role — and it binds to `prefix` and
+    `role`, not to `limit` or `labels`, so a client may change page size or ask for labels
+    mid-scan and keep paging.
+71. **`labels=true` now applies to three operations and not the other three.** `/search`,
+    `/schema`, and now `/terms` hydrate the release's frozen label cascade; `/fragment`,
+    `/describe`, and `/sample` still refuse the parameter and label only their HTML. Item
+    35 asked for the uniform rule and this widens the inconsistency by one operation
+    rather than resolving it, deliberately: an IRI list is the one response whose rows are
+    unreadable without labels, so it was the operation least able to wait. The remaining
+    gap is item 35's, and `/terms` is now the worked example of what the uniform answer
+    looks like — the label weighed into `max_response_bytes` with the row it belongs to.
 
 ## Not in this plan
 

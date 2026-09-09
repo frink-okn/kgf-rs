@@ -110,6 +110,22 @@ pub fn validate_predicate_role_iri(
 /// The core profile (`fragment`, `count`, `describe`, and the description
 /// surface) is mandatory and therefore absent from this enum: it is not a
 /// capability, it is the floor.
+///
+/// # Who this list is for
+///
+/// The whole set is [derived](capabilities_for) from which artifact files a
+/// bundle carries, so it tells a server holding that bundle nothing it could not
+/// work out itself. Its audience is the consumer that has the *manifest* and not
+/// the bundle: a registry building linksets, a mirror verifying what it copied, a
+/// client choosing which of forty endpoints to ask. `Filters` is the pure case —
+/// it gates no operation here at all.
+///
+/// Which means a server should read it only where an artifact can be missing.
+/// `Sample`, `Labels`, and `Terms` compose artifacts every bundle is required to
+/// carry, so for those the field is a restatement of "yes, always", and treating
+/// it as the authority lets a manifest written before an operation existed
+/// suppress work the bytes fully support. `kgf-server`'s `routes::capability_gate`
+/// carries that division.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Capability {
     /// `QUERY /star` — star hydration.
@@ -117,6 +133,14 @@ pub enum Capability {
     /// `GET /sample` — pseudo-random members of a pattern's results.
     Sample,
     /// `GET /terms` — dictionary prefix access.
+    ///
+    /// The prefix scan and its exact count, which the sorted PFC sections
+    /// answer without a sidecar. Key resolution — turning matched role-key
+    /// hashes back into terms — shares the same path in the protocol but not
+    /// the same bytes: it needs a derived key-to-id index no bundle carries, so
+    /// it is not part of what declaring this commits to. Which capability
+    /// should gate *that* is an open question, and the honest candidate is the
+    /// key sets it exists to complete rather than this one.
     Terms,
     /// `GET /export/...` — bulk artifact download.
     Export,
@@ -253,15 +277,17 @@ impl BundleFacts {
 
 /// Which capabilities an artifact set supports.
 ///
-/// Two optional capabilities need nothing beyond the artifacts every bundle is
-/// required to carry: `sample` composes triple patterns, and `labels` resolves
-/// the manifest's predicate cascade through the core permutations. `star`,
-/// `terms`, and `export` are not declared until their complete HTTP operations
-/// are implemented. The rest are gated on sidecars — the graph pair and the
-/// text index exist today, and `range` and `closure` are therefore never derived
+/// Three optional capabilities need nothing beyond the artifacts every bundle is
+/// required to carry: `sample` composes triple patterns, `labels` resolves the
+/// manifest's predicate cascade through the core permutations, and `terms`
+/// scans the sorted PFC sections the dictionary already stores. `star` and
+/// `export` are not declared until their complete HTTP operations are
+/// implemented. The rest are gated on sidecars — the graph pair and the text
+/// index exist today, and `range` and `closure` are therefore never derived
 /// here, since a bundle cannot acquire them without acquiring an artifact.
 fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
-    let mut capabilities = BTreeSet::from([Capability::Sample, Capability::Labels]);
+    let mut capabilities =
+        BTreeSet::from([Capability::Sample, Capability::Labels, Capability::Terms]);
     if artifacts.graphs.is_some() {
         capabilities.insert(Capability::Graphs);
     }
@@ -1218,7 +1244,10 @@ mod tests {
         let fixture = Fixture::build(TINY_NT);
         let capabilities: Vec<_> = facts(&fixture).capabilities().collect();
 
-        assert_eq!(capabilities, vec![Capability::Sample, Capability::Labels]);
+        assert_eq!(
+            capabilities,
+            vec![Capability::Sample, Capability::Terms, Capability::Labels]
+        );
         // Sidecar-gated capabilities are never guessed at.
         assert!(!capabilities.contains(&Capability::Search));
         assert!(!capabilities.contains(&Capability::Range));

@@ -117,6 +117,7 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/{dataset}/v/{version}/describe", read(get(describe)))
         .route("/{dataset}/v/{version}/sample", read(get(sample)))
         .route("/{dataset}/v/{version}/search", read(get(search)))
+        .route("/{dataset}/v/{version}/terms", read(get(terms)))
         .route("/{dataset}/v/{version}/schema", read(get(schema)))
         .route("/{dataset}/v/{version}/void", read(get(void)))
         .route("/{dataset}/v/{version}/summary", read(get(summary)))
@@ -739,20 +740,11 @@ async fn sample(
         BundleId { dataset, version },
         AccessOperation::Sample,
         wants,
-        |params, limits, release| {
-            // Sampling is optional, so a bundle that does not
-            // declare one is refused rather than served from artifacts it
-            // never promised — and refused *here*, before the open, because
-            // the manifest is already in memory.
-            if !release.declares(Capability::Sample) {
-                return Err(Problem::new(
-                    ErrorCode::CapabilityNotAvailable,
-                    "this bundle does not declare the `sample` capability; \
-                     its manifest lists the ones it does",
-                ));
-            }
-            request::Sample::parse(params, limits, release.prefixes())
-        },
+        // Ungated: `sample` composes triple patterns over the artifacts every
+        // bundle is required to carry, so there is no version of this bundle
+        // that cannot answer it. See `capability_gate` for why that is the whole
+        // test.
+        |params, limits, release| request::Sample::parse(params, limits, release.prefixes()),
         answer::sample,
     )
     .await
@@ -769,12 +761,7 @@ async fn search(
         AccessOperation::Search,
         wants,
         |params, limits, release| {
-            if !release.declares(Capability::Search) {
-                return Err(Problem::new(
-                    ErrorCode::CapabilityNotAvailable,
-                    "this bundle does not declare the `search` capability; its manifest lists the ones it does",
-                ));
-            }
+            capability_gate(release, Capability::Search)?;
             request::Search::parse(
                 params,
                 limits,
@@ -783,6 +770,32 @@ async fn search(
             )
         },
         answer::search,
+    )
+    .await
+}
+
+async fn terms(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate(
+        service,
+        BundleId { dataset, version },
+        AccessOperation::Terms,
+        wants,
+        // Ungated, both the scan and its labels: the sorted dictionary is a
+        // required artifact and the label cascade resolves through the core
+        // permutations. See `capability_gate`.
+        |params, limits, release| {
+            request::Terms::parse(
+                params,
+                limits,
+                release.predicate_roles(),
+                &release.binding(),
+            )
+        },
+        answer::terms,
     )
     .await
 }
@@ -798,15 +811,11 @@ async fn schema(
         AccessOperation::Schema,
         wants,
         |params, limits, release| {
-            let request =
-                request::Schema::parse(params, limits, release.prefixes(), &release.binding())?;
-            if request.labels && !release.declares(Capability::Labels) {
-                return Err(Problem::new(
-                    ErrorCode::CapabilityNotAvailable,
-                    "this bundle does not declare the `labels` capability; omit `labels=true` or use a release that does",
-                ));
-            }
-            Ok(request)
+            // `labels=true` is ungated for the reason `capability_gate`
+            // gives: the cascade resolves through the core permutations. A
+            // release that declares no `label` role still answers, with the
+            // labels absent rather than the request refused.
+            request::Schema::parse(params, limits, release.prefixes(), &release.binding())
         },
         answer::schema,
     )
@@ -910,13 +919,8 @@ async fn labels_operation(
                 body,
                 method,
             },
+            // Ungated; see `capability_gate`.
             |params, body, limits, release| {
-                if !release.declares(Capability::Labels) {
-                    return Err(Problem::new(
-                        ErrorCode::CapabilityNotAvailable,
-                        "this bundle does not declare the `labels` capability; its manifest lists the ones it does",
-                    ));
-                }
                 request::Labels::parse(
                     params,
                     body,
@@ -931,12 +935,50 @@ async fn labels_operation(
     )
 }
 
+/// Refuse an operation whose bytes this bundle may not carry.
+///
+/// # What is gated, and what is not
+///
+/// A capability names bytes, so this gate is for the capabilities an artifact
+/// can be *absent* for: `search` needs the text index, `graphs` the sidecar
+/// pair, and the sketch families their own files. Answering one of those from a
+/// bundle that does not carry them would be a wrong answer with no sign of being
+/// wrong, which is why the refusal is absolute rather than pragmatic.
+///
+/// `sample`, `labels`, and `terms` are *not* gated, and the reason is not
+/// leniency. Each composes the artifacts every bundle is required to carry —
+/// triple patterns, the core permutations, the sorted dictionary — so no
+/// published bundle exists that cannot answer them, and the manifest's
+/// declaration of them carries no information a server holding the bundle does
+/// not already have. All such a check could do is fail: the capability list is
+/// derived entirely from which artifact files exist, so a release whose manifest
+/// predates an operation would have that operation suppressed by stale metadata
+/// rather than by missing bytes. The manifest still declares them, because a
+/// registry or mirror reading manifests without opening bundles is a real
+/// consumer — but what this deployment *routes* is the service descriptor's
+/// business, which is where those three are advertised unconditionally.
+///
+/// Coded 501 because the request is well formed and the identical one against a
+/// bundle that declares the capability succeeds — the shortfall is what this
+/// bundle carries. Refused here, before the open, off the manifest already in
+/// memory.
+fn capability_gate(release: &Release, capability: Capability) -> Result<(), Problem> {
+    if release.declares(capability) {
+        return Ok(());
+    }
+    Err(Problem::new(
+        ErrorCode::CapabilityNotAvailable,
+        format!(
+            "this bundle does not declare the `{}` capability;              its manifest lists the ones it does",
+            capability.as_str()
+        ),
+    ))
+}
+
 /// Refuse `o.text` against a bundle that publishes no text index.
 ///
-/// The same gate `/sample` gets, and in the same place: before the open, off
-/// the manifest already in memory. It is coded 501 because the request is
-/// well formed and the identical one against a bundle declaring `search`
-/// succeeds — the shortfall is what this bundle carries.
+/// The same gate the operation itself gets, named after the parameter so the
+/// message says which half of the request the bundle cannot serve.
 fn declares_search(release: &Release, wanted: bool) -> Result<(), Problem> {
     if wanted && !release.declares(Capability::Search) {
         return Err(Problem::new(

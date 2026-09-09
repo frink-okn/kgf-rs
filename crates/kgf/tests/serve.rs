@@ -1739,6 +1739,103 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
 }
 
 #[test]
+fn terms_pages_the_dictionary_and_counts_it_over_the_wire() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", GROWN_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    // Discoverable from the service descriptor rather than guessed at, and
+    // browsable with no parameters at all: an empty prefix is the first page of
+    // the whole dictionary.
+    let descriptor = server.get("/").json();
+    assert_eq!(
+        descriptor["datasets"][0]["links"]["terms"],
+        "/tox/v/v1/terms"
+    );
+    server.get("/tox/v/v1/terms").assert_status(200);
+
+    let page = server.get("/tox/v/v1/terms?prefix=http%3A%2F%2Fexample.org%2F&role=any&limit=2");
+    page.assert_status(200);
+    page.assert_header("content-type", "application/json");
+    page.assert_cache_control(&["public", "max-age=31536000", "immutable"]);
+    let body = page.json();
+    assert_eq!(
+        body["terms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["term"]["value"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["http://example.org/alice", "http://example.org/bob"]
+    );
+    assert_eq!(body["terms"][0]["roles"], serde_json::json!(["subject"]));
+    assert_eq!(
+        body["terms"][1]["roles"],
+        serde_json::json!(["subject", "object"])
+    );
+    assert_eq!(body["terms"][0]["label"], "Alice");
+    // The page carries the size of the scan it is paging through.
+    assert_eq!(
+        body["cardinality"],
+        serde_json::json!({"value": 5, "exact": true})
+    );
+    page.assert_header("kgf-complete", "false");
+    page.assert_header("kgf-truncation-reason", "page_limit");
+    page.assert_header(
+        "kgf-next-cursor",
+        body["next"].as_str().expect("a cursor in the body"),
+    );
+
+    // The count is the whole answer, so it says so in both channels and offers
+    // nothing to continue.
+    let counted = server.get("/tox/v/v1/terms?prefix=http%3A%2F%2Fexample.org%2F&count=true");
+    counted.assert_status(200);
+    counted.assert_header("kgf-complete", "true");
+    assert!(counted.header("kgf-next-cursor").is_none());
+    assert_eq!(
+        counted.json()["count"],
+        serde_json::json!({"value": 5, "exact": true}),
+        "three subjects and two predicates under the prefix"
+    );
+    // Every position, in one request: the fan-out probe this operation exists
+    // for wants to know *how* a namespace is used, not only whether it is.
+    // `bob` is the one term under the prefix in both positions, so it is stored
+    // once and `any` is five rather than the six the positions add up to.
+    assert_eq!(
+        counted.json()["counts"],
+        serde_json::json!({"subject": 3, "predicate": 2, "object": 1, "any": 5})
+    );
+
+    // Empty controls are how a browser submits an untouched form, and each of
+    // these selects the same default as its omission.
+    server
+        .get("/tox/v/v1/terms?prefix=&role=&limit=&labels=")
+        .assert_status(200);
+
+    // And the same URL is a page in a browser.
+    let html = server.request(
+        "GET",
+        "/tox/v/v1/terms?prefix=http%3A%2F%2Fexample.org%2F&role=any&limit=2",
+        &[("Accept", "text/html")],
+    );
+    html.assert_status(200);
+    html.assert_header("content-type", "text/html; charset=utf-8");
+    let text = html.text();
+    assert!(text.contains("<h1>“http://example.org/…”</h1>"), "{text}");
+    assert!(text.contains("Terms · tox v1"), "{text}");
+    // The term is a link into its own neighborhood, and the label the request
+    // asked for sits under it rather than in a column of its own.
+    assert!(
+        text.contains(">ex:alice<span class=\"t-label\">Alice</span></a>"),
+        "{text}"
+    );
+    assert!(text.contains("How many in total?"), "{text}");
+
+    // A manifest that predates the operation does not withdraw it: see
+    // `an_operation_needing_no_sidecar_is_not_gated_on_its_declaration`.
+}
+
+#[test]
 fn one_url_serves_a_page_to_a_browser_and_data_to_everything_else() {
     const BROWSER: &str =
         "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
@@ -2693,30 +2790,92 @@ fn a_validator_moves_when_the_configuration_does() {
 }
 
 #[test]
-fn an_operation_a_bundle_does_not_declare_is_refused_before_it_is_opened() {
-    // Sampling is optional, so a bundle that does not declare it is
-    // answered 501 — the request is well formed and the shortfall is what this
-    // bundle offers, which is exactly what `capability_not_available` says.
+fn an_operation_whose_artifact_a_bundle_lacks_is_refused_before_it_is_opened() {
+    // Search needs the text index, so a bundle without one is answered 501 — the
+    // request is well formed and the shortfall is what this bundle carries, which
+    // is exactly what `capability_not_available` says.
     let deployment = Deployment::new();
-    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    deployment.publish_text("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
     let server = deployment.serve();
-    server.get("/tox/v/v1/sample?n=2").assert_status(200);
+    server.get("/tox/v/v1/search?q=Alice").assert_status(200);
+    server
+        .get("/tox/v/v1/fragment?o.text=Alice")
+        .assert_status(200);
 
-    // Withdraw it, and only `/sample` changes.
+    // Withdraw it, and only the operations that read those bytes change.
     let manifest = deployment.bundle("tox", "v1").join("manifest.json");
     let mut document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
     document["capabilities"]
         .as_object_mut()
         .unwrap()
-        .remove("sample");
+        .remove("search");
     std::fs::write(&manifest, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
     let server = deployment.serve();
 
-    let refused = server.get("/tox/v/v1/sample?n=2");
-    refused.assert_status(501);
-    assert_eq!(refused.json()["code"], "capability_not_available");
+    for target in [
+        "/tox/v/v1/search?q=Alice",
+        "/tox/v/v1/fragment?o.text=Alice",
+    ] {
+        let refused = server.get(target);
+        refused.assert_status(501);
+        assert_eq!(
+            refused.json()["code"],
+            "capability_not_available",
+            "{target}"
+        );
+    }
     server.get("/tox/v/v1/fragment?limit=2").assert_status(200);
+}
+
+#[test]
+fn an_operation_needing_no_sidecar_is_not_gated_on_its_declaration() {
+    // The other half of the rule. `sample`, `labels`, and `terms` compose the
+    // artifacts every bundle is required to carry, so their capability entries
+    // restate "yes, always" and nothing published can fail to answer them. A
+    // manifest that omits one is out of date — `kgf manifest --check` says so —
+    // and out-of-date metadata must not be able to withdraw work the bytes
+    // support, which is the failure a gate here would cause and cannot prevent.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let manifest = deployment.bundle("tox", "v1").join("manifest.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    let capabilities = document["capabilities"].as_object_mut().unwrap();
+    for capability in ["sample", "labels", "terms"] {
+        assert!(
+            capabilities.remove(capability).is_some(),
+            "a core bundle declares {capability}"
+        );
+    }
+    std::fs::write(&manifest, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    let server = deployment.serve();
+
+    server.get("/tox/v/v1/sample?n=2").assert_status(200);
+    server.get("/tox/v/v1/terms?limit=2").assert_status(200);
+    server
+        .get("/tox/v/v1/terms?limit=2&labels=true")
+        .assert_status(200);
+    let body = serde_json::to_vec(&serde_json::json!({"iris": ["ex:alice"]})).unwrap();
+    server
+        .request_with_body(
+            "QUERY",
+            "/tox/v/v1/labels",
+            &[("Content-Type", "application/json")],
+            &body,
+        )
+        .assert_status(200);
+
+    // And they stay advertised, because what this deployment routes is the
+    // descriptor's statement rather than the bundle's.
+    let links = &server.get("/").json()["datasets"][0]["links"];
+    for operation in ["sample", "terms", "labels"] {
+        assert_eq!(
+            links[operation],
+            serde_json::json!(format!("/tox/v/v1/{operation}")),
+            "{operation}"
+        );
+    }
 }
 
 #[test]

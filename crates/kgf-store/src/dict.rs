@@ -111,6 +111,57 @@ impl DictCounts {
         }
     }
 
+    /// Terms stored in one section.
+    pub fn section_len(&self, section: Section) -> u64 {
+        match section {
+            Section::Shared => self.shared,
+            Section::Subjects => self.subjects,
+            Section::Predicates => self.predicates,
+            Section::Objects => self.objects,
+        }
+    }
+
+    /// Where a section starts in [`DictPosition`]'s space.
+    fn section_base(&self, section: Section) -> Result<u64> {
+        let mut base = 0u64;
+        for earlier in Section::ALL {
+            if earlier == section {
+                return Ok(base);
+            }
+            base = base.checked_add(self.section_len(earlier)).ok_or_else(|| {
+                Error::Region("dictionary section positions overflow u64".to_owned())
+            })?;
+        }
+        unreachable!("every section occurs in Section::ALL")
+    }
+
+    /// The whole-dictionary position of a section-local id.
+    ///
+    /// `None` when the id is past the end of its section, which is how a
+    /// caller learns that a position it was handed does not name a term.
+    pub fn position_of(&self, id: SectionTermId) -> Option<DictPosition> {
+        if id.local_id() > self.section_len(id.section()) {
+            return None;
+        }
+        let base = self.section_base(id.section()).ok()?;
+        base.checked_add(id.local_id() - 1).map(DictPosition)
+    }
+
+    /// The term a whole-dictionary position names, or `None` past the last one.
+    ///
+    /// The inverse of [`position_of`](Self::position_of).
+    pub fn term_at(&self, position: DictPosition) -> Option<SectionTermId> {
+        let mut remaining = position.0;
+        for section in Section::ALL {
+            let terms = self.section_len(section);
+            if remaining < terms {
+                return SectionTermId::new(section, remaining + 1);
+            }
+            remaining -= terms;
+        }
+        None
+    }
+
     /// Establish the invariant that makes [`len`](Self::len)'s additions total.
     fn validate_role_lengths(&self) -> Result<()> {
         let subjects = self.shared.checked_add(self.subjects).ok_or_else(|| {
@@ -158,6 +209,43 @@ pub enum Section {
     Objects,
 }
 
+impl Section {
+    /// The four sections in `dictionaryFour`'s own order.
+    ///
+    /// Load-bearing rather than cosmetic: it is the order a
+    /// [`DictPosition`] counts in, and cursors into a merged prefix scan are
+    /// positions in that space.
+    pub const ALL: [Self; 4] = [
+        Self::Shared,
+        Self::Subjects,
+        Self::Predicates,
+        Self::Objects,
+    ];
+
+    /// The roles a term occupies by virtue of being stored in this section.
+    ///
+    /// The shared section is the only one that answers with two, and that is
+    /// the whole reason it exists.
+    pub fn roles(self) -> &'static [Role] {
+        match self {
+            Self::Shared => &[Role::Subject, Role::Object],
+            Self::Subjects => &[Role::Subject],
+            Self::Predicates => &[Role::Predicate],
+            Self::Objects => &[Role::Object],
+        }
+    }
+
+    /// Index into a four-slot array laid out in [`ALL`](Self::ALL)'s order.
+    fn slot(self) -> usize {
+        match self {
+            Self::Shared => 0,
+            Self::Subjects => 1,
+            Self::Predicates => 2,
+            Self::Objects => 3,
+        }
+    }
+}
+
 /// A one-based term id scoped to one `dictionaryFour` section.
 ///
 /// Unlike [`TermId`], this identifier is independent of a subject or object
@@ -187,6 +275,34 @@ impl SectionTermId {
     /// The one-based integer within [`section`](Self::section).
     pub fn local_id(self) -> u64 {
         self.local_id.get()
+    }
+}
+
+/// A term's zero-based position over all four sections, taken in
+/// [`Section::ALL`]'s order.
+///
+/// One number that names exactly one stored term. A [`TermId`] cannot: it is
+/// scoped to a role, so the same integer is one term as a subject and another as
+/// a predicate — and a scan that merges sections needs a position independent of
+/// which role asked for it. That makes this the position a cursor into such a
+/// scan carries. Both directions are arithmetic on [`DictCounts`]' running sums,
+/// so neither costs a read.
+///
+/// Opaque on purpose: the integer is meaningless without the counts of the
+/// bundle it came from, and whether it names a term at all is
+/// [`DictCounts::term_at`]'s answer rather than a property of the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DictPosition(u64);
+
+impl DictPosition {
+    /// Wrap an integer a caller round-tripped through a token of its own.
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// The integer, for a caller that has to encode it.
+    pub fn as_u64(self) -> u64 {
+        self.0
     }
 }
 
@@ -687,6 +803,526 @@ impl Dictionary<'_> {
     }
 }
 
+impl<'a> Dictionary<'a> {
+    /// Every term starting with `prefix` in the sections `role` covers, in one
+    /// lexicographic order.
+    ///
+    /// `prefix` is raw stored bytes, not request syntax: an IRI is spelled bare
+    /// and a literal carries its quotes, because that is how a section sorts.
+    /// An empty prefix scans everything the role covers.
+    ///
+    /// Two binary searches per covered section and no payload scan, so building
+    /// a scan costs `O(log D)` whatever it goes on to return.
+    pub fn terms(&self, role: ScanRole, prefix: &[u8]) -> Result<TermScan<'a>> {
+        let mut scratch = Vec::new();
+        let mut runs: [Option<Run<'a>>; 4] = [None, None, None, None];
+        for section in Section::ALL {
+            if !role.covers(section) {
+                continue;
+            }
+            let view = self.section(section);
+            let positions = view.prefix_positions(prefix, &mut scratch)?;
+            if positions.start == positions.end {
+                continue;
+            }
+            runs[section.slot()] = Some(Run { view, positions });
+        }
+        Ok(TermScan {
+            counts: self.counts,
+            role,
+            runs,
+        })
+    }
+
+    /// Every role's exact distinct term count under `prefix`.
+    ///
+    /// Two binary searches per section and no enumeration, so the whole
+    /// breakdown costs `O(log D)` however many terms match — with the one
+    /// addition [`TermScan::count`] documents, a probe per matching predicate to
+    /// deduplicate [`ScanRole::Any`]. Measured at a tenth of a millisecond over
+    /// the widest predicate set in the OKN corpus, which is why nothing prices
+    /// this differently from a page.
+    pub fn term_counts(&self, prefix: &[u8]) -> Result<RoleCounts> {
+        // One `Any` scan brackets all four sections, so the per-role numbers are
+        // sums of run lengths it already has and only the deduplicated total
+        // needs its own work.
+        let scan = self.terms(ScanRole::Any, prefix)?;
+        let shared = scan.matches(Section::Shared);
+        Ok(RoleCounts {
+            subject: shared + scan.matches(Section::Subjects),
+            predicate: scan.matches(Section::Predicates),
+            object: shared + scan.matches(Section::Objects),
+            any: scan.count()?,
+        })
+    }
+
+    /// One section's view. Which section a role or an id belongs to is
+    /// arithmetic this module owns, so nothing above it chooses between these.
+    fn section(&self, section: Section) -> PfcView<'a> {
+        match section {
+            Section::Shared => self.shared,
+            Section::Subjects => self.subjects,
+            Section::Predicates => self.predicates,
+            Section::Objects => self.objects,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prefix scans
+// ---------------------------------------------------------------------------
+
+/// Which dictionary sections one prefix scan reads.
+///
+/// Not a [`Role`]: "any role" is a fourth answer no role names, and the subject
+/// and object roles each span two sections anyway. What a scan needs is the set
+/// of sections to merge, and this is the closed set of choices worth offering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScanRole {
+    /// Shared and subject-only terms.
+    Subject,
+    /// Predicates.
+    Predicate,
+    /// Shared and object-only terms.
+    Object,
+    /// All four sections, so one distinct term is one row whatever positions it
+    /// occupies.
+    Any,
+}
+
+impl ScanRole {
+    /// Whether a scan of this role reads `section`.
+    pub fn covers(self, section: Section) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Subject => matches!(section, Section::Shared | Section::Subjects),
+            Self::Object => matches!(section, Section::Shared | Section::Objects),
+            Self::Predicate => section == Section::Predicates,
+        }
+    }
+}
+
+/// One section's contribution to a scan: the prefix's positions inside it.
+///
+/// Section-local rather than whole-dictionary, because the merge compares and
+/// decodes within a section; [`DictCounts::position_of`] is the one place that
+/// turns a local id into the position a resume point carries.
+#[derive(Debug, Clone)]
+struct Run<'a> {
+    view: PfcView<'a>,
+    /// Zero-based half-open positions matching the prefix, inside the section.
+    positions: Range<u64>,
+}
+
+/// Exact distinct term counts under one prefix, per role and over all of them.
+///
+/// One value per [`ScanRole`], which is the answer to "does this dataset use this
+/// namespace, and how" — the question a client fans across a federation. It is
+/// four numbers rather than one because they come from the same four bracketing
+/// searches: computing the second, third and fourth costs nothing the first has
+/// not already paid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleCounts {
+    subject: u64,
+    predicate: u64,
+    object: u64,
+    any: u64,
+}
+
+impl RoleCounts {
+    /// Terms in the shared and subject-only sections.
+    pub fn subject(&self) -> u64 {
+        self.subject
+    }
+
+    /// Terms in the predicate section.
+    pub fn predicate(&self) -> u64 {
+        self.predicate
+    }
+
+    /// Terms in the shared and object-only sections.
+    pub fn object(&self) -> u64 {
+        self.object
+    }
+
+    /// Distinct terms over all four sections.
+    ///
+    /// Not the sum of the other three: a term stored in the shared section is
+    /// both a subject and an object, and a predicate may repeat one of them.
+    pub fn any(&self) -> u64 {
+        self.any
+    }
+
+    /// The count for one role.
+    pub fn of(&self, role: ScanRole) -> u64 {
+        match role {
+            ScanRole::Subject => self.subject,
+            ScanRole::Predicate => self.predicate,
+            ScanRole::Object => self.object,
+            ScanRole::Any => self.any,
+        }
+    }
+}
+
+/// A resumable lexicographic scan of the terms under one byte prefix.
+///
+/// # Why this is a visitor rather than an iterator of ids
+///
+/// The subject and object roles each span two independently sorted sections and
+/// [`ScanRole::Any`] spans four, so a lexicographic answer is a merge — and a
+/// merge needs the strings it is ordering. Yielding ids would make the caller
+/// decode every term a second time to put them back into the order it asked
+/// for. So the scan decodes once and hands each term to a visitor, which also
+/// lets the caller stop on a budget of its own.
+///
+/// Set semantics come free with the merge: a term stored in several sections is
+/// one row, and the sections it occupied are reported with it.
+///
+/// # Cost
+///
+/// A page decodes at most one PFC block per row per covered section and holds
+/// one buffer per covered section, so it is bounded by the page rather than by
+/// the prefix or the dictionary. [`count`](Self::count) is arithmetic on the
+/// bracketing searches, with the documented exception of a distinct count over
+/// [`ScanRole::Any`].
+#[derive(Debug, Clone)]
+pub struct TermScan<'a> {
+    counts: DictCounts,
+    role: ScanRole,
+    /// Runs in [`Section::ALL`]'s order; `None` where the section holds no term
+    /// with the prefix.
+    runs: [Option<Run<'a>>; 4],
+}
+
+/// A resume point a [`TermScan`] has accepted as one of its own.
+///
+/// Only [`TermScan::resume_at`] builds one, so a page cannot be started from a
+/// position that names a term in another section, another bundle, or nothing at
+/// all.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanResume {
+    id: SectionTermId,
+}
+
+/// One term a [`TermScan`] found.
+#[derive(Debug, Clone, Copy)]
+pub struct ScannedTerm<'a> {
+    position: DictPosition,
+    sections: TermSections,
+    bytes: &'a [u8],
+    counts: DictCounts,
+}
+
+impl<'a> ScannedTerm<'a> {
+    /// The position naming this term, which a resuming caller records.
+    ///
+    /// The earliest section the term occurs in names it, so the value does not
+    /// depend on which section a merge happened to read first.
+    pub fn position(&self) -> DictPosition {
+        self.position
+    }
+
+    /// The sections this term occurs in, among those the scan read.
+    ///
+    /// Complete for [`ScanRole::Any`]. For a single role it is limited to what
+    /// the scan looked at: a subject scan reads the shared and subject-only
+    /// sections, so it can say whether a subject is also an object, and says
+    /// nothing about predicates.
+    pub fn sections(&self) -> TermSections {
+        self.sections
+    }
+
+    /// The stored bytes, borrowed from the scan's own buffer.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// This term's id in `role`'s space, when a section it occurs in belongs to
+    /// that role.
+    ///
+    /// Free where the scan already read that section, which is what lets a
+    /// caller follow a scanned subject into the permutations without a second
+    /// dictionary search.
+    pub fn id(&self, role: Role) -> Option<TermId> {
+        self.sections
+            .ids()
+            .find_map(|id| self.counts.role_id(role, id))
+    }
+}
+
+/// The sections one scanned term occurs in, with its local id in each.
+///
+/// Local ids differ between sections for the same string, so they are kept
+/// rather than derived: without them a term found in the predicate section could
+/// not also be named as an object.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TermSections([Option<NonZeroU64>; 4]);
+
+impl TermSections {
+    /// Whether the term is stored in `section`.
+    pub fn contains(&self, section: Section) -> bool {
+        self.0[section.slot()].is_some()
+    }
+
+    /// The term's section-local ids, in [`Section::ALL`]'s order.
+    pub fn ids(&self) -> impl Iterator<Item = SectionTermId> + '_ {
+        Section::ALL.into_iter().filter_map(move |section| {
+            self.0[section.slot()]
+                .map(|local| SectionTermId::new(section, local.get()).expect("a nonzero local id"))
+        })
+    }
+
+    /// The roles these sections put the term in, in subject-predicate-object
+    /// order.
+    pub fn roles(&self) -> impl Iterator<Item = Role> + '_ {
+        [Role::Subject, Role::Predicate, Role::Object]
+            .into_iter()
+            .filter(move |role| self.ids().any(|id| id.section().roles().contains(role)))
+    }
+
+    fn insert(&mut self, section: Section, local_id: u64) {
+        self.0[section.slot()] = NonZeroU64::new(local_id);
+    }
+}
+
+/// What a visitor wants after being shown one term.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanFlow {
+    /// Keep the term and continue.
+    Continue,
+    /// Keep the term and end the page after it.
+    Stop,
+    /// Drop the term and end the page before it.
+    ///
+    /// A visitor must not reject the first term it is shown: the page would
+    /// resume exactly where it started, and a caller paging on that would never
+    /// advance. [`ScanStop`] reports the situation faithfully rather than
+    /// pretending otherwise.
+    Reject,
+}
+
+/// Where a page of a [`TermScan`] stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanStop {
+    /// The last term the visitor kept, if it kept any.
+    pub last: Option<DictPosition>,
+    /// Whether the scan has terms the page did not deliver.
+    pub more: bool,
+}
+
+impl TermScan<'_> {
+    /// The role this scan covers.
+    pub fn role(&self) -> ScanRole {
+        self.role
+    }
+
+    /// Whether no term in the covered sections starts with the prefix.
+    pub fn is_empty(&self) -> bool {
+        self.runs.iter().all(Option::is_none)
+    }
+
+    /// Terms matching the prefix in one section this scan reads.
+    ///
+    /// Zero both when the section holds no matching term and when the scan does
+    /// not read it, which is why this stays inside the module: only a caller that
+    /// knows the role can tell those apart, and [`Dictionary::term_counts`] is
+    /// the one that does.
+    fn matches(&self, section: Section) -> u64 {
+        self.runs[section.slot()]
+            .as_ref()
+            .map_or(0, |run| run.positions.end - run.positions.start)
+    }
+
+    /// Exact number of distinct terms with the prefix.
+    ///
+    /// For a single role this is arithmetic on searches already done, so the
+    /// whole question costs `O(log D)` however many terms match.
+    ///
+    /// [`ScanRole::Any`] costs more, because it is the only role that can see
+    /// one string twice. The shared, subject-only, and object-only sections
+    /// partition their terms by construction, but a predicate may also be stored
+    /// as a subject or an object, so an exact distinct count probes each matching
+    /// predicate against the other covered sections. That is bounded by the
+    /// bundle's predicate count, which its manifest publishes — a few hundred at
+    /// the widest in the corpus this serves, and measured at a fraction of the
+    /// page beside it, so it is a bound worth stating rather than pricing.
+    pub fn count(&self) -> Result<u64> {
+        let mut total = 0u64;
+        for section in Section::ALL {
+            total = total.checked_add(self.matches(section)).ok_or_else(|| {
+                Error::Region("a dictionary prefix count overflows u64".to_owned())
+            })?;
+        }
+        if self.role != ScanRole::Any {
+            return Ok(total);
+        }
+        let Some(predicates) = self.runs[Section::Predicates.slot()].as_ref() else {
+            return Ok(total);
+        };
+
+        let mut scratch = Vec::new();
+        let mut term = Vec::new();
+        for position in predicates.positions.start..predicates.positions.end {
+            let bytes = predicates.view.extract_position(position, &mut term)?;
+            for (slot, run) in self.runs.iter().enumerate() {
+                let Some(run) = run else { continue };
+                if slot == Section::Predicates.slot() {
+                    continue;
+                }
+                if run.view.search(bytes, &mut scratch)?.equal {
+                    total -= 1;
+                    break;
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Accept a position as a resume point for this scan, or refuse it.
+    ///
+    /// `None` when the position does not name a term this scan enumerates —
+    /// which is how a stale, foreign, or edited resume point becomes a refusal
+    /// rather than a page that silently starts somewhere else.
+    pub fn resume_at(&self, position: DictPosition) -> Option<ScanResume> {
+        let id = self.counts.term_at(position)?;
+        let run = self.runs[id.section().slot()].as_ref()?;
+        let local = id.local_id() - 1;
+        (run.positions.start..run.positions.end)
+            .contains(&local)
+            .then_some(ScanResume { id })
+    }
+
+    /// Show the visitor up to `limit` terms in lexicographic order, resuming
+    /// strictly after `after`.
+    ///
+    /// Strictly after is what keeps a term stored in several sections one row
+    /// across a page boundary: every run skips past the resumed term itself
+    /// rather than only the section it was named in.
+    pub fn page<F>(&self, after: Option<ScanResume>, limit: usize, mut visit: F) -> Result<ScanStop>
+    where
+        F: FnMut(ScannedTerm<'_>) -> ScanFlow,
+    {
+        // One buffer per section rather than per row: a merge has to hold every
+        // run's current term at once to order them, and each is decoded once.
+        let mut heads: [Vec<u8>; 4] = Default::default();
+        let mut next: [Option<u64>; 4] = [None; 4];
+        let mut scratch = Vec::new();
+
+        let boundary = match after {
+            None => None,
+            Some(resume) => {
+                let run = self.runs[resume.id.section().slot()]
+                    .as_ref()
+                    .expect("a resume point this scan accepted names a run it reads");
+                let mut bytes = Vec::new();
+                run.view
+                    .extract_position(resume.id.local_id() - 1, &mut bytes)?;
+                Some(bytes)
+            }
+        };
+
+        for section in Section::ALL {
+            let slot = section.slot();
+            let Some(run) = self.runs[slot].as_ref() else {
+                continue;
+            };
+            let start = match &boundary {
+                Some(term) => {
+                    let found = run.view.search(term, &mut scratch)?;
+                    (found.position + u64::from(found.equal)).max(run.positions.start)
+                }
+                None => run.positions.start,
+            };
+            if start < run.positions.end {
+                run.view.extract_position(start, &mut heads[slot])?;
+                next[slot] = Some(start);
+            }
+        }
+
+        let mut last = None;
+        let mut delivered = 0usize;
+        loop {
+            let mut smallest = None;
+            for section in Section::ALL {
+                let slot = section.slot();
+                if next[slot].is_none() {
+                    continue;
+                }
+                smallest = match smallest {
+                    Some(best) if heads[best] <= heads[slot] => Some(best),
+                    _ => Some(slot),
+                };
+            }
+            let Some(slot) = smallest else {
+                return Ok(ScanStop { last, more: false });
+            };
+            if delivered == limit {
+                return Ok(ScanStop { last, more: true });
+            }
+
+            // Every run standing at the same string contributes its own local id
+            // and is consumed with it, so one term is one row however many
+            // sections hold it.
+            let mut sections = TermSections::default();
+            for section in Section::ALL {
+                let other = section.slot();
+                if let Some(position) = next[other]
+                    && heads[other] == heads[slot]
+                {
+                    sections.insert(section, position + 1);
+                }
+            }
+            let position = self
+                .counts
+                .position_of(
+                    sections
+                        .ids()
+                        .next()
+                        .expect("the smallest term occurs in at least its own section"),
+                )
+                .ok_or_else(|| {
+                    Error::Region("a scanned term has no whole-dictionary position".to_owned())
+                })?;
+
+            let flow = visit(ScannedTerm {
+                position,
+                sections,
+                bytes: &heads[slot],
+                counts: self.counts,
+            });
+            if flow == ScanFlow::Reject {
+                return Ok(ScanStop { last, more: true });
+            }
+            last = Some(position);
+            delivered += 1;
+
+            for section in Section::ALL {
+                if !sections.contains(section) {
+                    continue;
+                }
+                let advanced = section.slot();
+                let run = self.runs[advanced]
+                    .as_ref()
+                    .expect("a matched section is a run");
+                let position = next[advanced].expect("a matched section has a head") + 1;
+                next[advanced] = if position < run.positions.end {
+                    run.view.extract_position(position, &mut heads[advanced])?;
+                    Some(position)
+                } else {
+                    None
+                };
+            }
+
+            if flow == ScanFlow::Stop {
+                return Ok(ScanStop {
+                    last,
+                    more: next.iter().any(Option::is_some),
+                });
+            }
+        }
+    }
+}
+
 fn locate_in(
     section: PfcView<'_>,
     term: &[u8],
@@ -717,6 +1353,7 @@ fn global_range(id_offset: u64, positions: Range<u64>) -> Result<Range<TermId>> 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs::File;
     use std::io::{Seek, SeekFrom};
 
@@ -919,6 +1556,331 @@ mod tests {
             assert_eq!(dictionary.extract(role, id, &mut buffer).unwrap(), term);
             assert_eq!(dictionary.locate(role, term).unwrap(), Some(id));
         }
+    }
+
+    /// `p` is a predicate *and* a subject and an object, so it is stored in the
+    /// shared section and in the predicate section — the one way a term can
+    /// occupy two sections at once, and the case `ScanRole::Any` has to
+    /// deduplicate. `q` is a predicate only, `c` an object only, `b` a subject
+    /// only, and `_:b1` keeps a blank node in the sort.
+    const SCAN_NT: &str = concat!(
+        "<http://example.org/a> <http://example.org/p> <http://example.org/p> .\n",
+        "<http://example.org/p> <http://example.org/q> \"shared value\" .\n",
+        "<http://example.org/b> <http://example.org/q> <http://example.org/c> .\n",
+        "_:b1 <http://example.org/q> \"blank subject\" .\n",
+    );
+
+    /// Wide enough that every section crosses several PFC blocks, so a merge is
+    /// decoding blocks rather than reading one.
+    fn scan_source() -> String {
+        let mut source = SCAN_NT.to_owned();
+        for index in 0..40 {
+            source.push_str(&format!(
+                "<http://example.org/s{index:02}> <http://example.org/many> \"value{index:02}\" .\n"
+            ));
+        }
+        source
+    }
+
+    const SCAN_PREFIXES: [&[u8]; 7] = [
+        b"".as_slice(),
+        b"http://example.org/p",
+        b"http://example.org/s1",
+        b"\"value2",
+        b"_:",
+        b"http://example.org/zzz",
+        &[u8::MAX],
+    ];
+
+    #[test]
+    fn a_section_slot_is_its_place_in_the_all_order() {
+        for (slot, section) in Section::ALL.into_iter().enumerate() {
+            assert_eq!(section.slot(), slot);
+            assert_eq!(section as usize, slot);
+        }
+    }
+
+    #[test]
+    fn a_prefix_scan_merges_its_sections_into_one_lexicographic_order() {
+        let fixture = Fixture::build(&scan_source());
+        let expected_sections = sequential_sections(&fixture);
+        let hdt = fixture.map_hdt();
+        let layout = HdtLayout::parse(&hdt).expect("parse HDT");
+        let dictionary = layout.dictionary().view(&hdt);
+
+        for role in [
+            ScanRole::Subject,
+            ScanRole::Predicate,
+            ScanRole::Object,
+            ScanRole::Any,
+        ] {
+            for prefix in SCAN_PREFIXES {
+                let expected = expected_scan(&expected_sections, role, prefix);
+                let scan = dictionary.terms(role, prefix).unwrap();
+                let found = collect(&scan, None, usize::MAX);
+
+                let terms: Vec<_> = found.iter().map(|row| row.term.clone()).collect();
+                let expected_terms: Vec<_> =
+                    expected.iter().map(|(term, _)| term.clone()).collect();
+                assert_eq!(terms, expected_terms, "{role:?} {prefix:?}");
+
+                let roles: Vec<_> = found.iter().map(|row| row.roles.clone()).collect();
+                let expected_roles: Vec<_> =
+                    expected.iter().map(|(_, roles)| roles.clone()).collect();
+                assert_eq!(roles, expected_roles, "{role:?} {prefix:?}");
+
+                assert_eq!(scan.count().unwrap(), expected.len() as u64);
+                assert_eq!(scan.is_empty(), expected.is_empty());
+
+                // A scanned term's id is the one the dictionary's own lookup
+                // gives, in every role the scan reported it in — and nothing in
+                // a role it did not.
+                for row in &found {
+                    assert!(
+                        scan.resume_at(row.position).is_some(),
+                        "a scan accepts the position of a term it emitted"
+                    );
+                    for (role, id) in ROLES.into_iter().zip(row.ids) {
+                        let located = dictionary.locate(role, &row.term).unwrap();
+                        if row.roles.contains(&role) {
+                            assert!(located.is_some(), "{:?} located as {role:?}", row.term);
+                            assert_eq!(id, located);
+                        } else {
+                            assert_eq!(id, None, "{:?} has no {role:?} id here", row.term);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_role_breakdown_agrees_with_each_role_counted_alone() {
+        let fixture = Fixture::build(&scan_source());
+        let hdt = fixture.map_hdt();
+        let layout = HdtLayout::parse(&hdt).expect("parse HDT");
+        let dictionary = layout.dictionary().view(&hdt);
+
+        for prefix in SCAN_PREFIXES {
+            let counts = dictionary.term_counts(prefix).unwrap();
+            for role in [
+                ScanRole::Subject,
+                ScanRole::Predicate,
+                ScanRole::Object,
+                ScanRole::Any,
+            ] {
+                let alone = dictionary.terms(role, prefix).unwrap().count().unwrap();
+                assert_eq!(counts.of(role), alone, "{role:?} {prefix:?}");
+            }
+            // `any` deduplicates rather than adding up: `p` is stored in the
+            // shared section *and* the predicate section, and the sum of the
+            // three roles double-counts every shared term besides.
+            assert!(
+                counts.any() <= counts.subject() + counts.predicate() + counts.object(),
+                "{prefix:?}"
+            );
+        }
+
+        // The one case that makes the deduplication observable.
+        let counts = dictionary.term_counts(b"http://example.org/p").unwrap();
+        assert_eq!(counts.predicate(), 1);
+        assert_eq!(counts.subject(), 1);
+        assert_eq!(counts.object(), 1);
+        assert_eq!(counts.any(), 1, "one term, whatever positions it occupies");
+    }
+
+    #[test]
+    fn exhaustive_paging_of_a_scan_yields_each_term_once_at_every_size() {
+        let fixture = Fixture::build(&scan_source());
+        let hdt = fixture.map_hdt();
+        let layout = HdtLayout::parse(&hdt).expect("parse HDT");
+        let dictionary = layout.dictionary().view(&hdt);
+
+        for role in [
+            ScanRole::Subject,
+            ScanRole::Predicate,
+            ScanRole::Object,
+            ScanRole::Any,
+        ] {
+            for prefix in SCAN_PREFIXES {
+                let scan = dictionary.terms(role, prefix).unwrap();
+                let whole = collect(&scan, None, usize::MAX);
+                for limit in [1usize, 2, 3, 7, 13, whole.len().max(1)] {
+                    let mut paged = Vec::new();
+                    let mut after = None;
+                    loop {
+                        let mut page = Vec::new();
+                        let stop = scan
+                            .page(after, limit, |term| {
+                                page.push(ScannedRow::of(&term));
+                                ScanFlow::Continue
+                            })
+                            .unwrap();
+                        assert!(page.len() <= limit);
+                        paged.extend(page);
+                        if !stop.more {
+                            break;
+                        }
+                        let last = stop.last.expect("a page that leaves more kept a term");
+                        after = Some(scan.resume_at(last).expect("its own resume point"));
+                    }
+                    assert_eq!(paged, whole, "{role:?} {prefix:?} at limit {limit}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_rejected_term_ends_the_page_before_itself() {
+        let fixture = Fixture::build(&scan_source());
+        let hdt = fixture.map_hdt();
+        let layout = HdtLayout::parse(&hdt).expect("parse HDT");
+        let dictionary = layout.dictionary().view(&hdt);
+        let scan = dictionary.terms(ScanRole::Any, b"").unwrap();
+        let whole = collect(&scan, None, usize::MAX);
+
+        let mut kept = 0;
+        let stop = scan
+            .page(None, usize::MAX, |_| {
+                if kept == 3 {
+                    return ScanFlow::Reject;
+                }
+                kept += 1;
+                ScanFlow::Continue
+            })
+            .unwrap();
+        assert_eq!(kept, 3);
+        assert!(stop.more);
+        assert_eq!(stop.last, Some(whole[2].position));
+
+        // Resuming from the last kept term delivers the rejected one first, so
+        // nothing is lost by refusing it.
+        let after = scan.resume_at(stop.last.unwrap()).unwrap();
+        let rest = collect(&scan, Some(after), usize::MAX);
+        assert_eq!(rest, whole[3..]);
+    }
+
+    #[test]
+    fn a_page_that_stops_on_its_last_term_reports_nothing_more() {
+        let fixture = Fixture::build(&scan_source());
+        let hdt = fixture.map_hdt();
+        let layout = HdtLayout::parse(&hdt).expect("parse HDT");
+        let dictionary = layout.dictionary().view(&hdt);
+        let scan = dictionary.terms(ScanRole::Predicate, b"").unwrap();
+        let whole = collect(&scan, None, usize::MAX);
+
+        let mut seen = 0;
+        let stop = scan
+            .page(None, usize::MAX, |_| {
+                seen += 1;
+                if seen == whole.len() {
+                    ScanFlow::Stop
+                } else {
+                    ScanFlow::Continue
+                }
+            })
+            .unwrap();
+        assert_eq!(seen, whole.len());
+        assert!(!stop.more);
+    }
+
+    #[test]
+    fn a_resume_point_this_scan_does_not_enumerate_is_refused() {
+        let fixture = Fixture::build(&scan_source());
+        let hdt = fixture.map_hdt();
+        let layout = HdtLayout::parse(&hdt).expect("parse HDT");
+        let dictionary = layout.dictionary().view(&hdt);
+        let counts = *dictionary.counts();
+        let total = counts.shared + counts.subjects + counts.predicates + counts.objects;
+
+        // Past the last term of the dictionary.
+        let scan = dictionary.terms(ScanRole::Any, b"").unwrap();
+        assert!(scan.resume_at(DictPosition::new(total)).is_none());
+        assert!(scan.resume_at(DictPosition::new(u64::MAX)).is_none());
+
+        // A term the scan's own prefix excludes, and a term in a section this
+        // role does not read.
+        let narrowed = dictionary
+            .terms(ScanRole::Any, b"http://example.org/s1")
+            .unwrap();
+        let outside = collect(&scan, None, usize::MAX)
+            .into_iter()
+            .find(|row| !row.term.starts_with(b"http://example.org/s1"))
+            .expect("a term outside the narrowed prefix");
+        assert!(narrowed.resume_at(outside.position).is_none());
+
+        let predicates = dictionary.terms(ScanRole::Predicate, b"").unwrap();
+        let subjects = dictionary.terms(ScanRole::Subject, b"").unwrap();
+        let subject_only = collect(&subjects, None, usize::MAX)
+            .into_iter()
+            .find(|row| row.roles == [Role::Subject])
+            .expect("a subject-only term");
+        assert!(predicates.resume_at(subject_only.position).is_none());
+    }
+
+    const ROLES: [Role; 3] = [Role::Subject, Role::Predicate, Role::Object];
+
+    /// Everything one visited term reported, kept so a page can be compared with
+    /// a differently sized page term for term.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ScannedRow {
+        term: Vec<u8>,
+        roles: Vec<Role>,
+        position: DictPosition,
+        ids: [Option<TermId>; 3],
+    }
+
+    impl ScannedRow {
+        fn of(term: &ScannedTerm<'_>) -> Self {
+            Self {
+                term: term.bytes().to_vec(),
+                roles: term.sections().roles().collect(),
+                position: term.position(),
+                ids: ROLES.map(|role| term.id(role)),
+            }
+        }
+    }
+
+    fn collect(scan: &TermScan<'_>, after: Option<ScanResume>, limit: usize) -> Vec<ScannedRow> {
+        let mut rows = Vec::new();
+        scan.page(after, limit, |term| {
+            rows.push(ScannedRow::of(&term));
+            ScanFlow::Continue
+        })
+        .unwrap();
+        rows
+    }
+
+    fn expected_scan(
+        sections: &[Vec<Vec<u8>>; 4],
+        role: ScanRole,
+        prefix: &[u8],
+    ) -> Vec<(Vec<u8>, Vec<Role>)> {
+        let mut found: BTreeMap<Vec<u8>, [bool; 4]> = BTreeMap::new();
+        for section in Section::ALL {
+            if !role.covers(section) {
+                continue;
+            }
+            for term in &sections[section as usize] {
+                if term.starts_with(prefix) {
+                    found.entry(term.clone()).or_default()[section as usize] = true;
+                }
+            }
+        }
+        found
+            .into_iter()
+            .map(|(term, members)| {
+                let roles = [Role::Subject, Role::Predicate, Role::Object]
+                    .into_iter()
+                    .filter(|role| {
+                        Section::ALL.into_iter().any(|section| {
+                            members[section as usize] && section.roles().contains(role)
+                        })
+                    })
+                    .collect();
+                (term, roles)
+            })
+            .collect()
     }
 
     fn assert_prefix(dictionary: &Dictionary<'_>, role: Role, prefix: &[u8], terms: &[Vec<u8>]) {

@@ -66,8 +66,19 @@ option.
 
 **M1 is not doc 03 §3.1's core profile**, and the two read like the same set. This
 implementation now extends past M1 with bindings QUERY (§3.4.2) and the complete
-description surface, closing that gap. Present and *not* in M1: `/sample` and
-`o.text`, both optional capabilities.
+description surface, closing that gap. Present and *not* in M1: `/sample`, `o.text`,
+and `/terms`, all optional capabilities. `/terms` is only half of §3.4.8: the prefix
+scan needs no artifact, while key resolution needs a derived key-to-id index no bundle
+carries, so QUERY on that route is a 405 (`plan.md` question 67).
+
+`/terms` pages the sorted dictionary under a byte prefix, or with `count=true` returns
+the exact number of distinct terms matching it from two binary searches — the cheapest
+question in the API, and one every release can answer because standard HDT already
+stores its dictionary sorted. `role` chooses the sections read (`subject`, `predicate`,
+`object`, or `any`), a row reports the positions its term occupies, a page states the
+exact size of the scan it is paging, a count reports all four positions at once — `any`
+deduplicates rather than summing them — and a cursor names the last term delivered rather
+than a per-section offset.
 
 A bundle carrying `data.hdt.text` (built by `hdtc text`) declares `search` and answers
 `o.text` on `/fragment` and `/count`: a ranked constraint on the object position,
@@ -83,10 +94,11 @@ than forcing those resources into the default JSON representation.
 returning a plausible wrong answer. Do not replace one with a stub that returns a
 default.
 
-**`notes/plan.md` is the implementation route** — units 1–25, all complete, through
+**`notes/plan.md` is the implementation route** — units 1–28, all complete, through
 doc 20 §20.8's M1, search, bindings, the description surface, the bundle builder,
-request logging, serving under a path prefix, the dedicated `/tpf` route, and the
-admission policy, plus the decisions each one had to make and the **Questions for `../kgf`**
+request logging, serving under a path prefix, the dedicated `/tpf` route, the
+admission policy, the dictionary prefix scan, and the capability gate, plus the
+decisions each one had to make and the **Questions for `../kgf`**
 that implementation surfaced. It is kept current; read it before planning work.
 `notes/state.md` is a point-in-time handoff, written at a moment and not maintained
 afterwards, so where the two disagree about what exists, `plan.md` and the code win.
@@ -180,6 +192,15 @@ quietly.
    permutation serves a pattern breaks every outstanding cursor.
 7. **Never fork `data.hdt`.** The core triple store stays standard, interoperable HDT.
    New semantics live in sidecars beside it.
+8. **A capability gate belongs only where an artifact can be absent.** A manifest's
+   capability list is derived entirely from which artifact files a bundle carries, so it
+   tells a server holding that bundle nothing new; its audience is the consumer reading
+   manifests *without* the bundle. `search`, `graphs`, and the sketch families are
+   therefore refused before the open when undeclared, because the bytes may really be
+   missing. `sample`, `labels`, and `terms` are never gated: they compose artifacts every
+   bundle is required to carry, so a check could only suppress work the bytes support
+   because the metadata is older than the code. What the *bundle carries* is the
+   manifest's statement; what this *deployment routes* is the service descriptor's.
 
 ## The hdtc dependency
 

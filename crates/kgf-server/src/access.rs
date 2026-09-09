@@ -305,6 +305,8 @@ pub enum AccessOperation {
     Sample,
     /// Entity search.
     Search,
+    /// Dictionary prefix scan.
+    Terms,
     /// Description graph navigation.
     Schema,
     /// VoID description.
@@ -337,6 +339,7 @@ impl AccessOperation {
             Self::Describe => "describe",
             Self::Sample => "sample",
             Self::Search => "search",
+            Self::Terms => "terms",
             Self::Schema => "schema",
             Self::Void => "void",
             Self::Summary => "summary",
@@ -456,6 +459,18 @@ pub enum RequestShape {
         limit: u32,
         /// Whether preferred labels were requested.
         labels: bool,
+    },
+    /// Dictionary prefix scan.
+    Terms {
+        /// Prefix size in bytes.
+        prefix_len: u64,
+        /// Which dictionary sections the scan reads.
+        role: &'static str,
+        /// Requested page size; `null` when the request asks only for a count.
+        limit: Option<u32>,
+        /// Whether preferred labels were requested; `null` for a count, which
+        /// has no rows to label and refuses the parameter.
+        labels: Option<bool>,
     },
     /// Preferred-label batch.
     Labels {
