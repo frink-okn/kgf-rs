@@ -6854,23 +6854,18 @@ impl Resource for TermsPage {
             .terms
             .iter()
             .map(|row| {
-                let mut cell = term_cell(
+                // Every page links a term the same way, predicates included: a
+                // predicate is usually a subject too, carrying its label and its
+                // definition, and `roles` cannot say otherwise — it reports the
+                // sections *this scan read*, so a `role=predicate` scan calls
+                // every row a predicate whether or not the term is described
+                // elsewhere in the graph.
+                term_cell(
                     &self.target,
                     &self.blank_nodes,
                     &row.published,
                     row.label.as_ref().and_then(Option::as_deref),
-                );
-                // A term the scan saw only as a predicate is not described by
-                // `/describe`, which reads a resource's edges: the useful next
-                // request is the statements that use it.
-                if row.roles == [term_role_name(Role::Predicate)] {
-                    cell.href = Some(self.target.ask(
-                        "fragment",
-                        "p",
-                        &Term::from_dictionary(&row.published).to_request(),
-                    ));
-                }
-                cell
+                )
             })
             .collect();
         let roles: Vec<String> = self.terms.iter().map(|row| row.roles.join(", ")).collect();

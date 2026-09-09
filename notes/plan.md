@@ -2072,6 +2072,19 @@ against every block head a search touches, and echoed in the response. A GET tar
 reaches the body-size layer, so the only ceiling was whatever the HTTP stack happened to
 allow — not a published number a client can size a request by.
 
+**And one the review did not catch.** The terms page linked a term whose row said only
+`predicate` to `/fragment?p=` rather than to its own `/describe`, on the reasoning that
+such a term has no neighborhood to describe. The reasoning was wrong twice over. Most
+predicates *are* subjects — they carry the label and definition that say what they mean,
+which is exactly the page a reader wants from one. And the row could not have supported
+the claim anyway: `roles` reports the sections a scan *read*, so a `role=predicate` scan
+calls every row a predicate whether or not the term is described elsewhere, and the
+override fired hardest on the best-documented vocabularies. The same insight was already
+being applied correctly one layer down, where label hydration looks a scanned predicate up
+in the subject sections its own scan never read. The override is gone, every term links
+the way every other page links it, and `ScannedTerm::sections` now says in its own
+documentation that an absent section is silence rather than evidence.
+
 *Verified by* the store's role-breakdown and paging tests over the amended count, a
 request-layer test that the largest permitted prefix is accepted and one byte more is
 `cap_exceeded`, the capability-gate pair rewritten around a `terms` that is no longer

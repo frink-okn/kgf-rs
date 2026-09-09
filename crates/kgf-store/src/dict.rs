@@ -1028,6 +1028,13 @@ impl<'a> ScannedTerm<'a> {
     /// the scan looked at: a subject scan reads the shared and subject-only
     /// sections, so it can say whether a subject is also an object, and says
     /// nothing about predicates.
+    ///
+    /// **An absent section is not evidence the term is missing from it.** A
+    /// predicate scan reports every row as a predicate and nothing else, though
+    /// most predicates are also subjects carrying their own label and
+    /// definition. Presence is a fact; absence is only silence, and a caller
+    /// that needs the other answer has to look — [`Dictionary::locate`] in the
+    /// role it cares about.
     pub fn sections(&self) -> TermSections {
         self.sections
     }

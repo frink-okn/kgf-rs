@@ -2499,7 +2499,7 @@ fn a_scan_hydrates_labels_and_weighs_them_against_the_byte_budget() {
 }
 
 #[test]
-fn a_scan_page_links_each_term_to_the_request_that_uses_it() {
+fn a_scan_page_links_every_term_to_its_own_neighborhood() {
     let served = Served::new();
     let store = served.store();
 
@@ -2512,10 +2512,15 @@ fn a_scan_page_links_each_term_to_the_request_that_uses_it() {
     assert!(page.contains("<h1>“http://example.org/…”</h1>"));
     assert!(page.contains("Terms · tox 2026-06-01"));
     assert!(page.contains("<th>term</th><th>roles</th>"));
-    // A term that is a subject or an object leads to its neighborhood; one the
-    // scan saw only as a predicate leads to the statements that use it.
+    // Every term leads to its own neighborhood, whichever position it occupies:
+    // a predicate is usually a subject too, carrying the label and definition
+    // that describe it, and `roles` reports only the sections this scan read.
     assert!(page.contains("/tox/v/2026-06-01/describe?iri=%3Chttp%3A%2F%2Fexample.org%2Falice%3E"));
-    assert!(page.contains("/tox/v/2026-06-01/fragment?p=%3Chttp%3A%2F%2Fexample.org%2Fknows%3E"));
+    assert!(page.contains("/tox/v/2026-06-01/describe?iri=%3Chttp%3A%2F%2Fexample.org%2Fknows%3E"));
+    assert!(
+        !page.contains("fragment?p="),
+        "a predicate links like any other term"
+    );
     assert!(page.contains("subject, object"));
     // The label the request asked for annotates the term rather than adding a
     // column, and the exact total is one link away.
