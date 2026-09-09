@@ -305,6 +305,8 @@ pub enum AccessOperation {
     Sample,
     /// Entity search.
     Search,
+    /// Dictionary prefix scan.
+    Terms,
     /// Description graph navigation.
     Schema,
     /// VoID description.
@@ -337,6 +339,7 @@ impl AccessOperation {
             Self::Describe => "describe",
             Self::Sample => "sample",
             Self::Search => "search",
+            Self::Terms => "terms",
             Self::Schema => "schema",
             Self::Void => "void",
             Self::Summary => "summary",
@@ -456,6 +459,18 @@ pub enum RequestShape {
         limit: u32,
         /// Whether preferred labels were requested.
         labels: bool,
+    },
+    /// Dictionary prefix scan.
+    Terms {
+        /// Prefix size in bytes.
+        prefix_len: u64,
+        /// Which dictionary sections the scan reads.
+        role: &'static str,
+        /// Requested page size; `null` when the request asks only for a count.
+        limit: Option<u32>,
+        /// Whether preferred labels were requested; `null` for a count, which
+        /// has no rows to label and refuses the parameter.
+        labels: Option<bool>,
     },
     /// Preferred-label batch.
     Labels {
@@ -981,6 +996,14 @@ fn classify(user_agent: Option<&str>) -> ClientClass {
     }
 }
 
+/// The operation a matched route belongs to, for records no handler reached.
+///
+/// [`Observation`] carries the operation once a handler runs, so this is the
+/// fallback for everything that stops earlier: a method the route does not take,
+/// an admission refusal, a connection abandoned before the response. Forgetting
+/// an entry is silent — the record simply says `null` and cannot be attributed —
+/// which is why `every_versioned_operation_is_recoverable_from_its_route` builds
+/// each route from [`AccessOperation::path_segment`] and checks the round trip.
 fn operation_for_route(route: &str) -> Option<AccessOperation> {
     match route {
         "/" => Some(AccessOperation::Service),
@@ -993,6 +1016,7 @@ fn operation_for_route(route: &str) -> Option<AccessOperation> {
         "/{dataset}/v/{version}/describe" => Some(AccessOperation::Describe),
         "/{dataset}/v/{version}/sample" => Some(AccessOperation::Sample),
         "/{dataset}/v/{version}/search" => Some(AccessOperation::Search),
+        "/{dataset}/v/{version}/terms" => Some(AccessOperation::Terms),
         "/{dataset}/v/{version}/schema" => Some(AccessOperation::Schema),
         "/{dataset}/v/{version}/void" => Some(AccessOperation::Void),
         "/{dataset}/v/{version}/summary" => Some(AccessOperation::Summary),
@@ -1016,6 +1040,38 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
+
+    /// Every operation mounted under a version must be recoverable from the
+    /// route axum matched, or the records that never reach a handler — a 405, an
+    /// admission refusal, an abandoned connection — cannot be attributed to it.
+    ///
+    /// Built from `path_segment` rather than written out, so the two spellings
+    /// of a route cannot drift apart: adding an operation to that exhaustive
+    /// match and forgetting the lookup table fails here.
+    #[test]
+    fn every_versioned_operation_is_recoverable_from_its_route() {
+        for operation in [
+            AccessOperation::Fragment,
+            AccessOperation::Tpf,
+            AccessOperation::Count,
+            AccessOperation::Describe,
+            AccessOperation::Sample,
+            AccessOperation::Search,
+            AccessOperation::Terms,
+            AccessOperation::Schema,
+            AccessOperation::Void,
+            AccessOperation::Summary,
+            AccessOperation::Labels,
+            AccessOperation::Manifest,
+        ] {
+            let route = format!("/{{dataset}}/v/{{version}}/{}", operation.path_segment());
+            assert_eq!(
+                operation_for_route(&route),
+                Some(operation),
+                "no route table entry for {route}"
+            );
+        }
+    }
     use axum::body::Body;
     use axum::http::StatusCode;
 

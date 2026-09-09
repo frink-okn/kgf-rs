@@ -48,6 +48,7 @@ use std::collections::BTreeMap;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use kgf_store::dict::DictPosition;
 use kgf_store::pattern::{Permutation, Selection};
 use sha2::{Digest, Sha256};
 
@@ -95,6 +96,8 @@ pub enum Operation {
     Schema = 4,
     /// `GET /tpf`.
     Tpf = 5,
+    /// `GET /terms`.
+    Terms = 6,
 }
 
 impl Operation {
@@ -110,6 +113,7 @@ impl Operation {
             3 => Some(Self::Describe),
             4 => Some(Self::Schema),
             5 => Some(Self::Tpf),
+            6 => Some(Self::Terms),
             _ => None,
         }
     }
@@ -169,6 +173,17 @@ pub enum PositionSpace {
     ClassRelation = 8,
     /// Byte offset in the persisted `/schema` class-property projection.
     ClassProperty = 9,
+    /// The dictionary position of the last term a `/terms` page delivered.
+    ///
+    /// The last term rather than the next one, because a prefix scan over the
+    /// subject or object role merges two independently sorted PFC sections and
+    /// `role=any` merges four. Each run's next position follows from the term the
+    /// page stopped on — one binary search per section — while a set of next
+    /// positions would need one number per run and would let an edited token pair
+    /// them inconsistently. Naming the term also keeps a term stored in several
+    /// sections one row across a page boundary, since every run resumes strictly
+    /// past it.
+    DictionaryPrefix = 10,
 }
 
 impl PositionSpace {
@@ -209,6 +224,7 @@ impl PositionSpace {
             7 => Some(Self::SchemaChild),
             8 => Some(Self::ClassRelation),
             9 => Some(Self::ClassProperty),
+            10 => Some(Self::DictionaryPrefix),
             _ => None,
         }
     }
@@ -462,6 +478,11 @@ impl Cursor {
         Self::at(binding, PositionSpace::ClassProperty, byte_offset)
     }
 
+    /// Resume a `/terms` prefix scan after the term at `position`.
+    pub fn at_dictionary_position(binding: &CursorBinding, position: DictPosition) -> Self {
+        Self::at(binding, PositionSpace::DictionaryPrefix, position.as_u64())
+    }
+
     /// Encode to the opaque token clients round-trip.
     ///
     /// Fixed layout, little-endian, then URL-safe base64 without padding: 29
@@ -546,7 +567,8 @@ impl Cursor {
             }
             PositionSpace::SchemaChild
             | PositionSpace::ClassRelation
-            | PositionSpace::ClassProperty => binding_index.is_none() && scan_position.is_none(),
+            | PositionSpace::ClassProperty
+            | PositionSpace::DictionaryPrefix => binding_index.is_none() && scan_position.is_none(),
             PositionSpace::Spo
             | PositionSpace::Pos
             | PositionSpace::Ops
@@ -700,7 +722,10 @@ mod tests {
             reencode(&raw[..FIXED_LEN - 1]),
             reencode(&[raw.clone(), vec![0u8]].concat()),
         ];
-        for (index, value) in [(0, 2u8), (3, 10u8), (4, 0b1000_0000u8)] {
+        // A wrong version, a position space no build has assigned — `u8::MAX`
+        // rather than one past the last, so adding a space does not silently
+        // make this case legal — and an undefined trailer flag.
+        for (index, value) in [(0, 2u8), (3, u8::MAX), (4, 0b1000_0000u8)] {
             let mut tampered = raw.clone();
             tampered[index] = value;
             bad.push(reencode(&tampered));

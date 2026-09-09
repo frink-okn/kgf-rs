@@ -34,12 +34,11 @@ pub(crate) fn manifest_forms(
             (tpf(mount, dataset, version, &empty, false))
             (count(mount, dataset, version, &empty, search, false))
             (describe(mount, dataset, version, &empty, false))
-            @if manifest.declares(Capability::Sample) {
-                (sample(mount, dataset, version, &empty, false))
-            }
+            (sample(mount, dataset, version, &empty, false))
             @if search {
                 (search_form(mount, dataset, version, &empty, false))
             }
+            (terms(mount, dataset, version, &empty, false))
         }
     }
 }
@@ -60,6 +59,7 @@ pub(crate) fn operation_form(
         "describe" => Some(describe(mount, dataset, version, params, false)),
         "sample" => Some(sample(mount, dataset, version, params, false)),
         "search" => Some(search_form(mount, dataset, version, params, false)),
+        "terms" => Some(terms(mount, dataset, version, params, false)),
         _ => None,
     }?;
     Some(html! { div."query-stack" { (form) } })
@@ -322,6 +322,74 @@ fn search_form(mount: &Mount, dataset: &str, version: &str, params: &Params, ope
     )
 }
 
+/// The dictionary prefix scan.
+///
+/// No `count` control, deliberately. A count and a page are two answers, and
+/// `count=true` refuses the page-shaped parameters rather than ignoring them —
+/// so a control here would make the ordinary case of an echoed `limit` a
+/// refusal. The count is reached from the answer page instead, where the link is
+/// built from the two parameters that determine it.
+fn terms(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
+    let role = params.get("role").unwrap_or("any");
+    let labels = params.get("labels").unwrap_or("true");
+    form(
+        "Terms",
+        "List the sorted dictionary under one byte prefix. An IRI prefix is written bare, \
+         without angle brackets, and a literal prefix carries its opening quote.",
+        mount.operation(dataset, version, "terms"),
+        vec![
+            text_control(
+                "terms",
+                "prefix",
+                "Prefix",
+                params.get("prefix"),
+                "http://purl.obolibrary.org/obo/MONDO_",
+                false,
+            ),
+            html! {
+                label for="terms-role" {
+                    span."control-label" { "Position " code { "role" } }
+                    select id="terms-role" name="role" {
+                        @for (value, text) in [
+                            ("any", "any"),
+                            ("subject", "subject"),
+                            ("predicate", "predicate"),
+                            ("object", "object"),
+                        ] {
+                            option value=(value) selected[role == value] { (text) }
+                        }
+                    }
+                }
+            },
+            html! {
+                fieldset."choice" {
+                    legend { "Preferred labels " code { "labels" } }
+                    label for="terms-labels-yes" {
+                        input id="terms-labels-yes" type="radio" name="labels" value="true"
+                            checked[labels != "false"];
+                        " yes"
+                    }
+                    label for="terms-labels-no" {
+                        input id="terms-labels-no" type="radio" name="labels" value="false"
+                            checked[labels == "false"];
+                        " no"
+                    }
+                }
+            },
+            number_control(
+                "terms",
+                "limit",
+                "Terms",
+                params.get("limit"),
+                1,
+                "server default",
+            ),
+        ],
+        "List terms",
+        open,
+    )
+}
+
 fn form(
     title: &str,
     description: &str,
@@ -447,26 +515,29 @@ mod tests {
 
     #[test]
     fn manifest_forms_follow_capabilities() {
+        // Every form whose operation needs no sidecar is offered whatever the
+        // manifest says, because no bundle can fail to answer it. Only the ones
+        // reading bytes a bundle may not carry follow a declaration.
         let core = manifest_forms(&Mount::default(), "tox", "v1", &manifest(&[])).into_string();
         assert!(core.contains("class=\"query-stack\""));
-        assert!(core.contains("action=\"/tox/v/v1/fragment\""));
-        assert!(core.contains("action=\"/tox/v/v1/tpf\""));
-        assert!(core.contains("action=\"/tox/v/v1/count\""));
-        assert!(core.contains("action=\"/tox/v/v1/describe\""));
-        assert!(!core.contains("action=\"/tox/v/v1/sample\""));
+        for operation in ["fragment", "tpf", "count", "describe", "sample", "terms"] {
+            assert!(
+                core.contains(&format!("action=\"/tox/v/v1/{operation}\"")),
+                "{operation}"
+            );
+        }
         assert!(!core.contains("action=\"/tox/v/v1/search\""));
         assert!(!core.contains("name=\"o.text\""));
 
-        let optional = manifest_forms(
+        let searchable = manifest_forms(
             &Mount::default(),
             "tox",
             "v1",
-            &manifest(&[Capability::Sample, Capability::Search]),
+            &manifest(&[Capability::Search]),
         )
         .into_string();
-        assert!(optional.contains("action=\"/tox/v/v1/sample\""));
-        assert!(optional.contains("action=\"/tox/v/v1/search\""));
-        assert!(optional.contains("name=\"o.text\""));
+        assert!(searchable.contains("action=\"/tox/v/v1/search\""));
+        assert!(searchable.contains("name=\"o.text\""));
     }
 
     #[test]
@@ -493,10 +564,12 @@ mod tests {
             &mounted,
             "tox",
             "v1",
-            &manifest(&[Capability::Sample, Capability::Search]),
+            &manifest(&[Capability::Sample, Capability::Search, Capability::Terms]),
         )
         .into_string();
-        for operation in ["fragment", "tpf", "count", "describe", "sample", "search"] {
+        for operation in [
+            "fragment", "tpf", "count", "describe", "sample", "search", "terms",
+        ] {
             assert!(
                 rendered.contains(&format!("action=\"/kgf/tox/v/v1/{operation}\"")),
                 "{operation}"

@@ -53,7 +53,7 @@ use serde::{Deserialize, Serialize};
 
 use hdtc::format::{TextScanPosition, TextSearcher, parse_literal};
 use kgf_store::catalog::BundleId;
-use kgf_store::dict::Dictionary;
+use kgf_store::dict::{DictPosition, Dictionary, RoleCounts, ScanFlow, ScannedTerm};
 use kgf_store::pattern::{IdPattern, Selection};
 use kgf_store::{
     ClassPropertyStop, ClassRelationStop, IdTriple, Role, SchemaCollection,
@@ -75,7 +75,8 @@ use crate::rdf::{GraphFormat, serialize_dataset, serialize_graph};
 use crate::representation::{RdfSyntax, Representation};
 use crate::request::{
     self, BindingPattern, BindingRow, BoundTerm, Candidates, Direction, Pattern, Position,
-    ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter,
+    ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter, role_name,
+    term_role_name,
 };
 use crate::skolem::SkolemScope;
 use crate::term::{DictionaryTermError, LiteralKind, PrefixMap, Term, TermCache, serialized_bytes};
@@ -334,6 +335,7 @@ impl Target {
             AccessOperation::Describe => "Describe",
             AccessOperation::Sample => "Sample",
             AccessOperation::Search => "Search",
+            AccessOperation::Terms => "Terms",
             AccessOperation::Schema => "Schema",
             AccessOperation::Labels => "Labels",
             AccessOperation::Void => "void",
@@ -1657,6 +1659,174 @@ impl Renders for SearchAnswer {
             rows,
             cardinality: None,
         })
+    }
+}
+
+/// One term a `/terms` page returned.
+///
+/// `roles` is what the merge learned for free: a scan visits every covered
+/// section standing at the same string at once, so the positions a term occupies
+/// come out of the same step that emitted it.
+#[derive(Debug)]
+struct TermRow {
+    published: Rc<str>,
+    roles: Vec<&'static str>,
+    /// Two optional layers, as in a search result: the outer says hydration was
+    /// requested, the inner whether this bundle found a label.
+    label: Option<Option<String>>,
+    serialized: u64,
+}
+
+impl TermRow {
+    fn new(
+        published: Rc<str>,
+        term: u64,
+        roles: Vec<&'static str>,
+        label: Option<Option<String>>,
+    ) -> Self {
+        let roles_serialized = 2
+            + roles
+                .iter()
+                .map(|role| serialized_json_string(role))
+                .sum::<u64>()
+            + roles.len().saturating_sub(1) as u64;
+        let serialized = match &label {
+            None => serialized_object([("term", term), ("roles", roles_serialized)]),
+            Some(label) => serialized_object([
+                ("term", term),
+                ("roles", roles_serialized),
+                ("label", label.as_deref().map_or(4, serialized_json_string)),
+            ]),
+        };
+        Self {
+            published,
+            roles,
+            label,
+            serialized,
+        }
+    }
+}
+
+impl Serialize for TermRow {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("term", &Term::from_dictionary(&self.published))?;
+        map.serialize_entry("roles", &self.roles)?;
+        if let Some(label) = &self.label {
+            map.serialize_entry("label", label)?;
+        }
+        map.end()
+    }
+}
+
+/// `GET /terms`' page of the dictionary under one byte prefix.
+#[derive(Debug, Serialize)]
+pub struct TermsPage {
+    dataset: String,
+    version: String,
+    prefix: String,
+    role: &'static str,
+    /// Distinct terms the prefix matches in this role, exactly.
+    ///
+    /// Carried with the page for the reason a fragment page carries its own:
+    /// bracketing the prefix is what produced the page, so the total is already
+    /// known and a client should not have to spend a second request to learn how
+    /// far it is through the scan.
+    cardinality: Cardinality,
+    terms: Vec<TermRow>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+    /// Only the page needs this: a scanned term is already published scoped, and
+    /// HTML spells such a term `_:{section}-{local-id}` for its reader.
+    #[serde(skip)]
+    blank_nodes: SkolemScope,
+}
+
+/// `GET /terms?count=true`' exact number of distinct terms under one prefix.
+#[derive(Debug, Serialize)]
+pub struct TermsCount {
+    dataset: String,
+    version: String,
+    prefix: String,
+    role: &'static str,
+    /// The requested role's count, in the shape `/count` uses.
+    count: Cardinality,
+    /// Every role's count, always.
+    ///
+    /// The four numbers come out of the same four bracketing searches, so three
+    /// of them are free — and the breakdown is what the question behind this
+    /// operation actually asks. "Does this dataset use MONDO" is answered by
+    /// *how*: as subjects, as objects it links to, or as predicates. A client
+    /// fanning one probe across a federation would otherwise send four.
+    counts: RoleBreakdown,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+}
+
+/// One count per term position, and one over all of them.
+#[derive(Debug, Serialize)]
+pub struct RoleBreakdown {
+    subject: u64,
+    predicate: u64,
+    object: u64,
+    /// Distinct terms over every position, which is not the sum of the other
+    /// three: a shared term is both a subject and an object, and a predicate may
+    /// repeat either.
+    any: u64,
+}
+
+impl From<RoleCounts> for RoleBreakdown {
+    fn from(counts: RoleCounts) -> Self {
+        Self {
+            subject: counts.subject(),
+            predicate: counts.predicate(),
+            object: counts.object(),
+            any: counts.any(),
+        }
+    }
+}
+
+/// The two shapes `GET /terms` answers in.
+///
+/// An enum rather than a page with an optional count, because the count is not a
+/// summary of the page: it is the answer to a different question, computed
+/// without enumerating anything.
+#[derive(Debug)]
+pub enum TermsAnswer {
+    /// A page of terms.
+    Page(TermsPage),
+    /// One exact count.
+    Count(TermsCount),
+}
+
+impl Renders for TermsAnswer {
+    fn render(self, representation: Representation) -> Result<Rendered, Problem> {
+        match self {
+            Self::Page(page) => {
+                let body = standard_body(&page, representation);
+                let rows = Some(page.terms.len() as u64);
+                let cardinality = Some(page.cardinality);
+                Ok(Rendered {
+                    body,
+                    completeness: page.completeness,
+                    rows,
+                    cardinality,
+                })
+            }
+            Self::Count(count) => {
+                let body = standard_body(&count, representation);
+                Ok(Rendered {
+                    body,
+                    completeness: count.completeness,
+                    rows: None,
+                    cardinality: Some(count.count),
+                })
+            }
+        }
     }
 }
 
@@ -4121,6 +4291,187 @@ fn resolve_predicate_ids(
         .collect()
 }
 
+/// Answer a dictionary prefix scan: a page of terms, or how many there are.
+///
+/// The dictionary is already sorted, so this needs no artifact a bundle does not
+/// have to carry — which is why every release answers it. What it costs is two
+/// binary searches to bracket the prefix and then the page.
+pub fn terms(
+    store: &Store,
+    target: Target,
+    request: &request::Terms,
+) -> Result<TermsAnswer, Problem> {
+    let dictionary = store.dict();
+
+    if request.count {
+        let counts = dictionary
+            .term_counts(request.prefix.as_bytes())
+            .map_err(|error| unreadable("counting a dictionary prefix", &error))?;
+        return Ok(TermsAnswer::Count(TermsCount {
+            dataset: target.id.dataset.clone(),
+            version: target.id.version.clone(),
+            prefix: request.prefix.clone(),
+            role: role_name(request.role),
+            count: Cardinality::exact(counts.of(request.role)),
+            counts: counts.into(),
+            completeness: Completeness::complete(),
+            target,
+        }));
+    }
+
+    // Below the count, which brackets its own four sections: building this for a
+    // request that returns one number would pay for the whole scan twice.
+    let scan = dictionary
+        .terms(request.role, request.prefix.as_bytes())
+        .map_err(|error| unreadable("bracketing a dictionary prefix", &error))?;
+    let cardinality = scan
+        .count()
+        .map_err(|error| unreadable("counting a dictionary prefix", &error))?;
+
+    let after = match &request.cursor {
+        None => None,
+        Some(cursor) => {
+            if cursor.space != PositionSpace::DictionaryPrefix {
+                return Err(Problem::from(StaleCursor));
+            }
+            // The position must name a term *this* scan enumerates. A token for
+            // another prefix or another role decodes and then fails here, which
+            // is the same refusal as a token for another bundle.
+            Some(
+                scan.resume_at(DictPosition::new(cursor.position))
+                    .ok_or(StaleCursor)?,
+            )
+        }
+    };
+
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let label_predicates = resolve_predicate_ids(&dictionary, &request.label_predicates)?;
+    let mut cache = TermCache::new();
+    let mut published = PublishedTerms::new(blank_nodes.clone());
+    let mut rows: Vec<TermRow> = Vec::with_capacity(request.limit as usize);
+    let mut spent = 0u64;
+    let mut spent_budget = false;
+    let mut failure = None;
+
+    let stop = scan
+        .page(after, request.limit as usize, |term| {
+            let row = match scanned_row(
+                store,
+                &dictionary,
+                &mut cache,
+                &mut published,
+                &term,
+                request.labels.then_some(label_predicates.as_slice()),
+            ) {
+                Ok(row) => row,
+                Err(problem) => {
+                    failure = Some(problem);
+                    return ScanFlow::Reject;
+                }
+            };
+            spent = spent.saturating_add(row.serialized);
+            // Never on the first row, for the reason a fragment page keeps its
+            // first row: a page that carries nothing would resume exactly where
+            // it was issued, and a client paging on it would never move.
+            if spent > request.bytes.0 && !rows.is_empty() {
+                spent_budget = true;
+                return ScanFlow::Reject;
+            }
+            rows.push(row);
+            ScanFlow::Continue
+        })
+        .map_err(|error| unreadable("paging a dictionary prefix", &error))?;
+    if let Some(problem) = failure {
+        return Err(problem);
+    }
+
+    let completeness = match stop.last.filter(|_| stop.more) {
+        None if stop.more => {
+            // Unreachable: `limit` is at least one, the byte budget always
+            // admits the first row, and a failed row has already returned.
+            // Reported rather than asserted, because a page that kept nothing
+            // and cannot say where to resume is not a page to serve.
+            return Err(unreadable(
+                "paging a dictionary prefix",
+                &"a page that left terms behind kept none of them",
+            ));
+        }
+        None => Completeness::complete(),
+        Some(position) => {
+            let token = Cursor::at_dictionary_position(&request.binding, position).encode();
+            if spent_budget {
+                Completeness::budget_exhausted(BudgetReason::ResponseBytes, token)
+            } else {
+                Completeness::page_limit(token)
+            }
+        }
+    };
+
+    Ok(TermsAnswer::Page(TermsPage {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        prefix: request.prefix.clone(),
+        role: role_name(request.role),
+        cardinality: Cardinality::exact(cardinality),
+        terms: rows,
+        completeness,
+        target,
+        blank_nodes,
+    }))
+}
+
+/// One scanned term as a response row: its published spelling, the positions it
+/// occupies, and its preferred label when one was asked for.
+fn scanned_row(
+    store: &Store,
+    dictionary: &Dictionary<'_>,
+    cache: &mut TermCache,
+    published: &mut PublishedTerms,
+    term: &ScannedTerm<'_>,
+    label_predicates: Option<&[u64]>,
+) -> Result<TermRow, Problem> {
+    // Any role the scan read spells the term the same way, because a published
+    // blank node is named by its section and local id rather than by a role. So
+    // the first one is as good as any, and there is always one.
+    let (role, id) = term
+        .sections()
+        .roles()
+        .find_map(|role| term.id(role).map(|id| (role, id)))
+        .ok_or_else(|| {
+            unreadable(
+                "materializing a scanned term",
+                &"a scanned term has no id in any role its scan read",
+            )
+        })?;
+    let (row_term, serialized) = published
+        .measured(cache, dictionary, role, id)
+        .map_err(|error| unreadable("materializing a scanned term", &error))?;
+
+    let label = match label_predicates {
+        None => None,
+        Some(predicates) => {
+            // A label statement has the term as its subject, so a term the scan
+            // did not read in the subject sections still needs looking up there:
+            // a predicate carries `rdfs:label` like anything else, and refusing
+            // to look would make `role=predicate&labels=true` answer nothing.
+            let subject = match term.id(Role::Subject) {
+                Some(id) => Some(id.0),
+                None => dictionary
+                    .locate(Role::Subject, term.bytes())
+                    .map_err(|error| unreadable("looking a scanned term up", &error))?
+                    .map(|id| id.0),
+            };
+            Some(match subject {
+                None => None,
+                Some(subject) => preferred_label(store, dictionary, cache, subject, predicates)?,
+            })
+        }
+    };
+
+    let roles = term.sections().roles().map(term_role_name).collect();
+    Ok(TermRow::new(row_term.published, serialized, roles, label))
+}
+
 /// First predicate in the frozen cascade with a value, then its lowest object
 /// term id. There is intentionally no language axis: this is the release's one
 /// deterministic display label, independent of client locale.
@@ -6471,6 +6822,165 @@ impl Resource for SearchAnswer {
                         (results_table(&headers, &rows))
                     }
                 }
+            },
+        )
+    }
+}
+
+impl TermsPage {
+    /// The same scan, counted instead of paged.
+    ///
+    /// Built from the two parameters that determine the answer rather than from
+    /// the request's own, because a count refuses the page-shaped ones.
+    fn counted(&self) -> String {
+        format!(
+            "{}?prefix={}&role={}&count=true",
+            self.target
+                .mount
+                .operation(&self.target.id.dataset, &self.target.id.version, "terms"),
+            url::encode_value(&self.prefix),
+            self.role,
+        )
+    }
+}
+
+impl Resource for TermsPage {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let cells: Vec<Cell<'_>> = self
+            .terms
+            .iter()
+            .map(|row| {
+                // Every page links a term the same way, predicates included: a
+                // predicate is usually a subject too, carrying its label and its
+                // definition, and `roles` cannot say otherwise — it reports the
+                // sections *this scan read*, so a `role=predicate` scan calls
+                // every row a predicate whether or not the term is described
+                // elsewhere in the graph.
+                term_cell(
+                    &self.target,
+                    &self.blank_nodes,
+                    &row.published,
+                    row.label.as_ref().and_then(Option::as_deref),
+                )
+            })
+            .collect();
+        let roles: Vec<String> = self.terms.iter().map(|row| row.roles.join(", ")).collect();
+        let rows: Vec<Vec<Value<'_>>> = cells
+            .iter()
+            .zip(&roles)
+            .map(|(cell, roles)| vec![cell.value(), Value::Text(roles)])
+            .collect();
+
+        let returned = self.terms.len() as u64;
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        let heading = if self.prefix.is_empty() {
+            "Every term".to_owned()
+        } else {
+            format!("“{}…”", self.prefix)
+        };
+        let counted = self.counted();
+        operation_page(
+            &self.target.mount,
+            &heading,
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" {
+                    (fields(&[
+                        ("prefix", if self.prefix.is_empty() { Value::Text("(none)") } else { Value::Code(&self.prefix) }),
+                        ("role", Value::Text(self.role)),
+                        ("matching", Value::Number(self.cardinality.value())),
+                        ("returned", Value::Number(returned)),
+                        ("complete", Value::Text(completeness_text(&self.completeness))),
+                    ]))
+                }
+                @if let Some(form) = self.target.form() {
+                    div."query-editor" { (form) }
+                }
+                section."section-block" {
+                    h2 { "Terms" }
+                    @if rows.is_empty() {
+                        (note("No term in this role starts with that prefix."))
+                    } @else {
+                        (results_table(&["term", "roles"], &rows))
+                    }
+                }
+                (pager(&counted, "How many in total? →"))
+                @if let Some(token) = self.completeness.next_cursor() {
+                    @if let Some(next) = self.target.next(token) {
+                        (pager(&next, "Next page →"))
+                    }
+                }
+            },
+        )
+    }
+}
+
+impl Resource for TermsCount {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        let heading = if self.prefix.is_empty() {
+            "Every term".to_owned()
+        } else {
+            format!("“{}…”", self.prefix)
+        };
+        let listed = query(
+            self.target
+                .mount
+                .operation(&self.target.id.dataset, &self.target.id.version, "terms"),
+            &self.target.params.without("count"),
+        );
+        operation_page(
+            &self.target.mount,
+            &heading,
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" {
+                    (fields(&[
+                        ("prefix", if self.prefix.is_empty() { Value::Text("(none)") } else { Value::Code(&self.prefix) }),
+                        ("role", Value::Text(self.role)),
+                        ("count", Value::Number(self.count.value())),
+                        ("exact", Value::Text("yes")),
+                    ]))
+                }
+                @if let Some(form) = self.target.form() {
+                    div."query-editor" { (form) }
+                }
+                section."section-block" {
+                    h2 { "By position" }
+                    (results_table(
+                        &["position", "terms"],
+                        &[
+                            vec![Value::Text("subject"), Value::Number(self.counts.subject)],
+                            vec![Value::Text("predicate"), Value::Number(self.counts.predicate)],
+                            vec![Value::Text("object"), Value::Number(self.counts.object)],
+                            vec![Value::Text("any"), Value::Number(self.counts.any)],
+                        ],
+                    ))
+                    (note(
+                        "`any` deduplicates rather than adding up: a term stored as both a \
+                         subject and an object is one term, and a predicate may repeat either."
+                    ))
+                }
+                (note(
+                    "Two binary searches bracket a sorted dictionary section, so these numbers \
+                     cost the same whether they are nought or a million — which is what makes \
+                     this worth asking across a federation before asking for anything else."
+                ))
+                (pager(&listed, "The terms themselves →"))
             },
         )
     }

@@ -110,13 +110,46 @@ pub fn validate_predicate_role_iri(
 /// The core profile (`fragment`, `count`, `describe`, and the description
 /// surface) is mandatory and therefore absent from this enum: it is not a
 /// capability, it is the floor.
+///
+/// # Who this list is for
+///
+/// The whole set is [derived](capabilities_for) from which artifact files a
+/// bundle carries, so it tells a server holding that bundle nothing it could not
+/// work out itself. Its audience is the consumer that has the *manifest* and not
+/// the bundle: a registry building linksets, a mirror verifying what it copied, a
+/// client choosing which of forty endpoints to ask. `Filters` is the pure case —
+/// it gates no operation here at all.
+///
+/// Which means a server should read it only where an artifact can be missing.
+/// `Sample`, `Labels`, and `Terms` compose artifacts every bundle is required to
+/// carry, so for those the field is a restatement of "yes, always", and treating
+/// it as the authority lets a manifest written before an operation existed
+/// suppress work the bytes fully support. `kgf-server`'s `routes::capability_gate`
+/// carries that division.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Capability {
     /// `QUERY /star` — star hydration.
     Star,
     /// `GET /sample` — pseudo-random members of a pattern's results.
     Sample,
-    /// `GET /terms` — dictionary prefix access.
+    /// `GET|QUERY /terms` — dictionary access.
+    ///
+    /// **Never derived, and therefore never declared by a manifest this crate
+    /// writes.** Two operations share the name: a prefix scan, which the sorted
+    /// PFC sections answer with no sidecar at all, and key resolution, which
+    /// turns matched role-key hashes back into terms and needs a derived
+    /// key-to-id index no bundle carries. Declaring a capability commits to its
+    /// full contract, methods included, so a bundle cannot honestly claim this
+    /// one while half of it is unanswerable — and the half that *is* answerable
+    /// is answerable by every bundle, so declaring it would tell a reader
+    /// nothing either way.
+    ///
+    /// The variant stays because the name is part of the protocol's vocabulary
+    /// and a manifest written elsewhere may use it — `kgf manifest --check`
+    /// reports such a declaration as one the artifacts do not support, which is
+    /// what it is. Splitting the name so the two halves can be declared
+    /// separately is a question for the design documents; the candidate for key
+    /// resolution is the key sets it exists to complete.
     Terms,
     /// `GET /export/...` — bulk artifact download.
     Export,
@@ -256,10 +289,19 @@ impl BundleFacts {
 /// Two optional capabilities need nothing beyond the artifacts every bundle is
 /// required to carry: `sample` composes triple patterns, and `labels` resolves
 /// the manifest's predicate cascade through the core permutations. `star`,
-/// `terms`, and `export` are not declared until their complete HTTP operations
-/// are implemented. The rest are gated on sidecars — the graph pair and the
-/// text index exist today, and `range` and `closure` are therefore never derived
-/// here, since a bundle cannot acquire them without acquiring an artifact.
+/// `export`, and `terms` are not declared, each for its own reason — the first
+/// two have no implementation, and [`Capability::Terms`] names two operations of
+/// which only one can be answered from any bundle's bytes. The rest are gated on
+/// sidecars — the graph pair and the text index exist today, and `range` and
+/// `closure` are therefore never derived here, since a bundle cannot acquire
+/// them without acquiring an artifact.
+///
+/// Note what a bundle-invariant capability is worth to a reader: `sample` and
+/// `labels` are true of every bundle, so declaring them distinguishes nothing.
+/// They are kept because their contracts are met in full and because the list is
+/// what a consumer reading manifests without bundles has to go on. Whether such
+/// capabilities belong in the vocabulary at all is a separate question from
+/// whether this one can be declared honestly.
 fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
     let mut capabilities = BTreeSet::from([Capability::Sample, Capability::Labels]);
     if artifacts.graphs.is_some() {
@@ -1219,6 +1261,10 @@ mod tests {
         let capabilities: Vec<_> = facts(&fixture).capabilities().collect();
 
         assert_eq!(capabilities, vec![Capability::Sample, Capability::Labels]);
+        // Answerable by every bundle, and deliberately not declared: the name
+        // covers a key-resolution operation no bundle can answer, and the route
+        // is not gated on the declaration anyway.
+        assert!(!capabilities.contains(&Capability::Terms));
         // Sidecar-gated capabilities are never guessed at.
         assert!(!capabilities.contains(&Capability::Search));
         assert!(!capabilities.contains(&Capability::Range));

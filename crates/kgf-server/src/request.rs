@@ -44,6 +44,7 @@ use spargebra::term::GroundTerm;
 use spargebra::{Query, SparqlParser};
 
 use hdtc::format::TextQuery;
+use kgf_store::dict::ScanRole;
 use kgf_store::{
     Capability, ClassPropertyFilter as StoreClassPropertyFilter,
     ClassRelationFilter as StoreClassRelationFilter, Role,
@@ -497,7 +498,8 @@ impl TextFilter {
             return Err(Problem::new(
                 ErrorCode::MalformedRequest,
                 format!(
-                    "`o={}` and `o.text` both constrain the object; bind the term or                      search for it, not both",
+                    "`o={}` and `o.text` both constrain the object; bind the term \
+                     or search for it, not both",
                     reflected(bound.requested())
                 ),
             ));
@@ -1833,6 +1835,177 @@ impl Count {
     }
 }
 
+/// `GET /terms` — a lexicographic page of the dictionary under one byte prefix.
+///
+/// Two shapes behind one parameter set, which is what `count` selects: a page of
+/// terms, or the exact number of them. The count is the reason the operation
+/// scales across a federation — bracketing one prefix costs `O(log D)` however
+/// many terms match — so it is not a variant of paging with `limit=0` but its
+/// own answer.
+#[derive(Debug)]
+pub struct Terms {
+    /// Bytes a term must start with, as the dictionary stores them.
+    pub prefix: String,
+    /// Which dictionary sections the scan reads.
+    pub role: ScanRole,
+    /// Whether the request asks for the exact distinct count instead of a page.
+    pub count: bool,
+    /// Rows this page may carry.
+    pub limit: u32,
+    /// Whether each term receives its preferred display label.
+    ///
+    /// Defaulted on, as `/search` defaults it: an IRI list is what this
+    /// operation returns, and an unlabelled page of opaque identifiers answers
+    /// "which terms" without answering "which things". The cost is one bounded
+    /// lookup per row and `labels=false` declines it.
+    pub labels: bool,
+    /// Ordered predicates used to hydrate the preferred label.
+    pub label_predicates: Vec<BoundTerm>,
+    /// Bytes the result rows may occupy.
+    pub bytes: ResponseBytes,
+    /// Where to resume a page.
+    pub cursor: Option<Cursor>,
+    /// What a cursor this operation issues must match.
+    pub binding: CursorBinding,
+}
+
+impl Terms {
+    const PARAMETERS: &'static [&'static str] = &[
+        "prefix", "role", "count", "limit", "labels", "cursor", "format",
+    ];
+
+    /// The parameters a count refuses, and what each of them would have meant.
+    ///
+    /// Refused rather than ignored: each one describes a page, and a count has
+    /// no page. Silently dropping `limit` would answer a different question from
+    /// the one asked without saying so.
+    const PAGE_ONLY: [&'static str; 3] = ["limit", "labels", "cursor"];
+
+    /// Read the parameters of a `/terms` request.
+    pub fn parse(
+        params: &Params,
+        limits: Limits<'_>,
+        profile: &PredicateRoles,
+        bundle: &BundleBinding,
+    ) -> Result<Self, Problem> {
+        accept_only(params, TERMS, Self::PARAMETERS)?;
+
+        // A bare byte prefix, not a term: an IRI is spelled without brackets and
+        // a literal carries its quotes, because the parameter names stored bytes
+        // rather than a term in request syntax. Bracketing it is the one mistake
+        // worth naming, since it silently matches nothing.
+        let prefix = params.get("prefix").unwrap_or_default();
+        // `max_term_bytes`, for the same reason every other term-valued
+        // parameter is held to it: a prefix of a stored term cannot usefully be
+        // longer than the terms it selects, and this one is hashed into the
+        // cursor binding, copied to build its successor, compared against every
+        // block head a search touches, and echoed in the response. A GET target
+        // never meets the body-size layer, so without this the only ceiling is
+        // whatever the HTTP stack happens to allow, which is not a published
+        // number a client can size a request by.
+        let max = limits.budgets.max_term_bytes;
+        if prefix.len() as u64 > max {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "`prefix` is {} bytes, over this server's max_term_bytes of {max}",
+                    prefix.len()
+                ),
+            ));
+        }
+        if prefix.starts_with('<') {
+            return Err(Problem::new(
+                ErrorCode::BadTermSyntax,
+                format!(
+                    "prefix={} is a byte prefix of a stored term, not a term: \
+                     write an IRI bare, without angle brackets",
+                    reflected(prefix)
+                ),
+            ));
+        }
+
+        let role = match params.get("role").unwrap_or("any") {
+            "subject" => ScanRole::Subject,
+            "predicate" => ScanRole::Predicate,
+            "object" => ScanRole::Object,
+            "any" => ScanRole::Any,
+            other => {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    format!(
+                        "role={} is not a term position; use subject, predicate, object, or any",
+                        reflected(other)
+                    ),
+                ));
+            }
+        };
+
+        let count = boolean(params, "count", false)?;
+        if count
+            && let Some(name) = Self::PAGE_ONLY
+                .into_iter()
+                .find(|name| params.get(name).is_some())
+        {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "`{name}` describes a page, and count=true returns one number; \
+                     drop one of the two"
+                ),
+            ));
+        }
+
+        let binding = CursorBinding::new(
+            bundle,
+            &CanonicalRequest::new(Operation::Terms)
+                .with("prefix", prefix)
+                .with("role", role_name(role)),
+        );
+
+        Ok(Self {
+            prefix: prefix.to_owned(),
+            role,
+            count,
+            limit: page_size(
+                params,
+                "limit",
+                limits.caps.default_limit,
+                limits.caps.max_limit,
+                "ask for count=true when only the number is wanted",
+            )?,
+            labels: boolean(params, "labels", true)?,
+            label_predicates: profile_terms(profile, "label"),
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            cursor: resume(params, &binding)?,
+            binding,
+        })
+    }
+}
+
+/// The wire spelling of a scan role, in requests, echoes, and cursor bindings.
+///
+/// Kept here rather than on [`ScanRole`] because the store has no wire
+/// vocabulary: it takes the parsed choice and knows nothing about how a client
+/// spelled it.
+pub fn role_name(role: ScanRole) -> &'static str {
+    match role {
+        ScanRole::Subject => term_role_name(Role::Subject),
+        ScanRole::Predicate => term_role_name(Role::Predicate),
+        ScanRole::Object => term_role_name(Role::Object),
+        ScanRole::Any => "any",
+    }
+}
+
+/// The wire spelling of one term position, as `/terms` names it in a request and
+/// reports it per row.
+pub fn term_role_name(role: Role) -> &'static str {
+    match role {
+        Role::Subject => "subject",
+        Role::Predicate => "predicate",
+        Role::Object => "object",
+    }
+}
+
 /// `GET /describe` — a resource's neighborhood, paged.
 #[derive(Debug)]
 pub struct Describe {
@@ -2730,6 +2903,25 @@ impl ObservedRequest for Search {
     }
 }
 
+impl ObservedRequest for Terms {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Terms {
+            prefix_len: self.prefix.len() as u64,
+            role: role_name(self.role),
+            limit: (!self.count).then_some(self.limit),
+            labels: (!self.count).then_some(self.labels),
+        }
+    }
+
+    fn resumed(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    fn request_hash(&self) -> Option<[u8; 8]> {
+        Some(self.binding.request_hash())
+    }
+}
+
 impl ObservedRequest for BindingFragment {
     fn shape(&self) -> RequestShape {
         RequestShape::Bindings {
@@ -2914,6 +3106,25 @@ impl GetRequest for Search {
     }
 }
 
+impl GetRequest for Terms {
+    fn normalize_params(params: &Params) -> Params {
+        params.without_empty(&["prefix", "role", "count", "limit", "labels"])
+    }
+
+    fn labels_requested(&self) -> bool {
+        self.labels
+    }
+
+    // No `work_class`: every shape of this operation is ordinary. A page is
+    // bounded by `limit`, and so is label hydration over its rows. The count is
+    // bounded by the bundle's predicate count instead — deduplicating `any`
+    // probes each predicate matching the prefix against the other sections — but
+    // that is a published number in the hundreds, and it measures 0.36 ms where
+    // an ordinary page of the same operation costs 18 ms. Classing the cheapest
+    // request in the operation as heavy priced the shape of the bound rather
+    // than the work, which is the mistake `WorkClass` now warns about.
+}
+
 // ---------------------------------------------------------------------------
 // Shared parameter reading
 // ---------------------------------------------------------------------------
@@ -2959,6 +3170,7 @@ const SCHEMA: &str = "schema";
 const VOID: &str = "void";
 const SUMMARY: &str = "summary";
 const SEARCH: &str = "search";
+const TERMS: &str = "terms";
 const LABELS: &str = "labels";
 
 /// Refuse anything `operation` does not take.
@@ -3259,6 +3471,27 @@ mod tests {
                 .work_class(),
             WorkClass::Heavy
         );
+
+        // Every shape of a dictionary prefix scan is ordinary, the count over
+        // all four sections included: its extra bound is the bundle's predicate
+        // count, which is a published number in the hundreds and measures a
+        // fraction of the page beside it.
+        for query in [
+            "",
+            "prefix=http%3A%2F%2Fexample.org%2F&limit=10000",
+            "count=true",
+            "count=true&role=any",
+            "count=true&role=predicate",
+        ] {
+            let request = Terms::parse(
+                &Terms::normalize_params(&params(query)),
+                limits(),
+                &PredicateRoles::default(),
+                &bundle(),
+            )
+            .unwrap_or_else(|error| panic!("GET /terms?{query}: {error}"));
+            assert_eq!(request.work_class(), WorkClass::Ordinary, "{query}");
+        }
     }
 
     #[test]
