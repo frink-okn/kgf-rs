@@ -1141,11 +1141,19 @@ impl TermScan<'_> {
     /// [`ScanRole::Any`] costs more, because it is the only role that can see
     /// one string twice. The shared, subject-only, and object-only sections
     /// partition their terms by construction, but a predicate may also be stored
-    /// as a subject or an object, so an exact distinct count probes each matching
-    /// predicate against the other covered sections. That is bounded by the
-    /// bundle's predicate count, which its manifest publishes — a few hundred at
-    /// the widest in the corpus this serves, and measured at a fraction of the
-    /// page beside it, so it is a bound worth stating rather than pricing.
+    /// as a subject or an object, so an exact distinct count decodes each
+    /// matching predicate and searches the other covered sections for it: one
+    /// block decode and up to three binary searches per matching predicate.
+    ///
+    /// **Bounded, and the request cannot raise the bound.** The work is
+    /// proportional to the predicates matching the prefix, so the maximum is the
+    /// bundle's whole predicate count — a number its manifest publishes — and it
+    /// is reached by the empty prefix. No prefix can ask for more; a narrower one
+    /// asks for less. Measured: a tenth of a millisecond at 119 matching
+    /// predicates, the widest vocabulary in the corpus this serves, and 33 ms at
+    /// a synthetic 50 000, where one full-sized page of the same operation costs
+    /// 38 ms. That is why the exact answer is kept rather than estimated, and why
+    /// nothing prices this differently from a page.
     pub fn count(&self) -> Result<u64> {
         let mut total = 0u64;
         for section in Section::ALL {
@@ -1159,6 +1167,19 @@ impl TermScan<'_> {
         let Some(predicates) = self.runs[Section::Predicates.slot()].as_ref() else {
             return Ok(total);
         };
+        // A predicate can only repeat a term one of the other three sections
+        // holds, so when none of them has a match under this prefix there is
+        // nothing to deduplicate and no predicate needs looking at. Worth its
+        // own check rather than falling out of the loop: the loop would decode
+        // every matching predicate to search sections that cannot answer, which
+        // on a wide predicate vocabulary is the whole cost of the request.
+        if Section::ALL
+            .into_iter()
+            .filter(|section| *section != Section::Predicates)
+            .all(|section| self.matches(section) == 0)
+        {
+            return Ok(total);
+        }
 
         let mut scratch = Vec::new();
         let mut term = Vec::new();

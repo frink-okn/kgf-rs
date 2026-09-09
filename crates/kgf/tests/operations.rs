@@ -2429,6 +2429,26 @@ fn a_count_refuses_the_parameters_that_describe_a_page() {
         bracketed.to_string().contains("without angle brackets"),
         "{bracketed}"
     );
+
+    // A prefix selects terms, so it is held to the same published ceiling as a
+    // term. Nothing else bounds it: a GET target never reaches the body-size
+    // layer, and this one is hashed into the cursor binding and echoed back.
+    let huge = "a".repeat(BUDGETS.max_term_bytes as usize + 1);
+    let oversized = served
+        .try_parse_scan(&format!("prefix={huge}"))
+        .expect_err("a prefix over max_term_bytes");
+    assert_eq!(
+        oversized.code(),
+        kgf_server::envelope::ErrorCode::CapExceeded
+    );
+    assert!(
+        oversized.to_string().contains("max_term_bytes"),
+        "{oversized}"
+    );
+    // And one byte under it is accepted, so the check is a ceiling rather than a
+    // guess at what a prefix is for.
+    let largest = "a".repeat(BUDGETS.max_term_bytes as usize);
+    assert!(served.try_parse_scan(&format!("prefix={largest}")).is_ok());
 }
 
 #[test]

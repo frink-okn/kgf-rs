@@ -1894,6 +1894,24 @@ impl Terms {
         // rather than a term in request syntax. Bracketing it is the one mistake
         // worth naming, since it silently matches nothing.
         let prefix = params.get("prefix").unwrap_or_default();
+        // `max_term_bytes`, for the same reason every other term-valued
+        // parameter is held to it: a prefix of a stored term cannot usefully be
+        // longer than the terms it selects, and this one is hashed into the
+        // cursor binding, copied to build its successor, compared against every
+        // block head a search touches, and echoed in the response. A GET target
+        // never meets the body-size layer, so without this the only ceiling is
+        // whatever the HTTP stack happens to allow, which is not a published
+        // number a client can size a request by.
+        let max = limits.budgets.max_term_bytes;
+        if prefix.len() as u64 > max {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "`prefix` is {} bytes, over this server's max_term_bytes of {max}",
+                    prefix.len()
+                ),
+            ));
+        }
         if prefix.starts_with('<') {
             return Err(Problem::new(
                 ErrorCode::BadTermSyntax,

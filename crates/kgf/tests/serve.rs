@@ -2831,18 +2831,22 @@ fn an_operation_whose_artifact_a_bundle_lacks_is_refused_before_it_is_opened() {
 #[test]
 fn an_operation_needing_no_sidecar_is_not_gated_on_its_declaration() {
     // The other half of the rule. `sample`, `labels`, and `terms` compose the
-    // artifacts every bundle is required to carry, so their capability entries
-    // restate "yes, always" and nothing published can fail to answer them. A
-    // manifest that omits one is out of date — `kgf manifest --check` says so —
-    // and out-of-date metadata must not be able to withdraw work the bytes
-    // support, which is the failure a gate here would cause and cannot prevent.
+    // artifacts every bundle is required to carry, so nothing published can fail
+    // to answer them. A manifest that omits one is therefore not a bundle that
+    // cannot serve it, and out-of-date metadata must not be able to withdraw
+    // work the bytes support — the failure a gate here would cause and could not
+    // prevent. `terms` is not declared at all, which makes the point twice over.
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
     let manifest = deployment.bundle("tox", "v1").join("manifest.json");
     let mut document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
     let capabilities = document["capabilities"].as_object_mut().unwrap();
-    for capability in ["sample", "labels", "terms"] {
+    assert!(
+        !capabilities.contains_key("terms"),
+        "a bundle cannot honestly declare a capability half of which it cannot answer"
+    );
+    for capability in ["sample", "labels"] {
         assert!(
             capabilities.remove(capability).is_some(),
             "a core bundle declares {capability}"

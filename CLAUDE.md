@@ -69,7 +69,8 @@ implementation now extends past M1 with bindings QUERY (§3.4.2) and the complet
 description surface, closing that gap. Present and *not* in M1: `/sample`, `o.text`,
 and `/terms`, all optional capabilities. `/terms` is only half of §3.4.8: the prefix
 scan needs no artifact, while key resolution needs a derived key-to-id index no bundle
-carries, so QUERY on that route is a 405 (`plan.md` question 67).
+carries, so QUERY on that route is a 405 and no manifest declares the capability —
+declaring one commits to its full contract, methods included (`plan.md` question 67).
 
 `/terms` pages the sorted dictionary under a byte prefix, or with `count=true` returns
 the exact number of distinct terms matching it from two binary searches — the cheapest
@@ -94,7 +95,7 @@ than forcing those resources into the default JSON representation.
 returning a plausible wrong answer. Do not replace one with a stub that returns a
 default.
 
-**`notes/plan.md` is the implementation route** — units 1–28, all complete, through
+**`notes/plan.md` is the implementation route** — units 1–29, all complete, through
 doc 20 §20.8's M1, search, bindings, the description surface, the bundle builder,
 request logging, serving under a path prefix, the dedicated `/tpf` route, the
 admission policy, the dictionary prefix scan, and the capability gate, plus the
@@ -201,6 +202,9 @@ quietly.
    bundle is required to carry, so a check could only suppress work the bytes support
    because the metadata is older than the code. What the *bundle carries* is the
    manifest's statement; what this *deployment routes* is the service descriptor's.
+   `terms` goes one step further and is not declared at all: the name covers a key
+   resolution no bundle can answer, and declaring a capability commits to its full
+   contract, methods included.
 
 ## The hdtc dependency
 

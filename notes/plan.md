@@ -17,14 +17,14 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–28 are complete: all of M1 plus `o.text`, bindings, entity search,
+Units 1–29 are complete: all of M1 plus `o.text`, bindings, entity search,
 live labels, the browser workbench, the mandatory description surface, standard RDF
 serialization, stock Comunica TPF/brTPF interoperability, the bundle builder,
 structured request logging, public-base mounting, the dedicated `/tpf` route, an
 admission policy measured against the work it classes, the sorted dictionary as an
 operation, a capability gate that fires only where an artifact can be absent, and a
-prefix count that reports every position it was measured cheap enough to report. Each
-completed unit
+prefix count that reports every position it was measured cheap enough to report, and
+the review findings that measurement settled. Each completed unit
 carries a **What landed** section written after the fact, which is where a unit's plan
 and its outcome are reconciled.
 
@@ -2004,6 +2004,79 @@ breakdown against the dictionary; a fixture whose positions add up to more than 
 distinct total, so a regression to summing would fail; and the work-class test extended
 over five `/terms` shapes, all ordinary.
 
+### 29. Three review findings, and what measurement did to them ✅
+
+**Implemented 2026-09-09, from an agent code review of units 26–28.** All three were real;
+one reversed the reviewer's remedy, one reversed a decision of unit 26, and one was
+simply a gap.
+
+**The `any` count is bounded, and stays exact.** The finding was that deduplicating
+`role=any` loops over every matching predicate with no cap, against a normative
+`O(log D + limit)`, and could monopolise an ordinary admission slot. Two facts had to be
+established rather than argued. First, unit 28 had made it *worse* than the review
+described: adding the page's exact cardinality put the loop on the default page path,
+since `role` defaults to `any`. Second, the extrapolated cost was wrong, so a synthetic
+bundle settled it — 5 000 and 50 000 distinct predicates, none of them also a subject or
+object, so no probe short-circuits:
+
+| bundle | predicates | `count` any | `count` subject | page 100 | page 10 000 | `/fragment` 10 000 |
+|---|---:|---:|---:|---:|---:|---:|
+| p5k | 5 000 | 3.1 ms | 3.1 ms | 3.2 ms | 8.6 ms | 7.7 ms |
+| p50k | 50 000 | 33.4 ms | 33.2 ms | 33.2 ms | 38.6 ms | 8.5 ms |
+
+The corpus this serves peaks at 119 predicates, where the same work is a tenth of a
+millisecond. So the worst case is a synthetic vocabulary two orders of magnitude wider
+than anything real, costing about what one full-sized page of the same operation costs.
+
+The argument that decided it is that **the request cannot amplify the cost**. The empty
+prefix is the maximum and the maximum is a per-version constant the manifest publishes;
+a narrower prefix asks for less. That is categorically unlike `candidate_budget` work,
+where the query text decides how much scanning happens. Bounded cost is the project's
+thesis, and a fixed per-bundle ceiling of tens of milliseconds meets it. Estimating
+`any` instead would have been cheap — the error is at most the matching predicate count,
+observed as 1 in 28 841 — but exactness is the operation's whole point, and there was no
+cost that justified giving it up.
+
+What the measurement *did* buy was a skip the code was missing. A predicate can only
+repeat a term one of the other three sections holds, so when none of them matches the
+prefix there is nothing to deduplicate — and the old loop decoded every matching
+predicate anyway to search sections that could not answer. That case went from 4.6 ms to
+0.3 ms, and it is why every prefix narrower than "matches most predicates *and* something
+else" is now flat. The prices above are unchanged by it, because the empty prefix
+populates every section.
+
+Also noted and left alone: the breakdown means `role=predicate&count=true` pays the `any`
+deduplication too, since one `term_counts` produces all four numbers. That is inherent to
+returning the breakdown always, which was unit 28's point, and it is a tenth of a
+millisecond at real scale.
+
+**A bundle cannot declare `terms`.** The capability names two operations — the prefix scan,
+which needs no sidecar, and key resolution, which needs a key-to-id index no bundle
+carries — and declaring a capability commits to its full contract, methods included. Unit
+26 bent the definition instead, scoping `Capability::Terms` to the prefix half in its own
+documentation. What made the honest answer cheap was unit 27, which came afterwards: with
+the route no longer gated on the declaration, *not declaring it costs nothing*. The route
+answers regardless, the descriptor advertises it, the forms offer it. So `capabilities_for`
+no longer derives it, and the variant remains only because the name is protocol vocabulary
+a manifest written elsewhere may use — `kgf manifest --check` reports such a declaration as
+one the artifacts do not support, which is exactly what it is.
+
+The same "bundle-invariant, therefore uninformative" reasoning applies to `sample` and
+`labels`, but their contracts are met in full, so there is no defect to fix and they stay.
+Whether a capability that is true of every bundle belongs in the vocabulary at all is a
+question for the design documents rather than a change to make here.
+
+**`prefix` is held to `max_term_bytes`.** Every other term-valued parameter is, and this
+one was not: it is hashed into the cursor binding, copied to build its successor, compared
+against every block head a search touches, and echoed in the response. A GET target never
+reaches the body-size layer, so the only ceiling was whatever the HTTP stack happened to
+allow — not a published number a client can size a request by.
+
+*Verified by* the store's role-breakdown and paging tests over the amended count, a
+request-layer test that the largest permitted prefix is accepted and one byte more is
+`cap_exceeded`, the capability-gate pair rewritten around a `terms` that is no longer
+declared, and the two stress bundles above driven through a real listener.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
@@ -2888,14 +2961,16 @@ following the code.
     public-deployment evaluation in `../kgf-sparql` and implementation review.
 67. **§3.4.8's `terms` capability covers two operations, and only one of them can be
     declared from a bundle's bytes.** The prefix scan and its count need nothing beyond
-    the sorted dictionary every bundle carries, so unit 26 derives `terms` for every
-    release. Key resolution needs the derived key-to-id index §3.4.8 itself describes,
-    which no bundle carries and which doc 07 §7.5 item 19 has not yet decided is
-    mandatory. One capability name therefore cannot mean both without a client that reads
-    `terms` from a manifest being wrong about half of it. The proposal is to let `terms`
-    mean the prefix scan and gate key resolution on `keysets` — the capability it exists
-    to complete, and the one whose artifacts imply the index — rather than mint a third
-    name. Meanwhile QUERY on the route is a plain 405 with `Allow`.
+    the sorted dictionary every bundle carries. Key resolution needs the derived
+    key-to-id index §3.4.8 itself describes, which no bundle carries and which doc 07
+    §7.5 item 19 has not yet decided is mandatory. One capability name cannot mean both
+    without a client that reads `terms` from a manifest being wrong about half of it, so
+    unit 29 declares it for no bundle at all: the route answers unconditionally (item 8
+    of CLAUDE.md's rules) and QUERY on it is a plain 405 with `Allow`, which is the
+    honest pair. The proposal is to let `terms` mean the prefix scan — declarable by
+    everything, and therefore arguably not worth declaring — and gate key resolution on
+    `keysets`, the capability it exists to complete and the one whose artifacts imply the
+    index, rather than mint a third name.
 68. **§3.4.8's `O(log D)` count holds per role; `role=any` carries one more term.** The
     shared, subject-only, and object-only sections partition their terms, so those counts
     are arithmetic on the two bracketing searches. Predicates are the one section whose
@@ -2903,11 +2978,15 @@ following the code.
     matching predicate against the rest: `O(P·log D)` where `P` is the bundle's published
     predicate count. §3.4.8's "regardless of how many terms match" is still true — the
     bound is in the schema, not the match set — and §3.5's `terms` row should carry the
-    extra term rather than leave the reading to a server. It should *not* imply a cost
-    class: unit 28 measured that term at a tenth of a millisecond against the corpus's
-    widest predicate set, where an ordinary page of the same operation costs fifty times
-    the whole request. The alternative, an estimate for `any`, is worse still: the whole
-    point of the operation is that the number is exact.
+    extra term rather than leave the reading to a server, with the sentence that makes it
+    harmless: **a request cannot raise it.** The empty prefix is the maximum, the maximum
+    is a per-version constant the manifest publishes, and a narrower prefix asks for
+    less, which is what separates this from the budgeted operations §3.5 caps. It should
+    not imply a cost class either: unit 29 measured a tenth of a millisecond at the
+    corpus's widest vocabulary and 33 ms at a synthetic 50 000 predicates, against 38 ms
+    for one full-sized page of the same operation. The alternative, an estimate for
+    `any`, was cheap and rejected — the error is at most `P`, observed as 1 in 28 841 —
+    because an exact count is the operation's whole point.
 69. **`role=any` needs a stated meaning, and a row can afford to say more than doc 03
     asks.** §3.4.8 lists `any` among the roles without saying whether a term occupying
     several positions is one row or several. Unit 26 answers one row, because a merge that
@@ -2940,6 +3019,16 @@ following the code.
     unreadable without labels, so it was the operation least able to wait. The remaining
     gap is item 35's, and `/terms` is now the worked example of what the uniform answer
     looks like — the label weighed into `max_response_bytes` with the row it belongs to.
+
+72. **§3.4.8's `prefix` needs a stated ceiling, and §3.3's term budget is the one to
+    name.** `prefix` is a byte prefix rather than a term (question 10), which left it
+    outside the `max_term_bytes` §3.3 applies to every term-valued parameter — and
+    outside `max_request_bytes` too, since a GET target never reaches a body-size layer.
+    Unit 29 holds it to `max_term_bytes` on the reasoning that a prefix of a stored term
+    cannot usefully exceed the terms it selects, and that a published cap a server does
+    not apply is worse than none, because a client sizes its requests by it. Doc 03
+    should say which cap governs it rather than leaving the answer to whatever an HTTP
+    stack happens to allow.
 
 ## Not in this plan
 
