@@ -969,7 +969,8 @@ fn capability_gate(release: &Release, capability: Capability) -> Result<(), Prob
     Err(Problem::new(
         ErrorCode::CapabilityNotAvailable,
         format!(
-            "this bundle does not declare the `{}` capability;              its manifest lists the ones it does",
+            "this bundle does not declare the `{}` capability; \
+             its manifest lists the ones it does",
             capability.as_str()
         ),
     ))
@@ -983,7 +984,8 @@ fn declares_search(release: &Release, wanted: bool) -> Result<(), Problem> {
     if wanted && !release.declares(Capability::Search) {
         return Err(Problem::new(
             ErrorCode::CapabilityNotAvailable,
-            "`o.text` needs the `search` capability, which this bundle does not declare;              its manifest lists the ones it does",
+            "`o.text` needs the `search` capability, which this bundle does not \
+             declare; its manifest lists the ones it does",
         ));
     }
     Ok(())

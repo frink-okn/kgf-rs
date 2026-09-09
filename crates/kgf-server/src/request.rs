@@ -498,7 +498,8 @@ impl TextFilter {
             return Err(Problem::new(
                 ErrorCode::MalformedRequest,
                 format!(
-                    "`o={}` and `o.text` both constrain the object; bind the term or                      search for it, not both",
+                    "`o={}` and `o.text` both constrain the object; bind the term \
+                     or search for it, not both",
                     reflected(bound.requested())
                 ),
             ));

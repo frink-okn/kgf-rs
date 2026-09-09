@@ -2109,7 +2109,6 @@ impl Terms {
     }
 }
 
-/// Every term of a role, plus the variable.
 /// Every stored term the four sections hold, keyed by its stored spelling —
 /// which is the order a scan emits them in — and carrying the spelling a
 /// response publishes it under, plus the roles it occupies.
@@ -2541,6 +2540,7 @@ fn a_scan_page_links_each_term_to_the_request_that_uses_it() {
     }
 }
 
+/// Every term of a role, plus the variable.
 fn options(terms: &Terms, role: Role) -> Vec<Option<usize>> {
     std::iter::once(None)
         .chain((0..terms.of(role).len()).map(Some))

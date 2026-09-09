@@ -4291,9 +4291,6 @@ fn resolve_predicate_ids(
         .collect()
 }
 
-/// First predicate in the frozen cascade with a value, then its lowest object
-/// term id. There is intentionally no language axis: this is the release's one
-/// deterministic display label, independent of client locale.
 /// Answer a dictionary prefix scan: a page of terms, or how many there are.
 ///
 /// The dictionary is already sorted, so this needs no artifact a bundle does not
@@ -4305,9 +4302,6 @@ pub fn terms(
     request: &request::Terms,
 ) -> Result<TermsAnswer, Problem> {
     let dictionary = store.dict();
-    let scan = dictionary
-        .terms(request.role, request.prefix.as_bytes())
-        .map_err(|error| unreadable("bracketing a dictionary prefix", &error))?;
 
     if request.count {
         let counts = dictionary
@@ -4325,6 +4319,11 @@ pub fn terms(
         }));
     }
 
+    // Below the count, which brackets its own four sections: building this for a
+    // request that returns one number would pay for the whole scan twice.
+    let scan = dictionary
+        .terms(request.role, request.prefix.as_bytes())
+        .map_err(|error| unreadable("bracketing a dictionary prefix", &error))?;
     let cardinality = scan
         .count()
         .map_err(|error| unreadable("counting a dictionary prefix", &error))?;
@@ -4473,6 +4472,9 @@ fn scanned_row(
     Ok(TermRow::new(row_term.published, serialized, roles, label))
 }
 
+/// First predicate in the frozen cascade with a value, then its lowest object
+/// term id. There is intentionally no language axis: this is the release's one
+/// deterministic display label, independent of client locale.
 fn preferred_label(
     store: &Store,
     dictionary: &Dictionary<'_>,
