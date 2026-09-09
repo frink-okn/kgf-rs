@@ -43,7 +43,7 @@ Only the endpoint is set here (`--lakefs-endpoint`).
 
     ./tools/okn-build-config.py dreamkg --build --lakefs \
         --hdt-root /var/kgf/hdt --out-root /var/kgf/bundles \
-        --registry-prefixes --builder-image ghcr.io/frink-okn/kgf:v0.1.3
+        --registry-prefixes --builder-image ghcr.io/frink-okn/kgf:v0.2.0
 
 With no --registry it reads the same URL kace does.
 """
@@ -237,7 +237,9 @@ def lakectl(args: list[str], binary: str, endpoint: str) -> str:
 
 def lakefs_tags(repo: str, binary: str, endpoint: str) -> dict[str, str]:
     """Semver tag -> commit id for `repo`, from `lakectl tag list`."""
-    out = lakectl(["tag", "list", f"lakefs://{repo}", "--amount", "1000"], binary, endpoint)
+    out = lakectl(
+        ["tag", "list", f"lakefs://{repo}", "--amount", "1000"], binary, endpoint
+    )
     tags: dict[str, str] = {}
     for line in out.splitlines():
         parts = line.split()
@@ -255,7 +257,9 @@ def lakefs_release(
         raise RuntimeError(f"{repo}: no semver tags")
     if tag is not None:
         if tag not in tags:
-            raise RuntimeError(f"{repo}: no tag {tag!r} (have {', '.join(sorted(tags))})")
+            raise RuntimeError(
+                f"{repo}: no tag {tag!r} (have {', '.join(sorted(tags))})"
+            )
         return tag, tags[tag]
     latest = max(tags, key=lambda label: semver_key(label) or (0, 0, 0))
     return latest, tags[latest]
@@ -339,12 +343,17 @@ def lakefs_fetch_hdt(
     part = dest.with_name(dest.name + ".part")
     part.unlink(missing_ok=True)
     if downloader == "s5cmd":
-        s5cmd_download(f"s3://{repo}/{tag}/{LAKEFS_HDT_PATH}", part, s5cmd_binary, endpoint)
+        s5cmd_download(
+            f"s3://{repo}/{tag}/{LAKEFS_HDT_PATH}", part, s5cmd_binary, endpoint
+        )
     else:
         lakectl(
             [
-                "fs", "download", "--pre-sign=false",
-                f"lakefs://{repo}/{tag}/{LAKEFS_HDT_PATH}", str(part),
+                "fs",
+                "download",
+                "--pre-sign=false",
+                f"lakefs://{repo}/{tag}/{LAKEFS_HDT_PATH}",
+                str(part),
             ],
             lakectl_binary,
             endpoint,
@@ -359,7 +368,9 @@ def resolve_prefix_table(spec: str) -> Path:
         return Path(spec)
     with urllib.request.urlopen(spec) as response:  # noqa: S310 — fixed scheme
         data = response.read()
-    handle = tempfile.NamedTemporaryFile(prefix="prefixes-", suffix=".yaml", delete=False)
+    handle = tempfile.NamedTemporaryFile(
+        prefix="prefixes-", suffix=".yaml", delete=False
+    )
     with handle:
         handle.write(data)
     return Path(handle.name)
@@ -386,11 +397,16 @@ def build(
     instead. The builder verifies the input's digest itself either way.
     """
     command = [
-        kgf, "build",
-        "--config", "-",
-        "--out", str(out),
-        "--hdt", str(hdt),
-        "--source-url", source_url or hdt.resolve().as_uri(),
+        kgf,
+        "build",
+        "--config",
+        "-",
+        "--out",
+        str(out),
+        "--hdt",
+        str(hdt),
+        "--source-url",
+        source_url or hdt.resolve().as_uri(),
     ]
     if builder_image:
         command += ["--builder-image", builder_image]
@@ -441,7 +457,9 @@ def main() -> int:
         type=Path,
         help="find HDTs as {root}/{shortname}/{version}/data.hdt",
     )
-    parser.add_argument("--out-root", type=Path, help="publish into {root}/{id}/{version}")
+    parser.add_argument(
+        "--out-root", type=Path, help="publish into {root}/{id}/{version}"
+    )
     parser.add_argument("--hdtc", help="the hdtc binary kgf build should use")
     parser.add_argument(
         "--prefix-table",
@@ -478,9 +496,15 @@ def main() -> int:
         help="with --build: fetch each KG's tagged HDT from lakeFS into --hdt-root "
         "and record the commit-pinned lakefs:// URL as the source",
     )
-    parser.add_argument("--tag", help="with --lakefs: build this tag instead of the latest")
-    parser.add_argument("--lakefs-endpoint", default=LAKEFS_ENDPOINT, help="lakeFS server URL")
-    parser.add_argument("--lakectl", default="lakectl", help="the lakectl binary (tags)")
+    parser.add_argument(
+        "--tag", help="with --lakefs: build this tag instead of the latest"
+    )
+    parser.add_argument(
+        "--lakefs-endpoint", default=LAKEFS_ENDPOINT, help="lakeFS server URL"
+    )
+    parser.add_argument(
+        "--lakectl", default="lakectl", help="the lakectl binary (tags)"
+    )
     parser.add_argument(
         "--downloader",
         choices=("s5cmd", "lakectl"),
@@ -496,7 +520,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--builder-image",
-        help="image reference to record in the manifest, e.g. ghcr.io/frink-okn/kgf:v0.1.3",
+        help="image reference to record in the manifest, e.g. ghcr.io/frink-okn/kgf:v0.2.0",
     )
     parser.add_argument(
         "--check",
@@ -556,7 +580,9 @@ def main() -> int:
             "temp_dir": str(args.temp_dir) if args.temp_dir else None,
             "threads": args.threads,
         }
-        resources = {key: value for key, value in resources.items() if value is not None}
+        resources = {
+            key: value for key, value in resources.items() if value is not None
+        }
         if resources:
             config.setdefault("resources", {}).update(resources)
 
@@ -570,11 +596,18 @@ def main() -> int:
                     print(f"{shortname:<28} skipped (no lakefs-repo in the registry)")
                     continue
                 try:
-                    tag, commit = lakefs_release(repo, args.tag, args.lakectl, args.lakefs_endpoint)
+                    tag, commit = lakefs_release(
+                        repo, args.tag, args.lakectl, args.lakefs_endpoint
+                    )
                     hdt = args.hdt_root / shortname / tag / "data.hdt"
                     if lakefs_fetch_hdt(
-                        repo, tag, hdt, args.lakefs_endpoint,
-                        args.downloader, args.lakectl, args.s5cmd,
+                        repo,
+                        tag,
+                        hdt,
+                        args.lakefs_endpoint,
+                        args.downloader,
+                        args.lakectl,
+                        args.s5cmd,
                     ):
                         print(f"{shortname:<28} fetched {repo}@{tag} -> {hdt}")
                 except RuntimeError as error:
@@ -599,8 +632,13 @@ def main() -> int:
                 print(f"{shortname:<28} exists   {out}")
                 continue
             ok, detail = build(
-                config, hdt, out, args.kgf, args.hdtc,
-                source_url=source_url, builder_image=args.builder_image,
+                config,
+                hdt,
+                out,
+                args.kgf,
+                args.hdtc,
+                source_url=source_url,
+                builder_image=args.builder_image,
             )
             print(f"{shortname:<28} {'built ' + str(out) if ok else 'FAILED'}")
             if not ok:
