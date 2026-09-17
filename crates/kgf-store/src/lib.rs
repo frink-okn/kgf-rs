@@ -47,6 +47,7 @@ pub mod catalog;
 pub mod description;
 pub mod dict;
 pub mod error;
+pub mod graphs;
 pub mod hdt;
 mod indexed;
 pub mod manifest;
@@ -72,6 +73,7 @@ pub use description::{
     verify_description_artifacts,
 };
 pub use error::{Error, Result};
+pub use graphs::{GraphFacts, GraphId, Graphs, UNION_GRAPH_IRI, UNNAMED_GRAPH_IRI};
 pub use manifest::{BundleFacts, Capability, Manifest, ManifestDocument};
 pub use map::{PublishedBundle, PublishedRoot};
 pub use store::{OpenOptions, Store};

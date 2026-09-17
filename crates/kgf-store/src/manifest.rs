@@ -233,7 +233,7 @@ impl BundleFacts {
         let perm = open_published(bundle, &artifacts.perm)?;
         let data = IndexedHdt::open(hdt, perm)?;
 
-        artifacts.verify_graph_index()?;
+        let _graphs = artifacts.open_graphs(bundle)?;
         let _description = artifacts.open_description(bundle)?;
         // A manifest must not describe an optional capability whose complete
         // artifact cannot be opened. Reading only hdtc-text.meta would accept

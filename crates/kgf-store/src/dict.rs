@@ -376,6 +376,33 @@ impl PfcLayout {
         &self.buffer
     }
 
+    /// The zero-based position of `key` in this section, if the section holds
+    /// it.
+    ///
+    /// For a section read on its own rather than as one of the dictionary's
+    /// four — the graph sidecar's dictionary is one such section. Positions
+    /// rather than ids, because what an id means is the caller's: the graph
+    /// dictionary numbers its terms from one, and offsets from there.
+    pub(crate) fn position_of(&self, mapping: &Mapping, key: &[u8]) -> Result<Option<u64>> {
+        let mut scratch = Vec::new();
+        let found = self.view(mapping).search(key, &mut scratch)?;
+        Ok(found.equal.then_some(found.position))
+    }
+
+    /// The term at a zero-based position of this section.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `position >= terms()`.
+    pub(crate) fn term_at<'b>(
+        &self,
+        mapping: &Mapping,
+        position: u64,
+        buf: &'b mut Vec<u8>,
+    ) -> Result<&'b [u8]> {
+        self.view(mapping).extract_position(position, buf)
+    }
+
     /// Project this validated layout onto its HDT mapping.
     fn view<'a>(&self, mapping: &'a Mapping) -> PfcView<'a> {
         PfcView {

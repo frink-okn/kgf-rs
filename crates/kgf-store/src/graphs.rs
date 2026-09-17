@@ -1,0 +1,1490 @@
+//! Named-graph memberships: the mapped `data.hdt.graphs` sidecar and its
+//! derived `data.hdt.graphs.idx`.
+//!
+//! `data.hdt` is the deduplicated union of every graph, and this pair records
+//! which graphs each triple belongs to. The sidecar keeps one **layer** per
+//! graph — the set of SPO positions the graph contains, with rank and select
+//! over it — keyed by graph id, where id 0 is the **unnamed graph** (the
+//! statements that carried no graph in the source) and ids `1..=G` are the
+//! named graphs in the sorted order of the sidecar's own dictionary. The index
+//! re-keys the same layers to POS and OPS positions, so a pattern that is
+//! contiguous in one of those permutations can be scoped in its native
+//! position space, and optionally carries a transpose — for each SPO position,
+//! its graph ids — for the quad view's `g` column.
+//!
+//! # What is read at open, and what is not
+//!
+//! Open reads the two headers, checks each file's binding to the HDT and the
+//! index's binding to the sidecar, locates the graph dictionary and the layer
+//! directories as validated specs, and binds the transpose when present.
+//! Nothing proportional to the graph count is read: a bundle may carry
+//! thousands of graphs, and its layer entries, chunk directories, and
+//! Elias–Fano headers are decoded on first touch. That is why every layer
+//! operation returns a [`Result`] — the structure it walks was not validated
+//! when the bundle opened, and a malformed entry is reported as such rather
+//! than trusted.
+//!
+//! # One reader for three files' worth of layers
+//!
+//! A layer set inside the index has exactly the sidecar's layout, so
+//! [`LayerSet`] is parameterised by the file and the directory offset and
+//! nothing else; which permutation supplies a position is the caller's
+//! business ([`Permutation`]). Each layer is one of three encodings, and
+//! [`Layer`] presents the same five operations over all of them: `count`,
+//! `rank`, `select`, `access`, and `next_member`.
+//!
+//! # Two reserved names
+//!
+//! [`UNION_GRAPH_IRI`] names the union and [`UNNAMED_GRAPH_IRI`] the unnamed
+//! graph, everywhere in the API. Neither is a dictionary term: a build refuses
+//! source quads that use them, and [`Graphs::open`] refuses a sidecar whose
+//! dictionary holds either, so [`Graphs::resolve`] can answer the unnamed
+//! constant before consulting the dictionary and the union constant never
+//! reaches it.
+//!
+//! # Byte formats
+//!
+//! hdtc's `docs/graphs-sidecar-format.md` and `docs/graphs-index-format.md`
+//! are normative. Record decoding is hdtc's ([`GraphLayerEntry::parse`],
+//! [`GraphChunkEntry::parse`], [`EliasFanoHeader::parse`]); this module
+//! addresses records and interprets their payloads.
+
+use std::io::{Cursor, Seek, SeekFrom};
+use std::ops::Range;
+use std::path::Path;
+
+use hdtc::format::{
+    ELIAS_FANO_HEADER_SIZE, ELIAS_FANO_SUBBLOCK_BITS, ELIAS_FANO_SUPERBLOCK_BITS, EliasFanoHeader,
+    GRAPH_ARRAY_CONTAINER_MAX, GRAPH_BITMAP_CONTAINER_BYTES, GRAPH_BITMAP_CONTAINER_SUBBLOCK_BITS,
+    GRAPH_BITMAP_CONTAINER_SUBRANK_BYTES, GRAPH_CHUNK_ENTRY_SIZE, GRAPH_LAYER_ENTRY_SIZE,
+    GRAPH_POSITION_CHUNK_SHIFT, GraphChunkContainer, GraphChunkEntry, GraphIndex,
+    GraphIndexOpenError, GraphIndexSectionKind, GraphLayerEncoding, GraphLayerEntry,
+    GraphSidecarDirectory,
+};
+
+use crate::dict::PfcLayout;
+use crate::error::{Error, Result};
+use crate::map::{BitmapSpec, BitmapView, BytesSpec, Mapping, PackedArray, PackedSpec};
+use crate::pattern::Permutation;
+use crate::rank::{RankedBitmap, RankedSpec};
+
+/// The reserved name of the union of every graph — what an unscoped request
+/// reads. Accepted as a graph selector on every release and never a layer.
+pub const UNION_GRAPH_IRI: &str = "urn:x-kgf:union";
+
+/// The reserved name of the unnamed graph: the statements that carried no
+/// graph in the source, held as layer 0. Accepted as a graph selector on every
+/// release; on a bundle without memberships it selects every triple, since
+/// every triple of such a bundle is unnamed.
+pub const UNNAMED_GRAPH_IRI: &str = "urn:x-kgf:unnamed";
+
+/// A membership layer: 0 for the unnamed graph, `1..=G` for the named graphs
+/// in the sorted order of the sidecar's dictionary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GraphId(pub u64);
+
+impl GraphId {
+    /// The unnamed graph's layer.
+    pub const UNNAMED: GraphId = GraphId(0);
+
+    /// Whether this is the unnamed graph.
+    pub fn is_unnamed(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// Per-bundle membership facts, from the two headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphFacts {
+    /// `N`, the triples of the union.
+    pub triples: u64,
+    /// `G`, the named graphs.
+    pub named_graphs: u64,
+    /// `M`, memberships summed over every layer; at least `N`.
+    pub memberships: u64,
+}
+
+/// The mapped sidecar and index of one bundle, with specs validated at open.
+#[derive(Debug)]
+pub struct Graphs {
+    sidecar: Mapping,
+    index: Mapping,
+    facts: GraphFacts,
+    dictionary: PfcLayout,
+    spo: LayerSetSpec,
+    pos: LayerSetSpec,
+    ops: LayerSetSpec,
+    transpose: Option<TransposeSpec>,
+}
+
+/// Where a layer set's directory lives.
+#[derive(Debug, Clone, Copy)]
+struct LayerSetSpec {
+    directory: BytesSpec,
+}
+
+/// The SPO transpose: `BitmapG` with its rank directory, and `ArrayG` when the
+/// index carries graph ids as well as run boundaries.
+#[derive(Debug, Clone, Copy)]
+struct TransposeSpec {
+    bitmap: RankedSpec,
+    ids: Option<PackedSpec>,
+}
+
+impl Graphs {
+    /// Bind a mapped sidecar and index to the HDT at `hdt`.
+    ///
+    /// hdtc parses both headers and checks the cheap bindings — each file's
+    /// recorded suffix length, triple count, and digest fields against the
+    /// HDT's and each other's. Full digests stay off the open path, where
+    /// every other sidecar keeps them.
+    ///
+    /// Refuses an index without both POS and OPS layer sets: the three
+    /// index-side patterns would otherwise need a per-candidate probe this
+    /// crate does not implement. Refuses a sidecar whose dictionary holds a
+    /// reserved graph name, because both names have fixed meanings that a
+    /// stored layer could only contradict.
+    pub fn open(hdt: &Path, sidecar: Mapping, index: Mapping) -> Result<Self> {
+        let header = *GraphSidecarDirectory::read(sidecar.path(), hdt)
+            .map_err(|error| classify_sidecar_error(error, sidecar.path(), hdt))?
+            .header();
+
+        let directory = GraphIndex::directory(index.path(), hdt).map_err(|error| match error {
+            GraphIndexOpenError::Binding { source } => Error::ArtifactBindingMismatch {
+                artifact: index.path().to_path_buf(),
+                hdt: hdt.to_path_buf(),
+                detail: format!("{source:#}"),
+            },
+            GraphIndexOpenError::Index { source } => Error::Format(
+                source.context(format!("opening graph index {}", index.path().display())),
+            ),
+            GraphIndexOpenError::Source { source } => {
+                Error::Format(source.context(format!("validating source HDT {}", hdt.display())))
+            }
+            GraphIndexOpenError::Sidecar { source } => Error::Format(source.context(format!(
+                "opening graph sidecar {}",
+                sidecar.path().display()
+            ))),
+        })?;
+        let index_header = directory.header();
+        for (present, space) in [
+            (index_header.has_pos_layers(), "pos"),
+            (index_header.has_ops_layers(), "ops"),
+        ] {
+            if !present {
+                return Err(Error::MissingRequiredArtifact {
+                    bundle: index
+                        .path()
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default(),
+                    artifact: format!(
+                        "{} with the {space} layer set",
+                        index
+                            .path()
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    ),
+                    remedy: format!("hdtc graphs-index {} --positions pos,ops", hdt.display()),
+                });
+            }
+        }
+
+        let facts = GraphFacts {
+            triples: header.triples,
+            named_graphs: header.named_graphs,
+            memberships: header.memberships,
+        };
+
+        let dictionary = {
+            let mut cursor = Cursor::new(sidecar.as_bytes());
+            cursor
+                .seek(SeekFrom::Start(header.dictionary_offset))
+                .map_err(|error| malformed(&sidecar, format!("{error}")))?;
+            let section = hdtc::format::scan_pfc_section(&mut cursor, "graph dictionary")
+                .map_err(|error| malformed(&sidecar, format!("{error:#}")))?;
+            if section.string_count != facts.named_graphs {
+                return Err(malformed(
+                    &sidecar,
+                    format!(
+                        "graph dictionary holds {} terms for {} named graphs",
+                        section.string_count, facts.named_graphs
+                    ),
+                ));
+            }
+            with_artifact(&sidecar, PfcLayout::locate(&sidecar, &section))?
+        };
+
+        let layers = facts
+            .named_graphs
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(GRAPH_LAYER_ENTRY_SIZE as u64))
+            .ok_or_else(|| malformed(&sidecar, "layer directory length overflows".to_owned()))?;
+        let spo = LayerSetSpec {
+            directory: with_artifact(
+                &sidecar,
+                BytesSpec::new(&sidecar, header.directory_offset, layers),
+            )?,
+        };
+        let layer_set = |kind: GraphIndexSectionKind| -> Result<LayerSetSpec> {
+            let section = directory
+                .section(kind)
+                .ok_or_else(|| malformed(&index, format!("missing {kind:?} section")))?;
+            Ok(LayerSetSpec {
+                directory: with_artifact(&index, BytesSpec::new(&index, section.offset, layers))?,
+            })
+        };
+        let pos = layer_set(GraphIndexSectionKind::PosLayerDirectory)?;
+        let ops = layer_set(GraphIndexSectionKind::OpsLayerDirectory)?;
+
+        let transpose = if index_header.has_membership_ranks() {
+            let section = |kind: GraphIndexSectionKind| {
+                directory
+                    .section(kind)
+                    .ok_or_else(|| malformed(&index, format!("missing {kind:?} section")))
+            };
+            let bitmap = section(GraphIndexSectionKind::TransposeBitmap)?;
+            let superrank = section(GraphIndexSectionKind::TransposeSuperrank)?;
+            let subrank = section(GraphIndexSectionKind::TransposeSubrank)?;
+            let bitmap = with_artifact(
+                &index,
+                RankedSpec::new(
+                    BitmapSpec::new(&index, bitmap.offset, bitmap.entry_count)?,
+                    PackedSpec::new(
+                        &index,
+                        superrank.offset,
+                        superrank.entry_count,
+                        superrank.bits_per_entry,
+                    )?,
+                    PackedSpec::new(
+                        &index,
+                        subrank.offset,
+                        subrank.entry_count,
+                        subrank.bits_per_entry,
+                    )?,
+                    index_header.superblock_bits(),
+                    index_header.subblock_bits(),
+                ),
+            )?;
+            let ids = if index_header.has_membership_ids() {
+                let array = section(GraphIndexSectionKind::TransposeArray)?;
+                Some(with_artifact(
+                    &index,
+                    PackedSpec::new(
+                        &index,
+                        array.offset,
+                        array.entry_count,
+                        array.bits_per_entry,
+                    ),
+                )?)
+            } else {
+                None
+            };
+            Some(TransposeSpec { bitmap, ids })
+        } else {
+            None
+        };
+
+        let graphs = Self {
+            sidecar,
+            index,
+            facts,
+            dictionary,
+            spo,
+            pos,
+            ops,
+            transpose,
+        };
+        for reserved in [UNION_GRAPH_IRI, UNNAMED_GRAPH_IRI] {
+            if graphs.named_graph_id(reserved.as_bytes())?.is_some() {
+                return Err(malformed(
+                    &graphs.sidecar,
+                    format!(
+                        "the graph dictionary names {reserved}, which is reserved for the \
+                         graph selector and can never be a stored graph"
+                    ),
+                ));
+            }
+        }
+        Ok(graphs)
+    }
+
+    /// Triples, named graphs, and memberships.
+    pub fn facts(&self) -> GraphFacts {
+        self.facts
+    }
+
+    /// Whether the index carries the SPO transpose's run boundaries, which
+    /// make quad-view cardinality two selects rather than one rank per layer.
+    pub fn has_transpose(&self) -> bool {
+        self.transpose.is_some()
+    }
+
+    /// Whether the transpose also carries graph ids, which make the graph
+    /// column an array read rather than a probe of every layer.
+    pub fn has_transpose_ids(&self) -> bool {
+        self.transpose
+            .is_some_and(|transpose| transpose.ids.is_some())
+    }
+
+    /// The layer a graph selector names, resolving the unnamed constant
+    /// before the dictionary. `None` for a name this bundle does not hold.
+    ///
+    /// The union constant is not a layer and is refused by construction: a
+    /// caller selects the union by not scoping at all.
+    pub fn resolve(&self, name: &[u8]) -> Result<Option<GraphId>> {
+        if name == UNNAMED_GRAPH_IRI.as_bytes() {
+            return Ok(Some(GraphId::UNNAMED));
+        }
+        if name == UNION_GRAPH_IRI.as_bytes() {
+            return Ok(None);
+        }
+        self.named_graph_id(name)
+    }
+
+    fn named_graph_id(&self, name: &[u8]) -> Result<Option<GraphId>> {
+        Ok(self
+            .dictionary
+            .position_of(&self.sidecar, name)?
+            .map(|position| GraphId(position + 1)))
+    }
+
+    /// The name of a layer, as the sidecar spells it: an IRI without brackets,
+    /// or `_:label` for a graph named by a blank node. Layer 0 is spelled
+    /// [`UNNAMED_GRAPH_IRI`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is beyond the named-graph count.
+    pub fn name<'b>(&self, id: GraphId, buf: &'b mut Vec<u8>) -> Result<&'b [u8]> {
+        if id.is_unnamed() {
+            buf.clear();
+            buf.extend_from_slice(UNNAMED_GRAPH_IRI.as_bytes());
+            return Ok(buf);
+        }
+        assert!(
+            id.0 <= self.facts.named_graphs,
+            "graph id {} out of range for {} named graphs",
+            id.0,
+            self.facts.named_graphs
+        );
+        self.dictionary.term_at(&self.sidecar, id.0 - 1, buf)
+    }
+
+    /// The layer set keyed to `space`'s positions.
+    pub fn layers(&self, space: Permutation) -> LayerSet<'_> {
+        let (file, spec) = match space {
+            Permutation::Spo => (&self.sidecar, self.spo),
+            Permutation::Pos => (&self.index, self.pos),
+            Permutation::Ops => (&self.index, self.ops),
+        };
+        LayerSet {
+            file,
+            directory: spec.directory.view(file),
+            triples: self.facts.triples,
+            named_graphs: self.facts.named_graphs,
+        }
+    }
+
+    /// One layer in one position space.
+    pub fn layer(&self, space: Permutation, id: GraphId) -> Result<Layer<'_>> {
+        self.layers(space).layer(id)
+    }
+
+    /// Members of a layer: `count(g)`, the same in every space.
+    pub fn count(&self, id: GraphId) -> Result<u64> {
+        Ok(self.layers(Permutation::Spo).entry(id)?.member_count)
+    }
+
+    /// The transpose, when the index carries one.
+    fn transpose(&self) -> Option<Transpose<'_>> {
+        self.transpose.map(|spec| Transpose {
+            bitmap: spec.bitmap.view(&self.index, &self.index),
+            ids: spec.ids.map(|ids| ids.view(&self.index)),
+        })
+    }
+
+    /// Prepare to answer per-position questions in `space`: which graphs a
+    /// position has, and how many memberships a position range holds.
+    ///
+    /// Opens every layer of the space once, so a page pays the decoding of
+    /// `G + 1` directory entries once rather than per row. The SPO space
+    /// answers from the transpose instead whenever the index carries it.
+    pub fn memberships(&self, space: Permutation) -> Result<Memberships<'_>> {
+        let transpose = match space {
+            Permutation::Spo => self.transpose(),
+            Permutation::Pos | Permutation::Ops => None,
+        };
+        let set = self.layers(space);
+        let layers = if transpose
+            .as_ref()
+            .is_some_and(|transpose| transpose.ids.is_some())
+        {
+            Vec::new()
+        } else {
+            (0..=self.facts.named_graphs)
+                .map(|id| set.layer(GraphId(id)))
+                .collect::<Result<Vec<_>>>()?
+        };
+        Ok(Memberships {
+            layers,
+            transpose,
+            triples: self.facts.triples,
+        })
+    }
+}
+
+/// The transpose projected onto the index.
+struct Transpose<'a> {
+    bitmap: RankedBitmap<'a>,
+    ids: Option<PackedArray<'a>>,
+}
+
+impl Transpose<'_> {
+    /// The `ArrayG` index at which `position`'s run begins.
+    fn offset(&self, position: u64) -> u64 {
+        if position == 0 {
+            0
+        } else {
+            self.bitmap.select1(position - 1) + 1
+        }
+    }
+}
+
+/// Per-position membership questions over one space, prepared once.
+pub struct Memberships<'a> {
+    layers: Vec<Layer<'a>>,
+    transpose: Option<Transpose<'a>>,
+    triples: u64,
+}
+
+impl Memberships<'_> {
+    /// The graphs containing `position`, ascending, appended to `out`.
+    ///
+    /// An array read per graph with the transpose's ids, else one probe of
+    /// every layer — bounded by the graph count, and amortised over a page by
+    /// the locality of sequential positions.
+    pub fn graphs_of(&self, position: u64, out: &mut Vec<GraphId>) -> Result<()> {
+        assert!(
+            position < self.triples,
+            "position {position} out of range for {} triples",
+            self.triples
+        );
+        if let Some(transpose) = &self.transpose
+            && let Some(ids) = &transpose.ids
+        {
+            let start = transpose.offset(position);
+            let end = transpose.bitmap.select1(position) + 1;
+            out.extend((start..end).map(|ordinal| GraphId(ids.get(ordinal))));
+            return Ok(());
+        }
+        for layer in &self.layers {
+            if layer.access(position)? {
+                out.push(layer.id());
+            }
+        }
+        Ok(())
+    }
+
+    /// Memberships held by the positions in `range`: the quad-view
+    /// cardinality of a pattern contiguous in this space.
+    ///
+    /// Two selects with the transpose, else one rank difference per layer.
+    pub fn in_range(&self, range: Range<u64>) -> Result<u64> {
+        assert!(
+            range.start <= range.end && range.end <= self.triples,
+            "range {}..{} out of range for {} triples",
+            range.start,
+            range.end,
+            self.triples
+        );
+        if let Some(transpose) = &self.transpose {
+            return Ok(transpose.offset(range.end) - transpose.offset(range.start));
+        }
+        let mut total = 0u64;
+        for layer in &self.layers {
+            total += layer.rank(range.end)? - layer.rank(range.start)?;
+        }
+        Ok(total)
+    }
+}
+
+/// The `G + 1` layers of one position space, in one file.
+#[derive(Debug, Clone, Copy)]
+pub struct LayerSet<'a> {
+    file: &'a Mapping,
+    directory: &'a [u8],
+    triples: u64,
+    named_graphs: u64,
+}
+
+impl<'a> LayerSet<'a> {
+    /// The directory entry of a layer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is beyond the named-graph count.
+    fn entry(&self, id: GraphId) -> Result<GraphLayerEntry> {
+        assert!(
+            id.0 <= self.named_graphs,
+            "graph id {} out of range for {} named graphs",
+            id.0,
+            self.named_graphs
+        );
+        let start = (id.0 as usize) * GRAPH_LAYER_ENTRY_SIZE;
+        let bytes: &[u8; GRAPH_LAYER_ENTRY_SIZE] = self.directory
+            [start..start + GRAPH_LAYER_ENTRY_SIZE]
+            .try_into()
+            .expect("the directory spec holds G + 1 whole entries");
+        let entry = GraphLayerEntry::parse(bytes);
+        if entry.flags != 0 {
+            return Err(self.malformed(id, "nonzero layer flags"));
+        }
+        if entry.member_count == 0 {
+            return Ok(entry);
+        }
+        if entry.minimum_position >= entry.maximum_position_exclusive
+            || entry.maximum_position_exclusive > self.triples
+        {
+            return Err(self.malformed(id, "layer range is outside the triple universe"));
+        }
+        Ok(entry)
+    }
+
+    /// Open one layer: decode its directory entry and validate the extent of
+    /// its primary structure against the file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is beyond the named-graph count.
+    pub fn layer(&self, id: GraphId) -> Result<Layer<'a>> {
+        let entry = self.entry(id)?;
+        let file = self.file.as_bytes();
+        let body = if entry.member_count == 0 {
+            LayerBody::Empty
+        } else {
+            match entry.layer_encoding() {
+                Some(GraphLayerEncoding::DenseChunks | GraphLayerEncoding::SparseChunks) => {
+                    let dense = entry.encoding == GraphLayerEncoding::DenseChunks as u32;
+                    let expected = entry
+                        .item_count_a
+                        .checked_mul(GRAPH_CHUNK_ENTRY_SIZE as u64)
+                        .ok_or_else(|| self.malformed(id, "chunk directory length overflows"))?;
+                    if entry.primary_length != expected {
+                        return Err(self.malformed(
+                            id,
+                            "chunk directory length disagrees with its entry count",
+                        ));
+                    }
+                    if dense {
+                        let universe_chunks =
+                            self.triples.div_ceil(1 << GRAPH_POSITION_CHUNK_SHIFT);
+                        if entry.item_count_a != universe_chunks {
+                            return Err(self.malformed(
+                                id,
+                                "dense chunk directory does not cover the universe",
+                            ));
+                        }
+                    }
+                    let chunks = self
+                        .region(file, entry.primary_offset, entry.primary_length)
+                        .ok_or_else(|| self.malformed(id, "chunk directory runs past the file"))?;
+                    LayerBody::Chunked {
+                        chunks,
+                        dense,
+                        file,
+                    }
+                }
+                Some(GraphLayerEncoding::EliasFano) => {
+                    if entry.primary_length != ELIAS_FANO_HEADER_SIZE as u64 {
+                        return Err(self.malformed(id, "Elias-Fano header has the wrong length"));
+                    }
+                    let raw = self
+                        .region(file, entry.primary_offset, entry.primary_length)
+                        .ok_or_else(|| {
+                            self.malformed(id, "Elias-Fano header runs past the file")
+                        })?;
+                    let raw: &[u8; ELIAS_FANO_HEADER_SIZE] =
+                        raw.try_into().expect("the region is exactly the header");
+                    let header = EliasFanoHeader::parse(raw)
+                        .map_err(|error| self.malformed(id, &format!("{error:#}")))?;
+                    if header.universe != self.triples || header.members != entry.member_count {
+                        return Err(
+                            self.malformed(id, "Elias-Fano header disagrees with the directory")
+                        );
+                    }
+                    if header.low_bits >= 64 {
+                        return Err(self.malformed(id, "Elias-Fano low-bit width is not below 64"));
+                    }
+                    let lower = if header.low_bits == 0 {
+                        None
+                    } else {
+                        let bytes = self
+                            .region(file, header.lower_offset, header.lower_length)
+                            .ok_or_else(|| {
+                                self.malformed(id, "Elias-Fano lower bits run past the file")
+                            })?;
+                        Some(
+                            PackedArray::new(bytes, header.members, header.low_bits as u8)
+                                .map_err(|error| self.malformed(id, &error.to_string()))?,
+                        )
+                    };
+                    let region = |offset, length, what: &str| {
+                        self.region(file, offset, length).ok_or_else(|| {
+                            self.malformed(id, &format!("Elias-Fano {what} runs past the file"))
+                        })
+                    };
+                    let upper = RankedBitmap::new(
+                        BitmapView::new(
+                            region(header.upper_offset, header.upper_length, "upper bitmap")?,
+                            header.upper_bits,
+                        )
+                        .map_err(|error| self.malformed(id, &error.to_string()))?,
+                        PackedArray::new(
+                            region(
+                                header.superrank_offset,
+                                header.superrank_length,
+                                "superranks",
+                            )?,
+                            header.superrank_count,
+                            64,
+                        )
+                        .map_err(|error| self.malformed(id, &error.to_string()))?,
+                        PackedArray::new(
+                            region(header.subrank_offset, header.subrank_length, "subranks")?,
+                            header.subrank_count,
+                            16,
+                        )
+                        .map_err(|error| self.malformed(id, &error.to_string()))?,
+                        ELIAS_FANO_SUPERBLOCK_BITS,
+                        ELIAS_FANO_SUBBLOCK_BITS,
+                    )
+                    .map_err(|error| self.malformed(id, &error.to_string()))?;
+                    if upper.count() != header.members {
+                        return Err(self.malformed(
+                            id,
+                            "Elias-Fano upper bitmap does not hold one bit per member",
+                        ));
+                    }
+                    LayerBody::EliasFano(EliasFanoLayer {
+                        low_bits: header.low_bits,
+                        universe: header.universe,
+                        high_buckets: header.high_buckets,
+                        lower,
+                        upper,
+                    })
+                }
+                None => {
+                    return Err(
+                        self.malformed(id, &format!("unknown layer encoding {}", entry.encoding))
+                    );
+                }
+            }
+        };
+        Ok(Layer {
+            id,
+            entry,
+            triples: self.triples,
+            body,
+            path: self.file.path(),
+        })
+    }
+
+    fn region<'b>(&self, file: &'b [u8], offset: u64, length: u64) -> Option<&'b [u8]> {
+        let end = offset.checked_add(length)?;
+        file.get(offset as usize..end as usize)
+    }
+
+    fn malformed(&self, id: GraphId, detail: &str) -> Error {
+        Error::Malformed {
+            artifact: self.file.path().to_path_buf(),
+            detail: format!("layer {}: {detail}", id.0),
+        }
+    }
+}
+
+/// Positions per chunk.
+const CHUNK_POSITIONS: u64 = 1 << GRAPH_POSITION_CHUNK_SHIFT;
+
+/// One graph's positions in one space: a set over `[0, N)` with rank and select.
+///
+/// The five operations are what scoping a pattern needs: a scoped count is two
+/// ranks, a scoped page is a run of selects, `s ? o` filters its probe with
+/// `access`, and `next_member` skips from any position to the next member.
+#[derive(Debug, Clone, Copy)]
+pub struct Layer<'a> {
+    id: GraphId,
+    entry: GraphLayerEntry,
+    triples: u64,
+    body: LayerBody<'a>,
+    path: &'a Path,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LayerBody<'a> {
+    Empty,
+    Chunked {
+        chunks: &'a [u8],
+        dense: bool,
+        file: &'a [u8],
+    },
+    EliasFano(EliasFanoLayer<'a>),
+}
+
+/// The projected regions of an Elias–Fano layer and the three header fields
+/// its arithmetic needs; the header's region offsets and CRCs are consumed
+/// while projecting and not carried.
+#[derive(Debug, Clone, Copy)]
+struct EliasFanoLayer<'a> {
+    low_bits: u32,
+    universe: u64,
+    high_buckets: u64,
+    lower: Option<PackedArray<'a>>,
+    upper: RankedBitmap<'a>,
+}
+
+impl Layer<'_> {
+    /// The graph this layer holds.
+    pub fn id(&self) -> GraphId {
+        self.id
+    }
+
+    /// Members: `count(g)`.
+    pub fn count(&self) -> u64 {
+        self.entry.member_count
+    }
+
+    /// Members strictly before `position`. `position` may equal the universe.
+    pub fn rank(&self, position: u64) -> Result<u64> {
+        assert!(
+            position <= self.triples,
+            "rank({position}) out of range for {} triples",
+            self.triples
+        );
+        let entry = &self.entry;
+        if position == 0 || entry.member_count == 0 {
+            return Ok(0);
+        }
+        if position >= entry.maximum_position_exclusive {
+            return Ok(entry.member_count);
+        }
+        if position <= entry.minimum_position {
+            return Ok(0);
+        }
+        match &self.body {
+            LayerBody::Empty => Ok(0),
+            LayerBody::Chunked {
+                chunks,
+                dense,
+                file,
+            } => {
+                let key = position >> GRAPH_POSITION_CHUNK_SHIFT;
+                let offset = (position & (CHUNK_POSITIONS - 1)) as u16;
+                let (insertion, chunk) = self.find_chunk(chunks, *dense, key)?;
+                match chunk {
+                    Some(chunk) if chunk.cardinality == 0 => Ok(chunk.rank_before),
+                    Some(chunk) => {
+                        Ok(chunk.rank_before + self.container_rank(file, chunk, offset)?)
+                    }
+                    None if insertion == self.chunk_count(chunks) => Ok(entry.member_count),
+                    None => Ok(self.chunk(chunks, insertion)?.rank_before),
+                }
+            }
+            LayerBody::EliasFano(EliasFanoLayer {
+                low_bits,
+                universe,
+                high_buckets,
+                lower,
+                upper,
+            }) => {
+                let members = entry.member_count;
+                if position == *universe {
+                    return Ok(members);
+                }
+                let high = position >> low_bits;
+                let low_mask = if *low_bits == 0 {
+                    0
+                } else {
+                    (1u64 << low_bits) - 1
+                };
+                let low = position & low_mask;
+                if high >= *high_buckets {
+                    return Ok(members);
+                }
+                // Bucket `h` is closed by the `h`-th clear bit, and exactly `j`
+                // clear bits precede the `j`-th, so the members with a smaller
+                // high part number `select0(h - 1) - (h - 1)`.
+                let start = if high == 0 {
+                    0
+                } else {
+                    upper.select0(high - 1) - (high - 1)
+                };
+                let end = upper.select0(high) - high;
+                let (mut left, mut right) = (start, end);
+                while left < right {
+                    let middle = left + (right - left) / 2;
+                    if ef_lower(lower, middle) < low {
+                        left = middle + 1;
+                    } else {
+                        right = middle;
+                    }
+                }
+                Ok(left)
+            }
+        }
+    }
+
+    /// The position of the zero-based `ordinal`-th member.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ordinal >= count()`.
+    pub fn select(&self, ordinal: u64) -> Result<u64> {
+        assert!(
+            ordinal < self.entry.member_count,
+            "select({ordinal}) out of range for {} members",
+            self.entry.member_count
+        );
+        match &self.body {
+            LayerBody::Empty => unreachable!("an empty layer has no member to select"),
+            LayerBody::Chunked { chunks, file, .. } => {
+                // The last chunk whose first member is at or before the
+                // ordinal. Empty dense chunks share their successor's
+                // `rank_before`, and the last of a run of equal values is the
+                // non-empty one, so the search lands on a chunk that holds it.
+                let count = self.chunk_count(chunks);
+                let (mut low, mut high) = (0u64, count);
+                while low < high {
+                    let middle = low + (high - low) / 2;
+                    let chunk = self.chunk(chunks, middle)?;
+                    if chunk.rank_before + u64::from(chunk.cardinality) > ordinal {
+                        high = middle;
+                    } else {
+                        low = middle + 1;
+                    }
+                }
+                if low >= count {
+                    return Err(self.malformed("chunk directory does not hold its member count"));
+                }
+                let chunk = self.chunk(chunks, low)?;
+                let local = self.container_select(file, chunk, ordinal - chunk.rank_before)?;
+                Ok((chunk.key << GRAPH_POSITION_CHUNK_SHIFT) | u64::from(local))
+            }
+            LayerBody::EliasFano(EliasFanoLayer {
+                low_bits,
+                universe,
+                lower,
+                upper,
+                ..
+            }) => {
+                let high = upper.select1(ordinal) - ordinal;
+                let value = (high << low_bits) | ef_lower(lower, ordinal);
+                if value >= *universe {
+                    return Err(
+                        self.malformed("decoded Elias-Fano position is outside the universe")
+                    );
+                }
+                Ok(value)
+            }
+        }
+    }
+
+    /// Whether `position` is a member.
+    pub fn access(&self, position: u64) -> Result<bool> {
+        assert!(
+            position < self.triples,
+            "access({position}) out of range for {} triples",
+            self.triples
+        );
+        let entry = &self.entry;
+        if entry.member_count == 0
+            || position < entry.minimum_position
+            || position >= entry.maximum_position_exclusive
+        {
+            return Ok(false);
+        }
+        match &self.body {
+            LayerBody::Empty => Ok(false),
+            LayerBody::Chunked {
+                chunks,
+                dense,
+                file,
+            } => {
+                let key = position >> GRAPH_POSITION_CHUNK_SHIFT;
+                let offset = (position & (CHUNK_POSITIONS - 1)) as u16;
+                let Some(chunk) = self.find_chunk(chunks, *dense, key)?.1 else {
+                    return Ok(false);
+                };
+                self.container_access(file, chunk, offset)
+            }
+            LayerBody::EliasFano(_) => Ok(self.rank(position + 1)? != self.rank(position)?),
+        }
+    }
+
+    /// The first member at or after `position`, if any.
+    pub fn next_member(&self, position: u64) -> Result<Option<u64>> {
+        let rank = self.rank(position)?;
+        if rank == self.entry.member_count {
+            Ok(None)
+        } else {
+            self.select(rank).map(Some)
+        }
+    }
+
+    fn chunk_count(&self, chunks: &[u8]) -> u64 {
+        (chunks.len() / GRAPH_CHUNK_ENTRY_SIZE) as u64
+    }
+
+    fn chunk(&self, chunks: &[u8], index: u64) -> Result<GraphChunkEntry> {
+        let start = (index as usize)
+            .checked_mul(GRAPH_CHUNK_ENTRY_SIZE)
+            .filter(|start| start + GRAPH_CHUNK_ENTRY_SIZE <= chunks.len())
+            .ok_or_else(|| self.malformed("chunk index is outside the chunk directory"))?;
+        let bytes: &[u8; GRAPH_CHUNK_ENTRY_SIZE] = chunks[start..start + GRAPH_CHUNK_ENTRY_SIZE]
+            .try_into()
+            .expect("a whole chunk entry");
+        Ok(GraphChunkEntry::parse(bytes))
+    }
+
+    /// The chunk holding `key`, or where it would be inserted.
+    ///
+    /// A dense directory is indexed by key. A sparse one is binary-searched by
+    /// key: the directory is sorted, so the access hash the format also stores
+    /// is an alternative route to the same entry and stays unread.
+    fn find_chunk(
+        &self,
+        chunks: &[u8],
+        dense: bool,
+        key: u64,
+    ) -> Result<(u64, Option<GraphChunkEntry>)> {
+        let count = self.chunk_count(chunks);
+        if dense {
+            if key >= count {
+                return Ok((count, None));
+            }
+            let chunk = self.chunk(chunks, key)?;
+            if chunk.key != key {
+                return Err(self.malformed("dense chunk directory is out of key order"));
+            }
+            return Ok((key, Some(chunk)));
+        }
+        let (mut low, mut high) = (0u64, count);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.chunk(chunks, middle)?.key < key {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        if low < count {
+            let chunk = self.chunk(chunks, low)?;
+            if chunk.key == key {
+                return Ok((low, Some(chunk)));
+            }
+        }
+        Ok((low, None))
+    }
+
+    fn payload<'b>(&self, file: &'b [u8], chunk: GraphChunkEntry) -> Result<&'b [u8]> {
+        let expected = match chunk.container() {
+            Some(GraphChunkContainer::Array) if chunk.cardinality <= GRAPH_ARRAY_CONTAINER_MAX => {
+                chunk.cardinality * 2
+            }
+            Some(GraphChunkContainer::Bitmap) if chunk.cardinality > GRAPH_ARRAY_CONTAINER_MAX => {
+                GRAPH_BITMAP_CONTAINER_BYTES
+            }
+            _ => return Err(self.malformed("chunk container disagrees with its cardinality")),
+        };
+        if chunk.payload_length != expected {
+            return Err(self.malformed("chunk payload has the wrong length for its container"));
+        }
+        chunk
+            .payload_offset
+            .checked_add(u64::from(chunk.payload_length))
+            .and_then(|end| file.get(chunk.payload_offset as usize..end as usize))
+            .ok_or_else(|| self.malformed("chunk payload runs past the file"))
+    }
+
+    fn container_access(&self, file: &[u8], chunk: GraphChunkEntry, offset: u16) -> Result<bool> {
+        if chunk.cardinality == 0 {
+            return Ok(false);
+        }
+        let payload = self.payload(file, chunk)?;
+        Ok(match chunk.container() {
+            Some(GraphChunkContainer::Bitmap) => {
+                payload[BITMAP_CONTAINER_BITS_AT + usize::from(offset) / 8] >> (offset % 8) & 1 == 1
+            }
+            _ => {
+                let index = array_lower_bound(payload, offset);
+                index < chunk.cardinality as usize && array_value(payload, index) == offset
+            }
+        })
+    }
+
+    fn container_rank(&self, file: &[u8], chunk: GraphChunkEntry, offset: u16) -> Result<u64> {
+        let payload = self.payload(file, chunk)?;
+        Ok(match chunk.container() {
+            Some(GraphChunkContainer::Bitmap) => {
+                let subblock = usize::from(offset) / BITMAP_CONTAINER_SUBBLOCK_BITS;
+                let base = u64::from(u16::from_le_bytes([
+                    payload[subblock * 2],
+                    payload[subblock * 2 + 1],
+                ]));
+                let bits = BitmapView::new(&payload[BITMAP_CONTAINER_BITS_AT..], CHUNK_POSITIONS)
+                    .expect("a bitmap container holds exactly one chunk of bits");
+                base + bits.count_ones_in(
+                    (subblock * BITMAP_CONTAINER_SUBBLOCK_BITS) as u64..u64::from(offset),
+                )
+            }
+            _ => array_lower_bound(payload, offset) as u64,
+        })
+    }
+
+    fn container_select(&self, file: &[u8], chunk: GraphChunkEntry, ordinal: u64) -> Result<u16> {
+        debug_assert!(ordinal < u64::from(chunk.cardinality));
+        let payload = self.payload(file, chunk)?;
+        match chunk.container() {
+            Some(GraphChunkContainer::Bitmap) => {
+                // The last subblock whose starting rank is at or below the
+                // ordinal, then a bounded scan inside it.
+                let subrank =
+                    |j: usize| u64::from(u16::from_le_bytes([payload[j * 2], payload[j * 2 + 1]]));
+                let (mut low, mut high) = (0usize, BITMAP_CONTAINER_SUBBLOCKS - 1);
+                while low < high {
+                    let middle = low + (high - low).div_ceil(2);
+                    if subrank(middle) <= ordinal {
+                        low = middle;
+                    } else {
+                        high = middle - 1;
+                    }
+                }
+                let bits = BitmapView::new(&payload[BITMAP_CONTAINER_BITS_AT..], CHUNK_POSITIONS)
+                    .expect("a bitmap container holds exactly one chunk of bits");
+                bits.select_from(
+                    (low * BITMAP_CONTAINER_SUBBLOCK_BITS) as u64,
+                    ordinal - subrank(low),
+                )
+                .and_then(|position| u16::try_from(position).ok())
+                .ok_or_else(|| {
+                    self.malformed("bitmap container holds fewer members than its subranks say")
+                })
+            }
+            _ => Ok(array_value(payload, ordinal as usize)),
+        }
+    }
+
+    fn malformed(&self, detail: &str) -> Error {
+        Error::Malformed {
+            artifact: self.path.to_path_buf(),
+            detail: format!("layer {}: {detail}", self.id.0),
+        }
+    }
+}
+
+/// The `i`-th packed low part, or zero when the layer stores none.
+fn ef_lower(lower: &Option<PackedArray<'_>>, index: u64) -> u64 {
+    lower.as_ref().map_or(0, |lower| lower.get(index))
+}
+
+/// Byte offset of the bitmap inside a bitmap container, after its subranks.
+const BITMAP_CONTAINER_BITS_AT: usize = GRAPH_BITMAP_CONTAINER_SUBRANK_BYTES;
+/// Subranks per bitmap container, one per subblock.
+const BITMAP_CONTAINER_SUBBLOCKS: usize = GRAPH_BITMAP_CONTAINER_SUBRANK_BYTES / 2;
+const BITMAP_CONTAINER_SUBBLOCK_BITS: usize = GRAPH_BITMAP_CONTAINER_SUBBLOCK_BITS as usize;
+
+/// The `index`-th offset of an array container.
+fn array_value(payload: &[u8], index: usize) -> u16 {
+    u16::from_le_bytes([payload[index * 2], payload[index * 2 + 1]])
+}
+
+/// The first index of an array container whose offset is not below `offset`.
+fn array_lower_bound(payload: &[u8], offset: u16) -> usize {
+    let (mut low, mut high) = (0usize, payload.len() / 2);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if array_value(payload, middle) < offset {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+
+fn classify_sidecar_error(error: anyhow::Error, sidecar: &Path, hdt: &Path) -> Error {
+    // hdtc reports a sidecar that describes another HDT with one of two
+    // messages; both are a binding failure rather than a corrupt file.
+    let text = format!("{error:#}");
+    if text.contains("sidecar/HDT") {
+        Error::ArtifactBindingMismatch {
+            artifact: sidecar.to_path_buf(),
+            hdt: hdt.to_path_buf(),
+            detail: text,
+        }
+    } else {
+        Error::Format(error.context(format!("opening graph sidecar {}", sidecar.display())))
+    }
+}
+
+fn malformed(mapping: &Mapping, detail: String) -> Error {
+    Error::Malformed {
+        artifact: mapping.path().to_path_buf(),
+        detail,
+    }
+}
+
+fn with_artifact<T>(mapping: &Mapping, result: Result<T>) -> Result<T> {
+    result.map_err(|error| match error {
+        Error::Region(detail) => malformed(mapping, detail),
+        other => other,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pattern::{IdPattern, resolve};
+    use crate::perm::Permutations;
+    use crate::testing::{Fixture, TINY_NQ, WORKED_EXAMPLE_NQ, synthetic_quads};
+    use crate::{IdTriple, Role};
+    use std::collections::BTreeMap;
+
+    /// Every membership of a bundle in every space, from hdtc's own
+    /// four-position search and the permutations' positions: the oracle for
+    /// the layers, which shares nothing with the code it checks.
+    struct Oracle {
+        /// For each space, for each layer, the sorted member positions.
+        members: BTreeMap<Permutation, Vec<Vec<u64>>>,
+        triples: u64,
+    }
+
+    impl Oracle {
+        fn new(fixture: &Fixture, perms: &Permutations, graphs: &Graphs) -> Self {
+            let dictionary = perms.dict();
+            let positions = positions_by_space(perms);
+            let named = graphs.facts().named_graphs;
+            let mut members: BTreeMap<Permutation, Vec<Vec<u64>>> = BTreeMap::new();
+            for space in [Permutation::Spo, Permutation::Pos, Permutation::Ops] {
+                members.insert(space, vec![Vec::new(); named as usize + 1]);
+            }
+            let mut buf = Vec::new();
+            for graph in 0..=named {
+                let query = if graph == 0 {
+                    "? ? ? default".to_owned()
+                } else {
+                    let name = graphs.name(GraphId(graph), &mut buf).unwrap();
+                    format!("? ? ? <{}>", String::from_utf8_lossy(name))
+                };
+                for row in fixture.search(&query) {
+                    let triple = parse_hdtc_row(&dictionary, &row);
+                    for (space, layers) in members.iter_mut() {
+                        layers[graph as usize].push(positions[space][&triple]);
+                    }
+                }
+            }
+            for layers in members.values_mut() {
+                for layer in layers {
+                    layer.sort_unstable();
+                }
+            }
+            Self {
+                members,
+                triples: perms.triples(),
+            }
+        }
+
+        fn layer(&self, space: Permutation, graph: u64) -> &[u64] {
+            &self.members[&space][graph as usize]
+        }
+
+        fn rank(&self, space: Permutation, graph: u64, position: u64) -> u64 {
+            self.layer(space, graph)
+                .partition_point(|member| *member < position) as u64
+        }
+    }
+
+    /// Each triple's position in each permutation, by enumerating every
+    /// root group of that permutation with the running position.
+    fn positions_by_space(perms: &Permutations) -> BTreeMap<Permutation, BTreeMap<IdTriple, u64>> {
+        let counts = perms.dict_counts();
+        let mut by_space = BTreeMap::new();
+        for space in [Permutation::Spo, Permutation::Pos, Permutation::Ops] {
+            let mut positions = BTreeMap::new();
+            let role = match space {
+                Permutation::Spo => Role::Subject,
+                Permutation::Pos => Role::Predicate,
+                Permutation::Ops => Role::Object,
+            };
+            let make = |id| match space {
+                Permutation::Spo => IdPattern {
+                    subject: Some(id),
+                    predicate: None,
+                    object: None,
+                },
+                Permutation::Pos => IdPattern {
+                    subject: None,
+                    predicate: Some(id),
+                    object: None,
+                },
+                Permutation::Ops => IdPattern {
+                    subject: None,
+                    predicate: None,
+                    object: Some(id),
+                },
+            };
+            let mut next = 0u64;
+            for id in 1..=counts.len(role) {
+                let selection = resolve(perms, make(id)).unwrap();
+                assert_eq!(selection.permutation(), space);
+                for triple in selection.page(0, usize::MAX) {
+                    positions.insert(triple, next);
+                    next += 1;
+                }
+            }
+            assert_eq!(next, perms.triples());
+            by_space.insert(space, positions);
+        }
+        by_space
+    }
+
+    fn parse_hdtc_row(dictionary: &crate::dict::Dictionary<'_>, row: &[u8]) -> IdTriple {
+        let fields: Vec<&[u8]> = row.split(|byte| *byte == b'\t').collect();
+        let term = |field: &[u8]| -> Vec<u8> {
+            if field.starts_with(b"<") {
+                field[1..field.len() - 1].to_vec()
+            } else {
+                field.to_vec()
+            }
+        };
+        let id = |role, bytes: &[u8]| {
+            dictionary
+                .locate(role, bytes)
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "hdtc row names an absent term {}",
+                        String::from_utf8_lossy(bytes)
+                    )
+                })
+                .0
+        };
+        IdTriple {
+            subject: id(Role::Subject, &term(fields[0])),
+            predicate: id(Role::Predicate, &term(fields[1])),
+            object: id(Role::Object, &term(fields[2])),
+        }
+    }
+
+    fn open(fixture: &Fixture) -> (Permutations, Graphs) {
+        let perms = Permutations::open(fixture.map_hdt(), fixture.map_perm()).unwrap();
+        let graphs = Graphs::open(
+            &fixture.hdt_path(),
+            fixture.map_graphs(),
+            fixture.map_graph_index(),
+        )
+        .unwrap();
+        (perms, graphs)
+    }
+
+    #[test]
+    fn the_worked_example_has_the_counts_its_contract_states() {
+        let fixture = Fixture::build_quads(WORKED_EXAMPLE_NQ);
+        let (_, graphs) = open(&fixture);
+        let facts = graphs.facts();
+        assert_eq!(facts.triples, 3);
+        assert_eq!(facts.named_graphs, 2);
+        assert_eq!(facts.memberships, 5);
+
+        let g1 = graphs.resolve(b"http://example.org/g1").unwrap().unwrap();
+        let g2 = graphs.resolve(b"http://example.org/g2").unwrap().unwrap();
+        assert_eq!((g1, g2), (GraphId(1), GraphId(2)));
+        assert_eq!(
+            graphs.resolve(UNNAMED_GRAPH_IRI.as_bytes()).unwrap(),
+            Some(GraphId::UNNAMED)
+        );
+        assert_eq!(graphs.resolve(UNION_GRAPH_IRI.as_bytes()).unwrap(), None);
+        assert_eq!(graphs.resolve(b"http://example.org/g3").unwrap(), None);
+
+        assert_eq!(graphs.count(GraphId::UNNAMED).unwrap(), 2);
+        assert_eq!(graphs.count(g1).unwrap(), 2);
+        assert_eq!(graphs.count(g2).unwrap(), 1);
+
+        let mut buf = Vec::new();
+        assert_eq!(graphs.name(g1, &mut buf).unwrap(), b"http://example.org/g1");
+        assert_eq!(
+            graphs.name(GraphId::UNNAMED, &mut buf).unwrap(),
+            UNNAMED_GRAPH_IRI.as_bytes()
+        );
+    }
+
+    #[test]
+    fn every_layer_operation_agrees_with_hdtc_in_every_space() {
+        for (source, transpose) in [
+            (TINY_NQ, false),
+            (WORKED_EXAMPLE_NQ, false),
+            (WORKED_EXAMPLE_NQ, true),
+            (synthetic_quads().as_str(), false),
+            (synthetic_quads().as_str(), true),
+        ] {
+            let fixture = Fixture::build_quads_with(source, transpose);
+            let (perms, graphs) = open(&fixture);
+            assert_eq!(graphs.has_transpose(), transpose);
+            assert_eq!(graphs.has_transpose_ids(), transpose);
+            let oracle = Oracle::new(&fixture, &perms, &graphs);
+            let n = oracle.triples;
+            let mut encodings = Vec::new();
+
+            for space in [Permutation::Spo, Permutation::Pos, Permutation::Ops] {
+                for graph in 0..=graphs.facts().named_graphs {
+                    let layer = graphs.layer(space, GraphId(graph)).unwrap();
+                    encodings.push(layer.entry.encoding);
+                    let members = oracle.layer(space, graph);
+                    assert_eq!(
+                        layer.count(),
+                        members.len() as u64,
+                        "{space:?} layer {graph}"
+                    );
+                    for (ordinal, member) in members.iter().enumerate() {
+                        assert_eq!(
+                            layer.select(ordinal as u64).unwrap(),
+                            *member,
+                            "{space:?} layer {graph} select({ordinal})"
+                        );
+                    }
+                    // Every position for the small fixtures; for the wide
+                    // one, a stride plus the neighbourhood of a sample of
+                    // members, which is where rank and access change value.
+                    let probes: Vec<u64> = if n <= 64 {
+                        (0..=n).collect()
+                    } else {
+                        (0..=n)
+                            .step_by(997)
+                            .chain(
+                                members
+                                    .iter()
+                                    .step_by(97)
+                                    .flat_map(|m| [m.saturating_sub(1), *m, (*m + 1).min(n)]),
+                            )
+                            .collect()
+                    };
+                    for position in probes {
+                        assert_eq!(
+                            layer.rank(position).unwrap(),
+                            oracle.rank(space, graph, position),
+                            "{space:?} layer {graph} rank({position})"
+                        );
+                        if position < n {
+                            assert_eq!(
+                                layer.access(position).unwrap(),
+                                members.binary_search(&position).is_ok(),
+                                "{space:?} layer {graph} access({position})"
+                            );
+                            let next = members
+                                .get(members.partition_point(|m| *m < position))
+                                .copied();
+                            assert_eq!(
+                                layer.next_member(position).unwrap(),
+                                next,
+                                "{space:?} layer {graph} next_member({position})"
+                            );
+                        }
+                    }
+                }
+
+                // The per-position questions, against the same oracle.
+                let memberships = graphs.memberships(space).unwrap();
+                let mut out = Vec::new();
+                let sample: Vec<u64> = if n <= 64 {
+                    (0..n).collect()
+                } else {
+                    (0..n).step_by(4093).collect()
+                };
+                for position in sample {
+                    out.clear();
+                    memberships.graphs_of(position, &mut out).unwrap();
+                    let expected: Vec<GraphId> = (0..=graphs.facts().named_graphs)
+                        .filter(|graph| {
+                            oracle.layer(space, *graph).binary_search(&position).is_ok()
+                        })
+                        .map(GraphId)
+                        .collect();
+                    assert_eq!(out, expected, "{space:?} graphs_of({position})");
+                }
+                let total: u64 = (0..=graphs.facts().named_graphs)
+                    .map(|graph| oracle.layer(space, graph).len() as u64)
+                    .sum();
+                assert_eq!(
+                    memberships.in_range(0..n).unwrap(),
+                    total,
+                    "{space:?} whole range"
+                );
+                assert_eq!(memberships.in_range(0..0).unwrap(), 0);
+                let middle = n / 3..(2 * n / 3).max(n / 3);
+                let expected: u64 = (0..=graphs.facts().named_graphs)
+                    .map(|graph| {
+                        oracle.rank(space, graph, middle.end)
+                            - oracle.rank(space, graph, middle.start)
+                    })
+                    .sum();
+                assert_eq!(
+                    memberships.in_range(middle).unwrap(),
+                    expected,
+                    "{space:?} middle range"
+                );
+            }
+
+            if source.len() > 1000 {
+                encodings.sort_unstable();
+                encodings.dedup();
+                assert_eq!(
+                    encodings,
+                    vec![1, 2, 3],
+                    "the synthetic bundle must reach every encoding"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_sidecar_naming_a_reserved_graph_is_refused_at_open() {
+        for reserved in [UNION_GRAPH_IRI, UNNAMED_GRAPH_IRI] {
+            let fixture = Fixture::build_quads(&format!(
+                "<http://example.org/s> <http://example.org/p> <http://example.org/o> <{reserved}> .\n"
+            ));
+            let error = Graphs::open(
+                &fixture.hdt_path(),
+                fixture.map_graphs(),
+                fixture.map_graph_index(),
+            )
+            .expect_err("a reserved graph name must be refused");
+            match error {
+                Error::Malformed { artifact, detail } => {
+                    assert_eq!(
+                        artifact,
+                        fixture.bundle_path().join(crate::store::artifact::GRAPHS)
+                    );
+                    assert!(detail.contains(reserved), "{detail}");
+                }
+                other => panic!("unexpected error: {other:#}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_sidecar_for_another_hdt_is_refused_as_a_binding_failure() {
+        let first = Fixture::build_quads(WORKED_EXAMPLE_NQ);
+        let second = Fixture::build_quads(TINY_NQ);
+        let error = Graphs::open(
+            &second.hdt_path(),
+            first.map_graphs(),
+            first.map_graph_index(),
+        )
+        .expect_err("a foreign sidecar must be refused");
+        assert!(
+            matches!(error, Error::ArtifactBindingMismatch { .. }),
+            "{error:#}"
+        );
+    }
+}

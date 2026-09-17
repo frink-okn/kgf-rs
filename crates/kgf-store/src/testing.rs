@@ -133,6 +133,47 @@ pub const TINY_NQ: &str = concat!(
     "<http://example.org/g2> .\n",
 );
 
+/// The worked example of the graph read contract: five statements, three
+/// distinct triples, five memberships.
+///
+/// `:a :b :c` is in the unnamed graph and `g1`; `:a :b :d` in the unnamed
+/// graph alone; `:x :y :z` in `g1` and `g2`. So the union counts 3, `g1` 2,
+/// `g2` 1, the unnamed graph 2, and the quad view 5 — every number a scoped
+/// operation can be checked against by hand.
+pub const WORKED_EXAMPLE_NQ: &str = concat!(
+    "<http://example.org/a> <http://example.org/b> <http://example.org/c> .\n",
+    "<http://example.org/a> <http://example.org/b> <http://example.org/c> <http://example.org/g1> .\n",
+    "<http://example.org/a> <http://example.org/b> <http://example.org/d> .\n",
+    "<http://example.org/x> <http://example.org/y> <http://example.org/z> <http://example.org/g1> .\n",
+    "<http://example.org/x> <http://example.org/y> <http://example.org/z> <http://example.org/g2> .\n",
+);
+
+/// Quads wide enough that hdtc picks a different encoding for each layer.
+///
+/// Three graphs over 140,000 triples: everything (dense chunks with bitmap
+/// containers), every three-hundredth triple (Elias–Fano), and a short run in
+/// the middle (sparse chunks with an array container). The universe spans
+/// three position chunks, which matters: with one chunk a dense directory is
+/// always cheapest and no other encoding is ever written. A reader that only
+/// ever saw a tiny fixture would have two of its three decoders untested.
+pub fn synthetic_quads() -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for i in 0..140_000u32 {
+        let subject = format!("<urn:s{}>", i / 4);
+        let predicate = format!("<urn:p{}>", i % 4);
+        let object = format!("<urn:o{i}>");
+        writeln!(out, "{subject} {predicate} {object} <urn:g:all> .").unwrap();
+        if i % 300 == 0 {
+            writeln!(out, "{subject} {predicate} {object} <urn:g:sparse> .").unwrap();
+        }
+        if (70_000..70_040).contains(&i) {
+            writeln!(out, "{subject} {predicate} {object} <urn:g:run> .").unwrap();
+        }
+    }
+    out
+}
+
 /// The golden fixture's triples in role-scoped id space.
 ///
 /// Dictionary lookup is independent of BitmapTriples traversal, so this is an
@@ -283,8 +324,34 @@ impl Fixture {
     }
 
     /// Build a quad bundle with its graph sidecar and graph index.
+    ///
+    /// The index carries both layer sets and no transpose, which is the
+    /// configuration a bundle with few, coarse graphs publishes.
     pub fn build_quads(source: &str) -> Self {
         Self::build_with(source, true)
+    }
+
+    /// Build a quad bundle, optionally rebuilding its index with the SPO
+    /// transpose — both run boundaries and graph ids — so the paths that read
+    /// it are exercised beside the paths that probe the layers instead.
+    pub fn build_quads_with(source: &str, transpose: bool) -> Self {
+        let fixture = Self::build_with(source, true);
+        if transpose {
+            let hdtc = hdtc_binary();
+            let output = std::process::Command::new(&hdtc)
+                .arg("graphs-index")
+                .arg(fixture.hdt_path())
+                .args(["--transpose-ids", "--memory-limit", "64M", "--temp-dir"])
+                .arg(fixture.dir.path().join("work"))
+                .output()
+                .unwrap_or_else(|error| panic!("run {} graphs-index: {error}", hdtc.display()));
+            assert!(
+                output.status.success(),
+                "hdtc graphs-index failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fixture
     }
 
     /// Add a full-text index over this bundle's literals.
@@ -405,6 +472,18 @@ impl Fixture {
     /// Path of `data.hdt.perm`.
     pub(crate) fn perm_path(&self) -> std::path::PathBuf {
         self.dir.path().join(PERM)
+    }
+
+    /// Map `data.hdt.graphs`.
+    #[cfg(test)]
+    pub(crate) fn map_graphs(&self) -> crate::map::Mapping {
+        map_fixture(&self.dir.path().join(GRAPHS))
+    }
+
+    /// Map `data.hdt.graphs.idx`.
+    #[cfg(test)]
+    pub(crate) fn map_graph_index(&self) -> crate::map::Mapping {
+        map_fixture(&self.dir.path().join(GRAPHS_IDX))
     }
 
     /// Publish the complete physical description set around caller-supplied

@@ -39,8 +39,9 @@ pub struct IdPattern {
     pub object: Option<u64>,
 }
 
-/// Which permutation a selection reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which permutation a selection reads — and, for graph memberships, which
+/// position space a layer set is keyed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Permutation {
     /// Subject-rooted, from `data.hdt`.
     Spo,
