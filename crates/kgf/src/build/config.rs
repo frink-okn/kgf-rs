@@ -156,6 +156,9 @@ pub struct Contents {
     /// The full-text index over literals.
     #[serde(default)]
     pub text: Text,
+    /// The named-graph membership sidecar and its index.
+    #[serde(default)]
+    pub graphs: Graphs,
     /// Membership filters and overlap sketches.
     #[serde(default)]
     pub filters: Filters,
@@ -207,6 +210,31 @@ impl Default for Text {
             untagged_language: None,
         }
     }
+}
+
+/// `data.hdt.graphs` and `data.hdt.graphs.idx`. Built together or not at all.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Graphs {
+    /// Carry memberships, so the bundle declares `graphs` and answers `g`.
+    ///
+    /// Three values, not two. Omitted follows the input: RDF written in a quad
+    /// syntax, and an HDT with a sidecar beside it, carry graphs and keep
+    /// them; everything else has none to keep. `true` builds them from any
+    /// input, and refuses an HDT that arrives without a sidecar rather than
+    /// publishing a bundle whose graphs went missing on the way in. `false`
+    /// drops a quad source's graphs into the union deliberately, which is a
+    /// thing to be able to say and not a thing to do by accident.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+
+    /// Carry the membership transpose: the graph of every statement, by
+    /// position, rather than one layer to probe per graph.
+    ///
+    /// Omitted follows the number of graphs, which the build learns from the
+    /// sidecar it just wrote. `true` and `false` state it outright.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transpose: Option<bool>,
 }
 
 /// `filters/`. Always built as complete role families.

@@ -98,7 +98,7 @@ pub fn run(args: Args) -> Result<()> {
     let build = resolve_build(args, config)?;
 
     if build.dry_run {
-        print!("{}", execute::rehearse(&build));
+        print!("{}", execute::rehearse(&build)?);
         return Ok(());
     }
 

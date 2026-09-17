@@ -357,6 +357,28 @@ fn inspect_bundle(dir: &Path) -> Result<BundleInspection> {
     Ok(BundleInspection { bundle, facts })
 }
 
+/// Open a staged bundle's memberships, as a server opening it would.
+///
+/// `Store::open` refuses a sidecar naming one of the reserved graph IRIs, and
+/// an index carrying only one of the two position-keyed layer sets. The
+/// manifest written last would surface either — but only after the text index,
+/// the sketches, the key sets and the description set had been built over
+/// bytes that will never be published. This is the same check, run as soon as
+/// the two artifacts exist, and it also catches the build that asked for
+/// memberships and produced none.
+pub(crate) fn check_staged_graphs(dir: &Path) -> Result<()> {
+    let inspection = inspect_bundle(dir)?;
+    ensure!(
+        inspection
+            .facts
+            .capabilities()
+            .any(|capability| capability == Capability::Graphs),
+        "{} was built for named graphs but carries no membership artifacts",
+        dir.display()
+    );
+    Ok(())
+}
+
 /// Check that the manifest describes the artifacts *byte for byte*, not merely
 /// in cardinality.
 ///

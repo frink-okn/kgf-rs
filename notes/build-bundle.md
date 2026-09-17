@@ -105,6 +105,9 @@ contents:                      # what changes bytes
     exclude_datatypes: []
     index_all_datatypes: false
     untagged_language: en
+  graphs:                      # named-graph memberships; both keys tri-state
+    enabled: null              # null follows the input; true | false state it
+    transpose: null            # null follows the graph count
   filters:                     # hdtc sketch — always built, doc 17 §17.3
     filter_bits: 16            # MinHash k is fixed federation-wide, §17.2
   keysets:                     # hdtc keyset — always built, doc 18 §18.4
@@ -130,6 +133,27 @@ Two naming decisions worth stating, because both will look arbitrary later.
 §4.3's capability map calls them; `hdtc sketch` and `hdtc keyset` are the tools
 that happen to produce them today. The config describes the bundle, so renaming
 an hdtc subcommand must not be a config break.
+
+**`contents.graphs` is tri-state, not a boolean.** A bundle carries memberships
+when the input has memberships to carry, which neither `true` nor `false` can
+express: `null` (the default) follows the input — RDF written in a quad syntax,
+and an HDT with a `.graphs` sidecar beside it, carry graphs; everything else has
+none. The two stated values exist because both mistakes are real. `false` drops a
+quad source's graphs into the union *deliberately*, which is a thing to be able to
+say and not a thing to do by accident; `true` asks for them from any input and
+refuses an HDT that arrives without a sidecar, rather than publishing a bundle
+whose graphs went missing somewhere upstream. Whichever way it resolves, the
+sidecar is written by `hdtc create --mode quads` and indexed by a separate `hdtc
+graphs-index --positions pos,ops`: the index is where the two position-keyed layer
+sets a server requires are chosen, and `create --graphs-index` would choose them
+by its own default instead.
+
+`transpose` is the same shape for the same reason. The quad view reads the graphs
+of one statement per row: from the transpose that is one lookup, without it one
+probe per graph, and the transpose's own size grows with the memberships it
+copies. `null` reads the graph count out of the sidecar the build just wrote and
+adds `--transpose-ids` above 32 graphs (`GRAPH_TRANSPOSE_THRESHOLD` in
+`build/plan.rs`). A bundle that knows better says so.
 
 **`contents.perm`, `contents.filters`, and `contents.keysets` have no
 `enabled`.** `data.hdt.perm` is required by rule 1: no fallback for a missing

@@ -23,6 +23,16 @@ const CONFIG: &str = concat!(
     "  roles: {label: ['http://www.w3.org/2000/01/rdf-schema#label']}\n",
 );
 
+/// The worked example of `notes/graphs.md`: three distinct triples, five
+/// memberships, two named graphs and two statements that carried no graph.
+const QUADS: &str = concat!(
+    "<http://example.org/a> <http://example.org/b> <http://example.org/c> .\n",
+    "<http://example.org/a> <http://example.org/b> <http://example.org/c> <http://example.org/g1> .\n",
+    "<http://example.org/a> <http://example.org/b> <http://example.org/d> .\n",
+    "<http://example.org/x> <http://example.org/y> <http://example.org/z> <http://example.org/g1> .\n",
+    "<http://example.org/x> <http://example.org/y> <http://example.org/z> <http://example.org/g2> .\n",
+);
+
 const SOURCE: &str = concat!(
     "<http://example.org/alice> <http://www.w3.org/2000/01/rdf-schema#label> \"Alice\" .\n",
     "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .\n",
@@ -1022,4 +1032,268 @@ fn kgf(args: &[&str], stdin: &str) -> Run {
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         status: output.status,
     }
+}
+
+/// RDF written in a quad syntax keeps its graphs, and RDF that is not does not
+/// acquire a sidecar holding one layer. Neither needs a config key: the input
+/// says which it is.
+#[test]
+fn a_quad_source_keeps_its_graphs_and_a_triple_source_carries_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let quads = dir.path().join("tiny.nq");
+    std::fs::write(&quads, QUADS).unwrap();
+    let triples = dir.path().join("tiny.nt");
+    std::fs::write(&triples, SOURCE).unwrap();
+
+    let with_graphs = dir.path().join("root/tinykg/quads");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&with_graphs),
+            "--input",
+            path(&quads),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    for entry in ["data.hdt.graphs", "data.hdt.graphs.idx"] {
+        assert!(with_graphs.join(entry).exists(), "missing {entry}");
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(with_graphs.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        manifest["capabilities"]
+            .as_object()
+            .unwrap()
+            .contains_key("graphs"),
+        "{manifest}"
+    );
+    // Described like every other artifact, so `content_digest` covers it.
+    assert!(manifest["artifacts"]["data.hdt.graphs"]["sha256"].is_string());
+    kgf(&["manifest", path(&with_graphs), "--check"], "").ok();
+
+    let without = dir.path().join("root/tinykg/triples");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&without),
+            "--input",
+            path(&triples),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(!without.join("data.hdt.graphs").exists());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(without.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        !manifest["capabilities"]
+            .as_object()
+            .unwrap()
+            .contains_key("graphs"),
+        "{manifest}"
+    );
+}
+
+/// Dropping a quad source's graphs into the union is a thing to be able to
+/// say, and `contents.graphs.enabled: false` is how it is said.
+#[test]
+fn a_quad_source_built_as_triples_drops_its_graphs_deliberately() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!("{CONFIG}contents:\n  graphs: {{enabled: false}}\n"),
+    )
+    .ok();
+    assert!(!out.join("data.hdt.graphs").exists());
+    // The union is still every distinct triple of the quad source.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["counts"]["triples"], 3);
+}
+
+/// An HDT carries its memberships in the sidecar beside it or not at all, so a
+/// config that asks for them where there are none is refused rather than
+/// publishing a bundle whose graphs went missing on the way in.
+#[test]
+fn memberships_from_an_hdt_come_from_the_sidecar_beside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let quads = dir.path().join("tiny.nq");
+    std::fs::write(&quads, QUADS).unwrap();
+    let triples = dir.path().join("tiny.nt");
+    std::fs::write(&triples, SOURCE).unwrap();
+
+    // Two bundles to take HDTs from: one with memberships, one without.
+    let staged_quads = dir.path().join("staging/tinykg/quads");
+    let staged_triples = dir.path().join("staging/tinykg/triples");
+    for (out, input) in [(&staged_quads, &quads), (&staged_triples, &triples)] {
+        kgf(
+            &[
+                "build",
+                "--config",
+                "-",
+                "--out",
+                path(out),
+                "--input",
+                path(input),
+                "--hdtc",
+                &hdtc(),
+            ],
+            CONFIG,
+        )
+        .ok();
+    }
+
+    // The sidecar beside the HDT is found without being asked for, copied, and
+    // indexed for this server's position spaces.
+    let adopted = dir.path().join("root/tinykg/adopted");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&adopted),
+            "--hdt",
+            path(&staged_quads.join("data.hdt")),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(adopted.join("data.hdt.graphs").exists());
+    assert!(adopted.join("data.hdt.graphs.idx").exists());
+    kgf(&["manifest", path(&adopted), "--check"], "").ok();
+
+    // Asking for them where the input has none names the file it looked for.
+    let refused = dir.path().join("root/tinykg/refused");
+    let stderr = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&refused),
+            "--hdt",
+            path(&staged_triples.join("data.hdt")),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!("{CONFIG}contents:\n  graphs: {{enabled: true}}\n"),
+    )
+    .err();
+    assert!(stderr.contains("data.hdt.graphs"), "{stderr}");
+    assert!(!refused.exists(), "nothing is published on a refusal");
+}
+
+/// The two reserved names have fixed meanings across the federation, so a
+/// source that uses one as a graph name is refused — and refused as soon as
+/// the sidecar exists, before the expensive steps run.
+#[test]
+fn a_source_naming_a_reserved_graph_is_refused_before_the_bundle_is_built() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("reserved.nq");
+    std::fs::write(
+        &source,
+        "<http://example.org/a> <http://example.org/b> <http://example.org/c> \
+         <urn:x-kgf:union> .\n",
+    )
+    .unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+
+    let stderr = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .err();
+    assert!(stderr.contains("urn:x-kgf:union"), "{stderr}");
+    assert!(!out.exists(), "nothing is published on a refusal");
+    let siblings: Vec<_> = std::fs::read_dir(out.parent().unwrap())
+        .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    assert!(siblings.is_empty(), "staging was left behind: {siblings:?}");
+}
+
+/// The transpose follows the number of graphs when the config does not state
+/// it: the `g` column costs one lookup per row with it and one probe per graph
+/// without, and its own size grows with the memberships it copies.
+#[test]
+fn the_membership_transpose_follows_the_number_of_graphs() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("many.nq");
+    let mut quads = String::new();
+    for graph in 0..40 {
+        quads.push_str(&format!(
+            "<http://example.org/s{graph}> <http://example.org/p> \
+             <http://example.org/o> <http://example.org/g{graph}> .\n"
+        ));
+    }
+    std::fs::write(&source, &quads).unwrap();
+
+    let index_bytes = |out: &Path, config: &str| -> u64 {
+        kgf(
+            &[
+                "build",
+                "--config",
+                "-",
+                "--out",
+                path(out),
+                "--input",
+                path(&source),
+                "--hdtc",
+                &hdtc(),
+            ],
+            config,
+        )
+        .ok();
+        std::fs::metadata(out.join("data.hdt.graphs.idx"))
+            .expect("an indexed bundle")
+            .len()
+    };
+
+    let follows = index_bytes(&dir.path().join("root/tinykg/follows"), CONFIG);
+    let stated = index_bytes(
+        &dir.path().join("root/tinykg/stated"),
+        &format!("{CONFIG}contents:\n  graphs: {{transpose: false}}\n"),
+    );
+    assert!(
+        follows > stated,
+        "40 graphs is over the threshold, so the index carries the \
+         transpose: {follows} bytes against {stated}"
+    );
 }

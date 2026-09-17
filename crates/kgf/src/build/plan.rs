@@ -49,6 +49,26 @@ pub const SKETCH_ROLES: &str = "subjects,objects";
 /// of knowledge graphs "overlap" through `rdfs:label`.
 pub const KEYSET_ROLES: &str = "subjects-only,objects-only,shared";
 
+/// The position-keyed layer sets a bundle with memberships publishes.
+///
+/// Both, always. A scoped pattern enumerates in its own permutation's order,
+/// so a POS or OPS pattern reads the layers keyed by that permutation's
+/// positions, and a bundle carrying only one of the two is refused at open
+/// rather than answered from the other.
+pub const GRAPH_POSITIONS: &str = "pos,ops";
+
+/// Graphs above which the membership index carries the transpose.
+///
+/// The quad view reads the graphs of one statement per row. From the transpose
+/// that is one lookup; without it, it is one probe per graph — so the per-row
+/// cost of the `g` column grows with the number of graphs, while the
+/// transpose's size grows with the number of memberships. A handful of graphs
+/// is cheap to probe and not worth a second copy of every membership; a graph
+/// partitioned into thousands of named graphs is the other way round. The line
+/// is drawn here rather than left to whichever side a bundle happens to fall
+/// on, and `contents.graphs.transpose` states it outright when it matters.
+pub const GRAPH_TRANSPOSE_THRESHOLD: u64 = 32;
+
 /// A host-local dataset slug.
 ///
 /// It is simultaneously a directory name under the bundle root and the first
@@ -427,6 +447,8 @@ pub struct Contents {
     /// one case where someone deliberately turned it off.
     #[serde(serialize_with = "serialize_text")]
     pub text: Option<Text>,
+    /// `data.hdt.graphs` and `data.hdt.graphs.idx`, or what decides them.
+    pub graphs: Graphs,
     /// Membership filters and overlap sketches.
     pub filters: Filters,
     /// Exact role key sets.
@@ -448,6 +470,23 @@ fn serialize_text<S: serde::Serializer>(
             disabled.end()
         }
     }
+}
+
+/// `data.hdt.graphs` and `data.hdt.graphs.idx`.
+///
+/// Both fields stay three-valued in the resolved plan, because neither can be
+/// settled from the config alone: whether a bundle carries memberships depends
+/// on the input, and whether the index carries the transpose depends on how
+/// many graphs the sidecar turns out to hold. A plan is a decision about the
+/// bundle, and these two are decisions about how to read what the build finds.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct Graphs {
+    /// Carry memberships, never carry them, or follow the input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Carry the transpose, never carry it, or follow the graph count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transpose: Option<bool>,
 }
 
 /// `data.hdt.perm`.
@@ -783,6 +822,10 @@ fn resolve_contents(contents: config::Contents) -> Result<Contents> {
     Ok(Contents {
         perm: Perm { position_maps },
         text,
+        graphs: Graphs {
+            enabled: contents.graphs.enabled,
+            transpose: contents.graphs.transpose,
+        },
         filters,
         keysets,
         stats: Stats {},
@@ -850,6 +893,43 @@ pub enum Input {
     },
 }
 
+impl Input {
+    /// Whether this input carries graph memberships to keep.
+    ///
+    /// An HDT carries them in the sidecar beside it or not at all. RDF carries
+    /// them when it is written in a syntax that has a fourth position, which
+    /// is read from the file name: the alternative is parsing every input
+    /// before deciding how to build it, and a file named `.nt` that holds
+    /// quads is not a file this build has to guess about — `contents.graphs`
+    /// says so outright.
+    fn carries_graphs(&self) -> bool {
+        match self {
+            Self::Hdt { path, .. } => hdtc::format::graph_sidecar_path(path).is_file(),
+            Self::Rdf { paths } => paths.iter().any(|path| quad_syntax(path)),
+        }
+    }
+}
+
+/// Whether a file name says its RDF carries graphs.
+///
+/// Compression suffixes are stripped first, so `data.nq.gz` reads as N-Quads.
+fn quad_syntax(path: &Path) -> bool {
+    let mut name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    for compressed in [".gz", ".bz2", ".xz", ".zst"] {
+        if let Some(stem) = name.strip_suffix(compressed) {
+            name = stem.to_owned();
+            break;
+        }
+    }
+    [".nq", ".nquads", ".trig"]
+        .iter()
+        .any(|syntax| name.ends_with(syntax))
+}
+
 /// Recorded in the manifest, never acted on. This is provenance, not identity:
 /// `content_digest` covers published bytes rather than build inputs.
 #[derive(Debug, Clone, Serialize)]
@@ -866,6 +946,34 @@ pub struct Provenance {
 }
 
 impl BundlePlan {
+    /// Whether this build carries the input's graph memberships.
+    ///
+    /// An unset `contents.graphs.enabled` follows the input, which is the only
+    /// reading that neither drops a quad source's graphs on the floor nor
+    /// gives every triples bundle a sidecar holding one layer. Set, it is
+    /// obeyed — except that memberships cannot be conjured from an HDT that
+    /// arrives without a sidecar, and a config asking for them there is a
+    /// mistake about the input rather than an instruction.
+    pub fn builds_graphs(&self) -> Result<bool> {
+        match self.config.contents.graphs.enabled {
+            Some(false) => Ok(false),
+            Some(true) => {
+                if let Input::Hdt { path, .. } = &self.input {
+                    ensure!(
+                        self.input.carries_graphs(),
+                        "contents.graphs.enabled asks for memberships, but {} has no {} \
+                         beside it and an HDT does not record which graph a triple came \
+                         from. Build the bundle from the RDF, or drop the key",
+                        path.display(),
+                        hdtc::format::graph_sidecar_path(Path::new("data.hdt")).display(),
+                    );
+                }
+                Ok(true)
+            }
+            None => Ok(self.input.carries_graphs()),
+        }
+    }
+
     /// The version directory this build publishes into.
     pub fn output(&self) -> &Path {
         &self.output
