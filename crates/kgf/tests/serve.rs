@@ -1258,6 +1258,10 @@ fn stock_comunica_5_3_queries_the_tpf_endpoint() {
     remote.publish("remote", "v1", REMOTE_NT, "2026-06-01T14:03:22Z");
     let remote_server = remote.serve_with(caps);
     let remote_endpoint = format!("http://{}/remote/v/v1/tpf", remote_server.address);
+    let quads = Deployment::new();
+    quads.publish_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-06-01T14:03:22Z");
+    let quads_server = quads.serve_with(caps);
+    let quads_endpoint = format!("http://{}/quads/v/v1/tpf", quads_server.address);
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("interop/comunica/test.mjs");
@@ -1265,6 +1269,7 @@ fn stock_comunica_5_3_queries_the_tpf_endpoint() {
         .arg(script)
         .arg(endpoint)
         .arg(remote_endpoint)
+        .arg(quads_endpoint)
         .status()
         .expect("run Node.js; install it and run npm ci --prefix interop/comunica first");
     assert!(
@@ -1468,6 +1473,233 @@ fn graph_scope_is_gated_on_the_capability_and_pages_over_the_wire() {
     };
     assert_eq!(links("quads")["graphs"], "/quads/v/v1/graphs");
     assert!(links("tox").get("graphs").is_none());
+}
+
+/// The TPF route over a bundle with memberships: the four-position Hydra
+/// form with the union declared as the default graph, and the serving rule
+/// for every form of `graph` — the quad view with unnamed statements
+/// untagged, the union constant untagged like an absent `graph` but one row
+/// per distinct triple, and a named graph or the unnamed constant tagging
+/// with itself — with `hydra:totalItems` the count of the view requested.
+#[test]
+fn tpf_serves_the_quad_view_and_scoped_views_by_the_serving_table() {
+    const HYDRA: &str = "http://www.w3.org/ns/hydra/core#";
+    const SD: &str = "http://www.w3.org/ns/sparql-service-description#";
+    const UNION: &str = "urn:x-kgf:union";
+    const UNNAMED: &str = "urn:x-kgf:unnamed";
+
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    deployment.publish_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let nquads = |target: &str| -> Vec<oxrdf::Quad> {
+        let response = server.request("GET", target, &[("Accept", "application/n-quads")]);
+        response.assert_status(200);
+        oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
+            .for_slice(&response.body)
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|error| panic!("{target} did not parse: {error}"))
+    };
+    // Data statements: everything outside the page's metadata graph.
+    let data = |quads: &[oxrdf::Quad]| -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = quads
+            .iter()
+            .filter(|quad| {
+                !matches!(&quad.graph_name, oxrdf::GraphName::NamedNode(node)
+                    if node.as_str().ends_with("#metadata"))
+            })
+            .map(|quad| {
+                let graph = match &quad.graph_name {
+                    oxrdf::GraphName::DefaultGraph => String::new(),
+                    oxrdf::GraphName::NamedNode(node) => node.as_str().to_owned(),
+                    other => panic!("unexpected graph name {other}"),
+                };
+                (quad.object.to_string(), graph)
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let total_items = |quads: &[oxrdf::Quad]| -> u64 {
+        quads
+            .iter()
+            .find(|quad| quad.predicate.as_str() == format!("{HYDRA}totalItems"))
+            .and_then(|quad| match &quad.object {
+                oxrdf::Term::Literal(literal) => literal.value().parse().ok(),
+                _ => None,
+            })
+            .expect("hydra:totalItems")
+    };
+    let mappings = |quads: &[oxrdf::Quad]| -> Vec<String> {
+        let mut properties: Vec<String> = quads
+            .iter()
+            .filter(|quad| quad.predicate.as_str() == format!("{HYDRA}property"))
+            .map(|quad| quad.object.to_string())
+            .collect();
+        properties.sort();
+        properties
+    };
+    let default_graph = |quads: &[oxrdf::Quad]| -> Option<(bool, String)> {
+        quads
+            .iter()
+            .find(|quad| quad.predicate.as_str() == format!("{SD}defaultGraph"))
+            .map(|quad| {
+                (
+                    matches!(quad.subject, oxrdf::NamedOrBlankNode::BlankNode(_)),
+                    quad.object.to_string(),
+                )
+            })
+    };
+
+    // The graph-unbound quad view: five memberships, layer 0 untagged.
+    let unbound = nquads("/quads/v/v1/tpf?limit=10");
+    assert_eq!(total_items(&unbound), 5);
+    assert_eq!(
+        data(&unbound),
+        vec![
+            ("<http://example.org/c>".to_owned(), String::new()),
+            (
+                "<http://example.org/c>".to_owned(),
+                "http://example.org/g1".to_owned()
+            ),
+            ("<http://example.org/d>".to_owned(), String::new()),
+            (
+                "<http://example.org/z>".to_owned(),
+                "http://example.org/g1".to_owned()
+            ),
+            (
+                "<http://example.org/z>".to_owned(),
+                "http://example.org/g2".to_owned()
+            ),
+        ]
+    );
+    assert_eq!(
+        mappings(&unbound),
+        vec![
+            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#object>",
+            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#predicate>",
+            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#subject>",
+            "<http://www.w3.org/ns/sparql-service-description#graph>",
+        ],
+        "a bundle with memberships publishes the four-position form"
+    );
+    assert_eq!(
+        default_graph(&unbound),
+        Some((true, format!("<{UNION}>"))),
+        "the union is declared as the default graph under a blank-node subject"
+    );
+    assert!(unbound.iter().any(|quad| {
+        quad.predicate.as_str() == format!("{HYDRA}template")
+            && quad
+                .object
+                .to_string()
+                .contains("{?subject,predicate,object,graph}")
+    }));
+    // A variable, as a bindings-restricted client sends it, is the same view.
+    assert_eq!(
+        data(&nquads("/quads/v/v1/tpf?graph=%3Fg&limit=10")),
+        data(&unbound)
+    );
+
+    // The union constant: each triple once, in the document's default graph
+    // like the rows a bare pattern reads, never tagged with the constant.
+    let union = nquads(&format!("/quads/v/v1/tpf?graph={UNION}&limit=10"));
+    assert_eq!(total_items(&union), 3);
+    assert!(
+        data(&union).iter().all(|(_, graph)| graph.is_empty()) && data(&union).len() == 3,
+        "{:?}",
+        data(&union)
+    );
+
+    // A named graph and the unnamed graph, tagged with themselves.
+    let g1 = nquads("/quads/v/v1/tpf?graph=http%3A%2F%2Fexample.org%2Fg1&limit=10");
+    assert_eq!(total_items(&g1), 2);
+    assert_eq!(
+        data(&g1),
+        vec![
+            (
+                "<http://example.org/c>".to_owned(),
+                "http://example.org/g1".to_owned()
+            ),
+            (
+                "<http://example.org/z>".to_owned(),
+                "http://example.org/g1".to_owned()
+            ),
+        ]
+    );
+    let unnamed = nquads(&format!("/quads/v/v1/tpf?graph={UNNAMED}&limit=10"));
+    assert_eq!(total_items(&unnamed), 2);
+    assert!(data(&unnamed).iter().all(|(_, graph)| graph == UNNAMED));
+
+    // Turtle can carry one graph: the union and scoped views, not the quad view.
+    let refused = server.request(
+        "GET",
+        "/quads/v/v1/tpf?limit=10",
+        &[("Accept", "text/turtle")],
+    );
+    refused.assert_status(406);
+    assert_eq!(refused.json()["code"], "not_acceptable");
+    let turtle = server.request(
+        "GET",
+        &format!("/quads/v/v1/tpf?graph={UNION}&limit=10"),
+        &[("Accept", "text/turtle")],
+    );
+    turtle.assert_status(200);
+    let triples: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+        .for_slice(&turtle.body)
+        .collect::<Result<_, _>>()
+        .expect("Turtle parses");
+    assert_eq!(
+        triples
+            .iter()
+            .filter(|quad| quad.predicate.as_str() == "http://example.org/b"
+                || quad.predicate.as_str() == "http://example.org/y")
+            .count(),
+        3
+    );
+
+    // A bindings-restricted request keeps the same rule.
+    let values = kgf_server::url::encode_value("(?s) { (<http://example.org/x>) }");
+    let restricted = nquads(&format!(
+        "/quads/v/v1/tpf?subject=%3Fs&graph=%3Fg&values={values}&limit=10"
+    ));
+    assert_eq!(
+        data(&restricted),
+        vec![
+            (
+                "<http://example.org/z>".to_owned(),
+                "http://example.org/g1".to_owned()
+            ),
+            (
+                "<http://example.org/z>".to_owned(),
+                "http://example.org/g2".to_owned()
+            ),
+        ]
+    );
+    let bound_graph = server.request(
+        "GET",
+        &format!(
+            "/quads/v/v1/tpf?subject=%3Fs&graph=%3Fg&values={}&limit=10",
+            kgf_server::url::encode_value(
+                "(?s ?g) { (<http://example.org/x> <http://example.org/g1>) }"
+            )
+        ),
+        &[("Accept", "application/n-quads")],
+    );
+    bound_graph.assert_status(400);
+
+    // Without memberships: the three-position form, no default-graph
+    // declaration, and every statement untagged.
+    let plain = nquads("/tox/v/v1/tpf?limit=10");
+    assert_eq!(mappings(&plain).len(), 3);
+    assert_eq!(default_graph(&plain), None);
+    assert!(data(&plain).iter().all(|(_, graph)| graph.is_empty()));
+    let refused = server.request(
+        "GET",
+        "/tox/v/v1/tpf?graph=http%3A%2F%2Fexample.org%2Fg1&limit=10",
+        &[("Accept", "application/n-quads")],
+    );
+    refused.assert_status(501);
 }
 
 #[test]

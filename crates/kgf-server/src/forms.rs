@@ -36,7 +36,7 @@ pub(crate) fn manifest_forms(
         }
         div."query-stack" {
             (fragment(mount, dataset, version, &empty, offers, true))
-            (tpf(mount, dataset, version, &empty, false))
+            (tpf(mount, dataset, version, &empty, offers, false))
             (count(mount, dataset, version, &empty, offers, false))
             (describe(mount, dataset, version, &empty, false))
             (sample(mount, dataset, version, &empty, false))
@@ -59,7 +59,7 @@ pub(crate) fn operation_form(
 ) -> Option<Markup> {
     let form = match operation {
         "fragment" => Some(fragment(mount, dataset, version, params, offers, false)),
-        "tpf" => Some(tpf(mount, dataset, version, params, false)),
+        "tpf" => Some(tpf(mount, dataset, version, params, offers, false)),
         "count" => Some(count(mount, dataset, version, params, offers, false)),
         "describe" => Some(describe(mount, dataset, version, params, false)),
         "sample" => Some(sample(mount, dataset, version, params, false)),
@@ -70,8 +70,15 @@ pub(crate) fn operation_form(
     Some(html! { div."query-stack" { (form) } })
 }
 
-fn tpf(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
-    let controls = vec![
+fn tpf(
+    mount: &Mount,
+    dataset: &str,
+    version: &str,
+    params: &Params,
+    offers: Offers,
+    open: bool,
+) -> Markup {
+    let mut controls = vec![
         term_control(
             "tpf",
             "subject",
@@ -93,15 +100,25 @@ fn tpf(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bool)
             params.get("object"),
             "http://example.org/object or \"text\"@en",
         ),
-        number_control(
-            "tpf",
-            "limit",
-            "Rows",
-            params.get("limit"),
-            1,
-            "server default",
-        ),
     ];
+    if offers.graphs {
+        controls.push(text_control(
+            "tpf",
+            "graph",
+            "Graph",
+            params.get("graph"),
+            "urn:x-kgf:union, a graph IRI, or blank for every graph",
+            false,
+        ));
+    }
+    controls.push(number_control(
+        "tpf",
+        "limit",
+        "Rows",
+        params.get("limit"),
+        1,
+        "server default",
+    ));
     form(
         "TPF",
         "Browse the standard Triple Pattern Fragments interface. IRIs are bare, not CURIEs or angle-bracketed.",

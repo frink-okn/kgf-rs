@@ -898,6 +898,9 @@ pub struct Answer {
     /// show its label. `None` for every operation but `/describe`.
     #[serde(skip)]
     described: Option<String>,
+    /// How an RDF representation tags each statement's graph.
+    #[serde(skip)]
+    tagging: GraphTagging,
 }
 
 impl Renders for Answer {
@@ -1044,6 +1047,42 @@ const HYDRA_VARIABLE_REPRESENTATION: &str =
     "http://www.w3.org/ns/hydra/core#variableRepresentation";
 const HYDRA_EXPLICIT_REPRESENTATION: &str =
     "http://www.w3.org/ns/hydra/core#ExplicitRepresentation";
+const SD_GRAPH: &str = "http://www.w3.org/ns/sparql-service-description#graph";
+const SD_DEFAULT_DATASET: &str = "http://www.w3.org/ns/sparql-service-description#defaultDataset";
+const SD_DEFAULT_GRAPH: &str = "http://www.w3.org/ns/sparql-service-description#defaultGraph";
+
+/// How an RDF representation names the graph of each data statement.
+///
+/// The rule a graph-unbound request follows is the one a SPARQL client's
+/// `GRAPH ?g` needs: the unnamed graph's statements go untagged, in the
+/// document's default graph, and every other membership is tagged with its
+/// graph. A request that named a graph gets every statement tagged with that
+/// name, except the union, whose statements are the document's default graph
+/// whether the request named the constant or left `graph` out. The union is
+/// what a client's default-graph pattern reads, and a paging client matches
+/// every page after the first against the pattern's literal graph term, so
+/// tagging union rows with the constant would lose them from the second page
+/// on. The union constant therefore never appears as a tag in any response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GraphTagging {
+    /// Every statement in the default graph: the union, unnamed.
+    Untagged,
+    /// Every statement tagged with one graph name.
+    Fixed(String),
+    /// Each statement tagged with its row's graph, the unnamed graph excepted.
+    PerRow,
+}
+
+impl GraphTagging {
+    fn for_scope(scope: &GraphScope) -> Self {
+        match scope.selector() {
+            GraphSelector::Union => Self::Untagged,
+            GraphSelector::Unnamed => Self::Fixed(kgf_store::UNNAMED_GRAPH_IRI.to_owned()),
+            GraphSelector::Named(term) => Self::Fixed(term.dictionary().to_owned()),
+            GraphSelector::All => Self::PerRow,
+        }
+    }
+}
 
 struct TpfMetadata {
     page: NamedNode,
@@ -1203,7 +1242,17 @@ impl Answer {
                 "the fragment page could not be represented as RDF",
             ));
         }
-        let mut triples = Vec::with_capacity(keep);
+        // The quad view has no single graph to serve, so a graph syntax cannot
+        // carry it; every other form is one graph and serializes untagged.
+        if matches!(syntax, RdfSyntax::Graph(_)) && self.tagging == GraphTagging::PerRow {
+            return Err(Problem::new(
+                ErrorCode::NotAcceptable,
+                "the quad view puts each statement in its graph, which a single-graph syntax \
+                 cannot represent; ask for N-Quads, TriG or JSON-LD, or scope the request with \
+                 a graph",
+            ));
+        }
+        let mut statements = Vec::with_capacity(keep);
         let mut data = HashSet::with_capacity(keep);
         for row in self.rows.iter().take(keep) {
             let cell = |position| {
@@ -1230,8 +1279,19 @@ impl Answer {
                     .map_err(|error| unreadable("parsing an RDF predicate IRI", &error))?,
                 rdf_object(object.as_bytes())?,
             );
-            if data.insert(triple.clone()) {
-                triples.push(triple);
+            let graph_name = match &self.tagging {
+                GraphTagging::Untagged => GraphName::DefaultGraph,
+                GraphTagging::Fixed(name) => {
+                    GraphName::NamedNode(metadata_iri(name, "a graph name")?)
+                }
+                GraphTagging::PerRow => match row.graph.as_deref() {
+                    None | Some(kgf_store::UNNAMED_GRAPH_IRI) => GraphName::DefaultGraph,
+                    Some(name) => GraphName::NamedNode(metadata_iri(name, "a graph name")?),
+                },
+            };
+            let quad = triple.in_graph(graph_name);
+            if data.insert(quad.clone()) {
+                statements.push(quad);
             }
         }
 
@@ -1242,7 +1302,12 @@ impl Answer {
         let prefixes = [("kgfbn", self.blank_nodes.iri_prefix())];
         let serialized = match syntax {
             RdfSyntax::Graph(format) => {
-                let mut graph = triples;
+                // One graph, so the statements' graph names are dropped: a
+                // scoped or union answer serialized as Turtle is its triples.
+                let mut graph: Vec<Triple> = statements
+                    .into_iter()
+                    .map(|quad| Triple::new(quad.subject, quad.predicate, quad.object))
+                    .collect();
                 if let Some(metadata) = metadata {
                     graph.reserve(metadata.quads.len() + usize::from(next.is_some()));
                     graph.extend(metadata.quads.iter().map(|quad| {
@@ -1258,13 +1323,8 @@ impl Answer {
             }
             RdfSyntax::Dataset(format) => {
                 let metadata_len = metadata.as_ref().map_or(0, |value| value.quads.len());
-                let mut quads =
-                    Vec::with_capacity(triples.len() + metadata_len + usize::from(next.is_some()));
-                quads.extend(
-                    triples
-                        .into_iter()
-                        .map(|triple| triple.in_graph(GraphName::DefaultGraph)),
-                );
+                let mut quads = statements;
+                quads.reserve(metadata_len + usize::from(next.is_some()));
                 if let Some(metadata) = metadata {
                     quads.extend(metadata.quads.iter().cloned());
                 }
@@ -1325,7 +1385,7 @@ impl Answer {
         // blank nodes, which have already been replaced by stable IRIs.
         let mut used = HashSet::new();
         let search = metadata_blank_node("kgf-hydra-search", &mut used);
-        let mappings = [
+        let mut mappings = vec![
             (
                 "subject",
                 RDF_SUBJECT,
@@ -1342,7 +1402,19 @@ impl Answer {
                 metadata_blank_node("kgf-hydra-object", &mut used),
             ),
         ];
-        let mut triples = Vec::with_capacity(24);
+        // A bundle with memberships publishes the four-position form, and
+        // declares the union as its default graph — under a blank node,
+        // because that is one of the subjects a client reads the declaration
+        // from; the dataset resource itself is not.
+        let graphs = self.target.offers.graphs;
+        if graphs {
+            mappings.push((
+                "graph",
+                SD_GRAPH,
+                metadata_blank_node("kgf-hydra-graph", &mut used),
+            ));
+        }
+        let mut triples = Vec::with_capacity(32);
         triples.push(Triple::new(
             metadata_graph.clone(),
             metadata_iri(FOAF_PRIMARY_TOPIC, "foaf:primaryTopic")?,
@@ -1371,11 +1443,25 @@ impl Answer {
         triples.push(Triple::new(
             search.clone(),
             metadata_iri(HYDRA_TEMPLATE, "hydra:template")?,
-            Literal::new_simple_literal(format!(
-                "{}{{?subject,predicate,object}}",
-                dataset.as_str()
-            )),
+            Literal::new_simple_literal(if graphs {
+                format!("{}{{?subject,predicate,object,graph}}", dataset.as_str())
+            } else {
+                format!("{}{{?subject,predicate,object}}", dataset.as_str())
+            }),
         ));
+        if graphs {
+            let default_dataset = metadata_blank_node("kgf-default-dataset", &mut used);
+            triples.push(Triple::new(
+                dataset.clone(),
+                metadata_iri(SD_DEFAULT_DATASET, "sd:defaultDataset")?,
+                default_dataset.clone(),
+            ));
+            triples.push(Triple::new(
+                default_dataset,
+                metadata_iri(SD_DEFAULT_GRAPH, "sd:defaultGraph")?,
+                metadata_iri(kgf_store::UNION_GRAPH_IRI, "the union graph IRI")?,
+            ));
+        }
         triples.push(Triple::new(
             search.clone(),
             metadata_iri(
@@ -3944,6 +4030,7 @@ pub fn fragment(
         bindings: false,
         absent_terms: Vec::new(),
         blank_nodes,
+        tagging: GraphTagging::for_scope(&request.graph),
     };
 
     match (
@@ -4133,6 +4220,7 @@ pub fn binding_fragment(
         bindings: true,
         absent_terms: absent_graph.into_iter().collect(),
         blank_nodes,
+        tagging: GraphTagging::for_scope(&request.graph),
     };
     let paging = Paging {
         cursor: request.cursor.as_ref(),
@@ -4947,6 +5035,7 @@ pub fn describe(
             bindings: false,
             absent_terms,
             blank_nodes,
+            tagging: GraphTagging::Untagged,
         },
         phases,
         Paging {
@@ -5034,6 +5123,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         blank_nodes,
         page_labels: HashMap::new(),
         described: None,
+        tagging: GraphTagging::Untagged,
     })
 }
 
@@ -5696,6 +5786,7 @@ struct Envelope {
     bindings: bool,
     absent_terms: Vec<AbsentTerm>,
     blank_nodes: SkolemScope,
+    tagging: GraphTagging,
 }
 
 /// Where a page starts, how far it may go, and what a cursor out of it binds to.
@@ -5904,6 +5995,7 @@ fn finish(
         bindings,
         absent_terms,
         blank_nodes,
+        tagging,
     } = envelope;
 
     // Materializing is where the bytes appear, so it is where the byte budget
@@ -5959,6 +6051,7 @@ fn finish(
         blank_nodes,
         page_labels: HashMap::new(),
         described: None,
+        tagging,
     })
 }
 

@@ -481,7 +481,16 @@ async fn tpf(
         AccessOperation::Tpf,
         wants,
         Representation::TPF,
-        |params, limits, release| request::Tpf::parse(params, limits, &release.binding()),
+        |params, limits, release| {
+            let memberships = release.declares(Capability::Graphs);
+            let request = request::Tpf::parse(params, limits, &release.binding(), memberships)?;
+            let graph = match &request {
+                request::Tpf::Plain(request) => &request.graph,
+                request::Tpf::Values(request) => &request.graph,
+            };
+            declares_graphs(release, graph.needs_sidecar())?;
+            Ok(request)
+        },
         answer::tpf,
     )
     .await

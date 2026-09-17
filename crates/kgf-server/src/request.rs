@@ -787,6 +787,68 @@ impl GraphScope {
         }
     }
 
+    /// Read `/tpf`'s `graph`, in Hydra's explicit representation: a bare IRI,
+    /// or a variable as a bindings-restricted client sends it.
+    ///
+    /// The route's default differs from `/fragment`'s. A bundle with
+    /// memberships publishes the four-position form, and a client that leaves
+    /// `graph` out — or sends a variable — is asking for every membership,
+    /// tagged with its graph; the union it reaches by naming the union
+    /// constant, which the page metadata declares as the default graph. A
+    /// bundle without memberships has only the union to offer, so there the
+    /// absent parameter reads it.
+    fn parse_tpf(params: &Params, limits: Limits<'_>, memberships: bool) -> Result<Self, Problem> {
+        let unbound = || {
+            if memberships {
+                GraphSelector::All
+            } else {
+                GraphSelector::Union
+            }
+        };
+        match params.get("graph").filter(|text| !text.is_empty()) {
+            None => Ok(Self {
+                selector: unbound(),
+                requested: None,
+            }),
+            Some(text) if text.starts_with('?') => {
+                Variable::parse(text, "graph")?;
+                Ok(Self {
+                    selector: unbound(),
+                    requested: Some(text.to_owned()),
+                })
+            }
+            Some(text) => {
+                let term = BoundTerm::parse_tpf("graph", text, limits)?;
+                if term.kind != BoundKind::Iri {
+                    return Err(Problem::new(
+                        ErrorCode::BadTermSyntax,
+                        format!(
+                            "`graph` names a graph by IRI, or a variable; {} is not one",
+                            reflected(text)
+                        ),
+                    ));
+                }
+                let selector = match term.dictionary() {
+                    UNION_GRAPH_IRI => GraphSelector::Union,
+                    UNNAMED_GRAPH_IRI => GraphSelector::Unnamed,
+                    _ => GraphSelector::Named(term),
+                };
+                Ok(Self {
+                    selector,
+                    requested: Some(text.to_owned()),
+                })
+            }
+        }
+    }
+
+    /// The variable a bindings-restricted TPF client named for the graph,
+    /// if it sent one.
+    fn tpf_variable(&self) -> Option<&str> {
+        self.requested
+            .as_deref()
+            .filter(|text| text.starts_with('?'))
+    }
+
     /// Read a body's `g`, which carries the same syntax as the parameter.
     fn parse_body(
         text: Option<&str>,
@@ -1604,11 +1666,30 @@ impl BindingFragment {
     fn parse_values(
         params: &Params,
         pattern: BindingPattern,
+        graph: GraphScope,
         limits: Limits<'_>,
         bundle: &BundleBinding,
     ) -> Result<Self, Problem> {
         let values = params.get("values").expect("the caller selected values=");
         let bindings = Bindings::parse_values(values, &pattern, limits)?;
+        // A table column for the graph variable would scope each row to its
+        // own graph. This build scopes a request to one graph or to every
+        // graph, so such a column is refused rather than ignored.
+        if let Some(variable) = graph.tpf_variable()
+            && bindings
+                .columns
+                .keys()
+                .any(|column| column.as_str() == variable)
+        {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "values= binds the graph variable {}, which this build does not support; \
+                     scope the request with graph=<IRI> instead",
+                    reflected(variable)
+                ),
+            ));
+        }
         let limit = page_size(
             params,
             "limit",
@@ -1619,11 +1700,13 @@ impl BindingFragment {
         let canonical = bindings.canonicalize(pattern.canonicalize(String::new()));
         let binding = CursorBinding::new(
             bundle,
-            &CanonicalRequest::new(Operation::Tpf).with("bindings", &canonical),
+            &CanonicalRequest::new(Operation::Tpf)
+                .with("bindings", &canonical)
+                .with_opt("g", graph.canonical()),
         );
         Ok(Self {
             pattern,
-            graph: GraphScope::union(),
+            graph,
             bindings,
             limit,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
@@ -1929,6 +2012,7 @@ impl Tpf {
         "subject",
         "predicate",
         "object",
+        "graph",
         "values",
         "limit",
         "cursor",
@@ -1936,16 +2020,19 @@ impl Tpf {
     ];
 
     /// Parse only Hydra `ExplicitRepresentation`; this route never consults
-    /// the manifest prefix map.
+    /// the manifest prefix map. `memberships` says whether the release
+    /// declares `graphs`, which decides what an absent `graph` reads.
     pub fn parse(
         params: &Params,
         limits: Limits<'_>,
         bundle: &BundleBinding,
+        memberships: bool,
     ) -> Result<Self, Problem> {
         accept_only(params, TPF, Self::PARAMETERS)?;
         let pattern = BindingPattern::parse_tpf(params, limits)?;
+        let graph = GraphScope::parse_tpf(params, limits, memberships)?;
         if params.get("values").is_some() {
-            return BindingFragment::parse_values(params, pattern, limits, bundle)
+            return BindingFragment::parse_values(params, pattern, graph, limits, bundle)
                 .map(Self::Values);
         }
 
@@ -1959,11 +2046,13 @@ impl Tpf {
         )?;
         let binding = CursorBinding::new(
             bundle,
-            &pattern.canonicalize(CanonicalRequest::new(Operation::Tpf)),
+            &pattern
+                .canonicalize(CanonicalRequest::new(Operation::Tpf))
+                .with_opt("g", graph.canonical()),
         );
         Ok(Self::Plain(Fragment {
             pattern,
-            graph: GraphScope::union(),
+            graph,
             limit,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
             candidates: Candidates(limits.budgets.candidate_budget),
@@ -3259,7 +3348,7 @@ impl GetRequest for Fragment {
 
 impl GetRequest for Tpf {
     fn normalize_params(params: &Params) -> Params {
-        params.without_empty(&["subject", "predicate", "object", "limit"])
+        params.without_empty(&["subject", "predicate", "object", "graph", "limit"])
     }
 
     fn work_class(&self) -> WorkClass {
@@ -3694,7 +3783,7 @@ mod tests {
     }
 
     fn tpf(query: &str) -> Result<Tpf, Problem> {
-        Tpf::parse(&params(query), limits(), &bundle())
+        Tpf::parse(&params(query), limits(), &bundle(), false)
     }
 
     fn schema(query: &str) -> Result<Schema, Problem> {
@@ -3839,7 +3928,7 @@ mod tests {
     #[test]
     fn an_explicit_empty_tpf_values_table_is_not_silently_ignored() {
         let normalized = Tpf::normalize_params(&params("values="));
-        let error = Tpf::parse(&normalized, limits(), &bundle()).unwrap_err();
+        let error = Tpf::parse(&normalized, limits(), &bundle(), false).unwrap_err();
         assert_eq!(error.code(), ErrorCode::MalformedRequest);
     }
 
@@ -4389,7 +4478,7 @@ mod tests {
             crate::url::encode_value(empty_values)
         );
         assert_eq!(
-            Tpf::parse(&params(&query), limits(), &bundle())
+            Tpf::parse(&params(&query), limits(), &bundle(), false)
                 .unwrap_err()
                 .code(),
             ErrorCode::MalformedRequest,
@@ -4412,7 +4501,7 @@ mod tests {
             "subject=%3Fs&predicate=%3Fp&object=%3Fo&values={}",
             crate::url::encode_value(values)
         );
-        let error = Tpf::parse(&params(&query), limits, &bundle()).unwrap_err();
+        let error = Tpf::parse(&params(&query), limits, &bundle(), false).unwrap_err();
         assert_eq!(error.code(), ErrorCode::PayloadTooLarge);
         assert_eq!(error.status(), 413);
     }
@@ -4432,7 +4521,7 @@ mod tests {
 
         let query = "subject=%3F%3Fperson&predicate=http%3A%2F%2Fexample.org%2Fknows&object=%3Fknown&values=%28%3Fperson%29%20%7B%20%28%3Chttp%3A%2F%2Fexample.org%2Falice%3E%29%20%7D";
         assert_eq!(
-            Tpf::parse(&params(query), limits(), &bundle())
+            Tpf::parse(&params(query), limits(), &bundle(), false)
                 .unwrap_err()
                 .code(),
             ErrorCode::MalformedRequest
@@ -4446,7 +4535,7 @@ mod tests {
             "subject=%3Fp&object=%3Fknown&values={}",
             crate::url::encode_value(values)
         );
-        let parsed = Tpf::parse(&params(&query), limits(), &bundle()).unwrap();
+        let parsed = Tpf::parse(&params(&query), limits(), &bundle(), false).unwrap();
         let Tpf::Values(parsed) = parsed else {
             panic!("values= must select the bindings grammar")
         };
@@ -4473,7 +4562,7 @@ mod tests {
             crate::url::encode_value("http://example.org/knows"),
             crate::url::encode_value(values)
         );
-        let parsed = Tpf::parse(&params(&query), limits(), &bundle()).unwrap();
+        let parsed = Tpf::parse(&params(&query), limits(), &bundle(), false).unwrap();
         let Tpf::Values(parsed) = parsed else {
             panic!("values= must select the bindings grammar")
         };
@@ -4500,7 +4589,7 @@ mod tests {
             "subject=%3Fs&predicate=%3Fp&object=%3Fvalue&values={}",
             crate::url::encode_value(values)
         );
-        let parsed = Tpf::parse(&params(&query), limits(), &bundle()).unwrap();
+        let parsed = Tpf::parse(&params(&query), limits(), &bundle(), false).unwrap();
         let Tpf::Values(parsed) = parsed else {
             panic!("values= must select the bindings grammar")
         };

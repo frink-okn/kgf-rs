@@ -92,24 +92,33 @@ rule, in N-Quads/TriG/JSON-LD:
 | `graph=` | Data quads | `hydra:totalItems` |
 |---|---|---|
 | absent | quad view; layer-0 memberships **untagged** (document default graph), others tagged with their graph | memberships |
-| `<urn:x-kgf:union>` | each triple once, tagged `urn:x-kgf:union` | distinct triples |
+| `<urn:x-kgf:union>` | each triple once, **untagged** | distinct triples |
 | `<G>` | G's triples, tagged G | count in G |
 | `<urn:x-kgf:unnamed>` | layer 0, tagged `urn:x-kgf:unnamed` | count in layer 0 |
 | `?g` (brTPF row variable) | as absent | as absent |
 
-The union constant tags rows only in answers to a request that named it, never in a
-graph-unbound response. Union rows are tagged rather than untagged because Comunica
-sends the identical `graph=urn:x-kgf:union` request for a bare pattern and for an
-explicit `GRAPH <urn:x-kgf:union>`, and keeps untagged rows only for the former;
-tagged rows satisfy both (measured by the s2-qpf implementation: untagged rows gave
-the explicit form 0 rows). Traced through Comunica 5.3.0's `QuerySourceQpf` and
-verified there: a bare pattern gets the union rows; `GRAPH ?g` requests with `graph`
-absent (`qpf`) or `graph=?g` (`brtpf`) and Comunica's own filter discards the untagged
-quads, so it sees named graphs only; `GRAPH <G>`, `GRAPH <urn:x-kgf:unnamed>`, and
-`GRAPH <urn:x-kgf:union>` pass straight through. No context flag is involved. A
-bundle without the capability keeps the three-mapping form. Turtle, being
-single-graph, can only serve the union and scoped views; the quad view is refused in
-it.
+The union constant never appears as a tag in any response. An earlier draft of this
+table tagged union rows with the constant so that the identical
+`graph=urn:x-kgf:union` request Comunica sends for a bare pattern and for an explicit
+`GRAPH <urn:x-kgf:union>` would satisfy both (measured on the s2-qpf implementation,
+whose fixture fit one page). Implementation (2026-09-17) showed that only the first
+page of a fragment goes through Comunica 5.3.0's `QuerySourceQpf`, whose filter
+accepts a default-graph pattern against rows tagged with the declared
+`sd:defaultGraph` *or* left in the document's default graph; every later page is
+identified as a plain RDF document and matched by `QuerySourceRdfJs` against the
+pattern's literal graph term, which knows nothing of the declaration. Tagged union
+rows therefore vanished from the second page on, and a bare `?s ?p ?o` returned one
+row of three. Untagged union rows page to the end, and the bare pattern — the query
+every client sends — is the one that must work. The cost is that stock Comunica reads
+nothing through `GRAPH <urn:x-kgf:union>`, on the first page or any other; that idiom
+belongs to KGF's own API and to a KGF-aware SPARQL source, where the union is the
+default graph. Traced through the same code and verified against a one-row-page
+listener: a bare pattern gets every union row; `GRAPH ?g` requests with `graph` absent
+(`qpf`) or `graph=?g` (`brtpf`) and Comunica's own filter discards the untagged
+quads, so it sees named graphs only; `GRAPH <G>` and `GRAPH <urn:x-kgf:unnamed>` pass
+straight through. No context flag is involved. A bundle without the capability keeps
+the three-mapping form. Turtle, being single-graph, can only serve the union and
+scoped views; the quad view is refused in it.
 
 ## Store operations this needs
 
@@ -132,10 +141,10 @@ it.
 - TPF route: tagging per row of the serving table; `sd:defaultGraph` present with the
   four-mapping form and absent with the three-mapping form.
 - `interop/comunica/test.mjs`, as both `qpf` and `brtpf` sources and with no
-  `unionDefaultGraph` context: a bare `SELECT * { ?s ?p ?o }` returning 3 rows,
-  `GRAPH <urn:x-kgf:union>` returning the same 3, `GRAPH ?g` returning 3,
-  `GRAPH <urn:x-kgf:unnamed>` returning 2, and a bare two-pattern join to exercise
-  the bindings-restricted path.
+  `unionDefaultGraph` context, against one-row pages: a bare `SELECT * { ?s ?p ?o }`
+  returning 3 rows, `GRAPH ?g` returning 3, `GRAPH <urn:x-kgf:unnamed>` returning 2,
+  `GRAPH <g1>` returning 2, and a bare two-pattern join to exercise the
+  bindings-restricted path.
 - The metadata graph parses to a `sd:defaultGraph` triple whose subject is a blank
   node, and Comunica's extractor, run over the page, reports `defaultGraph`.
 - Build refuses a quad in graph `urn:x-kgf:union`.
