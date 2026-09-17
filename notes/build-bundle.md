@@ -149,6 +149,18 @@ graphs-index --positions pos,ops`: the index is where the two position-keyed lay
 sets a server requires are chosen, and `create --graphs-index` would choose them
 by its own default instead.
 
+**An HDT input brings its companions.** A `.graphs` sidecar beside it is taken
+when the bundle carries memberships, and a `.hdt.perm` beside it is taken
+instead of being rebuilt. Both bind to the HDT's own bytes, and opening one
+checks that binding before anything is published, so an index belonging to a
+different HDT is refused at the start rather than served later. The permutation
+is the hours in a build over a large graph, so taking one already built is what
+makes a second pass over the rest of the bundle affordable. An index carrying
+fewer position maps than `contents.perm.position_maps` names is refused, with
+the two ways out. The graph *index* is deliberately not taken: it is derived
+from the sidecar in minutes, and a server requires layer sets an arbitrary one
+need not carry. `--adopt` releases exactly what was taken.
+
 Two limits worth stating. Every `--input` is a file: each one's digest goes into
 the manifest's provenance, a directory has no digest, and a directory name says
 nothing about the syntax inside it either, so a directory is refused with that
@@ -163,15 +175,17 @@ copies. `null` reads the graph count out of the sidecar the build just wrote and
 adds `--transpose-ids` above 32 graphs (`GRAPH_TRANSPOSE_THRESHOLD` in
 `build/plan.rs`). A bundle that knows better says so.
 
-`describe` is the same shape with the opposite sign. A view per graph is a whole
-class-and-property projection per graph, in each of the three description
-artifacts and in the manifest range that declares it, so the description grows
-with the graphs times the schema and `/manifest` grows with it. `null` describes
-each graph up to 64 of them (`GRAPH_DESCRIPTION_THRESHOLD`) and none above, on
-the reasoning that a KG split by source or by release is the case where a
-per-graph schema is the most useful thing in the bundle, and a KG split per
-entity is the case where it describes nothing anyone asked for. Whatever it
-resolves to, the memberships are complete and `/graphs` pages them all.
+`describe` is the same shape and bounds a different thing. The analysis itself
+costs about one pass over the memberships however they are divided up, since the
+graphs of a dataset partition its statements and describing all of them is
+describing each statement once. What grows with the *number* of graphs is the
+published description: three view ranges per graph in the manifest, which is
+served whole, and a class-and-property projection per graph in each of the three
+artifacts. So `null` describes each graph up to 256 of them
+(`GRAPH_DESCRIPTION_THRESHOLD`) and none above, which is where a manifest stops
+being a document. A KG split by source, by release or by inference layer is well
+under that and is the case the per-graph view exists for. Whatever it resolves
+to, the memberships are complete and `/graphs` pages them all.
 
 **`contents.perm`, `contents.filters`, and `contents.keysets` have no
 `enabled`.** `data.hdt.perm` is required by rule 1: no fallback for a missing

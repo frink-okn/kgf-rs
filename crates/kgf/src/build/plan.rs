@@ -59,15 +59,21 @@ pub const GRAPH_POSITIONS: &str = "pos,ops";
 
 /// Graphs above which each one stops getting a description of its own.
 ///
-/// One view per graph is a whole class-and-property projection per graph, in
-/// each of the three description artifacts and in the manifest range that
-/// declares it, so the description set grows with the graphs times the schema
-/// and `/manifest` grows with it. A KG partitioned by source or by release
-/// stays well under this and is better for the per-graph view; a KG
-/// partitioned per entity is over it, and a schema projection per graph there
-/// describes nothing a reader wanted. `contents.graphs.describe` states it
-/// outright when a bundle knows better.
-pub const GRAPH_DESCRIPTION_THRESHOLD: u64 = 64;
+/// Not a bound on the analysis, which costs about one pass over the
+/// memberships however they are divided up: the graphs of a dataset partition
+/// its statements, so describing all of them is describing each statement
+/// once. What grows with the *number* of graphs is the published description —
+/// three view ranges per graph in the manifest, which is served whole, and a
+/// class-and-property projection per graph in each of the three artifacts.
+///
+/// So the line is drawn where a manifest stops being a document: a few hundred
+/// graphs is a KG partitioned by source, by release or by inference layer,
+/// which is the case the per-graph view exists for and which `/manifest`
+/// carries without complaint. A KG partitioned per entity is orders of
+/// magnitude past it, and a schema projection per graph there would describe
+/// nothing a reader wanted. `contents.graphs.describe` states it outright when
+/// a bundle knows better, and `/graphs` pages every graph either way.
+pub const GRAPH_DESCRIPTION_THRESHOLD: u64 = 256;
 
 /// Graphs above which the membership index carries the transpose.
 ///
@@ -920,6 +926,18 @@ impl Input {
     ///
     /// Every RDF input is a named file, which argument resolution ensures, so
     /// there is no directory here whose name could say nothing.
+    /// Whether a permutation index beside the input is taken rather than built.
+    ///
+    /// Decided from the path alone, so `--dry-run` prints the steps the build
+    /// will really run. Whether the index is *usable* is settled when it is
+    /// taken, where a refusal can name it.
+    pub fn adopts_permutation(&self) -> bool {
+        match self {
+            Self::Hdt { path, .. } => hdtc::format::permutation_index_path(path).is_file(),
+            Self::Rdf { .. } => false,
+        }
+    }
+
     /// The input as an operator would name it, for a message about what to fix.
     pub fn describe(&self) -> String {
         match self {

@@ -1713,11 +1713,12 @@ fn a_blank_named_graph_is_carried_without_being_described() {
 fn per_graph_description_follows_the_number_of_graphs() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("many.nq");
+    let graphs = 300;
     let mut quads = String::new();
-    for graph in 0..70 {
+    for graph in 0..graphs {
         quads.push_str(&format!(
             "<http://example.org/s{graph}> <http://example.org/p> \
-             <http://example.org/o> <http://example.org/g{graph}> .\n"
+             <http://example.org/o> <http://example.org/g{graph:04}> .\n"
         ));
     }
     std::fs::write(&source, &quads).unwrap();
@@ -1739,8 +1740,8 @@ fn per_graph_description_follows_the_number_of_graphs() {
         .ok();
     };
 
-    // Seventy graphs is over the line: the memberships are all there and the
-    // per-graph views are not.
+    // Three hundred graphs is over the line: the memberships are all there and
+    // the per-graph views are not.
     let many = dir.path().join("root/tinykg/many");
     build(&many, CONFIG, &source);
     assert!(many.join("data.hdt.graphs").exists());
@@ -1760,12 +1761,12 @@ fn per_graph_description_follows_the_number_of_graphs() {
         &format!("{CONFIG}contents:\n  graphs: {{describe: true}}\n"),
         &source,
     );
-    assert_eq!(views_of(&asked, "stats/schema-nodes.tsv").len(), 72);
+    assert_eq!(views_of(&asked, "stats/schema-nodes.tsv").len(), graphs + 2);
     // The card stays a card: the largest few, and the total beside them.
     let summary: serde_json::Value =
         serde_json::from_slice(&std::fs::read(asked.join("stats/summary.json")).unwrap()).unwrap();
     assert_eq!(summary["graphs"].as_array().unwrap().len(), 10);
-    assert_eq!(summary["graphs_total"], 70);
+    assert_eq!(summary["graphs_total"], graphs);
     kgf(&["manifest", path(&asked), "--check"], "").ok();
 
     // And the other way: a small bundle that does not want them.
@@ -1782,4 +1783,126 @@ fn per_graph_description_follows_the_number_of_graphs() {
         views_of(&declined, "stats/schema-nodes.tsv"),
         ["design", "queryable"]
     );
+}
+
+/// A permutation index beside an HDT input is taken rather than rebuilt, which
+/// is what makes a second opinion about the rest of the bundle affordable:
+/// building one over a large graph is the hours in a build.
+#[test]
+fn a_permutation_index_beside_the_input_is_taken_rather_than_rebuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+
+    // A first bundle, to take an HDT and its two companions from.
+    let staged = dir.path().join("staging/tinykg/v0");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&staged),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    let hdt = staged.join("data.hdt");
+    assert!(staged.join("data.hdt.perm").exists());
+
+    // The rehearsal says what the build will really do: no permutation step.
+    let rehearsal = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&dir.path().join("root/tinykg/rehearsed")),
+            "--hdt",
+            path(&hdt),
+            "--hdtc",
+            &hdtc(),
+            "--dry-run",
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(
+        !rehearsal.contains("hdtc perm"),
+        "an index beside the input is not rebuilt:\n{rehearsal}"
+    );
+    assert!(
+        rehearsal.contains("data.hdt.perm beside it"),
+        "the rehearsal says it is taken:\n{rehearsal}"
+    );
+
+    // And the build produces a bundle that checks, with the permutation and
+    // the memberships both taken from beside the input.
+    let out = dir.path().join("root/tinykg/taken");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--hdt",
+            path(&hdt),
+            "--adopt",
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    for artifact in ["data.hdt", "data.hdt.perm", "data.hdt.graphs"] {
+        assert!(out.join(artifact).exists(), "missing {artifact}");
+    }
+    kgf(&["manifest", path(&out), "--check"], "").ok();
+    // `--adopt` released everything it took, and nothing it did not: the graph
+    // index was rebuilt here, so the input's own copy stays where it was.
+    assert!(!hdt.exists());
+    assert!(!staged.join("data.hdt.perm").exists());
+    assert!(!staged.join("data.hdt.graphs").exists());
+    assert!(staged.join("data.hdt.graphs.idx").exists());
+
+    // An index that lacks a map the config asks for cannot serve as this
+    // bundle's, and the refusal names the two ways out.
+    let plain = dir.path().join("staging/tinykg/v1");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&plain),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    let stderr = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&dir.path().join("root/tinykg/mapped")),
+            "--hdt",
+            path(&plain.join("data.hdt")),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!("{CONFIG}contents:\n  perm: {{position_maps: [pos]}}\n"),
+    )
+    .err();
+    assert!(stderr.contains("position_maps"), "{stderr}");
+    assert!(stderr.contains("Remove that index"), "{stderr}");
 }

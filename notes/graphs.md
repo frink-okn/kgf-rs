@@ -167,12 +167,14 @@ already expresses both as `void:subset`. The counts are each graph's own, so the
 to more than the dataset's whenever a triple is in two graphs — which is the point of
 publishing them separately.
 
-**What it costs, and when it stops.** One view per graph is a whole
-class-and-property projection per graph, in each of the three description
-artifacts and in the manifest range that declares it, so the description set and
-`/manifest` grow with the graphs times the schema. A bundle with more than 64
-graphs therefore describes none of them one by one, and `contents.graphs.describe`
-states it outright either way. `/graphs` pages every graph whatever the
+**What it costs, and when it stops.** Not the analysis, which costs about one
+pass over the memberships however they are divided up: the graphs partition the
+statements, so describing all of them is describing each statement once. What
+grows with the number of graphs is the published description, three view ranges
+per graph in the manifest and a class-and-property projection per graph in each
+of the three artifacts. A bundle with more than 256 graphs therefore describes
+none of them one by one, and `contents.graphs.describe` states it outright
+either way. `/graphs` pages every graph whatever the
 description holds, and `stats/summary.json` names the largest ten with
 `graphs_total` beside them, so the card stays a card.
 

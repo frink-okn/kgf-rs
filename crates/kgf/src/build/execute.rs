@@ -23,7 +23,7 @@ use super::Build;
 use super::hdtc::{Runner, Step, render};
 use super::plan::{
     BundlePlan, GRAPH_DESCRIPTION_THRESHOLD, GRAPH_POSITIONS, GRAPH_TRANSPOSE_THRESHOLD, Input,
-    KEYSET_ROLES, SKETCH_ROLES,
+    KEYSET_ROLES, PositionMap, SKETCH_ROLES,
 };
 use crate::build::stats;
 use crate::manifest::Requested;
@@ -86,7 +86,7 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
         data: staging.path().join(artifact::HDT),
     };
     let graphs = plan.builds_graphs()?;
-    let inputs = materialize(plan, &runner, &layout, graphs)?;
+    let Materialized { inputs, adopted } = materialize(plan, &runner, &layout, graphs)?;
 
     // Read once, from the sidecar the core step just wrote: how many graphs
     // there are decides the transpose, and whether any is named by a blank
@@ -163,7 +163,7 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
         )
     })?;
     let _ = staging.keep();
-    release_adopted_input(plan, graphs);
+    release_adopted_input(plan, adopted);
     Ok(Built {
         manifest,
         description: outcome,
@@ -403,6 +403,7 @@ pub(super) fn rehearse(build: &Build) -> Result<String> {
         plan.config.semantics.prefix_tables.len()
     );
     let graphs = plan.builds_graphs()?;
+    let adopts_permutation = plan.input.adopts_permutation();
     if let Input::Hdt { path, adopt } = &plan.input {
         let verb = if *adopt { "move" } else { "copy" };
         let _ = writeln!(
@@ -418,12 +419,22 @@ pub(super) fn rehearse(build: &Build) -> Result<String> {
                 hdtc::format::graph_sidecar_path(path).display()
             );
         }
+        if adopts_permutation {
+            let _ = writeln!(
+                out,
+                "# {verb} {} beside it, instead of building one",
+                hdtc::format::permutation_index_path(path).display()
+            );
+        }
     }
     // The rehearsal cannot read a sidecar that does not exist yet, so an unset
     // transpose prints as the choice a bundle under the threshold gets, and
     // the line below says what really decides it.
     let transpose = plan.config.contents.graphs.transpose;
-    let mut steps = vec![(core_step(plan, &layout, graphs), Vec::new())];
+    let mut steps = Vec::new();
+    if !adopts_permutation {
+        steps.push((core_step(plan, &layout, graphs), Vec::new()));
+    }
     if graphs {
         let mut notes = Vec::new();
         if transpose.is_none() {
@@ -472,13 +483,31 @@ pub(super) fn rehearse(build: &Build) -> Result<String> {
     Ok(out)
 }
 
+/// What a build took from beside its input rather than building.
+///
+/// Only the files it actually placed: `--adopt` promises the input goes away,
+/// and a file this build did not take is not its to remove.
+#[derive(Debug, Clone, Copy, Default)]
+struct Adopted {
+    /// The graph membership sidecar.
+    graphs: bool,
+    /// The permutation index.
+    permutation: bool,
+}
+
+/// `data.hdt` and everything that came with it, and what was read to hash it.
+struct Materialized {
+    inputs: Vec<SourceInput>,
+    adopted: Adopted,
+}
+
 /// Put `data.hdt` and its permutation sidecar in place, and hash what was read.
 fn materialize(
     plan: &BundlePlan,
     runner: &Runner<'_>,
     layout: &Layout,
     graphs: bool,
-) -> Result<Vec<SourceInput>> {
+) -> Result<Materialized> {
     let data = &layout.data;
     match &plan.input {
         Input::Hdt { path, adopt } => {
@@ -512,12 +541,20 @@ fn materialize(
                     )
                 })?;
             }
-            // The index beside an input is deliberately not taken. It is
-            // derived, this server requires layer sets an arbitrary one need
-            // not carry, and rebuilding it costs a fraction of what verifying
-            // someone else's would.
-            runner.run(&core_step(plan, layout, graphs))?;
-            Ok(inputs)
+            // The graph *index* beside an input is deliberately not taken. It
+            // is derived from the sidecar in minutes, and this server requires
+            // layer sets an arbitrary one need not carry.
+            let permutation = adopt_permutation(plan, path, layout, *adopt)?;
+            if !permutation {
+                runner.run(&core_step(plan, layout, graphs))?;
+            }
+            Ok(Materialized {
+                inputs,
+                adopted: Adopted {
+                    graphs,
+                    permutation,
+                },
+            })
         }
         Input::Rdf { paths } => {
             // One `url` for several inputs cannot be apportioned, so it names
@@ -541,9 +578,72 @@ fn materialize(
             // assertion is settled first.
             verify_asserted_digest(plan, &inputs)?;
             runner.run(&core_step(plan, layout, graphs))?;
-            Ok(inputs)
+            Ok(Materialized {
+                inputs,
+                adopted: Adopted::default(),
+            })
         }
     }
+}
+
+/// Take the permutation index that sits beside an HDT input, if one does.
+///
+/// `hdtc perm` over a large HDT is hours, and an index already beside it is
+/// the index this build would produce. Taking it is the same trade as taking
+/// the graph sidecar: both bind to the HDT's own bytes, and opening one checks
+/// that binding before anything is published, so an index belonging to another
+/// HDT is refused here rather than served later.
+///
+/// What the config asks for still has to be there. An index carrying fewer
+/// position maps than `contents.perm.position_maps` names would publish a
+/// bundle that cannot answer what its own config promised, so it is refused
+/// with the two ways out. Extra maps are kept: the manifest describes the
+/// artifact that is there.
+fn adopt_permutation(
+    plan: &BundlePlan,
+    source: &Path,
+    layout: &Layout,
+    adopt: bool,
+) -> Result<bool> {
+    if !plan.input.adopts_permutation() {
+        return Ok(false);
+    }
+    let existing = hdtc::format::permutation_index_path(source);
+    let index = hdtc::format::PermutationIndex::open(&existing, source).with_context(|| {
+        format!(
+            "reading the permutation index {}, which sits beside the input and would be \
+             taken as this bundle's; remove it to build a fresh one instead",
+            existing.display()
+        )
+    })?;
+    for map in &plan.config.contents.perm.position_maps {
+        let component = match map {
+            PositionMap::Pos => hdtc::format::PermutationComponent::Pos,
+            PositionMap::Ops => hdtc::format::PermutationComponent::Ops,
+        };
+        let wanted = component.section_type(hdtc::format::PermutationSectionKind::PositionMap);
+        ensure!(
+            index
+                .sections()
+                .iter()
+                .any(|section| section.section_type == wanted),
+            "contents.perm.position_maps asks for the {} map and {} carries none. Remove that \
+             index so this build makes one with it, or drop the key",
+            map.as_str(),
+            existing.display()
+        );
+    }
+    place_unhashed(
+        &existing,
+        &hdtc::format::permutation_index_path(&layout.data),
+        adopt,
+    )
+    .with_context(|| format!("taking the permutation index {}", existing.display()))?;
+    tracing::info!(
+        source = %existing.display(),
+        "took the permutation index beside the input rather than building one"
+    );
+    Ok(true)
 }
 
 /// Check an asserted input digest against the bytes actually read.
@@ -689,17 +789,24 @@ fn linked(source: &Path, dest: &Path) -> bool {
 /// A failure here is reported and not fatal. The bundle is already published
 /// and correct; a leftover input is untidy, not wrong, and unpublishing a good
 /// bundle over it would be the worse trade.
-fn release_adopted_input(plan: &BundlePlan, graphs: bool) {
+fn release_adopted_input(plan: &BundlePlan, adopted: Adopted) {
     let Input::Hdt { path, adopt: true } = &plan.input else {
         return;
     };
-    // The sidecar goes only when this build took it: leaving it beside a
+    // Each companion goes only when this build took it: leaving one beside a
     // deleted HDT would leave a file that binds to nothing, but a build that
-    // deliberately dropped the memberships never took it, and deleting the
-    // caller's only copy of them would be this command's own data loss.
-    let sidecar = graphs.then(|| hdtc::format::graph_sidecar_path(path));
+    // deliberately dropped the memberships never took the sidecar, and
+    // deleting the caller's only copy of it would be this command's own data
+    // loss.
+    let sidecar = adopted
+        .graphs
+        .then(|| hdtc::format::graph_sidecar_path(path));
+    let permutation = adopted
+        .permutation
+        .then(|| hdtc::format::permutation_index_path(path));
     let released = std::iter::once(path.as_path())
         .chain(sidecar.as_deref())
+        .chain(permutation.as_deref())
         .filter(|file| file.is_file());
     for file in released {
         if let Err(error) = std::fs::remove_file(file) {
