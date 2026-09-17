@@ -796,6 +796,7 @@ mod tests {
     fn manifest() -> Manifest {
         Manifest {
             id: "tox".to_owned(),
+            components: Vec::new(),
             dataset_iri: Some("https://okn.example/id/tox".to_owned()),
             version: "2026-06-01".to_owned(),
             content_digest: "sha256:0123456789abcdef0123456789abcdef".to_owned(),

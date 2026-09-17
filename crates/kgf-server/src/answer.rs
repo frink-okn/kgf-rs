@@ -42,6 +42,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use maud::html;
@@ -54,6 +55,7 @@ use serde::{Deserialize, Serialize};
 use hdtc::format::{TextScanPosition, TextSearcher, parse_literal};
 use kgf_store::catalog::BundleId;
 use kgf_store::dict::{DictPosition, Dictionary, RoleCounts, ScanFlow, ScannedTerm};
+use kgf_store::manifest::Manifest;
 use kgf_store::pattern::{IdPattern, Selection};
 use kgf_store::{
     ClassPropertyStop, ClassRelationStop, IdTriple, Role, SchemaCollection,
@@ -110,6 +112,10 @@ pub struct Target {
     /// Logical dataset identity and the description link this release can
     /// actually answer, from the immutable manifest.
     dataset: Option<DatasetMetadata>,
+    /// The parts of the dataset this release declares, from the same manifest.
+    /// Held as the manifest itself, which the release already keeps behind an
+    /// `Arc`, so attaching it to a target costs a refcount rather than a copy.
+    declarations: Option<Arc<Manifest>>,
     /// The exact absolute GET URL received over HTTP. Hydra metadata keys its
     /// page controls by this IRI, so a merely equivalent canonical URL is not
     /// enough for an LDF client looking up controls for its request URL.
@@ -175,7 +181,28 @@ impl Target {
             offers,
             request_url,
             dataset: None,
+            declarations: None,
         }
+    }
+
+    /// Attach the release's manifest, for the declarations a page renders.
+    pub(crate) fn with_declarations(mut self, manifest: Arc<Manifest>) -> Self {
+        self.declarations = Some(manifest);
+        self
+    }
+
+    /// The parts of the dataset this release declares.
+    fn components(&self) -> &[kgf_store::manifest::Component] {
+        self.declarations
+            .as_deref()
+            .map_or(&[], |manifest| manifest.components.as_slice())
+    }
+
+    /// The component a graph holds, if this release says one does.
+    fn component_of_graph(&self, graph: &str) -> Option<&kgf_store::manifest::Component> {
+        self.components()
+            .iter()
+            .find(|component| component.graph.as_deref() == Some(graph))
     }
 
     /// Attach the release's logical dataset identity and whether its VoID
@@ -210,6 +237,7 @@ impl Target {
             offers: Offers::default(),
             request_url: None,
             dataset: None,
+            declarations: None,
         }
     }
 
@@ -1836,16 +1864,28 @@ impl Serialize for SearchEvidence {
 struct GraphEntry {
     published: Rc<str>,
     count: u64,
+    /// The component this graph holds, when the manifest says one does. It is
+    /// the graph's stable handle: a consumer keyed on the component id follows
+    /// an upstream rename of the IRI, and it is what `/schema` describes this
+    /// graph under.
+    component: Option<Rc<str>>,
     serialized: u64,
 }
 
 impl GraphEntry {
-    fn new(published: Rc<str>, term: u64, count: u64) -> Self {
-        let serialized =
-            serialized_object([(GRAPH, term), ("count", count.to_string().len() as u64)]);
+    fn new(published: Rc<str>, term: u64, count: u64, component: Option<Rc<str>>) -> Self {
+        let component_bytes = component
+            .as_deref()
+            .map_or(0, |id| serialized_bytes(&Term::Iri(Cow::Borrowed(id))));
+        let serialized = serialized_object([
+            (GRAPH, term),
+            ("count", count.to_string().len() as u64),
+            ("component", component_bytes),
+        ]);
         Self {
             published,
             count,
+            component,
             serialized,
         }
     }
@@ -1853,9 +1893,12 @@ impl GraphEntry {
 
 impl Serialize for GraphEntry {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(2))?;
+        let mut map = serializer.serialize_map(Some(2 + usize::from(self.component.is_some())))?;
         map.serialize_entry(GRAPH, &Term::from_dictionary(&self.published))?;
         map.serialize_entry("count", &self.count)?;
+        if let Some(component) = &self.component {
+            map.serialize_entry("component", component.as_ref())?;
+        }
         map.end()
     }
 }
@@ -3470,13 +3513,25 @@ pub fn schema(
             // that would answer 501.
             StatsView::Graph(graph) => Problem::new(
                 ErrorCode::NotFound,
-                match store.graphs() {
-                    Some(_) => format!(
+                match (
+                    target.component_of_graph(graph.as_str()),
+                    store.graphs().is_some(),
+                ) {
+                    // A graph a component claims is described under the
+                    // component's id, which is the stable handle for it.
+                    (Some(component), _) => format!(
+                        "graph `{}` holds component `{}` and is described under it; ask for \
+                         `view=component:{}`",
+                        graph.as_str(),
+                        component.id,
+                        component.id
+                    ),
+                    (None, true) => format!(
                         "this bundle has no description view for graph `{}`; `/graphs` lists \
                          the graphs it holds, which can be more than it describes",
                         graph.as_str()
                     ),
-                    None => format!(
+                    (None, false) => format!(
                         "this bundle carries no named graphs, so it has no description view \
                          for `{}`",
                         graph.as_str()
@@ -4438,7 +4493,10 @@ pub fn graphs_list(
                 .map_err(|error| unreadable("reading a graph's count", &error))?
         };
         let (published, term) = names.measured(graphs, id)?;
-        let row = GraphEntry::new(published, term, count);
+        let component = target
+            .component_of_graph(&published)
+            .map(|component| Rc::from(component.id.as_str()));
+        let row = GraphEntry::new(published, term, count, component);
         spent = spent.saturating_add(row.serialized);
         // Never on the first row, for the reason every page keeps its first
         // row: a page that carries nothing would resume where it was issued.
@@ -7614,9 +7672,22 @@ impl Resource for GraphsAnswer {
                 (cell, entry.count)
             })
             .collect();
+        // The component column appears only where something fills it, so a
+        // bundle that declares none keeps the two-column listing.
+        let components = self.graphs.iter().any(|entry| entry.component.is_some());
         let rows: Vec<Vec<Value<'_>>> = cells
             .iter()
-            .map(|(cell, count)| vec![cell.value(), Value::Number(*count)])
+            .zip(&self.graphs)
+            .map(|((cell, count), entry)| {
+                let mut row = vec![cell.value(), Value::Number(*count)];
+                if components {
+                    row.push(match &entry.component {
+                        Some(component) => Value::Code(component),
+                        None => Value::Text(""),
+                    });
+                }
+                row
+            })
             .collect();
         let summary = [
             ("triples", Value::Number(self.triples)),
@@ -7652,6 +7723,8 @@ impl Resource for GraphsAnswer {
                     h2 { "Graphs" }
                     @if rows.is_empty() {
                         (note("No graphs."))
+                    } @else if self.graphs.iter().any(|row| row.component.is_some()) {
+                        (results_table(&[GRAPH, "count", "component"], &rows))
                     } @else {
                         (results_table(&[GRAPH, "count"], &rows))
                     }

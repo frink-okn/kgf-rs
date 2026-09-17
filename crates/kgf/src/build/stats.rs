@@ -90,6 +90,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) prefix_tables: &'a [PathBuf],
     /// What the summary card says about the dataset.
     pub(crate) card: DatasetCard<'a>,
+    /// The parts of the dataset the publisher declared.
+    pub(crate) components: &'a [kgf_store::manifest::Component],
     /// Scratch directory for intermediates that are not published.
     pub(crate) work: &'a Path,
     /// What this bundle's graphs are, when it carries memberships at all. A
@@ -140,6 +142,7 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
         card,
         work,
         graphs,
+        components,
     } = inputs;
 
     let void_nt = work.join("void.nt");
@@ -196,9 +199,6 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
     graph.require_dataset_root(&root)?;
     let subject_ids = subject_ids(&void_hdt)?;
     let queryable = graph.project(&root, &subject_ids)?;
-    // A componentless bundle has one real graph. `design` and `queryable`
-    // are API aliases for that same root, not distinct RDF datasets.
-    let design = graph.project(&root, &subject_ids)?;
     // One view per named graph, and one for the unnamed graph under the name
     // the read API gives it. A graph is a subset of the published triples, the
     // same axis a component is on, so it is a view rather than a second kind
@@ -209,19 +209,51 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
         Some(facts) if facts.describe => graph_subsets(&graph, &root, facts)?,
         _ => Vec::new(),
     };
-    for (name, node) in subsets {
+    // The canonical component's own subset is the design view: the KG as its
+    // authors modelled it, which on a bundle carrying a materialized closure is
+    // a different graph from the one a query hits. A componentless bundle has
+    // one real graph, so there `design` and `queryable` stay API aliases for
+    // that same root rather than distinct RDF datasets.
+    let canonical = components
+        .iter()
+        .find(|component| component.role == kgf_store::manifest::ComponentRole::Source)
+        .and_then(|component| component.graph.as_deref())
+        .and_then(|graph| {
+            subsets
+                .iter()
+                .find(|(name, _)| name == graph)
+                .map(|(_, node)| node.clone())
+        });
+    let design = match &canonical {
+        Some(node) => graph
+            .project(node, &subject_ids)
+            .context("projecting the canonical component's description")?,
+        None => graph.project(&root, &subject_ids)?,
+    };
+    for (name, node) in &subsets {
+        let (name, node) = (name.clone(), node.clone());
         let projections = graph
             .project(&node, &subject_ids)
             .with_context(|| format!("projecting the description of graph {name}"))?;
-        // Built through the type that parses these names rather than spelled
-        // here: a view name this module invents is one no bundle could carry.
-        let view = kgf_store::StatsView::graph(&name)
-            .with_context(|| format!("graph {name} cannot name a description view"))?
-            .manifest_key()
-            .into_owned();
+        // A graph a component claims is described under the component's id,
+        // which is the publisher's stable handle for that part of the dataset;
+        // every other graph under its own IRI. Built through the type that
+        // parses these names rather than spelled here, so a view name this
+        // module invents is one no bundle could carry.
+        let component = components
+            .iter()
+            .find(|component| component.graph.as_deref() == Some(name.as_str()));
+        let view = match component {
+            Some(component) => kgf_store::StatsView::component(component.id.clone()),
+            None => kgf_store::StatsView::graph(&name),
+        }
+        .with_context(|| format!("graph {name} cannot name a description view"))?
+        .manifest_key()
+        .into_owned();
         graph_cards.push(GraphSummary {
             triples: graph.optional_count(&node, VOID_TRIPLES),
             counts: counts_of(&graph, &node),
+            component: component.map(|component| component.id.clone()),
             name,
             view: view.clone(),
         });
@@ -911,6 +943,8 @@ fn read_subject_section(
 struct GraphSummary {
     /// Its triple count, which is what the card ranks by.
     triples: u64,
+    /// The component this graph holds, when one claims it.
+    component: Option<String>,
     /// The graph's own IRI, or the reserved name of the unnamed graph.
     name: String,
     /// The description view describing it.
@@ -1029,6 +1063,7 @@ impl Summary {
             .map(|entry| {
                 json!({
                     "graph": entry.name,
+                    "component": entry.component,
                     "view": entry.view,
                     "counts": entry.counts,
                     "links": {

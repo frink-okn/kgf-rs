@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::indexed::IndexedHdt;
-use crate::manifest::{Counts, Manifest, ManifestDocument};
+use crate::manifest::{Counts, Manifest};
 use crate::map::PublishedBundle;
 use crate::pattern::IdPattern;
 use crate::store::{ArtifactSet, description_set_disagreement};
@@ -44,14 +44,7 @@ const VOID_SUBSET: &str = "http://rdfs.org/ns/void#subset";
 pub fn verify_description_artifacts(bundle: &PublishedBundle, manifest: &Manifest) -> Result<()> {
     let dir = bundle.path();
     manifest.validate(dir)?;
-    if manifest.carries_description_artifacts()
-        && ManifestDocument::read(dir)?.is_some_and(|document| document.declares_components())
-    {
-        return Err(description_set_disagreement(
-            dir,
-            "this build does not yet verify component description views against manifest component identities; use a componentless bundle until the full `kgf build` component contract is implemented",
-        ));
-    }
+    verify_component_views(dir, manifest)?;
     let artifacts = ArtifactSet::resolve(dir)?;
     let entries = manifest.description_artifacts();
     match (artifacts.description.as_ref(), entries) {
@@ -1245,6 +1238,38 @@ fn compare_class_properties(
                     view.manifest_key()
                 ),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Every `component:<id>` view names a component the manifest declares.
+///
+/// One direction only. A bundle may describe fewer parts than it declares —
+/// per-graph description is a build choice, and a component declared without a
+/// graph has no extent to describe — but a view naming a component nothing
+/// declares is one no consumer could interpret, and it would be the shape a
+/// stale manifest leaves behind.
+fn verify_component_views(dir: &Path, manifest: &Manifest) -> Result<()> {
+    let declared: std::collections::BTreeSet<&str> = manifest
+        .components
+        .iter()
+        .map(|component| component.id.as_str())
+        .collect();
+    for (artifact, entry) in &manifest.artifacts {
+        for view in entry.views.keys() {
+            let Some(id) = view.strip_prefix("component:") else {
+                continue;
+            };
+            if !declared.contains(id) {
+                return Err(description_set_disagreement(
+                    dir,
+                    &format!(
+                        "{artifact} carries a view for component {id:?}, which this manifest \
+                         does not declare"
+                    ),
+                ));
+            }
         }
     }
     Ok(())

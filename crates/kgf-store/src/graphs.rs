@@ -132,6 +132,17 @@ struct TransposeSpec {
 }
 
 impl Graphs {
+    /// Open only the membership artifacts of a published bundle.
+    ///
+    /// [`Store::open`](crate::Store::open) is the ordinary door and requires a
+    /// manifest. This one is for a caller that has to check a claim about a
+    /// bundle's graphs *before* the manifest describing it exists — a build
+    /// validating a declaration against the data it just wrote. `None` is a
+    /// bundle that carries no memberships.
+    pub fn open_bundle(bundle: &crate::map::PublishedBundle) -> Result<Option<Self>> {
+        crate::store::ArtifactSet::resolve(bundle.path())?.open_graphs(bundle)
+    }
+
     /// Bind a mapped sidecar and index to the HDT at `hdt`.
     ///
     /// hdtc parses both headers and checks the cheap bindings — each file's

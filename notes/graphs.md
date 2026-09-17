@@ -178,6 +178,16 @@ either way. `/graphs` pages every graph whatever the
 description holds, and `stats/summary.json` names the largest ten with
 `graphs_total` beside them, so the card stays a card.
 
+**A graph a component claims is described under the component's id.** A bundle
+may declare the parts of itself — the canonical release, an entailment, a derived
+overlay — and bind each to the graph holding it. Such a graph is then described as
+`component:<id>` rather than `graph:<IRI>`, listed with its component by
+`GET /graphs`, and, where it is the canonical one, projected as the *design view*
+that `/schema?view=design` and the summary card describe. That is the difference
+between a card describing a KG as its authors modelled it and one describing a
+materialized closure. Declaring a component says what a part of a dataset is; it
+does not say who built it, and `kgf build` runs no component DAG.
+
 **Not every graph gets one.** A graph whose stored name is a blank node has no IRI to
 name a view after, and the analysis gives it a bare subset with no service description
 saying which graph it is — which makes it indistinguishable from the unnamed graph's

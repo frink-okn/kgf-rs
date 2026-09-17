@@ -3379,6 +3379,18 @@ impl Deployment {
     /// only kind of test that can catch the two disagreeing about what a view
     /// is called or where its rows are.
     fn publish_built_quads(&self, dataset: &str, version: &str, source: &str, created: &str) {
+        self.publish_built(dataset, version, source, created, "");
+    }
+
+    /// The same, with extra build config appended — components, say.
+    fn publish_built(
+        &self,
+        dataset: &str,
+        version: &str,
+        source: &str,
+        created: &str,
+        extra: &str,
+    ) {
         let workspace = tempfile::tempdir().expect("build scratch");
         let input = workspace.path().join("source.nq");
         std::fs::write(&input, source).expect("write the build's input");
@@ -3387,7 +3399,7 @@ impl Deployment {
             &config,
             format!(
                 "schema: 1\ndataset: {{id: {dataset}, iri: 'https://example.org/{dataset}'}}\n\
-                 semantics: {{prefixes: {{ex: 'http://example.org/'}}}}\n"
+                 semantics: {{prefixes: {{ex: 'http://example.org/'}}}}\n{extra}"
             ),
         )
         .expect("write the build config");
@@ -3936,4 +3948,83 @@ fn a_built_quad_bundle_describes_each_of_its_graphs() {
         "{malformed:?}",
         malformed = malformed.json()
     );
+}
+
+/// A declared component is a graph with a name of its own: `/graphs` says which
+/// graph holds it, `/schema` describes it under that name, and the design view
+/// follows the canonical one rather than the merged whole.
+#[test]
+fn a_bundle_serves_the_components_it_declares() {
+    const G1: &str = "http://example.org/g1";
+
+    let deployment = Deployment::new();
+    deployment.publish_built(
+        "quads",
+        "v1",
+        WORKED_EXAMPLE_NQ,
+        "2026-09-17T09:00:00Z",
+        concat!(
+            "components:\n",
+            "  asserted: {role: source, graph: 'http://example.org/g1'}\n",
+            "  closure: {role: entailment, graph: 'http://example.org/g2', ",
+            "inputs: [asserted]}\n",
+        ),
+    );
+    let server = deployment.serve();
+
+    // The listing says which graphs are components, and which are not.
+    let graphs = server.get("/quads/v/v1/graphs");
+    graphs.assert_status(200);
+    let claimed: Vec<(String, Option<String>)> = graphs.json()["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["g"]["value"].as_str().unwrap().to_owned(),
+                entry["component"].as_str().map(str::to_owned),
+            )
+        })
+        .collect();
+    assert_eq!(
+        claimed,
+        vec![
+            ("urn:x-kgf:unnamed".to_owned(), None),
+            (G1.to_owned(), Some("asserted".to_owned())),
+            (
+                "http://example.org/g2".to_owned(),
+                Some("closure".to_owned())
+            ),
+        ]
+    );
+
+    // Its description is under the component's id, and asking for the graph's
+    // own name says where to look instead.
+    let component = server.get("/quads/v/v1/schema?view=component%3Aasserted");
+    component.assert_status(200);
+    assert_eq!(component.json()["node"]["counts"]["triples"], 2);
+    let by_graph = server.get("/quads/v/v1/schema?view=graph%3Ahttp%3A%2F%2Fexample.org%2Fg1");
+    by_graph.assert_status(404);
+    assert!(
+        by_graph.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("view=component:asserted"),
+        "{:?}",
+        by_graph.json()
+    );
+
+    // The design view is the canonical component, not the merged graph: two of
+    // the three distinct triples.
+    let design = server.get("/quads/v/v1/schema?view=design");
+    design.assert_status(200);
+    assert_eq!(design.json()["node"]["counts"]["triples"], 2);
+    let queryable = server.get("/quads/v/v1/schema?view=queryable");
+    assert_eq!(queryable.json()["node"]["counts"]["triples"], 3);
+
+    // And the manifest publishes what was declared.
+    let manifest = server.get("/quads/v/v1/manifest").json();
+    assert_eq!(manifest["components"][0]["id"], "asserted");
+    assert_eq!(manifest["components"][1]["role"], "entailment");
+    assert_eq!(manifest["components"][1]["inputs"][0], "asserted");
 }

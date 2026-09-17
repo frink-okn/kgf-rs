@@ -43,15 +43,15 @@ pub struct Config {
     #[serde(default)]
     pub resources: Resources,
 
-    /// Derived-triple components. Recognized, not yet supported.
+    /// The parts of this dataset, by id.
     ///
-    /// Named rather than left to `deny_unknown_fields` so that a config written
-    /// against the planned component DAG fails with an explanation instead of
-    /// "unknown field `components`". Claiming the key now stays additive: when
-    /// the DAG lands, the refusal becomes an implementation and no config that
-    /// works today breaks.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub components: Option<serde_norway::Value>,
+    /// Declaration, not derivation. An entry says what a part of the dataset
+    /// *is* — the canonical release, an entailment, a derived overlay — and
+    /// binds it to the graph holding it. Building a component from a recipe is
+    /// the component DAG, which this build does not run: an entry carrying
+    /// `files` or `tool` is refused with that reason rather than ignored.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub components: BTreeMap<String, Component>,
 
     /// Which components merge into `data.hdt`. As above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,6 +210,37 @@ impl Default for Text {
             untagged_language: None,
         }
     }
+}
+
+/// One declared part of the dataset.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Component {
+    /// `source`, `derived`, or `entailment`.
+    pub role: String,
+    /// The graph holding this component's triples.
+    ///
+    /// Omitted, the component is provenance and nothing more: it records what
+    /// went in and by what, and nothing can say which triples are its, so it
+    /// gets no description view and no `g=` scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<String>,
+    /// The components this one was computed over, by id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<String>,
+    /// What produced it, as the publisher names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator: Option<String>,
+    /// The entailment regime a `role: entailment` component was closed under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime: Option<String>,
+
+    /// A recipe this build cannot run. Recognized so it fails with a reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<serde_norway::Value>,
+    /// The same, for the external tool the component DAG would invoke.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<serde_norway::Value>,
 }
 
 /// `data.hdt.graphs` and `data.hdt.graphs.idx`. Built together or not at all.

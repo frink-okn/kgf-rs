@@ -931,21 +931,75 @@ fn the_documented_config_sample_parses() {
     );
 }
 
-/// The component DAG is not built here, and a config that declares one is
-/// refused with that reason rather than with "unknown field". The
-/// failure mode this prevents is quiet: a bundle whose config named components
-/// and whose artifacts contain none would be described as an ordinary bundle,
-/// with every per-component statistic and graph identity silently absent.
+/// Declaring a component is supported; building one from a recipe is the
+/// component DAG, which this build does not run. A config carrying a recipe is
+/// refused with that reason rather than half-obeyed, and so is `publish`, which
+/// selects what such a DAG would merge.
 #[test]
-fn a_config_declaring_components_is_refused_with_a_reason() {
-    for field in ["components", "publish"] {
+fn a_component_recipe_is_refused_and_a_declaration_is_not() {
+    let declared = concat!(
+        "components:\n",
+        "  asserted: {role: source, graph: 'http://example.org/g1'}\n",
+        "  closure: {role: entailment, graph: 'http://example.org/g2', inputs: [asserted]}\n",
+    );
+    let plan = kgf(
+        &["build", "--config", "-", "--check-config"],
+        &format!("{MINIMAL}{declared}"),
+    )
+    .ok();
+    let plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
+    assert_eq!(plan["components"][0]["id"], "asserted");
+    assert_eq!(plan["components"][0]["role"], "source");
+    assert_eq!(plan["components"][1]["inputs"][0], "asserted");
+
+    // A recipe names the DAG this build has no orchestrator for.
+    for recipe in ["files: [kg.nt.gz]", "tool: {argv: [owl-rl]}"] {
         let stderr = kgf(
             &["build", "--config", "-", "--check-config"],
-            &format!("{MINIMAL}{field}: []\n"),
+            &format!("{MINIMAL}components:\n  canonical: {{role: source, {recipe}}}\n"),
         )
         .err();
-        assert!(stderr.contains("no component DAG"), "{field}: {stderr}");
-        assert!(stderr.contains("--input"), "{field}: {stderr}");
+        assert!(
+            stderr.contains("component DAG this build does not run"),
+            "{stderr}"
+        );
+    }
+    let stderr = kgf(
+        &["build", "--config", "-", "--check-config"],
+        &format!("{MINIMAL}publish: [canonical]\n"),
+    )
+    .err();
+    assert!(stderr.contains("runs no DAG"), "{stderr}");
+
+    // What a declaration must be internally consistent about.
+    for (config, expected) in [
+        (
+            concat!(
+                "components:\n",
+                "  a: {role: source, graph: 'http://example.org/g1'}\n",
+                "  b: {role: source, graph: 'http://example.org/g2'}\n",
+            ),
+            "canonical",
+        ),
+        (
+            "components:\n  a: {role: nonsense, graph: 'http://example.org/g1'}\n",
+            "use `source`",
+        ),
+        (
+            "components:\n  a: {role: source, inputs: [missing]}\n",
+            "which no component declares",
+        ),
+        (
+            "components:\n  a: {role: source, graph: 'not an iri'}\n",
+            "not an absolute IRI",
+        ),
+    ] {
+        let stderr = kgf(
+            &["build", "--config", "-", "--check-config"],
+            &format!("{MINIMAL}{config}"),
+        )
+        .err();
+        assert!(stderr.contains(expected), "{config}: {stderr}");
     }
 }
 
@@ -1905,4 +1959,120 @@ fn a_permutation_index_beside_the_input_is_taken_rather_than_rebuilt() {
     .err();
     assert!(stderr.contains("position_maps"), "{stderr}");
     assert!(stderr.contains("Remove that index"), "{stderr}");
+}
+
+/// A declared component is described under its own id, and the canonical one
+/// becomes the design view — which is the whole point on a bundle whose merged
+/// graph is mostly derived triples.
+#[test]
+fn a_declared_component_is_described_under_its_id_and_becomes_the_design_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+    let config = concat!(
+        "components:\n",
+        "  asserted: {role: source, graph: 'http://example.org/g1'}\n",
+        "  closure: {role: entailment, graph: 'http://example.org/g2', inputs: [asserted]}\n",
+    );
+
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!("{CONFIG}{config}"),
+    )
+    .ok();
+
+    // A graph a component claims is described under the component's id; the
+    // graph nothing claims keeps its own IRI.
+    assert_eq!(
+        views_of(&out, "stats/schema-nodes.tsv"),
+        [
+            "design",
+            "queryable",
+            "component:asserted",
+            "component:closure",
+            "graph:urn:x-kgf:unnamed",
+        ]
+    );
+
+    // The design view is the canonical component's, not a copy of queryable:
+    // `g1` holds two of the three distinct triples.
+    let rows = |view: &str| -> Vec<String> {
+        std::fs::read_to_string(out.join("stats/schema-nodes.tsv"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix(&format!("{view}\t")).map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(rows("design"), rows("component:asserted"));
+    assert_ne!(rows("design"), rows("queryable"));
+
+    // The manifest records what was declared, and the summary names each
+    // graph's component.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["components"][0]["id"], "asserted");
+    assert_eq!(manifest["components"][0]["graph"], "http://example.org/g1");
+    assert_eq!(manifest["components"][1]["role"], "entailment");
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("stats/summary.json")).unwrap()).unwrap();
+    let claimed: Vec<(String, Option<String>)> = summary["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["graph"].as_str().unwrap().to_owned(),
+                entry["component"].as_str().map(str::to_owned),
+            )
+        })
+        .collect();
+    assert_eq!(
+        claimed,
+        vec![
+            (
+                "http://example.org/g1".to_owned(),
+                Some("asserted".to_owned())
+            ),
+            ("urn:x-kgf:unnamed".to_owned(), None),
+            (
+                "http://example.org/g2".to_owned(),
+                Some("closure".to_owned())
+            ),
+        ]
+    );
+    kgf(&["manifest", path(&out), "--check"], "").ok();
+
+    // A component naming a graph the data does not carry is refused, and
+    // nothing is published.
+    let refused = dir.path().join("root/tinykg/refused");
+    let stderr = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&refused),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!(
+            "{CONFIG}components:\n  ghost: {{role: source, graph: 'http://example.org/nope'}}\n"
+        ),
+    )
+    .err();
+    assert!(stderr.contains("is not one this bundle holds"), "{stderr}");
+    assert!(!refused.exists());
 }

@@ -132,6 +132,9 @@ pub(crate) struct Requested {
     pub(crate) roles: BTreeMap<String, Vec<String>>,
     /// Provenance for re-derivation. `None` keeps what the manifest has.
     pub(crate) source: Option<Source>,
+    /// The parts of the dataset the config declared. Empty keeps what the
+    /// manifest has, so re-describing a bundle by hand does not drop them.
+    pub(crate) components: Vec<kgf_store::manifest::Component>,
 }
 
 impl Requested {
@@ -169,6 +172,10 @@ impl Requested {
         }
 
         Ok(Self {
+            // `kgf manifest` describes a bundle that already exists and reads no
+            // build config, so it never declares components; the writer carries
+            // forward whatever the manifest already had.
+            components: Vec::new(),
             id: args.id.clone(),
             version: args.version.clone(),
             dataset_iri: args.dataset_iri.clone(),
@@ -378,7 +385,10 @@ fn inspect_bundle(dir: &Path) -> Result<BundleInspection> {
 /// bytes that will never be published. This is the same check, run as soon as
 /// the two artifacts exist, and it also catches the build that asked for
 /// memberships and produced none.
-pub(crate) fn check_staged_graphs(dir: &Path) -> Result<()> {
+pub(crate) fn check_staged_graphs(
+    dir: &Path,
+    components: &[kgf_store::manifest::Component],
+) -> Result<()> {
     let inspection = inspect_bundle(dir)?;
     ensure!(
         inspection
@@ -388,6 +398,55 @@ pub(crate) fn check_staged_graphs(dir: &Path) -> Result<()> {
         "the build asked for named graphs and produced no membership artifacts; \
          this is a bug in `kgf build` rather than in the input"
     );
+    check_component_graphs(dir, components)
+}
+
+/// Check that every component's graph is one this bundle holds.
+///
+/// A declared component is trusted about *what* its graph contains — nothing
+/// can check that `#asserted` holds the asserted axioms — but not about
+/// whether the graph is there at all. Checked where the declaration is made,
+/// so a config naming a graph the data does not carry fails before anything is
+/// published rather than serving a component nothing can scope to.
+///
+/// # Safety obligation
+///
+/// The same as [`inspect_bundle`]'s, and for the same reason: the mappings
+/// live only inside this call, which writes nothing, over a staging directory
+/// no other writer is touching.
+#[allow(unsafe_code)]
+pub(crate) fn check_component_graphs(
+    dir: &Path,
+    components: &[kgf_store::manifest::Component],
+) -> Result<()> {
+    let wanted: Vec<&str> = components
+        .iter()
+        .filter_map(|component| component.graph.as_deref())
+        .collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let bundle = unsafe { kgf_store::PublishedBundle::new(dir) };
+    // The memberships alone: this runs before the manifest exists, which is
+    // what `Store::open` would need.
+    let graphs = kgf_store::Graphs::open_bundle(&bundle)
+        .context("opening the staged memberships to check the declared components")?;
+    let graphs = graphs.context(
+        "components declare graphs, but this bundle carries no memberships. Set \
+         contents.graphs.enabled, or drop the `graph` from each component and declare \
+         them as provenance alone",
+    )?;
+    for graph in wanted {
+        let found = graphs
+            .resolve(graph.as_bytes())
+            .with_context(|| format!("looking up the component graph {graph}"))?;
+        ensure!(
+            found.is_some(),
+            "component graph {graph} is not one this bundle holds; `kgf build` refuses \
+             a declaration the data cannot back. `GET /graphs` on a built bundle lists \
+             the names it carries"
+        );
+    }
     Ok(())
 }
 
@@ -573,6 +632,14 @@ fn build(
             .clone()
             .or_else(|| previous.and_then(|m| m.homepage.clone())),
         publisher: publisher(requested, previous),
+        // Declared in the build config, which `kgf manifest` does not read, so
+        // regenerating a manifest by hand carries them forward like every other
+        // statement about the dataset rather than dropping them.
+        components: if requested.components.is_empty() {
+            previous.map(|m| m.components.clone()).unwrap_or_default()
+        } else {
+            requested.components.clone()
+        },
         counts: facts.counts(),
         capabilities: facts
             .capabilities()
@@ -1389,6 +1456,7 @@ mod tests {
             id: "d".to_owned(),
             dataset_iri: None,
             version: "v".to_owned(),
+            components: Vec::new(),
             content_digest: "sha256:0".to_owned(),
             created: None,
             formats: Formats::default(),

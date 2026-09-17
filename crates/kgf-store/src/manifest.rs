@@ -661,9 +661,97 @@ pub struct Manifest {
     /// The version this one supersedes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_version: Option<String>,
+    /// The parts of this dataset the publisher named.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<Component>,
     /// How this bundle was built, for re-derivation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<Source>,
+}
+
+/// One named part of the dataset.
+///
+/// A component is whatever the publisher declares one: the contributor's
+/// canonical release, an entailment, a derived overlay. It is not a claim about
+/// who built it — a bundle assembled elsewhere declares the components that
+/// arrived, and one this toolchain derives declares the ones it made.
+///
+/// Its extent is a named graph, so a component of a bundle carrying memberships
+/// is scopable (`g=`), counted, and described on its own. A component without a
+/// `graph` is provenance and nothing more: it records what went in and by what,
+/// and nothing can say which triples are its.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Component {
+    /// Stable handle for this part, and the `view=component:<id>` selector.
+    ///
+    /// The publisher's own name, which outlives the graph IRI that holds it: a
+    /// consumer keyed on the id survives an upstream rename.
+    pub id: String,
+    /// What kind of part it is.
+    pub role: ComponentRole,
+    /// The graph holding it, when the bundle can say which triples are its.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<String>,
+    /// The components it was computed over, by id.
+    ///
+    /// What the publisher says it was derived from. For a component this
+    /// toolchain did not build, that is a statement rather than a record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<String>,
+    /// What produced it, as the publisher names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator: Option<String>,
+    /// The entailment regime a `role: entailment` component was closed under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime: Option<String>,
+}
+
+/// What kind of part of the dataset a component is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ComponentRole {
+    /// The contributor's own data: the canonical component, and the one whose
+    /// schema the design view describes.
+    Source,
+    /// Triples derived from other components by some tool.
+    Derived,
+    /// Triples a reasoner entailed from other components.
+    Entailment,
+}
+
+impl ComponentRole {
+    /// The name this role is spelled by in a manifest and a build config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Derived => "derived",
+            Self::Entailment => "entailment",
+        }
+    }
+}
+
+impl Manifest {
+    /// The canonical component: the one whose schema the design view describes.
+    ///
+    /// `None` where no component claims `role: source`, which is every bundle
+    /// that declares none, and where several do — a case with no rule to pick
+    /// between them, refused when a bundle is built rather than guessed here.
+    pub fn canonical_component(&self) -> Option<&Component> {
+        let mut sources = self
+            .components
+            .iter()
+            .filter(|component| component.role == ComponentRole::Source);
+        let first = sources.next()?;
+        sources.next().is_none().then_some(first)
+    }
+
+    /// The component a graph holds, if one claims it.
+    pub fn component_of_graph(&self, graph: &str) -> Option<&Component> {
+        self.components
+            .iter()
+            .find(|component| component.graph.as_deref() == Some(graph))
+    }
 }
 
 /// Provenance: what this bundle was built from, and by what.
@@ -754,7 +842,54 @@ impl Manifest {
     /// same checks to an existing document. The path is used only to identify
     /// `manifest.json` in an error.
     pub fn validate(&self, bundle_dir: &Path) -> Result<()> {
+        self.validate_components()?;
         self.validate_description_artifacts(bundle_dir)
+    }
+
+    /// Check the declared components against each other.
+    ///
+    /// Only what the document itself can settle. Whether a component's graph is
+    /// one this bundle holds needs the membership sidecar, so it is checked
+    /// where the declaration is made rather than on every open.
+    fn validate_components(&self) -> Result<()> {
+        let syntax = |detail: String| Error::ManifestSyntax {
+            path: PathBuf::from("manifest.json"),
+            detail,
+        };
+        let mut ids = BTreeSet::new();
+        let mut graphs = BTreeSet::new();
+        for component in &self.components {
+            if crate::description::StatsView::component(component.id.clone()).is_none() {
+                return Err(syntax(format!(
+                    "component id {:?} cannot name a description view",
+                    component.id
+                )));
+            }
+            if !ids.insert(component.id.as_str()) {
+                return Err(syntax(format!(
+                    "component {:?} is declared twice",
+                    component.id
+                )));
+            }
+            if let Some(graph) = &component.graph
+                && !graphs.insert(graph.as_str())
+            {
+                return Err(syntax(format!(
+                    "graph {graph:?} is claimed by two components"
+                )));
+            }
+        }
+        for component in &self.components {
+            for input in &component.inputs {
+                if !ids.contains(input.as_str()) {
+                    return Err(syntax(format!(
+                        "component {:?} names input {input:?}, which no component declares",
+                        component.id
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Serialize to the canonical on-disk bytes: two-space indent, trailing
@@ -1388,6 +1523,7 @@ mod tests {
             id: "tiny".to_owned(),
             dataset_iri: None,
             version: "2026-08-01".to_owned(),
+            components: Vec::new(),
             content_digest: "sha256:0".to_owned(),
             created: None,
             formats: Formats::default(),

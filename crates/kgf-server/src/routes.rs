@@ -1159,7 +1159,8 @@ where
         },
         wants.request_url.clone(),
     )
-    .with_dataset_metadata(release.dataset_iri(), release.carries_description());
+    .with_dataset_metadata(release.dataset_iri(), release.carries_description())
+    .with_declarations(release.declarations());
     let labels = PageLabelProfile::for_request(
         &service,
         release,
@@ -1260,7 +1261,8 @@ where
         },
         wants.request_url.clone(),
     )
-    .with_dataset_metadata(release.dataset_iri(), release.carries_description());
+    .with_dataset_metadata(release.dataset_iri(), release.carries_description())
+    .with_declarations(release.declarations());
     let opened = Arc::clone(&service);
     let timed = blocking(&service, work_class, move || {
         let (store, open) = opened.open_observed(target.id())?;

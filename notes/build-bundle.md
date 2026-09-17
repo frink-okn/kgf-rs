@@ -115,6 +115,15 @@ contents:                      # what changes bytes
     encoding: elias-fano
   stats: {}                  # always built; no knobs yet
 
+components:                    # the parts of this dataset, by id
+  asserted:                    # `role: source` is the canonical one
+    role: source               # source | derived | entailment
+    graph: http://example.org/asserted
+  closure:
+    role: entailment
+    graph: http://example.org/closure
+    inputs: [asserted]         # what the publisher says it was computed over
+
 resources:
   memory_limit: 4G
   temp_dir: /scratch
@@ -134,6 +143,30 @@ Two naming decisions worth stating, because both will look arbitrary later.
 §4.3's capability map calls them; `hdtc sketch` and `hdtc keyset` are the tools
 that happen to produce them today. The config describes the bundle, so renaming
 an hdtc subcommand must not be a config break.
+
+**`components:` declares, it does not build.** A component is whatever the
+publisher names one: the canonical release, an entailment, a derived overlay.
+Declaring it says what a part of the dataset *is* and binds it to the graph
+holding it; it does not ask this command to produce anything. An entry carrying
+a recipe — `files`, or a `tool` and its `inputs` — is the component DAG, which
+this build has no orchestrator for, and is refused with that reason rather than
+half-obeyed. So is `publish:`, which selects what such a DAG would merge.
+
+Three things follow from a declaration. The graph is described under
+`component:<id>` instead of `graph:<IRI>`, so a consumer keyed on the
+publisher's own handle survives an upstream rename of the IRI. `GET /graphs`
+says which graphs are components. And the `role: source` component becomes the
+*design view*: `/schema?view=design` and the summary card describe it rather
+than the merged graph, which on a bundle carrying a materialized closure is the
+difference between describing the ontology and describing the reasoner's
+output. A component with no `graph` is provenance and nothing more — it gets no
+view and no `g=` scope, because nothing can say which triples are its.
+
+A declaration is *trusted*: nothing checks that the graph named `asserted` holds
+the asserted axioms. What is checked is that the graph exists, that ids are
+usable and unique, that `inputs` name declared components, and that at most one
+component claims `role: source`, since the canonical one is what the design view
+describes.
 
 **`contents.graphs` is tri-state, not a boolean.** A bundle carries memberships
 when the input has memberships to carry, which neither `true` nor `false` can

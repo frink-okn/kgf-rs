@@ -740,6 +740,13 @@ impl Release {
         self.manifest.parsed.dataset_iri.as_deref()
     }
 
+    /// The manifest's own statements about the dataset, for a page that
+    /// renders them. Shared rather than copied: the release already holds it
+    /// behind an `Arc`, and a request only reads it.
+    pub fn declarations(&self) -> std::sync::Arc<kgf_store::manifest::Manifest> {
+        std::sync::Arc::clone(&self.manifest.parsed)
+    }
+
     /// The CURIE prefixes this version's parameters accept.
     pub fn prefixes(&self) -> &PrefixMap {
         &self.prefixes
@@ -870,6 +877,7 @@ mod tests {
             predicate_roles: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             previous_version: None,
+            components: Vec::new(),
             source: None,
         })
         .expect("a manifest serializes")

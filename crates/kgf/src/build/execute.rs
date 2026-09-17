@@ -100,12 +100,18 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
         // cannot read is worth hearing about now rather than once the text
         // index, the sketches, the key sets and the description set have been
         // built over bytes that will never be published.
-        crate::manifest::check_staged_graphs(&layout.staging).with_context(|| {
-            format!(
-                "the memberships built from {} cannot be read back, so nothing was published",
-                plan.input.describe()
-            )
-        })?;
+        crate::manifest::check_staged_graphs(&layout.staging, &plan.config.components)
+            .with_context(|| {
+                format!(
+                    "the memberships built from {} cannot be read back, so nothing was \
+                     published",
+                    plan.input.describe()
+                )
+            })?;
+    } else {
+        // Without memberships there is no graph to bind a component to, and a
+        // declaration the data cannot back is refused rather than published.
+        crate::manifest::check_component_graphs(&layout.staging, &plan.config.components)?;
     }
 
     for step in sidecar_steps(plan, &layout) {
@@ -133,6 +139,7 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
             card,
             work: work.path(),
             graphs: graph_facts,
+            components: &plan.config.components,
         },
         &staged_stats,
     )?;
@@ -678,6 +685,7 @@ fn requested_manifest(
     prefixes: BTreeMap<String, String>,
 ) -> Result<Requested> {
     Ok(Requested {
+        components: plan.config.components.clone(),
         id: Some(plan.config.dataset.id.to_string()),
         version: Some(plan.version.to_string()),
         dataset_iri: Some(plan.config.dataset.iri.as_str().to_owned()),

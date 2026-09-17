@@ -582,6 +582,89 @@ pub struct ConfigPlan {
     pub contents: Contents,
     /// Limits for the external builders.
     pub resources: Resources,
+    /// The parts of this dataset the publisher declared, ordered by id.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<kgf_store::manifest::Component>,
+}
+
+/// Resolve the declared components, refusing what this build cannot honour.
+///
+/// Declaration only. A recipe — `files`, or a `tool` and its `inputs` — is the
+/// component DAG, which this build does not run, so an entry carrying one is
+/// refused with that reason rather than half-obeyed. What survives is the
+/// statement: an id, what kind of part it is, and the graph holding it.
+fn resolve_components(
+    components: BTreeMap<String, config::Component>,
+) -> Result<Vec<kgf_store::manifest::Component>> {
+    use kgf_store::manifest::{Component, ComponentRole};
+
+    let mut resolved = Vec::with_capacity(components.len());
+    let mut sources = Vec::new();
+    for (id, component) in components {
+        for (field, value) in [("files", &component.files), ("tool", &component.tool)] {
+            ensure!(
+                value.is_none(),
+                "component {id:?} declares `{field}`, which is a recipe for the component \
+                 DAG this build does not run. Drop it and declare what the component is: \
+                 its `role`, and the `graph` holding it"
+            );
+        }
+        let role = match component.role.as_str() {
+            "source" => ComponentRole::Source,
+            "derived" => ComponentRole::Derived,
+            "entailment" => ComponentRole::Entailment,
+            other => bail!(
+                "component {id:?} has role {other:?}; use `source` for the contributor's \
+                 own data, `derived` for triples some tool computed, or `entailment` for \
+                 triples a reasoner inferred"
+            ),
+        };
+        ensure!(
+            kgf_store::StatsView::component(id.clone()).is_some(),
+            "component id {id:?} cannot name a description view"
+        );
+        if let Some(graph) = &component.graph {
+            oxrdf::NamedNode::new(graph).with_context(|| {
+                format!("component {id:?} names graph {graph:?}, which is not an absolute IRI")
+            })?;
+        }
+        if role == ComponentRole::Source {
+            sources.push(id.clone());
+        }
+        resolved.push(Component {
+            id,
+            role,
+            graph: component.graph,
+            inputs: component.inputs,
+            generator: component.generator,
+            regime: component.regime,
+        });
+    }
+
+    // The canonical component is the one the design view describes, so a
+    // config naming two leaves the summary card with no answer to which the
+    // dataset is. Refused here rather than picked arbitrarily later.
+    ensure!(
+        sources.len() <= 1,
+        "components {} all claim `role: source`, and the canonical one is what the \
+         design view describes. Give exactly one that role",
+        sources.join(", ")
+    );
+
+    let declared: std::collections::BTreeSet<&str> = resolved
+        .iter()
+        .map(|component| component.id.as_str())
+        .collect();
+    for component in &resolved {
+        for input in &component.inputs {
+            ensure!(
+                declared.contains(input.as_str()),
+                "component {:?} names input {input:?}, which no component declares",
+                component.id
+            );
+        }
+    }
+    Ok(resolved)
 }
 
 /// hdtc's own defaults, restated here so a resolved plan is complete rather than
@@ -608,28 +691,22 @@ impl ConfigPlan {
             config::SCHEMA_VERSION
         );
 
-        // Refused rather than ignored. A bundle whose config declares components
-        // and whose artifacts contain none would be described as a plain bundle
-        // — its statistics, graph identities, and entailment flags would all
-        // be silently absent.
-        for (field, value) in [
-            ("components", &config.components),
-            ("publish", &config.publish),
-        ] {
-            ensure!(
-                value.is_none(),
-                "build config declares `{field}`, but this build has no component \
-                 DAG: it merges no derived components, binds no per-component graph \
-                 identity, and produces no per-component statistics. \
-                 Remove it, or build the components with their own tools and pass \
-                 the merged result as `--input`"
-            );
-        }
+        // Refused rather than ignored. `publish` selects which components a DAG
+        // merges into `data.hdt`, and this build runs no DAG: a config naming it
+        // would describe a merge that never happened.
+        ensure!(
+            config.publish.is_none(),
+            "build config declares `publish`, which selects what a component DAG \
+             merges into data.hdt. This build runs no DAG: declare the components \
+             already present in the input under `components`, or build them with \
+             their own tools and pass the merged result as `--input`"
+        );
 
         let dataset = resolve_dataset(config.dataset)?;
         let semantics = resolve_semantics(config.semantics)?;
         let contents = resolve_contents(config.contents)?;
         let resources = resolve_resources(config.resources)?;
+        let components = resolve_components(config.components)?;
 
         Ok(Self {
             schema: config.schema,
@@ -637,6 +714,7 @@ impl ConfigPlan {
             semantics,
             contents,
             resources,
+            components,
         })
     }
 }
