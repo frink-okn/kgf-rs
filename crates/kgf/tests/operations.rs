@@ -2823,6 +2823,26 @@ fn an_absent_graph_is_an_empty_answer_that_names_g() {
     assert_eq!(count["count"]["value"], 0);
     assert_eq!(count["absent_terms"][0]["parameter"], "g");
 
+    // A bindings count says it too, rather than leaving a client to read a
+    // column of zeros as data.
+    let body = serde_json::json!({
+        "pattern": {"s": "?s", "p": "ex:b", "o": "?o"},
+        "bindings": {"vars": ["?s"], "rows": [["ex:a"], ["ex:x"]]},
+        "g": "<http://example.org/nowhere>",
+    });
+    let counts = served.binding_count(&store, &body);
+    assert_eq!(counts["absent_terms"][0]["parameter"], "g");
+    assert!(
+        counts["counts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["count"]["value"] == 0),
+        "{counts}"
+    );
+    let page = served.binding_fragment(&store, &body);
+    assert_eq!(page["absent_terms"][0]["parameter"], "g");
+
     // A literal is not a graph name, and says so before any bundle opens.
     let problem = request::Fragment::parse(
         &params("g=%22text%22"),
@@ -2832,6 +2852,172 @@ fn an_absent_graph_is_an_empty_answer_that_names_g() {
     )
     .expect_err("a literal is refused");
     assert_eq!(problem.code().as_str(), "bad_term_syntax");
+}
+
+/// A `/graphs` cursor names a graph of this listing and nothing else, and a
+/// page that runs out of bytes says so and resumes where it stopped.
+#[test]
+fn a_graph_listing_refuses_a_forged_cursor_and_reports_its_byte_budget() {
+    use kgf_server::cursor::{Cursor, PositionSpace};
+
+    let served = Served::quads();
+    let store = served.store();
+    let binding =
+        request::GraphList::parse(&params(""), served.limits(), &served.release().binding())
+            .expect("a listing with no parameters")
+            .binding;
+
+    // Two named graphs, so ids 1 and 2 are the listing; zero is the unnamed
+    // graph, which is never a resume point, and another space is another
+    // operation's token.
+    for token in [
+        Cursor::at_graph(&binding, 0).encode(),
+        Cursor::at_graph(&binding, 3).encode(),
+        Cursor::at(&binding, PositionSpace::Spo, 1).encode(),
+    ] {
+        let query = format!("cursor={token}");
+        let problem = request::GraphList::parse(
+            &params(&query),
+            served.limits(),
+            &served.release().binding(),
+        )
+        .and_then(|request| {
+            answer::graphs_list(&store, served.target("graphs", &query), &request).map(|_| ())
+        })
+        .expect_err("a forged graph cursor must be refused");
+        assert_eq!(problem.code().as_str(), "stale_cursor", "{token}");
+    }
+
+    // One row always goes out, however small the budget, and the rest of the
+    // listing is behind the cursor it hands back.
+    let bytes = Budgets {
+        max_response_bytes: 1,
+        ..Budgets::new()
+    };
+    let list = |query: &str| -> serde_json::Value {
+        let request = request::GraphList::parse(
+            &params(query),
+            served.within(&bytes),
+            &served.release().binding(),
+        )
+        .expect("a well-formed listing");
+        json(
+            answer::graphs_list(&store, served.target("graphs", query), &request)
+                .expect("a listing"),
+            Representation::Json,
+        )
+    };
+    let mut collected = Vec::new();
+    let mut query = String::new();
+    loop {
+        let page = list(&query);
+        let rows = page["graphs"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "one row fits a one-byte budget: {page}");
+        collected.push(dictionary_spelling(&rows[0]["g"]));
+        match page["next"].as_str() {
+            Some(next) => {
+                assert_eq!(page["truncation_reason"], "response_bytes");
+                query = format!("cursor={next}");
+            }
+            None => break,
+        }
+    }
+    assert_eq!(collected, vec![UNNAMED, G1, G2]);
+}
+
+/// A graph named by a blank node is published under an IRI this bundle mints
+/// for it, and that IRI scopes a request back to the same layer. The spelling
+/// is not a second name for an ordinary graph: an id out of range, and an id
+/// whose layer carries a real IRI, name nothing.
+#[test]
+fn a_blank_node_graph_name_is_published_under_a_bundle_scoped_iri() {
+    let served = Served::from_fixture(Fixture::build_quads(concat!(
+        "<http://example.org/a> <http://example.org/b> <http://example.org/c> _:g .\n",
+        "<http://example.org/a> <http://example.org/b> <http://example.org/d> .\n",
+        "<http://example.org/x> <http://example.org/y> <http://example.org/z> <http://example.org/g1> .\n",
+    )));
+    let store = served.store();
+    let request =
+        request::GraphList::parse(&params(""), served.limits(), &served.release().binding())
+            .expect("a listing");
+    let listing = json(
+        answer::graphs_list(&store, served.target("graphs", ""), &request).expect("a listing"),
+        Representation::Json,
+    );
+    let named: Vec<String> = listing["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| dictionary_spelling(&entry["g"]))
+        .filter(|name| name != UNNAMED && name != G1)
+        .collect();
+    let [minted] = named.as_slice() else {
+        panic!("one blank graph name is published: {listing}");
+    };
+    assert!(
+        !minted.starts_with("_:") && minted.contains("g-"),
+        "a blank graph name is published as an IRI: {minted}"
+    );
+
+    // It scopes a request back to the layer it names.
+    let page = served.fragment(&store, &format!("{}&limit=10", g(minted)));
+    assert_eq!(
+        rows(&page),
+        vec![vec![
+            "http://example.org/a",
+            "http://example.org/b",
+            "http://example.org/c"
+        ]]
+    );
+
+    // Blank-node syntax addresses nothing here, as in every other position:
+    // the stored label means nothing outside the document it was parsed from.
+    let blank = served.fragment(
+        &store,
+        &format!("g={}&limit=10", kgf_server::url::encode_value("_:g")),
+    );
+    assert_eq!(blank["cardinality"]["value"], 0);
+    assert_eq!(blank["absent_terms"][0]["reason"], "blank_node");
+
+    // The id is checked against the sidecar rather than trusted: the layer
+    // holding `g1` carries an IRI and is reachable only by it, and an id past
+    // the last layer names no graph at all.
+    let id: u64 = minted
+        .rsplit("g-")
+        .next()
+        .and_then(|tail| tail.parse().ok())
+        .unwrap_or_else(|| panic!("a minted name ends in its layer id: {minted}"));
+    let prefix = minted
+        .strip_suffix(&format!("g-{id}"))
+        .expect("the id is the suffix");
+    for other in [3 - id, 99] {
+        let alias = format!("{prefix}g-{other}");
+        let refused = served.fragment(&store, &format!("{}&limit=10", g(&alias)));
+        assert_eq!(refused["cardinality"]["value"], 0, "{alias}");
+        assert_eq!(
+            refused["absent_terms"],
+            serde_json::json!([{"parameter": "g", "reason": "not_in_bundle"}]),
+            "{alias}"
+        );
+    }
+}
+
+/// The quad view's cursor carries how many of a triple's memberships the last
+/// page delivered. A trailer past the end of that run would silently drop the
+/// rest of the triple, so it is refused rather than clamped.
+#[test]
+fn a_forged_membership_trailer_is_stale() {
+    use kgf_server::cursor::{Cursor, PositionSpace};
+
+    let served = Served::quads();
+    let store = served.store();
+    let request = served.parse_fragment("g=*&limit=1");
+    let mut cursor = Cursor::at(&request.binding, PositionSpace::Spo, 0);
+    cursor.scan_position = Some(5);
+    let problem = served
+        .try_fragment(&store, &format!("g=*&limit=1&cursor={}", cursor.encode()))
+        .expect_err("a trailer past this triple's memberships must be stale");
+    assert_eq!(problem.code().as_str(), "stale_cursor");
 }
 
 /// The bindings operations scope every input row the same way.

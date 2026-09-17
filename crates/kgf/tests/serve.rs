@@ -1631,6 +1631,65 @@ fn tpf_serves_the_quad_view_and_scoped_views_by_the_serving_table() {
     assert_eq!(total_items(&unnamed), 2);
     assert!(data(&unnamed).iter().all(|(_, graph)| graph == UNNAMED));
 
+    // TriG names graphs too, so the quad view serializes in it unchanged.
+    let trig = server.request(
+        "GET",
+        "/quads/v/v1/tpf?limit=10",
+        &[("Accept", "application/trig")],
+    );
+    trig.assert_status(200);
+    let parsed: Vec<oxrdf::Quad> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::TriG)
+        .for_slice(&trig.body)
+        .collect::<Result<_, _>>()
+        .expect("TriG parses");
+    assert_eq!(data(&parsed), data(&unbound));
+
+    // Every form pages to the same rows one row at a time, following the
+    // `hydra:next` link of each page — which carries the scope it was issued
+    // under, and for the quad view a run trailer that resumes inside one
+    // triple's memberships.
+    let origin = format!("http://{}", server.address);
+    let next_link = |quads: &[oxrdf::Quad]| -> Option<String> {
+        quads
+            .iter()
+            .find(|quad| quad.predicate.as_str() == format!("{HYDRA}next"))
+            .and_then(|quad| match &quad.object {
+                oxrdf::Term::NamedNode(node) => Some(node.as_str().to_owned()),
+                _ => None,
+            })
+    };
+    let walk = |target: &str| -> Vec<(String, String)> {
+        let mut collected = Vec::new();
+        let mut next = Some(target.to_owned());
+        let mut pages = 0;
+        while let Some(target) = next {
+            pages += 1;
+            assert!(pages < 20, "{target} did not terminate");
+            let page = nquads(&target);
+            collected.extend(data(&page));
+            next = next_link(&page).map(|link| {
+                let path = link
+                    .strip_prefix(&origin)
+                    .unwrap_or_else(|| panic!("a page link addresses this server: {link}"));
+                path.to_owned()
+            });
+        }
+        collected.sort();
+        collected
+    };
+    for scope in [
+        String::new(),
+        format!("graph={UNION}&"),
+        "graph=http%3A%2F%2Fexample.org%2Fg1&".to_owned(),
+        format!("graph={UNNAMED}&"),
+    ] {
+        assert_eq!(
+            walk(&format!("/quads/v/v1/tpf?{scope}limit=1")),
+            data(&nquads(&format!("/quads/v/v1/tpf?{scope}limit=10"))),
+            "paging {scope:?} one row at a time"
+        );
+    }
+
     // Turtle can carry one graph: the union and scoped views, not the quad view.
     let refused = server.request(
         "GET",
@@ -2320,6 +2379,7 @@ fn a_page_is_admitted_the_same_way_in_every_representation_it_offers() {
 fn access_logging_emits_one_correlated_record_for_every_response() {
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    deployment.publish_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-06-01T14:03:22Z");
     let records = RecordingAccessLog::default();
     let server = deployment.serve_with_access(Arc::new(records.clone()), false);
     let fragment_path = "/tox/v/v1/fragment?limit=2";
@@ -2354,6 +2414,8 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
     malformed_rdf.assert_header("content-type", "application/problem+json");
     let latest_query = server.request("QUERY", "/tox/latest/fragment", &[]);
     latest_query.assert_status(307);
+    let graphs = server.request("GET", "/quads/v/v1/graphs?limit=1", &[]);
+    graphs.assert_status(200);
 
     let responses = [
         &page,
@@ -2364,6 +2426,7 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
         &latest,
         &malformed_rdf,
         &latest_query,
+        &graphs,
     ];
     let records = records.records();
     assert_eq!(records.len(), responses.len());
@@ -2449,6 +2512,23 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
     assert_eq!(
         records[7].transport,
         Some(kgf_server::access::Transport::Query)
+    );
+
+    // A listing records the shape of what it was asked for and how much of the
+    // answer it delivered, exactly as a pattern page does.
+    let listing = &records[8];
+    assert_eq!(
+        listing.operation,
+        Some(kgf_server::access::AccessOperation::Graphs)
+    );
+    assert_eq!(listing.dataset.as_deref(), Some("quads"));
+    assert_eq!(listing.rows, Some(1));
+    assert_eq!(listing.cardinality, Some(3));
+    assert_eq!(listing.complete, Some(false));
+    assert_eq!(listing.truncation_reason, Some("page_limit"));
+    assert_eq!(
+        serde_json::to_value(listing).unwrap()["shape"],
+        serde_json::json!({"limit": 1})
     );
 }
 

@@ -461,7 +461,7 @@ async fn fragment(
                     &release.binding(),
                 )?;
                 declares_search(release, request.pattern.text().is_some())?;
-                declares_graphs(release, request.graph.needs_sidecar())?;
+                declares_graphs(release, &request.graph)?;
                 Ok(request)
             },
             answer::fragment,
@@ -488,7 +488,7 @@ async fn tpf(
                 request::Tpf::Plain(request) => &request.graph,
                 request::Tpf::Values(request) => &request.graph,
             };
-            declares_graphs(release, graph.needs_sidecar())?;
+            declares_graphs(release, graph)?;
             Ok(request)
         },
         answer::tpf,
@@ -511,7 +511,7 @@ async fn count(
                 let request =
                     request::Count::parse(params, limits, release.prefixes(), &release.binding())?;
                 declares_search(release, request.pattern.text().is_some())?;
-                declares_graphs(release, request.graph.needs_sidecar())?;
+                declares_graphs(release, &request.graph)?;
                 Ok(request)
             },
             answer::count,
@@ -586,7 +586,7 @@ async fn binding_fragment(
                     release.prefixes(),
                     &release.binding(),
                 )?;
-                declares_graphs(release, request.graph.needs_sidecar())?;
+                declares_graphs(release, &request.graph)?;
                 Ok(request)
             },
             answer::binding_fragment,
@@ -656,7 +656,7 @@ async fn binding_count(
             |params, body, limits, release| {
                 let request =
                     request::BindingCount::parse(params, body, limits, release.prefixes())?;
-                declares_graphs(release, request.graph.needs_sidecar())?;
+                declares_graphs(release, &request.graph)?;
                 Ok(request)
             },
             answer::binding_count,
@@ -1036,13 +1036,18 @@ fn declares_search(release: &Release, wanted: bool) -> Result<(), Problem> {
 /// the union is `data.hdt` itself, and a bundle without memberships is one
 /// whose triples are all unnamed — so they pass whether or not the release
 /// declares `graphs`.
-fn declares_graphs(release: &Release, wanted: bool) -> Result<(), Problem> {
-    if wanted && !release.declares(Capability::Graphs) {
+fn declares_graphs(release: &Release, graph: &request::GraphScope) -> Result<(), Problem> {
+    if graph.needs_sidecar() && !release.declares(Capability::Graphs) {
+        let parameter = graph.parameter();
         return Err(Problem::new(
             ErrorCode::CapabilityNotAvailable,
-            "this form of `g` needs the `graphs` capability, which this bundle does not \
-             declare; its manifest lists the ones it does. `g=<urn:x-kgf:union>` and \
-             `g=<urn:x-kgf:unnamed>` are answerable on every release",
+            format!(
+                "this form of `{}` needs the `graphs` capability, which this bundle does not \
+                 declare; its manifest lists the ones it does. {} are answerable on every \
+                 release",
+                parameter.as_str(),
+                parameter.reserved_forms(),
+            ),
         ));
     }
     Ok(())
@@ -1118,6 +1123,9 @@ where
     // failed to parse selected none and stays plain GET.
     observation.transport = Some(request.transport());
     observation.request(&request, work_class);
+    if let Err(problem) = request.representable(representation) {
+        return observed_result(Err(problem), observation);
+    }
 
     // A versioned operation is a deterministic function of immutable bytes,
     // so the URL and the representation fix the response
@@ -1221,6 +1229,9 @@ where
     };
     let work_class = request.work_class();
     observation.request(&request, work_class);
+    if let Err(problem) = request.representable(representation) {
+        return observed_result(Err(problem), observation);
+    }
     let validator = etag(
         release.digest(),
         service.descriptor_digest(),
@@ -1396,6 +1407,9 @@ where
         Err(problem) => return observed_result(Err(problem), observation),
     };
     observation.request(&request, WorkClass::Heavy);
+    if let Err(problem) = request.representable(representation) {
+        return observed_result(Err(problem), observation);
+    }
     let validator = etag_for_body(
         release.digest(),
         service.descriptor_digest(),

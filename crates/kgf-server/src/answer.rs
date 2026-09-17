@@ -1252,6 +1252,12 @@ impl Answer {
                  a graph",
             ));
         }
+        // A scope that fixed one graph names it once for the whole page
+        // rather than parsing the same IRI again for every row.
+        let fixed_graph = match &self.tagging {
+            GraphTagging::Fixed(name) => Some(GraphName::NamedNode(rdf_graph_name(name)?)),
+            GraphTagging::Untagged | GraphTagging::PerRow => None,
+        };
         let mut statements = Vec::with_capacity(keep);
         let mut data = HashSet::with_capacity(keep);
         for row in self.rows.iter().take(keep) {
@@ -1280,13 +1286,12 @@ impl Answer {
                 rdf_object(object.as_bytes())?,
             );
             let graph_name = match &self.tagging {
-                GraphTagging::Untagged => GraphName::DefaultGraph,
-                GraphTagging::Fixed(name) => {
-                    GraphName::NamedNode(metadata_iri(name, "a graph name")?)
+                GraphTagging::Untagged | GraphTagging::Fixed(_) => {
+                    fixed_graph.clone().unwrap_or(GraphName::DefaultGraph)
                 }
                 GraphTagging::PerRow => match row.graph.as_deref() {
                     None | Some(kgf_store::UNNAMED_GRAPH_IRI) => GraphName::DefaultGraph,
-                    Some(name) => GraphName::NamedNode(metadata_iri(name, "a graph name")?),
+                    Some(name) => GraphName::NamedNode(rdf_graph_name(name)?),
                 },
             };
             let quad = triple.in_graph(graph_name);
@@ -1607,6 +1612,21 @@ fn id_patterns_overlap(left: IdPattern, right: IdPattern) -> bool {
         && compatible(left.object, right.object)
 }
 
+/// A data statement's graph name, as an RDF term.
+///
+/// Separate from [`metadata_iri`] because the value is a graph of the bundle
+/// or the one the request scoped to, so a failure is about the data rather
+/// than about the page's description of itself, and the message has to say so.
+fn rdf_graph_name(value: &str) -> Result<NamedNode, Problem> {
+    NamedNode::new(value).map_err(|error| {
+        tracing::error!(%error, value, "a graph name is not an IRI");
+        Problem::new(
+            ErrorCode::InternalError,
+            "a graph name could not be represented as RDF",
+        )
+    })
+}
+
 fn metadata_iri(value: &str, what: &'static str) -> Result<NamedNode, Problem> {
     NamedNode::new(value).map_err(|error| {
         tracing::error!(%error, value, what, "could not construct fragment metadata IRI");
@@ -1675,6 +1695,10 @@ pub struct BindingCountAnswer {
     pattern: BindingPattern,
     #[serde(skip_serializing_if = "Option::is_none")]
     g: Option<String>,
+    /// The scope named a graph this bundle does not hold, which is why every
+    /// count is zero.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    absent_terms: Vec<AbsentTerm>,
     counts: Vec<PerBindingCount>,
     #[serde(flatten)]
     completeness: Completeness,
@@ -4190,23 +4214,16 @@ pub fn binding_fragment(
         normalize_rdf_restrictions(&mut restrictions);
     }
 
+    let scope = Scope::resolve(store, &target, &blank_nodes, &request.graph)?;
+    // A graph this bundle does not hold empties every row at once.
+    let absent_graph = scope.absent();
     let mut phases = Vec::with_capacity(restrictions.len());
     let mut restriction_counts = Vec::with_capacity(restrictions.len());
-    let mut absent_graph = None;
-    for (row_index, ids) in restrictions.iter().copied() {
-        match scoped(store, &target, &blank_nodes, ids, &request.graph)? {
-            Ok(enumeration) => {
-                let phase = binding_phase(enumeration, row_index)?;
-                restriction_counts.push((ids, phase.count));
-                phases.push(phase);
-            }
-            // A graph this bundle does not hold empties every row at once.
-            Err(absent) => {
-                absent_graph = Some(absent);
-                phases.clear();
-                restriction_counts.clear();
-                break;
-            }
+    if absent_graph.is_none() {
+        for (row_index, ids) in restrictions.iter().copied() {
+            let phase = binding_phase(scope.enumerate(select(store, ids)?)?, row_index)?;
+            restriction_counts.push((ids, phase.count));
+            phases.push(phase);
         }
     }
 
@@ -4233,7 +4250,8 @@ pub fn binding_fragment(
     }
 
     let base_pattern = resolve_binding_pattern(&mut cache, &request.pattern)?;
-    let rdf_cardinality = rdf_projection_cardinality(store, base_pattern, &restriction_counts)?;
+    let rdf_cardinality =
+        rdf_projection_cardinality(store, &scope, base_pattern, &restriction_counts)?;
     let mut answer = paged_distinct_bindings(
         store,
         target,
@@ -4256,14 +4274,15 @@ pub fn binding_count(
     let dictionary = store.dict();
     let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
     let mut cache = LookupCache::new(dictionary, blank_nodes.clone());
+    let scope = Scope::resolve(store, &target, &blank_nodes, &request.graph)?;
+    // A graph this bundle does not hold makes every row zero, and the answer
+    // says so rather than letting a client read the zeros as data.
+    let absent_graph = scope.absent();
     let mut counts = Vec::new();
     for row in request.rows() {
-        let value = match resolve_binding(&mut cache, row)? {
-            Some(ids) => match scoped(store, &target, &blank_nodes, ids, &request.graph)? {
-                Ok(enumeration) => enumeration.count()?,
-                Err(_) => 0,
-            },
-            None => 0,
+        let value = match (absent_graph, resolve_binding(&mut cache, row)?) {
+            (None, Some(ids)) => scope.enumerate(select(store, ids)?)?.count()?,
+            _ => 0,
         };
         counts.push(PerBindingCount {
             binding: row.index(),
@@ -4275,6 +4294,7 @@ pub fn binding_count(
         version: target.id.version.clone(),
         pattern: request.pattern.clone(),
         g: request.graph.requested().map(str::to_owned),
+        absent_terms: absent_graph.into_iter().collect(),
         counts,
         completeness: Completeness::complete(),
         target,
@@ -4283,8 +4303,9 @@ pub fn binding_count(
 
 /// `GET /graphs` — every graph with its membership count, paged by graph id.
 ///
-/// One directory read per graph listed: a layer's count is a field of its
-/// entry. The unnamed graph is listed first, under its reserved name, and
+/// One directory entry and one dictionary lookup per graph listed: a layer's
+/// count is a field of its entry, and its name is a term of the sidecar's own
+/// PFC section. The unnamed graph is listed first, under its reserved name, and
 /// only when it holds a triple; the named graphs follow in the sidecar's
 /// dictionary order. The cursor is the next id to list, so a page resumes by
 /// arithmetic rather than by search.
@@ -5192,13 +5213,6 @@ impl<'a> Enumeration<'a> {
         }
     }
 
-    fn triples(&self) -> Result<u64, Problem> {
-        match self {
-            Self::Quads(quads) => Ok(quads.triples()),
-            _ => self.count(),
-        }
-    }
-
     fn is_quad_view(&self) -> bool {
         matches!(self, Self::Quads(_))
     }
@@ -5239,10 +5253,18 @@ impl<'a> Enumeration<'a> {
 }
 
 fn phase(enumeration: Enumeration<'_>, direction: Option<Direction>) -> Result<Phase<'_>, Problem> {
+    // Counted once. The quad view's two numbers differ and it holds both
+    // already; everywhere else the triples *are* the rows, and counting a
+    // scoped selection twice would pay for its ranks twice.
+    let count = enumeration.count()?;
+    let triples = match &enumeration {
+        Enumeration::Quads(quads) => quads.triples(),
+        Enumeration::Triples(_) | Enumeration::Scoped(_) => count,
+    };
     Ok(Phase {
         space: enumeration.space(),
-        count: enumeration.count()?,
-        triples: enumeration.triples()?,
+        count,
+        triples,
         enumeration,
         binding_index: None,
         direction,
@@ -5275,11 +5297,128 @@ fn graphs<'a>(store: &'a Store, target: &Target) -> Result<&'a Graphs, Problem> 
     })
 }
 
-/// Resolve a pattern under a graph scope.
+/// A request's graph scope, resolved against this bundle once.
+///
+/// The lookup belongs to the request rather than to the pattern it scopes: a
+/// bindings request enumerates one pattern per input row under one scope, and
+/// resolving per row would read the sidecar's dictionary again for every row
+/// to arrive at the same layer.
+enum Scope<'a> {
+    /// Every triple once: the union, and the unnamed graph of a bundle whose
+    /// triples are all unnamed.
+    Union,
+    /// One layer's triples.
+    Layer(&'a Graphs, GraphId),
+    /// One row per membership.
+    Quads(&'a Graphs),
+    /// A well-formed name this bundle does not hold. Every pattern under it is
+    /// empty, and the answer says which parameter, exactly as an absent term
+    /// in the pattern does.
+    Absent(AbsentTerm),
+}
+
+impl<'a> Scope<'a> {
+    /// Resolve a request's `g` against this bundle's memberships.
+    fn resolve(
+        store: &'a Store,
+        target: &Target,
+        blank_nodes: &SkolemScope,
+        scope: &GraphScope,
+    ) -> Result<Self, Problem> {
+        Ok(match scope.selector() {
+            GraphSelector::Union => Self::Union,
+            // Without memberships every triple is unnamed, so the unnamed
+            // graph is the union — the same rows, under the name the client
+            // used.
+            GraphSelector::Unnamed => match store.graphs() {
+                None => Self::Union,
+                Some(graphs) => Self::Layer(graphs, GraphId::UNNAMED),
+            },
+            GraphSelector::Named(term) => {
+                let graphs = graphs(store, target)?;
+                match named_layer(graphs, blank_nodes, term)? {
+                    Some(graph) => Self::Layer(graphs, graph),
+                    None => Self::Absent(AbsentTerm::new(scope.parameter().as_str(), term)),
+                }
+            }
+            GraphSelector::All => Self::Quads(graphs(store, target)?),
+        })
+    }
+
+    /// The name this bundle does not hold, when that is what the scope named.
+    fn absent(&self) -> Option<AbsentTerm> {
+        match self {
+            Self::Absent(absent) => Some(*absent),
+            Self::Union | Self::Layer(..) | Self::Quads(_) => None,
+        }
+    }
+
+    /// Enumerate one resolved pattern under this scope.
+    fn enumerate(&self, selection: Selection<'a>) -> Result<Enumeration<'a>, Problem> {
+        Ok(match self {
+            Self::Union => Enumeration::Triples(selection),
+            Self::Layer(graphs, graph) => selection
+                .in_graph(graphs, *graph)
+                .map(Enumeration::Scoped)
+                .map_err(|error| unreadable("opening a graph's layer", &error))?,
+            Self::Quads(graphs) => selection
+                .memberships(graphs)
+                .map(Enumeration::Quads)
+                .map_err(|error| unreadable("preparing the quad view", &error))?,
+            // Every caller that can reach an absent scope answers from
+            // `absent` instead, so arriving here is this module's own bug
+            // rather than anything a request can ask for.
+            Self::Absent(_) => {
+                tracing::error!("a graph this bundle does not hold was asked to enumerate");
+                return Err(Problem::new(
+                    ErrorCode::InternalError,
+                    "the graph scope could not be applied",
+                ));
+            }
+        })
+    }
+}
+
+/// The layer a request's graph name selects, or `None` when this bundle holds
+/// no such graph.
+///
+/// A graph whose stored name is a blank node is published under a
+/// bundle-scoped IRI, and a request may send that IRI back. The layer id it
+/// carries is checked against the sidecar rather than trusted: the spelling
+/// names a *blank* layer of this bundle, so an id out of range names no graph
+/// — and neither does one whose layer carries an ordinary IRI, because that
+/// graph is addressed by the IRI itself and by nothing else.
+fn named_layer(
+    graphs: &Graphs,
+    blank_nodes: &SkolemScope,
+    term: &BoundTerm,
+) -> Result<Option<GraphId>, Problem> {
+    if let Some(id) = blank_nodes.graph_id(term.dictionary()) {
+        if id.0 == 0 || id.0 > graphs.facts().named_graphs {
+            return Ok(None);
+        }
+        let mut buffer = Vec::new();
+        let stored = graphs
+            .name(id, &mut buffer)
+            .map_err(|error| unreadable("reading a graph's name", &error))?;
+        return Ok(stored.starts_with(b"_:").then_some(id));
+    }
+    if term.denotes_blank_node() {
+        // `_:label` names nothing outside the document it was parsed from,
+        // in this position as in every other.
+        return Ok(None);
+    }
+    graphs
+        .resolve(term.dictionary().as_bytes())
+        .map_err(|error| unreadable("looking a graph up", &error))
+}
+
+/// Resolve one pattern under a graph scope.
 ///
 /// `Err(absent)` is the well-formed request that names a graph this bundle
 /// does not hold — an empty answer that says which parameter, exactly as an
-/// absent term is reported.
+/// absent term is reported. An operation enumerating many patterns resolves
+/// the scope once with [`Scope::resolve`] instead.
 fn scoped<'a>(
     store: &'a Store,
     target: &Target,
@@ -5287,48 +5426,11 @@ fn scoped<'a>(
     ids: IdPattern,
     scope: &GraphScope,
 ) -> Result<Result<Enumeration<'a>, AbsentTerm>, Problem> {
-    let selection = select(store, ids)?;
-    Ok(Ok(match scope.selector() {
-        GraphSelector::Union => Enumeration::Triples(selection),
-        // Without memberships every triple is unnamed, so the unnamed graph is
-        // the union — the same rows, under the name the client used.
-        GraphSelector::Unnamed => match store.graphs() {
-            None => Enumeration::Triples(selection),
-            Some(graphs) => in_layer(selection, graphs, GraphId::UNNAMED)?,
-        },
-        GraphSelector::Named(term) => {
-            let graphs = graphs(store, target)?;
-            let found = match blank_nodes.graph_id(term.dictionary()) {
-                Some(id) => (id.0 <= graphs.facts().named_graphs).then_some(id),
-                None if term.denotes_blank_node() => None,
-                None => graphs
-                    .resolve(term.dictionary().as_bytes())
-                    .map_err(|error| unreadable("looking a graph up", &error))?,
-            };
-            match found {
-                Some(graph) => in_layer(selection, graphs, graph)?,
-                None => return Ok(Err(AbsentTerm::new("g", term))),
-            }
-        }
-        GraphSelector::All => {
-            let graphs = graphs(store, target)?;
-            selection
-                .memberships(graphs)
-                .map(Enumeration::Quads)
-                .map_err(|error| unreadable("preparing the quad view", &error))?
-        }
-    }))
-}
-
-fn in_layer<'a>(
-    selection: Selection<'a>,
-    graphs: &'a Graphs,
-    graph: GraphId,
-) -> Result<Enumeration<'a>, Problem> {
-    selection
-        .in_graph(graphs, graph)
-        .map(Enumeration::Scoped)
-        .map_err(|error| unreadable("opening a graph's layer", &error))
+    let resolved = Scope::resolve(store, target, blank_nodes, scope)?;
+    if let Some(absent) = resolved.absent() {
+        return Ok(Err(absent));
+    }
+    Ok(Ok(resolved.enumerate(select(store, ids)?)?))
 }
 
 /// One row of an enumeration, with the position that resumes *at* it.
@@ -5879,10 +5981,14 @@ fn exact_cardinality_sum(counts: impl IntoIterator<Item = u64>) -> Result<Cardin
 /// others gives the union exactly. Arbitrary partial overlaps would require an
 /// unbounded union enumeration, so report a bounded upper estimate: no larger
 /// than either the relation sum or the base triple pattern containing every
-/// restriction. TPF cardinalities are planning estimates; query correctness
-/// continues to come from paging the distinct projection to exhaustion.
-fn rdf_projection_cardinality(
-    store: &Store,
+/// restriction. That base is counted under the request's own scope, so a quad
+/// view is bounded by its memberships rather than by the smaller number of
+/// distinct triples they belong to. TPF cardinalities are planning estimates;
+/// query correctness continues to come from paging the distinct projection to
+/// exhaustion.
+fn rdf_projection_cardinality<'a>(
+    store: &'a Store,
+    scope: &Scope<'a>,
     base_pattern: Option<IdPattern>,
     restrictions: &[(IdPattern, u64)],
 ) -> Result<Cardinality, Problem> {
@@ -5920,7 +6026,7 @@ fn rdf_projection_cardinality(
             "the RDF fragment cardinality could not be determined",
         ));
     };
-    let base_count = select(store, base_pattern)?.count().value;
+    let base_count = scope.enumerate(select(store, base_pattern)?)?.count()?;
     Ok(Cardinality::estimated(total.min(base_count)))
 }
 
@@ -6233,10 +6339,18 @@ fn positioned<'a>(
 ) -> impl Iterator<Item = Result<PositionedRow, Problem>> + 'a {
     let mut resume = from;
     let mut current: Option<IdTriple> = None;
+    let mut first = true;
     // The enumeration is lazy, so the caller's `take` is what bounds the work,
     // and a multi-phase walk cannot know its own bound per phase up front.
     enumeration.rows(from, skip).map(move |row| {
         let row = row?;
+        // The trailer says how many of this triple's memberships the previous
+        // page delivered, and an enumeration clamps one that runs past them.
+        // A first row that is not the one the token names is therefore a
+        // forged trailer, and honouring it would drop the rest of the triple.
+        if std::mem::take(&mut first) && row.delivered.unwrap_or(0) != skip {
+            return Err(Problem::from(StaleCursor));
+        }
         // A new triple, unless this row continues the run the last one was in.
         // The first triple of a page resumes at `from` itself, which for the
         // predicate space is the predicate *before* it — what a page that ends
@@ -7457,12 +7571,14 @@ impl Resource for GraphsAnswer {
                      union of all graphs is what an unscoped request reads, and a triple in \
                      several graphs counts once there. Each graph links to its triples."
                 ))
+                // No query editor: `limit` is the only control this listing
+                // takes, and the pager already offers it.
                 section."section-block" {
                     h2 { "Graphs" }
                     @if rows.is_empty() {
                         (note("No graphs."))
                     } @else {
-                        (results_table(&[GRAPH, "triples"], &rows))
+                        (results_table(&[GRAPH, "count"], &rows))
                     }
                 }
                 @if let Some(token) = self.completeness.next_cursor() {
@@ -7885,6 +8001,12 @@ impl Resource for BindingCountAnswer {
                         fields.extend(graph_field(self.g.as_deref()));
                         fields
                     }))
+                }
+                @if !self.absent_terms.is_empty() {
+                    (note(&format!(
+                        "{}, so every count is zero.",
+                        absent_terms_text(&self.absent_terms)
+                    )))
                 }
                 section."section-block" {
                     h2 { "Counts" }

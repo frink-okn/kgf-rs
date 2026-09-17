@@ -428,8 +428,10 @@ pub struct Cursor {
     pub position: u64,
     /// Row index, for bindings operations.
     pub binding_index: Option<u32>,
-    /// Secondary position: an offset within a ranked hit, or an accumulated
-    /// count for an unranked text scan.
+    /// Secondary position, for the spaces whose position has a run inside it:
+    /// an offset within a ranked hit, an accumulated count for an unranked
+    /// text scan, or the memberships of one triple a quad-view page already
+    /// delivered.
     pub scan_position: Option<u64>,
 }
 
@@ -693,6 +695,7 @@ mod tests {
             Cursor::at_binding(&binding(), u32::MAX, PositionSpace::Predicate, 0),
             Cursor::at_rank(&binding(), 7, u64::MAX),
             Cursor::at_text_scan(&binding(), 42, 1_000),
+            Cursor::at_graph(&binding(), 5),
             Cursor::at_schema_child(&binding(), 99),
             Cursor::at_class_relation(&binding(), 4_096),
         ] {

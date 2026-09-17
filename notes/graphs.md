@@ -1,10 +1,11 @@
 # Named graphs: the read contract for the `graphs` capability
 
-Status: decided 2026-09-15, not yet implemented. Today `g=` on `/fragment` and `/count`
-answers 501 `capability_not_available` from the `NOT_OFFERED` table in
-`crates/kgf-server/src/request.rs`, and `kgf-store` opens and binding-checks
-`data.hdt.graphs` + `data.hdt.graphs.idx` without reading them. This note is the
-contract that implementation must meet. The rationale is a comparison with what
+Status: decided 2026-09-15; the read side landed 2026-09-17, except for the
+per-graph statistics. `g` answers its four forms on `/fragment` and `/count`,
+`/graphs` lists them, and `/tpf` serves the table below. `kgf build` cannot yet
+produce a quads bundle, so a bundle with memberships is assembled by hand or by
+`hdtc` until it can. This note is the contract that implementation meets; where the
+two disagree, that is a bug in one of them. The rationale is a comparison with what
 union-default triplestores do; the short version is that KGF does what QLever,
 RDF4J/GraphDB, and Blazegraph do, and nothing else.
 
@@ -44,6 +45,27 @@ since every triple of such a bundle is unnamed.
 row has a `g`; layer-0 rows carry `urn:x-kgf:unnamed`, and `urn:x-kgf:union` never
 appears as a value. `GET /graphs` lists every named graph with its count, and the
 unnamed graph under its constant when layer 0 is non-empty. Cursors carry the scope.
+
+Four decisions the implementation had to make, recorded here because each is a
+promise to a client rather than an internal choice:
+
+- **`g` beside `o.text` is refused**, 400 rather than 501. A ranked text page is
+  assembled from one selection per matching literal and this build scopes none of
+  them, so the request is well-formed and unanswerable rather than unimplemented.
+  Every other ignored filter is refused the same way.
+- **`/graphs` enumerates by layer id**: the unnamed graph first when it holds a
+  triple, then the named graphs in the sidecar's dictionary order, and the cursor is
+  the next id to list. That order is a contract, as every enumeration order here is:
+  it is what an outstanding token indexes.
+- **A graph whose stored name is a blank node** is published under the same
+  bundle-scoped IRI a blank node in the data gets, in a section of its own keyed by
+  layer id. A request may send that IRI back, and the layer id in it is checked
+  against the sidecar rather than trusted: an id out of range, or one whose layer
+  carries an ordinary IRI, names no graph. `_:label` itself addresses nothing, here
+  as in every other position.
+- **The RDF representations of `/fragment` follow the serving table below**, not just
+  `/tpf`'s: a scope tags every statement with the graph it named, the quad view tags
+  per row, and a single-graph syntax refuses the quad view with 406.
 
 Worked example. Source, five statements:
 
@@ -148,3 +170,9 @@ scoped views; the quad view is refused in it.
 - The metadata graph parses to a `sd:defaultGraph` triple whose subject is a blank
   node, and Comunica's extractor, run over the page, reports `defaultGraph`.
 - Build refuses a quad in graph `urn:x-kgf:union`.
+- Every form of `graph` on `/tpf` pages to the same rows one row at a time, following
+  the `hydra:next` link, quad view included — the case that needs the run trailer.
+- A forged run trailer, past the memberships of the triple its position names, is a
+  stale cursor rather than a triple silently skipped.
+- A blank-node graph fixture: the minted IRI round-trips, and neither an
+  out-of-range id nor the id of an IRI-named layer resolves through it.
