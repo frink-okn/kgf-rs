@@ -2090,6 +2090,72 @@ request-layer test that the largest permitted prefix is accepted and one byte mo
 `cap_exceeded`, the capability-gate pair rewritten around a `terms` that is no longer
 declared, and the two stress bundles above driven through a real listener.
 
+### 30. Named graphs — the `graphs` capability
+
+**Planned 2026-09-16.** [`graphs.md`](graphs.md) is the read contract this unit meets;
+what follows is the order the work lands in, and the decisions each step had to make
+that the contract left to the implementation. hdtc already builds everything: `hdtc
+create --mode quads --graphs-index` writes `data.hdt.graphs` and `data.hdt.graphs.idx`,
+and `hdtc void --graph-view dataset` describes every graph as a `void:subset`. What was
+missing was on this side: the store never read the two artifacts it binding-checked,
+`g=` answered 501 from `NOT_OFFERED`, and `kgf build` could only make a triples bundle.
+
+The steps, each a commit reviewed on its own:
+
+1. **hdtc façade** (`../hdtc`, branch `graphs-facade`). A mapped reader needs the
+   sidecar's header and the index's typed section directory the way it already gets the
+   permutation index's, plus parsers for the three fixed-size records it must address
+   lazily — the 96-byte layer entry, the 48-byte chunk entry, and the 160-byte
+   Elias–Fano header — because a bundle may carry thousands of graphs and reading every
+   layer entry at open would make opening proportional to `G`. Nothing else is shared:
+   hdtc's seek-based `GraphSidecarReader` is its CLI's, as `PermutationIndex::triples`
+   is.
+2. **`rank::select0`.** Elias–Fano rank needs the position of the `h`-th zero of the
+   upper bitmap, over the same two-level directory `select1` walks.
+3. **`kgf-store::graphs`.** The mapped sidecar and index: header facts, the graph
+   dictionary as one more PFC section, one layer-set reader parameterised by which file
+   and which position space, and the three layer encodings behind one `Layer` API —
+   `count`, `rank`, `select`, `access`, `next_member` — each returning `Result` because
+   the chunk directories and Elias–Fano headers are validated on first touch rather than
+   at open. `graphs_of` and `memberships` read the transpose when the index carries it
+   and probe or sum the layers otherwise; that is one algorithm choosing on cost between
+   two structures the format defines as equivalent, not a fallback for a missing
+   artifact. `Store::open` requires the index to carry **both** POS and OPS layer sets,
+   naming `hdtc graphs-index` otherwise, and refuses a sidecar whose dictionary holds
+   either reserved IRI. Differential tests against `hdtc search`'s four-position
+   patterns and a naive oracle over every layer of a synthetic bundle wide enough to
+   produce all three encodings.
+4. **Scoped and quad-view selections.** `Selection::in_graph` and
+   `Selection::memberships` over all eight patterns in each pattern's native position
+   space: scoped counts are two ranks, scoped pages are `select`-driven, `s ? o` filters
+   its bounded probe by `access`; the quad view yields one row per membership in
+   position order then ascending graph id, counting by rank differences summed over the
+   layers or by the transpose. Cursors keep their existing spaces — the request binding
+   already carries `g` — and the quad view reuses the token's trailer for "memberships
+   of this triple already delivered", so a page may end inside one triple's graphs in
+   any space, the predicate space included.
+5. **`g=` on `/fragment` and `/count`**, GET and bindings bodies alike: the four forms,
+   the two constants accepted on every release, `g=<G>` and `g=*` gated on the
+   capability before the open, the `g` column and `vars` entry in the quad view, the
+   forms and answer pages, the access-log shape. The worked example of `graphs.md` as a
+   fixture, every count in both of its tables.
+6. **`GET /graphs`**: every named graph with its layer count, the unnamed graph under
+   its constant when non-empty, paged by graph id; the descriptor link and the manifest
+   page row.
+7. **`/tpf`**: the `graph` parameter in `ExplicitRepresentation`, the four-mapping Hydra
+   form with `sd:graph`, the blank-node `sd:defaultDataset [ sd:defaultGraph
+   <urn:x-kgf:union> ]` declaration, the per-row tagging rule of the serving table, and
+   the refusal of the quad view in Turtle. The Comunica harness gains the `GRAPH` cases.
+8. **`kgf build`**: `contents.graphs.enabled` selects `--mode quads --graphs-index` for
+   RDF input and, for an HDT input, requires and adopts the sidecar beside it and builds
+   the index; the reserved IRIs are refused before anything is published.
+9. **Per-graph statistics**: `hdtc void --graph-view dataset` on a graphs bundle, each
+   subset projected into `graph:<name>` views of the three TSVs beside `design` and
+   `queryable`, a `graphs` section in the summary, `StatsView::Graph` in the store, and
+   `g=` on `/schema` to select one.
+10. **Notes**: this unit's *What landed*, `graphs.md`'s status, and the questions for
+    `../kgf` the work raised.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that

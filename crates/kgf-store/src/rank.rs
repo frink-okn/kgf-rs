@@ -29,8 +29,12 @@
 //! load, and a popcount over less than one subblock.
 //! [`select1`](RankedBitmap::select1) is `O(log(L / B))` for a binary search over
 //! superblocks, then a bounded search within one superblock, then a scan of at
-//! most one subblock. Version 1 stores no select samples; if select ever
-//! profiles hot, the format reserves the extension point.
+//! most one subblock. [`select0`](RankedBitmap::select0) is the same search
+//! over the complement, with each directory sample read as "bits before the
+//! boundary, less the ones before it"; Elias–Fano rank needs it, since the
+//! `h`-th zero of an upper bitmap ends bucket `h`. Version 1 stores no select
+//! samples; if select ever profiles hot, the format reserves the extension
+//! point.
 //!
 //! # Malformed files
 //!
@@ -357,6 +361,70 @@ impl<'a> RankedBitmap<'a> {
             .select_from(subblock * self.geometry.subblock_bits, i - seen)
             .unwrap_or_else(|| panic!("directory claims {total} set bits but the bitmap has fewer"))
     }
+
+    /// Position of the `i`-th clear bit, zero-based.
+    ///
+    /// The same descent as [`select1`](Self::select1) over the complement.
+    /// Every directory sample counts set bits before a boundary, so the clear
+    /// bits before that boundary are the boundary less the sample — which is
+    /// why no second directory is stored for zeros.
+    ///
+    /// Panics if `i >= len() - count()`.
+    pub fn select0(&self, i: u64) -> u64 {
+        let total = self.len() - self.count();
+        assert!(
+            i < total,
+            "select0({i}) out of range for {total} clear bits"
+        );
+
+        // The last superblock whose starting clear-bit count has not passed
+        // `i`. The sentinel is at the bitmap's end and holds every clear bit,
+        // so it is never selected.
+        let bits = self.len();
+        let superblock_bits = self.geometry.superblock_bits;
+        let zeros_before_superblock =
+            |k: u64| (k * superblock_bits).min(bits) - self.superrank.get(k);
+        let superblock = last_not_above(0, self.geometry.sentinel, i, zeros_before_superblock);
+        let superblock_start = superblock * superblock_bits;
+        let base = zeros_before_superblock(superblock);
+
+        // Within it, the last subblock whose starting clear-bit count has not
+        // passed `i`. A subblock's sample counts set bits from its superblock's
+        // start, so the clear bits over the same span are the span less it.
+        let subblock_bits = self.geometry.subblock_bits;
+        let first_sub = superblock * self.geometry.subs_per_super;
+        let last_sub =
+            ((superblock + 1) * self.geometry.subs_per_super).min(self.subrank.len()) - 1;
+        let zeros_before_subblock =
+            |j: u64| base + (j * subblock_bits - superblock_start) - self.subrank.get(j);
+        let subblock = last_not_above(first_sub, last_sub, i, zeros_before_subblock);
+
+        let seen = zeros_before_subblock(subblock);
+        self.bitmap
+            .select_zero_from(subblock * subblock_bits, i - seen)
+            .unwrap_or_else(|| {
+                panic!("directory claims {total} clear bits but the bitmap has fewer")
+            })
+    }
+}
+
+/// The largest index in `lo..=hi` whose derived value does not exceed
+/// `target`.
+///
+/// [`last_index_not_above`] over a function of the index rather than an
+/// array read, for the directories that are consulted through arithmetic.
+/// Same precondition: `value(lo) <= target` and `value` non-decreasing.
+fn last_not_above(lo: u64, hi: u64, target: u64, value: impl Fn(u64) -> u64) -> u64 {
+    let (mut low, mut high) = (lo, hi);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if value(mid) <= target {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    low
 }
 
 /// The largest index in `lo..=hi` whose value does not exceed `target`.
@@ -449,22 +517,26 @@ mod tests {
     struct Oracle {
         ranks: Vec<u64>,
         ones: Vec<u64>,
+        zeros: Vec<u64>,
     }
 
     impl Oracle {
         fn new(bytes: &[u8], bits: u64) -> Self {
             let mut ranks = Vec::with_capacity(bits as usize + 1);
             let mut ones = Vec::new();
+            let mut zeros = Vec::new();
             let mut seen = 0;
             for position in 0..bits {
                 ranks.push(seen);
                 if bit(bytes, position) {
                     ones.push(position);
                     seen += 1;
+                } else {
+                    zeros.push(position);
                 }
             }
             ranks.push(seen);
-            Self { ranks, ones }
+            Self { ranks, ones, zeros }
         }
 
         fn rank(&self, position: u64) -> u64 {
@@ -473,6 +545,10 @@ mod tests {
 
         fn select(&self, i: u64) -> u64 {
             self.ones[i as usize]
+        }
+
+        fn select_zero(&self, i: u64) -> u64 {
+            self.zeros[i as usize]
         }
 
         fn count(&self) -> u64 {
@@ -557,6 +633,50 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn select0_matches_a_naive_scan_for_every_clear_bit() {
+        for &bits in LENGTHS {
+            for density in [0u32, 1, 32, 63] {
+                let bytes = make_bitmap(bits, density, bits * 23 + u64::from(density));
+                let directory = build_directory(&bytes, bits);
+                let ranked = ranked(&bytes, bits, &directory);
+                let oracle = Oracle::new(&bytes, bits);
+                let zeros = bits - oracle.count();
+
+                for i in 0..zeros {
+                    let position = ranked.select0(i);
+                    assert_eq!(
+                        position,
+                        oracle.select_zero(i),
+                        "{bits} bits at density {density}, select0({i})"
+                    );
+                    // The defining relation: exactly `i` clear bits precede the
+                    // `i`-th, so the set bits before it are the rest.
+                    assert_eq!(ranked.rank1(position), position - i);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_clear_bit_is_found_wherever_it_sits() {
+        // The mirror of the single-set-bit case: an all-ones bitmap with one
+        // hole, at each boundary that the descent treats specially, including
+        // the tail byte whose bits past the end must not read as clear.
+        let bits = 8191u64;
+        for position in [0u64, 1, 511, 512, 513, 4095, 4096, 4097, 8189, 8190] {
+            let mut bytes = vec![0xFFu8; bits.div_ceil(8) as usize];
+            bytes[(position / 8) as usize] &= !(1 << (position % 8));
+            let last = bytes.len() - 1;
+            bytes[last] &= (1u8 << (bits % 8)) - 1;
+            let directory = build_directory(&bytes, bits);
+            let ranked = ranked(&bytes, bits, &directory);
+
+            assert_eq!(ranked.count(), bits - 1, "hole at {position}");
+            assert_eq!(ranked.select0(0), position, "hole at {position}");
         }
     }
 
