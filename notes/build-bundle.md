@@ -105,9 +105,10 @@ contents:                      # what changes bytes
     exclude_datatypes: []
     index_all_datatypes: false
     untagged_language: en
-  graphs:                      # named-graph memberships; both keys tri-state
+  graphs:                      # named-graph memberships; every key tri-state
     enabled: null              # null follows the input; true | false state it
     transpose: null            # null follows the graph count
+    describe: null             # per-graph description views; null follows it too
   filters:                     # hdtc sketch — always built, doc 17 §17.3
     filter_bits: 16            # MinHash k is fixed federation-wide, §17.2
   keysets:                     # hdtc keyset — always built, doc 18 §18.4
@@ -161,6 +162,16 @@ probe per graph, and the transpose's own size grows with the memberships it
 copies. `null` reads the graph count out of the sidecar the build just wrote and
 adds `--transpose-ids` above 32 graphs (`GRAPH_TRANSPOSE_THRESHOLD` in
 `build/plan.rs`). A bundle that knows better says so.
+
+`describe` is the same shape with the opposite sign. A view per graph is a whole
+class-and-property projection per graph, in each of the three description
+artifacts and in the manifest range that declares it, so the description grows
+with the graphs times the schema and `/manifest` grows with it. `null` describes
+each graph up to 64 of them (`GRAPH_DESCRIPTION_THRESHOLD`) and none above, on
+the reasoning that a KG split by source or by release is the case where a
+per-graph schema is the most useful thing in the bundle, and a KG split per
+entity is the case where it describes nothing anyone asked for. Whatever it
+resolves to, the memberships are complete and `/graphs` pages them all.
 
 **`contents.perm`, `contents.filters`, and `contents.keysets` have no
 `enabled`.** `data.hdt.perm` is required by rule 1: no fallback for a missing

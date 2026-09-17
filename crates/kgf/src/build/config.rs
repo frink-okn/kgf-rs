@@ -235,6 +235,20 @@ pub struct Graphs {
     /// sidecar it just wrote. `true` and `false` state it outright.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transpose: Option<bool>,
+
+    /// Describe each graph on its own, as a `graph:<IRI>` view of the tier-1
+    /// description set.
+    ///
+    /// Omitted follows the number of graphs, for the same reason `transpose`
+    /// does and with the opposite sign: one view per graph is a whole
+    /// class-and-property projection per graph, in each of the three
+    /// artifacts and in the manifest that declares their ranges, so the
+    /// description grows with the graphs times the schema. A KG split by
+    /// source or by release has few enough graphs for that to be the most
+    /// useful thing in the bundle; one split per entity has too many for it to
+    /// be a description at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub describe: Option<bool>,
 }
 
 /// `filters/`. Always built as complete role families.

@@ -42,6 +42,12 @@ const SD_NAMED_GRAPH: &str = "http://www.w3.org/ns/sparql-service-description#na
 const SD_NAME: &str = "http://www.w3.org/ns/sparql-service-description#name";
 const SD_GRAPH: &str = "http://www.w3.org/ns/sparql-service-description#graph";
 
+/// How many entries each ranked list on the summary card carries.
+///
+/// The card is a page a person reads, and every list on it is the leading few
+/// of something a route pages in full.
+const SUMMARY_LIST_LIMIT: usize = 10;
+
 const SCHEMA_HEADER: &str = "view\tkind\tclass\tpredicate\tdatatype\tsubject_id\n";
 const RELATIONS_HEADER: &str = "view\tsubject_class\tpredicate\tobject_class\ttriples\n";
 const CLASS_PROPERTIES_HEADER: &str =
@@ -102,6 +108,8 @@ pub(crate) struct GraphFacts {
     /// analysis describes it as a bare `void:subset` with nothing to say which
     /// graph it is — indistinguishable from the unnamed graph's own subset.
     pub(crate) blank_names: bool,
+    /// Whether each graph gets a description view of its own.
+    pub(crate) describe: bool,
 }
 
 /// What a description build produced, beyond the files themselves.
@@ -148,7 +156,7 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
         OsString::from("--partition-distinct-counts"),
         OsString::from("dataset-properties"),
     ];
-    if graphs.is_some() {
+    if graphs.is_some_and(|facts| facts.describe) {
         // A bundle with memberships is described one graph at a time as well
         // as whole: the analysis adds one `void:subset` per graph, and the
         // projection below turns each into a view of its own. It reads the
@@ -198,15 +206,21 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
     let mut per_graph = Vec::new();
     let mut graph_cards = Vec::new();
     let subsets = match graphs {
-        Some(facts) => graph_subsets(&graph, &root, facts)?,
-        None => Vec::new(),
+        Some(facts) if facts.describe => graph_subsets(&graph, &root, facts)?,
+        _ => Vec::new(),
     };
     for (name, node) in subsets {
         let projections = graph
             .project(&node, &subject_ids)
             .with_context(|| format!("projecting the description of graph {name}"))?;
-        let view = format!("graph:{name}");
+        // Built through the type that parses these names rather than spelled
+        // here: a view name this module invents is one no bundle could carry.
+        let view = kgf_store::StatsView::graph(&name)
+            .with_context(|| format!("graph {name} cannot name a description view"))?
+            .manifest_key()
+            .into_owned();
         graph_cards.push(GraphSummary {
+            triples: graph.optional_count(&node, VOID_TRIPLES),
             counts: counts_of(&graph, &node),
             name,
             view: view.clone(),
@@ -306,6 +320,14 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
     prefix_table.remove("source");
     write(&namespaces_path, &serde_json::to_vec_pretty(&namespaces)?)?;
 
+    // The card shows the largest graphs; the artifacts and `/graphs` carry
+    // them all.
+    graph_cards.sort_by(|left, right| {
+        right
+            .triples
+            .cmp(&left.triples)
+            .then_with(|| left.name.cmp(&right.name))
+    });
     let summary = Summary::new(
         &card,
         dataset_iri,
@@ -497,10 +519,10 @@ fn render_views<T>(
     mut append: impl FnMut(&str, &T, &mut Vec<u8>, &mut u64),
 ) -> Result<RenderedTsv> {
     // Laid out in the order a mapped bundle walks the views, which is
-    // `StatsView`'s own ordering rather than the names': a reader requires the
-    // declared ranges to tile the file with no gap and no overlap, so the file
-    // is written in the order it will be read. Parsing each name here is what
-    // keeps the build from emitting one no bundle could carry.
+    // `StatsView`'s own ordering rather than the names': the verifier requires
+    // the declared ranges to tile the file with no gap and no overlap, so the
+    // file is written in the order it will be read. Parsing each name here is
+    // what keeps the build from emitting one no bundle could carry.
     let mut ordered = Vec::with_capacity(views.len());
     for (view, rows) in views {
         let parsed = kgf_store::StatsView::from_manifest_key(&view)
@@ -887,6 +909,8 @@ fn read_subject_section(
 
 /// One graph's entry in the persisted summary.
 struct GraphSummary {
+    /// Its triple count, which is what the card ranks by.
+    triples: u64,
     /// The graph's own IRI, or the reserved name of the unnamed graph.
     name: String,
     /// The description view describing it.
@@ -924,7 +948,7 @@ impl Summary {
         let top_classes = projections
             .classes
             .iter()
-            .take(10)
+            .take(SUMMARY_LIST_LIMIT)
             .map(|(class, entities)| {
                 json!({
                     "class": class,
@@ -943,7 +967,7 @@ impl Summary {
         let top_properties = projections
             .properties
             .iter()
-            .take(10)
+            .take(SUMMARY_LIST_LIMIT)
             .map(|row| {
                 let mut entry = serde_json::Map::new();
                 entry.insert("predicate".into(), json!(row.predicate));
@@ -974,7 +998,7 @@ impl Summary {
         let leading_relations = projections
             .relations
             .iter()
-            .take(10)
+            .take(SUMMARY_LIST_LIMIT)
             .map(|relation| {
                 json!({
                     "subject_class": relation.subject_class,
@@ -994,11 +1018,14 @@ impl Summary {
             })
             .collect::<Vec<_>>();
         let counts = counts_of(graph, root);
-        // Every graph the dataset holds, with its own counts and the way in to
-        // its description and its triples. The counts are the graph's own, so
-        // they sum to more than the dataset's when a triple is in two graphs.
+        // The largest graphs, capped like every other list on this card: a
+        // dataset may hold thousands, and `/graphs` is the route that pages
+        // them. The counts are each graph's own, so they can sum to more than
+        // the dataset's when a triple is in two graphs.
+        let graph_total = graphs.len();
         let graphs = graphs
             .iter()
+            .take(SUMMARY_LIST_LIMIT)
             .map(|entry| {
                 json!({
                     "graph": entry.name,
@@ -1041,6 +1068,7 @@ impl Summary {
             },
             "counts": counts,
             "graphs": graphs,
+            "graphs_total": graph_total,
 
             "top_classes": top_classes,
             "top_properties": top_properties,

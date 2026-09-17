@@ -57,6 +57,18 @@ pub const KEYSET_ROLES: &str = "subjects-only,objects-only,shared";
 /// rather than answered from the other.
 pub const GRAPH_POSITIONS: &str = "pos,ops";
 
+/// Graphs above which each one stops getting a description of its own.
+///
+/// One view per graph is a whole class-and-property projection per graph, in
+/// each of the three description artifacts and in the manifest range that
+/// declares it, so the description set grows with the graphs times the schema
+/// and `/manifest` grows with it. A KG partitioned by source or by release
+/// stays well under this and is better for the per-graph view; a KG
+/// partitioned per entity is over it, and a schema projection per graph there
+/// describes nothing a reader wanted. `contents.graphs.describe` states it
+/// outright when a bundle knows better.
+pub const GRAPH_DESCRIPTION_THRESHOLD: u64 = 64;
+
 /// Graphs above which the membership index carries the transpose.
 ///
 /// The quad view reads the graphs of one statement per row. From the transpose
@@ -487,6 +499,9 @@ pub struct Graphs {
     /// Carry the transpose, never carry it, or follow the graph count.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transpose: Option<bool>,
+    /// Describe each graph, describe none, or follow the graph count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub describe: Option<bool>,
 }
 
 /// `data.hdt.perm`.
@@ -825,6 +840,7 @@ fn resolve_contents(contents: config::Contents) -> Result<Contents> {
         graphs: Graphs {
             enabled: contents.graphs.enabled,
             transpose: contents.graphs.transpose,
+            describe: contents.graphs.describe,
         },
         filters,
         keysets,

@@ -2968,30 +2968,35 @@ impl SummaryResource {
                 ]
             })
             .collect();
-        // A graph's name links to its triples rather than to its schema: the
-        // question a reader has about a named graph is what is in it, and the
-        // schema view is one click along from there.
+        // Both ways in, because they answer different questions: the name
+        // links to the graph's triples and the last cell to its description.
+        // No other page leads to one graph's description.
         let graph_cells: Vec<_> = card
             .graphs
             .iter()
             .map(|entry| {
-                summary_iri_cell(
-                    &self.target,
-                    &entry.graph,
-                    entry.links.get("fragment").cloned(),
-                )
+                [
+                    summary_iri_cell(
+                        &self.target,
+                        &entry.graph,
+                        entry.links.get("fragment").cloned(),
+                    ),
+                    Cell::link("schema", entry.links.get("schema").cloned()),
+                ]
             })
             .collect();
         let graph_rows: Vec<_> = card
             .graphs
             .iter()
             .zip(&graph_cells)
-            .map(|(entry, cell)| {
+            .map(|(entry, cells)| {
                 vec![
-                    cell.value(),
+                    cells[0].value(),
                     Value::Number(entry.counts.triples),
                     Value::Number(entry.counts.subjects),
+                    Value::Number(entry.counts.predicates),
                     Value::Number(entry.counts.objects),
+                    cells[1].value(),
                 ]
             })
             .collect();
@@ -3036,13 +3041,14 @@ impl SummaryResource {
                     section."section-block" {
                         h2 { "Named graphs" }
                         (note(
-                            "Every graph this dataset holds, with the counts it \
-                             publishes for itself: a triple in two graphs is counted \
-                             by both, so these sum to more than the dataset's. Each \
-                             name links to that graph's triples."
+                            "The largest graphs of this dataset, with the counts each \
+                             publishes for itself: a triple in two graphs is counted by \
+                             both, so these can sum to more than the dataset's. Each \
+                             name links to that graph's triples, and its schema to the \
+                             description of that graph alone."
                         ))
                         (results_table(
-                            &["graph", "triples", "subjects", "objects"],
+                            &["Graph", "Triples", "Subjects", "Predicates", "Objects", ""],
                             &graph_rows,
                         ))
                     }
@@ -3457,16 +3463,25 @@ pub fn schema(
                     component.as_str()
                 ),
             ),
-            // A graph the bundle does not describe: either it holds no such
-            // graph, or it was built before this description did. `GET
-            // /graphs` says which graphs it has.
+            // A graph the bundle does not describe: it holds no such graph,
+            // it holds no graphs at all, or it describes fewer than it holds.
+            // `/graphs` says which it has — but only where there are any, so a
+            // bundle without memberships says that rather than naming a route
+            // that would answer 501.
             StatsView::Graph(graph) => Problem::new(
                 ErrorCode::NotFound,
-                format!(
-                    "this bundle has no description view for graph `{}`; `/graphs` lists the \
-                     graphs it holds",
-                    graph.as_str()
-                ),
+                match store.graphs() {
+                    Some(_) => format!(
+                        "this bundle has no description view for graph `{}`; `/graphs` lists \
+                         the graphs it holds, which can be more than it describes",
+                        graph.as_str()
+                    ),
+                    None => format!(
+                        "this bundle carries no named graphs, so it has no description view \
+                         for `{}`",
+                        graph.as_str()
+                    ),
+                },
             ),
             StatsView::Design | StatsView::Queryable => {
                 tracing::error!(?request.view, "a tier-1 description is missing a required view");
@@ -8180,6 +8195,18 @@ struct Cell<'a> {
 }
 
 impl<'a> Cell<'a> {
+    /// A cell that is a link and not a term: a named way out of a row.
+    fn link(label: &str, href: Option<String>) -> Self {
+        Self {
+            label: label.to_owned(),
+            qualifier: None,
+            annotation: None,
+            href,
+            full_iri: None,
+            structured: false,
+        }
+    }
+
     /// A plain unlinked cell: a binding index, a direction, a score.
     fn text(label: String) -> Self {
         Self {

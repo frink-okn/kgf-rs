@@ -22,7 +22,8 @@ use sha2::{Digest, Sha256};
 use super::Build;
 use super::hdtc::{Runner, Step, render};
 use super::plan::{
-    BundlePlan, GRAPH_POSITIONS, GRAPH_TRANSPOSE_THRESHOLD, Input, KEYSET_ROLES, SKETCH_ROLES,
+    BundlePlan, GRAPH_DESCRIPTION_THRESHOLD, GRAPH_POSITIONS, GRAPH_TRANSPOSE_THRESHOLD, Input,
+    KEYSET_ROLES, SKETCH_ROLES,
 };
 use crate::build::stats;
 use crate::manifest::Requested;
@@ -90,7 +91,9 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
     // Read once, from the sidecar the core step just wrote: how many graphs
     // there are decides the transpose, and whether any is named by a blank
     // node decides what can be described.
-    let graph_facts = graphs.then(|| sidecar_facts(&layout.data)).transpose()?;
+    let graph_facts = graphs
+        .then(|| sidecar_facts(plan, &layout.data))
+        .transpose()?;
     if let Some(facts) = graph_facts {
         runner.run(&graphs_index_step(&layout, wants_transpose(plan, facts)))?;
         // Before the expensive sidecars, not after: a sidecar this server
@@ -272,8 +275,9 @@ fn wants_transpose(plan: &BundlePlan, facts: stats::GraphFacts) -> bool {
         .unwrap_or(facts.named_graphs > GRAPH_TRANSPOSE_THRESHOLD)
 }
 
-/// What the sidecar this build just wrote says about its graphs.
-fn sidecar_facts(data: &Path) -> Result<stats::GraphFacts> {
+/// What the sidecar this build just wrote says about its graphs, and what the
+/// plan makes of it.
+fn sidecar_facts(plan: &BundlePlan, data: &Path) -> Result<stats::GraphFacts> {
     let sidecar = hdtc::format::graph_sidecar_path(data);
     let directory = hdtc::format::GraphSidecarDirectory::read(&sidecar, data)
         .with_context(|| format!("reading the graph sidecar {}", sidecar.display()))?;
@@ -281,6 +285,12 @@ fn sidecar_facts(data: &Path) -> Result<stats::GraphFacts> {
     Ok(stats::GraphFacts {
         named_graphs: header.named_graphs,
         blank_names: header.has_blank_graph_names(),
+        describe: plan
+            .config
+            .contents
+            .graphs
+            .describe
+            .unwrap_or(header.named_graphs <= GRAPH_DESCRIPTION_THRESHOLD),
     })
 }
 

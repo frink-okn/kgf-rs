@@ -3891,7 +3891,9 @@ fn a_built_quad_bundle_describes_each_of_its_graphs() {
         .iter()
         .map(|entry| entry["graph"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(named, vec![UNNAMED, G1, "http://example.org/g2"]);
+    // The card ranks by size; `/graphs` above lists by layer id.
+    assert_eq!(named, vec![G1, UNNAMED, "http://example.org/g2"]);
+    assert_eq!(summary["graphs_total"], 3);
     for entry in summary["graphs"].as_array().unwrap() {
         for link in ["schema", "fragment"] {
             let followed = server.get(&format!(

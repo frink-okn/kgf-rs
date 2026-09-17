@@ -1412,14 +1412,17 @@ fn a_quad_bundle_is_described_one_graph_at_a_time() {
             )
         })
         .collect();
+    // Ranked by size like every other list on the card, which is a different
+    // order from `/graphs`'s complete listing by layer id.
     assert_eq!(
         graphs,
         vec![
-            ("urn:x-kgf:unnamed".to_owned(), 2),
             ("http://example.org/g1".to_owned(), 2),
+            ("urn:x-kgf:unnamed".to_owned(), 2),
             ("http://example.org/g2".to_owned(), 1),
         ]
     );
+    assert_eq!(summary["graphs_total"], 3);
     assert_eq!(summary["counts"]["triples"], 3);
 
     // A bundle without memberships has nothing to say there and says nothing.
@@ -1701,4 +1704,82 @@ fn a_blank_named_graph_is_carried_without_being_described() {
         .collect();
     assert_eq!(graphs, ["http://example.org/g1"]);
     kgf(&["manifest", path(&out), "--check"], "").ok();
+}
+
+/// One view per graph is a whole schema projection per graph, in each of the
+/// three artifacts and in the manifest range that declares it, so a bundle
+/// split into many graphs stops describing them one by one.
+#[test]
+fn per_graph_description_follows_the_number_of_graphs() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("many.nq");
+    let mut quads = String::new();
+    for graph in 0..70 {
+        quads.push_str(&format!(
+            "<http://example.org/s{graph}> <http://example.org/p> \
+             <http://example.org/o> <http://example.org/g{graph}> .\n"
+        ));
+    }
+    std::fs::write(&source, &quads).unwrap();
+    let build = |out: &Path, config: &str, input: &Path| {
+        kgf(
+            &[
+                "build",
+                "--config",
+                "-",
+                "--out",
+                path(out),
+                "--input",
+                path(input),
+                "--hdtc",
+                &hdtc(),
+            ],
+            config,
+        )
+        .ok();
+    };
+
+    // Seventy graphs is over the line: the memberships are all there and the
+    // per-graph views are not.
+    let many = dir.path().join("root/tinykg/many");
+    build(&many, CONFIG, &source);
+    assert!(many.join("data.hdt.graphs").exists());
+    assert_eq!(
+        views_of(&many, "stats/schema-nodes.tsv"),
+        ["design", "queryable"]
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(many.join("stats/summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["graphs"], serde_json::json!([]));
+    kgf(&["manifest", path(&many), "--check"], "").ok();
+
+    // A bundle that knows better says so, and gets a view for every graph.
+    let asked = dir.path().join("root/tinykg/asked");
+    build(
+        &asked,
+        &format!("{CONFIG}contents:\n  graphs: {{describe: true}}\n"),
+        &source,
+    );
+    assert_eq!(views_of(&asked, "stats/schema-nodes.tsv").len(), 72);
+    // The card stays a card: the largest few, and the total beside them.
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(asked.join("stats/summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["graphs"].as_array().unwrap().len(), 10);
+    assert_eq!(summary["graphs_total"], 70);
+    kgf(&["manifest", path(&asked), "--check"], "").ok();
+
+    // And the other way: a small bundle that does not want them.
+    let small = dir.path().join("small.nq");
+    std::fs::write(&small, QUADS).unwrap();
+    let declined = dir.path().join("root/tinykg/declined");
+    build(
+        &declined,
+        &format!("{CONFIG}contents:\n  graphs: {{describe: false}}\n"),
+        &small,
+    );
+    assert!(declined.join("data.hdt.graphs").exists());
+    assert_eq!(
+        views_of(&declined, "stats/schema-nodes.tsv"),
+        ["design", "queryable"]
+    );
 }
