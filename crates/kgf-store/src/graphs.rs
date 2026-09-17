@@ -59,14 +59,14 @@ use hdtc::format::{
     GRAPH_BITMAP_CONTAINER_SUBRANK_BYTES, GRAPH_CHUNK_ENTRY_SIZE, GRAPH_LAYER_ENTRY_SIZE,
     GRAPH_POSITION_CHUNK_SHIFT, GraphChunkContainer, GraphChunkEntry, GraphIndex,
     GraphIndexOpenError, GraphIndexSectionKind, GraphLayerEncoding, GraphLayerEntry,
-    GraphSidecarDirectory,
+    GraphSidecarDirectory, GraphSidecarOpenError,
 };
 
 use crate::dict::PfcLayout;
 use crate::error::{Error, Result};
 use crate::map::{BitmapSpec, BitmapView, BytesSpec, Mapping, PackedArray, PackedSpec};
 use crate::pattern::Permutation;
-use crate::rank::{RankedBitmap, RankedSpec};
+use crate::rank::{RankedBitmap, RankedSpec, SUBRANK_WIDTH, SUPERRANK_WIDTH};
 
 /// The reserved name of the union of every graph — what an unscoped request
 /// reads. Accepted as a graph selector on every release and never a layer.
@@ -145,8 +145,27 @@ impl Graphs {
     /// reserved graph name, because both names have fixed meanings that a
     /// stored layer could only contradict.
     pub fn open(hdt: &Path, sidecar: Mapping, index: Mapping) -> Result<Self> {
+        // hdtc binds the index to the sidecar it finds beside the HDT, so the
+        // mapping handed in must be that file.
+        assert_eq!(
+            sidecar.path(),
+            hdtc::format::graph_sidecar_path(hdt),
+            "the graph sidecar mapping is not the HDT's canonical sidecar"
+        );
         let header = *GraphSidecarDirectory::read(sidecar.path(), hdt)
-            .map_err(|error| classify_sidecar_error(error, sidecar.path(), hdt))?
+            .map_err(|error| match error {
+                GraphSidecarOpenError::Binding { source } => Error::ArtifactBindingMismatch {
+                    artifact: sidecar.path().to_path_buf(),
+                    hdt: hdt.to_path_buf(),
+                    detail: format!("{source:#}"),
+                },
+                GraphSidecarOpenError::Sidecar { source } => Error::Format(source.context(
+                    format!("opening graph sidecar {}", sidecar.path().display()),
+                )),
+                GraphSidecarOpenError::Source { source } => Error::Format(
+                    source.context(format!("validating source HDT {}", hdt.display())),
+                ),
+            })?
             .header();
 
         let directory = GraphIndex::directory(index.path(), hdt).map_err(|error| match error {
@@ -249,27 +268,43 @@ impl Graphs {
             let subrank = section(GraphIndexSectionKind::TransposeSubrank)?;
             let bitmap = with_artifact(
                 &index,
-                RankedSpec::new(
-                    BitmapSpec::new(&index, bitmap.offset, bitmap.entry_count)?,
-                    PackedSpec::new(
-                        &index,
-                        superrank.offset,
-                        superrank.entry_count,
-                        superrank.bits_per_entry,
-                    )?,
-                    PackedSpec::new(
-                        &index,
-                        subrank.offset,
-                        subrank.entry_count,
-                        subrank.bits_per_entry,
-                    )?,
-                    index_header.superblock_bits(),
-                    index_header.subblock_bits(),
-                ),
+                BitmapSpec::new(&index, bitmap.offset, bitmap.entry_count).and_then(|bitmap| {
+                    RankedSpec::new(
+                        bitmap,
+                        PackedSpec::new(
+                            &index,
+                            superrank.offset,
+                            superrank.entry_count,
+                            superrank.bits_per_entry,
+                        )?,
+                        PackedSpec::new(
+                            &index,
+                            subrank.offset,
+                            subrank.entry_count,
+                            subrank.bits_per_entry,
+                        )?,
+                        index_header.superblock_bits(),
+                        index_header.subblock_bits(),
+                    )
+                }),
             )?;
+            // One sentinel read: the transpose closes exactly one run per
+            // position, so its population is the triple count. Without this a
+            // short bitmap would fail inside a request's select rather than
+            // here, with the path in hand.
+            let runs = bitmap.view(&index, &index).count();
+            if runs != facts.triples {
+                return Err(malformed(
+                    &index,
+                    format!(
+                        "the transpose closes {runs} runs for {} triples",
+                        facts.triples
+                    ),
+                ));
+            }
             let ids = if index_header.has_membership_ids() {
                 let array = section(GraphIndexSectionKind::TransposeArray)?;
-                Some(with_artifact(
+                let ids = with_artifact(
                     &index,
                     PackedSpec::new(
                         &index,
@@ -277,7 +312,21 @@ impl Graphs {
                         array.entry_count,
                         array.bits_per_entry,
                     ),
-                )?)
+                )?;
+                // Every graph id must fit the array's width, or an entry the
+                // writer could not have stored is read as a smaller id.
+                let needed = u64::BITS - facts.named_graphs.leading_zeros();
+                if u32::from(ids.width()) < needed {
+                    return Err(malformed(
+                        &index,
+                        format!(
+                            "the transpose stores graph ids in {} bits, too few for {} graphs",
+                            ids.width(),
+                            facts.named_graphs
+                        ),
+                    ));
+                }
+                Some(ids)
             } else {
                 None
             };
@@ -328,19 +377,24 @@ impl Graphs {
             .is_some_and(|transpose| transpose.ids.is_some())
     }
 
-    /// The layer a graph selector names, resolving the unnamed constant
-    /// before the dictionary. `None` for a name this bundle does not hold.
+    /// The layer a graph name selects: the unnamed constant is layer 0, and
+    /// any other name is looked up in the dictionary. `None` for a name this
+    /// bundle does not hold.
     ///
-    /// The union constant is not a layer and is refused by construction: a
-    /// caller selects the union by not scoping at all.
+    /// The union is not a layer, so its constant is not this function's to
+    /// answer: a caller reads the union by not scoping at all, and decides
+    /// that before asking for a layer. Asked anyway, the constant is simply a
+    /// name no dictionary can hold, because opening refused any that did.
     pub fn resolve(&self, name: &[u8]) -> Result<Option<GraphId>> {
         if name == UNNAMED_GRAPH_IRI.as_bytes() {
             return Ok(Some(GraphId::UNNAMED));
         }
-        if name == UNION_GRAPH_IRI.as_bytes() {
-            return Ok(None);
-        }
         self.named_graph_id(name)
+    }
+
+    /// Every layer, the unnamed graph first: `0..=G`.
+    pub fn graph_ids(&self) -> impl Iterator<Item = GraphId> {
+        (0..=self.facts.named_graphs).map(GraphId)
     }
 
     fn named_graph_id(&self, name: &[u8]) -> Result<Option<GraphId>> {
@@ -431,6 +485,7 @@ impl Graphs {
             layers,
             transpose,
             triples: self.facts.triples,
+            named_graphs: self.facts.named_graphs,
         })
     }
 }
@@ -457,6 +512,7 @@ pub struct Memberships<'a> {
     layers: Vec<Layer<'a>>,
     transpose: Option<Transpose<'a>>,
     triples: u64,
+    named_graphs: u64,
 }
 
 impl Memberships<'_> {
@@ -476,7 +532,17 @@ impl Memberships<'_> {
         {
             let start = transpose.offset(position);
             let end = transpose.bitmap.select1(position) + 1;
-            out.extend((start..end).map(|ordinal| GraphId(ids.get(ordinal))));
+            for ordinal in start..end {
+                let id = ids.get(ordinal);
+                if id > self.named_graphs {
+                    return Err(crate::error::Error::Region(format!(
+                        "the transpose names graph {id} at position {position}, beyond the \
+                         {} named graphs",
+                        self.named_graphs
+                    )));
+                }
+                out.push(GraphId(id));
+            }
             return Ok(());
         }
         for layer in &self.layers {
@@ -617,6 +683,17 @@ impl<'a> LayerSet<'a> {
                     if header.low_bits >= 64 {
                         return Err(self.malformed(id, "Elias-Fano low-bit width is not below 64"));
                     }
+                    // `rank` walks buckets by their closing zero, so the bucket
+                    // count must be what the universe and width imply and the
+                    // upper bitmap must hold exactly one zero per bucket.
+                    if header.high_buckets != 1 + ((header.universe - 1) >> header.low_bits)
+                        || header.upper_bits != header.high_buckets + header.members
+                    {
+                        return Err(self.malformed(
+                            id,
+                            "Elias-Fano bucket count disagrees with the universe and width",
+                        ));
+                    }
                     let lower = if header.low_bits == 0 {
                         None
                     } else {
@@ -648,13 +725,13 @@ impl<'a> LayerSet<'a> {
                                 "superranks",
                             )?,
                             header.superrank_count,
-                            64,
+                            SUPERRANK_WIDTH,
                         )
                         .map_err(|error| self.malformed(id, &error.to_string()))?,
                         PackedArray::new(
                             region(header.subrank_offset, header.subrank_length, "subranks")?,
                             header.subrank_count,
-                            16,
+                            SUBRANK_WIDTH,
                         )
                         .map_err(|error| self.malformed(id, &error.to_string()))?,
                         ELIAS_FANO_SUPERBLOCK_BITS,
@@ -849,10 +926,10 @@ impl Layer<'_> {
         match &self.body {
             LayerBody::Empty => unreachable!("an empty layer has no member to select"),
             LayerBody::Chunked { chunks, file, .. } => {
-                // The last chunk whose first member is at or before the
-                // ordinal. Empty dense chunks share their successor's
-                // `rank_before`, and the last of a run of equal values is the
-                // non-empty one, so the search lands on a chunk that holds it.
+                // The first chunk whose members extend past the ordinal. An
+                // empty dense chunk extends no further than its predecessor,
+                // so the search passes over it to the chunk that holds the
+                // member.
                 let count = self.chunk_count(chunks);
                 let (mut low, mut high) = (0u64, count);
                 while low < high {
@@ -1113,21 +1190,6 @@ fn array_lower_bound(payload: &[u8], offset: u16) -> usize {
     low
 }
 
-fn classify_sidecar_error(error: anyhow::Error, sidecar: &Path, hdt: &Path) -> Error {
-    // hdtc reports a sidecar that describes another HDT with one of two
-    // messages; both are a binding failure rather than a corrupt file.
-    let text = format!("{error:#}");
-    if text.contains("sidecar/HDT") {
-        Error::ArtifactBindingMismatch {
-            artifact: sidecar.to_path_buf(),
-            hdt: hdt.to_path_buf(),
-            detail: text,
-        }
-    } else {
-        Error::Format(error.context(format!("opening graph sidecar {}", sidecar.display())))
-    }
-}
-
 fn malformed(mapping: &Mapping, detail: String) -> Error {
     Error::Malformed {
         artifact: mapping.path().to_path_buf(),
@@ -1147,7 +1209,9 @@ mod tests {
     use super::*;
     use crate::pattern::{IdPattern, resolve};
     use crate::perm::Permutations;
-    use crate::testing::{Fixture, TINY_NQ, WORKED_EXAMPLE_NQ, synthetic_quads};
+    use crate::testing::{
+        Fixture, TINY_NQ, Transpose as Built, WORKED_EXAMPLE_NQ, parse_hdtc_row, synthetic_quads,
+    };
     use crate::{IdTriple, Role};
     use std::collections::BTreeMap;
 
@@ -1249,34 +1313,6 @@ mod tests {
         by_space
     }
 
-    fn parse_hdtc_row(dictionary: &crate::dict::Dictionary<'_>, row: &[u8]) -> IdTriple {
-        let fields: Vec<&[u8]> = row.split(|byte| *byte == b'\t').collect();
-        let term = |field: &[u8]| -> Vec<u8> {
-            if field.starts_with(b"<") {
-                field[1..field.len() - 1].to_vec()
-            } else {
-                field.to_vec()
-            }
-        };
-        let id = |role, bytes: &[u8]| {
-            dictionary
-                .locate(role, bytes)
-                .unwrap()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "hdtc row names an absent term {}",
-                        String::from_utf8_lossy(bytes)
-                    )
-                })
-                .0
-        };
-        IdTriple {
-            subject: id(Role::Subject, &term(fields[0])),
-            predicate: id(Role::Predicate, &term(fields[1])),
-            object: id(Role::Object, &term(fields[2])),
-        }
-    }
-
     fn open(fixture: &Fixture) -> (Permutations, Graphs) {
         let perms = Permutations::open(fixture.map_hdt(), fixture.map_perm()).unwrap();
         let graphs = Graphs::open(
@@ -1322,16 +1358,18 @@ mod tests {
     #[test]
     fn every_layer_operation_agrees_with_hdtc_in_every_space() {
         for (source, transpose) in [
-            (TINY_NQ, false),
-            (WORKED_EXAMPLE_NQ, false),
-            (WORKED_EXAMPLE_NQ, true),
-            (synthetic_quads().as_str(), false),
-            (synthetic_quads().as_str(), true),
+            (TINY_NQ, Built::None),
+            (WORKED_EXAMPLE_NQ, Built::None),
+            (WORKED_EXAMPLE_NQ, Built::Ranks),
+            (WORKED_EXAMPLE_NQ, Built::Ids),
+            (synthetic_quads().as_str(), Built::None),
+            (synthetic_quads().as_str(), Built::Ranks),
+            (synthetic_quads().as_str(), Built::Ids),
         ] {
             let fixture = Fixture::build_quads_with(source, transpose);
             let (perms, graphs) = open(&fixture);
-            assert_eq!(graphs.has_transpose(), transpose);
-            assert_eq!(graphs.has_transpose_ids(), transpose);
+            assert_eq!(graphs.has_transpose(), transpose != Built::None);
+            assert_eq!(graphs.has_transpose_ids(), transpose == Built::Ids);
             let oracle = Oracle::new(&fixture, &perms, &graphs);
             let n = oracle.triples;
             let mut encodings = Vec::new();
@@ -1354,8 +1392,9 @@ mod tests {
                         );
                     }
                     // Every position for the small fixtures; for the wide
-                    // one, a stride plus the neighbourhood of a sample of
-                    // members, which is where rank and access change value.
+                    // one, a stride, the neighbourhood of a sample of members
+                    // (where rank and access change value), and every chunk
+                    // and subblock boundary (where the directories hand over).
                     let probes: Vec<u64> = if n <= 64 {
                         (0..=n).collect()
                     } else {
@@ -1367,6 +1406,8 @@ mod tests {
                                     .step_by(97)
                                     .flat_map(|m| [m.saturating_sub(1), *m, (*m + 1).min(n)]),
                             )
+                            .chain((0..=n).step_by(512))
+                            .chain((0..=n).step_by(CHUNK_POSITIONS as usize))
                             .collect()
                     };
                     for position in probes {
@@ -1448,6 +1489,89 @@ mod tests {
     }
 
     #[test]
+    fn an_index_without_both_layer_sets_is_refused_by_name() {
+        let fixture = Fixture::build_quads(WORKED_EXAMPLE_NQ);
+        let hdtc = crate::testing::hdtc_binary();
+        let status = std::process::Command::new(&hdtc)
+            .arg("graphs-index")
+            .arg(fixture.hdt_path())
+            .args(["--positions", "pos", "--memory-limit", "64M"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let error = Graphs::open(
+            &fixture.hdt_path(),
+            fixture.map_graphs(),
+            fixture.map_graph_index(),
+        )
+        .expect_err("an index missing the OPS layer set must be refused");
+        match error {
+            Error::MissingRequiredArtifact {
+                artifact, remedy, ..
+            } => {
+                assert!(artifact.contains("ops"), "{artifact}");
+                assert!(remedy.contains("--positions pos,ops"), "{remedy}");
+            }
+            other => panic!("unexpected error: {other:#}"),
+        }
+    }
+
+    /// The structures a layer walks are decoded on first touch, so a
+    /// malformed one must come back as an error naming the file rather than
+    /// a panic inside a request. Corrupt each field the reader trusts and ask
+    /// for the layer.
+    #[test]
+    fn a_malformed_layer_is_reported_rather_than_trusted() {
+        let fixture = Fixture::build_quads(&synthetic_quads());
+        let (_, graphs) = open(&fixture);
+        let header = GraphSidecarDirectory::read(
+            &fixture.bundle_path().join(crate::store::artifact::GRAPHS),
+            &fixture.hdt_path(),
+        )
+        .unwrap();
+        let directory_offset = header.header().directory_offset as usize;
+        let original =
+            std::fs::read(fixture.bundle_path().join(crate::store::artifact::GRAPHS)).unwrap();
+
+        // Layer 1 is the dense one, layer 3 the Elias–Fano one; every graph
+        // id here is 1-based, so the entry offsets follow.
+        let corruptions: Vec<(&str, usize, Vec<u8>)> = vec![
+            ("nonzero layer flags", 76, vec![1, 0, 0, 0]),
+            ("unknown encoding", 72, vec![9, 0, 0, 0]),
+            ("chunk directory length", 8, vec![1, 0, 0, 0, 0, 0, 0, 0]),
+            ("range past the universe", 64, vec![0xff; 8]),
+        ];
+        for (what, field, bytes) in corruptions {
+            for graph in graphs.graph_ids().filter(|id| !id.is_unnamed()) {
+                let mut corrupt = original.clone();
+                let at = directory_offset + graph.0 as usize * GRAPH_LAYER_ENTRY_SIZE + field;
+                corrupt[at..at + bytes.len()].copy_from_slice(&bytes);
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("data.hdt.graphs");
+                std::fs::write(&path, &corrupt).unwrap();
+                let file = crate::testing::map_fixture(&path);
+                let set = LayerSet {
+                    file: &file,
+                    directory: &file.as_bytes()[directory_offset..],
+                    triples: graphs.facts().triples,
+                    named_graphs: graphs.facts().named_graphs,
+                };
+                match set.layer(graph) {
+                    Err(Error::Malformed { artifact, detail }) => {
+                        assert_eq!(artifact, path, "{what} on layer {}", graph.0);
+                        assert!(
+                            detail.starts_with(&format!("layer {}", graph.0)),
+                            "{detail}"
+                        );
+                    }
+                    Ok(_) => panic!("{what} on layer {} was accepted", graph.0),
+                    Err(other) => panic!("{what} on layer {}: {other:#}", graph.0),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_sidecar_naming_a_reserved_graph_is_refused_at_open() {
         for reserved in [UNION_GRAPH_IRI, UNNAMED_GRAPH_IRI] {
             let fixture = Fixture::build_quads(&format!(
@@ -1474,17 +1598,31 @@ mod tests {
 
     #[test]
     fn a_sidecar_for_another_hdt_is_refused_as_a_binding_failure() {
+        // The shape a real bundle can have: one directory whose sidecar pair
+        // was built against a different HDT than the one beside them.
         let first = Fixture::build_quads(WORKED_EXAMPLE_NQ);
         let second = Fixture::build_quads(TINY_NQ);
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("mixed");
+        second.copy_bundle_to(&bundle);
+        for name in [
+            crate::store::artifact::GRAPHS,
+            crate::store::artifact::GRAPHS_IDX,
+        ] {
+            std::fs::copy(first.bundle_path().join(name), bundle.join(name)).unwrap();
+        }
         let error = Graphs::open(
-            &second.hdt_path(),
-            first.map_graphs(),
-            first.map_graph_index(),
+            &bundle.join(crate::store::artifact::HDT),
+            crate::testing::map_fixture(&bundle.join(crate::store::artifact::GRAPHS)),
+            crate::testing::map_fixture(&bundle.join(crate::store::artifact::GRAPHS_IDX)),
         )
         .expect_err("a foreign sidecar must be refused");
-        assert!(
-            matches!(error, Error::ArtifactBindingMismatch { .. }),
-            "{error:#}"
-        );
+        match error {
+            Error::ArtifactBindingMismatch { artifact, hdt, .. } => {
+                assert_eq!(artifact, bundle.join(crate::store::artifact::GRAPHS));
+                assert_eq!(hdt, bundle.join(crate::store::artifact::HDT));
+            }
+            other => panic!("expected a binding mismatch, got {other:#}"),
+        }
     }
 }

@@ -238,6 +238,19 @@ pub fn tiny_id_triples(dictionary: &crate::dict::Dictionary<'_>) -> Vec<crate::I
     ]
 }
 
+/// Which SPO transpose a quad fixture's index carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transpose {
+    /// Neither half: both layer sets only, the configuration a bundle with
+    /// few coarse graphs publishes.
+    None,
+    /// Run boundaries only, so range counts come from the transpose while the
+    /// graph column still probes the layers.
+    Ranks,
+    /// Run boundaries and graph ids.
+    Ids,
+}
+
 /// A bundle built by hdtc into a temporary directory.
 ///
 /// The fixture RDF is checked in and hdtc builds the binary artifacts, so the
@@ -332,25 +345,28 @@ impl Fixture {
     }
 
     /// Build a quad bundle, optionally rebuilding its index with the SPO
-    /// transpose — both run boundaries and graph ids — so the paths that read
-    /// it are exercised beside the paths that probe the layers instead.
-    pub fn build_quads_with(source: &str, transpose: bool) -> Self {
+    /// transpose, so the paths that read it are exercised beside the paths
+    /// that probe the layers instead.
+    pub fn build_quads_with(source: &str, transpose: Transpose) -> Self {
         let fixture = Self::build_with(source, true);
-        if transpose {
-            let hdtc = hdtc_binary();
-            let output = std::process::Command::new(&hdtc)
-                .arg("graphs-index")
-                .arg(fixture.hdt_path())
-                .args(["--transpose-ids", "--memory-limit", "64M", "--temp-dir"])
-                .arg(fixture.dir.path().join("work"))
-                .output()
-                .unwrap_or_else(|error| panic!("run {} graphs-index: {error}", hdtc.display()));
-            assert!(
-                output.status.success(),
-                "hdtc graphs-index failed:\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+        let flag = match transpose {
+            Transpose::None => return fixture,
+            Transpose::Ranks => "--transpose-ranks",
+            Transpose::Ids => "--transpose-ids",
+        };
+        let hdtc = hdtc_binary();
+        let output = std::process::Command::new(&hdtc)
+            .arg("graphs-index")
+            .arg(fixture.hdt_path())
+            .args([flag, "--memory-limit", "64M", "--temp-dir"])
+            .arg(fixture.dir.path().join("work"))
+            .output()
+            .unwrap_or_else(|error| panic!("run {} graphs-index: {error}", hdtc.display()));
+        assert!(
+            output.status.success(),
+            "hdtc graphs-index failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         fixture
     }
 
@@ -684,6 +700,41 @@ impl Fixture {
             .filter(|line| !line.is_empty())
             .map(<[u8]>::to_vec)
             .collect()
+    }
+}
+
+/// Parse one row of `hdtc search` output — tab-separated terms, a trailing
+/// graph for a quad, and `.` — into role-scoped ids.
+#[cfg(test)]
+pub(crate) fn parse_hdtc_row(
+    dictionary: &crate::dict::Dictionary<'_>,
+    row: &[u8],
+) -> crate::IdTriple {
+    use crate::Role;
+    let fields: Vec<&[u8]> = row.split(|byte| *byte == b'\t').collect();
+    let term = |field: &[u8]| -> Vec<u8> {
+        if field.starts_with(b"<") {
+            field[1..field.len() - 1].to_vec()
+        } else {
+            field.to_vec()
+        }
+    };
+    let id = |role, bytes: &[u8]| {
+        dictionary
+            .locate(role, bytes)
+            .expect("read the fixture dictionary")
+            .unwrap_or_else(|| {
+                panic!(
+                    "hdtc row names an absent term {}",
+                    String::from_utf8_lossy(bytes)
+                )
+            })
+            .0
+    };
+    crate::IdTriple {
+        subject: id(Role::Subject, &term(fields[0])),
+        predicate: id(Role::Predicate, &term(fields[1])),
+        object: id(Role::Object, &term(fields[2])),
     }
 }
 

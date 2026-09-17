@@ -178,8 +178,8 @@ impl Geometry {
 /// this one, which the entry counts alone would not catch — and since open
 /// deliberately skips CRC verification, so cheap structural checks
 /// are what stand between a misparsed sidecar and wrong answers.
-const SUPERRANK_WIDTH: u8 = 64;
-const SUBRANK_WIDTH: u8 = 16;
+pub(crate) const SUPERRANK_WIDTH: u8 = 64;
+pub(crate) const SUBRANK_WIDTH: u8 = 16;
 
 /// Reject a directory array that is not at its natural width.
 ///
