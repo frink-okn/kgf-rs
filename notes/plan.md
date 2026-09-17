@@ -3043,12 +3043,33 @@ following the code.
     should say which cap governs it rather than leaving the answer to whatever an HTTP
     stack happens to allow.
 
+73. **`/search`'s `complete: true` says a top-k finished, not that the matches are
+    exhausted, and §3.6 has no word for the difference.** Unit 17 reads `limit` as a
+    requested top-k rather than a page size, so the entity loop stops the moment it has
+    kept `limit` subjects and the completeness decision weighs only the response-byte,
+    RDF-resolution, and text-candidate budgets. The two requests recorded in
+    `notes/search-completeness.md` are the symptom: over Ubergraph, `q=buffalo` at
+    `limit=100` answers 100 entities `complete: true, next: null`, and the same query at
+    `limit=1000` answers 742 the same way. Every other paged operation asks for
+    `limit + 1` and keeps `limit` precisely so a full page cannot claim completeness,
+    and §3.6 forbids silent truncation. So one of three has to be written down: §3.6
+    gains a term for a bounded ranking that exhausted no budget; or `/search` owes a
+    `page_limit` truncation with no cursor behind it, which the envelope contract must
+    then permit; or ranked entity paging gets specified along with the state it costs.
+    The note argues the third is the expensive one — ranking is over literals and the
+    response unit is entities, so deduplication happens after ranking and a cursor
+    naming a literal rank cannot keep a subject from reappearing. Found serving
+    Ubergraph.
+
 ## Not in this plan
 
 Remaining composed operations (ranges, star, key resolution), graph scoping, and
 everything requiring a sidecar beyond `.perm` and the existing exhaustive text index.
 Those are doc 20 §20.8's later milestones and compose through the `Store`, envelope,
-cursor, term, and live-profile layers this plan builds.
+cursor, term, and live-profile layers this plan builds. Graph scoping has its read
+contract written ahead of the code in [`graphs.md`](graphs.md): two reserved IRIs, the
+four forms of `g`, what a SPARQL client derives from each, and the `sd:defaultGraph`
+declaration stock Comunica needs before it will ask for the union at all.
 
 `kgf build` was deliberately absent from units 1–18 and landed as unit 21, once unit
 19 had settled enough of the consumer contract to say what a description set must

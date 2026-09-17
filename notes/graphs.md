@@ -1,0 +1,141 @@
+# Named graphs: the read contract for the `graphs` capability
+
+Status: decided 2026-09-15, not yet implemented. Today `g=` on `/fragment` and `/count`
+answers 501 `capability_not_available` from the `NOT_OFFERED` table in
+`crates/kgf-server/src/request.rs`, and `kgf-store` opens and binding-checks
+`data.hdt.graphs` + `data.hdt.graphs.idx` without reading them. This note is the
+contract that implementation must meet. The rationale is a comparison with what
+union-default triplestores do; the short version is that KGF does what QLever,
+RDF4J/GraphDB, and Blazegraph do, and nothing else.
+
+## The model
+
+- `data.hdt` is the deduplicated union of every graph. The sidecar records memberships:
+  `(graph id, SPO position)` pairs, set semantics, and a triple may be in several graphs.
+- hdtc's layer 0 holds the statements that carried no graph in the source. KGF calls
+  this the **unnamed graph**. It is never called the default graph.
+- **The default graph is the union.** A request with no `g` reads it. This is a
+  semantic choice, stated as KGF's own; it matches union-default stores and not a
+  spec-strict SPARQL store.
+
+## Two reserved IRIs, fixed federation-wide
+
+| Constant | Names |
+|---|---|
+| `urn:x-kgf:union` | the union; `g=<urn:x-kgf:union>` is identical to omitting `g` |
+| `urn:x-kgf:unnamed` | the unnamed graph, layer 0 |
+
+`kgf build` refuses a source quad, or a component graph, whose IRI is either constant,
+so no sidecar layer can carry them and no runtime check is needed. In the s, p, and o
+positions they are ordinary IRIs that match nothing. Both are accepted on every
+release, sidecar or not: on a bundle with no memberships each selects every triple,
+since every triple of such a bundle is unnamed.
+
+## The four forms of `g` on `/fragment` and `/count`
+
+| `g` | Selection | Count |
+|---|---|---|
+| absent | union, one row per distinct triple | N |
+| `<G>` | triples in G, set semantics | rank difference in G's layer |
+| `<urn:x-kgf:unnamed>` | layer 0 | rank difference in layer 0 |
+| `*` | quad view: one row per membership, with a `g` column | Σ over layers |
+
+`g=<G>` and `g=*` need the capability and stay 501 without it. In the quad view every
+row has a `g`; layer-0 rows carry `urn:x-kgf:unnamed`, and `urn:x-kgf:union` never
+appears as a value. `GET /graphs` lists every named graph with its count, and the
+unnamed graph under its constant when layer 0 is non-empty. Cursors carry the scope.
+
+Worked example. Source, five statements:
+
+```
+:a :b :c .          :a :b :c :g1        :a :b :d .          :x :y :z :g1        :x :y :z :g2
+```
+
+Three distinct triples. Memberships: `:a :b :c` in {unnamed, g1}; `:a :b :d` in
+{unnamed}; `:x :y :z` in {g1, g2}. Counts: absent 3; `<g1>` 2; `<g2>` 1;
+`<urn:x-kgf:unnamed>` 2; `*` 5.
+
+## What SPARQL clients derive from this
+
+Normative for the Comunica source in `../kgf-sparql` and for any restricted SPARQL
+profile:
+
+| Pattern graph | Request | Result |
+|---|---|---|
+| none | no `g` | the union |
+| `GRAPH <G>` | `g=<G>`, constants included | G |
+| `GRAPH ?g` | `g=*`, then drop rows whose `g` is `urn:x-kgf:unnamed` | named-graph memberships only |
+
+`GRAPH ?g` never lists the unnamed graph. That is what QLever, RDF4J, and Blazegraph do
+by default; each reaches its bucket through its own reserved IRI. On the example,
+`GRAPH ?g { ?s ?p ?o }` has 3 solutions.
+
+## The TPF route
+
+A bundle with the capability publishes the **four-mapping** Hydra form, adding
+`hydra:property sd:graph` with variable `graph`, and declares in the page metadata:
+
+```
+<D> sd:defaultDataset [ sd:defaultGraph <urn:x-kgf:union> ] .
+```
+
+The blank-node subject is load-bearing: Comunica's metadata extractor reads
+`sd:defaultGraph` only from the page URL it fetched, from a resource declared earlier
+in the stream as that page's `void:subset` superset, or from a blank node. `<D>` is
+none of those (its subset is `<F>`, not the page), so `<D> sd:defaultGraph …` is
+silently ignored and Comunica treats the default graph as empty, sending no request
+at all for bare patterns. The blank-node shape works in any quad order. That
+declaration is what makes stock Comunica request the union for a bare pattern (its
+QPF source sends `graph=<the declared IRI>` for a default-graph pattern). Serving
+rule, in N-Quads/TriG/JSON-LD:
+
+| `graph=` | Data quads | `hydra:totalItems` |
+|---|---|---|
+| absent | quad view; layer-0 memberships **untagged** (document default graph), others tagged with their graph | memberships |
+| `<urn:x-kgf:union>` | each triple once, tagged `urn:x-kgf:union` | distinct triples |
+| `<G>` | G's triples, tagged G | count in G |
+| `<urn:x-kgf:unnamed>` | layer 0, tagged `urn:x-kgf:unnamed` | count in layer 0 |
+| `?g` (brTPF row variable) | as absent | as absent |
+
+The union constant tags rows only in answers to a request that named it, never in a
+graph-unbound response. Union rows are tagged rather than untagged because Comunica
+sends the identical `graph=urn:x-kgf:union` request for a bare pattern and for an
+explicit `GRAPH <urn:x-kgf:union>`, and keeps untagged rows only for the former;
+tagged rows satisfy both (measured by the s2-qpf implementation: untagged rows gave
+the explicit form 0 rows). Traced through Comunica 5.3.0's `QuerySourceQpf` and
+verified there: a bare pattern gets the union rows; `GRAPH ?g` requests with `graph`
+absent (`qpf`) or `graph=?g` (`brtpf`) and Comunica's own filter discards the untagged
+quads, so it sees named graphs only; `GRAPH <G>`, `GRAPH <urn:x-kgf:unnamed>`, and
+`GRAPH <urn:x-kgf:union>` pass straight through. No context flag is involved. A
+bundle without the capability keeps the three-mapping form. Turtle, being
+single-graph, can only serve the union and scoped views; the quad view is refused in
+it.
+
+## Store operations this needs
+
+- `graph_id(term)` and `graph(id)` over the sidecar dictionary; the two constants are
+  resolved before the dictionary is consulted.
+- Scoped enumeration for all eight patterns in the pattern's native position space
+  (SPO from the sidecar, POS and OPS from the index), `next_member`/`select` driven,
+  O(1) per row; scoped counts as two ranks.
+- `graphs_of(position)` for the `g` column, from the transpose when built and from
+  probing each layer otherwise.
+- Quad-view counts as the sum of per-layer rank differences.
+- Build: refuse the two constants as graph names; assign nothing to layer 0 that the
+  source did not leave bare.
+
+## Tests to write
+
+- The worked example as a fixture: every count in both tables above, on every
+  representation.
+- `GET /graphs` lists g1, g2, and the unnamed graph with counts 2, 1, 2.
+- TPF route: tagging per row of the serving table; `sd:defaultGraph` present with the
+  four-mapping form and absent with the three-mapping form.
+- `interop/comunica/test.mjs`, as both `qpf` and `brtpf` sources and with no
+  `unionDefaultGraph` context: a bare `SELECT * { ?s ?p ?o }` returning 3 rows,
+  `GRAPH <urn:x-kgf:union>` returning the same 3, `GRAPH ?g` returning 3,
+  `GRAPH <urn:x-kgf:unnamed>` returning 2, and a bare two-pattern join to exercise
+  the bindings-restricted path.
+- The metadata graph parses to a `sd:defaultGraph` triple whose subject is a blank
+  node, and Comunica's extractor, run over the page, reports `defaultGraph`.
+- Build refuses a quad in graph `urn:x-kgf:union`.

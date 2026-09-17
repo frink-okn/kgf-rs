@@ -9,7 +9,7 @@
 # the text index are pinned by convention rather than by commit, so that
 # mismatch produces plausible artifacts rather than an error.
 #
-#   docker build --build-arg HDTC_REF=v1.2.0-beta.3 -t kgf .
+#   docker build --build-arg HDTC_REF=v1.2.0 -t kgf .
 #   docker run --rm -v /bundles:/bundles kgf serve --bundle-root /bundles --bind 0.0.0.0:8080
 #   docker run --rm -v /bundles:/bundles kgf build --config - \
 #     --out /bundles/dreamkg/2026-06-01 --hdt /in/graph.hdt
@@ -18,7 +18,7 @@
 # mismatch here only costs a second toolchain download inside the image.
 ARG RUST_VERSION=1.94.1
 # The hdtc release this image is built from and tested against.
-ARG HDTC_REF=v1.2.0-beta.3
+ARG HDTC_REF=v1.2.0
 
 FROM rust:${RUST_VERSION}-bookworm AS build
 ARG HDTC_REF
