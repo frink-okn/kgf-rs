@@ -2909,33 +2909,30 @@ impl Schema {
     }
 }
 
+/// Which description layer `/schema` reads.
+///
+/// The grammar is the store's, so a name this accepts is one a bundle can
+/// carry: `design`, `queryable`, `component:<id>`, and `graph:<IRI>` — a graph
+/// being a subset of the published triples, which is the same axis a component
+/// is on rather than a second one.
 fn schema_view(params: &Params) -> Result<StatsView, Problem> {
     match params.get("view") {
-        None | Some("design") => Ok(StatsView::Design),
-        Some("queryable") => Ok(StatsView::Queryable),
-        Some(value) => value
-            .strip_prefix("component:")
-            .and_then(StatsView::component)
-            .ok_or_else(|| {
-                Problem::new(
-                    ErrorCode::MalformedRequest,
-                    format!(
-                        "view={} is not a schema view; use `design`, `queryable`, or `component:<id>`",
-                        reflected(value)
-                    ),
-                )
-            }),
+        None => Ok(StatsView::Design),
+        Some(value) => StatsView::from_manifest_key(value).ok_or_else(|| {
+            Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "view={} is not a schema view; use `design`, `queryable`, \
+                     `component:<id>`, or `graph:<IRI>`",
+                    reflected(value)
+                ),
+            )
+        }),
     }
 }
 
 fn canonicalize_schema_view(view: &StatsView, request: CanonicalRequest) -> CanonicalRequest {
-    match view {
-        StatsView::Design => request.with("view", "design"),
-        StatsView::Queryable => request.with("view", "queryable"),
-        StatsView::Component(component) => {
-            request.with("view", &format!("component:{}", component.as_str()))
-        }
-    }
+    request.with("view", &view.manifest_key())
 }
 
 fn parse_schema_query(
@@ -3315,10 +3312,13 @@ impl ObservedRequest for Schema {
             SchemaQuery::ClassRelations(_) => ("root", None, Some("class-relations")),
             SchemaQuery::ClassProperties(_) => ("root", None, Some("class-properties")),
         };
+        // The kind, never the identity: a component id or a graph IRI is
+        // request content, and the access log records shapes.
         let view = match &self.view {
             StatsView::Design => "design",
             StatsView::Queryable => "queryable",
             StatsView::Component(_) => "component",
+            StatsView::Graph(_) => "graph",
         };
         RequestShape::Schema {
             selection,

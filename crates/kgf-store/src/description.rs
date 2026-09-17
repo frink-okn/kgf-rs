@@ -6,6 +6,7 @@
 //! description size. Schema lookup binary-searches one declared view block;
 //! count-ranked projections page rows from resumable byte boundaries.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -109,6 +110,29 @@ impl ComponentId {
     }
 }
 
+/// A named graph a description view describes.
+///
+/// The graph's own IRI, which is the identity `g=` and `GET /graphs` use, so a
+/// client that has a graph's name has its description without a second
+/// vocabulary to map between. The unnamed graph is described under its
+/// reserved constant; the union is the dataset itself, which `queryable`
+/// already describes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GraphName(String);
+
+impl GraphName {
+    /// Parse a non-empty graph name.
+    pub fn new(name: impl Into<String>) -> Option<Self> {
+        let name = name.into();
+        (!name.is_empty()).then_some(Self(name))
+    }
+
+    /// The graph IRI, without the manifest's `graph:` prefix.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// One description layer published by the bundle.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StatsView {
@@ -118,6 +142,12 @@ pub enum StatsView {
     Queryable,
     /// One published component.
     Component(ComponentId),
+    /// One named graph of the dataset.
+    ///
+    /// The same axis as a component and not a second one: both describe a
+    /// subset of the published triples, and the analysis names both the same
+    /// way, as a `void:subset` of the dataset.
+    Graph(GraphName),
 }
 
 impl StatsView {
@@ -126,14 +156,38 @@ impl StatsView {
         ComponentId::new(id).map(Self::Component)
     }
 
-    fn from_manifest_key(key: &str) -> Option<Self> {
+    /// Construct a graph view, refusing an empty graph name.
+    pub fn graph(name: impl Into<String>) -> Option<Self> {
+        GraphName::new(name).map(Self::Graph)
+    }
+
+    /// The manifest key for this view, which is also its `view=` spelling.
+    pub fn manifest_key(&self) -> Cow<'static, str> {
+        match self {
+            Self::Design => Cow::Borrowed("design"),
+            Self::Queryable => Cow::Borrowed("queryable"),
+            Self::Component(component) => Cow::Owned(format!("component:{}", component.as_str())),
+            Self::Graph(graph) => Cow::Owned(format!("graph:{}", graph.as_str())),
+        }
+    }
+
+    /// Parse a manifest key, which is the same grammar a request sends.
+    ///
+    /// The one place the view grammar is written down: the manifest validates
+    /// names with it, a mapped bundle parses them with it, and a request is
+    /// checked against it, so none of the three can drift from the others.
+    pub fn from_manifest_key(key: &str) -> Option<Self> {
         match key {
             "design" => Some(Self::Design),
             "queryable" => Some(Self::Queryable),
-            _ => key
-                .strip_prefix("component:")
-                .and_then(ComponentId::new)
-                .map(Self::Component),
+            _ => {
+                if let Some(component) = key.strip_prefix("component:") {
+                    return ComponentId::new(component).map(Self::Component);
+                }
+                key.strip_prefix("graph:")
+                    .and_then(GraphName::new)
+                    .map(Self::Graph)
+            }
         }
     }
 }

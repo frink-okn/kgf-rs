@@ -3405,6 +3405,17 @@ pub fn schema(
                     component.as_str()
                 ),
             ),
+            // A graph the bundle does not describe: either it holds no such
+            // graph, or it was built before this description did. `GET
+            // /graphs` says which graphs it has.
+            StatsView::Graph(graph) => Problem::new(
+                ErrorCode::NotFound,
+                format!(
+                    "this bundle has no description view for graph `{}`; `/graphs` lists the \
+                     graphs it holds",
+                    graph.as_str()
+                ),
+            ),
             StatsView::Design | StatsView::Queryable => {
                 tracing::error!(?request.view, "a tier-1 description is missing a required view");
                 Problem::new(
@@ -3817,11 +3828,7 @@ fn selector_term(bound: &BoundTerm) -> SchemaTerm {
 }
 
 fn schema_view_name(view: &StatsView) -> String {
-    match view {
-        StatsView::Design => "design".to_owned(),
-        StatsView::Queryable => "queryable".to_owned(),
-        StatsView::Component(component) => format!("component:{}", component.as_str()),
-    }
+    view.manifest_key().into_owned()
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -1,13 +1,12 @@
 # Named graphs: the read contract for the `graphs` capability
 
-Status: decided 2026-09-15; the read side landed 2026-09-17, except for the
-per-graph statistics. `g` answers its four forms on `/fragment` and `/count`,
-`/graphs` lists them, and `/tpf` serves the table below. `kgf build` cannot yet
-produce a quads bundle, so a bundle with memberships is assembled by hand or by
-`hdtc` until it can. This note is the contract that implementation meets; where the
-two disagree, that is a bug in one of them. The rationale is a comparison with what
-union-default triplestores do; the short version is that KGF does what QLever,
-RDF4J/GraphDB, and Blazegraph do, and nothing else.
+Status: decided 2026-09-15, implemented 2026-09-17. `g` answers its four forms on
+`/fragment` and `/count`, `/graphs` lists them, `/tpf` serves the table below,
+`kgf build` assembles a bundle that carries memberships, and each graph has a
+description view of its own. This note is the contract that implementation meets;
+where the two disagree, that is a bug in one of them. The rationale is a comparison
+with what union-default triplestores do; the short version is that KGF does what
+QLever, RDF4J/GraphDB, and Blazegraph do, and nothing else.
 
 ## The model
 
@@ -141,6 +140,23 @@ quads, so it sees named graphs only; `GRAPH <G>` and `GRAPH <urn:x-kgf:unnamed>`
 straight through. No context flag is involved. A bundle without the capability keeps
 the three-mapping form. Turtle, being single-graph, can only serve the union and
 scoped views; the quad view is refused in it.
+
+## Each graph's own description
+
+A bundle with memberships is described one graph at a time as well as whole. The
+analysis describes the dataset as the union plus one `void:subset` per graph, and
+the build projects each subset into a description view named `graph:<IRI>` — the
+unnamed graph under `urn:x-kgf:unnamed`, the same name `g=` and `/graphs` use, so a
+client holding a graph's name holds its description without a second vocabulary to
+map between. `GET /schema?view=graph:<IRI>` reads one, `stats/summary.json` lists
+every graph with its own counts and the links into both, and a graph the bundle does
+not describe is a 404 naming `/graphs`.
+
+A graph is a view rather than a second kind of description because it is on the axis
+components are on: both name a subset of the published triples, and the analysis
+already expresses both as `void:subset`. The counts are each graph's own, so they sum
+to more than the dataset's whenever a triple is in two graphs — which is the point of
+publishing them separately.
 
 ## Store operations this needs
 

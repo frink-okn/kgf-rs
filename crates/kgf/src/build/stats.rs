@@ -37,6 +37,10 @@ const VOID_PROPERTIES: &str = "http://rdfs.org/ns/void#properties";
 const VOID_EXT_OBJECT_CLASS_PARTITION: &str = "http://ldf.fi/void-ext#objectClassPartition";
 const VOID_EXT_DATATYPE_PARTITION: &str = "http://ldf.fi/void-ext#datatypePartition";
 const VOID_EXT_DATATYPE: &str = "http://ldf.fi/void-ext#datatype";
+const VOID_SUBSET: &str = "http://rdfs.org/ns/void#subset";
+const SD_NAMED_GRAPH: &str = "http://www.w3.org/ns/sparql-service-description#namedGraph";
+const SD_NAME: &str = "http://www.w3.org/ns/sparql-service-description#name";
+const SD_GRAPH: &str = "http://www.w3.org/ns/sparql-service-description#graph";
 
 const SCHEMA_HEADER: &str = "view\tkind\tclass\tpredicate\tdatatype\tsubject_id\n";
 const RELATIONS_HEADER: &str = "view\tsubject_class\tpredicate\tobject_class\ttriples\n";
@@ -82,6 +86,9 @@ pub(crate) struct Inputs<'a> {
     pub(crate) card: DatasetCard<'a>,
     /// Scratch directory for intermediates that are not published.
     pub(crate) work: &'a Path,
+    /// Whether the bundle carries graph memberships, and so is described one
+    /// graph at a time as well as whole.
+    pub(crate) graphs: bool,
 }
 
 /// What a description build produced, beyond the files themselves.
@@ -111,25 +118,35 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
         prefix_tables,
         card,
         work,
+        graphs,
     } = inputs;
 
     let void_nt = work.join("void.nt");
+    let mut void_args = vec![
+        OsString::from("void"),
+        data.as_os_str().to_owned(),
+        OsString::from("--dataset-uri"),
+        OsString::from(dataset_iri),
+        OsString::from("--output"),
+        void_nt.as_os_str().to_owned(),
+        // Dataset-level property partitions carry exact distinct subject and
+        // object counts; the object side reads `data.hdt.perm`, which every
+        // bundle publishes.
+        OsString::from("--partition-distinct-counts"),
+        OsString::from("dataset-properties"),
+    ];
+    if graphs {
+        // A bundle with memberships is described one graph at a time as well
+        // as whole: the analysis adds one `void:subset` per graph, and the
+        // projection below turns each into a view of its own. It reads the
+        // membership index this build has already written.
+        void_args.push(OsString::from("--graph-view"));
+        void_args.push(OsString::from("dataset"));
+    }
     runner.run(&super::hdtc::Step {
         name: "queryable VoID analysis",
         temp: None,
-        args: vec![
-            OsString::from("void"),
-            data.as_os_str().to_owned(),
-            OsString::from("--dataset-uri"),
-            OsString::from(dataset_iri),
-            OsString::from("--output"),
-            void_nt.as_os_str().to_owned(),
-            // Dataset-level property partitions carry exact distinct subject and
-            // object counts; the object side reads `data.hdt.perm`, which every
-            // bundle publishes.
-            OsString::from("--partition-distinct-counts"),
-            OsString::from("dataset-properties"),
-        ],
+        args: void_args,
     })?;
 
     let void_hdt = into.join("void.hdt");
@@ -161,18 +178,44 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
     // A componentless bundle has one real graph. `design` and `queryable`
     // are API aliases for that same root, not distinct RDF datasets.
     let design = graph.project(&root, &subject_ids)?;
-    let schema_views = vec![
-        ("design", design.schema.as_slice()),
-        ("queryable", queryable.schema.as_slice()),
+    // One view per named graph, and one for the unnamed graph under the name
+    // the read API gives it. A graph is a subset of the published triples, the
+    // same axis a component is on, so it is a view rather than a second kind
+    // of description.
+    let mut per_graph = Vec::new();
+    let mut graph_cards = Vec::new();
+    for (name, node) in graph_subsets(&graph, &root)? {
+        let projections = graph
+            .project(&node, &subject_ids)
+            .with_context(|| format!("projecting the description of graph {name}"))?;
+        let view = format!("graph:{name}");
+        graph_cards.push(GraphSummary {
+            counts: counts_of(&graph, &node),
+            name,
+            view: view.clone(),
+        });
+        per_graph.push((view, projections));
+    }
+    let mut schema_views = vec![
+        ("design".to_owned(), design.schema.as_slice()),
+        ("queryable".to_owned(), queryable.schema.as_slice()),
     ];
-    let relation_views = vec![
-        ("design", design.relations.as_slice()),
-        ("queryable", queryable.relations.as_slice()),
+    let mut relation_views = vec![
+        ("design".to_owned(), design.relations.as_slice()),
+        ("queryable".to_owned(), queryable.relations.as_slice()),
     ];
-    let class_property_views = vec![
-        ("design", design.class_properties.as_slice()),
-        ("queryable", queryable.class_properties.as_slice()),
+    let mut class_property_views = vec![
+        ("design".to_owned(), design.class_properties.as_slice()),
+        (
+            "queryable".to_owned(),
+            queryable.class_properties.as_slice(),
+        ),
     ];
+    for (view, projections) in &per_graph {
+        schema_views.push((view.clone(), projections.schema.as_slice()));
+        relation_views.push((view.clone(), projections.relations.as_slice()));
+        class_property_views.push((view.clone(), projections.class_properties.as_slice()));
+    }
     let schema_rows = schema_views
         .iter()
         .map(|(_, rows)| rows.len())
@@ -246,7 +289,15 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
     prefix_table.remove("source");
     write(&namespaces_path, &serde_json::to_vec_pretty(&namespaces)?)?;
 
-    let summary = Summary::new(&card, dataset_iri, &graph, &root, &design, namespaces);
+    let summary = Summary::new(
+        &card,
+        dataset_iri,
+        &graph,
+        &root,
+        &design,
+        &graph_cards,
+        namespaces,
+    );
     write(
         &into.join("summary.json"),
         &serde_json::to_vec_pretty(&summary.json)?,
@@ -333,9 +384,9 @@ struct RenderedTsv {
     metadata: RowArtifactMetadata,
 }
 
-fn render_schema(views: &[(&str, &[SchemaRow])]) -> Result<RenderedTsv> {
+fn render_schema(views: &[(String, &[SchemaRow])]) -> Result<RenderedTsv> {
     let mut blocks = Vec::new();
-    for &(view, rows) in views {
+    for (view, rows) in views {
         let mut sorted = rows.to_vec();
         sorted.sort_by(|a, b| {
             (&a.kind, &a.class, &a.predicate, &a.datatype).cmp(&(
@@ -361,7 +412,7 @@ fn render_schema(views: &[(&str, &[SchemaRow])]) -> Result<RenderedTsv> {
                 "VoID traversal produced duplicate schema selector"
             );
         }
-        blocks.push((view, sorted));
+        blocks.push((view.clone(), sorted));
     }
     render_views(SCHEMA_HEADER, blocks, |view, row, bytes, max| {
         let line = format!(
@@ -373,9 +424,9 @@ fn render_schema(views: &[(&str, &[SchemaRow])]) -> Result<RenderedTsv> {
     })
 }
 
-fn render_relations(views: &[(&str, &[RelationRow])]) -> Result<RenderedTsv> {
+fn render_relations(views: &[(String, &[RelationRow])]) -> Result<RenderedTsv> {
     let mut blocks = Vec::new();
-    for &(view, rows) in views {
+    for (view, rows) in views {
         let mut sorted = rows.to_vec();
         sorted.sort_by(|a, b| {
             b.triples.cmp(&a.triples).then_with(|| {
@@ -386,7 +437,7 @@ fn render_relations(views: &[(&str, &[RelationRow])]) -> Result<RenderedTsv> {
                 ))
             })
         });
-        blocks.push((view, sorted));
+        blocks.push((view.clone(), sorted));
     }
     render_views(RELATIONS_HEADER, blocks, |view, row, bytes, max| {
         let line = format!(
@@ -398,16 +449,16 @@ fn render_relations(views: &[(&str, &[RelationRow])]) -> Result<RenderedTsv> {
     })
 }
 
-fn render_class_properties(views: &[(&str, &[ClassPropertyRow])]) -> Result<RenderedTsv> {
+fn render_class_properties(views: &[(String, &[ClassPropertyRow])]) -> Result<RenderedTsv> {
     let mut blocks = Vec::new();
-    for &(view, rows) in views {
+    for (view, rows) in views {
         let mut sorted = rows.to_vec();
         sorted.sort_by(|a, b| {
             b.triples
                 .cmp(&a.triples)
                 .then_with(|| (&a.class, &a.predicate).cmp(&(&b.class, &b.predicate)))
         });
-        blocks.push((view, sorted));
+        blocks.push((view.clone(), sorted));
     }
     render_views(CLASS_PROPERTIES_HEADER, blocks, |view, row, bytes, max| {
         let line = format!(
@@ -425,20 +476,32 @@ fn render_class_properties(views: &[(&str, &[ClassPropertyRow])]) -> Result<Rend
 
 fn render_views<T>(
     header: &str,
-    views: Vec<(&str, Vec<T>)>,
+    views: Vec<(String, Vec<T>)>,
     mut append: impl FnMut(&str, &T, &mut Vec<u8>, &mut u64),
 ) -> Result<RenderedTsv> {
+    // Laid out in the order a mapped bundle walks the views, which is
+    // `StatsView`'s own ordering rather than the names': a reader requires the
+    // declared ranges to tile the file with no gap and no overlap, so the file
+    // is written in the order it will be read. Parsing each name here is what
+    // keeps the build from emitting one no bundle could carry.
+    let mut ordered = Vec::with_capacity(views.len());
+    for (view, rows) in views {
+        let parsed = kgf_store::StatsView::from_manifest_key(&view)
+            .with_context(|| format!("{view:?} is not a description view name"))?;
+        ordered.push((parsed, view, rows));
+    }
+    ordered.sort_by(|left, right| left.0.cmp(&right.0));
     let mut bytes = header.as_bytes().to_vec();
     let mut max_row_bytes = header.len() as u64;
     let mut directory = BTreeMap::new();
-    for (view, rows) in views {
+    for (_, view, rows) in ordered {
         let offset = bytes.len() as u64;
         let row_count = rows.len() as u64;
         for row in &rows {
-            append(view, row, &mut bytes, &mut max_row_bytes);
+            append(&view, row, &mut bytes, &mut max_row_bytes);
         }
         directory.insert(
-            view.to_owned(),
+            view,
             ArtifactView {
                 offset,
                 bytes: bytes.len() as u64 - offset,
@@ -697,6 +760,50 @@ impl VoidGraph {
     }
 }
 
+/// Every graph of the dataset's description, as (name, the node describing it).
+///
+/// The analysis describes a quads dataset as the union plus one `void:subset`
+/// per graph, and links the named ones through SPARQL Service Description: a
+/// `sd:namedGraph` carries the graph's own IRI as `sd:name` and points at the
+/// subset with `sd:graph`. The subset nothing names that way is the unnamed
+/// graph, and it is described under the reserved constant the read API gives
+/// it rather than under whichever IRI the analysis minted for the node.
+///
+/// The unnamed graph comes first here; what the published order ends up being
+/// is the view order of the artifacts, which [`render_views`] fixes.
+fn graph_subsets(
+    graph: &VoidGraph,
+    root: &NamedOrBlankNode,
+) -> Result<Vec<(String, NamedOrBlankNode)>> {
+    let mut named = Vec::new();
+    for entry in graph.children(root, SD_NAMED_GRAPH)? {
+        let name = graph.unique_iri(&entry, SD_NAME)?;
+        let nodes = graph.children(&entry, SD_GRAPH)?;
+        let [node] = nodes.as_slice() else {
+            bail!(
+                "named graph {entry} describes {} subsets, expected one",
+                nodes.len()
+            );
+        };
+        named.push((name, node.clone()));
+    }
+    named.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut subsets = Vec::new();
+    for subset in graph.children(root, VOID_SUBSET)? {
+        if named.iter().all(|(_, node)| node != &subset) {
+            subsets.push((kgf_store::UNNAMED_GRAPH_IRI.to_owned(), subset));
+        }
+    }
+    ensure!(
+        subsets.len() <= 1,
+        "the dataset has {} subsets no named graph claims, expected at most the unnamed graph",
+        subsets.len()
+    );
+    subsets.extend(named);
+    Ok(subsets)
+}
+
 fn optional_decimal(value: Option<u64>) -> String {
     value.map_or_else(String::new, |value| value.to_string())
 }
@@ -744,6 +851,27 @@ fn read_subject_section(
     Ok(())
 }
 
+/// One graph's entry in the persisted summary.
+struct GraphSummary {
+    /// The graph's own IRI, or the reserved name of the unnamed graph.
+    name: String,
+    /// The description view describing it.
+    view: String,
+    /// Its own counts, which are not a share of the dataset's: a triple in two
+    /// graphs is counted by both.
+    counts: Value,
+}
+
+/// The four counts a VoID dataset node states about itself.
+fn counts_of(graph: &VoidGraph, node: &NamedOrBlankNode) -> Value {
+    json!({
+        "triples": graph.optional_count(node, VOID_TRIPLES),
+        "subjects": graph.optional_count(node, VOID_DISTINCT_SUBJECTS),
+        "predicates": graph.optional_count(node, VOID_PROPERTIES),
+        "objects": graph.optional_count(node, VOID_DISTINCT_OBJECTS),
+    })
+}
+
 struct Summary {
     json: Value,
     markdown: String,
@@ -756,6 +884,7 @@ impl Summary {
         graph: &VoidGraph,
         root: &NamedOrBlankNode,
         projections: &Projections,
+        graphs: &[GraphSummary],
         namespaces: Value,
     ) -> Self {
         let top_classes = projections
@@ -830,12 +959,31 @@ impl Summary {
                 })
             })
             .collect::<Vec<_>>();
-        let counts = json!({
-            "triples": graph.optional_count(root, VOID_TRIPLES),
-            "subjects": graph.optional_count(root, VOID_DISTINCT_SUBJECTS),
-            "predicates": graph.optional_count(root, VOID_PROPERTIES),
-            "objects": graph.optional_count(root, VOID_DISTINCT_OBJECTS),
-        });
+        let counts = counts_of(graph, root);
+        // Every graph the dataset holds, with its own counts and the way in to
+        // its description and its triples. The counts are the graph's own, so
+        // they sum to more than the dataset's when a triple is in two graphs.
+        let graphs = graphs
+            .iter()
+            .map(|entry| {
+                json!({
+                    "graph": entry.name,
+                    "view": entry.view,
+                    "counts": entry.counts,
+                    "links": {
+                        "schema": summary_schema_link(
+                            Params::default().with("view", &entry.view)
+                        ),
+                        "fragment": format!(
+                            "fragment?{}",
+                            Params::default()
+                                .with("g", &iri_request(&entry.name))
+                                .to_query()
+                        ),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
         let json = json!({
             "dataset": {
                 "id": card.id,
@@ -858,6 +1006,7 @@ impl Summary {
                 "void": "void",
             },
             "counts": counts,
+            "graphs": graphs,
 
             "top_classes": top_classes,
             "top_properties": top_properties,
@@ -899,6 +1048,18 @@ fn render_summary_markdown(card: &DatasetCard<'_>, summary: &Value) -> String {
             out.push('\n');
         }
         None => out.push_str("No description was supplied.\n"),
+    }
+    if let Some(graphs) = summary["graphs"].as_array()
+        && !graphs.is_empty()
+    {
+        out.push_str("\n## Named graphs\n\n");
+        for entry in graphs {
+            out.push_str(&format!(
+                "- `{}` ({} triples)\n",
+                entry["graph"].as_str().unwrap_or(""),
+                entry["counts"]["triples"],
+            ));
+        }
     }
     append_ranked(
         &mut out,

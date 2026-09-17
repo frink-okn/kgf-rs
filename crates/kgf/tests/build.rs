@@ -1297,3 +1297,126 @@ fn the_membership_transpose_follows_the_number_of_graphs() {
          transpose: {follows} bytes against {stated}"
     );
 }
+
+/// A bundle with memberships is described one graph at a time as well as
+/// whole: one view per graph in each of the three projections, named after the
+/// graph, and one entry per graph in the persisted summary.
+#[test]
+fn a_quad_bundle_is_described_one_graph_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+
+    // Every projection declares the same views, because a view a bundle
+    // cannot answer in all three is one no request can select — even where the
+    // projection has no rows to put in it, as the typed ones do not here.
+    let expected = [
+        "design",
+        "queryable",
+        "graph:http://example.org/g1",
+        "graph:http://example.org/g2",
+        "graph:urn:x-kgf:unnamed",
+    ];
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    for artifact in [
+        "stats/schema-nodes.tsv",
+        "stats/class-relations.tsv",
+        "stats/class-properties.tsv",
+    ] {
+        let declared = manifest["artifacts"][artifact]["views"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{artifact} declares no views"));
+        for view in expected {
+            assert!(
+                declared.contains_key(view),
+                "{artifact} has no range for {view}"
+            );
+        }
+    }
+    // The rows are laid out in the order a mapped bundle walks the views, and
+    // `--check` walks them: rows that are not where the manifest says fail.
+    assert_eq!(views_of(&out, "stats/schema-nodes.tsv"), expected);
+    kgf(&["manifest", path(&out), "--check"], "").ok();
+
+    // The summary names each graph with its own counts, which sum to more than
+    // the dataset's three triples because one triple is in two graphs.
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("stats/summary.json")).unwrap()).unwrap();
+    let graphs: Vec<(String, u64)> = summary["graphs"]
+        .as_array()
+        .expect("a quad bundle's summary names its graphs")
+        .iter()
+        .map(|entry| {
+            (
+                entry["graph"].as_str().unwrap().to_owned(),
+                entry["counts"]["triples"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        graphs,
+        vec![
+            ("urn:x-kgf:unnamed".to_owned(), 2),
+            ("http://example.org/g1".to_owned(), 2),
+            ("http://example.org/g2".to_owned(), 1),
+        ]
+    );
+    assert_eq!(summary["counts"]["triples"], 3);
+
+    // A bundle without memberships has nothing to say there and says nothing.
+    let triples = dir.path().join("tiny.nt");
+    std::fs::write(&triples, SOURCE).unwrap();
+    let plain = dir.path().join("root/tinykg/plain");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&plain),
+            "--input",
+            path(&triples),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(plain.join("stats/summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["graphs"], serde_json::json!([]));
+    assert_eq!(
+        views_of(&plain, "stats/schema-nodes.tsv"),
+        ["design", "queryable"]
+    );
+}
+
+/// The distinct view names of one projection, in file order.
+fn views_of(bundle: &Path, artifact: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(bundle.join(artifact)).expect(artifact);
+    let mut names: Vec<String> = text
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').next().unwrap().to_owned())
+        .collect();
+    names.dedup();
+    names
+}

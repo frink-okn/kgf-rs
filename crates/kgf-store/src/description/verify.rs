@@ -5,7 +5,6 @@
 //! call [`verify_description_artifacts`] to scan the complete TSVs and static
 //! documents and prove that the manifest metadata and indexed VoID graph agree.
 
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -251,7 +250,7 @@ impl MappedTsv {
                     self.path(),
                     format!(
                         "view {:?} starts at byte {}, expected contiguous offset {cursor}",
-                        manifest_view_name(view_name),
+                        view_name.manifest_key(),
                         view.offset,
                     ),
                 ));
@@ -272,7 +271,7 @@ impl MappedTsv {
                     self.path(),
                     format!(
                         "view {:?} ends inside a row at byte {}",
-                        manifest_view_name(view_name),
+                        view_name.manifest_key(),
                         view.end()
                     ),
                 ));
@@ -282,7 +281,7 @@ impl MappedTsv {
                     self.path(),
                     format!(
                         "view {:?} records {} rows but contains {rows}",
-                        manifest_view_name(view_name),
+                        view_name.manifest_key(),
                         view.rows
                     ),
                 ));
@@ -451,10 +450,7 @@ fn verify_schema_bindings(void: &IndexedHdt, indexes: &SelectorIndex, path: &Pat
             .ok_or_else(|| {
                 malformed(
                     path,
-                    format!(
-                        "view {:?} has no dataset selector",
-                        manifest_view_name(view)
-                    ),
+                    format!("view {:?} has no dataset selector", view.manifest_key()),
                 )
             })?;
         ensure_named_triple(void, root, RDF_TYPE, VOID_DATASET, path, "dataset type")?;
@@ -746,7 +742,7 @@ fn require_child_selector(
             path,
             format!(
                 "{context} in view {:?} reaches subject {}, but selector {selector:?} names subject {}",
-                manifest_view_name(view),
+                view.manifest_key(),
                 child.0,
                 subject.0
             ),
@@ -756,7 +752,7 @@ fn require_child_selector(
             format!(
                 "{context} subject {} in view {:?} has no schema selector {selector:?}",
                 child.0,
-                manifest_view_name(view)
+                view.manifest_key()
             ),
         )),
     }
@@ -773,7 +769,7 @@ fn required_selector(
             path,
             format!(
                 "view {:?} is missing parent selector {selector:?}",
-                manifest_view_name(view)
+                view.manifest_key()
             ),
         )
     })
@@ -896,7 +892,7 @@ fn expected_relations(
                         path,
                         format!(
                             "VoID graph yields duplicate class relation {key:?} in view {:?}",
-                            manifest_view_name(view)
+                            view.manifest_key()
                         ),
                     ));
                 }
@@ -974,7 +970,7 @@ fn compare_relations(actual: &RelationIndex, expected: &RelationIndex, path: &Pa
                         path,
                         format!(
                             "class relation {key:?} in view {:?} records {actual_count} triples, VoID records {expected_count}",
-                            manifest_view_name(view)
+                            view.manifest_key()
                         ),
                     ));
                 }
@@ -983,7 +979,7 @@ fn compare_relations(actual: &RelationIndex, expected: &RelationIndex, path: &Pa
                         path,
                         format!(
                             "class relation {key:?} from VoID is missing in view {:?}",
-                            manifest_view_name(view)
+                            view.manifest_key()
                         ),
                     ));
                 }
@@ -997,7 +993,7 @@ fn compare_relations(actual: &RelationIndex, expected: &RelationIndex, path: &Pa
                 path,
                 format!(
                     "class relation {extra:?} in view {:?} is absent from VoID",
-                    manifest_view_name(view)
+                    view.manifest_key()
                 ),
             ));
         }
@@ -1154,7 +1150,7 @@ fn expected_class_properties(
                     path,
                     format!(
                         "VoID graph yields duplicate class property {key:?} in view {:?}",
-                        manifest_view_name(view)
+                        view.manifest_key()
                     ),
                 ));
             }
@@ -1223,7 +1219,7 @@ fn compare_class_properties(
                         path,
                         format!(
                             "class property {key:?} in view {:?} records {actual_counts:?}, VoID records {expected_counts:?}",
-                            manifest_view_name(view)
+                            view.manifest_key()
                         ),
                     ));
                 }
@@ -1232,7 +1228,7 @@ fn compare_class_properties(
                         path,
                         format!(
                             "class property {key:?} from VoID is missing in view {:?}",
-                            manifest_view_name(view)
+                            view.manifest_key()
                         ),
                     ));
                 }
@@ -1246,7 +1242,7 @@ fn compare_class_properties(
                 path,
                 format!(
                     "class property {extra:?} in view {:?} is absent from VoID",
-                    manifest_view_name(view)
+                    view.manifest_key()
                 ),
             ));
         }
@@ -1255,7 +1251,7 @@ fn compare_class_properties(
 }
 
 fn require_row_view(row_view: &str, declared: &StatsView, path: &Path, offset: u64) -> Result<()> {
-    let expected = manifest_view_name(declared);
+    let expected = declared.manifest_key();
     if row_view != expected {
         return Err(malformed(
             path,
@@ -1265,14 +1261,6 @@ fn require_row_view(row_view: &str, declared: &StatsView, path: &Path, offset: u
         ));
     }
     Ok(())
-}
-
-fn manifest_view_name(view: &StatsView) -> Cow<'_, str> {
-    match view {
-        StatsView::Design => Cow::Borrowed("design"),
-        StatsView::Queryable => Cow::Borrowed("queryable"),
-        StatsView::Component(component) => Cow::Owned(format!("component:{}", component.as_str())),
-    }
 }
 
 fn ensure_named_triple(

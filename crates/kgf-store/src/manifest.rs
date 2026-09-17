@@ -885,11 +885,10 @@ impl Manifest {
                 }
             }
             for (view, range) in &entry.views {
-                let valid_name = matches!(view.as_str(), "design" | "queryable")
-                    || view
-                        .strip_prefix("component:")
-                        .is_some_and(|component| !component.is_empty());
-                if !valid_name {
+                // The grammar lives in `StatsView`, which is what a mapped
+                // bundle parses these names with: a name this accepts and that
+                // cannot parse would be a view no request could ever select.
+                if crate::description::StatsView::from_manifest_key(view).is_none() {
                     return Err(syntax(format!(
                         "artifact {name} has invalid view name {view:?}"
                     )));

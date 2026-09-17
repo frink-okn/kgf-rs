@@ -3372,6 +3372,46 @@ impl Deployment {
         self.publish_fixture(dataset, version, Fixture::build_quads(source), created);
     }
 
+    /// Assemble a quad bundle with `kgf build`, the way a deployment does.
+    ///
+    /// The whole pipeline rather than a fixture: the description of each graph
+    /// is produced by the build and read back by the server, so this is the
+    /// only kind of test that can catch the two disagreeing about what a view
+    /// is called or where its rows are.
+    fn publish_built_quads(&self, dataset: &str, version: &str, source: &str, created: &str) {
+        let workspace = tempfile::tempdir().expect("build scratch");
+        let input = workspace.path().join("source.nq");
+        std::fs::write(&input, source).expect("write the build's input");
+        let config = workspace.path().join("build.yaml");
+        std::fs::write(
+            &config,
+            format!(
+                "schema: 1\ndataset: {{id: {dataset}, iri: 'https://example.org/{dataset}'}}\n\
+                 semantics: {{prefixes: {{ex: 'http://example.org/'}}}}\n"
+            ),
+        )
+        .expect("write the build config");
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: kgf::build::Args,
+        }
+        let cli = Cli::parse_from([
+            "kgf-build",
+            "--config",
+            config.to_str().unwrap(),
+            "--out",
+            self.bundle(dataset, version).to_str().unwrap(),
+            "--input",
+            input.to_str().unwrap(),
+            "--hdtc",
+            kgf_store::testing::hdtc_binary().to_str().unwrap(),
+        ]);
+        kgf::build::run(cli.args).expect("build a quad bundle");
+        self.set_created(&self.bundle(dataset, version), created);
+    }
+
     fn publish_description(&self, dataset: &str, version: &str, created: &str) {
         self.publish_description_with_labels(dataset, version, created, true);
     }
@@ -3785,4 +3825,103 @@ impl Response {
             self.headers
         );
     }
+}
+
+/// A bundle the build assembled from quads describes every graph it holds, and
+/// the server reads those descriptions back under the names `/graphs` lists.
+///
+/// The whole pipeline in one test, because the two halves are only correct
+/// together: the build names a view after the graph, lays the rows out in the
+/// order a mapped bundle walks them, and records the ranges; the server parses
+/// the name a request sends with the same grammar and reads those ranges.
+#[test]
+fn a_built_quad_bundle_describes_each_of_its_graphs() {
+    const G1: &str = "http://example.org/g1";
+    const UNNAMED: &str = "urn:x-kgf:unnamed";
+
+    let deployment = Deployment::new();
+    deployment.publish_built_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-09-17T09:00:00Z");
+    let server = deployment.serve();
+
+    // The graphs the bundle holds, and the counts of the worked example.
+    let graphs = server.get("/quads/v/v1/graphs");
+    graphs.assert_status(200);
+    let listed: Vec<(String, u64)> = graphs.json()["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["g"]["value"].as_str().unwrap().to_owned(),
+                entry["count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            (UNNAMED.to_owned(), 2),
+            (G1.to_owned(), 2),
+            ("http://example.org/g2".to_owned(), 1),
+        ]
+    );
+
+    // Each graph has a description of its own, under the name it is listed by,
+    // and its counts are the graph's rather than the dataset's.
+    for (graph, triples) in [(UNNAMED, 2), (G1, 2), ("http://example.org/g2", 1)] {
+        let view = kgf_server::url::encode_value(&format!("graph:{graph}"));
+        let schema = server.get(&format!("/quads/v/v1/schema?view={view}"));
+        schema.assert_status(200);
+        let body = schema.json();
+        assert_eq!(body["view"], format!("graph:{graph}"), "{graph}");
+        assert_eq!(body["node"]["counts"]["triples"], triples, "{graph}");
+    }
+    // The union is what the dataset's own views describe, and it counts each
+    // distinct triple once rather than once per graph.
+    let whole = server.get("/quads/v/v1/schema?view=queryable");
+    assert_eq!(whole.json()["node"]["counts"]["triples"], 3);
+
+    // The persisted summary names the same graphs, and its links work.
+    let summary = server.get("/quads/v/v1/summary?format=json");
+    summary.assert_status(200);
+    let summary = summary.json();
+    let named: Vec<String> = summary["graphs"]
+        .as_array()
+        .expect("a quad bundle's summary names its graphs")
+        .iter()
+        .map(|entry| entry["graph"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(named, vec![UNNAMED, G1, "http://example.org/g2"]);
+    for entry in summary["graphs"].as_array().unwrap() {
+        for link in ["schema", "fragment"] {
+            let followed = server.get(&format!(
+                "/quads/v/v1/{}",
+                entry["links"][link].as_str().unwrap()
+            ));
+            followed.assert_status(200);
+        }
+    }
+
+    // A graph this bundle does not hold is a 404 that says where to look, and
+    // a view name of no known kind is refused before anything opens.
+    let missing = server.get("/quads/v/v1/schema?view=graph%3Ahttp%3A%2F%2Fexample.org%2Fnope");
+    missing.assert_status(404);
+    assert!(
+        missing.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("/graphs"),
+        "{missing:?}",
+        missing = missing.json()
+    );
+    let malformed = server.get("/quads/v/v1/schema?view=nonsense");
+    malformed.assert_status(400);
+    assert!(
+        malformed.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("graph:<IRI>"),
+        "{malformed:?}",
+        malformed = malformed.json()
+    );
 }

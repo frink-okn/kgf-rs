@@ -123,6 +123,7 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
             prefix_tables: &plan.config.semantics.prefix_tables,
             card,
             work: work.path(),
+            graphs,
         },
         &staged_stats,
     )?;
