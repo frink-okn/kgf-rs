@@ -26,7 +26,11 @@
 //! `s ? o` the sum over its hits. A page resumes at a triple *and* a number of
 //! that triple's memberships already delivered, so a page may end inside one
 //! triple's graphs in any space; the resume position for the triple is the
-//! same offset or predicate id an unscoped page uses.
+//! same offset or predicate id an unscoped page uses. For `s ? o` that is the
+//! predicate *before* the triple, so a page that ends inside a triple's run
+//! carries the predicate that started the triple — the `from` it was itself
+//! resumed with, when the whole page lies in one run — and not the triple's
+//! own predicate, which would skip the rest of the run.
 //!
 //! # Cost
 //!
@@ -192,6 +196,16 @@ impl Iterator for ScopedPage<'_, '_> {
                 if position >= range.end {
                     return None;
                 }
+                if position < range.start {
+                    // Members are strictly increasing from the one rank
+                    // located, so a position before the range is a layer
+                    // whose rank and select disagree — reported, as every
+                    // lazily decoded structure is, rather than trusted.
+                    self.remaining = 0;
+                    return Some(Err(self.scoped.layer.inconsistent(
+                        "select returned a member before the position its rank located",
+                    )));
+                }
                 *next = Some(ordinal + 1);
                 self.remaining -= 1;
                 Some(Ok(self.scoped.selection.at_position(position)))
@@ -316,7 +330,7 @@ impl<I: Iterator<Item = Positioned>> Iterator for QuadPage<'_, '_, I> {
             // sidecar that is not exhaustive — refused rather than skipped.
             if self.graphs.is_empty() {
                 self.remaining = 0;
-                return Some(Err(crate::error::Error::Region(format!(
+                return Some(Err(self.quads.memberships.inconsistent(&format!(
                     "position {} belongs to no graph",
                     hit.position
                 ))));
@@ -459,7 +473,11 @@ mod tests {
                 object: Some(id),
             });
         }
-        // `s ? o` over real edges, so the probe has hits.
+        // `s ? o` over real edges, so the probe has hits — and edges the thin
+        // graphs contain, so a probe testing the wrong space's position
+        // against a layer shows up as a miss. Every subject here has four
+        // triples and every object one, so the probe runs through OPS, and
+        // the OPS layers are what the hits must be tested against.
         let all = resolve(perms, patterns[0]).unwrap();
         for triple in all.page(0, usize::MAX).step_by(17_011) {
             patterns.push(IdPattern {
@@ -474,6 +492,20 @@ mod tests {
             });
         }
         patterns
+    }
+
+    /// `s ? o` for every triple of a thin graph.
+    fn subject_object_members(bundle: &Bundle, graph: GraphId) -> Vec<IdPattern> {
+        bundle
+            .memberships
+            .iter()
+            .filter(|(_, graphs)| graphs.contains(&graph))
+            .map(|(triple, _)| IdPattern {
+                subject: Some(triple.subject),
+                predicate: None,
+                object: Some(triple.object),
+            })
+            .collect()
     }
 
     fn check(bundle: &Bundle, patterns: &[IdPattern], exhaustive_resume: bool) {
@@ -696,7 +728,13 @@ mod tests {
     fn scoped_and_quad_views_agree_with_hdtc_across_every_encoding() {
         for transpose in [Transpose::None, Transpose::Ids] {
             let bundle = open(&synthetic_quads(), transpose);
-            let patterns = sampled_patterns(&bundle.perms);
+            let mut patterns = sampled_patterns(&bundle.perms);
+            // Graph 2 is `run` (40 triples) and graph 3 is `sparse` (467).
+            for graph in [GraphId(2), GraphId(3)] {
+                let thin = subject_object_members(&bundle, graph);
+                assert!(!thin.is_empty());
+                patterns.extend(thin.into_iter().step_by(7));
+            }
             check(&bundle, &patterns, false);
         }
     }

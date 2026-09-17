@@ -486,6 +486,7 @@ impl Graphs {
             transpose,
             triples: self.facts.triples,
             named_graphs: self.facts.named_graphs,
+            index: self.index.path(),
         })
     }
 }
@@ -513,6 +514,8 @@ pub struct Memberships<'a> {
     transpose: Option<Transpose<'a>>,
     triples: u64,
     named_graphs: u64,
+    /// The file the transpose lives in, for an error that names it.
+    index: &'a Path,
 }
 
 impl Memberships<'_> {
@@ -535,11 +538,14 @@ impl Memberships<'_> {
             for ordinal in start..end {
                 let id = ids.get(ordinal);
                 if id > self.named_graphs {
-                    return Err(crate::error::Error::Region(format!(
-                        "the transpose names graph {id} at position {position}, beyond the \
-                         {} named graphs",
-                        self.named_graphs
-                    )));
+                    return Err(Error::Malformed {
+                        artifact: self.index.to_path_buf(),
+                        detail: format!(
+                            "the transpose names graph {id} at position {position}, beyond \
+                             the {} named graphs",
+                            self.named_graphs
+                        ),
+                    });
                 }
                 out.push(GraphId(id));
             }
@@ -551,6 +557,15 @@ impl Memberships<'_> {
             }
         }
         Ok(())
+    }
+
+    /// An error for memberships that contradict the sidecar's own invariants,
+    /// named after the index, for a caller that composes them.
+    pub fn inconsistent(&self, detail: &str) -> Error {
+        Error::Malformed {
+            artifact: self.index.to_path_buf(),
+            detail: detail.to_owned(),
+        }
     }
 
     /// Memberships held by the positions in `range`: the quad-view
@@ -614,6 +629,12 @@ impl<'a> LayerSet<'a> {
             || entry.maximum_position_exclusive > self.triples
         {
             return Err(self.malformed(id, "layer range is outside the triple universe"));
+        }
+        // More members than positions in the range is impossible for a set,
+        // and bounding the count here is what keeps every later sum over it
+        // in range.
+        if entry.member_count > entry.maximum_position_exclusive - entry.minimum_position {
+            return Err(self.malformed(id, "layer holds more members than its range has positions"));
         }
         Ok(entry)
     }
@@ -1158,6 +1179,12 @@ impl Layer<'_> {
             detail: format!("layer {}: {detail}", self.id.0),
         }
     }
+
+    /// An error for a layer whose operations contradict each other, named
+    /// after the file, for a caller that composes them.
+    pub fn inconsistent(&self, detail: &str) -> Error {
+        self.malformed(detail)
+    }
 }
 
 /// The `i`-th packed low part, or zero when the layer stores none.
@@ -1568,6 +1595,46 @@ mod tests {
                     Err(other) => panic!("{what} on layer {}: {other:#}", graph.0),
                 }
             }
+        }
+    }
+
+    /// The transpose's run count is checked at open with one sentinel read; a
+    /// bitmap that closes the wrong number of runs would otherwise fail
+    /// inside a request's select.
+    #[test]
+    fn a_transpose_closing_the_wrong_number_of_runs_is_refused_at_open() {
+        let fixture = Fixture::build_quads_with(WORKED_EXAMPLE_NQ, Built::Ids);
+        let index_path = fixture
+            .bundle_path()
+            .join(crate::store::artifact::GRAPHS_IDX);
+        let directory = GraphIndex::directory(&index_path, &fixture.hdt_path()).unwrap();
+        let bitmap = directory
+            .section(GraphIndexSectionKind::TransposeBitmap)
+            .expect("the fixture carries a transpose");
+        // The rank directory is read at open and the bitmap is not, so a
+        // sentinel that disagrees with the header is the case to catch:
+        // rewrite the superrank sentinel to claim one run fewer.
+        let superrank = directory
+            .section(GraphIndexSectionKind::TransposeSuperrank)
+            .unwrap();
+        let mut bytes = std::fs::read(&index_path).unwrap();
+        let sentinel = (superrank.offset + (superrank.entry_count - 1) * 8) as usize;
+        bytes[sentinel..sentinel + 8].copy_from_slice(&(bitmap.entry_count - 1).to_le_bytes());
+        std::fs::write(&index_path, &bytes).unwrap();
+        // The sentinel is under the section's CRC; hdtc's open verifies the
+        // header and footer only, so the store's own check is what fires.
+        let error = Graphs::open(
+            &fixture.hdt_path(),
+            fixture.map_graphs(),
+            fixture.map_graph_index(),
+        )
+        .expect_err("a transpose with the wrong run count must be refused");
+        match error {
+            Error::Malformed { artifact, detail } => {
+                assert_eq!(artifact, index_path);
+                assert!(detail.contains("runs"), "{detail}");
+            }
+            other => panic!("unexpected error: {other:#}"),
         }
     }
 
