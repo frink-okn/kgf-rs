@@ -65,6 +65,11 @@ promise to a client rather than an internal choice:
 - **The RDF representations of `/fragment` follow the serving table below**, not just
   `/tpf`'s: a scope tags every statement with the graph it named, the quad view tags
   per row, and a single-graph syntax refuses the quad view with 406.
+- **A TPF `graph` variable may not repeat a pattern variable.** `graph=?s` beside
+  `subject=?s` asks for each statement's graph to equal one of its own terms, which is
+  a join this build does not do; answering the unjoined quad view would be a superset,
+  and silently wrong for a client that does not filter it again. Refused with 400,
+  like the repeated variables `/tpf`'s plain form already refuses.
 
 Worked example. Source, five statements:
 
@@ -171,24 +176,25 @@ publishing them separately.
 - Build: refuse the two constants as graph names; assign nothing to layer 0 that the
   source did not leave bare.
 
-## Tests to write
+## The tests this contract is held to
 
-- The worked example as a fixture: every count in both tables above, on every
-  representation.
-- `GET /graphs` lists g1, g2, and the unnamed graph with counts 2, 1, 2.
-- TPF route: tagging per row of the serving table; `sd:defaultGraph` present with the
-  four-mapping form and absent with the three-mapping form.
-- `interop/comunica/test.mjs`, as both `qpf` and `brtpf` sources and with no
-  `unionDefaultGraph` context, against one-row pages: a bare `SELECT * { ?s ?p ?o }`
-  returning 3 rows, `GRAPH ?g` returning 3, `GRAPH <urn:x-kgf:unnamed>` returning 2,
-  `GRAPH <g1>` returning 2, and a bare two-pattern join to exercise the
-  bindings-restricted path.
-- The metadata graph parses to a `sd:defaultGraph` triple whose subject is a blank
-  node, and Comunica's extractor, run over the page, reports `defaultGraph`.
-- Build refuses a quad in graph `urn:x-kgf:union`.
-- Every form of `graph` on `/tpf` pages to the same rows one row at a time, following
-  the `hydra:next` link, quad view included — the case that needs the run trailer.
-- A forged run trailer, past the memberships of the triple its position names, is a
-  stale cursor rather than a triple silently skipped.
-- A blank-node graph fixture: the minted IRI round-trips, and neither an
-  out-of-range id nor the id of an IRI-named layer resolves through it.
+Written, and kept: the worked example as a fixture with every count in both tables
+above, on every representation; `GET /graphs` listing g1, g2 and the unnamed graph
+with counts 2, 1, 2; the TPF route's tagging per row of the serving table, with
+`sd:defaultGraph` present in the four-mapping form and absent in the three-mapping
+one; every form of `graph` paging to the same rows one row at a time through
+`hydra:next`, quad view included, which is the case the run trailer exists for; a
+forged run trailer refused as a stale cursor rather than skipping the rest of a
+triple — including on the last triple of an enumeration, where the rows run out
+before anything is checked; a blank-node graph fixture whose minted IRI round-trips
+while neither an out-of-range id nor the id of an IRI-named layer resolves through
+it; the build refusing a quad in graph `urn:x-kgf:union`; and, in
+`interop/comunica/test.mjs`, stock Comunica as both a `qpf` and a `brtpf` source with
+no `unionDefaultGraph` context, against one-row pages, reading 3 rows for a bare
+`SELECT * { ?s ?p ?o }`, 3 for `GRAPH ?g`, 2 for `GRAPH <urn:x-kgf:unnamed>`, 2 for
+`GRAPH <g1>`, and completing a bind join through the bindings-restricted path.
+
+Still to write: the metadata graph parses to a `sd:defaultGraph` triple whose subject
+is a blank node, and Comunica's own extractor, run over the page, reports
+`defaultGraph` — the conformance script exercises the consequence rather than the
+declaration.

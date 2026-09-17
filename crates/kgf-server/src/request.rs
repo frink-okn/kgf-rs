@@ -1008,13 +1008,19 @@ fn one_graph_syntax_carries(
     if graph.is_quad_view() && matches!(representation.rdf_syntax(), Some(RdfSyntax::Graph(_))) {
         return Err(Problem::new(
             ErrorCode::NotAcceptable,
-            "the quad view puts each statement in its graph, which a single-graph syntax \
-             cannot represent; ask for N-Quads, TriG or JSON-LD, or scope the request with \
-             a graph",
+            QUAD_VIEW_NEEDS_A_DATASET,
         ));
     }
     Ok(())
 }
+
+/// What a client is told when it asks for the quad view in Turtle.
+///
+/// Shared with the serializer, which checks again as it builds the page: two
+/// spellings of one refusal would drift, and a client that hit the second
+/// would be told something the first never said.
+pub(crate) const QUAD_VIEW_NEEDS_A_DATASET: &str = "the quad view puts each statement in its graph, which a single-graph syntax cannot \
+     represent; ask for N-Quads, TriG or JSON-LD, or scope the request with a graph";
 
 /// Refuse a graph scope beside a text constraint.
 ///
@@ -4682,17 +4688,21 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(repeated.code(), ErrorCode::MalformedRequest);
+        assert!(
+            repeated.to_string().contains("the pattern already binds"),
+            "a repeat is a different mistake from a table column: {repeated}"
+        );
 
         let values = "(?s ?g) { (<http://example.org/x> <http://example.org/g1>) }";
         let query = format!(
             "subject=%3Fs&graph=%3Fg&values={}",
             crate::url::encode_value(values)
         );
-        assert_eq!(
-            Tpf::parse(&params(&query), limits(), &bundle(), true)
-                .unwrap_err()
-                .code(),
-            ErrorCode::MalformedRequest
+        let bound = Tpf::parse(&params(&query), limits(), &bundle(), true).unwrap_err();
+        assert_eq!(bound.code(), ErrorCode::MalformedRequest);
+        assert!(
+            bound.to_string().contains("binds the graph variable"),
+            "a table column is a different mistake from a repeat: {bound}"
         );
     }
 

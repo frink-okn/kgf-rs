@@ -1661,6 +1661,47 @@ impl Served {
         String::from_utf8(rendered.body.to_vec()).expect("a bindings fragment page is UTF-8")
     }
 
+    /// A bindings fragment request, for a test that needs its cursor binding.
+    fn parse_binding_fragment(&self, body: &serde_json::Value) -> request::BindingFragment {
+        let encoded = serde_json::to_vec(body).expect("a JSON body");
+        request::BindingFragment::parse(
+            &params(""),
+            &encoded,
+            self.limits(),
+            self.release().prefixes(),
+            &self.release().binding(),
+        )
+        .expect("a bindings fragment request")
+    }
+
+    /// A bindings fragment that may be refused, for the tokens that must be.
+    fn try_binding_fragment(
+        &self,
+        store: &Store,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, kgf_server::envelope::Problem> {
+        let encoded = serde_json::to_vec(body).expect("a JSON body");
+        let request = request::BindingFragment::parse(
+            &params(""),
+            &encoded,
+            self.limits(),
+            self.release().prefixes(),
+            &self.release().binding(),
+        )?;
+        let answer = answer::binding_fragment(
+            store,
+            Target::body(
+                self.id(),
+                AccessOperation::Fragment,
+                params(""),
+                self.release().prefixes().clone(),
+                kgf_server::url::Mount::default(),
+            ),
+            &request,
+        )?;
+        Ok(json(answer, Representation::Json))
+    }
+
     fn render_binding_fragment(
         &self,
         store: &Store,
@@ -3012,12 +3053,46 @@ fn a_forged_membership_trailer_is_stale() {
     let served = Served::quads();
     let store = served.store();
     let request = served.parse_fragment("g=*&limit=1");
-    let mut cursor = Cursor::at(&request.binding, PositionSpace::Spo, 0);
-    cursor.scan_position = Some(5);
+    // Three triples, so position 2 is the last one: a trailer past its
+    // memberships leaves the enumeration with no row to check at all, which is
+    // the case that pages an empty answer and calls it complete.
+    for position in [0, 1, 2] {
+        let mut cursor = Cursor::at(&request.binding, PositionSpace::Spo, position);
+        cursor.scan_position = Some(5);
+        let problem = served
+            .try_fragment(&store, &format!("g=*&limit=1&cursor={}", cursor.encode()))
+            .expect_err("a trailer past this triple's memberships must be stale");
+        assert_eq!(
+            problem.code().as_str(),
+            "stale_cursor",
+            "position {position}"
+        );
+    }
+
+    // The same in a bindings walk, where a phase that ends early would
+    // otherwise carry on into the next input row's phase.
+    let body = serde_json::json!({
+        "pattern": {"s": "?s", "p": "?p", "o": "?o"},
+        "bindings": {"vars": ["?s"], "rows": [["ex:a"], ["ex:x"]]},
+        "g": "*",
+        "limit": 1,
+    });
+    let parsed = served.parse_binding_fragment(&body);
+    let mut cursor = Cursor::at(&parsed.binding, PositionSpace::Spo, 1);
+    cursor.binding_index = Some(0);
+    cursor.scan_position = Some(4);
+    let mut forged = body.clone();
+    forged["cursor"] = serde_json::json!(cursor.encode().as_str());
     let problem = served
-        .try_fragment(&store, &format!("g=*&limit=1&cursor={}", cursor.encode()))
-        .expect_err("a trailer past this triple's memberships must be stale");
+        .try_binding_fragment(&store, &forged)
+        .expect_err("a forged trailer in a bindings phase must be stale");
     assert_eq!(problem.code().as_str(), "stale_cursor");
+
+    // A trailer that names a run this triple really has still resumes it.
+    let mut cursor = Cursor::at(&request.binding, PositionSpace::Spo, 2);
+    cursor.scan_position = Some(1);
+    let page = served.fragment(&store, &format!("g=*&limit=5&cursor={}", cursor.encode()));
+    assert_eq!(rows(&page).len(), 1, "{page}");
 }
 
 /// The bindings operations scope every input row the same way.
@@ -3041,6 +3116,17 @@ fn bindings_scope_every_row() {
     assert_eq!(
         rows(&page),
         vec![vec!["http://example.org/a", "http://example.org/c"]]
+    );
+
+    // An empty `g` in a body selects this operation's default, as an empty
+    // query parameter does: a form sends the field it has, blank or not.
+    let mut blank = body.clone();
+    blank["g"] = serde_json::json!("");
+    let page = served.binding_fragment(&store, &blank);
+    assert!(page["g"].is_null(), "{page}");
+    assert_eq!(
+        page["cardinality"]["value"], 2,
+        "the union of both rows, not a refusal"
     );
 
     let mut quads = body.clone();

@@ -1247,9 +1247,7 @@ impl Answer {
         if matches!(syntax, RdfSyntax::Graph(_)) && self.tagging == GraphTagging::PerRow {
             return Err(Problem::new(
                 ErrorCode::NotAcceptable,
-                "the quad view puts each statement in its graph, which a single-graph syntax \
-                 cannot represent; ask for N-Quads, TriG or JSON-LD, or scope the request with \
-                 a graph",
+                request::QUAD_VIEW_NEEDS_A_DATASET,
             ));
         }
         // A scope that fixed one graph names it once for the whole page
@@ -4221,18 +4219,21 @@ pub fn binding_fragment(
         normalize_rdf_restrictions(&mut restrictions);
     }
 
-    let scope = Scope::resolve(store, &target, &blank_nodes, &request.graph)?;
     // A graph this bundle does not hold empties every row at once.
-    let absent_graph = scope.absent();
+    let scope = Scope::resolve(store, &target, &blank_nodes, &request.graph)?;
     let mut phases = Vec::with_capacity(restrictions.len());
     let mut restriction_counts = Vec::with_capacity(restrictions.len());
-    if absent_graph.is_none() {
-        for (row_index, ids) in restrictions.iter().copied() {
-            let phase = binding_phase(scope.enumerate(select(store, ids)?)?, row_index)?;
-            restriction_counts.push((ids, phase.count));
-            phases.push(phase);
+    let absent_graph = match &scope {
+        Ok(scope) => {
+            for (row_index, ids) in restrictions.iter().copied() {
+                let phase = binding_phase(scope.enumerate(select(store, ids)?)?, row_index)?;
+                restriction_counts.push((ids, phase.count));
+                phases.push(phase);
+            }
+            None
         }
-    }
+        Err(absent) => Some(*absent),
+    };
 
     let envelope = Envelope {
         echo: Echo::BindingsFragment {
@@ -4257,8 +4258,11 @@ pub fn binding_fragment(
     }
 
     let base_pattern = resolve_binding_pattern(&mut cache, &request.pattern)?;
-    let rdf_cardinality =
-        rdf_projection_cardinality(store, &scope, base_pattern, &restriction_counts)?;
+    // Reached only with rows to count, which an absent graph cannot produce.
+    let rdf_cardinality = match &scope {
+        Ok(scope) => rdf_projection_cardinality(store, scope, base_pattern, &restriction_counts)?,
+        Err(_) => Cardinality::exact(0),
+    };
     let mut answer = paged_distinct_bindings(
         store,
         target,
@@ -4281,14 +4285,13 @@ pub fn binding_count(
     let dictionary = store.dict();
     let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
     let mut cache = LookupCache::new(dictionary, blank_nodes.clone());
-    let scope = Scope::resolve(store, &target, &blank_nodes, &request.graph)?;
     // A graph this bundle does not hold makes every row zero, and the answer
     // says so rather than letting a client read the zeros as data.
-    let absent_graph = scope.absent();
+    let scope = Scope::resolve(store, &target, &blank_nodes, &request.graph)?;
     let mut counts = Vec::new();
     for row in request.rows() {
-        let value = match (absent_graph, resolve_binding(&mut cache, row)?) {
-            (None, Some(ids)) => scope.enumerate(select(store, ids)?)?.count()?,
+        let value = match (&scope, resolve_binding(&mut cache, row)?) {
+            (Ok(scope), Some(ids)) => scope.enumerate(select(store, ids)?)?.count()?,
             _ => 0,
         };
         counts.push(PerBindingCount {
@@ -4296,6 +4299,7 @@ pub fn binding_count(
             count: Cardinality::exact(value),
         });
     }
+    let absent_graph = scope.err();
     Ok(BindingCountAnswer {
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
@@ -5318,21 +5322,23 @@ enum Scope<'a> {
     Layer(&'a Graphs, GraphId),
     /// One row per membership.
     Quads(&'a Graphs),
-    /// A well-formed name this bundle does not hold. Every pattern under it is
-    /// empty, and the answer says which parameter, exactly as an absent term
-    /// in the pattern does.
-    Absent(AbsentTerm),
 }
 
 impl<'a> Scope<'a> {
     /// Resolve a request's `g` against this bundle's memberships.
+    ///
+    /// `Err(absent)` is the well-formed request naming a graph this bundle
+    /// does not hold. It is returned rather than carried as a fourth variant
+    /// so that a resolved scope is always one that can enumerate: the empty
+    /// answer is decided once, by the caller, instead of guarded at every
+    /// later use.
     fn resolve(
         store: &'a Store,
         target: &Target,
         blank_nodes: &SkolemScope,
         scope: &GraphScope,
-    ) -> Result<Self, Problem> {
-        Ok(match scope.selector() {
+    ) -> Result<Result<Self, AbsentTerm>, Problem> {
+        Ok(Ok(match scope.selector() {
             GraphSelector::Union => Self::Union,
             // Without memberships every triple is unnamed, so the unnamed
             // graph is the union — the same rows, under the name the client
@@ -5345,19 +5351,13 @@ impl<'a> Scope<'a> {
                 let graphs = graphs(store, target)?;
                 match named_layer(graphs, blank_nodes, term)? {
                     Some(graph) => Self::Layer(graphs, graph),
-                    None => Self::Absent(AbsentTerm::new(scope.parameter().as_str(), term)),
+                    None => {
+                        return Ok(Err(AbsentTerm::new(scope.parameter().as_str(), term)));
+                    }
                 }
             }
             GraphSelector::All => Self::Quads(graphs(store, target)?),
-        })
-    }
-
-    /// The name this bundle does not hold, when that is what the scope named.
-    fn absent(&self) -> Option<AbsentTerm> {
-        match self {
-            Self::Absent(absent) => Some(*absent),
-            Self::Union | Self::Layer(..) | Self::Quads(_) => None,
-        }
+        }))
     }
 
     /// Enumerate one resolved pattern under this scope.
@@ -5372,16 +5372,6 @@ impl<'a> Scope<'a> {
                 .memberships(graphs)
                 .map(Enumeration::Quads)
                 .map_err(|error| unreadable("preparing the quad view", &error))?,
-            // Every caller that can reach an absent scope answers from
-            // `absent` instead, so arriving here is this module's own bug
-            // rather than anything a request can ask for.
-            Self::Absent(_) => {
-                tracing::error!("a graph this bundle does not hold was asked to enumerate");
-                return Err(Problem::new(
-                    ErrorCode::InternalError,
-                    "the graph scope could not be applied",
-                ));
-            }
         })
     }
 }
@@ -5433,11 +5423,10 @@ fn scoped<'a>(
     ids: IdPattern,
     scope: &GraphScope,
 ) -> Result<Result<Enumeration<'a>, AbsentTerm>, Problem> {
-    let resolved = Scope::resolve(store, target, blank_nodes, scope)?;
-    if let Some(absent) = resolved.absent() {
-        return Ok(Err(absent));
+    match Scope::resolve(store, target, blank_nodes, scope)? {
+        Ok(resolved) => Ok(Ok(resolved.enumerate(select(store, ids)?)?)),
+        Err(absent) => Ok(Err(absent)),
     }
-    Ok(Ok(resolved.enumerate(select(store, ids)?)?))
 }
 
 /// One row of an enumeration, with the position that resumes *at* it.
@@ -6349,14 +6338,24 @@ fn positioned<'a>(
     let mut first = true;
     // The enumeration is lazy, so the caller's `take` is what bounds the work,
     // and a multi-phase walk cannot know its own bound per phase up front.
-    enumeration.rows(from, skip).map(move |row| {
-        let row = row?;
+    let mut rows = enumeration.rows(from, skip);
+    std::iter::from_fn(move || {
         // The trailer says how many of this triple's memberships the previous
-        // page delivered, and an enumeration clamps one that runs past them.
-        // A first row that is not the one the token names is therefore a
-        // forged trailer, and honouring it would drop the rest of the triple.
+        // page delivered, and an enumeration clamps one that runs past them:
+        // it either starts the run later than the token names, or — on the
+        // last triple of the enumeration — produces no row at all. Either way
+        // the first row is not the one the token names, and honouring the
+        // token would drop the rest of the triple and call the page complete.
+        let Some(row) = rows.next() else {
+            return (std::mem::take(&mut first) && skip > 0)
+                .then(|| Err(Problem::from(StaleCursor)));
+        };
+        let row = match row {
+            Ok(row) => row,
+            Err(problem) => return Some(Err(problem)),
+        };
         if std::mem::take(&mut first) && row.delivered.unwrap_or(0) != skip {
-            return Err(Problem::from(StaleCursor));
+            return Some(Err(Problem::from(StaleCursor)));
         }
         // A new triple, unless this row continues the run the last one was in.
         // The first triple of a page resumes at `from` itself, which for the
@@ -6371,12 +6370,12 @@ fn positioned<'a>(
             }
             current = Some(row.triple);
         }
-        Ok(PositionedRow {
+        Some(Ok(PositionedRow {
             triple: row.triple,
             graph: row.graph,
             resume,
             delivered: row.delivered,
-        })
+        }))
     })
 }
 
