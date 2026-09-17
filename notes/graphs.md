@@ -181,12 +181,19 @@ description holds, and `stats/summary.json` names the largest ten with
 **A graph a component claims is described under the component's id.** A bundle
 may declare the parts of itself — the canonical release, an entailment, a derived
 overlay — and bind each to the graph holding it. Such a graph is then described as
-`component:<id>` rather than `graph:<IRI>`, listed with its component by
-`GET /graphs`, and, where it is the canonical one, projected as the *design view*
-that `/schema?view=design` and the summary card describe. That is the difference
-between a card describing a KG as its authors modelled it and one describing a
-materialized closure. Declaring a component says what a part of a dataset is; it
-does not say who built it, and `kgf build` runs no component DAG.
+`component:<id>` rather than `graph:<IRI>`, and listed with its component by
+`GET /graphs`. Declaring a component says what a part of a dataset is; it does not
+say who built it, and `kgf build` runs no component DAG.
+
+One of them is the *design view*, which `/schema?view=design` reads and the summary
+card is rendered from: `design:` nominates it, defaulting to the canonical
+component. The default suits a KG whose own encoding is the one its readers want.
+It does not suit one modelled in OWL, where the canonical component holds
+restrictions and blank nodes and the legible view is a projection of it, so the
+publisher nominates the projection instead. Every view is reachable either way —
+the listing links each graph to its description, and a description page offers the
+others — because which part answers a question depends on what the reader came to
+find out.
 
 **Not every graph gets one.** A graph whose stored name is a blank node has no IRI to
 name a view after, and the analysis gives it a bare subset with no service description

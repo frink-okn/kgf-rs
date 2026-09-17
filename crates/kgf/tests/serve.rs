@@ -4027,4 +4027,28 @@ fn a_bundle_serves_the_components_it_declares() {
     assert_eq!(manifest["components"][0]["id"], "asserted");
     assert_eq!(manifest["components"][1]["role"], "entailment");
     assert_eq!(manifest["components"][1]["inputs"][0], "asserted");
+
+    // A reader can get from the listing to each part's description, and from
+    // one description to another: which view answers a question depends on
+    // what the reader came to find out, so no page is a dead end.
+    let listing = server.request("GET", "/quads/v/v1/graphs", &[("Accept", "text/html")]);
+    listing.assert_status(200);
+    let listing = String::from_utf8(listing.body.to_vec()).unwrap();
+    for view in ["component%3Aasserted", "component%3Aclosure"] {
+        assert!(
+            listing.contains(&format!("schema?view={view}")),
+            "{listing}"
+        );
+    }
+    let page = server.request(
+        "GET",
+        "/quads/v/v1/schema?view=component%3Aasserted",
+        &[("Accept", "text/html")],
+    );
+    page.assert_status(200);
+    let page = String::from_utf8(page.body.to_vec()).unwrap();
+    assert!(page.contains("schema-views"), "{page}");
+    for view in ["design", "queryable", "component%3Aclosure"] {
+        assert!(page.contains(&format!("view={view}")), "missing {view}");
+    }
 }

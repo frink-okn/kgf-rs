@@ -664,6 +664,15 @@ pub struct Manifest {
     /// The parts of this dataset the publisher named.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<Component>,
+    /// The component the design view describes, by id.
+    ///
+    /// Absent, the canonical component is it — the one and only `role: source`
+    /// — which is the legible view of a dataset whose native encoding is the
+    /// one its readers want. Where it is not, the publisher nominates: a KG
+    /// written in OWL has its restrictions and blank nodes in the canonical
+    /// component, and the view worth describing is a projection of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design: Option<String>,
     /// How this bundle was built, for re-derivation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<Source>,
@@ -732,18 +741,24 @@ impl ComponentRole {
 }
 
 impl Manifest {
-    /// The canonical component: the one whose schema the design view describes.
+    /// The component the design view describes.
     ///
-    /// `None` where no component claims `role: source`, which is every bundle
-    /// that declares none, and where several do — a case with no rule to pick
-    /// between them, refused when a bundle is built rather than guessed here.
-    pub fn canonical_component(&self) -> Option<&Component> {
-        let mut sources = self
-            .components
-            .iter()
-            .filter(|component| component.role == ComponentRole::Source);
-        let first = sources.next()?;
-        sources.next().is_none().then_some(first)
+    /// The nominated one, or the canonical one where nothing nominates. `None`
+    /// where neither exists: a bundle declaring no components, or one whose
+    /// several `role: source` components leave no canonical one to pick, which
+    /// is refused when a bundle is built rather than guessed here.
+    pub fn design_component(&self) -> Option<&Component> {
+        match &self.design {
+            Some(id) => self.components.iter().find(|component| &component.id == id),
+            None => {
+                let mut sources = self
+                    .components
+                    .iter()
+                    .filter(|component| component.role == ComponentRole::Source);
+                let first = sources.next()?;
+                sources.next().is_none().then_some(first)
+            }
+        }
     }
 
     /// The component a graph holds, if one claims it.
@@ -887,6 +902,24 @@ impl Manifest {
                         component.id
                     )));
                 }
+            }
+        }
+        if let Some(design) = &self.design {
+            let Some(component) = self
+                .components
+                .iter()
+                .find(|component| &component.id == design)
+            else {
+                return Err(syntax(format!(
+                    "the design view names component {design:?}, which this manifest does \
+                     not declare"
+                )));
+            };
+            if component.graph.is_none() {
+                return Err(syntax(format!(
+                    "the design view names component {design:?}, which has no graph and so \
+                     no triples to describe"
+                )));
             }
         }
         Ok(())
@@ -1524,6 +1557,7 @@ mod tests {
             dataset_iri: None,
             version: "2026-08-01".to_owned(),
             components: Vec::new(),
+            design: None,
             content_digest: "sha256:0".to_owned(),
             created: None,
             formats: Formats::default(),

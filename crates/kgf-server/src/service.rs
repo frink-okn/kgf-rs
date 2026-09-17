@@ -878,6 +878,7 @@ mod tests {
             artifacts: BTreeMap::new(),
             previous_version: None,
             components: Vec::new(),
+            design: None,
             source: None,
         })
         .expect("a manifest serializes")

@@ -585,6 +585,9 @@ pub struct ConfigPlan {
     /// The parts of this dataset the publisher declared, ordered by id.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<kgf_store::manifest::Component>,
+    /// The component the design view describes, when one is nominated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub design: Option<String>,
 }
 
 /// Resolve the declared components, refusing what this build cannot honour.
@@ -595,6 +598,7 @@ pub struct ConfigPlan {
 /// statement: an id, what kind of part it is, and the graph holding it.
 fn resolve_components(
     components: BTreeMap<String, config::Component>,
+    design: Option<&str>,
 ) -> Result<Vec<kgf_store::manifest::Component>> {
     use kgf_store::manifest::{Component, ComponentRole};
 
@@ -641,15 +645,27 @@ fn resolve_components(
         });
     }
 
-    // The canonical component is the one the design view describes, so a
+    // Without a nomination the canonical component is the design view, so a
     // config naming two leaves the summary card with no answer to which the
     // dataset is. Refused here rather than picked arbitrarily later.
     ensure!(
-        sources.len() <= 1,
+        design.is_some() || sources.len() <= 1,
         "components {} all claim `role: source`, and the canonical one is what the \
-         design view describes. Give exactly one that role",
+         design view describes. Give exactly one that role, or nominate the design \
+         view with `design:`",
         sources.join(", ")
     );
+    if let Some(design) = design {
+        let component = resolved
+            .iter()
+            .find(|component| component.id == design)
+            .with_context(|| format!("`design: {design}` names no declared component"))?;
+        ensure!(
+            component.graph.is_some(),
+            "`design: {design}` names a component with no graph, which has no triples \
+             to describe. Give it the graph holding it, or nominate one that has it"
+        );
+    }
 
     let declared: std::collections::BTreeSet<&str> = resolved
         .iter()
@@ -706,7 +722,7 @@ impl ConfigPlan {
         let semantics = resolve_semantics(config.semantics)?;
         let contents = resolve_contents(config.contents)?;
         let resources = resolve_resources(config.resources)?;
-        let components = resolve_components(config.components)?;
+        let components = resolve_components(config.components, config.design.as_deref())?;
 
         Ok(Self {
             schema: config.schema,
@@ -715,6 +731,7 @@ impl ConfigPlan {
             contents,
             resources,
             components,
+            design: config.design,
         })
     }
 }

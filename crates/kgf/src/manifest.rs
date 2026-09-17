@@ -135,6 +135,8 @@ pub(crate) struct Requested {
     /// The parts of the dataset the config declared. Empty keeps what the
     /// manifest has, so re-describing a bundle by hand does not drop them.
     pub(crate) components: Vec<kgf_store::manifest::Component>,
+    /// Which of them the design view describes, carried the same way.
+    pub(crate) design: Option<String>,
 }
 
 impl Requested {
@@ -176,6 +178,7 @@ impl Requested {
             // build config, so it never declares components; the writer carries
             // forward whatever the manifest already had.
             components: Vec::new(),
+            design: None,
             id: args.id.clone(),
             version: args.version.clone(),
             dataset_iri: args.dataset_iri.clone(),
@@ -640,6 +643,10 @@ fn build(
         } else {
             requested.components.clone()
         },
+        design: requested
+            .design
+            .clone()
+            .or_else(|| previous.and_then(|m| m.design.clone())),
         counts: facts.counts(),
         capabilities: facts
             .capabilities()
@@ -1457,6 +1464,7 @@ mod tests {
             dataset_iri: None,
             version: "v".to_owned(),
             components: Vec::new(),
+            design: None,
             content_digest: "sha256:0".to_owned(),
             created: None,
             formats: Formats::default(),

@@ -92,6 +92,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) card: DatasetCard<'a>,
     /// The parts of the dataset the publisher declared.
     pub(crate) components: &'a [kgf_store::manifest::Component],
+    /// Which of them the design view describes, when one is nominated.
+    pub(crate) design: Option<&'a str>,
     /// Scratch directory for intermediates that are not published.
     pub(crate) work: &'a Path,
     /// What this bundle's graphs are, when it carries memberships at all. A
@@ -143,6 +145,7 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
         work,
         graphs,
         components,
+        design,
     } = inputs;
 
     let void_nt = work.join("void.nt");
@@ -209,14 +212,21 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
         Some(facts) if facts.describe => graph_subsets(&graph, &root, facts)?,
         _ => Vec::new(),
     };
-    // The canonical component's own subset is the design view: the KG as its
-    // authors modelled it, which on a bundle carrying a materialized closure is
-    // a different graph from the one a query hits. A componentless bundle has
-    // one real graph, so there `design` and `queryable` stay API aliases for
-    // that same root rather than distinct RDF datasets.
-    let canonical = components
-        .iter()
-        .find(|component| component.role == kgf_store::manifest::ComponentRole::Source)
+    // The design view is one component's own subset: the part of the dataset
+    // worth describing, which is the canonical component unless the publisher
+    // nominated another. A componentless bundle has one real graph, so there
+    // `design` and `queryable` stay API aliases for that same root rather than
+    // distinct RDF datasets.
+    let nominated = match design {
+        Some(id) => components.iter().find(|component| component.id == id),
+        None => {
+            let mut sources = components
+                .iter()
+                .filter(|component| component.role == kgf_store::manifest::ComponentRole::Source);
+            sources.next().filter(|_| sources.next().is_none())
+        }
+    };
+    let canonical = nominated
         .and_then(|component| component.graph.as_deref())
         .and_then(|graph| {
             subsets

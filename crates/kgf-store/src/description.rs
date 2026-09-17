@@ -807,6 +807,15 @@ impl DescriptionStore {
         documents::summary_markdown(self.summary_md.as_bytes(), self.summary_md.path())
     }
 
+    /// Every view this bundle published, in the order a reader walks them.
+    ///
+    /// For a page that offers them: which parts of a dataset are described is
+    /// a property of the artifacts, not of the manifest's declarations, and a
+    /// bundle may describe fewer parts than it declares.
+    pub fn views(&self) -> impl Iterator<Item = &StatsView> {
+        self.schema_nodes.views.keys()
+    }
+
     /// Select one published description view.
     ///
     /// `None` distinguishes an unknown component from a valid view whose
@@ -1892,6 +1901,7 @@ mod tests {
                 generator: None,
                 regime: None,
             }],
+            design: None,
             content_digest: "sha256:00".to_owned(),
             created: None,
             formats: Formats::default(),
@@ -2145,6 +2155,7 @@ mod tests {
                 generator: None,
                 regime: None,
             }],
+            design: None,
             content_digest: "sha256:00".to_owned(),
             created: None,
             formats: Formats::default(),

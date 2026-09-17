@@ -140,6 +140,7 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
             work: work.path(),
             graphs: graph_facts,
             components: &plan.config.components,
+            design: plan.config.design.as_deref(),
         },
         &staged_stats,
     )?;
@@ -686,6 +687,7 @@ fn requested_manifest(
 ) -> Result<Requested> {
     Ok(Requested {
         components: plan.config.components.clone(),
+        design: plan.config.design.clone(),
         id: Some(plan.config.dataset.id.to_string()),
         version: Some(plan.version.to_string()),
         dataset_iri: Some(plan.config.dataset.iri.as_str().to_owned()),

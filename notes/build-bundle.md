@@ -123,6 +123,7 @@ components:                    # the parts of this dataset, by id
     role: entailment
     graph: http://example.org/closure
     inputs: [asserted]         # what the publisher says it was computed over
+design: asserted               # which component the design view describes
 
 resources:
   memory_limit: 4G
@@ -155,12 +156,20 @@ half-obeyed. So is `publish:`, which selects what such a DAG would merge.
 Three things follow from a declaration. The graph is described under
 `component:<id>` instead of `graph:<IRI>`, so a consumer keyed on the
 publisher's own handle survives an upstream rename of the IRI. `GET /graphs`
-says which graphs are components. And the `role: source` component becomes the
-*design view*: `/schema?view=design` and the summary card describe it rather
-than the merged graph, which on a bundle carrying a materialized closure is the
-difference between describing the ontology and describing the reasoner's
-output. A component with no `graph` is provenance and nothing more — it gets no
-view and no `g=` scope, because nothing can say which triples are its.
+says which graphs are components, and links each to its description. And one
+component becomes the *design view*, which `/schema?view=design` reads and the
+summary card is rendered from. A component with no `graph` is provenance and
+nothing more — it gets no view and no `g=` scope, because nothing can say which
+triples are its.
+
+**`design:` nominates that component**, and defaults to the canonical one. The
+default is right where a KG's own encoding is the one its readers want. It is
+wrong where the encoding is OWL: the canonical component then holds
+restrictions and blank nodes, and a card rendered from it describes RDF
+scaffolding rather than the classes and relations a reader came for, so the
+publisher nominates whichever projection is worth reading. A nomination must
+name a declared component that has a graph, since a component with no extent
+has nothing to describe.
 
 A declaration is *trusted*: nothing checks that the graph named `asserted` holds
 the asserted axioms. What is checked is that the graph exists, that ids are

@@ -2053,6 +2053,57 @@ fn a_declared_component_is_described_under_its_id_and_becomes_the_design_view() 
     );
     kgf(&["manifest", path(&out), "--check"], "").ok();
 
+    // The design view follows a nomination where there is one. `g2` holds one
+    // of the three distinct triples, and nominating it moves design there.
+    let nominated = dir.path().join("root/tinykg/nominated");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&nominated),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!("{CONFIG}{config}design: closure\n"),
+    )
+    .ok();
+    let rows = |bundle: &Path, view: &str| -> Vec<String> {
+        std::fs::read_to_string(bundle.join("stats/schema-nodes.tsv"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix(&format!("{view}\t")).map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(
+        rows(&nominated, "design"),
+        rows(&nominated, "component:closure"),
+        "the nominated component is the design view"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(nominated.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["design"], "closure");
+    kgf(&["manifest", path(&nominated), "--check"], "").ok();
+
+    // A nomination has to name a component that has triples to describe.
+    for (extra, expected) in [
+        ("design: nobody\n", "names no declared component"),
+        (
+            "components:\n  loose: {role: derived}\ndesign: loose\n",
+            "no graph",
+        ),
+    ] {
+        let stderr = kgf(
+            &["build", "--config", "-", "--check-config"],
+            &format!("{MINIMAL}{extra}"),
+        )
+        .err();
+        assert!(stderr.contains(expected), "{extra}: {stderr}");
+    }
+
     // A component naming a graph the data does not carry is refused, and
     // nothing is published.
     let refused = dir.path().join("root/tinykg/refused");

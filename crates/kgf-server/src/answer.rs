@@ -1869,11 +1869,21 @@ struct GraphEntry {
     /// an upstream rename of the IRI, and it is what `/schema` describes this
     /// graph under.
     component: Option<Rc<str>>,
+    /// The `view=` this graph is described under, when the bundle describes it.
+    /// Absent where it does not: describing each graph is a build choice, and
+    /// a page offers only the link it can honour.
+    view: Option<String>,
     serialized: u64,
 }
 
 impl GraphEntry {
-    fn new(published: Rc<str>, term: u64, count: u64, component: Option<Rc<str>>) -> Self {
+    fn new(
+        published: Rc<str>,
+        term: u64,
+        count: u64,
+        component: Option<Rc<str>>,
+        view: Option<String>,
+    ) -> Self {
         let component_bytes = component
             .as_deref()
             .map_or(0, |id| serialized_bytes(&Term::Iri(Cow::Borrowed(id))));
@@ -1886,6 +1896,7 @@ impl GraphEntry {
             published,
             count,
             component,
+            view,
             serialized,
         }
     }
@@ -2431,6 +2442,9 @@ pub struct SchemaNavigationAnswer {
     dataset: String,
     version: String,
     view: String,
+    /// The views this bundle published, for the page's own navigation.
+    #[serde(skip)]
+    views: Vec<String>,
     selector: SchemaSelectorResource,
     node: Option<SchemaResource>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2459,6 +2473,9 @@ pub struct SchemaRelationsAnswer {
     dataset: String,
     version: String,
     view: String,
+    /// The views this bundle published, for the page's own navigation.
+    #[serde(skip)]
+    views: Vec<String>,
     projection: &'static str,
     filters: SchemaProjectionFilters,
     order: SchemaProjectionOrder,
@@ -2484,6 +2501,9 @@ pub struct SchemaClassPropertiesAnswer {
     dataset: String,
     version: String,
     view: String,
+    /// The views this bundle published, for the page's own navigation.
+    #[serde(skip)]
+    views: Vec<String>,
     projection: &'static str,
     filters: SchemaProjectionFilters,
     order: SchemaProjectionOrder,
@@ -3112,6 +3132,35 @@ impl SummaryResource {
     }
 }
 
+/// The other views of this dataset, with the current one marked.
+///
+/// A view is one part of the dataset described on its own: a declared
+/// component, a named graph, or the `design` and `queryable` readings of the
+/// whole. Which one a reader wants depends on what they came to find out, and
+/// a KG that publishes both its own encoding and a projection of it has no
+/// single answer, so the page offers them all rather than leaving a reader to
+/// edit the parameter. Switching returns to that view's overview, because a
+/// class selected in one view need not exist in another.
+fn schema_views(target: &Target, views: &[String], current: &str) -> maud::Markup {
+    html! {
+        @if views.len() > 1 {
+            nav."schema-views" aria-label="Description views" {
+                ul {
+                    @for view in views {
+                        li {
+                            @if view == current {
+                                strong."current" { (view) }
+                            } @else {
+                                a href=(target.ask("schema", "view", view)) { (view) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn summary_actions(links: &BTreeMap<String, String>) -> maud::Markup {
     const ACTIONS: [(&str, &str, &str); 7] = [
         (
@@ -3496,6 +3545,11 @@ pub fn schema(
             "this bundle does not carry the complete tier-1 description artifact set needed by `/schema`",
         )
     })?;
+    // The views this bundle published, so a page can offer the others.
+    let views: Vec<String> = description
+        .views()
+        .map(|view| view.manifest_key().into_owned())
+        .collect();
     let view = description
         .view(&request.view)
         .ok_or_else(|| match &request.view {
@@ -3567,6 +3621,7 @@ pub fn schema(
                 dataset: target.id.dataset.clone(),
                 version: target.id.version.clone(),
                 view: schema_view_name(&request.view),
+                views,
                 selector: selection_resource(selection),
                 node,
                 collection: None,
@@ -3580,11 +3635,13 @@ pub fn schema(
             }))
         }
         SchemaQuery::Children(children) => {
-            schema_children(description, view, target, request, children)
+            schema_children(description, view, target, request, children, views)
         }
-        SchemaQuery::ClassRelations(filter) => schema_relations(view, target, request, filter),
+        SchemaQuery::ClassRelations(filter) => {
+            schema_relations(view, target, request, filter, views)
+        }
         SchemaQuery::ClassProperties(filter) => {
-            schema_class_properties(view, target, request, filter)
+            schema_class_properties(view, target, request, filter, views)
         }
     }
 }
@@ -3595,6 +3652,7 @@ fn schema_children(
     target: Target,
     request: &request::Schema,
     children: &SchemaChildren,
+    views: Vec<String>,
 ) -> Result<SchemaAnswer, Problem> {
     let from = request.cursor.as_ref().map_or(0, |cursor| cursor.position);
     let limit = nonzero_schema_limit(request.limit.expect("children carry a page limit"));
@@ -3641,6 +3699,7 @@ fn schema_children(
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
         view: schema_view_name(&request.view),
+        views,
         selector: child_parent_selection_resource(children),
         node,
         collection: Some(SchemaCollectionResource {
@@ -3716,6 +3775,7 @@ fn schema_relations(
     target: Target,
     request: &request::Schema,
     filter: &request::SchemaRelationFilter,
+    views: Vec<String>,
 ) -> Result<SchemaAnswer, Problem> {
     let from = match request.cursor.as_ref() {
         None => None,
@@ -3753,6 +3813,7 @@ fn schema_relations(
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
         view: schema_view_name(&request.view),
+        views,
         projection: "class-relations",
         filters: projection_filters(&filter.class, &filter.predicate),
         order: CLASS_RELATION_ORDER,
@@ -3771,6 +3832,7 @@ fn schema_class_properties(
     target: Target,
     request: &request::Schema,
     filter: &request::SchemaClassPropertyFilter,
+    views: Vec<String>,
 ) -> Result<SchemaAnswer, Problem> {
     let from = match request.cursor.as_ref() {
         None => None,
@@ -3809,6 +3871,7 @@ fn schema_class_properties(
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
         view: schema_view_name(&request.view),
+        views,
         projection: "class-properties",
         filters: projection_filters(&filter.class, &filter.predicate),
         order: CLASS_PROPERTY_ORDER,
@@ -4493,10 +4556,21 @@ pub fn graphs_list(
                 .map_err(|error| unreadable("reading a graph's count", &error))?
         };
         let (published, term) = names.measured(graphs, id)?;
-        let component = target
-            .component_of_graph(&published)
-            .map(|component| Rc::from(component.id.as_str()));
-        let row = GraphEntry::new(published, term, count, component);
+        let claimed = target.component_of_graph(&published);
+        // The view this graph is described under, offered only where the
+        // bundle really carries it.
+        let view = match claimed {
+            Some(component) => kgf_store::StatsView::component(component.id.clone()),
+            None => kgf_store::StatsView::graph(published.as_ref()),
+        }
+        .filter(|view| {
+            store
+                .description()
+                .is_some_and(|description| description.view(view).is_some())
+        })
+        .map(|view| view.manifest_key().into_owned());
+        let component = claimed.map(|component| Rc::from(component.id.as_str()));
+        let row = GraphEntry::new(published, term, count, component, view);
         spent = spent.saturating_add(row.serialized);
         // Never on the first row, for the reason every page keeps its first
         // row: a page that carries nothing would resume where it was issued.
@@ -6915,6 +6989,7 @@ impl SchemaNavigationAnswer {
                         ("complete", Value::Text(completeness_text(&self.completeness))),
                     ]))
                 }
+                (schema_views(&self.target, &self.views, &self.view))
                 section."section-block" {
                     h2 { (schema_node_heading(self.selector.kind())) }
                     @if let Some(node) = &self.node {
@@ -7084,6 +7159,7 @@ impl SchemaRelationsAnswer {
                         ("complete", Value::Text(completeness_text(&self.completeness))),
                     ]))
                 }
+                (schema_views(&self.target, &self.views, &self.view))
                 section."section-block" {
                     h2 { "Observed class relations" }
                     (note(
@@ -7185,6 +7261,7 @@ impl SchemaClassPropertiesAnswer {
                         ("complete", Value::Text(completeness_text(&self.completeness))),
                     ]))
                 }
+                (schema_views(&self.target, &self.views, &self.view))
                 section."section-block" {
                     h2 { "Properties by class" }
                     (note(
@@ -7672,13 +7749,29 @@ impl Resource for GraphsAnswer {
                 (cell, entry.count)
             })
             .collect();
-        // The component column appears only where something fills it, so a
-        // bundle that declares none keeps the two-column listing.
+        // Each optional column appears only where something fills it, so a
+        // bundle that declares no components, or describes no graph, keeps the
+        // shorter listing.
         let components = self.graphs.iter().any(|entry| entry.component.is_some());
+        let described = self.graphs.iter().any(|entry| entry.view.is_some());
+        let schema: Vec<Cell<'_>> = self
+            .graphs
+            .iter()
+            .map(|entry| {
+                Cell::link(
+                    "schema",
+                    entry
+                        .view
+                        .as_deref()
+                        .map(|view| self.target.ask("schema", "view", view)),
+                )
+            })
+            .collect();
         let rows: Vec<Vec<Value<'_>>> = cells
             .iter()
             .zip(&self.graphs)
-            .map(|((cell, count), entry)| {
+            .zip(&schema)
+            .map(|(((cell, count), entry), schema)| {
                 let mut row = vec![cell.value(), Value::Number(*count)];
                 if components {
                     row.push(match &entry.component {
@@ -7686,9 +7779,19 @@ impl Resource for GraphsAnswer {
                         None => Value::Text(""),
                     });
                 }
+                if described {
+                    row.push(schema.value());
+                }
                 row
             })
             .collect();
+        let mut headers = vec![GRAPH, "count"];
+        if components {
+            headers.push("component");
+        }
+        if described {
+            headers.push("");
+        }
         let summary = [
             ("triples", Value::Number(self.triples)),
             ("memberships", Value::Number(self.memberships)),
@@ -7723,10 +7826,8 @@ impl Resource for GraphsAnswer {
                     h2 { "Graphs" }
                     @if rows.is_empty() {
                         (note("No graphs."))
-                    } @else if self.graphs.iter().any(|row| row.component.is_some()) {
-                        (results_table(&[GRAPH, "count", "component"], &rows))
                     } @else {
-                        (results_table(&[GRAPH, "count"], &rows))
+                        (results_table(&headers, &rows))
                     }
                 }
                 @if let Some(token) = self.completeness.next_cursor() {
