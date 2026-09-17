@@ -344,12 +344,24 @@ struct BundleInspection {
 /// # Safety obligation
 ///
 /// [`PublishedBundle::new`](kgf_store::PublishedBundle::new) requires that the
-/// artifacts not be modified or truncated while mapped. This is a one-shot
-/// command over a directory the operator named, holding the mappings only for
-/// the duration of this call and writing nothing but `manifest.json`, which is
-/// not among the mapped artifacts. Establishing that obligation explicitly is
-/// what the capability exists for; the rest of this crate keeps
-/// `unsafe` denied.
+/// artifacts not be modified or truncated while mapped. The mappings live only
+/// inside this call, which is single-threaded and writes nothing at all, so
+/// what has to hold is that nothing *else* writes those bytes while it runs.
+/// Both callers establish that, differently:
+///
+/// - `kgf manifest` is a one-shot command over a directory the operator named,
+///   and the only file it writes afterwards is `manifest.json`, which is not
+///   among the mapped artifacts.
+/// - A build calls it over its own staging directory, between the step that
+///   wrote the artifacts and the next step that runs. The directory is this
+///   process's private temporary one, invisible to a catalog scan, and no
+///   builder is running against it at the time. Under `--adopt` the staged
+///   `data.hdt` is a hard link to the caller's file, so this inherits the
+///   promise `--adopt` already makes: the input is not being rewritten while
+///   the build reads it.
+///
+/// Establishing that obligation explicitly is what the capability exists for;
+/// the rest of this crate keeps `unsafe` denied.
 #[allow(unsafe_code)]
 fn inspect_bundle(dir: &Path) -> Result<BundleInspection> {
     let bundle = unsafe { kgf_store::PublishedBundle::new(dir) };
@@ -373,8 +385,8 @@ pub(crate) fn check_staged_graphs(dir: &Path) -> Result<()> {
             .facts
             .capabilities()
             .any(|capability| capability == Capability::Graphs),
-        "{} was built for named graphs but carries no membership artifacts",
-        dir.display()
+        "the build asked for named graphs and produced no membership artifacts; \
+         this is a bug in `kgf build` rather than in the input"
     );
     Ok(())
 }

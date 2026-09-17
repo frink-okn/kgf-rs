@@ -1073,8 +1073,13 @@ fn a_quad_source_keeps_its_graphs_and_a_triple_source_carries_none() {
             .contains_key("graphs"),
         "{manifest}"
     );
-    // Described like every other artifact, so `content_digest` covers it.
-    assert!(manifest["artifacts"]["data.hdt.graphs"]["sha256"].is_string());
+    // Described like every other artifact, so `content_digest` covers both.
+    for artifact in ["data.hdt.graphs", "data.hdt.graphs.idx"] {
+        assert!(
+            manifest["artifacts"][artifact]["sha256"].is_string(),
+            "{artifact} is not described"
+        );
+    }
     kgf(&["manifest", path(&with_graphs), "--check"], "").ok();
 
     let without = dir.path().join("root/tinykg/triples");
@@ -1296,6 +1301,42 @@ fn the_membership_transpose_follows_the_number_of_graphs() {
         "40 graphs is over the threshold, so the index carries the \
          transpose: {follows} bytes against {stated}"
     );
+
+    // And below it the other way round: the worked example's two graphs are
+    // cheap to probe, so an unset key builds no transpose and asking for one
+    // builds it.
+    let small = dir.path().join("small.nq");
+    std::fs::write(&small, QUADS).unwrap();
+    let index_of = |out: &Path, config: &str| -> u64 {
+        kgf(
+            &[
+                "build",
+                "--config",
+                "-",
+                "--out",
+                path(out),
+                "--input",
+                path(&small),
+                "--hdtc",
+                &hdtc(),
+            ],
+            config,
+        )
+        .ok();
+        std::fs::metadata(out.join("data.hdt.graphs.idx"))
+            .expect("an indexed bundle")
+            .len()
+    };
+    let bare = index_of(&dir.path().join("root/tinykg/bare"), CONFIG);
+    let asked = index_of(
+        &dir.path().join("root/tinykg/asked"),
+        &format!("{CONFIG}contents:\n  graphs: {{transpose: true}}\n"),
+    );
+    assert!(
+        asked > bare,
+        "two graphs are under the threshold, so the transpose is built only \
+         when asked for: {asked} bytes against {bare}"
+    );
 }
 
 /// A bundle with memberships is described one graph at a time as well as
@@ -1419,4 +1460,180 @@ fn views_of(bundle: &Path, artifact: &str) -> Vec<String> {
         .collect();
     names.dedup();
     names
+}
+
+/// `--adopt` releases the memberships it took and leaves alone the ones it
+/// did not: a build that deliberately dropped a quad source's graphs must not
+/// delete the only copy of them on its way out.
+#[test]
+fn adopt_releases_the_sidecar_only_when_the_bundle_took_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+
+    let staged = |name: &str| -> std::path::PathBuf {
+        let out = dir.path().join(format!("staging/tinykg/{name}"));
+        kgf(
+            &[
+                "build",
+                "--config",
+                "-",
+                "--out",
+                path(&out),
+                "--input",
+                path(&source),
+                "--hdtc",
+                &hdtc(),
+            ],
+            CONFIG,
+        )
+        .ok();
+        out
+    };
+
+    // Dropped deliberately: the bundle has no memberships, and the input keeps
+    // the only copy of the ones it arrived with.
+    let kept = staged("kept");
+    let out = dir.path().join("root/tinykg/dropped");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--hdt",
+            path(&kept.join("data.hdt")),
+            "--adopt",
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!("{CONFIG}contents:\n  graphs: {{enabled: false}}\n"),
+    )
+    .ok();
+    assert!(!out.join("data.hdt.graphs").exists());
+    assert!(!kept.join("data.hdt").exists(), "--adopt keeps its promise");
+    assert!(
+        kept.join("data.hdt.graphs").exists(),
+        "a build that dropped the graphs must not delete them"
+    );
+
+    // Taken: both files move, and neither is left binding to nothing.
+    let taken = staged("taken");
+    let out = dir.path().join("root/tinykg/taken");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--hdt",
+            path(&taken.join("data.hdt")),
+            "--adopt",
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(out.join("data.hdt.graphs").exists());
+    assert!(!taken.join("data.hdt").exists());
+    assert!(!taken.join("data.hdt.graphs").exists());
+}
+
+/// What a file name says about its syntax is the builder's own classification,
+/// and a directory's name says nothing at all.
+#[test]
+fn the_input_decides_memberships_unless_it_cannot_say() {
+    let dir = tempfile::tempdir().unwrap();
+    // JSON-LD names graphs with `@graph`, so a bundle built from one keeps
+    // them without being asked to.
+    let jsonld = dir.path().join("tiny.jsonld");
+    std::fs::write(
+        &jsonld,
+        "{\"@graph\": [{\"@id\": \"http://example.org/g1\", \"@graph\": \
+         [{\"@id\": \"http://example.org/a\", \"http://example.org/b\": \
+         {\"@id\": \"http://example.org/c\"}}]}]}",
+    )
+    .unwrap();
+    let out = dir.path().join("root/tinykg/jsonld");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&jsonld),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(
+        out.join("data.hdt.graphs").exists(),
+        "JSON-LD carries graphs"
+    );
+
+    // A directory is not an input at all: it has no digest for the manifest
+    // and no syntax to read graphs from, and the refusal says so before
+    // anything is built.
+    let inputs = dir.path().join("inputs");
+    std::fs::create_dir(&inputs).unwrap();
+    std::fs::copy(&jsonld, inputs.join("tiny.jsonld")).unwrap();
+    let stderr = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&dir.path().join("root/tinykg/dir")),
+            "--input",
+            path(&inputs),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .err();
+    assert!(stderr.contains("is a directory"), "{stderr}");
+
+    // `enabled: true` over triples RDF builds the sidecar the config asked
+    // for, holding one layer: every statement carried no graph.
+    let triples = dir.path().join("tiny.nt");
+    std::fs::write(&triples, SOURCE).unwrap();
+    let out = dir.path().join("root/tinykg/asked");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&triples),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!("{CONFIG}contents:\n  graphs: {{enabled: true}}\n"),
+    )
+    .ok();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        manifest["capabilities"]
+            .as_object()
+            .unwrap()
+            .contains_key("graphs"),
+        "{manifest}"
+    );
+    let graphs: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("stats/summary.json")).unwrap()).unwrap();
+    assert_eq!(
+        graphs["graphs"][0]["graph"], "urn:x-kgf:unnamed",
+        "one layer, and it is the unnamed graph"
+    );
 }

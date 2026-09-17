@@ -25,11 +25,15 @@ QLever, RDF4J/GraphDB, and Blazegraph do, and nothing else.
 | `urn:x-kgf:union` | the union; `g=<urn:x-kgf:union>` is identical to omitting `g` |
 | `urn:x-kgf:unnamed` | the unnamed graph, layer 0 |
 
-`kgf build` refuses a source quad, or a component graph, whose IRI is either constant,
-so no sidecar layer can carry them and no runtime check is needed. In the s, p, and o
-positions they are ordinary IRIs that match nothing. Both are accepted on every
-release, sidecar or not: on a bundle with no memberships each selects every triple,
-since every triple of such a bundle is unnamed.
+`kgf build` refuses a source quad, or a component graph, whose IRI is either
+constant. It refuses it by *running the runtime check*: the sidecar is built, opened
+the way a server opens it, and a dictionary holding either constant fails there —
+before the text index, the sketches, the key sets and the description set, but after
+the HDT. Refusing at parse time would be cheaper and needs hdtc to know these names,
+which is a question for `../hdtc` rather than a thing to duplicate here. In the s, p,
+and o positions the two are ordinary IRIs that match nothing. Both are accepted on
+every release, sidecar or not: on a bundle with no memberships each selects every
+triple, since every triple of such a bundle is unnamed.
 
 ## The four forms of `g` on `/fragment` and `/count`
 

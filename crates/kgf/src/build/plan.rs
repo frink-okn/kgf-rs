@@ -898,36 +898,32 @@ impl Input {
     ///
     /// An HDT carries them in the sidecar beside it or not at all. RDF carries
     /// them when it is written in a syntax that has a fourth position, which
-    /// is read from the file name: the alternative is parsing every input
-    /// before deciding how to build it, and a file named `.nt` that holds
-    /// quads is not a file this build has to guess about — `contents.graphs`
-    /// says so outright.
+    /// the builder's own classification answers from the file name — the
+    /// alternative is parsing every input before deciding how to build it, and
+    /// a file named `.nt` that holds quads is not a file this can guess about.
+    ///
+    /// Every RDF input is a named file, which argument resolution ensures, so
+    /// there is no directory here whose name could say nothing.
+    /// The input as an operator would name it, for a message about what to fix.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Hdt { path, .. } => path.display().to_string(),
+            Self::Rdf { paths } => paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+
     fn carries_graphs(&self) -> bool {
         match self {
             Self::Hdt { path, .. } => hdtc::format::graph_sidecar_path(path).is_file(),
-            Self::Rdf { paths } => paths.iter().any(|path| quad_syntax(path)),
+            Self::Rdf { paths } => paths
+                .iter()
+                .any(|path| hdtc::format::rdf_input_carries_graphs(path)),
         }
     }
-}
-
-/// Whether a file name says its RDF carries graphs.
-///
-/// Compression suffixes are stripped first, so `data.nq.gz` reads as N-Quads.
-fn quad_syntax(path: &Path) -> bool {
-    let mut name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    for compressed in [".gz", ".bz2", ".xz", ".zst"] {
-        if let Some(stem) = name.strip_suffix(compressed) {
-            name = stem.to_owned();
-            break;
-        }
-    }
-    [".nq", ".nquads", ".trig"]
-        .iter()
-        .any(|syntax| name.ends_with(syntax))
 }
 
 /// Recorded in the manifest, never acted on. This is provenance, not identity:
@@ -1062,6 +1058,12 @@ mod tests {
         for source in [
             MINIMAL,
             "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\ncontents: {text: {enabled: false}}\n",
+            // Both graph keys are three-valued, and all three values have to
+            // survive the round trip: an omitted one coming back stated, or a
+            // stated one coming back omitted, changes what the build does.
+            "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\ncontents: {graphs: {enabled: false}}\n",
+            "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\ncontents: {graphs: {enabled: true}}\n",
+            "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\ncontents: {graphs: {transpose: false}}\n",
             "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\nresources: {memory_limit: 8G}\n",
             // The two fields validated against the prefix map. Both once
             // resolved to a plan that would not re-parse, because the

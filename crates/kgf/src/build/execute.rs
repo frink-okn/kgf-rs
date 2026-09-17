@@ -96,7 +96,12 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
         // cannot read is worth hearing about now rather than once the text
         // index, the sketches, the key sets and the description set have been
         // built over bytes that will never be published.
-        crate::manifest::check_staged_graphs(&layout.staging)?;
+        crate::manifest::check_staged_graphs(&layout.staging).with_context(|| {
+            format!(
+                "the memberships built from {} cannot be read back, so nothing was published",
+                plan.input.describe()
+            )
+        })?;
     }
 
     for step in sidecar_steps(plan, &layout) {
@@ -154,7 +159,7 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
         )
     })?;
     let _ = staging.keep();
-    release_adopted_input(plan);
+    release_adopted_input(plan, graphs);
     Ok(Built {
         manifest,
         description: outcome,
@@ -397,21 +402,35 @@ pub(super) fn rehearse(build: &Build) -> Result<String> {
     // transpose prints as the choice a bundle under the threshold gets, and
     // the line below says what really decides it.
     let transpose = plan.config.contents.graphs.transpose;
-    let mut steps = vec![core_step(plan, &layout, graphs)];
+    let mut steps = vec![(core_step(plan, &layout, graphs), Vec::new())];
     if graphs {
-        steps.push(graphs_index_step(&layout, transpose.unwrap_or(false)));
+        let mut notes = Vec::new();
+        if transpose.is_none() {
+            notes.push(format!(
+                "#   …plus --transpose-ids above {GRAPH_TRANSPOSE_THRESHOLD} graphs, which \
+                 this bundle's sidecar states once it is built"
+            ));
+        }
+        notes.push(
+            "#   then open the staged memberships as a server would, before the steps below"
+                .to_owned(),
+        );
+        steps.push((
+            graphs_index_step(&layout, transpose.unwrap_or(false)),
+            notes,
+        ));
     }
-    steps.extend(sidecar_steps(plan, &layout));
-    for step in &steps {
+    steps.extend(
+        sidecar_steps(plan, &layout)
+            .into_iter()
+            .map(|step| (step, Vec::new())),
+    );
+    for (step, notes) in &steps {
         let _ = writeln!(out, "# {}", step.name);
         let _ = writeln!(out, "{}", render(&runner.hdtc_argv(step)));
-    }
-    if graphs && transpose.is_none() {
-        let _ = writeln!(
-            out,
-            "# --transpose-ids is added above {GRAPH_TRANSPOSE_THRESHOLD} graphs, \
-             which this bundle's sidecar states once it is built"
-        );
+        for note in notes {
+            let _ = writeln!(out, "{note}");
+        }
     }
     let _ = writeln!(
         out,
@@ -459,7 +478,7 @@ fn materialize(
             // second source input: one input arrived, in two files, and the
             // manifest covers the second as an artifact like every other.
             if graphs {
-                place(
+                place_unhashed(
                     &hdtc::format::graph_sidecar_path(path),
                     &hdtc::format::graph_sidecar_path(data),
                     *adopt,
@@ -472,6 +491,10 @@ fn materialize(
                     )
                 })?;
             }
+            // The index beside an input is deliberately not taken. It is
+            // derived, this server requires layer sets an arbitrary one need
+            // not carry, and rebuilding it costs a fraction of what verifying
+            // someone else's would.
             runner.run(&core_step(plan, layout, graphs))?;
             Ok(inputs)
         }
@@ -590,26 +613,49 @@ fn hdtc_version(hdtc: &Path) -> Option<String> {
 /// twice. Moving cannot, and pays a second read — which is still the cheaper
 /// option overall, since it skips writing a second copy of the file.
 fn place(source: &Path, dest: &Path, adopt: bool) -> Result<String> {
-    if adopt {
-        // A hard link, never a rename. Staging is a temporary directory that is
-        // deleted on *any* later failure — a bad digest, a failed sidecar, a
-        // full disk — and a rename would put the caller's only copy of the
-        // input inside it. Linking leaves the source in place until the build
-        // has actually published, so a failed `--adopt` costs nothing.
-        match std::fs::hard_link(source, dest) {
-            Ok(()) => return hash_file(dest),
-            // Across filesystems there is no link to make, and every other
-            // failure is worth one attempt at a copy too: the fallback is
-            // strictly more capable, so telling the causes apart would only
-            // turn recoverable cases into errors.
-            Err(error) => tracing::debug!(
+    if adopt && linked(source, dest) {
+        return hash_file(dest);
+    }
+    copy_hashing(source, dest)
+}
+
+/// Put an existing file at `dest` without hashing it.
+///
+/// For a file the manifest does not record as a source input: the bundle's own
+/// per-artifact checksum covers it once it is in place, and hashing it here
+/// would be a second full read for a number nothing asks for.
+fn place_unhashed(source: &Path, dest: &Path, adopt: bool) -> Result<()> {
+    if adopt && linked(source, dest) {
+        return Ok(());
+    }
+    std::fs::copy(source, dest)
+        .map(|_| ())
+        .with_context(|| format!("copying {} to {}", source.display(), dest.display()))
+}
+
+/// Try to hard-link the input into staging, reporting whether it worked.
+///
+/// A hard link, never a rename. Staging is a temporary directory that is
+/// deleted on *any* later failure — a bad digest, a failed sidecar, a full
+/// disk — and a rename would put the caller's only copy of the input inside
+/// it. Linking leaves the source in place until the build has actually
+/// published, so a failed `--adopt` costs nothing.
+fn linked(source: &Path, dest: &Path) -> bool {
+    match std::fs::hard_link(source, dest) {
+        Ok(()) => true,
+        // Across filesystems there is no link to make, and every other failure
+        // is worth one attempt at a copy too: the fallback is strictly more
+        // capable, so telling the causes apart would only turn recoverable
+        // cases into errors.
+        Err(error) => {
+            tracing::debug!(
                 %error,
                 source = %source.display(),
                 "linking the input failed; copying instead"
-            ),
+            );
+            false
         }
     }
-    copy_hashing(source, dest)
 }
 
 /// Drop the adopted input, once the bundle that replaced it is published.
@@ -622,15 +668,17 @@ fn place(source: &Path, dest: &Path, adopt: bool) -> Result<String> {
 /// A failure here is reported and not fatal. The bundle is already published
 /// and correct; a leftover input is untidy, not wrong, and unpublishing a good
 /// bundle over it would be the worse trade.
-fn release_adopted_input(plan: &BundlePlan) {
+fn release_adopted_input(plan: &BundlePlan, graphs: bool) {
     let Input::Hdt { path, adopt: true } = &plan.input else {
         return;
     };
-    // The sidecar is part of the input that was adopted, and leaving it beside
-    // a deleted HDT would leave a file that binds to nothing.
-    let sidecar = hdtc::format::graph_sidecar_path(path);
-    let released = [path.as_path(), sidecar.as_path()]
-        .into_iter()
+    // The sidecar goes only when this build took it: leaving it beside a
+    // deleted HDT would leave a file that binds to nothing, but a build that
+    // deliberately dropped the memberships never took it, and deleting the
+    // caller's only copy of them would be this command's own data loss.
+    let sidecar = graphs.then(|| hdtc::format::graph_sidecar_path(path));
+    let released = std::iter::once(path.as_path())
+        .chain(sidecar.as_deref())
         .filter(|file| file.is_file());
     for file in released {
         if let Err(error) = std::fs::remove_file(file) {

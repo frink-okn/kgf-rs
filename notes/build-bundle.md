@@ -148,6 +148,13 @@ graphs-index --positions pos,ops`: the index is where the two position-keyed lay
 sets a server requires are chosen, and `create --graphs-index` would choose them
 by its own default instead.
 
+Two limits worth stating. Every `--input` is a file: each one's digest goes into
+the manifest's provenance, a directory has no digest, and a directory name says
+nothing about the syntax inside it either, so a directory is refused with that
+reason rather than walked. And which syntaxes carry graphs is hdtc's table, read
+through `hdtc::format::rdf_input_carries_graphs`, so this command cannot drift
+from what the builder will actually preserve — N-Quads, TriG and JSON-LD today.
+
 `transpose` is the same shape for the same reason. The quad view reads the graphs
 of one statement per row: from the transpose that is one lookup, without it one
 probe per graph, and the transpose's own size grows with the memberships it
@@ -631,6 +638,9 @@ unknown fields, so a config written against doc 04's DAG fails with an
 explanation. Claiming the keys stays additive: when the DAG lands the refusal
 becomes an implementation, and no config that works today breaks. That is the whole reason for the `schema: 1` line.
 
-Named graphs are off for this deployment (plan §9): `hdtc create` drops the graph
-component of quads, so there is no `.graphs` sidecar and no `graphs` capability
-to declare.
+Named graphs are **not** on that list any more (2026-09-17). A quad input keeps
+its graphs, `contents.graphs` says what a build does with them, and the bundle
+declares `graphs` and describes each graph of its own. What is still absent is
+graphs *per component*: a component DAG would give each component its own
+subset, and how that composes with a source's own named graphs is a question
+for the DAG rather than for this command.
