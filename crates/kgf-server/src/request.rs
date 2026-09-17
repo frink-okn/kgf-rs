@@ -57,7 +57,7 @@ use crate::Limits;
 use crate::access::{RequestShape, Transport};
 use crate::admission::WorkClass;
 use crate::cursor::{
-    BundleBinding, CanonicalRequest, Cursor, CursorBinding, Operation, StaleCursor,
+    BundleBinding, CanonicalRequest, Cursor, CursorBinding, Operation, PositionSpace, StaleCursor,
 };
 use crate::envelope::{ErrorCode, Problem, reflected};
 use crate::service::PredicateRoles;
@@ -2025,6 +2025,77 @@ impl Count {
     }
 }
 
+/// `GET /graphs` — every graph of the bundle with its membership count.
+///
+/// Paged by graph id: the unnamed graph first, under its reserved name, when
+/// it holds any triple; then the named graphs in the sidecar's dictionary
+/// order. There is nothing to scope, so the request is only its page.
+#[derive(Debug)]
+pub struct GraphList {
+    /// Rows this page may carry.
+    pub limit: u32,
+    /// Bytes its rows may occupy.
+    pub bytes: ResponseBytes,
+    /// Where to resume, if the request carried a cursor.
+    pub cursor: Option<Cursor>,
+    /// What a cursor this request issues must match.
+    pub binding: CursorBinding,
+}
+
+impl GraphList {
+    const PARAMETERS: &'static [&'static str] = &["limit", "cursor", "format"];
+
+    /// Read the parameters of a `/graphs` request.
+    pub fn parse(
+        params: &Params,
+        limits: Limits<'_>,
+        bundle: &BundleBinding,
+    ) -> Result<Self, Problem> {
+        accept_only(params, GRAPHS, Self::PARAMETERS)?;
+        let limit = page_size(
+            params,
+            "limit",
+            limits.caps.default_limit,
+            limits.caps.max_limit,
+            "a listing has at least one row",
+        )?;
+        let binding = CursorBinding::new(bundle, &CanonicalRequest::new(Operation::Graphs));
+        let cursor = resume(params, &binding)?;
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.space != PositionSpace::Graph)
+        {
+            return Err(Problem::from(StaleCursor));
+        }
+        Ok(Self {
+            limit,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            cursor,
+            binding,
+        })
+    }
+}
+
+impl ObservedRequest for GraphList {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Graphs { limit: self.limit }
+    }
+
+    fn resumed(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    fn request_hash(&self) -> Option<[u8; 8]> {
+        Some(self.binding.request_hash())
+    }
+}
+
+impl GetRequest for GraphList {
+    fn normalize_params(params: &Params) -> Params {
+        params.without_empty(&["limit"])
+    }
+}
+
 /// `GET /terms` — a lexicographic page of the dictionary under one byte prefix.
 ///
 /// Two shapes behind one parameter set, which is what `count` selects: a page of
@@ -3365,6 +3436,7 @@ const SUMMARY: &str = "summary";
 const SEARCH: &str = "search";
 const TERMS: &str = "terms";
 const LABELS: &str = "labels";
+const GRAPHS: &str = "graphs";
 
 /// Refuse anything `operation` does not take.
 fn accept_only(params: &Params, operation: &str, accepted: &[&str]) -> Result<(), Problem> {

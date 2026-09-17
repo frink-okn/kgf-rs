@@ -1452,6 +1452,22 @@ fn graph_scope_is_gated_on_the_capability_and_pages_over_the_wire() {
         !form.contains("name=\"g\""),
         "a bundle without memberships does not"
     );
+
+    // The listing is routed and linked only where the capability is declared.
+    let refused = server.request("GET", "/tox/v/v1/graphs", &[]);
+    refused.assert_status(501);
+    assert_eq!(refused.json()["code"], "capability_not_available");
+    let listing = server.request("GET", "/quads/v/v1/graphs", &[]);
+    listing.assert_status(200);
+    assert_eq!(listing.json()["graphs"].as_array().unwrap().len(), 3);
+    let page = server.request("GET", "/quads/v/v1/graphs", &[("accept", "text/html")]);
+    page.assert_status(200);
+    assert!(page.text().contains("urn:x-kgf:unnamed"));
+    let links = |dataset: &str| {
+        server.request("GET", &format!("/{dataset}"), &[]).json()["releases"][0]["links"].clone()
+    };
+    assert_eq!(links("quads")["graphs"], "/quads/v/v1/graphs");
+    assert!(links("tox").get("graphs").is_none());
 }
 
 #[test]

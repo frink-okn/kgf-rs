@@ -2938,6 +2938,104 @@ fn a_quad_view_page_shows_its_graph_column() {
     );
 }
 
+/// `/graphs` lists the unnamed graph under its constant and every named graph
+/// with its count, pages by graph id, and is absent where there is nothing
+/// to list.
+#[test]
+fn the_graph_listing_pages_every_graph_with_its_count() {
+    let served = Served::quads();
+    let store = served.store();
+    let list = |query: &str| -> serde_json::Value {
+        let request =
+            request::GraphList::parse(&params(query), served.limits(), &served.release().binding())
+                .unwrap_or_else(|error| panic!("GET /graphs?{query}: {error}"));
+        json(
+            answer::graphs_list(&store, served.target("graphs", query), &request)
+                .unwrap_or_else(|error| panic!("GET /graphs?{query}: {error}")),
+            Representation::Json,
+        )
+    };
+
+    let whole = list("");
+    assert_eq!(whole["triples"], 3);
+    assert_eq!(whole["memberships"], 5);
+    assert_eq!(
+        whole["cardinality"],
+        serde_json::json!({"value": 3, "exact": true})
+    );
+    assert_eq!(whole["complete"], true);
+    let listed: Vec<(String, u64)> = whole["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                dictionary_spelling(&entry["g"]),
+                entry["count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            (UNNAMED.to_owned(), 2),
+            (G1.to_owned(), 2),
+            (G2.to_owned(), 1),
+        ]
+    );
+
+    // One per page, resumed from each cursor, reproduces the listing.
+    let mut collected = Vec::new();
+    let mut query = "limit=1".to_owned();
+    loop {
+        let page = list(&query);
+        assert_eq!(page["cardinality"]["value"], 3);
+        for entry in page["graphs"].as_array().unwrap() {
+            collected.push(dictionary_spelling(&entry["g"]));
+        }
+        match page["next"].as_str() {
+            Some(next) => query = format!("limit=1&cursor={next}"),
+            None => break,
+        }
+    }
+    assert_eq!(collected, vec![UNNAMED, G1, G2]);
+
+    // The page: every graph links to its own triples.
+    let request =
+        request::GraphList::parse(&params(""), served.limits(), &served.release().binding())
+            .unwrap();
+    let page = answer::graphs_list(&store, served.target("graphs", ""), &request)
+        .unwrap()
+        .render(Representation::Html)
+        .unwrap();
+    let page = String::from_utf8(page.body.to_vec()).unwrap();
+    assert!(page.contains(&g(G1)), "{page}");
+    assert!(page.contains(&g(UNNAMED)), "{page}");
+
+    // A bundle whose every statement is named lists no unnamed graph.
+    let named_only = Served::from_fixture(Fixture::build_quads(kgf_store::testing::TINY_NQ));
+    let store = named_only.store();
+    let request = request::GraphList::parse(
+        &params(""),
+        named_only.limits(),
+        &named_only.release().binding(),
+    )
+    .unwrap();
+    let listing = json(
+        answer::graphs_list(&store, named_only.target("graphs", ""), &request).unwrap(),
+        Representation::Json,
+    );
+    assert_eq!(listing["cardinality"]["value"], 2);
+    assert!(
+        listing["graphs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["g"]["value"] != UNNAMED),
+        "{listing}"
+    );
+}
+
 /// Every term of a role, plus the variable.
 fn options(terms: &Terms, role: Role) -> Vec<Option<usize>> {
     std::iter::once(None)
@@ -2986,6 +3084,7 @@ fn access_operation(operation: &str) -> AccessOperation {
         "sample" => AccessOperation::Sample,
         "search" => AccessOperation::Search,
         "terms" => AccessOperation::Terms,
+        "graphs" => AccessOperation::Graphs,
         "schema" => AccessOperation::Schema,
         "void" => AccessOperation::Void,
         "summary" => AccessOperation::Summary,

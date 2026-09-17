@@ -98,6 +98,8 @@ pub enum Operation {
     Tpf = 5,
     /// `GET /terms`.
     Terms = 6,
+    /// `GET /graphs`.
+    Graphs = 7,
 }
 
 impl Operation {
@@ -114,6 +116,7 @@ impl Operation {
             4 => Some(Self::Schema),
             5 => Some(Self::Tpf),
             6 => Some(Self::Terms),
+            7 => Some(Self::Graphs),
             _ => None,
         }
     }
@@ -184,6 +187,10 @@ pub enum PositionSpace {
     /// sections one row across a page boundary, since every run resumes strictly
     /// past it.
     DictionaryPrefix = 10,
+    /// The next graph id a `/graphs` page lists: the unnamed graph is 0 and
+    /// the named graphs follow in the sidecar's dictionary order, so the id
+    /// is the page's own offset into that order.
+    Graph = 11,
 }
 
 impl PositionSpace {
@@ -235,6 +242,7 @@ impl PositionSpace {
             8 => Some(Self::ClassRelation),
             9 => Some(Self::ClassProperty),
             10 => Some(Self::DictionaryPrefix),
+            11 => Some(Self::Graph),
             _ => None,
         }
     }
@@ -493,6 +501,11 @@ impl Cursor {
         Self::at(binding, PositionSpace::DictionaryPrefix, position.as_u64())
     }
 
+    /// Resume a `/graphs` listing at graph id `next`.
+    pub fn at_graph(binding: &CursorBinding, next: u64) -> Self {
+        Self::at(binding, PositionSpace::Graph, next)
+    }
+
     /// Encode to the opaque token clients round-trip.
     ///
     /// Fixed layout, little-endian, then URL-safe base64 without padding: 29
@@ -583,7 +596,8 @@ impl Cursor {
             PositionSpace::SchemaChild
             | PositionSpace::ClassRelation
             | PositionSpace::ClassProperty
-            | PositionSpace::DictionaryPrefix => binding_index.is_none() && scan_position.is_none(),
+            | PositionSpace::DictionaryPrefix
+            | PositionSpace::Graph => binding_index.is_none() && scan_position.is_none(),
             PositionSpace::Spo
             | PositionSpace::Pos
             | PositionSpace::Ops

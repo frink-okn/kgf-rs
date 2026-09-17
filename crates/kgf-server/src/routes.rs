@@ -118,6 +118,7 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/{dataset}/v/{version}/sample", read(get(sample)))
         .route("/{dataset}/v/{version}/search", read(get(search)))
         .route("/{dataset}/v/{version}/terms", read(get(terms)))
+        .route("/{dataset}/v/{version}/graphs", read(get(graphs)))
         .route("/{dataset}/v/{version}/schema", read(get(schema)))
         .route("/{dataset}/v/{version}/void", read(get(void)))
         .route("/{dataset}/v/{version}/summary", read(get(summary)))
@@ -803,6 +804,27 @@ async fn terms(
             )
         },
         answer::terms,
+    )
+    .await
+}
+
+async fn graphs(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate(
+        service,
+        BundleId { dataset, version },
+        AccessOperation::Graphs,
+        wants,
+        // Gated: the listing reads the membership sidecar, which a bundle
+        // may not carry. See `capability_gate`.
+        |params, limits, release| {
+            capability_gate(release, Capability::Graphs)?;
+            request::GraphList::parse(params, limits, &release.binding())
+        },
+        answer::graphs_list,
     )
     .await
 }

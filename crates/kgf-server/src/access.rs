@@ -307,6 +307,8 @@ pub enum AccessOperation {
     Search,
     /// Dictionary prefix scan.
     Terms,
+    /// Graph listing.
+    Graphs,
     /// Description graph navigation.
     Schema,
     /// VoID description.
@@ -340,6 +342,7 @@ impl AccessOperation {
             Self::Sample => "sample",
             Self::Search => "search",
             Self::Terms => "terms",
+            Self::Graphs => "graphs",
             Self::Schema => "schema",
             Self::Void => "void",
             Self::Summary => "summary",
@@ -483,6 +486,11 @@ pub enum RequestShape {
     Labels {
         /// Submitted IRIs.
         k: u64,
+    },
+    /// Graph listing.
+    Graphs {
+        /// Requested page size.
+        limit: u32,
     },
     /// Description-graph request.
     Schema {
@@ -1024,6 +1032,7 @@ fn operation_for_route(route: &str) -> Option<AccessOperation> {
         "/{dataset}/v/{version}/sample" => Some(AccessOperation::Sample),
         "/{dataset}/v/{version}/search" => Some(AccessOperation::Search),
         "/{dataset}/v/{version}/terms" => Some(AccessOperation::Terms),
+        "/{dataset}/v/{version}/graphs" => Some(AccessOperation::Graphs),
         "/{dataset}/v/{version}/schema" => Some(AccessOperation::Schema),
         "/{dataset}/v/{version}/void" => Some(AccessOperation::Void),
         "/{dataset}/v/{version}/summary" => Some(AccessOperation::Summary),
@@ -1065,6 +1074,7 @@ mod tests {
             AccessOperation::Sample,
             AccessOperation::Search,
             AccessOperation::Terms,
+            AccessOperation::Graphs,
             AccessOperation::Schema,
             AccessOperation::Void,
             AccessOperation::Summary,

@@ -358,6 +358,7 @@ impl Target {
             AccessOperation::Sample => "Sample",
             AccessOperation::Search => "Search",
             AccessOperation::Terms => "Terms",
+            AccessOperation::Graphs => "Graphs",
             AccessOperation::Schema => "Schema",
             AccessOperation::Labels => "Labels",
             AccessOperation::Void => "void",
@@ -1719,6 +1720,70 @@ impl Serialize for SearchEvidence {
             _ => map.serialize_entry("literal", self.literal.as_ref())?,
         }
         map.end()
+    }
+}
+
+/// One graph of a `/graphs` listing.
+#[derive(Debug)]
+struct GraphEntry {
+    published: Rc<str>,
+    count: u64,
+    serialized: u64,
+}
+
+impl GraphEntry {
+    fn new(published: Rc<str>, term: u64, count: u64) -> Self {
+        let serialized =
+            serialized_object([(GRAPH, term), ("count", count.to_string().len() as u64)]);
+        Self {
+            published,
+            count,
+            serialized,
+        }
+    }
+}
+
+impl Serialize for GraphEntry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry(GRAPH, &Term::from_dictionary(&self.published))?;
+        map.serialize_entry("count", &self.count)?;
+        map.end()
+    }
+}
+
+/// `GET /graphs`' page of the bundle's graphs.
+#[derive(Debug, Serialize)]
+pub struct GraphsAnswer {
+    dataset: String,
+    version: String,
+    /// Distinct triples: what the union counts.
+    triples: u64,
+    /// Memberships over every graph: what the quad view counts. At least
+    /// `triples`, and equal to it only when no triple is in two graphs.
+    memberships: u64,
+    /// The graphs listed across every page: the named graphs, plus the
+    /// unnamed graph when it holds any triple.
+    cardinality: Cardinality,
+    graphs: Vec<GraphEntry>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+    #[serde(skip)]
+    blank_nodes: SkolemScope,
+}
+
+impl Renders for GraphsAnswer {
+    fn render(self, representation: Representation) -> Result<Rendered, Problem> {
+        let body = standard_body(&self, representation);
+        let rows = Some(self.graphs.len() as u64);
+        Ok(Rendered {
+            body,
+            completeness: self.completeness,
+            rows,
+            cardinality: Some(self.cardinality),
+        })
     }
 }
 
@@ -4125,6 +4190,90 @@ pub fn binding_count(
         counts,
         completeness: Completeness::complete(),
         target,
+    })
+}
+
+/// `GET /graphs` — every graph with its membership count, paged by graph id.
+///
+/// One directory read per graph listed: a layer's count is a field of its
+/// entry. The unnamed graph is listed first, under its reserved name, and
+/// only when it holds a triple; the named graphs follow in the sidecar's
+/// dictionary order. The cursor is the next id to list, so a page resumes by
+/// arithmetic rather than by search.
+pub fn graphs_list(
+    store: &Store,
+    target: Target,
+    request: &request::GraphList,
+) -> Result<GraphsAnswer, Problem> {
+    let dictionary = store.dict();
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let graphs = graphs(store, &target)?;
+    let facts = graphs.facts();
+    let unnamed_count = graphs
+        .count(GraphId::UNNAMED)
+        .map_err(|error| unreadable("reading the unnamed graph's count", &error))?;
+    let listed = facts.named_graphs + u64::from(unnamed_count > 0);
+
+    // The first id to list: after the cursor, or the unnamed graph — skipped
+    // when empty, so an empty unnamed graph never appears under its name.
+    let mut next = match &request.cursor {
+        None => 0,
+        Some(cursor) => {
+            if cursor.position == 0 || cursor.position > facts.named_graphs {
+                return Err(Problem::from(StaleCursor));
+            }
+            cursor.position
+        }
+    };
+    if next == 0 && unnamed_count == 0 {
+        next = 1;
+    }
+
+    let mut names = GraphNames::new(&blank_nodes);
+    let mut rows = Vec::with_capacity(request.limit as usize);
+    let mut spent = 0u64;
+    let mut stop = None;
+    while next <= facts.named_graphs {
+        if rows.len() >= request.limit as usize {
+            stop = Some(Completeness::page_limit(
+                Cursor::at_graph(&request.binding, next).encode(),
+            ));
+            break;
+        }
+        let id = GraphId(next);
+        let count = if id.is_unnamed() {
+            unnamed_count
+        } else {
+            graphs
+                .count(id)
+                .map_err(|error| unreadable("reading a graph's count", &error))?
+        };
+        let (published, term) = names.measured(graphs, id)?;
+        let row = GraphEntry::new(published, term, count);
+        spent = spent.saturating_add(row.serialized);
+        // Never on the first row, for the reason every page keeps its first
+        // row: a page that carries nothing would resume where it was issued.
+        if spent > request.bytes.0 && !rows.is_empty() {
+            stop = Some(Completeness::budget_exhausted(
+                BudgetReason::ResponseBytes,
+                Cursor::at_graph(&request.binding, next).encode(),
+            ));
+            break;
+        }
+        rows.push(row);
+        next += 1;
+    }
+
+    Ok(GraphsAnswer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        triples: facts.triples,
+        memberships: facts.memberships,
+        cardinality: Cardinality::exact(listed),
+        graphs: rows,
+        completeness: stop.unwrap_or_else(Completeness::complete),
+        target,
+        blank_nodes,
     })
 }
 
@@ -7164,6 +7313,72 @@ fn completeness_text(completeness: &Completeness) -> &'static str {
         Some(TruncationReason::ResponseBytes) => "no — the response byte budget filled",
         Some(TruncationReason::CellOverflow) => "no — a cell overflowed its cap",
         Some(TruncationReason::PartialFailure) => "no — part of the request failed",
+    }
+}
+
+impl Resource for GraphsAnswer {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let cells: Vec<(Cell<'_>, u64)> = self
+            .graphs
+            .iter()
+            .map(|entry| {
+                let request = Term::from_dictionary(&entry.published).to_request();
+                let mut cell = term_cell(&self.target, &self.blank_nodes, &entry.published, None);
+                cell.href = Some(self.target.ask("fragment", GRAPH, &request));
+                (cell, entry.count)
+            })
+            .collect();
+        let rows: Vec<Vec<Value<'_>>> = cells
+            .iter()
+            .map(|(cell, count)| vec![cell.value(), Value::Number(*count)])
+            .collect();
+        let summary = [
+            ("triples", Value::Number(self.triples)),
+            ("memberships", Value::Number(self.memberships)),
+            ("graphs", Value::Number(self.cardinality.value())),
+            ("returned", Value::Number(self.graphs.len() as u64)),
+            (
+                "complete",
+                Value::Text(completeness_text(&self.completeness)),
+            ),
+        ];
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        operation_page(
+            &self.target.mount,
+            "Graphs",
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" {
+                    (fields(&summary))
+                }
+                (note(
+                    "Every graph the bundle's triples belong to, with the number of triples in \
+                     each. The unnamed graph holds the statements that carried no graph; the \
+                     union of all graphs is what an unscoped request reads, and a triple in \
+                     several graphs counts once there. Each graph links to its triples."
+                ))
+                section."section-block" {
+                    h2 { "Graphs" }
+                    @if rows.is_empty() {
+                        (note("No graphs."))
+                    } @else {
+                        (results_table(&[GRAPH, "triples"], &rows))
+                    }
+                }
+                @if let Some(token) = self.completeness.next_cursor() {
+                    @if let Some(next) = self.target.next(token) {
+                        (pager(&next, "Next page →"))
+                    }
+                }
+            },
+        )
     }
 }
 
