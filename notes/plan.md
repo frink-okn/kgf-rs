@@ -2156,6 +2156,67 @@ The steps, each a commit reviewed on its own:
 10. **Notes**: this unit's *What landed*, `graphs.md`'s status, and the questions for
     `../kgf` the work raised.
 
+**What landed (2026-09-17).** All ten steps, in that order, each reviewed on its own.
+The contract in [`graphs.md`](graphs.md) held, with four amendments the code forced.
+
+**The union is untagged, always.** The contract had `g=<urn:x-kgf:union>` tag every
+statement with the constant, measured on an implementation whose fixture fit one page.
+It does not survive paging. Comunica 5.3.0 hands only a fragment's *first* page to its
+QPF source, whose filter honours the page's `sd:defaultGraph` declaration; every later
+page is identified as a plain RDF document and matched against the pattern's literal
+graph term, which knows nothing of the declaration. Tagged union rows therefore vanish
+from the second page on: a bare `?s ?p ?o` over one-row pages read one triple of three.
+Untagged rows page to the end, so the union is the document's default graph whether the
+request named the constant or left `graph` out. The cost is that stock Comunica reads
+nothing through an explicit `GRAPH <urn:x-kgf:union>`; that idiom belongs to this API
+and to a KGF-aware source, where the union is the default graph. The bare pattern is
+the query every client sends, and it is the one that must work.
+
+**A graph is a description view, not a second kind of description.** The plan said
+`g=` on `/schema`; what landed is `view=graph:<IRI>`, beside `design`, `queryable` and
+`component:<id>`. A graph and a component are on the same axis — both name a subset of
+the published triples, and the analysis expresses both as a `void:subset` — so the
+parameter that already chooses a subset is the one to extend. It also keeps `/schema`
+from having to explain what `g=*` would mean there. The grammar for these names now
+lives in `StatsView` alone: the manifest validates a name by parsing it, a mapped
+bundle parses it the same way, and a request is checked against it, so the three cannot
+drift. The build parses every name it emits for the same reason, and lays the views out
+in the order a mapped bundle walks them, which a reader requires.
+
+**`contents.graphs` is tri-state.** Whether a bundle carries memberships depends on the
+input, which neither `true` nor `false` can express. Omitted follows the input; `false`
+drops a quad source's graphs into the union deliberately; `true` refuses an HDT that
+arrives without a sidecar. `transpose` is the same shape: the quad view's `g` column
+costs one lookup per row with the transpose and one probe per graph without, while the
+transpose's size grows with the memberships it copies, so an unset value reads the
+graph count out of the sidecar the build just wrote and takes it above 32.
+
+**The reserved names are refused by running the runtime check.** `graphs.md` said no
+runtime check would be needed because the build refuses them. The build refuses them
+*with* that check: it opens the staged bundle as a server would, as soon as the two
+artifacts exist and before the text index, the sketches, the key sets and the
+description set. Refusing at parse time would be cheaper and needs hdtc to know these
+names, which is question 78 below rather than a table to duplicate here.
+
+Two bugs worth recording because both are the same shape — a check that cannot fire.
+The quad view's cursor carries how many of a triple's memberships the last page
+delivered, and comparing that against the first row the enumeration produced misses the
+forged trailer that produces *no* first row, which is what a trailer past the last
+triple's run does: the page came back empty and called itself complete. And `--adopt`
+released the caller's sidecar whether or not the bundle had taken it, so a build that
+deliberately dropped the graphs deleted the only copy of them. Neither was reachable
+from a passing test until one was written for it.
+
+*Verified by* the worked example of `graphs.md` as a fixture — every count in both of
+its tables, on every representation — differential tests against `hdtc search`'s
+four-position patterns and a naive oracle over a synthetic bundle wide enough to
+produce all three layer encodings, exhaustive paging of every form of `g` and `graph`
+at adversarial page sizes, forged cursors at every position and inside a bindings
+phase, a blank-node graph fixture, stock Comunica 5.3.0 as both a `qpf` and a `brtpf`
+source against one-row pages, and a bundle assembled by `kgf build` and served, which
+is the only test that can catch the build and the server disagreeing about what a view
+is called.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
@@ -3126,16 +3187,43 @@ following the code.
     response unit is entities, so deduplication happens after ranking and a cursor
     naming a literal rank cannot keep a subject from reappearing. Found serving
     Ubergraph.
+74. **The union must be untagged in every RDF representation, and the design should say
+    why.** [`graphs.md`](graphs.md) now carries the corrected serving table, but the
+    reasoning belongs to anyone implementing doc 03 over a quads bundle: a paging client
+    matches pages after the first against the pattern's literal graph term, so a union
+    row tagged with the reserved constant is dropped from the second page on. The
+    consequence is that `GRAPH <urn:x-kgf:union>` is not an idiom stock Comunica can
+    page, and the union is reached by a bare pattern plus the `sd:defaultGraph`
+    declaration. Measured against Comunica 5.3.0 at one row per page.
+75. **`g` beside `o.text` is refused, and §3.4 should say which error it is.** A ranked
+    text page is assembled from one selection per matching literal and this build scopes
+    none of them, so the request is well-formed and unanswerable: 400, not the 501 an
+    undeclared capability earns. If a later milestone scopes ranked pages the refusal
+    goes away, but until then the distinction is a client's only way to tell "not here"
+    from "not ever".
+76. **`/graphs` needs its response shape and its enumeration order in the spec.** What
+    landed lists the unnamed graph first when it holds a triple, then the named graphs
+    in the sidecar's dictionary order, with the cursor naming the next layer id. That
+    order is a cursor contract like every other enumeration order here, so it belongs in
+    doc 03 rather than only in this implementation.
+77. **A graph named by a blank node needs a stated spelling.** The sidecar stores such a
+    name as `_:label`, which means nothing outside the document it was parsed from. This
+    implementation publishes it as the bundle-scoped IRI a data blank node gets, in a
+    section of its own keyed by layer id, and checks the id against the sidecar when one
+    comes back. Whether that is the federation's answer, and whether a graph so named
+    should be listed at all, is a doc 03 question.
+78. **hdtc could refuse the two reserved graph IRIs at build time.** `kgf build` refuses
+    them by opening the finished sidecar the way a server does, which is after the whole
+    HDT has been built. hdtc knows a quad's graph as it reads it and could refuse there,
+    in seconds rather than hours — but the names are KGF's, not hdtc's, so this is a
+    question about where the federation's reserved vocabulary lives rather than a patch.
 
 ## Not in this plan
 
-Remaining composed operations (ranges, star, key resolution), graph scoping, and
-everything requiring a sidecar beyond `.perm` and the existing exhaustive text index.
-Those are doc 20 §20.8's later milestones and compose through the `Store`, envelope,
-cursor, term, and live-profile layers this plan builds. Graph scoping has its read
-contract written ahead of the code in [`graphs.md`](graphs.md): two reserved IRIs, the
-four forms of `g`, what a SPARQL client derives from each, and the `sd:defaultGraph`
-declaration stock Comunica needs before it will ask for the union at all.
+Remaining composed operations (ranges, star, key resolution) and everything requiring a
+sidecar beyond `.perm`, the exhaustive text index, and the graph memberships unit 30
+added. Those are doc 20 §20.8's later milestones and compose through the `Store`,
+envelope, cursor, term, and live-profile layers this plan builds.
 
 `kgf build` was deliberately absent from units 1–18 and landed as unit 21, once unit
 19 had settled enough of the consumer contract to say what a description set must
