@@ -1637,3 +1637,68 @@ fn the_input_decides_memberships_unless_it_cannot_say() {
         "one layer, and it is the unnamed graph"
     );
 }
+
+/// A graph named by a blank node has no IRI to name a description view after,
+/// and the analysis cannot say which bare subset is which. The bundle builds,
+/// carries every graph, and describes the ones that can be told apart.
+#[test]
+fn a_blank_named_graph_is_carried_without_being_described() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("blank.nq");
+    std::fs::write(
+        &source,
+        concat!(
+            "<http://example.org/a> <http://example.org/b> <http://example.org/c> _:g .\n",
+            "<http://example.org/a> <http://example.org/b> <http://example.org/d> .\n",
+            "<http://example.org/x> <http://example.org/y> <http://example.org/z> \
+             <http://example.org/g1> .\n",
+        ),
+    )
+    .unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+
+    // Every graph is carried: the memberships are complete, whatever the
+    // description can name.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        manifest["capabilities"]
+            .as_object()
+            .unwrap()
+            .contains_key("graphs"),
+        "{manifest}"
+    );
+
+    // Described: the graph with an IRI, and neither of the two subsets that
+    // cannot be told apart — the unnamed graph's and the blank one's.
+    assert_eq!(
+        views_of(&out, "stats/schema-nodes.tsv"),
+        ["design", "queryable", "graph:http://example.org/g1"]
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("stats/summary.json")).unwrap()).unwrap();
+    let graphs: Vec<String> = summary["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["graph"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(graphs, ["http://example.org/g1"]);
+    kgf(&["manifest", path(&out), "--check"], "").ok();
+}

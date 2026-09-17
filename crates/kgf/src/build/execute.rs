@@ -87,11 +87,12 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
     let graphs = plan.builds_graphs()?;
     let inputs = materialize(plan, &runner, &layout, graphs)?;
 
-    if graphs {
-        runner.run(&graphs_index_step(
-            &layout,
-            wants_transpose(plan, &layout.data)?,
-        ))?;
+    // Read once, from the sidecar the core step just wrote: how many graphs
+    // there are decides the transpose, and whether any is named by a blank
+    // node decides what can be described.
+    let graph_facts = graphs.then(|| sidecar_facts(&layout.data)).transpose()?;
+    if let Some(facts) = graph_facts {
+        runner.run(&graphs_index_step(&layout, wants_transpose(plan, facts)))?;
         // Before the expensive sidecars, not after: a sidecar this server
         // cannot read is worth hearing about now rather than once the text
         // index, the sketches, the key sets and the description set have been
@@ -128,7 +129,7 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
             prefix_tables: &plan.config.semantics.prefix_tables,
             card,
             work: work.path(),
-            graphs,
+            graphs: graph_facts,
         },
         &staged_stats,
     )?;
@@ -263,14 +264,24 @@ fn graphs_index_step(layout: &Layout, transpose: bool) -> Step {
 /// Stated by the config, or read from the sidecar this build just wrote: the
 /// number of graphs is a field of its header, and it is what the choice turns
 /// on.
-fn wants_transpose(plan: &BundlePlan, data: &Path) -> Result<bool> {
-    if let Some(transpose) = plan.config.contents.graphs.transpose {
-        return Ok(transpose);
-    }
+fn wants_transpose(plan: &BundlePlan, facts: stats::GraphFacts) -> bool {
+    plan.config
+        .contents
+        .graphs
+        .transpose
+        .unwrap_or(facts.named_graphs > GRAPH_TRANSPOSE_THRESHOLD)
+}
+
+/// What the sidecar this build just wrote says about its graphs.
+fn sidecar_facts(data: &Path) -> Result<stats::GraphFacts> {
     let sidecar = hdtc::format::graph_sidecar_path(data);
     let directory = hdtc::format::GraphSidecarDirectory::read(&sidecar, data)
         .with_context(|| format!("reading the graph sidecar {}", sidecar.display()))?;
-    Ok(directory.header().named_graphs > GRAPH_TRANSPOSE_THRESHOLD)
+    let header = directory.header();
+    Ok(stats::GraphFacts {
+        named_graphs: header.named_graphs,
+        blank_names: header.has_blank_graph_names(),
+    })
 }
 
 /// The sidecar steps, in the order they run.

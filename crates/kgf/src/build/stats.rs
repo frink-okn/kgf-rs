@@ -86,9 +86,22 @@ pub(crate) struct Inputs<'a> {
     pub(crate) card: DatasetCard<'a>,
     /// Scratch directory for intermediates that are not published.
     pub(crate) work: &'a Path,
-    /// Whether the bundle carries graph memberships, and so is described one
-    /// graph at a time as well as whole.
-    pub(crate) graphs: bool,
+    /// What this bundle's graphs are, when it carries memberships at all. A
+    /// bundle with them is described one graph at a time as well as whole.
+    pub(crate) graphs: Option<GraphFacts>,
+}
+
+/// What the sidecar says about a bundle's graphs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GraphFacts {
+    /// Named graphs in the sidecar's dictionary.
+    pub(crate) named_graphs: u64,
+    /// At least one graph's stored name is a blank node.
+    ///
+    /// Such a graph has no IRI to name a description view after, and the
+    /// analysis describes it as a bare `void:subset` with nothing to say which
+    /// graph it is — indistinguishable from the unnamed graph's own subset.
+    pub(crate) blank_names: bool,
 }
 
 /// What a description build produced, beyond the files themselves.
@@ -135,7 +148,7 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
         OsString::from("--partition-distinct-counts"),
         OsString::from("dataset-properties"),
     ];
-    if graphs {
+    if graphs.is_some() {
         // A bundle with memberships is described one graph at a time as well
         // as whole: the analysis adds one `void:subset` per graph, and the
         // projection below turns each into a view of its own. It reads the
@@ -184,7 +197,11 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
     // of description.
     let mut per_graph = Vec::new();
     let mut graph_cards = Vec::new();
-    for (name, node) in graph_subsets(&graph, &root)? {
+    let subsets = match graphs {
+        Some(facts) => graph_subsets(&graph, &root, facts)?,
+        None => Vec::new(),
+    };
+    for (name, node) in subsets {
         let projections = graph
             .project(&node, &subject_ids)
             .with_context(|| format!("projecting the description of graph {name}"))?;
@@ -774,6 +791,7 @@ impl VoidGraph {
 fn graph_subsets(
     graph: &VoidGraph,
     root: &NamedOrBlankNode,
+    facts: GraphFacts,
 ) -> Result<Vec<(String, NamedOrBlankNode)>> {
     let mut named = Vec::new();
     for entry in graph.children(root, SD_NAMED_GRAPH)? {
@@ -789,17 +807,33 @@ fn graph_subsets(
     }
     named.sort_by(|left, right| left.0.cmp(&right.0));
 
+    let unclaimed: Vec<_> = graph
+        .children(root, VOID_SUBSET)?
+        .into_iter()
+        .filter(|subset| named.iter().all(|(_, node)| node != subset))
+        .collect();
+
+    // A graph whose stored name is a blank node has no IRI to name a view
+    // after, and the analysis gives it a bare subset with no service
+    // description to say which graph it is. Where one exists, the unnamed
+    // graph's subset cannot be told from it, so neither is described rather
+    // than one of them being described under the other's name. The graphs with
+    // IRIs for names are unaffected, and every graph is still listed by
+    // `/graphs` and reachable by `g=`.
     let mut subsets = Vec::new();
-    for subset in graph.children(root, VOID_SUBSET)? {
-        if named.iter().all(|(_, node)| node != &subset) {
-            subsets.push((kgf_store::UNNAMED_GRAPH_IRI.to_owned(), subset));
-        }
+    if !facts.blank_names {
+        ensure!(
+            unclaimed.len() <= 1,
+            "the dataset has {} subsets no named graph claims, expected at most the \
+             unnamed graph",
+            unclaimed.len()
+        );
+        subsets.extend(
+            unclaimed
+                .into_iter()
+                .map(|subset| (kgf_store::UNNAMED_GRAPH_IRI.to_owned(), subset)),
+        );
     }
-    ensure!(
-        subsets.len() <= 1,
-        "the dataset has {} subsets no named graph claims, expected at most the unnamed graph",
-        subsets.len()
-    );
     subsets.extend(named);
     Ok(subsets)
 }

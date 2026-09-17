@@ -65,7 +65,7 @@ promise to a client rather than an internal choice:
   layer id. A request may send that IRI back, and the layer id in it is checked
   against the sidecar rather than trusted: an id out of range, or one whose layer
   carries an ordinary IRI, names no graph. `_:label` itself addresses nothing, here
-  as in every other position.
+  as in every other position. Such a graph has no *description* view: see below.
 - **The RDF representations of `/fragment` follow the serving table below**, not just
   `/tpf`'s: a scope tags every statement with the graph it named, the quad view tags
   per row, and a single-graph syntax refuses the quad view with 406.
@@ -166,6 +166,16 @@ components are on: both name a subset of the published triples, and the analysis
 already expresses both as `void:subset`. The counts are each graph's own, so they sum
 to more than the dataset's whenever a triple is in two graphs — which is the point of
 publishing them separately.
+
+**Not every graph gets one.** A graph whose stored name is a blank node has no IRI to
+name a view after, and the analysis gives it a bare subset with no service description
+saying which graph it is — which makes it indistinguishable from the unnamed graph's
+own subset. Where such a graph exists, neither of those two is described, rather than
+one being described under the other's name; the graphs with IRIs for names are
+unaffected. So `/graphs` can list more graphs than the summary describes, and
+`/schema?view=graph:<IRI>` answers 404 for one of them. Every graph is still complete
+in the memberships and reachable by `g=`. Linking a blank-named graph in the dataset
+view would close this, and that is a question for `../hdtc`.
 
 ## Store operations this needs
 

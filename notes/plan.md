@@ -3217,6 +3217,14 @@ following the code.
     HDT has been built. hdtc knows a quad's graph as it reads it and could refuse there,
     in seconds rather than hours — but the names are KGF's, not hdtc's, so this is a
     question about where the federation's reserved vocabulary lives rather than a patch.
+79. **hdtc's dataset VoID view cannot say which subset is a blank-named graph.**
+    `--graph-view dataset` links a graph with an IRI for a name through
+    `sd:namedGraph`/`sd:name`, and emits a graph named by a blank node as a bare
+    `void:subset` with no link at all — which is exactly the shape the unnamed graph's
+    own subset has. A consumer cannot tell the two apart, so `kgf build` describes
+    neither rather than describing one under the other's name, and a bundle can list
+    more graphs through `/graphs` than its summary describes. A `sd:namedGraph` whose
+    `sd:name` is the blank node, or any other discriminator, would close it.
 
 ## Not in this plan
 
