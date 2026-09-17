@@ -2848,6 +2848,18 @@ struct SummaryCard {
     top_properties: Vec<SummaryProperty>,
     #[serde(default)]
     leading_class_relations: Vec<SummaryRelation>,
+    /// Every graph the dataset holds, on a bundle that carries memberships.
+    #[serde(default)]
+    graphs: Vec<SummaryGraph>,
+}
+
+/// One graph of the dataset, with the counts it publishes for itself.
+#[derive(Debug, Deserialize)]
+struct SummaryGraph {
+    graph: String,
+    counts: SummaryCounts,
+    #[serde(default)]
+    links: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2956,6 +2968,33 @@ impl SummaryResource {
                 ]
             })
             .collect();
+        // A graph's name links to its triples rather than to its schema: the
+        // question a reader has about a named graph is what is in it, and the
+        // schema view is one click along from there.
+        let graph_cells: Vec<_> = card
+            .graphs
+            .iter()
+            .map(|entry| {
+                summary_iri_cell(
+                    &self.target,
+                    &entry.graph,
+                    entry.links.get("fragment").cloned(),
+                )
+            })
+            .collect();
+        let graph_rows: Vec<_> = card
+            .graphs
+            .iter()
+            .zip(&graph_cells)
+            .map(|(entry, cell)| {
+                vec![
+                    cell.value(),
+                    Value::Number(entry.counts.triples),
+                    Value::Number(entry.counts.subjects),
+                    Value::Number(entry.counts.objects),
+                ]
+            })
+            .collect();
         let title = card.dataset.title.as_deref().unwrap_or(&card.dataset.id);
         operation_page(
             &self.target.mount,
@@ -2991,6 +3030,21 @@ impl SummaryResource {
                         h2 { "Top properties" }
                         (note("Observed predicates ranked by triple count in the designed-schema view."))
                         (table(&["Property", "Triples"], &property_rows))
+                    }
+                }
+                @if !graph_rows.is_empty() {
+                    section."section-block" {
+                        h2 { "Named graphs" }
+                        (note(
+                            "Every graph this dataset holds, with the counts it \
+                             publishes for itself: a triple in two graphs is counted \
+                             by both, so these sum to more than the dataset's. Each \
+                             name links to that graph's triples."
+                        ))
+                        (results_table(
+                            &["graph", "triples", "subjects", "objects"],
+                            &graph_rows,
+                        ))
                     }
                 }
                 section."section-block" {

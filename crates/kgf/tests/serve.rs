@@ -3902,6 +3902,16 @@ fn a_built_quad_bundle_describes_each_of_its_graphs() {
         }
     }
 
+    // The browser page shows them too, with the way into each graph's triples.
+    let page = server.request("GET", "/quads/v/v1/summary", &[("Accept", "text/html")]);
+    page.assert_status(200);
+    let page = String::from_utf8(page.body.to_vec()).unwrap();
+    assert!(page.contains("Named graphs"), "{page}");
+    assert!(
+        page.contains("g=%3Chttp%3A%2F%2Fexample.org%2Fg1%3E"),
+        "{page}"
+    );
+
     // A graph this bundle does not hold is a 404 that says where to look, and
     // a view name of no known kind is refused before anything opens.
     let missing = server.get("/quads/v/v1/schema?view=graph%3Ahttp%3A%2F%2Fexample.org%2Fnope");
