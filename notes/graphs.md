@@ -49,7 +49,7 @@ row has a `g`; layer-0 rows carry `urn:x-kgf:unnamed`, and `urn:x-kgf:union` nev
 appears as a value. `GET /graphs` lists every named graph with its count, and the
 unnamed graph under its constant when layer 0 is non-empty. Cursors carry the scope.
 
-Four decisions the implementation had to make, recorded here because each is a
+Five decisions the implementation had to make, recorded here because each is a
 promise to a client rather than an internal choice:
 
 - **`g` beside `o.text` is refused**, 400 rather than 501. A ranked text page is
