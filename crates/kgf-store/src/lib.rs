@@ -54,6 +54,7 @@ pub mod manifest;
 pub mod pattern;
 pub mod perm;
 pub mod rank;
+pub mod scope;
 pub mod store;
 
 // Golden-bundle fixtures. Behind a feature rather than `cfg(test)` because
@@ -76,6 +77,7 @@ pub use error::{Error, Result};
 pub use graphs::{GraphFacts, GraphId, Graphs, UNION_GRAPH_IRI, UNNAMED_GRAPH_IRI};
 pub use manifest::{BundleFacts, Capability, Manifest, ManifestDocument};
 pub use map::{PublishedBundle, PublishedRoot};
+pub use scope::{QuadRow, QuadSelection, ScopedSelection};
 pub use store::{OpenOptions, Store};
 
 /// A term identifier in one of HDT's role-scoped id spaces.

@@ -145,7 +145,51 @@ impl<'a> Selection<'a> {
     /// beginning. The latter is deliberately route-independent, so a later page
     /// may choose either endpoint without changing cursor semantics.
     pub fn page(&self, from: u64, limit: usize) -> impl Iterator<Item = IdTriple> + '_ {
+        self.positions(from, limit).map(|found| found.triple)
+    }
+
+    /// [`page`](Self::page), with each triple's level-3 position in the
+    /// permutation this selection reads.
+    pub(crate) fn positions(
+        &self,
+        from: u64,
+        limit: usize,
+    ) -> impl Iterator<Item = Positioned> + '_ {
         SelectionPage::new(&self.plan, from, limit)
+    }
+
+    /// The level-3 range of a contiguous selection, or `None` for `s ? o`.
+    ///
+    /// Positions in it are exactly what a graph layer keyed to this
+    /// selection's permutation counts, so a scoped cardinality is a rank
+    /// difference over it.
+    pub(crate) fn contiguous_range(&self) -> Option<Range<u64>> {
+        match &self.plan {
+            SelectionPlan::Contiguous(plan) => Some(plan.z_range.clone()),
+            SelectionPlan::SubjectObject(_) => None,
+        }
+    }
+
+    /// The triple at a level-3 position of a contiguous selection's range.
+    ///
+    /// # Panics
+    ///
+    /// Panics for `s ? o`, which has no contiguous range, and for a position
+    /// outside the range.
+    pub(crate) fn at_position(&self, position: u64) -> IdTriple {
+        match &self.plan {
+            SelectionPlan::Contiguous(plan) => {
+                assert!(
+                    plan.z_range.contains(&position),
+                    "position {position} outside the selection's range {:?}",
+                    plan.z_range
+                );
+                materialize(plan.permutation, plan.triples, position)
+            }
+            SelectionPlan::SubjectObject(_) => {
+                panic!("an `s ? o` selection has no contiguous positions")
+            }
+        }
     }
 
     /// The `i`-th triple, for `/sample`.
@@ -170,9 +214,9 @@ impl<'a> Selection<'a> {
             SelectionPlan::SubjectObject(plan) => {
                 let mut seen = 0;
                 for y_position in plan.y_range.clone() {
-                    if let Some(triple) = subject_object_hit(plan, y_position) {
+                    if let Some(hit) = subject_object_hit(plan, y_position) {
                         if seen == i {
-                            return triple;
+                            return hit.triple;
                         }
                         seen += 1;
                     }
@@ -372,18 +416,36 @@ fn subject_object_count(plan: &SubjectObjectPlan<'_>) -> u64 {
     })
 }
 
-fn subject_object_hit(plan: &SubjectObjectPlan<'_>, y_position: u64) -> Option<IdTriple> {
+/// Probe one predicate group of the `s ? o` plan for the other endpoint.
+///
+/// The hit carries the level-3 position it was found at, in the route's own
+/// permutation, because graph scoping tests membership by position: a triple
+/// found through OPS is a member of a graph's OPS layer at exactly this
+/// position.
+fn subject_object_hit(plan: &SubjectObjectPlan<'_>, y_position: u64) -> Option<Positioned> {
     let predicate = plan.triples.level2_at(y_position);
     let target = match plan.route {
         SubjectObjectRoute::ViaSubject => plan.object,
         SubjectObjectRoute::ViaObject => plan.subject,
     };
     let z_range = plan.triples.level3_range(y_position);
-    contains_level3(plan.triples, z_range, target, plan.probe).then_some(IdTriple {
-        subject: plan.subject,
-        predicate,
-        object: plan.object,
+    locate_level3(plan.triples, z_range, target, plan.probe).map(|position| Positioned {
+        triple: IdTriple {
+            subject: plan.subject,
+            predicate,
+            object: plan.object,
+        },
+        position,
     })
+}
+
+/// A triple with the level-3 position it occupies in the permutation the
+/// selection reads — the position a graph layer keyed to that permutation
+/// tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Positioned {
+    pub(crate) triple: IdTriple,
+    pub(crate) position: u64,
 }
 
 // Two conventional 4 KiB pages. This is a performance choice inside the same
@@ -399,15 +461,15 @@ fn subject_object_probe(endpoint_degree: u64, width: u8) -> SubjectObjectProbe {
     }
 }
 
-fn contains_level3(
+fn locate_level3(
     triples: BitmapTriples<'_>,
     mut range: Range<u64>,
     target: u64,
     probe: SubjectObjectProbe,
-) -> bool {
+) -> Option<u64> {
     match probe {
-        SubjectObjectProbe::Linear => range.any(|position| triples.level3_at(position) == target),
-        SubjectObjectProbe::Binary => triples.find_level3(range, target).is_some(),
+        SubjectObjectProbe::Linear => range.find(|position| triples.level3_at(*position) == target),
+        SubjectObjectProbe::Binary => triples.find_level3(range, target),
     }
 }
 
@@ -462,7 +524,7 @@ impl<'a> SelectionPage<'a> {
 }
 
 impl Iterator for SelectionPage<'_> {
-    type Item = IdTriple;
+    type Item = Positioned;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {
@@ -473,18 +535,19 @@ impl Iterator for SelectionPage<'_> {
                 if *next_z == plan.z_range.end {
                     return None;
                 }
-                let triple = materialize(plan.permutation, plan.triples, *next_z);
+                let position = *next_z;
+                let triple = materialize(plan.permutation, plan.triples, position);
                 *next_z += 1;
                 self.remaining -= 1;
-                Some(triple)
+                Some(Positioned { triple, position })
             }
             PageState::SubjectObject { plan, next_y } => {
                 while *next_y < plan.y_range.end {
                     let y_position = *next_y;
                     *next_y += 1;
-                    if let Some(triple) = subject_object_hit(plan, y_position) {
+                    if let Some(hit) = subject_object_hit(plan, y_position) {
                         self.remaining -= 1;
-                        return Some(triple);
+                        return Some(hit);
                     }
                 }
                 None
