@@ -9,6 +9,7 @@
 use std::fmt::Write as _;
 
 use kgf_store::dict::{DictCounts, Section, SectionTermId};
+use kgf_store::graphs::GraphId;
 use kgf_store::{Role, TermId};
 
 const FDC_PREFIX: &str = "urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:";
@@ -52,6 +53,30 @@ impl SkolemScope {
             self.iri_prefix,
             section_id.local_id()
         ))
+    }
+
+    /// Replace a graph named by a blank node with its stable RDF IRI.
+    ///
+    /// The membership sidecar stores such a name as `_:label`, which means
+    /// nothing outside the document it was parsed from, exactly as a data
+    /// blank node does. Graphs have their own section, `g`, keyed by layer
+    /// id: a graph's id space is the sidecar's, not the dictionary's.
+    pub(crate) fn graph_iri(&self, graph: GraphId, stored_name: &str) -> Option<String> {
+        stored_name.strip_prefix("_:")?;
+        Some(format!("{}g-{}", self.iri_prefix, graph.0))
+    }
+
+    /// Recover the layer named by one of this HDT's blank-graph URNs.
+    ///
+    /// The caller still verifies that the id names a layer of this bundle
+    /// and that the layer's stored name is a blank node.
+    pub(crate) fn graph_id(&self, term: &str) -> Option<GraphId> {
+        let local = term.strip_prefix(&self.iri_prefix)?;
+        let id = local.strip_prefix("g-")?;
+        if id.starts_with('0') || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        id.parse().ok().map(GraphId)
     }
 
     /// Recover the role-scoped id named by one of this HDT's blank-node URNs.
@@ -126,6 +151,19 @@ mod tests {
         assert_eq!(scope.role_id(Role::Object, &shared), Some(TermId(7)));
         assert_eq!(scope.role_id(Role::Subject, &subject), Some(TermId(12)));
         assert_eq!(scope.role_id(Role::Object, &object), Some(TermId(13)));
+    }
+
+    #[test]
+    fn a_blank_graph_name_is_scoped_by_layer_and_reversed_only_from_the_same_hdt() {
+        let first = SkolemScope::new([1; 32], counts());
+        let second = SkolemScope::new([2; 32], counts());
+        let iri = first.graph_iri(GraphId(3), "_:g").unwrap();
+        assert!(iri.ends_with(":g-3"), "{iri}");
+        assert_eq!(first.graph_id(&iri), Some(GraphId(3)));
+        assert_eq!(second.graph_id(&iri), None);
+        assert_eq!(first.graph_iri(GraphId(3), "http://example.org/g"), None);
+        assert_eq!(first.graph_id(&format!("{}g-03", first.iri_prefix)), None);
+        assert_eq!(first.graph_id(&format!("{}s-3", first.iri_prefix)), None);
     }
 
     #[test]

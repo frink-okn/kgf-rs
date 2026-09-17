@@ -203,10 +203,20 @@ impl PositionSpace {
     /// a selection per matching literal, so the space is a property of the
     /// *operation* rather than of anything this function can see.
     pub fn of(selection: &Selection<'_>) -> Self {
-        if selection.subject_object_route().is_some() {
+        Self::of_parts(
+            selection.permutation(),
+            selection.subject_object_route().is_some(),
+        )
+    }
+
+    /// The space of a selection's positions, from the two facts that decide
+    /// it — for the graph-scoped and quad-view forms of a selection, which
+    /// keep its permutation and its route and therefore its space.
+    pub fn of_parts(permutation: Permutation, subject_object: bool) -> Self {
+        if subject_object {
             return Self::Predicate;
         }
-        match selection.permutation() {
+        match permutation {
             Permutation::Spo => Self::Spo,
             Permutation::Pos => Self::Pos,
             Permutation::Ops => Self::Ops,
@@ -558,9 +568,14 @@ impl Cursor {
             return Err(StaleCursor);
         }
 
-        // Optional trailers are not independent state. Each current position
-        // space has one exact shape; accepting another lets an edited token
-        // silently restart a ranked hit or reinterpret a scan accumulator.
+        // Optional trailers are not independent state. Each position space
+        // has the shapes its operations issue and no other; accepting another
+        // lets an edited token silently restart a ranked hit or reinterpret a
+        // scan accumulator. The four permutation spaces take the run trailer
+        // in the quad view only, where it counts a triple's memberships
+        // already delivered; whether the request *is* a quad view is fixed by
+        // the request hash, and the operation checks the trailer's presence
+        // against that.
         let shape_is_valid = match space {
             PositionSpace::TextRank | PositionSpace::TextScan => {
                 binding_index.is_none() && scan_position.is_some()
@@ -572,7 +587,7 @@ impl Cursor {
             PositionSpace::Spo
             | PositionSpace::Pos
             | PositionSpace::Ops
-            | PositionSpace::Predicate => scan_position.is_none(),
+            | PositionSpace::Predicate => true,
         };
         if !shape_is_valid {
             return Err(StaleCursor);
@@ -674,8 +689,14 @@ mod tests {
         }
 
         // A trailer is part of its position space's shape, not an optional
-        // field an edited token may add or remove.
-        let mut unexpected = sample();
+        // field an edited token may add or remove. The permutation spaces
+        // take the run trailer — the quad view's memberships already
+        // delivered — and the operation checks its presence against the
+        // request; the other spaces without one refuse it outright.
+        let mut run = sample();
+        run.scan_position = Some(7);
+        assert_eq!(Cursor::decode(run.encode().as_str(), &binding()), Ok(run));
+        let mut unexpected = Cursor::at_schema_child(&binding(), 99);
         unexpected.scan_position = Some(7);
         assert_eq!(
             Cursor::decode(unexpected.encode().as_str(), &binding()),

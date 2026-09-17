@@ -415,6 +415,10 @@ pub enum RequestShape {
         pattern: String,
         /// Whether `o.text` constrains the object.
         text: bool,
+        /// The graph scope's kind — `unnamed`, `named`, or `all` — and absent
+        /// for the union, which is what a request without `g` reads.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        graph: Option<&'static str>,
         /// Requested page size; `null` for `/count`.
         limit: Option<u32>,
     },
@@ -424,6 +428,9 @@ pub enum RequestShape {
         pattern: String,
         /// Bindings requests do not carry `o.text`.
         text: bool,
+        /// The graph scope's kind, as for a pattern request.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        graph: Option<&'static str>,
         /// Requested page size; `null` for bindings count.
         limit: Option<u32>,
         /// Submitted binding rows.

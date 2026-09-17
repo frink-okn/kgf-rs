@@ -78,9 +78,12 @@ use crate::request::{
     ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter, role_name,
     term_role_name,
 };
+use crate::request::{GraphScope, GraphSelector};
 use crate::skolem::SkolemScope;
 use crate::term::{DictionaryTermError, LiteralKind, PrefixMap, Term, TermCache, serialized_bytes};
 use crate::url::{self, Mount, Params};
+use kgf_store::graphs::{GraphId, Graphs};
+use kgf_store::scope::{QuadSelection, ScopedSelection};
 
 // ---------------------------------------------------------------------------
 // Where a response came from
@@ -103,7 +106,7 @@ pub struct Target {
     /// against it, from the same place the prefix map is read.
     mount: Mount,
     body: bool,
-    has_search: bool,
+    offers: Offers,
     /// Logical dataset identity and the description link this release can
     /// actually answer, from the immutable manifest.
     dataset: Option<DatasetMetadata>,
@@ -119,6 +122,17 @@ struct DatasetMetadata {
     void_available: bool,
 }
 
+/// The optional capabilities a release declares that a page's controls are
+/// shaped by: whether to offer a text constraint, and whether to offer a
+/// graph scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Offers {
+    /// The release declares `search`, so `o.text` is a control.
+    pub search: bool,
+    /// The release declares `graphs`, so `g` is a control.
+    pub graphs: bool,
+}
+
 impl Target {
     /// The version and operation a request addressed, with its parameters, the
     /// version's immutable prefix map for human-facing result labels, and the
@@ -130,7 +144,15 @@ impl Target {
         prefixes: PrefixMap,
         mount: Mount,
     ) -> Self {
-        Self::get(id, operation, params, prefixes, mount, false, None)
+        Self::get(
+            id,
+            operation,
+            params,
+            prefixes,
+            mount,
+            Offers::default(),
+            None,
+        )
     }
 
     /// A GET target with the release capabilities its page may expose.
@@ -140,7 +162,7 @@ impl Target {
         params: Params,
         prefixes: PrefixMap,
         mount: Mount,
-        has_search: bool,
+        offers: Offers,
         request_url: Option<String>,
     ) -> Self {
         Self {
@@ -150,7 +172,7 @@ impl Target {
             prefixes,
             mount,
             body: false,
-            has_search,
+            offers,
             request_url,
             dataset: None,
         }
@@ -185,7 +207,7 @@ impl Target {
             prefixes,
             mount,
             body: true,
-            has_search: false,
+            offers: Offers::default(),
             request_url: None,
             dataset: None,
         }
@@ -358,7 +380,7 @@ impl Target {
                 &self.id.version,
                 self.operation.path_segment(),
                 &self.params,
-                self.has_search,
+                self.offers,
             )
         }
     }
@@ -586,11 +608,16 @@ impl PublishedTerms {
 #[derive(Debug, Clone)]
 pub struct Row {
     cells: Vec<(Position, RowTerm)>,
+    /// The graph this membership belongs to, in the quad view.
+    graph: Option<Rc<str>>,
     binding: Option<u32>,
     direction: Option<Direction>,
     ranking: Option<Ranking>,
     serialized: u64,
 }
+
+/// The key under which a quad-view row reports its graph.
+const GRAPH: &str = "g";
 
 /// What a text-ranked row says about how it matched.
 ///
@@ -612,6 +639,9 @@ impl Serialize for Row {
         }
         for (position, term) in &self.cells {
             map.serialize_entry(position.as_str(), &Term::from_dictionary(&term.published))?;
+        }
+        if let Some(graph) = &self.graph {
+            map.serialize_entry(GRAPH, &Term::from_dictionary(graph))?;
         }
         if let Some(direction) = self.direction {
             map.serialize_entry(DIRECTION, &direction)?;
@@ -642,6 +672,7 @@ impl Row {
     fn new(
         cells: Vec<(Position, RowTerm)>,
         terms: u64,
+        graph: Option<(Rc<str>, u64)>,
         binding: Option<u32>,
         direction: Option<Direction>,
         ranking: Option<Ranking>,
@@ -655,6 +686,11 @@ impl Row {
         for (position, _) in &cells {
             serialized += quoted_key(position.as_str());
         }
+        let graph = graph.map(|(graph, measured)| {
+            entries += 1;
+            serialized += quoted_key(GRAPH) + measured;
+            graph
+        });
         if let Some(direction) = direction {
             entries += 1;
             serialized += quoted_key(DIRECTION) + direction.as_str().len() as u64 + 2;
@@ -671,6 +707,7 @@ impl Row {
         }
         Self {
             cells,
+            graph,
             binding,
             direction,
             ranking,
@@ -735,9 +772,13 @@ fn serialized_score(score: f32) -> u64 {
 enum Echo {
     Fragment {
         pattern: Pattern,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        g: Option<String>,
     },
     BindingsFragment {
         pattern: BindingPattern,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        g: Option<String>,
     },
     Describe {
         resource: String,
@@ -748,6 +789,54 @@ enum Echo {
         n: u32,
         seed: u64,
     },
+}
+
+/// The keys a page's rows carry: the unbound positions, and `g` in the quad
+/// view.
+///
+/// `g` is a column rather than a position because it is not a term of the
+/// triple: a row's graph comes from the membership sidecar, and the same
+/// triple recurs once per graph it is in.
+#[derive(Debug, Clone)]
+pub struct Vars {
+    positions: Vec<Position>,
+    graph: bool,
+}
+
+impl Vars {
+    fn new(positions: Vec<Position>, graph: bool) -> Self {
+        Self { positions, graph }
+    }
+
+    /// The triple positions rows report.
+    fn positions(&self) -> &[Position] {
+        &self.positions
+    }
+
+    /// Whether rows report `g`.
+    fn has_graph(&self) -> bool {
+        self.graph
+    }
+
+    /// Whether a row has nothing to report: every position bound, and no
+    /// graph column.
+    fn is_empty(&self) -> bool {
+        self.positions.is_empty() && !self.graph
+    }
+
+    /// Every key, in row order.
+    fn keys(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.positions
+            .iter()
+            .map(|position| position.as_str())
+            .chain(self.graph.then_some(GRAPH))
+    }
+}
+
+impl Serialize for Vars {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.keys())
+    }
 }
 
 /// A page of rows in the envelope shared by `/fragment`,
@@ -769,7 +858,7 @@ pub struct Answer {
     /// reported here if absent.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     absent_terms: Vec<AbsentTerm>,
-    vars: Vec<Position>,
+    vars: Vars,
     rows: Vec<Row>,
     #[serde(skip)]
     row_resumes: Vec<RowResume>,
@@ -843,7 +932,7 @@ impl Renders for Answer {
         let mut wanted: Vec<&str> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
         let named = |text: &str| !text.starts_with('"');
-        if let Echo::Fragment { pattern } | Echo::Sample { pattern, .. } = &self.echo {
+        if let Echo::Fragment { pattern, .. } | Echo::Sample { pattern, .. } = &self.echo {
             for position in Position::ALL {
                 if let Some(bound) = pattern.bound(position) {
                     let text = bound.dictionary();
@@ -1118,8 +1207,8 @@ impl Answer {
         for row in self.rows.iter().take(keep) {
             let cell = |position| {
                 let bound = match &self.echo {
-                    Echo::Fragment { pattern } => pattern.bound(position),
-                    Echo::BindingsFragment { pattern } => pattern.bound(position),
+                    Echo::Fragment { pattern, .. } => pattern.bound(position),
+                    Echo::BindingsFragment { pattern, .. } => pattern.bound(position),
                     Echo::Describe { .. } | Echo::Sample { .. } => None,
                 };
                 rdf_fragment_cell(bound, row, position)
@@ -1461,6 +1550,8 @@ pub struct CountAnswer {
     dataset: String,
     version: String,
     pattern: Pattern,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    g: Option<String>,
     count: Cardinality,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     absent_terms: Vec<AbsentTerm>,
@@ -1495,6 +1586,8 @@ pub struct BindingCountAnswer {
     dataset: String,
     version: String,
     pattern: BindingPattern,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    g: Option<String>,
     counts: Vec<PerBindingCount>,
     #[serde(flatten)]
     completeness: Completeness,
@@ -3769,8 +3862,9 @@ pub fn fragment(
     let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
     let echo = Echo::Fragment {
         pattern: request.pattern.clone(),
+        g: request.graph.requested().map(str::to_owned),
     };
-    let vars = request.pattern.vars();
+    let vars = Vars::new(request.pattern.vars(), request.graph.is_quad_view());
 
     let paging = Paging {
         cursor: request.cursor.as_ref(),
@@ -3792,7 +3886,7 @@ pub fn fragment(
         request.pattern.text(),
     ) {
         (Resolved::Absent(absent), _) => paged(
-            &dictionary,
+            store,
             target,
             Envelope {
                 absent_terms: absent,
@@ -3801,13 +3895,27 @@ pub fn fragment(
             Vec::new(),
             paging,
         ),
-        (Resolved::Ids(ids), None) => paged(
-            &dictionary,
-            target,
-            envelope,
-            vec![phase(select(store, ids)?, None)],
-            paging,
-        ),
+        (Resolved::Ids(ids), None) => {
+            match scoped(store, &target, &envelope.blank_nodes, ids, &request.graph)? {
+                Ok(enumeration) => paged(
+                    store,
+                    target,
+                    envelope,
+                    vec![phase(enumeration, None)?],
+                    paging,
+                ),
+                Err(absent) => paged(
+                    store,
+                    target,
+                    Envelope {
+                        absent_terms: vec![absent],
+                        ..envelope
+                    },
+                    Vec::new(),
+                    paging,
+                ),
+            }
+        }
         (Resolved::Ids(ids), Some(filter)) => {
             let searcher = searcher(store, &target)?;
             let found = ranked(
@@ -3819,7 +3927,7 @@ pub fn fragment(
                 paging.want(),
                 request.candidates,
             )?;
-            ranked_page(&dictionary, target, envelope, found, paging)
+            ranked_page(store, target, envelope, found, paging)
         }
     }
 }
@@ -3864,12 +3972,23 @@ pub fn count(
     ) {
         // Exact and free of the enumeration: a range width after bounded
         // descent for seven shapes, and for `s ? o` the same bounded
-        // predicate-group probe the enumeration would run.
-        (Resolved::Ids(ids), None) => (
-            Cardinality::exact(select(store, ids)?.count().value),
-            Completeness::complete(),
-            Vec::new(),
-        ),
+        // predicate-group probe the enumeration would run. Scoped to a
+        // graph, two ranks over its layer; in the quad view, the memberships
+        // of the range.
+        (Resolved::Ids(ids), None) => {
+            match scoped(store, &target, &blank_nodes, ids, &request.graph)? {
+                Ok(enumeration) => (
+                    Cardinality::exact(enumeration.count()?),
+                    Completeness::complete(),
+                    Vec::new(),
+                ),
+                Err(absent) => (
+                    Cardinality::exact(0),
+                    Completeness::complete(),
+                    vec![absent],
+                ),
+            }
+        }
         (Resolved::Absent(_), Some(_)) if request.cursor.is_some() => {
             return Err(Problem::from(StaleCursor));
         }
@@ -3891,6 +4010,7 @@ pub fn count(
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
         pattern: request.pattern.clone(),
+        g: request.graph.requested().map(str::to_owned),
         count,
         absent_terms,
         completeness,
@@ -3920,20 +4040,33 @@ pub fn binding_fragment(
 
     let mut phases = Vec::with_capacity(restrictions.len());
     let mut restriction_counts = Vec::with_capacity(restrictions.len());
+    let mut absent_graph = None;
     for (row_index, ids) in restrictions.iter().copied() {
-        let selection = select(store, ids)?;
-        restriction_counts.push((ids, selection.count().value));
-        phases.push(binding_phase(selection, row_index));
+        match scoped(store, &target, &blank_nodes, ids, &request.graph)? {
+            Ok(enumeration) => {
+                let phase = binding_phase(enumeration, row_index)?;
+                restriction_counts.push((ids, phase.count));
+                phases.push(phase);
+            }
+            // A graph this bundle does not hold empties every row at once.
+            Err(absent) => {
+                absent_graph = Some(absent);
+                phases.clear();
+                restriction_counts.clear();
+                break;
+            }
+        }
     }
 
     let envelope = Envelope {
         echo: Echo::BindingsFragment {
             pattern: request.pattern.clone(),
+            g: request.graph.requested().map(str::to_owned),
         },
-        vars: request.pattern.vars(),
+        vars: Vars::new(request.pattern.vars(), request.graph.is_quad_view()),
         directed: false,
         bindings: true,
-        absent_terms: Vec::new(),
+        absent_terms: absent_graph.into_iter().collect(),
         blank_nodes,
     };
     let paging = Paging {
@@ -3943,13 +4076,13 @@ pub fn binding_fragment(
         binding: &request.binding,
     };
     if !request.distinct_rdf() {
-        return paged(&dictionary, target, envelope, phases, paging);
+        return paged(store, target, envelope, phases, paging);
     }
 
     let base_pattern = resolve_binding_pattern(&mut cache, &request.pattern)?;
     let rdf_cardinality = rdf_projection_cardinality(store, base_pattern, &restriction_counts)?;
     let mut answer = paged_distinct_bindings(
-        &dictionary,
+        store,
         target,
         envelope,
         phases,
@@ -3969,11 +4102,14 @@ pub fn binding_count(
 ) -> Result<BindingCountAnswer, Problem> {
     let dictionary = store.dict();
     let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
-    let mut cache = LookupCache::new(dictionary, blank_nodes);
+    let mut cache = LookupCache::new(dictionary, blank_nodes.clone());
     let mut counts = Vec::new();
     for row in request.rows() {
         let value = match resolve_binding(&mut cache, row)? {
-            Some(ids) => select(store, ids)?.count().value,
+            Some(ids) => match scoped(store, &target, &blank_nodes, ids, &request.graph)? {
+                Ok(enumeration) => enumeration.count()?,
+                Err(_) => 0,
+            },
             None => 0,
         };
         counts.push(PerBindingCount {
@@ -3985,6 +4121,7 @@ pub fn binding_count(
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
         pattern: request.pattern.clone(),
+        g: request.graph.requested().map(str::to_owned),
         counts,
         completeness: Completeness::complete(),
         target,
@@ -4620,7 +4757,10 @@ pub fn describe(
                 object: None,
             },
         )?;
-        phases.push(phase(selection, Some(Direction::Out)));
+        phases.push(phase(
+            Enumeration::Triples(selection),
+            Some(Direction::Out),
+        )?);
     }
     if request.direction.walks_in()
         && let Some(object) =
@@ -4634,7 +4774,7 @@ pub fn describe(
                 object: Some(object),
             },
         )?;
-        phases.push(phase(selection, Some(Direction::In)));
+        phases.push(phase(Enumeration::Triples(selection), Some(Direction::In))?);
     }
     // Absent in the sense that matters for *this* request: the bundle holds no
     // term that could match it in any of the roles the direction walks.
@@ -4645,7 +4785,7 @@ pub fn describe(
     };
 
     let mut answer = paged(
-        &dictionary,
+        store,
         target,
         Envelope {
             echo,
@@ -4653,7 +4793,7 @@ pub fn describe(
             // is no single bound position — and a row shape that changed with
             // `direction` would make the wrapper harder to consume than the
             // `/fragment` it wraps.
-            vars: Position::ALL.to_vec(),
+            vars: Vars::new(Position::ALL.to_vec(), false),
             directed: true,
             bindings: false,
             absent_terms,
@@ -4680,7 +4820,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         n: request.n,
         seed: request.seed,
     };
-    let vars = request.pattern.vars();
+    let vars = Vars::new(request.pattern.vars(), false);
 
     let (count, triples, absent_terms) = match resolve(&dictionary, &blank_nodes, &request.pattern)?
     {
@@ -4695,6 +4835,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         .into_iter()
         .map(|triple| Step {
             triple,
+            graph: None,
             // A sample never pages, so nothing reads these.
             space: PositionSpace::Spo,
             resume: 0,
@@ -4705,7 +4846,14 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         })
         .collect();
 
-    let (rows, spent_at) = materialize(&dictionary, &blank_nodes, &vars, &steps, request.bytes)?;
+    let (rows, spent_at) = materialize(
+        &dictionary,
+        &blank_nodes,
+        None,
+        &vars,
+        &steps,
+        request.bytes,
+    )?;
     Ok(Answer {
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
@@ -4746,31 +4894,202 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
 
 /// One enumeration a paged operation walks.
 struct Phase<'a> {
-    selection: Selection<'a>,
+    enumeration: Enumeration<'a>,
     space: PositionSpace,
+    /// The cardinality this phase contributes: triples, or memberships in the
+    /// quad view.
     count: u64,
+    /// The triples this phase enumerates, which is what a resume offset is
+    /// checked against — one triple carries several quad-view rows.
+    triples: u64,
     binding_index: Option<u32>,
     direction: Option<Direction>,
 }
 
-fn phase(selection: Selection<'_>, direction: Option<Direction>) -> Phase<'_> {
-    Phase {
-        space: PositionSpace::of(&selection),
-        count: selection.count().value,
-        selection,
-        binding_index: None,
-        direction,
+/// What a phase enumerates: the union, one graph, or every membership.
+///
+/// All three read the pattern's own permutation and share its cursor
+/// positions; the quad view adds one row per graph a triple belongs to and a
+/// second number, the memberships of the current triple already delivered,
+/// to resume inside that run.
+enum Enumeration<'a> {
+    Triples(Selection<'a>),
+    Scoped(ScopedSelection<'a>),
+    Quads(QuadSelection<'a>),
+}
+
+/// One row of an enumeration, before its resume position is assigned.
+struct EnumeratedRow {
+    triple: IdTriple,
+    /// The graph, in the quad view.
+    graph: Option<GraphId>,
+    /// The quad view's index of this row among its triple's memberships.
+    delivered: Option<u64>,
+}
+
+impl<'a> Enumeration<'a> {
+    fn space(&self) -> PositionSpace {
+        match self {
+            Self::Triples(selection) => PositionSpace::of(selection),
+            Self::Scoped(scoped) => PositionSpace::of_parts(
+                scoped.permutation(),
+                scoped.subject_object_route().is_some(),
+            ),
+            Self::Quads(quads) => {
+                PositionSpace::of_parts(quads.permutation(), quads.subject_object_route().is_some())
+            }
+        }
+    }
+
+    fn count(&self) -> Result<u64, Problem> {
+        match self {
+            Self::Triples(selection) => Ok(selection.count().value),
+            Self::Scoped(scoped) => scoped
+                .count()
+                .map_err(|error| unreadable("counting a graph's triples", &error)),
+            Self::Quads(quads) => quads
+                .count()
+                .map_err(|error| unreadable("counting memberships", &error)),
+        }
+    }
+
+    fn triples(&self) -> Result<u64, Problem> {
+        match self {
+            Self::Quads(quads) => Ok(quads.triples()),
+            _ => self.count(),
+        }
+    }
+
+    fn is_quad_view(&self) -> bool {
+        matches!(self, Self::Quads(_))
+    }
+
+    /// Rows from `from` — an offset or the last predicate id — skipping the
+    /// first `skip` memberships of the first triple in the quad view.
+    fn rows(
+        &'a self,
+        from: u64,
+        skip: u64,
+    ) -> Box<dyn Iterator<Item = Result<EnumeratedRow, Problem>> + 'a> {
+        match self {
+            Self::Triples(selection) => Box::new(selection.page(from, usize::MAX).map(|triple| {
+                Ok(EnumeratedRow {
+                    triple,
+                    graph: None,
+                    delivered: None,
+                })
+            })),
+            Self::Scoped(scoped) => Box::new(scoped.page(from, usize::MAX).map(|row| {
+                row.map(|triple| EnumeratedRow {
+                    triple,
+                    graph: None,
+                    delivered: None,
+                })
+                .map_err(|error| unreadable("enumerating a graph's triples", &error))
+            })),
+            Self::Quads(quads) => Box::new(quads.page(from, skip, usize::MAX).map(|row| {
+                row.map(|row| EnumeratedRow {
+                    triple: row.triple,
+                    graph: Some(row.graph),
+                    delivered: Some(row.delivered),
+                })
+                .map_err(|error| unreadable("enumerating memberships", &error))
+            })),
+        }
     }
 }
 
-fn binding_phase(selection: Selection<'_>, binding_index: u32) -> Phase<'_> {
-    Phase {
-        space: PositionSpace::of(&selection),
-        count: selection.count().value,
-        selection,
+fn phase(enumeration: Enumeration<'_>, direction: Option<Direction>) -> Result<Phase<'_>, Problem> {
+    Ok(Phase {
+        space: enumeration.space(),
+        count: enumeration.count()?,
+        triples: enumeration.triples()?,
+        enumeration,
+        binding_index: None,
+        direction,
+    })
+}
+
+fn binding_phase(enumeration: Enumeration<'_>, binding_index: u32) -> Result<Phase<'_>, Problem> {
+    Ok(Phase {
         binding_index: Some(binding_index),
-        direction: None,
-    }
+        ..phase(enumeration, None)?
+    })
+}
+
+/// The graph memberships, or the 501 that says this bundle has none.
+///
+/// Reached only for a scope that needs the sidecar, and only after the
+/// handler has checked the manifest declares `graphs` — the second half of one
+/// condition, as for the text index.
+fn graphs<'a>(store: &'a Store, target: &Target) -> Result<&'a Graphs, Problem> {
+    store.graphs().ok_or_else(|| {
+        tracing::error!(
+            dataset = %target.id.dataset,
+            version = %target.id.version,
+            "a bundle declaring `graphs` has no membership sidecar",
+        );
+        Problem::new(
+            ErrorCode::CapabilityNotAvailable,
+            "this bundle declares `graphs` but carries no membership sidecar",
+        )
+    })
+}
+
+/// Resolve a pattern under a graph scope.
+///
+/// `Err(absent)` is the well-formed request that names a graph this bundle
+/// does not hold — an empty answer that says which parameter, exactly as an
+/// absent term is reported.
+fn scoped<'a>(
+    store: &'a Store,
+    target: &Target,
+    blank_nodes: &SkolemScope,
+    ids: IdPattern,
+    scope: &GraphScope,
+) -> Result<Result<Enumeration<'a>, AbsentTerm>, Problem> {
+    let selection = select(store, ids)?;
+    Ok(Ok(match scope.selector() {
+        GraphSelector::Union => Enumeration::Triples(selection),
+        // Without memberships every triple is unnamed, so the unnamed graph is
+        // the union — the same rows, under the name the client used.
+        GraphSelector::Unnamed => match store.graphs() {
+            None => Enumeration::Triples(selection),
+            Some(graphs) => in_layer(selection, graphs, GraphId::UNNAMED)?,
+        },
+        GraphSelector::Named(term) => {
+            let graphs = graphs(store, target)?;
+            let found = match blank_nodes.graph_id(term.dictionary()) {
+                Some(id) => (id.0 <= graphs.facts().named_graphs).then_some(id),
+                None if term.denotes_blank_node() => None,
+                None => graphs
+                    .resolve(term.dictionary().as_bytes())
+                    .map_err(|error| unreadable("looking a graph up", &error))?,
+            };
+            match found {
+                Some(graph) => in_layer(selection, graphs, graph)?,
+                None => return Ok(Err(AbsentTerm::new("g", term))),
+            }
+        }
+        GraphSelector::All => {
+            let graphs = graphs(store, target)?;
+            selection
+                .memberships(graphs)
+                .map(Enumeration::Quads)
+                .map_err(|error| unreadable("preparing the quad view", &error))?
+        }
+    }))
+}
+
+fn in_layer<'a>(
+    selection: Selection<'a>,
+    graphs: &'a Graphs,
+    graph: GraphId,
+) -> Result<Enumeration<'a>, Problem> {
+    selection
+        .in_graph(graphs, graph)
+        .map(Enumeration::Scoped)
+        .map_err(|error| unreadable("opening a graph's layer", &error))
 }
 
 /// One row of an enumeration, with the position that resumes *at* it.
@@ -4782,11 +5101,15 @@ fn binding_phase(selection: Selection<'_>, binding_index: u32) -> Phase<'_> {
 /// the first one and would be refused as out of range.
 struct Step {
     triple: IdTriple,
+    /// The graph this row's membership is in, in the quad view.
+    graph: Option<GraphId>,
     space: PositionSpace,
     resume: u64,
-    /// The second half of a [`PositionSpace::TextRank`] position: how many of
-    /// this hit's statements come before this row. `None` in every space whose
-    /// position is a single number.
+    /// The second number of a position that needs two: for
+    /// [`PositionSpace::TextRank`], how many of this hit's statements come
+    /// before this row; in the quad view, how many of this triple's
+    /// memberships come before this row. `None` in every space whose position
+    /// is a single number.
     scan: Option<u64>,
     binding_index: Option<u32>,
     direction: Option<Direction>,
@@ -4808,19 +5131,13 @@ struct RowResume {
 
 impl RowResume {
     fn cursor(self, binding: &CursorBinding) -> CursorToken {
-        match self.space {
-            PositionSpace::TextRank => {
-                Cursor::at_rank(binding, self.position, self.scan.unwrap_or(0))
-            }
-            space if self.binding_index.is_some() => Cursor::at_binding(
-                binding,
-                self.binding_index.expect("checked above"),
-                space,
-                self.position,
-            ),
-            space => Cursor::at(binding, space, self.position),
-        }
-        .encode()
+        let mut cursor = Cursor::at(binding, self.space, self.position);
+        cursor.binding_index = self.binding_index;
+        // The trailer means "how far into this position's run" in every space
+        // that has runs: a ranked hit's statements, or a triple's memberships
+        // in the quad view. A space without runs never sets it.
+        cursor.scan_position = self.scan;
+        cursor.encode()
     }
 }
 
@@ -4980,22 +5297,23 @@ fn ranked(
         {
             return Err(Problem::from(StaleCursor));
         }
-        steps.extend(
-            positioned(&selection, space, within)
-                .take(want - steps.len())
-                .map(|(triple, at)| Step {
-                    triple,
-                    space: PositionSpace::TextRank,
-                    resume: rank as u64,
-                    scan: Some(at),
-                    binding_index: None,
-                    direction: None,
-                    ranking: Some(Ranking {
-                        score: hit.score,
-                        kind: match_kind(hit.kind),
-                    }),
+        let enumeration = Enumeration::Triples(selection);
+        for row in positioned(&enumeration, space, within, 0).take(want - steps.len()) {
+            let row = row?;
+            steps.push(Step {
+                triple: row.triple,
+                graph: None,
+                space: PositionSpace::TextRank,
+                resume: rank as u64,
+                scan: Some(row.resume),
+                binding_index: None,
+                direction: None,
+                ranking: Some(Ranking {
+                    score: hit.score,
+                    kind: match_kind(hit.kind),
                 }),
-        );
+            });
+        }
     }
 
     let spent = (steps.len() < want && !found.complete).then_some(Spent::Deepest);
@@ -5224,7 +5542,7 @@ fn select(store: &Store, ids: IdPattern) -> Result<Selection<'_>, Problem> {
 /// The parts of an answer that the enumeration does not produce.
 struct Envelope {
     echo: Echo,
-    vars: Vec<Position>,
+    vars: Vars,
     directed: bool,
     bindings: bool,
     absent_terms: Vec<AbsentTerm>,
@@ -5253,19 +5571,20 @@ impl Paging<'_> {
 
 /// Build a page of rows out of `phases`, resuming where `paging` says.
 fn paged(
-    dictionary: &Dictionary<'_>,
+    store: &Store,
     target: Target,
     envelope: Envelope,
     phases: Vec<Phase<'_>>,
     paging: Paging<'_>,
 ) -> Result<Answer, Problem> {
+    let dictionary = store.dict();
     let predicates = dictionary.counts().len(Role::Predicate);
     let steps = walk(&phases, paging.cursor, predicates, paging.want())?;
     // Exact, and known before the walk: a pattern's cardinality is a range
     // width after bounded descent, so the enumeration is not what produces it.
     let cardinality = exact_cardinality_sum(phases.iter().map(|phase| phase.count))?;
 
-    finish(dictionary, target, envelope, steps, paging, None, |_, _| {
+    finish(store, target, envelope, steps, paging, None, |_, _| {
         cardinality
     })
 }
@@ -5274,7 +5593,7 @@ fn paged(
 /// distinct triple union. Filtering happens before the page limit, so overlap
 /// cannot turn a full native page into an empty Hydra page.
 fn paged_distinct_bindings(
-    dictionary: &Dictionary<'_>,
+    store: &Store,
     target: Target,
     envelope: Envelope,
     phases: Vec<Phase<'_>>,
@@ -5282,6 +5601,7 @@ fn paged_distinct_bindings(
     candidates: Candidates,
     paging: Paging<'_>,
 ) -> Result<Answer, Problem> {
+    let dictionary = store.dict();
     let predicates = dictionary.counts().len(Role::Predicate);
     let (steps, spent) = walk_distinct_bindings(
         &phases,
@@ -5292,15 +5612,9 @@ fn paged_distinct_bindings(
         candidates,
     )?;
     let cardinality = exact_cardinality_sum(phases.iter().map(|phase| phase.count))?;
-    finish(
-        dictionary,
-        target,
-        envelope,
-        steps,
-        paging,
-        spent,
-        |_, _| cardinality,
-    )
+    finish(store, target, envelope, steps, paging, spent, |_, _| {
+        cardinality
+    })
 }
 
 /// Sum independently resolved phase cardinalities without letting a valid
@@ -5377,7 +5691,7 @@ fn rdf_projection_cardinality(
 /// cardinality depend on how the page ended rather than being known before it
 /// started.
 fn ranked_page(
-    dictionary: &Dictionary<'_>,
+    store: &Store,
     target: Target,
     envelope: Envelope,
     found: Ranked,
@@ -5392,7 +5706,7 @@ fn ranked_page(
     let from_start = paging.cursor.is_none();
 
     finish(
-        dictionary,
+        store,
         target,
         envelope,
         steps,
@@ -5419,7 +5733,7 @@ fn ranked_page(
 /// that ran out from the top has enumerated its own answer, and can say so
 /// exactly.
 fn finish(
-    dictionary: &Dictionary<'_>,
+    store: &Store,
     target: Target,
     envelope: Envelope,
     mut steps: Vec<Step>,
@@ -5427,6 +5741,7 @@ fn finish(
     spent: Option<Spent>,
     cardinality: impl FnOnce(&Completeness, &[Row]) -> Cardinality,
 ) -> Result<Answer, Problem> {
+    let dictionary = store.dict();
     // The row this page cannot carry, kept because it is where the next one
     // begins rather than merely because it exists.
     let dropped = (steps.len() == paging.want())
@@ -5445,7 +5760,14 @@ fn finish(
     // Materializing is where the bytes appear, so it is where the byte budget
     // applies — before the response exists rather than after, which also bounds
     // the memory a page can take.
-    let (rows, spent_at) = materialize(dictionary, &blank_nodes, &vars, &steps, paging.bytes)?;
+    let (rows, spent_at) = materialize(
+        &dictionary,
+        &blank_nodes,
+        store.graphs(),
+        &vars,
+        &steps,
+        paging.bytes,
+    )?;
     let row_resumes = steps[..rows.len()].iter().map(Step::row_resume).collect();
 
     // Whichever bound was reached first names the reason and the resume point.
@@ -5548,7 +5870,7 @@ fn walk(
     predicates: u64,
     want: usize,
 ) -> Result<Vec<Step>, Problem> {
-    let (start, mut from) = walk_start(phases, cursor, predicates)?;
+    let (start, mut from, mut skip) = walk_start(phases, cursor, predicates)?;
 
     let mut steps = Vec::new();
     for phase in &phases[start..] {
@@ -5556,20 +5878,21 @@ fn walk(
             break;
         }
         let remaining = want - steps.len();
-        steps.extend(
-            positioned(&phase.selection, phase.space, from)
-                .take(remaining)
-                .map(|(triple, resume)| Step {
-                    triple,
-                    space: phase.space,
-                    resume,
-                    scan: None,
-                    binding_index: phase.binding_index,
-                    direction: phase.direction,
-                    ranking: None,
-                }),
-        );
+        for row in positioned(&phase.enumeration, phase.space, from, skip).take(remaining) {
+            let row = row?;
+            steps.push(Step {
+                triple: row.triple,
+                graph: row.graph,
+                space: phase.space,
+                resume: row.resume,
+                scan: row.delivered,
+                binding_index: phase.binding_index,
+                direction: phase.direction,
+                ranking: None,
+            });
+        }
         from = 0;
+        skip = 0;
     }
     Ok(steps)
 }
@@ -5585,19 +5908,21 @@ fn walk_distinct_bindings(
     want: usize,
     candidates: Candidates,
 ) -> Result<(Vec<Step>, Option<Spent>), Problem> {
-    let (start, mut from) = walk_start(phases, cursor, predicates)?;
+    let (start, mut from, mut skip) = walk_start(phases, cursor, predicates)?;
     let mut steps = Vec::new();
     let mut examined = 0u64;
     for phase in &phases[start..] {
         let binding_index = phase
             .binding_index
             .expect("a distinct binding walk contains only binding phases");
-        for (triple, resume) in positioned(&phase.selection, phase.space, from) {
+        for row in positioned(&phase.enumeration, phase.space, from, skip) {
+            let row = row?;
             let candidate = Step {
-                triple,
+                triple: row.triple,
+                graph: row.graph,
                 space: phase.space,
-                resume,
-                scan: None,
+                resume: row.resume,
+                scan: row.delivered,
                 binding_index: phase.binding_index,
                 direction: phase.direction,
                 ranking: None,
@@ -5607,7 +5932,7 @@ fn walk_distinct_bindings(
             }
             examined += 1;
             if restrictions.iter().any(|(owner, pattern)| {
-                *owner < binding_index && id_pattern_matches(*pattern, triple)
+                *owner < binding_index && id_pattern_matches(*pattern, row.triple)
             }) {
                 continue;
             }
@@ -5617,6 +5942,7 @@ fn walk_distinct_bindings(
             }
         }
         from = 0;
+        skip = 0;
     }
     Ok((steps, None))
 }
@@ -5625,9 +5951,9 @@ fn walk_start(
     phases: &[Phase<'_>],
     cursor: Option<&Cursor>,
     predicates: u64,
-) -> Result<(usize, u64), Problem> {
+) -> Result<(usize, u64, u64), Problem> {
     match cursor {
-        None => Ok((0, 0)),
+        None => Ok((0, 0, 0)),
         Some(cursor) => {
             let index = phases
                 .iter()
@@ -5635,43 +5961,76 @@ fn walk_start(
                     phase.space == cursor.space && phase.binding_index == cursor.binding_index
                 })
                 .ok_or_else(|| Problem::from(StaleCursor))?;
-            Ok((index, resume_position(cursor, &phases[index], predicates)?))
+            let (from, skip) = resume_position(cursor, &phases[index], predicates)?;
+            Ok((index, from, skip))
         }
     }
 }
 
-/// Pair each triple with the position a page resumes at to return it first.
+/// A row with the position a page resumes at to return it first.
+struct PositionedRow {
+    triple: IdTriple,
+    graph: Option<GraphId>,
+    resume: u64,
+    delivered: Option<u64>,
+}
+
+/// Pair each row with the position a page resumes at to return it first.
 ///
-/// The running position *before* each row, in whichever space this phase counts
-/// in: an offset for the three permutation spaces, and for `s ? o` the previous
-/// row's predicate id — route-independent and strictly
-/// increasing, since one (s, p, o) occurs at most once.
+/// The running position *before* each triple, in whichever space this phase
+/// counts in: an offset for the three permutation spaces, and for `s ? o` the
+/// previous triple's predicate id — route-independent and strictly increasing,
+/// since one (s, p, o) occurs at most once. In the quad view every row of one
+/// triple shares the triple's position; the row's own place in the triple's
+/// run travels beside it.
 fn positioned<'a>(
-    selection: &'a Selection<'a>,
+    enumeration: &'a Enumeration<'a>,
     space: PositionSpace,
     from: u64,
-) -> impl Iterator<Item = (IdTriple, u64)> + 'a {
+    skip: u64,
+) -> impl Iterator<Item = Result<PositionedRow, Problem>> + 'a {
     let mut resume = from;
-    // `usize::MAX` rather than a page size: `Selection::page` is lazy, so the
-    // caller's `take` is what bounds the work, and a multi-phase walk cannot
-    // know its own bound per phase up front.
-    selection.page(from, usize::MAX).map(move |triple| {
-        let at = resume;
-        resume = match space {
-            PositionSpace::Predicate => triple.predicate,
-            _ => resume + 1,
-        };
-        (triple, at)
+    let mut current: Option<IdTriple> = None;
+    // The enumeration is lazy, so the caller's `take` is what bounds the work,
+    // and a multi-phase walk cannot know its own bound per phase up front.
+    enumeration.rows(from, skip).map(move |row| {
+        let row = row?;
+        // A new triple, unless this row continues the run the last one was in.
+        // The first triple of a page resumes at `from` itself, which for the
+        // predicate space is the predicate *before* it — what a page that ends
+        // inside this triple's run must carry to start this triple again.
+        if current != Some(row.triple) {
+            if let Some(previous) = current {
+                resume = match space {
+                    PositionSpace::Predicate => previous.predicate,
+                    _ => resume + 1,
+                };
+            }
+            current = Some(row.triple);
+        }
+        Ok(PositionedRow {
+            triple: row.triple,
+            graph: row.graph,
+            resume,
+            delivered: row.delivered,
+        })
     })
 }
 
-/// Where a cursor resumes this phase, or `stale_cursor`.
-fn resume_position(cursor: &Cursor, phase: &Phase<'_>, predicates: u64) -> Result<u64, Problem> {
+/// Where a cursor resumes this phase — the triple's position, and how many of
+/// its memberships to skip — or `stale_cursor`.
+fn resume_position(
+    cursor: &Cursor,
+    phase: &Phase<'_>,
+    predicates: u64,
+) -> Result<(u64, u64), Problem> {
     let stale = || Problem::from(StaleCursor);
-    // A phase's binding trailer must match it exactly; `scan_position` belongs
-    // to text spaces, which are not phases. Any other shape was not issued by
-    // the request it arrived on.
-    if cursor.binding_index != phase.binding_index || cursor.scan_position.is_some() {
+    // A phase's binding trailer must match it exactly. The run trailer belongs
+    // to the quad view alone here — the text spaces that also use it are not
+    // phases — so a quad-view cursor carries it and no other cursor may.
+    if cursor.binding_index != phase.binding_index
+        || cursor.scan_position.is_some() != phase.enumeration.is_quad_view()
+    {
         return Err(stale());
     }
     // A position past the end would otherwise page to an empty response, which
@@ -5681,11 +6040,17 @@ fn resume_position(cursor: &Cursor, phase: &Phase<'_>, predicates: u64) -> Resul
             (1..=predicates).contains(&cursor.position)
                 // At a binding-row boundary there is no previous predicate;
                 // zero is the sentinel for the first result of the new row.
-                || (cursor.position == 0 && phase.binding_index.is_some())
+                // Nor is there one for a quad-view page that ended inside
+                // the first triple's run, which resumes that triple from the
+                // start of the enumeration and skips the rows it delivered.
+                || (cursor.position == 0
+                    && (phase.binding_index.is_some() || phase.enumeration.is_quad_view()))
         }
-        _ => cursor.position < phase.count,
+        _ => cursor.position < phase.triples,
     };
-    within.then_some(cursor.position).ok_or_else(stale)
+    within
+        .then_some((cursor.position, cursor.scan_position.unwrap_or(0)))
+        .ok_or_else(stale)
 }
 
 /// Turn ids into terms once per distinct term, within
@@ -5722,18 +6087,20 @@ fn resume_position(cursor: &Cursor, phase: &Phase<'_>, predicates: u64) -> Resul
 fn materialize(
     dictionary: &Dictionary<'_>,
     blank_nodes: &SkolemScope,
-    vars: &[Position],
+    graphs: Option<&Graphs>,
+    vars: &Vars,
     steps: &[Step],
     bytes: ResponseBytes,
 ) -> Result<(Vec<Row>, Option<usize>), Problem> {
     let mut cache = TermCache::new();
     let mut published = PublishedTerms::new(blank_nodes.clone());
+    let mut graph_names = GraphNames::new(blank_nodes);
     let mut rows: Vec<Row> = Vec::with_capacity(steps.len());
     let mut spent = 0u64;
     for (index, step) in steps.iter().enumerate() {
-        let mut cells = Vec::with_capacity(vars.len());
+        let mut cells = Vec::with_capacity(vars.positions().len());
         let mut terms = 0u64;
-        for position in vars {
+        for position in vars.positions() {
             let (term, serialized) = published
                 .measured(
                     &mut cache,
@@ -5745,9 +6112,21 @@ fn materialize(
             terms += serialized;
             cells.push((*position, term));
         }
+        let graph = match (vars.has_graph(), step.graph, graphs) {
+            (true, Some(graph), Some(graphs)) => Some(graph_names.measured(graphs, graph)?),
+            (true, _, _) => {
+                tracing::error!("a quad-view row has no graph to report");
+                return Err(Problem::new(
+                    ErrorCode::InternalError,
+                    "the quad view could not name a row's graph",
+                ));
+            }
+            (false, _, _) => None,
+        };
         let row = Row::new(
             cells,
             terms,
+            graph,
             step.binding_index,
             step.direction,
             step.ranking,
@@ -5764,6 +6143,50 @@ fn materialize(
         rows.push(row);
     }
     Ok((rows, None))
+}
+
+/// Graph names as this API publishes them, memoized for one page.
+///
+/// A graph's name is spelled once per distinct graph rather than once per
+/// row: the quad view repeats a handful of graphs down a page. A graph named
+/// by a blank node is published as this bundle's scoped IRI, as a data blank
+/// node is, because a `_:` label means nothing outside the document it came
+/// from.
+struct GraphNames<'a> {
+    blank_nodes: &'a SkolemScope,
+    names: HashMap<GraphId, (Rc<str>, u64)>,
+    buffer: Vec<u8>,
+}
+
+impl<'a> GraphNames<'a> {
+    fn new(blank_nodes: &'a SkolemScope) -> Self {
+        Self {
+            blank_nodes,
+            names: HashMap::new(),
+            buffer: Vec::new(),
+        }
+    }
+
+    /// The published spelling, and the bytes its term object takes.
+    fn measured(&mut self, graphs: &Graphs, graph: GraphId) -> Result<(Rc<str>, u64), Problem> {
+        if let Some(found) = self.names.get(&graph) {
+            return Ok(found.clone());
+        }
+        let stored = graphs
+            .name(graph, &mut self.buffer)
+            .map_err(|error| unreadable("reading a graph's name", &error))?;
+        let stored = std::str::from_utf8(stored).map_err(|error| {
+            unreadable("reading a graph's name", &format!("not UTF-8: {error}"))
+        })?;
+        let published: Rc<str> = match self.blank_nodes.graph_iri(graph, stored) {
+            Some(iri) => Rc::from(iri.as_str()),
+            None => Rc::from(stored),
+        };
+        let serialized = serialized_bytes(&Term::Iri(Cow::Borrowed(published.as_ref())));
+        self.names
+            .insert(graph, (Rc::clone(&published), serialized));
+        Ok((published, serialized))
+    }
 }
 
 /// A bundle this server published and cannot read is the server's problem, not
@@ -6547,7 +6970,7 @@ impl Answer {
 
     fn fragment_pattern(&self) -> Option<&Pattern> {
         match &self.echo {
-            Echo::Fragment { pattern } => Some(pattern),
+            Echo::Fragment { pattern, .. } => Some(pattern),
             _ => None,
         }
     }
@@ -6555,9 +6978,15 @@ impl Answer {
     /// The fields above the table: what was asked, and how much of it came back.
     fn summary<'a>(&'a self, completeness: &'a str) -> Vec<(&'a str, Value<'a>)> {
         let mut summary = match &self.echo {
-            Echo::Fragment { pattern } => pattern_fields(pattern, self.target.operation),
-            Echo::BindingsFragment { pattern } => {
-                binding_pattern_fields(pattern, self.target.operation)
+            Echo::Fragment { pattern, g } => {
+                let mut fields = pattern_fields(pattern, self.target.operation);
+                fields.extend(graph_field(g.as_deref()));
+                fields
+            }
+            Echo::BindingsFragment { pattern, g } => {
+                let mut fields = binding_pattern_fields(pattern, self.target.operation);
+                fields.extend(graph_field(g.as_deref()));
+                fields
             }
             Echo::Describe { direction, .. } => {
                 vec![("direction", Value::Text(direction.as_str()))]
@@ -6601,8 +7030,15 @@ impl Answer {
                 .map(|position| position.as_str())
                 .collect()
         } else {
-            self.vars.iter().map(|position| position.as_str()).collect()
+            self.vars
+                .positions()
+                .iter()
+                .map(|position| position.as_str())
+                .collect()
         };
+        if self.vars.has_graph() {
+            headers.push(GRAPH);
+        }
         if self.bindings {
             headers.insert(0, BINDING);
         }
@@ -6653,6 +7089,9 @@ impl Answer {
                             .map(|(_, term)| self.cell(&term.published, &term.stored)),
                     );
                 }
+                if let Some(graph) = &row.graph {
+                    cells.push(self.graph_cell(graph));
+                }
                 if let Some(direction) = row.direction {
                     cells.push(Cell::text(direction.as_str().to_owned()));
                 }
@@ -6663,6 +7102,23 @@ impl Answer {
                 cells
             })
             .collect()
+    }
+
+    /// A graph's name, linking to the same pattern scoped to that graph — the
+    /// question a quad-view row invites.
+    fn graph_cell<'a>(&'a self, graph: &'a str) -> Cell<'a> {
+        let request = Term::from_dictionary(graph).to_request();
+        let mut cell = term_cell(&self.target, &self.blank_nodes, graph, None);
+        cell.href = Some(query(
+            self.target.base(),
+            &self
+                .target
+                .params
+                .without("cursor")
+                .without("format")
+                .with(GRAPH, &request),
+        ));
+        cell
     }
 
     /// One term, and the request that asks about it.
@@ -7035,6 +7491,7 @@ impl Resource for CountAnswer {
 
     fn to_html(&self) -> String {
         let mut summary = pattern_fields(&self.pattern, self.target.operation);
+        summary.extend(graph_field(self.g.as_deref()));
         summary.push(("count", Value::Number(self.count.value())));
         summary.push((
             "exact",
@@ -7115,7 +7572,11 @@ impl Resource for BindingCountAnswer {
             canonical.as_deref(),
             html! {
                 div."answer-summary" {
-                    (fields(&binding_pattern_fields(&self.pattern, self.target.operation)))
+                    (fields(&{
+                        let mut fields = binding_pattern_fields(&self.pattern, self.target.operation);
+                        fields.extend(graph_field(self.g.as_deref()));
+                        fields
+                    }))
                 }
                 section."section-block" {
                     h2 { "Counts" }
@@ -7128,6 +7589,11 @@ impl Resource for BindingCountAnswer {
             },
         )
     }
+}
+
+/// The `g` field, when the request scoped its pattern.
+fn graph_field(requested: Option<&str>) -> Option<(&str, Value<'_>)> {
+    requested.map(|g| (GRAPH, Value::Code(g)))
 }
 
 /// The three pattern positions, as page fields.
@@ -7368,8 +7834,14 @@ mod tests {
                                 .expect("a term serializes")
                                 .len() as u64;
 
-                            let row =
-                                Row::new(cells, each * width as u64, binding, direction, score);
+                            let row = Row::new(
+                                cells,
+                                each * width as u64,
+                                None,
+                                binding,
+                                direction,
+                                score,
+                            );
                             assert_eq!(
                                 row.serialized,
                                 serde_json::to_vec(&row).expect("a row serializes").len() as u64,

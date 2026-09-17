@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 use kgf_server::service::Service;
 use kgf_server::{AccessLog, AccessRecord};
-use kgf_store::testing::{Fixture, TINY_NT};
+use kgf_store::testing::{Fixture, TINY_NT, WORKED_EXAMPLE_NQ};
 use sha2::{Digest, Sha256};
 
 /// A second fixture graph, so two versions of one dataset differ in content and
@@ -1360,6 +1360,98 @@ fn void_and_summary_serve_the_published_description_in_every_format() {
     for operation in ["schema", "void", "summary"] {
         assert!(manifest.contains(&format!("href=\"/tox/v/v1/{operation}\"")));
     }
+}
+
+/// The graph scope over the wire: gated on the capability before any bundle
+/// opens, answerable in its reserved forms on every release, and paged
+/// through the quad view with the cursor the envelope carries.
+#[test]
+fn graph_scope_is_gated_on_the_capability_and_pages_over_the_wire() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    deployment.publish_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-01-09T09:00:00Z");
+    let server = deployment.serve();
+    let g1 = kgf_server::url::encode_value("<http://example.org/g1>");
+    let unnamed = kgf_server::url::encode_value("<urn:x-kgf:unnamed>");
+
+    // No memberships: a named graph and the quad view are 501 before the
+    // open; the two reserved names answer.
+    for target in [
+        format!("/tox/v/v1/fragment?g={g1}"),
+        format!("/tox/v/v1/count?g={g1}"),
+        "/tox/v/v1/fragment?g=*".to_owned(),
+    ] {
+        let refused = server.request("GET", &target, &[]);
+        refused.assert_status(501);
+        assert_eq!(
+            refused.json()["code"],
+            "capability_not_available",
+            "{target}"
+        );
+    }
+    let whole = server.request("GET", "/tox/v/v1/count", &[]).json()["count"]["value"]
+        .as_u64()
+        .unwrap();
+    let unnamed_count = server.request("GET", &format!("/tox/v/v1/count?g={unnamed}"), &[]);
+    unnamed_count.assert_status(200);
+    assert_eq!(unnamed_count.json()["count"]["value"], whole);
+
+    // The capability is declared for the quad bundle, and every form answers.
+    let manifest = server.request("GET", "/quads/v/v1/manifest", &[]).json();
+    assert!(
+        manifest["capabilities"]
+            .as_object()
+            .unwrap()
+            .contains_key("graphs"),
+        "{manifest}"
+    );
+    let count = server.request("GET", &format!("/quads/v/v1/count?g={g1}"), &[]);
+    count.assert_status(200);
+    assert_eq!(count.json()["count"]["value"], 2);
+    let quads = server.request("GET", "/quads/v/v1/count?g=*", &[]);
+    assert_eq!(quads.json()["count"]["value"], 5);
+
+    // Paged at one row: five pages, each resumed from the previous cursor,
+    // including the boundaries inside a triple's run.
+    let mut target = "/quads/v/v1/fragment?g=*&limit=1".to_owned();
+    let mut graphs = Vec::new();
+    loop {
+        let page = server.request("GET", &target, &[]);
+        page.assert_status(200);
+        let body = page.json();
+        assert_eq!(body["vars"], serde_json::json!(["s", "p", "o", "g"]));
+        graphs.push(body["rows"][0]["g"]["value"].as_str().unwrap().to_owned());
+        match body["next"].as_str() {
+            Some(next) => target = format!("/quads/v/v1/fragment?g=*&limit=1&cursor={next}"),
+            None => break,
+        }
+    }
+    assert_eq!(
+        graphs,
+        [
+            "urn:x-kgf:unnamed",
+            "http://example.org/g1",
+            "urn:x-kgf:unnamed",
+            "http://example.org/g1",
+            "http://example.org/g2",
+        ]
+    );
+
+    // The browser form offers the control only where it can be answered.
+    let form = server
+        .request("GET", "/quads/v/v1/fragment", &[("accept", "text/html")])
+        .text();
+    assert!(
+        form.contains("name=\"g\""),
+        "the quad bundle offers a graph control"
+    );
+    let form = server
+        .request("GET", "/tox/v/v1/fragment", &[("accept", "text/html")])
+        .text();
+    assert!(
+        !form.contains("name=\"g\""),
+        "a bundle without memberships does not"
+    );
 }
 
 #[test]
@@ -2947,6 +3039,11 @@ impl Deployment {
         self.publish_bundle(dataset, version, source, created, true);
     }
 
+    /// Build a quad bundle — sidecar and index beside the HDT — and describe it.
+    fn publish_quads(&self, dataset: &str, version: &str, source: &str, created: &str) {
+        self.publish_fixture(dataset, version, Fixture::build_quads(source), created);
+    }
+
     fn publish_description(&self, dataset: &str, version: &str, created: &str) {
         self.publish_description_with_labels(dataset, version, created, true);
     }
@@ -3010,9 +3107,13 @@ impl Deployment {
         created: &str,
         text: bool,
     ) {
-        let bundle = self.bundle(dataset, version);
         let fixture = Fixture::build(source);
         let fixture = if text { fixture.with_text() } else { fixture };
+        self.publish_fixture(dataset, version, fixture, created);
+    }
+
+    fn publish_fixture(&self, dataset: &str, version: &str, fixture: Fixture, created: &str) {
+        let bundle = self.bundle(dataset, version);
         fixture.copy_bundle_to(&bundle);
 
         #[derive(Parser)]
