@@ -29,7 +29,9 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Request, State};
-use axum::http::header::{ACCEPT, ALLOW, CONTENT_TYPE, LOCATION, RETRY_AFTER, VARY};
+use axum::http::header::{
+    ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_TYPE, ETAG, LOCATION, RETRY_AFTER, VARY,
+};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -39,6 +41,9 @@ use headers::{ETag, HeaderMapExt, Host, IfNoneMatch};
 use kgf_store::Capability;
 use kgf_store::catalog::BundleId;
 use mediatype::{MediaTypeBuf, names};
+use tower_http::CompressionLevel;
+use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::SizeAbove;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -54,6 +59,25 @@ use crate::service::{Release, Service};
 use crate::url::{self, Params};
 use crate::{Limits, PublicBase};
 
+/// The health probe's path.
+///
+/// Not a resource in the KGF URL space: it has no representation, no links,
+/// and no descriptor mentions it. It is here so that a probe has a target that
+/// opens no bundle and reads nothing, which is what makes a failing check mean
+/// "this process cannot answer" rather than "a bundle is cold".
+pub const HEALTH_PATH: &str = "/healthz";
+
+/// Dataset ids a build must refuse, because a route at the root already spells
+/// them.
+///
+/// `/{dataset}` is a wildcard directly under the root, so any static route
+/// beside it wins the match and shadows the dataset whose id is that same
+/// segment. The shadowed dataset would be published, listed in the service
+/// descriptor, and unreachable — a failure with no error to report. Enforcing
+/// the list where ids are parsed makes such a bundle impossible to build
+/// rather than merely broken to serve.
+pub const RESERVED_DATASET_IDS: &[&str] = &["healthz"];
+
 /// The KGF routes over a built service.
 pub fn router(service: Arc<Service>) -> Router {
     let body_limit =
@@ -61,6 +85,11 @@ pub fn router(service: Arc<Service>) -> Router {
 
     Router::new()
         .route("/", read(get(service_descriptor)))
+        // Before the dataset wildcard in reading order, though not in
+        // matching order: the router prefers a static segment to a
+        // parameter whatever the registration order, which is exactly why
+        // `healthz` is a reserved dataset id.
+        .route(HEALTH_PATH, read(get(health)))
         .route("/{dataset}", read(get(dataset_descriptor)))
         // Method-preserving by construction: `any` hands every method to the
         // same handler, which answers 307. A router that matched only
@@ -78,6 +107,7 @@ pub fn router(service: Arc<Service>) -> Router {
                 .post(fragment_bindings_post)
                 .fallback(fragment_fallback),
         )
+        .route("/{dataset}/v/{version}/tpf", read(get(tpf)))
         .route(
             "/{dataset}/v/{version}/count",
             get(count)
@@ -87,6 +117,7 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/{dataset}/v/{version}/describe", read(get(describe)))
         .route("/{dataset}/v/{version}/sample", read(get(sample)))
         .route("/{dataset}/v/{version}/search", read(get(search)))
+        .route("/{dataset}/v/{version}/terms", read(get(terms)))
         .route("/{dataset}/v/{version}/schema", read(get(schema)))
         .route("/{dataset}/v/{version}/void", read(get(void)))
         .route("/{dataset}/v/{version}/summary", read(get(summary)))
@@ -142,6 +173,29 @@ pub fn router(service: Arc<Service>) -> Router {
             Arc::clone(&service),
             crate::access::record_request,
         ))
+        // Compression sits *outside* access logging on purpose, so `bytes_out`
+        // keeps meaning the entity's size rather than the wire's. That is the
+        // number the published response caps bound and the one earlier records
+        // are comparable with; a client that does not negotiate `gzip` receives
+        // exactly those bytes. Outside `render_problems` is also required:
+        // that layer `insert`s `Vary: Accept`, and compression only *appends*
+        // `accept-encoding`, so the reverse order would drop it.
+        //
+        // Fastest, not the default: on a real fragment response level 1 is
+        // 11.3x for ~0.03 ms, where level 6 buys 13.0x for ~0.06 ms. At
+        // roughly 1% of a request's service time the cheap setting is the one
+        // that stays free even when the server is CPU-bound. `SizeAbove`
+        // raises tower-http's 32-byte floor: below about a kilobyte the
+        // framing costs more than the saving.
+        .layer(
+            CompressionLayer::new()
+                .quality(CompressionLevel::Fastest)
+                .compress_when(SizeAbove::new(1024)),
+        )
+        // Outermost, because it must observe the `Content-Encoding` the layer
+        // below may have added — and must also reach the responses that layer
+        // never handles, a `304` in particular.
+        .layer(middleware::from_fn(mark_encoding_negotiated))
         .with_state(service)
 }
 
@@ -207,7 +261,7 @@ async fn no_such_route(
         ErrorCode::NotFound,
         format!(
             "no resource at {}; this server serves {prefix}/ (service descriptor), \
-             {prefix}/{{dataset}}, and {prefix}/{{dataset}}/v/{{version}}/{{manifest,fragment,\
+             {prefix}/{{dataset}}, and {prefix}/{{dataset}}/v/{{version}}/{{manifest,fragment,tpf,\
              count,describe,sample,search,labels,schema,void,summary}}; version resources \
              are also available under {prefix}/{{dataset}}/latest/{hint}",
             reflected(&mount.public_path(path))
@@ -218,6 +272,35 @@ async fn no_such_route(
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
+
+/// Answer that this process is running and able to serve a request.
+///
+/// Deliberately trivial. It opens no bundle, consults no catalog, and
+/// allocates nothing beyond the response, so the only ways it can fail are the
+/// ones a probe is for: the listener is gone, or the runtime cannot schedule a
+/// handler. A probe pointed at a resource would instead report on whichever
+/// bundle that resource happens to touch.
+///
+/// It still sits inside every layer — CORS, the body limit, problem rendering,
+/// access recording — because a probe that bypassed the stack would not be
+/// testing the stack that serves requests.
+///
+/// `no-store` because a cached health check is not a health check; the gateway
+/// and any intermediary must ask the process every time.
+async fn health() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            ),
+            (CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        "ok\n",
+    )
+        .into_response()
+}
 
 async fn service_descriptor(
     State(service): State<Arc<Service>>,
@@ -378,24 +461,37 @@ async fn fragment(
             AccessOperation::Fragment,
             wants,
             Representation::FRAGMENT,
-            |params, limits, release, representation| {
-                let request = request::GetFragment::parse(
+            |params, limits, release| {
+                let request = request::Fragment::parse(
                     params,
                     limits,
                     release.prefixes(),
                     &release.binding(),
-                    matches!(
-                        representation,
-                        Representation::Turtle | Representation::JsonLd
-                    ),
                 )?;
-                declares_search(release, request.text().is_some())?;
+                declares_search(release, request.pattern.text().is_some())?;
                 Ok(request)
             },
-            answer::get_fragment,
+            answer::fragment,
         )
         .await,
     )
+}
+
+async fn tpf(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate_represented(
+        service,
+        BundleId { dataset, version },
+        AccessOperation::Tpf,
+        wants,
+        Representation::TPF,
+        |params, limits, release| request::Tpf::parse(params, limits, &release.binding()),
+        answer::tpf,
+    )
+    .await
 }
 
 async fn count(
@@ -409,7 +505,7 @@ async fn count(
             BundleId { dataset, version },
             AccessOperation::Count,
             wants,
-            |params, limits, release, _representation| {
+            |params, limits, release| {
                 let request =
                     request::Count::parse(params, limits, release.prefixes(), &release.binding())?;
                 declares_search(release, request.pattern.text().is_some())?;
@@ -635,7 +731,7 @@ async fn describe(
         BundleId { dataset, version },
         AccessOperation::Describe,
         wants,
-        |params, limits, release, _representation| {
+        |params, limits, release| {
             request::Describe::parse(params, limits, release.prefixes(), &release.binding())
         },
         answer::describe,
@@ -653,20 +749,11 @@ async fn sample(
         BundleId { dataset, version },
         AccessOperation::Sample,
         wants,
-        |params, limits, release, _representation| {
-            // Sampling is optional, so a bundle that does not
-            // declare one is refused rather than served from artifacts it
-            // never promised — and refused *here*, before the open, because
-            // the manifest is already in memory.
-            if !release.declares(Capability::Sample) {
-                return Err(Problem::new(
-                    ErrorCode::CapabilityNotAvailable,
-                    "this bundle does not declare the `sample` capability; \
-                     its manifest lists the ones it does",
-                ));
-            }
-            request::Sample::parse(params, limits, release.prefixes())
-        },
+        // Ungated: `sample` composes triple patterns over the artifacts every
+        // bundle is required to carry, so there is no version of this bundle
+        // that cannot answer it. See `capability_gate` for why that is the whole
+        // test.
+        |params, limits, release| request::Sample::parse(params, limits, release.prefixes()),
         answer::sample,
     )
     .await
@@ -682,13 +769,8 @@ async fn search(
         BundleId { dataset, version },
         AccessOperation::Search,
         wants,
-        |params, limits, release, _representation| {
-            if !release.declares(Capability::Search) {
-                return Err(Problem::new(
-                    ErrorCode::CapabilityNotAvailable,
-                    "this bundle does not declare the `search` capability; its manifest lists the ones it does",
-                ));
-            }
+        |params, limits, release| {
+            capability_gate(release, Capability::Search)?;
             request::Search::parse(
                 params,
                 limits,
@@ -697,6 +779,32 @@ async fn search(
             )
         },
         answer::search,
+    )
+    .await
+}
+
+async fn terms(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate(
+        service,
+        BundleId { dataset, version },
+        AccessOperation::Terms,
+        wants,
+        // Ungated, both the scan and its labels: the sorted dictionary is a
+        // required artifact and the label cascade resolves through the core
+        // permutations. See `capability_gate`.
+        |params, limits, release| {
+            request::Terms::parse(
+                params,
+                limits,
+                release.predicate_roles(),
+                &release.binding(),
+            )
+        },
+        answer::terms,
     )
     .await
 }
@@ -711,16 +819,12 @@ async fn schema(
         BundleId { dataset, version },
         AccessOperation::Schema,
         wants,
-        |params, limits, release, _representation| {
-            let request =
-                request::Schema::parse(params, limits, release.prefixes(), &release.binding())?;
-            if request.labels && !release.declares(Capability::Labels) {
-                return Err(Problem::new(
-                    ErrorCode::CapabilityNotAvailable,
-                    "this bundle does not declare the `labels` capability; omit `labels=true` or use a release that does",
-                ));
-            }
-            Ok(request)
+        |params, limits, release| {
+            // `labels=true` is ungated for the reason `capability_gate`
+            // gives: the cascade resolves through the core permutations. A
+            // release that declares no `label` role still answers, with the
+            // labels absent rather than the request refused.
+            request::Schema::parse(params, limits, release.prefixes(), &release.binding())
         },
         answer::schema,
     )
@@ -824,13 +928,8 @@ async fn labels_operation(
                 body,
                 method,
             },
+            // Ungated; see `capability_gate`.
             |params, body, limits, release| {
-                if !release.declares(Capability::Labels) {
-                    return Err(Problem::new(
-                        ErrorCode::CapabilityNotAvailable,
-                        "this bundle does not declare the `labels` capability; its manifest lists the ones it does",
-                    ));
-                }
                 request::Labels::parse(
                     params,
                     body,
@@ -855,8 +954,9 @@ async fn verbalize(
         BundleId { dataset, version },
         AccessOperation::Verbalize,
         wants,
-        |params, limits, release, _representation| {
-            declares_verbalize(release)?;
+        |params, limits, release| {
+            // Ungated: a root's star and the label cascade read the artifacts
+            // every bundle carries. See `capability_gate`.
             request::Verbalize::parse(
                 params,
                 limits,
@@ -928,7 +1028,6 @@ async fn verbalize_operation(
                 method,
             },
             |params, body, limits, release| {
-                declares_verbalize(release)?;
                 request::Verbalize::parse_body(
                     params,
                     body,
@@ -943,27 +1042,57 @@ async fn verbalize_operation(
     )
 }
 
-fn declares_verbalize(release: &Release) -> Result<(), Problem> {
-    if !release.declares(Capability::Verbalize) {
-        return Err(Problem::new(
-            ErrorCode::CapabilityNotAvailable,
-            "this bundle does not declare the `verbalize` capability; its manifest lists the ones it does",
-        ));
+/// Refuse an operation whose bytes this bundle may not carry.
+///
+/// # What is gated, and what is not
+///
+/// A capability names bytes, so this gate is for the capabilities an artifact
+/// can be *absent* for: `search` needs the text index, `graphs` the sidecar
+/// pair, and the sketch families their own files. Answering one of those from a
+/// bundle that does not carry them would be a wrong answer with no sign of being
+/// wrong, which is why the refusal is absolute rather than pragmatic.
+///
+/// `sample`, `labels`, and `terms` are *not* gated, and the reason is not
+/// leniency. Each composes the artifacts every bundle is required to carry —
+/// triple patterns, the core permutations, the sorted dictionary — so no
+/// published bundle exists that cannot answer them, and the manifest's
+/// declaration of them carries no information a server holding the bundle does
+/// not already have. All such a check could do is fail: the capability list is
+/// derived entirely from which artifact files exist, so a release whose manifest
+/// predates an operation would have that operation suppressed by stale metadata
+/// rather than by missing bytes. The manifest still declares them, because a
+/// registry or mirror reading manifests without opening bundles is a real
+/// consumer — but what this deployment *routes* is the service descriptor's
+/// business, which is where those three are advertised unconditionally.
+///
+/// Coded 501 because the request is well formed and the identical one against a
+/// bundle that declares the capability succeeds — the shortfall is what this
+/// bundle carries. Refused here, before the open, off the manifest already in
+/// memory.
+fn capability_gate(release: &Release, capability: Capability) -> Result<(), Problem> {
+    if release.declares(capability) {
+        return Ok(());
     }
-    Ok(())
+    Err(Problem::new(
+        ErrorCode::CapabilityNotAvailable,
+        format!(
+            "this bundle does not declare the `{}` capability; \
+             its manifest lists the ones it does",
+            capability.as_str()
+        ),
+    ))
 }
 
 /// Refuse `o.text` against a bundle that publishes no text index.
 ///
-/// The same gate `/sample` gets, and in the same place: before the open, off
-/// the manifest already in memory. It is coded 501 because the request is
-/// well formed and the identical one against a bundle declaring `search`
-/// succeeds — the shortfall is what this bundle carries.
+/// The same gate the operation itself gets, named after the parameter so the
+/// message says which half of the request the bundle cannot serve.
 fn declares_search(release: &Release, wanted: bool) -> Result<(), Problem> {
     if wanted && !release.declares(Capability::Search) {
         return Err(Problem::new(
             ErrorCode::CapabilityNotAvailable,
-            "`o.text` needs the `search` capability, which this bundle does not declare;              its manifest lists the ones it does",
+            "`o.text` needs the `search` capability, which this bundle does not \
+             declare; its manifest lists the ones it does",
         ));
     }
     Ok(())
@@ -987,7 +1116,7 @@ async fn operate<Q, A, P, E>(
 where
     Q: request::GetRequest + Send + 'static,
     A: Renders,
-    P: FnOnce(&Params, Limits<'_>, &Release, Representation) -> Result<Q, Problem>,
+    P: FnOnce(&Params, Limits<'_>, &Release) -> Result<Q, Problem>,
     E: FnOnce(&kgf_store::Store, Target, &Q) -> Result<A, Problem> + Send + 'static,
 {
     operate_represented(
@@ -1015,18 +1144,14 @@ async fn operate_represented<Q, A, P, E>(
 where
     Q: request::GetRequest + Send + 'static,
     A: Renders,
-    P: FnOnce(&Params, Limits<'_>, &Release, Representation) -> Result<Q, Problem>,
+    P: FnOnce(&Params, Limits<'_>, &Release) -> Result<Q, Problem>,
     E: FnOnce(&kgf_store::Store, Target, &Q) -> Result<A, Problem> + Send + 'static,
 {
     let representation = wants.representation_from(offered)?;
-    if matches!(
-        representation,
-        Representation::Turtle | Representation::JsonLd
-    ) && wants.request_url.is_none()
-    {
+    if operation == AccessOperation::Tpf && representation.is_rdf() && wants.request_url.is_none() {
         return Err(Problem::new(
             ErrorCode::MalformedRequest,
-            "an RDF fragment request requires an absolute request target or a valid Host header",
+            "a TPF RDF request requires an absolute request target or a valid Host header",
         ));
     }
     let release = service.datasets().release(&id.dataset, &id.version)?;
@@ -1034,7 +1159,7 @@ where
         Observation::operation(service.access(), operation, Transport::Get, representation)
             .resolved(&id.dataset, Some(&id.version));
     let params = Q::normalize_params(wants.params());
-    let request = match parse(&params, service.config().limits(), release, representation) {
+    let request = match parse(&params, service.config().limits(), release) {
         Ok(request) => request,
         Err(problem) => return observed_result(Err(problem), observation),
     };
@@ -1066,13 +1191,14 @@ where
 
     let target = Target::get(
         id,
-        operation.path_segment(),
+        operation,
         params,
         release.prefixes().clone(),
         service.mount().clone(),
         release.declares(Capability::Search),
         wants.request_url.clone(),
-    );
+    )
+    .with_dataset_metadata(release.dataset_iri(), release.carries_description());
     let labels = PageLabelProfile::for_request(
         &service,
         release,
@@ -1160,13 +1286,14 @@ where
 
     let target = Target::get(
         id,
-        operation.path_segment(),
+        operation,
         params,
         release.prefixes().clone(),
         service.mount().clone(),
         release.declares(Capability::Search),
         wants.request_url.clone(),
-    );
+    )
+    .with_dataset_metadata(release.dataset_iri(), release.carries_description());
     let opened = Arc::clone(&service);
     let timed = blocking(&service, work_class, move || {
         let (store, open) = opened.open_observed(target.id())?;
@@ -1340,7 +1467,7 @@ where
 
     let target = Target::body(
         id,
-        operation.path_segment(),
+        operation,
         wants.params().clone(),
         release.prefixes().clone(),
         service.mount().clone(),
@@ -1500,7 +1627,7 @@ pub struct Wants {
     accept: Option<String>,
     if_none_match: Option<IfNoneMatch>,
     /// Exact absolute URL as the client addressed it, when the request carries
-    /// a usable authority. Fragment RDF needs this for Hydra's page subject.
+    /// a usable authority. TPF RDF needs this for Hydra's page subject.
     request_url: Option<String>,
 }
 
@@ -1657,7 +1784,11 @@ fn respond(
     let body = match representation {
         Representation::Json => resource.to_json(),
         Representation::Html => bytes::Bytes::from(resource.to_html()),
-        Representation::Turtle | Representation::JsonLd | Representation::Markdown => {
+        Representation::NQuads
+        | Representation::TriG
+        | Representation::Turtle
+        | Representation::JsonLd
+        | Representation::Markdown => {
             unreachable!("Resource responses negotiate only JSON and HTML")
         }
     };
@@ -1838,6 +1969,77 @@ impl IntoResponse for Problem {
     }
 }
 
+/// Give every response the encoding metadata a negotiated `200` would carry.
+///
+/// Two headers, and they have to agree across status codes. Compression is
+/// negotiated, so `Vary` must name `accept-encoding`; and an encoded body is not
+/// byte-identical to the identity body, so it must not claim the identity body's
+/// strong validator. `representation::etag` mixes the negotiated representation
+/// into the tag precisely because RFC 9110 §8.8.3 makes each representation its
+/// own entity, and a content coding is part of that same identity.
+///
+/// The hard case is the `304`. It carries no body, so nothing below it adds a
+/// `Content-Encoding` or a `Vary`, and RFC 9110 §15.4.5 still requires it to
+/// carry the `ETag` and `Vary` a `200` to the same request would have sent. A
+/// cache updating stored headers from a `304` (RFC 9111 §4.3.4) would otherwise
+/// drop the field keeping its stored encoded bytes away from a request that
+/// cannot decode them, and record a strong validator for bytes that do not
+/// deserve one.
+///
+/// So both are applied unconditionally rather than to the requests predicted to
+/// compress. Predicting means re-deriving the layer below's negotiation, and its
+/// parser is private to that crate: it reads every `Accept-Encoding` field line
+/// as one list, accepts `x-gzip` as `gzip`, and weighs qualities. Every drift
+/// between the two readings lands as a weak `200` answered by a strong `304` —
+/// the exact disagreement this exists to prevent, reachable by nothing worse
+/// than an unusual spelling. An unconditional rule cannot drift.
+///
+/// It costs a strong validator on identity responses, and that is free here.
+/// Strong validators are only required for `Range` and `If-Match`, and this
+/// server implements neither; `If-None-Match` compares weakly (RFC 9110
+/// §13.1.2), so revalidation is unaffected. A weak tag also states the truth
+/// that a shared one asserts: the encoded and identity bodies are semantically
+/// equivalent, not byte-identical. Adding `Range` support later would mean
+/// revisiting this.
+async fn mark_encoding_negotiated(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    declare_encoding_vary(response.headers_mut());
+    // Only a strong tag needs weakening, and only a well-formed one is touched:
+    // anything else is left exactly as the handler set it.
+    let weakened = response.headers().get(ETAG).and_then(|tag| {
+        let bytes = tag.as_bytes();
+        (bytes.first() == Some(&b'"')).then(|| {
+            let mut value = Vec::with_capacity(bytes.len() + 2);
+            value.extend_from_slice(b"W/");
+            value.extend_from_slice(bytes);
+            value
+        })
+    });
+    if let Some(value) = weakened
+        && let Ok(value) = HeaderValue::from_bytes(&value)
+    {
+        response.headers_mut().insert(ETAG, value);
+    }
+    response
+}
+
+/// Append `accept-encoding` to `Vary` unless it is already named.
+///
+/// The compression layer below adds it to the responses it handles; this covers
+/// the ones it never sees, a `304` above all. Appending rather than inserting
+/// keeps the `Accept` and CORS entries other layers contribute.
+fn declare_encoding_vary(headers: &mut HeaderMap) {
+    let already = headers.get_all(VARY).iter().any(|value| {
+        value
+            .as_bytes()
+            .split(|byte| *byte == b',')
+            .any(|field| field.trim_ascii().eq_ignore_ascii_case(b"accept-encoding"))
+    });
+    if !already {
+        headers.append(VARY, HeaderValue::from_static("accept-encoding"));
+    }
+}
+
 /// Render every error response in the client's representation, with a code.
 ///
 /// Two jobs, and the second is why this is a layer rather than a helper. A
@@ -1891,7 +2093,11 @@ async fn render_problems(
             Representation::Html.content_type(),
             bytes::Bytes::from(problem.to_html(mount)),
         ),
-        Representation::Turtle | Representation::JsonLd | Representation::Markdown => {
+        Representation::NQuads
+        | Representation::TriG
+        | Representation::Turtle
+        | Representation::JsonLd
+        | Representation::Markdown => {
             unreachable!("problem negotiation resolves to JSON or HTML")
         }
     };
@@ -2034,6 +2240,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_health_probe_is_answered_without_touching_a_bundle() {
+        let response = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(health());
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        // A cached probe reports on the cache, not the process.
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+    }
+
+    #[test]
+    fn a_static_root_route_wins_against_the_dataset_wildcard() {
+        // The reserved-id rule exists because of this precedence, and the
+        // precedence is the router's rather than ours. Registered wildcard
+        // first, so the test would fail if matching ever became order-sensitive
+        // instead of static-first.
+        use tower::ServiceExt as _;
+
+        let router: Router = Router::new()
+            .route("/{dataset}", get(|| async { "dataset" }))
+            .route(HEALTH_PATH, get(|| async { "health" }));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let answered = |path: &str| {
+            let response = runtime
+                .block_on(
+                    router
+                        .clone()
+                        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap()),
+                )
+                .unwrap();
+            runtime.block_on(async {
+                let bytes = axum::body::to_bytes(response.into_body(), 64)
+                    .await
+                    .unwrap();
+                String::from_utf8(bytes.to_vec()).unwrap()
+            })
+        };
+
+        assert_eq!(answered(HEALTH_PATH), "health");
+        assert_eq!(answered("/tox"), "dataset");
+    }
+
+    #[test]
+    fn every_static_root_route_is_refused_as_a_dataset_id() {
+        // The two lists are the same fact written twice; nothing else keeps
+        // them together.
+        assert_eq!(
+            HEALTH_PATH.strip_prefix('/'),
+            Some(RESERVED_DATASET_IDS[0]),
+            "the reserved list must name the route that shadows the wildcard"
+        );
+        assert_eq!(RESERVED_DATASET_IDS.len(), 1);
+    }
+
+    #[test]
     fn the_query_method_is_a_method() {
         // If this ever stops holding, RFC 10008 is not expressible on this
         // stack and the choice of stack has to be revisited.
@@ -2087,6 +2355,8 @@ mod tests {
         // the `hydra:next` that continuation is spelled with.
         for representation in [
             Representation::Json,
+            Representation::NQuads,
+            Representation::TriG,
             Representation::Turtle,
             Representation::JsonLd,
             Representation::Markdown,

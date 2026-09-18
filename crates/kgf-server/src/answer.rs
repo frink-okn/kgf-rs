@@ -45,13 +45,15 @@ use std::rc::Rc;
 
 use bytes::Bytes;
 use maud::html;
-use oxrdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term as RdfTerm, Triple};
+use oxrdf::{
+    BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term as RdfTerm, Triple,
+};
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 
 use hdtc::format::{TextScanPosition, TextSearcher, parse_literal};
 use kgf_store::catalog::BundleId;
-use kgf_store::dict::Dictionary;
+use kgf_store::dict::{DictPosition, Dictionary, RoleCounts, ScanFlow, ScannedTerm};
 use kgf_store::pattern::{IdPattern, Selection};
 use kgf_store::{
     ClassPropertyStop, ClassRelationStop, IdTriple, Role, SchemaCollection,
@@ -59,6 +61,7 @@ use kgf_store::{
     Store, TermId,
 };
 
+use crate::access::AccessOperation;
 use crate::cursor::{Cursor, CursorBinding, CursorToken, PositionSpace, StaleCursor};
 use crate::envelope::{
     BudgetReason, Cardinality, Completeness, ErrorCode, Problem, TruncationReason,
@@ -68,14 +71,15 @@ use crate::html::{
     Crumb, Resource, TermText, Value, fields, group_digits, json_body, note, operation_page,
     operation_page_with_format, page, pager, results_table, stats, table,
 };
-use crate::rdf::{GraphFormat, serialize_graph};
-use crate::representation::Representation;
+use crate::rdf::{GraphFormat, serialize_dataset, serialize_graph};
+use crate::representation::{RdfSyntax, Representation};
 use crate::request::{
     self, BindingPattern, BindingRow, BoundTerm, Candidates, Direction, Pattern, Position,
-    ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter,
+    ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter, role_name,
+    term_role_name,
 };
 use crate::skolem::SkolemScope;
-use crate::term::{LiteralKind, PrefixMap, Term, TermCache};
+use crate::term::{DictionaryTermError, LiteralKind, PrefixMap, Term, TermCache, serialized_bytes};
 use crate::url::{self, Mount, Params};
 use kgf_verbalize::{Bound, Rendered as Verbalized, Unknown, Verbalizer};
 
@@ -92,7 +96,7 @@ use kgf_verbalize::{Bound, Rendered as Verbalized, Unknown, Verbalizer};
 #[derive(Debug, Clone)]
 pub struct Target {
     id: BundleId,
-    operation: &'static str,
+    operation: AccessOperation,
     params: Params,
     prefixes: PrefixMap,
     /// Where the deployment is mounted. Every link this answer renders — the
@@ -101,10 +105,19 @@ pub struct Target {
     mount: Mount,
     body: bool,
     has_search: bool,
+    /// Logical dataset identity and the description link this release can
+    /// actually answer, from the immutable manifest.
+    dataset: Option<DatasetMetadata>,
     /// The exact absolute GET URL received over HTTP. Hydra metadata keys its
     /// page controls by this IRI, so a merely equivalent canonical URL is not
     /// enough for an LDF client looking up controls for its request URL.
     request_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DatasetMetadata {
+    iri: String,
+    void_available: bool,
 }
 
 impl Target {
@@ -113,7 +126,7 @@ impl Target {
     /// mount its links are built against.
     pub fn new(
         id: BundleId,
-        operation: &'static str,
+        operation: AccessOperation,
         params: Params,
         prefixes: PrefixMap,
         mount: Mount,
@@ -124,7 +137,7 @@ impl Target {
     /// A GET target with the release capabilities its page may expose.
     pub(crate) fn get(
         id: BundleId,
-        operation: &'static str,
+        operation: AccessOperation,
         params: Params,
         prefixes: PrefixMap,
         mount: Mount,
@@ -140,13 +153,28 @@ impl Target {
             body: false,
             has_search,
             request_url,
+            dataset: None,
         }
+    }
+
+    /// Attach the release's logical dataset identity and whether its VoID
+    /// description is a real published capability.
+    pub(crate) fn with_dataset_metadata(
+        mut self,
+        dataset_iri: Option<&str>,
+        void_available: bool,
+    ) -> Self {
+        self.dataset = dataset_iri.map(|iri| DatasetMetadata {
+            iri: iri.to_owned(),
+            void_available,
+        });
+        self
     }
 
     /// A body-addressed operation, whose request cannot be reconstructed as a link.
     pub fn body(
         id: BundleId,
-        operation: &'static str,
+        operation: AccessOperation,
         params: Params,
         prefixes: PrefixMap,
         mount: Mount,
@@ -160,6 +188,7 @@ impl Target {
             body: true,
             has_search: false,
             request_url: None,
+            dataset: None,
         }
     }
 
@@ -177,8 +206,11 @@ impl Target {
     /// [`origin`](Self::origin) for the absolute form: the origin is
     /// `scheme://authority` alone, so the prefix appears exactly once.
     fn base(&self) -> String {
-        self.mount
-            .operation(&self.id.dataset, &self.id.version, self.operation)
+        self.mount.operation(
+            &self.id.dataset,
+            &self.id.version,
+            self.operation.path_segment(),
+        )
     }
 
     /// The origin on which the request arrived.
@@ -203,12 +235,43 @@ impl Target {
         Some(format!("{}{}", self.origin()?, self.next(token)?))
     }
 
+    fn tpf_page_url(&self) -> Option<String> {
+        self.request_url.as_deref().map(url::encode_rdf_iri)
+    }
+
+    /// The canonical TPF fragment identity: the request parameters without
+    /// controls that select a representation, page size, or resume position.
+    /// Page one and every continuation therefore name the same fragment even
+    /// when the client ordered or escaped its original parameters differently.
+    fn tpf_fragment_url(&self) -> Option<String> {
+        let params = self
+            .params
+            .without("cursor")
+            .without("limit")
+            .without("format");
+        Some(format!("{}{}", self.origin()?, query(self.base(), &params)))
+    }
+
+    fn absolute_void(&self) -> Option<String> {
+        Some(format!(
+            "{}{}",
+            self.origin()?,
+            self.mount
+                .operation(&self.id.dataset, &self.id.version, "void")
+        ))
+    }
+
+    fn is_tpf(&self) -> bool {
+        self.operation == AccessOperation::Tpf
+    }
+
     /// This response's URL, with the representation selector removed.
     ///
-    /// [`page`] appends `format=json` to build the footer link, and a URL that
-    /// already carried `format=html` would come back with the parameter twice —
-    /// which this server's own parser refuses. Dropping it is also the more
-    /// honest reading of "canonical": one resource, several representations.
+    /// The page appends its machine representation selector to build the
+    /// footer link, and a URL that already carried `format=html` would come
+    /// back with the parameter twice — which this server's own parser refuses.
+    /// Dropping it is also the more honest reading of "canonical": one
+    /// resource, several representations.
     fn canonical(&self) -> Option<String> {
         (!self.body).then(|| query(self.base(), &self.params.without("format")))
     }
@@ -239,14 +302,16 @@ impl Target {
                 self.mount
                     .operation(&self.id.dataset, &self.id.version, "manifest"),
             ),
-            Crumb::here(self.operation),
+            Crumb::here(self.operation.path_segment()),
         ]
     }
 
     fn title(&self) -> String {
         format!(
             "{} — {} {}",
-            self.operation, self.id.dataset, self.id.version
+            self.operation.path_segment(),
+            self.id.dataset,
+            self.id.version
         )
     }
 
@@ -265,14 +330,22 @@ impl Target {
 
     fn operation_label(&self) -> &'static str {
         match self.operation {
-            "fragment" => "Fragment",
-            "count" => "Count",
-            "describe" => "Describe",
-            "sample" => "Sample",
-            "search" => "Search",
-            "schema" => "Schema",
-            "labels" => "Labels",
-            operation => operation,
+            AccessOperation::Fragment => "Fragment",
+            AccessOperation::Tpf => "Triple Pattern Fragment",
+            AccessOperation::Count => "Count",
+            AccessOperation::Describe => "Describe",
+            AccessOperation::Sample => "Sample",
+            AccessOperation::Search => "Search",
+            AccessOperation::Terms => "Terms",
+            AccessOperation::Schema => "Schema",
+            AccessOperation::Labels => "Labels",
+            AccessOperation::Verbalize => "Verbalize",
+            AccessOperation::Void => "void",
+            AccessOperation::Summary => "summary",
+            AccessOperation::Manifest => "manifest",
+            AccessOperation::Service => "service",
+            AccessOperation::Dataset => "dataset",
+            AccessOperation::Latest => "latest",
         }
     }
 
@@ -285,7 +358,7 @@ impl Target {
                 &self.mount,
                 &self.id.dataset,
                 &self.id.version,
-                self.operation,
+                self.operation.path_segment(),
                 &self.params,
                 self.has_search,
             )
@@ -387,12 +460,134 @@ fn match_kind(kind: hdtc::format::MatchKind) -> &'static str {
     }
 }
 
+/// A bound parameter that matched nothing, and why.
+///
+/// Two very different situations produce the same empty answer, and only the
+/// server can tell them apart. "This bundle does not hold that term" is a fact
+/// about the data, remedied by asking a different bundle. "Blank-node syntax
+/// does not address anything here" is a fact about the API, remedied by sending
+/// the scoped IRI the response would have carried — and it is the one a client
+/// is most likely to hit by copying a term out of a browser page, where a blank
+/// node is shown as `_:{section}-{local-id}` for legibility.
+#[derive(Debug, Clone, Copy, Serialize)]
+struct AbsentTerm {
+    parameter: &'static str,
+    reason: AbsentReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AbsentReason {
+    /// A well-formed term whose spelling this bundle's dictionary does not hold.
+    NotInBundle,
+    /// Blank-node syntax, which addresses no term in any bundle by design.
+    BlankNode,
+}
+
+impl AbsentTerm {
+    fn new(parameter: &'static str, term: &BoundTerm) -> Self {
+        Self {
+            parameter,
+            reason: if term.denotes_blank_node() {
+                AbsentReason::BlankNode
+            } else {
+                AbsentReason::NotInBundle
+            },
+        }
+    }
+
+    /// The one sentence a browser page says about it.
+    fn explanation(&self) -> String {
+        match self.reason {
+            AbsentReason::NotInBundle => {
+                format!(
+                    "`{}` names a term this release does not hold",
+                    self.parameter
+                )
+            }
+            AbsentReason::BlankNode => format!(
+                "`{}` is written as a blank node, which addresses nothing here — \
+                 use the scoped IRI this API publishes for it",
+                self.parameter
+            ),
+        }
+    }
+}
+
+/// One term of a row, in both spellings the server needs.
+///
+/// They differ for exactly one term shape. A stored blank node is published as
+/// this bundle's scoped IRI, because a `_:` label means nothing outside the
+/// document it was parsed from — but label lookup still has to find the term in
+/// the dictionary, which knows it only by that label. Holding both is what lets
+/// the response name a node the way the API does while the page still labels it.
+#[derive(Debug, Clone)]
+struct RowTerm {
+    /// What a response carries, and what its byte accounting weighs.
+    published: Rc<str>,
+    /// The dictionary spelling, which `locate` matches and labels key on.
+    stored: Rc<str>,
+}
+
+/// Terms as this API publishes them, memoized for one request.
+///
+/// [`TermCache`] materializes and measures a term as the dictionary spells it.
+/// This adds the one substitution the wire makes, and memoizes that separately
+/// so a blank node repeated down a page is formatted and weighed once rather
+/// than once per row — the same reason the cache underneath it exists.
+struct PublishedTerms {
+    blank_nodes: SkolemScope,
+    published: HashMap<(Role, u64), (Rc<str>, u64)>,
+}
+
+impl PublishedTerms {
+    fn new(blank_nodes: SkolemScope) -> Self {
+        Self {
+            blank_nodes,
+            published: HashMap::new(),
+        }
+    }
+
+    /// The term's two spellings, and the bytes its published term object takes.
+    fn measured(
+        &mut self,
+        cache: &mut TermCache,
+        dictionary: &Dictionary<'_>,
+        role: Role,
+        id: TermId,
+    ) -> Result<(RowTerm, u64), DictionaryTermError> {
+        let (stored, serialized) = cache.measured(dictionary, role, id)?;
+        if let Some((published, serialized)) = self.published.get(&(role, id.0)) {
+            return Ok((
+                RowTerm {
+                    published: Rc::clone(published),
+                    stored,
+                },
+                *serialized,
+            ));
+        }
+        let Some(iri) = self.blank_nodes.iri(role, id, &stored) else {
+            return Ok((
+                RowTerm {
+                    published: Rc::clone(&stored),
+                    stored,
+                },
+                serialized,
+            ));
+        };
+        let published: Rc<str> = Rc::from(iri.as_str());
+        let serialized = serialized_bytes(&Term::Iri(Cow::Borrowed(published.as_ref())));
+        self.published
+            .insert((role, id.0), (Rc::clone(&published), serialized));
+        Ok((RowTerm { published, stored }, serialized))
+    }
+}
+
 /// One result row: a term per variable, and for `/describe` which side of the
 /// neighborhood it came from.
 #[derive(Debug, Clone)]
 pub struct Row {
-    cells: Vec<(Position, Rc<str>)>,
-    triple: IdTriple,
+    cells: Vec<(Position, RowTerm)>,
     binding: Option<u32>,
     direction: Option<Direction>,
     ranking: Option<Ranking>,
@@ -417,8 +612,8 @@ impl Serialize for Row {
         if let Some(binding) = self.binding {
             map.serialize_entry(BINDING, &binding)?;
         }
-        for (position, text) in &self.cells {
-            map.serialize_entry(position.as_str(), &Term::from_dictionary(text))?;
+        for (position, term) in &self.cells {
+            map.serialize_entry(position.as_str(), &Term::from_dictionary(&term.published))?;
         }
         if let Some(direction) = self.direction {
             map.serialize_entry(DIRECTION, &direction)?;
@@ -447,9 +642,8 @@ impl Row {
     /// directly above, which is why the two sit together and why
     /// `a_row_weighs_exactly_what_it_serializes` compares them for every shape.
     fn new(
-        cells: Vec<(Position, Rc<str>)>,
+        cells: Vec<(Position, RowTerm)>,
         terms: u64,
-        triple: IdTriple,
         binding: Option<u32>,
         direction: Option<Direction>,
         ranking: Option<Ranking>,
@@ -479,7 +673,6 @@ impl Row {
         }
         Self {
             cells,
-            triple,
             binding,
             direction,
             ranking,
@@ -577,7 +770,7 @@ pub struct Answer {
     /// them apart, so unusual but valid IRIs are accepted at the edge and
     /// reported here if absent.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    absent_terms: Vec<&'static str>,
+    absent_terms: Vec<AbsentTerm>,
     vars: Vec<Position>,
     rows: Vec<Row>,
     #[serde(skip)]
@@ -588,6 +781,10 @@ pub struct Answer {
     /// relation keeps its independently exact row count in `cardinality`.
     #[serde(skip)]
     rdf_cardinality: Option<Cardinality>,
+    /// The effective row limit selected for this request, before byte fitting
+    /// or distinct RDF projection shortens the serialized page.
+    #[serde(skip)]
+    page_limit: u32,
     #[serde(skip)]
     byte_budget: u64,
     #[serde(flatten)]
@@ -617,10 +814,10 @@ pub struct Answer {
 
 impl Renders for Answer {
     fn render(mut self, representation: Representation) -> Result<Rendered, Problem> {
-        let body = match representation {
-            Representation::Turtle => self.fit_fragment_rdf(GraphFormat::Turtle)?,
-            Representation::JsonLd => self.fit_fragment_rdf(GraphFormat::JsonLd)?,
-            _ => standard_body(&self, representation),
+        let body = if representation.rdf_syntax().is_some() {
+            self.fit_fragment_rdf(representation)?
+        } else {
+            standard_body(&self, representation)
         };
         let rows = Some(self.rows.len() as u64);
         let cardinality = Some(self.rdf_cardinality.unwrap_or(self.cardinality));
@@ -659,7 +856,10 @@ impl Renders for Answer {
             }
         }
         for row in &self.rows {
-            for (_, text) in &row.cells {
+            for (_, term) in &row.cells {
+                // The dictionary spelling: a published blank-node IRI is not a
+                // term this bundle holds, so it would never resolve a label.
+                let text = term.stored.as_ref();
                 if named(text) && seen.insert(text) {
                     wanted.push(text);
                 }
@@ -705,14 +905,27 @@ impl Renders for Answer {
         let mut cache = TermCache::new();
         let mut labels = HashMap::new();
         for text in wanted {
-            let Some(subject) = dictionary
-                .locate(Role::Subject, text.as_bytes())
-                .map_err(|error| unreadable("looking a term up", &error))?
-            else {
-                continue;
+            // A blank node reaches this in whichever spelling its position put
+            // on the page: a row cell carries the dictionary label, while a
+            // bound position carries the scoped IRI the request named it by.
+            // Both are the same node, so both must find the same label —
+            // otherwise a term is labelled when a row happens to carry it and
+            // bare when the request asked about it.
+            let subject = match reverse_scoped(&dictionary, &self.blank_nodes, Role::Subject, text)?
+            {
+                Some(id) => id,
+                None => {
+                    let Some(id) = dictionary
+                        .locate(Role::Subject, text.as_bytes())
+                        .map_err(|error| unreadable("looking a term up", &error))?
+                    else {
+                        continue;
+                    };
+                    id.0
+                }
             };
             if let Some(label) =
-                preferred_label(store, &dictionary, &mut cache, subject.0, &predicates)?
+                preferred_label(store, &dictionary, &mut cache, subject, &predicates)?
             {
                 labels.insert(text.to_owned(), label);
             }
@@ -726,14 +939,29 @@ const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDF_SUBJECT: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#subject";
 const RDF_PREDICATE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#predicate";
 const RDF_OBJECT: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#object";
+const RDFS_SEE_ALSO: &str = "http://www.w3.org/2000/01/rdf-schema#seeAlso";
 const VOID_DATASET: &str = "http://rdfs.org/ns/void#Dataset";
+const VOID_SUBSET: &str = "http://rdfs.org/ns/void#subset";
+const VOID_IN_DATASET: &str = "http://rdfs.org/ns/void#inDataset";
+const FOAF_PRIMARY_TOPIC: &str = "http://xmlns.com/foaf/0.1/primaryTopic";
 const HYDRA_SEARCH: &str = "http://www.w3.org/ns/hydra/core#search";
 const HYDRA_TEMPLATE: &str = "http://www.w3.org/ns/hydra/core#template";
 const HYDRA_MAPPING: &str = "http://www.w3.org/ns/hydra/core#mapping";
 const HYDRA_VARIABLE: &str = "http://www.w3.org/ns/hydra/core#variable";
 const HYDRA_PROPERTY: &str = "http://www.w3.org/ns/hydra/core#property";
 const HYDRA_TOTAL_ITEMS: &str = "http://www.w3.org/ns/hydra/core#totalItems";
+const HYDRA_ITEMS_PER_PAGE: &str = "http://www.w3.org/ns/hydra/core#itemsPerPage";
 const HYDRA_NEXT: &str = "http://www.w3.org/ns/hydra/core#next";
+const HYDRA_VARIABLE_REPRESENTATION: &str =
+    "http://www.w3.org/ns/hydra/core#variableRepresentation";
+const HYDRA_EXPLICIT_REPRESENTATION: &str =
+    "http://www.w3.org/ns/hydra/core#ExplicitRepresentation";
+
+struct TpfMetadata {
+    page: NamedNode,
+    graph_name: NamedNode,
+    quads: Vec<Quad>,
+}
 
 impl Answer {
     /// Fit a finished RDF document, Hydra metadata included, to the response
@@ -741,10 +969,22 @@ impl Answer {
     /// always advance past it.
     ///
     /// Worst case is `Z·(1 + log limit)` serialized bytes: one complete
-    /// candidate document plus bounded complete-prefix probes. RDF fragments
-    /// are therefore admitted as heavy work.
-    fn fit_fragment_rdf(&mut self, format: GraphFormat) -> Result<Bytes, Problem> {
-        let body = self.fragment_rdf(format)?;
+    /// candidate document plus bounded complete-prefix probes. In practice the
+    /// probes never run at the default budgets, because [`materialize`] has
+    /// already trimmed the page to `max_response_bytes` measured as compact
+    /// JSON and every RDF serialization of those rows is smaller than that
+    /// measure — so the first complete document fits and returns. The search
+    /// below is the guard for the case where it does not: an operator holding
+    /// `max_response_bytes` low enough that it, rather than `limit`, is what
+    /// ends a page. Admission classes this operation by its page, not by this
+    /// worst case; see `WorkClass`.
+    fn fit_fragment_rdf(&mut self, representation: Representation) -> Result<Bytes, Problem> {
+        let metadata = self
+            .target
+            .is_tpf()
+            .then(|| self.tpf_metadata())
+            .transpose()?;
+        let body = self.fragment_rdf(representation, metadata.as_ref())?;
         if body.len() as u64 <= self.byte_budget || self.rows.len() <= 1 {
             return Ok(body);
         }
@@ -752,7 +992,7 @@ impl Answer {
         let total = self.rows.len();
         let encode_prefix = |keep: usize| {
             let next = self.rdf_row_cursor(keep)?;
-            self.fragment_rdf_prefix(format, keep, Some(next.as_str()))
+            self.fragment_rdf_prefix(representation, keep, Some(next.as_str()), metadata.as_ref())
         };
 
         // Grow from one row until the first complete document that does not
@@ -832,20 +1072,32 @@ impl Answer {
         Ok(resume.cursor(binding))
     }
 
-    /// Project an ordinary fragment page into the TPF RDF graph understood by
-    /// stock LDF clients. Native binding answers are body-addressed and never
-    /// negotiate this representation; brTPF's GET transport joins this path
-    /// once its `values=` request parser has normalized the restrictions.
-    fn fragment_rdf(&self, format: GraphFormat) -> Result<Bytes, Problem> {
-        self.fragment_rdf_prefix(format, self.rows.len(), self.completeness.next_cursor())
+    fn fragment_rdf(
+        &self,
+        representation: Representation,
+        metadata: Option<&TpfMetadata>,
+    ) -> Result<Bytes, Problem> {
+        self.fragment_rdf_prefix(
+            representation,
+            self.rows.len(),
+            self.completeness.next_cursor(),
+            metadata,
+        )
     }
 
     fn fragment_rdf_prefix(
         &self,
-        format: GraphFormat,
+        representation: Representation,
         keep: usize,
         next_cursor: Option<&str>,
+        metadata: Option<&TpfMetadata>,
     ) -> Result<Bytes, Problem> {
+        let syntax = representation.rdf_syntax().ok_or_else(|| {
+            Problem::new(
+                ErrorCode::InternalError,
+                "the caller selected a non-RDF fragment representation",
+            )
+        })?;
         if matches!(self.echo, Echo::Describe { .. } | Echo::Sample { .. }) {
             return Err(Problem::new(
                 ErrorCode::InternalError,
@@ -863,7 +1115,7 @@ impl Answer {
                 "the fragment page could not be represented as RDF",
             ));
         }
-        let mut triples = Vec::with_capacity(keep.saturating_add(18));
+        let mut triples = Vec::with_capacity(keep);
         let mut data = HashSet::with_capacity(keep);
         for row in self.rows.iter().take(keep) {
             let cell = |position| {
@@ -880,67 +1132,144 @@ impl Answer {
                 cell(Position::Predicate).expect("every fragment row binds every triple position");
             let object =
                 cell(Position::Object).expect("every fragment row binds every triple position");
+            // No skolemization here: a row is materialized in its published
+            // spelling, so a data blank node is already the scoped IRI and
+            // these see a named node. That is what keeps the RDF and native
+            // representations naming one node the same way.
             let triple = Triple::new(
-                rdf_fragment_subject(
-                    subject.as_bytes(),
-                    TermId(row.triple.subject),
-                    &self.blank_nodes,
-                )?,
+                rdf_subject(subject.as_bytes())?,
                 NamedNode::new(predicate)
                     .map_err(|error| unreadable("parsing an RDF predicate IRI", &error))?,
-                rdf_fragment_object(
-                    object.as_bytes(),
-                    TermId(row.triple.object),
-                    &self.blank_nodes,
-                )?,
+                rdf_object(object.as_bytes())?,
             );
             if data.insert(triple.clone()) {
                 triples.push(triple);
             }
         }
 
+        let next = match (metadata, next_cursor) {
+            (Some(metadata), Some(cursor)) => Some(self.tpf_next(metadata, cursor)?),
+            _ => None,
+        };
+        let prefixes = [("kgfbn", self.blank_nodes.iri_prefix())];
+        let serialized = match syntax {
+            RdfSyntax::Graph(format) => {
+                let mut graph = triples;
+                if let Some(metadata) = metadata {
+                    graph.reserve(metadata.quads.len() + usize::from(next.is_some()));
+                    graph.extend(metadata.quads.iter().map(|quad| {
+                        Triple::new(
+                            quad.subject.clone(),
+                            quad.predicate.clone(),
+                            quad.object.clone(),
+                        )
+                    }));
+                }
+                graph.extend(next);
+                serialize_graph(format, &graph, &prefixes)
+            }
+            RdfSyntax::Dataset(format) => {
+                let metadata_len = metadata.as_ref().map_or(0, |value| value.quads.len());
+                let mut quads =
+                    Vec::with_capacity(triples.len() + metadata_len + usize::from(next.is_some()));
+                quads.extend(
+                    triples
+                        .into_iter()
+                        .map(|triple| triple.in_graph(GraphName::DefaultGraph)),
+                );
+                if let Some(metadata) = metadata {
+                    quads.extend(metadata.quads.iter().cloned());
+                }
+                quads.extend(next.map(|triple| {
+                    triple.in_graph(
+                        metadata
+                            .expect("a TPF next triple has invariant metadata")
+                            .graph_name
+                            .clone(),
+                    )
+                }));
+                serialize_dataset(format, &quads, &prefixes)
+            }
+        };
+        serialized
+            .map(Bytes::from)
+            .map_err(|error| unreadable("serializing fragment RDF", &error))
+    }
+
+    /// Build the TPF control graph. The caller decides whether the syntax can
+    /// preserve its graph name; Turtle necessarily flattens these triples into
+    /// its one graph, while N-Quads, TriG, and JSON-LD keep them named.
+    fn tpf_metadata(&self) -> Result<TpfMetadata, Problem> {
         let page = metadata_iri(
-            self.target.request_url.as_deref().ok_or_else(|| {
+            &self.target.tpf_page_url().ok_or_else(|| {
                 Problem::new(
                     ErrorCode::InternalError,
-                    "an RDF fragment response needs the absolute request URL",
+                    "a TPF response needs the absolute request URL",
                 )
             })?,
-            "the fragment page URL",
+            "the TPF page URL",
+        )?;
+        let fragment = metadata_iri(
+            &self.target.tpf_fragment_url().ok_or_else(|| {
+                Problem::new(
+                    ErrorCode::InternalError,
+                    "a TPF response needs the absolute request URL",
+                )
+            })?,
+            "the TPF fragment URL",
         )?;
         let dataset = metadata_iri(
             &self.target.absolute_base().ok_or_else(|| {
                 Problem::new(
                     ErrorCode::InternalError,
-                    "an RDF fragment response needs the request origin",
+                    "a TPF response needs the request origin",
                 )
             })?,
-            "the fragment dataset URL",
+            "the TPF dataset URL",
+        )?;
+        let metadata_graph = metadata_iri(
+            &format!("{}#metadata", page.as_str()),
+            "the TPF metadata graph IRI",
         )?;
 
-        // Metadata blank-node labels are deterministic because strong ETags
-        // require stable bytes. Data blank nodes have already become stable
-        // HDT-scoped IRIs and therefore cannot merge with these local nodes.
+        // Deterministic labels keep strong validators stable. They are scoped
+        // to the named metadata graph and cannot merge with published data
+        // blank nodes, which have already been replaced by stable IRIs.
         let mut used = HashSet::new();
         let search = metadata_blank_node("kgf-hydra-search", &mut used);
         let mappings = [
             (
-                "s",
+                "subject",
                 RDF_SUBJECT,
-                metadata_blank_node("kgf-hydra-s", &mut used),
+                metadata_blank_node("kgf-hydra-subject", &mut used),
             ),
             (
-                "p",
+                "predicate",
                 RDF_PREDICATE,
-                metadata_blank_node("kgf-hydra-p", &mut used),
+                metadata_blank_node("kgf-hydra-predicate", &mut used),
             ),
             (
-                "o",
+                "object",
                 RDF_OBJECT,
-                metadata_blank_node("kgf-hydra-o", &mut used),
+                metadata_blank_node("kgf-hydra-object", &mut used),
             ),
         ];
-
+        let mut triples = Vec::with_capacity(24);
+        triples.push(Triple::new(
+            metadata_graph.clone(),
+            metadata_iri(FOAF_PRIMARY_TOPIC, "foaf:primaryTopic")?,
+            fragment.clone(),
+        ));
+        triples.push(Triple::new(
+            fragment.clone(),
+            metadata_iri(VOID_SUBSET, "void:subset")?,
+            page.clone(),
+        ));
+        triples.push(Triple::new(
+            dataset.clone(),
+            metadata_iri(VOID_SUBSET, "void:subset")?,
+            fragment,
+        ));
         triples.push(Triple::new(
             dataset.clone(),
             metadata_iri(RDF_TYPE, "rdf:type")?,
@@ -954,7 +1283,21 @@ impl Answer {
         triples.push(Triple::new(
             search.clone(),
             metadata_iri(HYDRA_TEMPLATE, "hydra:template")?,
-            Literal::new_simple_literal(format!("{}{{?s,p,o}}", dataset.as_str())),
+            Literal::new_simple_literal(format!(
+                "{}{{?subject,predicate,object}}",
+                dataset.as_str()
+            )),
+        ));
+        triples.push(Triple::new(
+            search.clone(),
+            metadata_iri(
+                HYDRA_VARIABLE_REPRESENTATION,
+                "hydra:variableRepresentation",
+            )?,
+            metadata_iri(
+                HYDRA_EXPLICIT_REPRESENTATION,
+                "hydra:ExplicitRepresentation",
+            )?,
         ));
         for (variable, property, mapping) in mappings {
             triples.push(Triple::new(
@@ -978,32 +1321,67 @@ impl Answer {
             metadata_iri(HYDRA_TOTAL_ITEMS, "hydra:totalItems")?,
             Literal::from(self.rdf_cardinality.unwrap_or(self.cardinality).value()),
         ));
-        if let Some(cursor) = next_cursor {
+        triples.push(Triple::new(
+            page.clone(),
+            metadata_iri(HYDRA_ITEMS_PER_PAGE, "hydra:itemsPerPage")?,
+            Literal::from(u64::from(self.page_limit)),
+        ));
+        if let Some(dataset_metadata) = &self.target.dataset {
+            let logical = metadata_iri(&dataset_metadata.iri, "the manifest dataset IRI")?;
             triples.push(Triple::new(
-                page,
-                metadata_iri(HYDRA_NEXT, "hydra:next")?,
-                metadata_iri(
-                    &self.target.absolute_next(cursor).ok_or_else(|| {
-                        Problem::new(
-                            ErrorCode::InternalError,
-                            "an RDF fragment continuation needs the request origin",
-                        )
-                    })?,
-                    "the fragment continuation URL",
-                )?,
+                page.clone(),
+                metadata_iri(VOID_IN_DATASET, "void:inDataset")?,
+                logical.clone(),
             ));
+            if dataset_metadata.void_available {
+                triples.push(Triple::new(
+                    logical,
+                    metadata_iri(RDFS_SEE_ALSO, "rdfs:seeAlso")?,
+                    metadata_iri(
+                        &self.target.absolute_void().ok_or_else(|| {
+                            Problem::new(
+                                ErrorCode::InternalError,
+                                "a TPF description link needs the request origin",
+                            )
+                        })?,
+                        "the VoID description URL",
+                    )?,
+                ));
+            }
         }
+        let quads = triples
+            .into_iter()
+            .map(|triple| triple.in_graph(metadata_graph.clone()))
+            .collect();
+        Ok(TpfMetadata {
+            page,
+            graph_name: metadata_graph,
+            quads,
+        })
+    }
 
-        serialize_graph(
-            format,
-            &triples,
-            &[("kgfbn", self.blank_nodes.iri_prefix())],
-        )
-        .map(Bytes::from)
-        .map_err(|error| unreadable("serializing the fragment RDF graph", &error))
+    fn tpf_next(&self, metadata: &TpfMetadata, cursor: &str) -> Result<Triple, Problem> {
+        Ok(Triple::new(
+            metadata.page.clone(),
+            metadata_iri(HYDRA_NEXT, "hydra:next")?,
+            metadata_iri(
+                &self.target.absolute_next(cursor).ok_or_else(|| {
+                    Problem::new(
+                        ErrorCode::InternalError,
+                        "a TPF continuation needs the request origin",
+                    )
+                })?,
+                "the TPF continuation URL",
+            )?,
+        ))
     }
 }
 
+/// The term an RDF fragment row carries at `position`, as published.
+///
+/// A bound position is not a row cell — JSON rows carry variables only — so it
+/// comes from the request, which named it in the one spelling that reaches a
+/// blank node: the scoped IRI. Everything else is the row's published spelling.
 fn rdf_fragment_cell<'a>(
     bound: Option<&'a BoundTerm>,
     row: &'a Row,
@@ -1012,7 +1390,7 @@ fn rdf_fragment_cell<'a>(
     bound.map(BoundTerm::dictionary).or_else(|| {
         row.cells
             .iter()
-            .find_map(|(found, value)| (*found == position).then_some(value.as_ref()))
+            .find_map(|(found, term)| (*found == position).then_some(term.published.as_ref()))
     })
 }
 
@@ -1087,7 +1465,7 @@ pub struct CountAnswer {
     pattern: Pattern,
     count: Cardinality,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    absent_terms: Vec<&'static str>,
+    absent_terms: Vec<AbsentTerm>,
     #[serde(flatten)]
     completeness: Completeness,
     #[serde(skip)]
@@ -1267,6 +1645,10 @@ pub struct SearchAnswer {
     completeness: Completeness,
     #[serde(skip)]
     target: Target,
+    /// Only the page needs this: a subject is already published scoped, and
+    /// HTML spells such a term `_:{section}-{local-id}` for its reader.
+    #[serde(skip)]
+    blank_nodes: SkolemScope,
 }
 
 impl Renders for SearchAnswer {
@@ -1279,6 +1661,174 @@ impl Renders for SearchAnswer {
             rows,
             cardinality: None,
         })
+    }
+}
+
+/// One term a `/terms` page returned.
+///
+/// `roles` is what the merge learned for free: a scan visits every covered
+/// section standing at the same string at once, so the positions a term occupies
+/// come out of the same step that emitted it.
+#[derive(Debug)]
+struct TermRow {
+    published: Rc<str>,
+    roles: Vec<&'static str>,
+    /// Two optional layers, as in a search result: the outer says hydration was
+    /// requested, the inner whether this bundle found a label.
+    label: Option<Option<String>>,
+    serialized: u64,
+}
+
+impl TermRow {
+    fn new(
+        published: Rc<str>,
+        term: u64,
+        roles: Vec<&'static str>,
+        label: Option<Option<String>>,
+    ) -> Self {
+        let roles_serialized = 2
+            + roles
+                .iter()
+                .map(|role| serialized_json_string(role))
+                .sum::<u64>()
+            + roles.len().saturating_sub(1) as u64;
+        let serialized = match &label {
+            None => serialized_object([("term", term), ("roles", roles_serialized)]),
+            Some(label) => serialized_object([
+                ("term", term),
+                ("roles", roles_serialized),
+                ("label", label.as_deref().map_or(4, serialized_json_string)),
+            ]),
+        };
+        Self {
+            published,
+            roles,
+            label,
+            serialized,
+        }
+    }
+}
+
+impl Serialize for TermRow {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("term", &Term::from_dictionary(&self.published))?;
+        map.serialize_entry("roles", &self.roles)?;
+        if let Some(label) = &self.label {
+            map.serialize_entry("label", label)?;
+        }
+        map.end()
+    }
+}
+
+/// `GET /terms`' page of the dictionary under one byte prefix.
+#[derive(Debug, Serialize)]
+pub struct TermsPage {
+    dataset: String,
+    version: String,
+    prefix: String,
+    role: &'static str,
+    /// Distinct terms the prefix matches in this role, exactly.
+    ///
+    /// Carried with the page for the reason a fragment page carries its own:
+    /// bracketing the prefix is what produced the page, so the total is already
+    /// known and a client should not have to spend a second request to learn how
+    /// far it is through the scan.
+    cardinality: Cardinality,
+    terms: Vec<TermRow>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+    /// Only the page needs this: a scanned term is already published scoped, and
+    /// HTML spells such a term `_:{section}-{local-id}` for its reader.
+    #[serde(skip)]
+    blank_nodes: SkolemScope,
+}
+
+/// `GET /terms?count=true`' exact number of distinct terms under one prefix.
+#[derive(Debug, Serialize)]
+pub struct TermsCount {
+    dataset: String,
+    version: String,
+    prefix: String,
+    role: &'static str,
+    /// The requested role's count, in the shape `/count` uses.
+    count: Cardinality,
+    /// Every role's count, always.
+    ///
+    /// The four numbers come out of the same four bracketing searches, so three
+    /// of them are free — and the breakdown is what the question behind this
+    /// operation actually asks. "Does this dataset use MONDO" is answered by
+    /// *how*: as subjects, as objects it links to, or as predicates. A client
+    /// fanning one probe across a federation would otherwise send four.
+    counts: RoleBreakdown,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+}
+
+/// One count per term position, and one over all of them.
+#[derive(Debug, Serialize)]
+pub struct RoleBreakdown {
+    subject: u64,
+    predicate: u64,
+    object: u64,
+    /// Distinct terms over every position, which is not the sum of the other
+    /// three: a shared term is both a subject and an object, and a predicate may
+    /// repeat either.
+    any: u64,
+}
+
+impl From<RoleCounts> for RoleBreakdown {
+    fn from(counts: RoleCounts) -> Self {
+        Self {
+            subject: counts.subject(),
+            predicate: counts.predicate(),
+            object: counts.object(),
+            any: counts.any(),
+        }
+    }
+}
+
+/// The two shapes `GET /terms` answers in.
+///
+/// An enum rather than a page with an optional count, because the count is not a
+/// summary of the page: it is the answer to a different question, computed
+/// without enumerating anything.
+#[derive(Debug)]
+pub enum TermsAnswer {
+    /// A page of terms.
+    Page(TermsPage),
+    /// One exact count.
+    Count(TermsCount),
+}
+
+impl Renders for TermsAnswer {
+    fn render(self, representation: Representation) -> Result<Rendered, Problem> {
+        match self {
+            Self::Page(page) => {
+                let body = standard_body(&page, representation);
+                let rows = Some(page.terms.len() as u64);
+                let cardinality = Some(page.cardinality);
+                Ok(Rendered {
+                    body,
+                    completeness: page.completeness,
+                    rows,
+                    cardinality,
+                })
+            }
+            Self::Count(count) => {
+                let body = standard_body(&count, representation);
+                Ok(Rendered {
+                    body,
+                    completeness: count.completeness,
+                    rows: None,
+                    cardinality: Some(count.count),
+                })
+            }
+        }
     }
 }
 
@@ -1964,7 +2514,11 @@ fn standard_body(resource: &impl Resource, representation: Representation) -> By
     match representation {
         Representation::Json => resource.to_json(),
         Representation::Html => Bytes::from(resource.to_html()),
-        Representation::Turtle | Representation::JsonLd | Representation::Markdown => {
+        Representation::NQuads
+        | Representation::TriG
+        | Representation::Turtle
+        | Representation::JsonLd
+        | Representation::Markdown => {
             unreachable!("ordinary operations negotiate only JSON and HTML")
         }
     }
@@ -2359,7 +2913,10 @@ pub fn void(
                 cardinality: None,
             });
         }
-        Representation::Json | Representation::Markdown => {
+        Representation::Json
+        | Representation::NQuads
+        | Representation::TriG
+        | Representation::Markdown => {
             unreachable!("/void negotiation does not offer this representation")
         }
     };
@@ -2400,7 +2957,10 @@ pub fn summary(
             };
             Bytes::from(resource.to_html())
         }
-        Representation::Turtle | Representation::JsonLd => {
+        Representation::NQuads
+        | Representation::TriG
+        | Representation::Turtle
+        | Representation::JsonLd => {
             unreachable!("/summary negotiation does not offer RDF representations")
         }
     };
@@ -2522,20 +3082,6 @@ fn rdf_subject(term: &[u8]) -> Result<NamedOrBlankNode, Problem> {
         .map_err(|error| unreadable("parsing a VoID subject IRI", &error))
 }
 
-fn rdf_fragment_subject(
-    term: &[u8],
-    id: TermId,
-    blank_nodes: &SkolemScope,
-) -> Result<NamedOrBlankNode, Problem> {
-    let text = rdf_text(term)?;
-    if let Some(iri) = blank_nodes.iri(Role::Subject, id, text) {
-        return NamedNode::new(iri)
-            .map(Into::into)
-            .map_err(|error| unreadable("skolemizing an RDF blank-node subject", &error));
-    }
-    rdf_subject(term)
-}
-
 fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
     if let Some(literal) = parse_literal(term) {
         let value = rdf_text(literal.value)?.to_owned();
@@ -2560,20 +3106,6 @@ fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
     NamedNode::new(text)
         .map(Into::into)
         .map_err(|error| unreadable("parsing a VoID object IRI", &error))
-}
-
-fn rdf_fragment_object(
-    term: &[u8],
-    id: TermId,
-    blank_nodes: &SkolemScope,
-) -> Result<RdfTerm, Problem> {
-    let text = rdf_text(term)?;
-    if let Some(iri) = blank_nodes.iri(Role::Object, id, text) {
-        return NamedNode::new(iri)
-            .map(Into::into)
-            .map_err(|error| unreadable("skolemizing an RDF blank-node object", &error));
-    }
-    rdf_object(term)
 }
 
 fn rdf_text(bytes: &[u8]) -> Result<&str, Problem> {
@@ -3211,17 +3743,21 @@ fn with_optional_param(params: &Params, name: &str, value: Option<&str>) -> Para
     value.map_or_else(|| params.clone(), |value| params.with(name, value))
 }
 
-/// `GET /fragment` — enumerate a triple pattern.
-pub fn get_fragment(
-    store: &Store,
-    target: Target,
-    request: &request::GetFragment,
-) -> Result<Answer, Problem> {
+/// `GET /tpf` — enumerate a TPF or bindings-restricted TPF pattern.
+pub fn tpf(store: &Store, target: Target, request: &request::Tpf) -> Result<Answer, Problem> {
+    if !target.is_tpf() {
+        tracing::error!(
+            operation = ?target.operation,
+            "a typed TPF request was paired with a non-TPF response target"
+        );
+        return Err(Problem::new(
+            ErrorCode::InternalError,
+            "the TPF request was routed to the wrong response target",
+        ));
+    }
     match request {
-        request::GetFragment::Plain(request) => fragment(store, target, request),
-        request::GetFragment::Values(request) | request::GetFragment::Variables(request) => {
-            binding_fragment(store, target, request)
-        }
+        request::Tpf::Plain(request) => fragment(store, target, request),
+        request::Tpf::Values(request) => binding_fragment(store, target, request),
     }
 }
 
@@ -3465,6 +4001,7 @@ pub fn search(
     request: &request::Search,
 ) -> Result<SearchAnswer, Problem> {
     let dictionary = store.dict();
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
     let searcher = searcher(store, &target)?;
     let found = searcher
         .search_up_to(
@@ -3486,6 +4023,7 @@ pub fn search(
     let mut results = Vec::with_capacity(request.limit as usize);
     let mut seen = HashSet::with_capacity(request.limit as usize);
     let mut cache = TermCache::new();
+    let mut published = PublishedTerms::new(blank_nodes.clone());
     let mut resolution_budget = request.candidates.0;
     let mut spent_bytes = 0u64;
     let mut resolution_exhausted = false;
@@ -3521,6 +4059,7 @@ pub fn search(
                     store,
                     &dictionary,
                     &mut cache,
+                    &mut published,
                     &mut seen,
                     &mut results,
                     &mut spent_bytes,
@@ -3567,6 +4106,7 @@ pub fn search(
                         store,
                         &dictionary,
                         &mut cache,
+                        &mut published,
                         &mut seen,
                         &mut results,
                         &mut spent_bytes,
@@ -3616,6 +4156,7 @@ pub fn search(
         results,
         completeness,
         target,
+        blank_nodes,
     })
 }
 
@@ -3624,6 +4165,7 @@ fn push_search_result(
     store: &Store,
     dictionary: &Dictionary<'_>,
     cache: &mut TermCache,
+    published: &mut PublishedTerms,
     seen: &mut HashSet<u64>,
     results: &mut Vec<SearchResult>,
     spent_bytes: &mut u64,
@@ -3637,8 +4179,12 @@ fn push_search_result(
         return Ok(false);
     }
 
-    let (subject, subject_serialized) = cache
-        .measured(dictionary, Role::Subject, TermId(triple.subject))
+    // Published, not stored: a text hit can land on a blank-node subject, and a
+    // result naming it `_:b1` would be a label no client could ask about and
+    // one that collides with every other graph's.
+    let (subject, subject_serialized) = published
+        .measured(cache, dictionary, Role::Subject, TermId(triple.subject))
+        .map(|(term, serialized)| (term.published, serialized))
         .map_err(|error| unreadable("materializing a search subject", &error))?;
     let predicate = cache
         .resolve(dictionary, Role::Predicate, TermId(triple.predicate))
@@ -3745,6 +4291,187 @@ fn resolve_predicate_ids(
         .map(|predicate| locate(dictionary, Role::Predicate, predicate))
         .filter_map(|result| result.transpose())
         .collect()
+}
+
+/// Answer a dictionary prefix scan: a page of terms, or how many there are.
+///
+/// The dictionary is already sorted, so this needs no artifact a bundle does not
+/// have to carry — which is why every release answers it. What it costs is two
+/// binary searches to bracket the prefix and then the page.
+pub fn terms(
+    store: &Store,
+    target: Target,
+    request: &request::Terms,
+) -> Result<TermsAnswer, Problem> {
+    let dictionary = store.dict();
+
+    if request.count {
+        let counts = dictionary
+            .term_counts(request.prefix.as_bytes())
+            .map_err(|error| unreadable("counting a dictionary prefix", &error))?;
+        return Ok(TermsAnswer::Count(TermsCount {
+            dataset: target.id.dataset.clone(),
+            version: target.id.version.clone(),
+            prefix: request.prefix.clone(),
+            role: role_name(request.role),
+            count: Cardinality::exact(counts.of(request.role)),
+            counts: counts.into(),
+            completeness: Completeness::complete(),
+            target,
+        }));
+    }
+
+    // Below the count, which brackets its own four sections: building this for a
+    // request that returns one number would pay for the whole scan twice.
+    let scan = dictionary
+        .terms(request.role, request.prefix.as_bytes())
+        .map_err(|error| unreadable("bracketing a dictionary prefix", &error))?;
+    let cardinality = scan
+        .count()
+        .map_err(|error| unreadable("counting a dictionary prefix", &error))?;
+
+    let after = match &request.cursor {
+        None => None,
+        Some(cursor) => {
+            if cursor.space != PositionSpace::DictionaryPrefix {
+                return Err(Problem::from(StaleCursor));
+            }
+            // The position must name a term *this* scan enumerates. A token for
+            // another prefix or another role decodes and then fails here, which
+            // is the same refusal as a token for another bundle.
+            Some(
+                scan.resume_at(DictPosition::new(cursor.position))
+                    .ok_or(StaleCursor)?,
+            )
+        }
+    };
+
+    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let label_predicates = resolve_predicate_ids(&dictionary, &request.label_predicates)?;
+    let mut cache = TermCache::new();
+    let mut published = PublishedTerms::new(blank_nodes.clone());
+    let mut rows: Vec<TermRow> = Vec::with_capacity(request.limit as usize);
+    let mut spent = 0u64;
+    let mut spent_budget = false;
+    let mut failure = None;
+
+    let stop = scan
+        .page(after, request.limit as usize, |term| {
+            let row = match scanned_row(
+                store,
+                &dictionary,
+                &mut cache,
+                &mut published,
+                &term,
+                request.labels.then_some(label_predicates.as_slice()),
+            ) {
+                Ok(row) => row,
+                Err(problem) => {
+                    failure = Some(problem);
+                    return ScanFlow::Reject;
+                }
+            };
+            spent = spent.saturating_add(row.serialized);
+            // Never on the first row, for the reason a fragment page keeps its
+            // first row: a page that carries nothing would resume exactly where
+            // it was issued, and a client paging on it would never move.
+            if spent > request.bytes.0 && !rows.is_empty() {
+                spent_budget = true;
+                return ScanFlow::Reject;
+            }
+            rows.push(row);
+            ScanFlow::Continue
+        })
+        .map_err(|error| unreadable("paging a dictionary prefix", &error))?;
+    if let Some(problem) = failure {
+        return Err(problem);
+    }
+
+    let completeness = match stop.last.filter(|_| stop.more) {
+        None if stop.more => {
+            // Unreachable: `limit` is at least one, the byte budget always
+            // admits the first row, and a failed row has already returned.
+            // Reported rather than asserted, because a page that kept nothing
+            // and cannot say where to resume is not a page to serve.
+            return Err(unreadable(
+                "paging a dictionary prefix",
+                &"a page that left terms behind kept none of them",
+            ));
+        }
+        None => Completeness::complete(),
+        Some(position) => {
+            let token = Cursor::at_dictionary_position(&request.binding, position).encode();
+            if spent_budget {
+                Completeness::budget_exhausted(BudgetReason::ResponseBytes, token)
+            } else {
+                Completeness::page_limit(token)
+            }
+        }
+    };
+
+    Ok(TermsAnswer::Page(TermsPage {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        prefix: request.prefix.clone(),
+        role: role_name(request.role),
+        cardinality: Cardinality::exact(cardinality),
+        terms: rows,
+        completeness,
+        target,
+        blank_nodes,
+    }))
+}
+
+/// One scanned term as a response row: its published spelling, the positions it
+/// occupies, and its preferred label when one was asked for.
+fn scanned_row(
+    store: &Store,
+    dictionary: &Dictionary<'_>,
+    cache: &mut TermCache,
+    published: &mut PublishedTerms,
+    term: &ScannedTerm<'_>,
+    label_predicates: Option<&[u64]>,
+) -> Result<TermRow, Problem> {
+    // Any role the scan read spells the term the same way, because a published
+    // blank node is named by its section and local id rather than by a role. So
+    // the first one is as good as any, and there is always one.
+    let (role, id) = term
+        .sections()
+        .roles()
+        .find_map(|role| term.id(role).map(|id| (role, id)))
+        .ok_or_else(|| {
+            unreadable(
+                "materializing a scanned term",
+                &"a scanned term has no id in any role its scan read",
+            )
+        })?;
+    let (row_term, serialized) = published
+        .measured(cache, dictionary, role, id)
+        .map_err(|error| unreadable("materializing a scanned term", &error))?;
+
+    let label = match label_predicates {
+        None => None,
+        Some(predicates) => {
+            // A label statement has the term as its subject, so a term the scan
+            // did not read in the subject sections still needs looking up there:
+            // a predicate carries `rdfs:label` like anything else, and refusing
+            // to look would make `role=predicate&labels=true` answer nothing.
+            let subject = match term.id(Role::Subject) {
+                Some(id) => Some(id.0),
+                None => dictionary
+                    .locate(Role::Subject, term.bytes())
+                    .map_err(|error| unreadable("looking a scanned term up", &error))?
+                    .map(|id| id.0),
+            };
+            Some(match subject {
+                None => None,
+                Some(subject) => preferred_label(store, dictionary, cache, subject, predicates)?,
+            })
+        }
+    };
+
+    let roles = term.sections().roles().map(term_role_name).collect();
+    Ok(TermRow::new(row_term.published, serialized, roles, label))
 }
 
 /// First predicate in the frozen cascade with a value, then its lowest object
@@ -4290,7 +5017,7 @@ pub fn describe(
     // Absent in the sense that matters for *this* request: the bundle holds no
     // term that could match it in any of the roles the direction walks.
     let absent_terms = if phases.is_empty() {
-        vec!["iri"]
+        vec![AbsentTerm::new("iri", &request.resource)]
     } else {
         Vec::new()
     };
@@ -4356,7 +5083,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         })
         .collect();
 
-    let (rows, spent_at) = materialize(&dictionary, &vars, &steps, request.bytes)?;
+    let (rows, spent_at) = materialize(&dictionary, &blank_nodes, &vars, &steps, request.bytes)?;
     Ok(Answer {
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
@@ -4370,6 +5097,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         row_resumes: Vec::new(),
         row_binding: None,
         rdf_cardinality: None,
+        page_limit: request.n,
         byte_budget: request.bytes.0,
         vars,
         // A sample stops for one reason only. It is not paged, so `n` is what
@@ -4664,7 +5392,7 @@ fn ranked(
 /// A pattern's ids, or the parameters whose terms the bundle does not hold.
 enum Resolved {
     Ids(IdPattern),
-    Absent(Vec<&'static str>),
+    Absent(Vec<AbsentTerm>),
 }
 
 fn resolve(
@@ -4690,7 +5418,7 @@ fn resolve(
             },
             // Not an error: the term is well formed and simply not in this
             // bundle, so the answer is provably empty rather than unanswerable.
-            None => absent.push(position.as_str()),
+            None => absent.push(AbsentTerm::new(position.as_str(), term)),
         }
     }
     if absent.is_empty() {
@@ -4700,34 +5428,73 @@ fn resolve(
     }
 }
 
+/// Resolve a request term, or `None` when this bundle does not hold it.
+///
+/// Blank-node syntax never resolves, and is never even probed for. A stored
+/// `_:` label belongs to whichever document was loaded, so the same label names
+/// unrelated nodes at different bundles; a lookup that succeeded would join
+/// across knowledge graphs on a coincidence of spelling. Blank nodes are
+/// addressed by the bundle-scoped IRI [`SkolemScope`] mints, whose digest is
+/// what makes the identity refuse to travel. The term is still accepted and
+/// reported as absent rather than rejected, so a client submitting a mixed
+/// batch of IRIs and blank nodes gets one answer instead of a spoiled request.
 fn locate(
     dictionary: &Dictionary<'_>,
     role: Role,
     term: &BoundTerm,
 ) -> Result<Option<u64>, Problem> {
+    if term.denotes_blank_node() {
+        return Ok(None);
+    }
     dictionary
         .locate(role, term.dictionary().as_bytes())
         .map(|found| found.map(|id| id.0))
         .map_err(|error| unreadable("looking a term up", &error))
 }
 
+/// Reverse a scoped blank-node IRI to the dictionary id it names.
+///
+/// The checks are what stop the identity travelling: a URN reverses only
+/// against the bundle whose digest it carries, in a role its section is valid
+/// for, at a local id in range, and only when the term there really is a blank
+/// node. Anything else is an ordinary IRI and resolves — or does not — as one.
+///
+/// Shared by request resolution and by the page's label cascade, because a term
+/// the API names one way has to be recognized the same way wherever it is read.
+fn reverse_scoped(
+    dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    role: Role,
+    text: &str,
+) -> Result<Option<u64>, Problem> {
+    if !matches!(role, Role::Subject | Role::Object) {
+        return Ok(None);
+    }
+    let Some(id) = blank_nodes.role_id(role, text) else {
+        return Ok(None);
+    };
+    let mut buffer = Vec::new();
+    let stored = dictionary
+        .extract(role, id, &mut buffer)
+        .map_err(|error| unreadable("reversing a blank-node IRI", &error))?;
+    Ok(stored.starts_with(b"_:").then_some(id.0))
+}
+
 /// Look up a request term, reversing this HDT's skolem URNs in RDF term roles.
+///
+/// The scoped IRI is the only spelling that reaches a blank node; see
+/// [`locate`], which this shares its refusal with.
 fn locate_scoped(
     dictionary: &Dictionary<'_>,
     blank_nodes: &SkolemScope,
     role: Role,
     term: &BoundTerm,
 ) -> Result<Option<u64>, Problem> {
-    if matches!(role, Role::Subject | Role::Object)
-        && let Some(id) = blank_nodes.role_id(role, term.dictionary())
-    {
-        let mut buffer = Vec::new();
-        let stored = dictionary
-            .extract(role, id, &mut buffer)
-            .map_err(|error| unreadable("reversing a blank-node IRI", &error))?;
-        if stored.starts_with(b"_:") {
-            return Ok(Some(id.0));
-        }
+    if term.denotes_blank_node() {
+        return Ok(None);
+    }
+    if let Some(id) = reverse_scoped(dictionary, blank_nodes, role, term.dictionary())? {
+        return Ok(Some(id));
     }
     dictionary
         .locate(role, term.dictionary().as_bytes())
@@ -4838,7 +5605,7 @@ struct Envelope {
     vars: Vec<Position>,
     directed: bool,
     bindings: bool,
-    absent_terms: Vec<&'static str>,
+    absent_terms: Vec<AbsentTerm>,
     blank_nodes: SkolemScope,
 }
 
@@ -5056,7 +5823,7 @@ fn finish(
     // Materializing is where the bytes appear, so it is where the byte budget
     // applies — before the response exists rather than after, which also bounds
     // the memory a page can take.
-    let (rows, spent_at) = materialize(dictionary, &vars, &steps, paging.bytes)?;
+    let (rows, spent_at) = materialize(dictionary, &blank_nodes, &vars, &steps, paging.bytes)?;
     let row_resumes = steps[..rows.len()].iter().map(Step::row_resume).collect();
 
     // Whichever bound was reached first names the reason and the resume point.
@@ -5089,6 +5856,7 @@ fn finish(
         row_resumes,
         row_binding: Some(paging.binding.clone()),
         rdf_cardinality: None,
+        page_limit: paging.limit,
         byte_budget: paging.bytes.0,
         vars,
         completeness,
@@ -5331,31 +6099,33 @@ fn resume_position(cursor: &Cursor, phase: &Phase<'_>, predicates: u64) -> Resul
 /// removed without replacing it with an equally explicit memory bound.
 fn materialize(
     dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
     vars: &[Position],
     steps: &[Step],
     bytes: ResponseBytes,
 ) -> Result<(Vec<Row>, Option<usize>), Problem> {
     let mut cache = TermCache::new();
+    let mut published = PublishedTerms::new(blank_nodes.clone());
     let mut rows: Vec<Row> = Vec::with_capacity(steps.len());
     let mut spent = 0u64;
     for (index, step) in steps.iter().enumerate() {
         let mut cells = Vec::with_capacity(vars.len());
         let mut terms = 0u64;
         for position in vars {
-            let (text, serialized) = cache
+            let (term, serialized) = published
                 .measured(
+                    &mut cache,
                     dictionary,
                     position.role(),
                     TermId(position.of(step.triple)),
                 )
                 .map_err(|error| unreadable("materializing a term", &error))?;
             terms += serialized;
-            cells.push((*position, text));
+            cells.push((*position, term));
         }
         let row = Row::new(
             cells,
             terms,
-            step.triple,
             step.binding_index,
             step.direction,
             step.ranking,
@@ -6083,12 +6853,18 @@ impl Resource for Answer {
         let canonical = self.target.canonical();
         let heading = self.page_heading();
         let context = self.target.context();
-        operation_page(
+        let alternate = if self.target.is_tpf() {
+            Representation::NQuads
+        } else {
+            Representation::Json
+        };
+        operation_page_with_format(
             &self.target.mount,
             &heading,
             &context,
             &self.target.crumbs(),
             canonical.as_deref(),
+            alternate,
             html! {
                 @if let Some(identifier) = self.described_identifier() {
                     p."focus-identifier" { code { (identifier) } }
@@ -6101,9 +6877,9 @@ impl Resource for Answer {
                 }
                 @if !self.absent_terms.is_empty() {
                     (note(&format!(
-                        "This bundle's dictionary holds no term for {}. The answer is empty for \
-                         that reason, not because the pattern has no matches.",
-                        self.absent_terms.join(", ")
+                        "{}. The answer is empty for that reason, not because the pattern has \
+                         no matches.",
+                        absent_terms_text(&self.absent_terms)
                     )))
                 }
                 @if !self.completeness.is_complete()
@@ -6185,12 +6961,14 @@ impl Answer {
     /// The fields above the table: what was asked, and how much of it came back.
     fn summary<'a>(&'a self, completeness: &'a str) -> Vec<(&'a str, Value<'a>)> {
         let mut summary = match &self.echo {
-            Echo::Fragment { pattern } => pattern_fields(pattern),
-            Echo::BindingsFragment { pattern } => binding_pattern_fields(pattern),
+            Echo::Fragment { pattern } => pattern_fields(pattern, self.target.operation),
+            Echo::BindingsFragment { pattern } => {
+                binding_pattern_fields(pattern, self.target.operation)
+            }
             Echo::Describe { direction, .. } => {
                 vec![("direction", Value::Text(direction.as_str()))]
             }
-            Echo::Sample { pattern, .. } => pattern_fields(pattern),
+            Echo::Sample { pattern, .. } => pattern_fields(pattern, self.target.operation),
         };
         summary.push(("cardinality", Value::Number(self.cardinality.value())));
         summary.push(("returned", Value::Number(self.rows.len() as u64)));
@@ -6255,24 +7033,31 @@ impl Answer {
                 if let Some(pattern) = self.fragment_pattern() {
                     // JSON rows carry variables only. A browser page is a
                     // table of triples, so merge the request's bound terms
-                    // back into their fixed positions for display.
+                    // back into their fixed positions for display. A bound term
+                    // has one spelling — the request's, which for a blank node
+                    // is already the scoped IRI, since nothing else resolves.
                     for position in Position::ALL {
-                        let text =
-                            pattern
-                                .bound(position)
-                                .map(BoundTerm::dictionary)
-                                .or_else(|| {
-                                    row.cells
-                                        .iter()
-                                        .find(|(row_position, _)| *row_position == position)
-                                        .map(|(_, text)| text.as_ref())
-                                });
-                        if let Some(text) = text {
-                            cells.push(self.cell(text));
+                        let found = pattern
+                            .bound(position)
+                            .map(|bound| (bound.dictionary(), bound.dictionary()))
+                            .or_else(|| {
+                                row.cells
+                                    .iter()
+                                    .find(|(row_position, _)| *row_position == position)
+                                    .map(|(_, term)| {
+                                        (term.published.as_ref(), term.stored.as_ref())
+                                    })
+                            });
+                        if let Some((published, stored)) = found {
+                            cells.push(self.cell(published, stored));
                         }
                     }
                 } else {
-                    cells.extend(row.cells.iter().map(|(_, text)| self.cell(text)));
+                    cells.extend(
+                        row.cells
+                            .iter()
+                            .map(|(_, term)| self.cell(&term.published, &term.stored)),
+                    );
                 }
                 if let Some(direction) = row.direction {
                     cells.push(Cell::text(direction.as_str().to_owned()));
@@ -6291,17 +7076,29 @@ impl Answer {
     /// This is what makes the page a way *into* the data rather than a dump of
     /// it: a subject, predicate or object links to its own neighborhood, a
     /// literal to every triple carrying it.
-    fn cell<'a>(&'a self, text: &'a str) -> Cell<'a> {
+    /// `published` is what the cell shows and links to; `stored` is the
+    /// dictionary spelling the page's labels were resolved against.
+    fn cell<'a>(&'a self, published: &'a str, stored: &'a str) -> Cell<'a> {
         let mut cell = term_cell(
             &self.target,
-            text,
-            self.page_labels.get(text).map(String::as_str),
+            &self.blank_nodes,
+            published,
+            self.page_labels.get(stored).map(String::as_str),
         );
-        if self.described.as_deref() == Some(text) {
+        if self.described.as_deref() == Some(published) {
             cell.href = None;
         }
         cell
     }
+}
+
+/// The page's sentence about parameters that matched nothing.
+fn absent_terms_text(absent: &[AbsentTerm]) -> String {
+    absent
+        .iter()
+        .map(AbsentTerm::explanation)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The one line a page says about completeness, honestly: the actual
@@ -6332,6 +7129,7 @@ impl Resource for SearchAnswer {
             .map(|result| {
                 term_cell(
                     &self.target,
+                    &self.blank_nodes,
                     &result.subject,
                     result.label.as_ref().and_then(Option::as_deref),
                 )
@@ -6340,7 +7138,14 @@ impl Resource for SearchAnswer {
         let predicates: Vec<_> = self
             .results
             .iter()
-            .map(|result| term_cell(&self.target, &result.evidence.predicate, None))
+            .map(|result| {
+                term_cell(
+                    &self.target,
+                    &self.blank_nodes,
+                    &result.evidence.predicate,
+                    None,
+                )
+            })
             .collect();
         let scores: Vec<String> = self
             .results
@@ -6428,6 +7233,165 @@ impl Resource for SearchAnswer {
     }
 }
 
+impl TermsPage {
+    /// The same scan, counted instead of paged.
+    ///
+    /// Built from the two parameters that determine the answer rather than from
+    /// the request's own, because a count refuses the page-shaped ones.
+    fn counted(&self) -> String {
+        format!(
+            "{}?prefix={}&role={}&count=true",
+            self.target
+                .mount
+                .operation(&self.target.id.dataset, &self.target.id.version, "terms"),
+            url::encode_value(&self.prefix),
+            self.role,
+        )
+    }
+}
+
+impl Resource for TermsPage {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let cells: Vec<Cell<'_>> = self
+            .terms
+            .iter()
+            .map(|row| {
+                // Every page links a term the same way, predicates included: a
+                // predicate is usually a subject too, carrying its label and its
+                // definition, and `roles` cannot say otherwise — it reports the
+                // sections *this scan read*, so a `role=predicate` scan calls
+                // every row a predicate whether or not the term is described
+                // elsewhere in the graph.
+                term_cell(
+                    &self.target,
+                    &self.blank_nodes,
+                    &row.published,
+                    row.label.as_ref().and_then(Option::as_deref),
+                )
+            })
+            .collect();
+        let roles: Vec<String> = self.terms.iter().map(|row| row.roles.join(", ")).collect();
+        let rows: Vec<Vec<Value<'_>>> = cells
+            .iter()
+            .zip(&roles)
+            .map(|(cell, roles)| vec![cell.value(), Value::Text(roles)])
+            .collect();
+
+        let returned = self.terms.len() as u64;
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        let heading = if self.prefix.is_empty() {
+            "Every term".to_owned()
+        } else {
+            format!("“{}…”", self.prefix)
+        };
+        let counted = self.counted();
+        operation_page(
+            &self.target.mount,
+            &heading,
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" {
+                    (fields(&[
+                        ("prefix", if self.prefix.is_empty() { Value::Text("(none)") } else { Value::Code(&self.prefix) }),
+                        ("role", Value::Text(self.role)),
+                        ("matching", Value::Number(self.cardinality.value())),
+                        ("returned", Value::Number(returned)),
+                        ("complete", Value::Text(completeness_text(&self.completeness))),
+                    ]))
+                }
+                @if let Some(form) = self.target.form() {
+                    div."query-editor" { (form) }
+                }
+                section."section-block" {
+                    h2 { "Terms" }
+                    @if rows.is_empty() {
+                        (note("No term in this role starts with that prefix."))
+                    } @else {
+                        (results_table(&["term", "roles"], &rows))
+                    }
+                }
+                (pager(&counted, "How many in total? →"))
+                @if let Some(token) = self.completeness.next_cursor() {
+                    @if let Some(next) = self.target.next(token) {
+                        (pager(&next, "Next page →"))
+                    }
+                }
+            },
+        )
+    }
+}
+
+impl Resource for TermsCount {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        let heading = if self.prefix.is_empty() {
+            "Every term".to_owned()
+        } else {
+            format!("“{}…”", self.prefix)
+        };
+        let listed = query(
+            self.target
+                .mount
+                .operation(&self.target.id.dataset, &self.target.id.version, "terms"),
+            &self.target.params.without("count"),
+        );
+        operation_page(
+            &self.target.mount,
+            &heading,
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" {
+                    (fields(&[
+                        ("prefix", if self.prefix.is_empty() { Value::Text("(none)") } else { Value::Code(&self.prefix) }),
+                        ("role", Value::Text(self.role)),
+                        ("count", Value::Number(self.count.value())),
+                        ("exact", Value::Text("yes")),
+                    ]))
+                }
+                @if let Some(form) = self.target.form() {
+                    div."query-editor" { (form) }
+                }
+                section."section-block" {
+                    h2 { "By position" }
+                    (results_table(
+                        &["position", "terms"],
+                        &[
+                            vec![Value::Text("subject"), Value::Number(self.counts.subject)],
+                            vec![Value::Text("predicate"), Value::Number(self.counts.predicate)],
+                            vec![Value::Text("object"), Value::Number(self.counts.object)],
+                            vec![Value::Text("any"), Value::Number(self.counts.any)],
+                        ],
+                    ))
+                    (note(
+                        "`any` deduplicates rather than adding up: a term stored as both a \
+                         subject and an object is one term, and a predicate may repeat either."
+                    ))
+                }
+                (note(
+                    "Two binary searches bracket a sorted dictionary section, so these numbers \
+                     cost the same whether they are nought or a million — which is what makes \
+                     this worth asking across a federation before asking for anything else."
+                ))
+                (pager(&listed, "The terms themselves →"))
+            },
+        )
+    }
+}
+
 impl Resource for LabelsAnswer {
     fn to_json(&self) -> Bytes {
         json_body(self)
@@ -6476,7 +7440,7 @@ impl Resource for CountAnswer {
     }
 
     fn to_html(&self) -> String {
-        let mut summary = pattern_fields(&self.pattern);
+        let mut summary = pattern_fields(&self.pattern, self.target.operation);
         summary.push(("count", Value::Number(self.count.value())));
         summary.push((
             "exact",
@@ -6500,8 +7464,8 @@ impl Resource for CountAnswer {
                 }
                 @if !self.absent_terms.is_empty() {
                     (note(&format!(
-                        "This bundle's dictionary holds no term for {}, so nothing can match.",
-                        self.absent_terms.join(", ")
+                        "{}, so nothing can match.",
+                        absent_terms_text(&self.absent_terms)
                     )))
                 }
                 @if self.pattern.text().is_none() {
@@ -6557,7 +7521,7 @@ impl Resource for BindingCountAnswer {
             canonical.as_deref(),
             html! {
                 div."answer-summary" {
-                    (fields(&binding_pattern_fields(&self.pattern)))
+                    (fields(&binding_pattern_fields(&self.pattern, self.target.operation)))
                 }
                 section."section-block" {
                     h2 { "Counts" }
@@ -6573,12 +7537,12 @@ impl Resource for BindingCountAnswer {
 }
 
 /// The three pattern positions, as page fields.
-fn pattern_fields(pattern: &Pattern) -> Vec<(&str, Value<'_>)> {
+fn pattern_fields(pattern: &Pattern, operation: AccessOperation) -> Vec<(&str, Value<'_>)> {
     let mut fields: Vec<_> = Position::ALL
         .into_iter()
         .map(|position| {
             (
-                position.as_str(),
+                pattern_parameter(position, operation),
                 pattern
                     .bound(position)
                     .map_or(Value::Text("(any)"), |term| Value::Code(term.requested())),
@@ -6591,11 +7555,27 @@ fn pattern_fields(pattern: &Pattern) -> Vec<(&str, Value<'_>)> {
     fields
 }
 
-fn binding_pattern_fields(pattern: &BindingPattern) -> Vec<(&str, Value<'_>)> {
+fn binding_pattern_fields(
+    pattern: &BindingPattern,
+    operation: AccessOperation,
+) -> Vec<(&str, Value<'_>)> {
     Position::ALL
         .into_iter()
-        .map(|position| (position.as_str(), Value::Code(pattern.requested(position))))
+        .map(|position| {
+            (
+                pattern_parameter(position, operation),
+                Value::Code(pattern.requested(position)),
+            )
+        })
         .collect()
+}
+
+fn pattern_parameter(position: Position, operation: AccessOperation) -> &'static str {
+    if operation == AccessOperation::Tpf {
+        position.tpf_parameter()
+    } else {
+        position.as_str()
+    }
 }
 
 /// Render one RDF term with this release's prefix map and the same drill-down
@@ -6605,14 +7585,30 @@ fn binding_pattern_fields(pattern: &BindingPattern) -> Vec<(&str, Value<'_>)> {
 /// `/describe` neighborhood; a literal links to every triple carrying it. A
 /// predicate used to link to `/fragment?p=`, but the page a reader wants from
 /// a predicate is what the term *is*, and its usage is one link further.
-fn term_cell<'a>(target: &Target, text: &'a str, annotation: Option<&'a str>) -> Cell<'a> {
+/// One term, and the request that asks about it.
+///
+/// A blank node is shown as `_:{section}-{local-id}` rather than as the scoped
+/// IRI it actually is. `_:` is the one spelling every RDF reader recognizes
+/// without a legend, and the tail is the canonical identity rather than the
+/// parser-local label — but it is a *display* form: nothing expands it and no
+/// parameter accepts it, so the link and the tooltip carry the full IRI, which
+/// is the spelling that works.
+fn term_cell<'a>(
+    target: &Target,
+    blank_nodes: &SkolemScope,
+    text: &'a str,
+    annotation: Option<&'a str>,
+) -> Cell<'a> {
     let term = Term::from_dictionary(text);
     let request = term.to_request();
     let href = match &term {
         Term::Literal(_) => target.ask("fragment", "o", &request),
         _ => target.ask("describe", "iri", &request),
     };
-    let (label, qualifier, full_iri) = term.into_display(&target.prefixes).into_structured();
+    let (label, qualifier, full_iri) = match blank_nodes.display_label(text) {
+        Some(suffix) => (format!("_:{suffix}"), None, Some(Cow::Borrowed(text))),
+        None => term.into_display(&target.prefixes).into_structured(),
+    };
     Cell {
         label,
         qualifier,
@@ -6686,7 +7682,9 @@ mod tests {
     }
 
     #[test]
-    fn fragment_rdf_publishes_data_blank_nodes_as_named_urns() {
+    fn a_published_blank_node_is_a_named_node_in_rdf() {
+        // The materializer is what substitutes the scoped IRI, so by the time
+        // the RDF serializer sees a term there is no blank node left to keep.
         let counts = kgf_store::dict::DictCounts {
             shared: 1,
             subjects: 0,
@@ -6694,18 +7692,18 @@ mod tests {
             predicates: 0,
         };
         let blank_nodes = SkolemScope::new([0xab; 32], counts);
-        let subject = rdf_fragment_subject(b"_:b1", TermId(1), &blank_nodes).unwrap();
-        let object = rdf_fragment_object(b"_:b1", TermId(1), &blank_nodes).unwrap();
-        let expected = blank_nodes.iri(Role::Subject, TermId(1), "_:b1").unwrap();
+        let published = blank_nodes.iri(Role::Subject, TermId(1), "_:b1").unwrap();
 
-        match subject {
-            NamedOrBlankNode::NamedNode(node) => assert_eq!(node.as_str(), expected),
+        match rdf_subject(published.as_bytes()).unwrap() {
+            NamedOrBlankNode::NamedNode(node) => assert_eq!(node.as_str(), published),
             NamedOrBlankNode::BlankNode(_) => panic!("fragment data kept a local blank node"),
         }
-        match object {
-            RdfTerm::NamedNode(node) => assert_eq!(node.as_str(), expected),
+        match rdf_object(published.as_bytes()).unwrap() {
+            RdfTerm::NamedNode(node) => assert_eq!(node.as_str(), published),
             other => panic!("fragment data became {other:?} rather than a named node"),
         }
+        // And the page spells that IRI back as a blank node for a reader.
+        assert_eq!(blank_nodes.display_label(&published), Some("sh-1"));
     }
 
     #[test]
@@ -6758,27 +7756,26 @@ mod tests {
                     ];
                     for score in rankings {
                         for binding in [None, Some(0), Some(12_345)] {
-                            let cells: Vec<(Position, Rc<str>)> = Position::ALL[..width]
+                            let cells: Vec<(Position, RowTerm)> = Position::ALL[..width]
                                 .iter()
-                                .map(|position| (*position, Rc::from(term)))
+                                .map(|position| {
+                                    let text: Rc<str> = Rc::from(term);
+                                    (
+                                        *position,
+                                        RowTerm {
+                                            published: Rc::clone(&text),
+                                            stored: text,
+                                        },
+                                    )
+                                })
                                 .collect();
                             // What the cache would have measured for each cell.
                             let each = serde_json::to_vec(&Term::from_dictionary(term))
                                 .expect("a term serializes")
                                 .len() as u64;
 
-                            let row = Row::new(
-                                cells,
-                                each * width as u64,
-                                IdTriple {
-                                    subject: 1,
-                                    predicate: 1,
-                                    object: 1,
-                                },
-                                binding,
-                                direction,
-                                score,
-                            );
+                            let row =
+                                Row::new(cells, each * width as u64, binding, direction, score);
                             assert_eq!(
                                 row.serialized,
                                 serde_json::to_vec(&row).expect("a row serializes").len() as u64,

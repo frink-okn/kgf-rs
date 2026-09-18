@@ -70,10 +70,14 @@ pub(crate) struct Inputs<'a> {
     pub(crate) data: &'a Path,
     /// Stable dataset IRI, already validated as an absolute IRI.
     pub(crate) dataset_iri: &'a str,
-    /// Prefix tables, layered with later files winning.
+    /// The bundle's prefix map, already layered. Written out as the one table
+    /// the namespace inventory counts against, so the identity the inventory
+    /// publishes is the digest of exactly what the manifest declares.
+    pub(crate) prefixes: &'a BTreeMap<String, String>,
+    /// The files that map was layered from. Named in diagnostics only: the
+    /// inventory reads the finished map from scratch, and scratch is gone by
+    /// the time anyone reads an error about it.
     pub(crate) prefix_tables: &'a [PathBuf],
-    /// Prefixes layered last of all, above every table.
-    pub(crate) extra_prefixes: &'a BTreeMap<String, String>,
     /// What the summary card says about the dataset.
     pub(crate) card: DatasetCard<'a>,
     /// Scratch directory for intermediates that are not published.
@@ -103,8 +107,8 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
         runner,
         data,
         dataset_iri,
+        prefixes,
         prefix_tables,
-        extra_prefixes,
         card,
         work,
     } = inputs;
@@ -193,32 +197,45 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
     write(&into.join("class-relations.tsv"), &relations.bytes)?;
     write(&into.join("class-properties.tsv"), &class_properties.bytes)?;
 
-    let mut namespace_tables = prefix_tables.to_vec();
-    if !extra_prefixes.is_empty() {
-        // Layered last, above every table: the shared OKN table is the base and
-        // a per-dataset binding wins over it.
-        let extra = work.join("dataset-prefixes.json");
-        write(&extra, &serde_json::to_vec_pretty(extra_prefixes)?)?;
-        namespace_tables.push(extra);
-    }
+    // One table, the manifest's own map, rather than the configured files and
+    // the dataset's bindings handed over separately. The inventory merges what
+    // it is given and publishes the digest of the result, so giving it the
+    // finished map is what makes that digest the manifest's identity too.
+    let table_path = work.join("prefixes.json");
+    write(&table_path, &serde_json::to_vec_pretty(prefixes)?)?;
     let namespaces_path = into.join("namespaces.json");
-    let mut namespace_args = vec![OsString::from("namespaces")];
-    for table in &namespace_tables {
-        namespace_args.push(OsString::from("--prefixes"));
-        namespace_args.push(table.as_os_str().to_owned());
-    }
-    namespace_args.extend([
+    let namespace_args = vec![
+        OsString::from("namespaces"),
+        OsString::from("--prefixes"),
+        table_path.into_os_string(),
         OsString::from("--output"),
         namespaces_path.as_os_str().to_owned(),
         OsString::from("--format"),
         OsString::from("json"),
         data.as_os_str().to_owned(),
-    ]);
-    runner.run(&super::hdtc::Step {
-        name: "namespace inventory",
-        args: namespace_args,
-        temp: None,
-    })?;
+    ];
+    runner
+        .run(&super::hdtc::Step {
+            name: "namespace inventory",
+            args: namespace_args,
+            temp: None,
+        })
+        .with_context(|| {
+            let sources = if prefix_tables.is_empty() {
+                "no shared tables".to_owned()
+            } else {
+                prefix_tables
+                    .iter()
+                    .map(|table| table.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!(
+                "the namespace inventory refused the layered prefix map, built from {sources} \
+                 under the config's own semantics.prefixes; the merged table it read was in \
+                 scratch and is gone once this build unwinds"
+            )
+        })?;
     let mut namespaces: Value = serde_json::from_slice(
         &std::fs::read(&namespaces_path)
             .with_context(|| format!("reading {}", namespaces_path.display()))?,

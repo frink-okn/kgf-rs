@@ -524,8 +524,7 @@ fn a_missing_prefix_table_fails_before_anything_is_built() {
     let source = dir.path().join("tiny.nt");
     std::fs::write(&source, SOURCE).unwrap();
     let out = dir.path().join("root/tinykg/2026-06-01");
-    let config =
-        format!("{CONFIG}contents: {{stats: {{prefix_tables: ['/nope/missing.json']}}}}\n");
+    let config = format!("{CONFIG}  prefix_tables: ['/nope/missing.json']\n");
 
     let stderr = kgf(
         &[
@@ -553,6 +552,239 @@ fn a_missing_prefix_table_fails_before_anything_is_built() {
     // The same config still passes `--check-config`, which cannot know the
     // paths of the machine that will run the build.
     kgf(&["build", "--config", "-", "--check-config"], &config).ok();
+}
+
+/// The shared tables are the bundle's prefix map, not only the namespace
+/// inventory's: an IRI the inventory counts under `obo:` must also render as
+/// `obo:…` and be writable as one in a request. Both readers get the one
+/// layered map, later tables winning and the dataset's own bindings last, and
+/// the identity the inventory publishes is that map's.
+#[test]
+fn prefix_tables_are_layered_into_the_manifest_and_the_inventory() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nt");
+    std::fs::write(&source, SOURCE).unwrap();
+    let shared = dir.path().join("shared.yaml");
+    std::fs::write(
+        &shared,
+        concat!(
+            "# the federation's table, quoted and commented as the registry writes it\n",
+            "obo: \"http://purl.obolibrary.org/obo/\"\n",
+            "chebi: \"http://old.example/CHEBI_\"\n",
+            "ex: \"http://table.example/\"\n",
+        ),
+    )
+    .unwrap();
+    let local = dir.path().join("local.json");
+    std::fs::write(
+        &local,
+        r#"{"chebi": "http://purl.obolibrary.org/obo/CHEBI_"}"#,
+    )
+    .unwrap();
+    let out = dir.path().join("root/tinykg/2026-06-01");
+    let config = format!(
+        "{CONFIG}  prefix_tables: ['{}', '{}']\n",
+        path(&shared),
+        path(&local)
+    );
+
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &config,
+    )
+    .ok();
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    let prefixes = manifest["prefixes"].as_object().unwrap();
+    // From the first table.
+    assert_eq!(prefixes["obo"], "http://purl.obolibrary.org/obo/");
+    // A later table wins over an earlier one.
+    assert_eq!(prefixes["chebi"], "http://purl.obolibrary.org/obo/CHEBI_");
+    // The dataset's own binding wins over every table.
+    assert_eq!(prefixes["ex"], "http://example.org/");
+    // The well-known four are declared whatever the tables say.
+    assert_eq!(
+        prefixes["rdf"],
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+    );
+
+    // The inventory counted against the same map. Its published identity is
+    // whatever hdtc computes for a table holding exactly the manifest's
+    // prefixes, established by asking hdtc rather than by restating its
+    // recipe here. The dataset's binding beat the table's there as well.
+    let inventory: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("stats/namespaces.json")).unwrap()).unwrap();
+    let manifest_table = dir.path().join("manifest-prefixes.json");
+    std::fs::write(
+        &manifest_table,
+        serde_json::to_vec(&manifest["prefixes"]).unwrap(),
+    )
+    .unwrap();
+    let reference = dir.path().join("reference-namespaces.json");
+    let status = Command::new(hdtc())
+        .args([
+            "namespaces",
+            "--prefixes",
+            path(&manifest_table),
+            "--output",
+            path(&reference),
+            "--format",
+            "json",
+            path(&out.join("data.hdt")),
+        ])
+        .status()
+        .expect("run hdtc namespaces");
+    assert!(
+        status.success(),
+        "hdtc namespaces over the manifest's prefixes"
+    );
+    let reference: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&reference).unwrap()).unwrap();
+    assert_eq!(
+        inventory["prefix_table"]["version"],
+        reference["prefix_table"]["version"]
+    );
+    let ex = inventory["namespaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["prefix"] == "ex")
+        .expect("ex occurs in the source and is counted");
+    assert_eq!(ex["namespace"], "http://example.org/");
+}
+
+/// A table entry no request could use is refused, naming the file and the
+/// entry, before anything is created or run. The table used to be read only
+/// by the namespace inventory, the last step of the whole pipeline.
+#[test]
+fn a_malformed_prefix_table_fails_before_anything_is_built() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nt");
+    std::fs::write(&source, SOURCE).unwrap();
+    let table = dir.path().join("bad.yaml");
+    std::fs::write(&table, "\"has space\": \"http://x.example/\"\n").unwrap();
+    let out = dir.path().join("root/tinykg/2026-06-01");
+    let config = format!("{CONFIG}  prefix_tables: ['{}']\n", path(&table));
+
+    let stderr = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &config,
+    )
+    .err();
+    assert!(stderr.contains("bad.yaml"), "{stderr}");
+    assert!(stderr.contains("has space"), "{stderr}");
+    assert!(
+        !out.parent().unwrap().exists(),
+        "the build created its dataset directory before reading the table"
+    );
+}
+
+/// The rehearsal reads the tables too. A `--dry-run` that passed on a table
+/// the real build refuses would be a pre-flight that lies.
+#[test]
+fn a_dry_run_reads_the_prefix_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nt");
+    std::fs::write(&source, SOURCE).unwrap();
+    let out = dir.path().join("root/tinykg/2026-06-01");
+    let good = dir.path().join("good.yaml");
+    std::fs::write(&good, "obo: \"http://purl.obolibrary.org/obo/\"\n").unwrap();
+    let bad = dir.path().join("bad.yaml");
+    std::fs::write(&bad, "\"has space\": \"http://x.example/\"\n").unwrap();
+    let dry_run = |table: &Path| {
+        kgf(
+            &[
+                "build",
+                "--config",
+                "-",
+                "--out",
+                path(&out),
+                "--input",
+                path(&source),
+                "--dry-run",
+            ],
+            &format!("{CONFIG}  prefix_tables: ['{}']\n", path(table)),
+        )
+    };
+
+    let stdout = dry_run(&good).ok();
+    // The well-known four, `ex` from the config, `obo` from the table.
+    assert!(
+        stdout.contains("prefix map: 6 bindings, 1 table(s)"),
+        "{stdout}"
+    );
+
+    let stderr = dry_run(&bad).err();
+    assert!(stderr.contains("bad.yaml"), "{stderr}");
+    assert!(stderr.contains("has space"), "{stderr}");
+    assert!(!out.parent().unwrap().exists(), "a dry run creates nothing");
+}
+
+/// A role predicate written as a CURIE against a *table* prefix parses as an
+/// IRI with an odd scheme, so the config check, which cannot read tables,
+/// lets it through. The build, which can, must not freeze it into the
+/// manifest.
+#[test]
+fn a_role_predicate_spelled_as_a_table_curie_is_caught_by_the_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nt");
+    std::fs::write(&source, SOURCE).unwrap();
+    let out = dir.path().join("root/tinykg/2026-06-01");
+    let table = dir.path().join("shared.yaml");
+    std::fs::write(&table, "obo: \"http://purl.obolibrary.org/obo/\"\n").unwrap();
+    let config = format!(
+        concat!(
+            "schema: 1\n",
+            "dataset: {{id: tinykg, iri: 'https://purl.org/okn/frink/kg/tinykg'}}\n",
+            "semantics:\n",
+            "  prefix_tables: ['{}']\n",
+            "  roles: {{label: ['obo:IAO_0000118']}}\n",
+        ),
+        path(&table)
+    );
+
+    // The check has no table to read, so the token is an IRI as far as it knows.
+    kgf(&["build", "--config", "-", "--check-config"], &config).ok();
+
+    let stderr = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &config,
+    )
+    .err();
+    assert!(stderr.contains("obo:IAO_0000118"), "{stderr}");
+    assert!(stderr.contains("expanded IRI"), "{stderr}");
+    assert!(!out.parent().unwrap().exists(), "nothing was staged");
 }
 
 /// `--adopt` must not cost the caller their input when the build fails.

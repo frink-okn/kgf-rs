@@ -38,6 +38,15 @@ const TEXT_LIMIT: usize = 200;
 /// Records the writer thread may fall behind by before new ones are dropped.
 const QUEUE_CAPACITY: usize = 4096;
 
+/// How long a health probe may take and still count as uneventful.
+///
+/// The probe handler does no I/O and touches no bundle, so its own work is
+/// unmeasurable; everything in this budget is the stack around it. Exceeding it
+/// means the runtime could not schedule a trivial handler promptly — thread
+/// starvation, or a process stalled on page faults elsewhere — which is the
+/// condition a probe exists to surface, so a slow one is recorded.
+const PROBE_QUIET: Duration = Duration::from_millis(100);
+
 /// One structured record emitted for one HTTP request.
 ///
 /// Optional fields serialize as `null`. The raw-tier fields — `user_agent`,
@@ -286,6 +295,8 @@ impl Drop for QueuedLines {
 pub enum AccessOperation {
     /// Triple-pattern enumeration.
     Fragment,
+    /// Triple Pattern Fragments compatibility resource.
+    Tpf,
     /// Cardinality lookup.
     Count,
     /// Resource neighborhood.
@@ -294,6 +305,8 @@ pub enum AccessOperation {
     Sample,
     /// Entity search.
     Search,
+    /// Dictionary prefix scan.
+    Terms,
     /// Description graph navigation.
     Schema,
     /// VoID description.
@@ -323,10 +336,12 @@ impl AccessOperation {
     pub fn path_segment(self) -> &'static str {
         match self {
             Self::Fragment => "fragment",
+            Self::Tpf => "tpf",
             Self::Count => "count",
             Self::Describe => "describe",
             Self::Sample => "sample",
             Self::Search => "search",
+            Self::Terms => "terms",
             Self::Schema => "schema",
             Self::Void => "void",
             Self::Summary => "summary",
@@ -447,6 +462,18 @@ pub enum RequestShape {
         limit: u32,
         /// Whether preferred labels were requested.
         labels: bool,
+    },
+    /// Dictionary prefix scan.
+    Terms {
+        /// Prefix size in bytes.
+        prefix_len: u64,
+        /// Which dictionary sections the scan reads.
+        role: &'static str,
+        /// Requested page size; `null` when the request asks only for a count.
+        limit: Option<u32>,
+        /// Whether preferred labels were requested; `null` for a count, which
+        /// has no rows to label and refuses the parameter.
+        labels: Option<bool>,
     },
     /// Preferred-label batch.
     Labels {
@@ -786,8 +813,10 @@ impl InFlight {
         );
         if let Some((sink, pending)) = self.recording.take() {
             let outcome = Outcome::of(&mut response);
-            let request_id = std::mem::take(&mut self.request_id);
-            sink.record(&pending.record(request_id, Some(outcome)));
+            if !pending.is_uneventful_probe(&outcome) {
+                let request_id = std::mem::take(&mut self.request_id);
+                sink.record(&pending.record(request_id, Some(outcome)));
+            }
         }
         response
     }
@@ -822,6 +851,31 @@ impl Outcome {
 }
 
 impl Pending {
+    /// Whether this request was a health probe that went exactly as it should.
+    ///
+    /// Kubelet and the load balancer between them probe several times a
+    /// second, forever, and a successful probe carries nothing this log exists
+    /// to collect: no dataset, no operation, no shape, no representation. Left
+    /// in, they are effectively all of the log on a quiet service, and the real
+    /// requests are unfindable.
+    ///
+    /// The route is matched rather than the User-Agent. Sniffing `kube-probe/`
+    /// and `GoogleHC/` would be a guess about a header any client can send, and
+    /// getting it wrong hides real traffic; a dedicated path is what the probe
+    /// was pointed at, so this is exact.
+    ///
+    /// Only the uneventful ones are dropped. A non-200 is recorded, and so is a
+    /// success too slow to be plausible ([`PROBE_QUIET`]) — those are the
+    /// probes worth having. So is one abandoned before a response: that never
+    /// reaches here, because `Drop` emits it. The census argument for recording
+    /// abandoned requests does not apply either way, since a probe admits no
+    /// bundle work that outlives it.
+    fn is_uneventful_probe(&self, outcome: &Outcome) -> bool {
+        self.route.as_deref() == Some(crate::routes::HEALTH_PATH)
+            && outcome.status == 200
+            && self.started.elapsed() < PROBE_QUIET
+    }
+
     /// The record for a response, or for a request abandoned without one.
     fn record(self, request_id: String, outcome: Option<Outcome>) -> AccessRecord {
         let (status, code, problem_representation, bytes_out, observation) = match outcome {
@@ -954,6 +1008,14 @@ fn classify(user_agent: Option<&str>) -> ClientClass {
     }
 }
 
+/// The operation a matched route belongs to, for records no handler reached.
+///
+/// [`Observation`] carries the operation once a handler runs, so this is the
+/// fallback for everything that stops earlier: a method the route does not take,
+/// an admission refusal, a connection abandoned before the response. Forgetting
+/// an entry is silent — the record simply says `null` and cannot be attributed —
+/// which is why `every_versioned_operation_is_recoverable_from_its_route` builds
+/// each route from [`AccessOperation::path_segment`] and checks the round trip.
 fn operation_for_route(route: &str) -> Option<AccessOperation> {
     match route {
         "/" => Some(AccessOperation::Service),
@@ -961,10 +1023,12 @@ fn operation_for_route(route: &str) -> Option<AccessOperation> {
         "/{dataset}/latest/{*rest}" => Some(AccessOperation::Latest),
         "/{dataset}/v/{version}/manifest" => Some(AccessOperation::Manifest),
         "/{dataset}/v/{version}/fragment" => Some(AccessOperation::Fragment),
+        "/{dataset}/v/{version}/tpf" => Some(AccessOperation::Tpf),
         "/{dataset}/v/{version}/count" => Some(AccessOperation::Count),
         "/{dataset}/v/{version}/describe" => Some(AccessOperation::Describe),
         "/{dataset}/v/{version}/sample" => Some(AccessOperation::Sample),
         "/{dataset}/v/{version}/search" => Some(AccessOperation::Search),
+        "/{dataset}/v/{version}/terms" => Some(AccessOperation::Terms),
         "/{dataset}/v/{version}/schema" => Some(AccessOperation::Schema),
         "/{dataset}/v/{version}/void" => Some(AccessOperation::Void),
         "/{dataset}/v/{version}/summary" => Some(AccessOperation::Summary),
@@ -989,6 +1053,38 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
+
+    /// Every operation mounted under a version must be recoverable from the
+    /// route axum matched, or the records that never reach a handler — a 405, an
+    /// admission refusal, an abandoned connection — cannot be attributed to it.
+    ///
+    /// Built from `path_segment` rather than written out, so the two spellings
+    /// of a route cannot drift apart: adding an operation to that exhaustive
+    /// match and forgetting the lookup table fails here.
+    #[test]
+    fn every_versioned_operation_is_recoverable_from_its_route() {
+        for operation in [
+            AccessOperation::Fragment,
+            AccessOperation::Tpf,
+            AccessOperation::Count,
+            AccessOperation::Describe,
+            AccessOperation::Sample,
+            AccessOperation::Search,
+            AccessOperation::Terms,
+            AccessOperation::Schema,
+            AccessOperation::Void,
+            AccessOperation::Summary,
+            AccessOperation::Labels,
+            AccessOperation::Manifest,
+        ] {
+            let route = format!("/{{dataset}}/v/{{version}}/{}", operation.path_segment());
+            assert_eq!(
+                operation_for_route(&route),
+                Some(operation),
+                "no route table entry for {route}"
+            );
+        }
+    }
     use axum::body::Body;
     use axum::http::StatusCode;
 
@@ -1075,6 +1171,68 @@ mod tests {
         assert_ne!(one.pseudonym("192.0.2.8"), two.pseudonym("192.0.2.8"));
         assert_eq!(one.pseudonym("192.0.2.8").len(), 16);
         assert_ne!(one.request_id(), two.request_id());
+    }
+
+    fn probe(route: &str, started: Instant) -> Pending {
+        Pending {
+            started,
+            method: "GET".to_owned(),
+            route: Some(route.to_owned()),
+            target: None,
+            user_agent: None,
+            client_request_id: None,
+            client_class: ClientClass::Unknown,
+            client_hash: None,
+            forwarded_hash: None,
+            waiting: 0,
+        }
+    }
+
+    fn answered(status: u16) -> Outcome {
+        Outcome {
+            status,
+            code: None,
+            representation: None,
+            bytes_out: Some(3),
+            observation: Observation::default(),
+        }
+    }
+
+    #[test]
+    fn only_an_uneventful_health_probe_goes_unrecorded() {
+        let now = Instant::now();
+        let slow = now.checked_sub(PROBE_QUIET * 2).unwrap();
+
+        // The one case worth dropping: the probe that says nothing happened.
+        assert!(probe(crate::routes::HEALTH_PATH, now).is_uneventful_probe(&answered(200)));
+
+        // A probe that failed is the whole point of having probes.
+        for status in [500, 503, 429, 404] {
+            assert!(
+                !probe(crate::routes::HEALTH_PATH, now).is_uneventful_probe(&answered(status)),
+                "{status}"
+            );
+        }
+
+        // A success this slow means the runtime could not schedule a handler
+        // that does no work, which is a finding rather than noise.
+        assert!(!probe(crate::routes::HEALTH_PATH, slow).is_uneventful_probe(&answered(200)));
+
+        // Nothing else is ever dropped, however quiet. The route is matched, so
+        // no client can hide by claiming to be a prober.
+        for route in ["/", "/{dataset}", "/{dataset}/v/{version}/fragment"] {
+            assert!(
+                !probe(route, now).is_uneventful_probe(&answered(200)),
+                "{route}"
+            );
+        }
+        assert!(
+            !Pending {
+                route: None,
+                ..probe("/", now)
+            }
+            .is_uneventful_probe(&answered(200))
+        );
     }
 
     #[test]

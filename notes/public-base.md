@@ -208,8 +208,9 @@ Three details:
 - The same host carries a `/{kg_name}` route per knowledge graph. `kgf` is not a
   registry shortname today; the registry's CI should refuse one, or the route table
   becomes ambiguous.
-- The health probe: `HealthCheckPolicy` targets the pod, so it probes `/` as the
-  Dockerfile says (`Dockerfile:61`); through the gateway that resource is `/kgf`.
+- The health probe: `HealthCheckPolicy` targets the pod, so it probes `/healthz`
+  directly and the prefix never enters it. `/healthz` is not a resource and no
+  descriptor links to it, so it is the one path the base does not have to reach.
 
 ## 8. Tests
 

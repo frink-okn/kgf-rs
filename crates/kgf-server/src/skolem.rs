@@ -60,6 +60,26 @@ impl SkolemScope {
     /// Foreign, malformed, out-of-range, and wrong-role URNs remain ordinary
     /// named nodes.
     pub(crate) fn role_id(&self, role: Role, term: &str) -> Option<TermId> {
+        let (section, local_id) = self.suffix(term)?;
+        self.counts
+            .role_id(role, SectionTermId::new(section, local_id)?)
+    }
+
+    /// The `{section}-{local-id}` tail of one of this HDT's blank-node URNs.
+    ///
+    /// A human-facing spelling for a term the wire names by its full IRI: a
+    /// page shows `_:sh-7` because `_:` is what an RDF reader recognizes, while
+    /// the IRI it abbreviates stays in the link and the tooltip. Display only —
+    /// nothing expands it, and it is not a spelling any parameter accepts.
+    pub(crate) fn display_label<'a>(&self, term: &'a str) -> Option<&'a str> {
+        // Parsed rather than merely stripped, so a malformed or out-of-range
+        // tail is shown as the ordinary IRI it is treated as everywhere else.
+        self.suffix(term)?;
+        term.strip_prefix(&self.iri_prefix)
+    }
+
+    /// Split a URN of this scope into its section and canonical local id.
+    fn suffix(&self, term: &str) -> Option<(Section, u64)> {
         let local = term.strip_prefix(&self.iri_prefix)?;
         let (section, id) = local.split_once('-')?;
         if id.starts_with('0') || !id.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -71,8 +91,7 @@ impl SkolemScope {
             "o" => Section::Objects,
             _ => return None,
         };
-        self.counts
-            .role_id(role, SectionTermId::new(section, id.parse().ok()?)?)
+        Some((section, id.parse().ok()?))
     }
 }
 

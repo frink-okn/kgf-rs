@@ -60,6 +60,7 @@
 use hdtc::format::{XSD_STRING, encode_literal, parse_literal};
 use kgf_store::dict::Dictionary;
 use kgf_store::{Manifest, Role, TermId};
+use oxrdf::{BlankNodeRef, Literal as RdfLiteral, NamedNodeRef};
 use serde::ser::{Serialize, SerializeMap, Serializer};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -191,11 +192,18 @@ impl PrefixMap {
     /// The prefixes a bundle declares.
     ///
     /// **Bundle-scoped, not request-scoped.** This copies the manifest's map,
-    /// which is cheap once per open and wasteful once per request; a bundle
-    /// declaring the fifty-odd prefixes an OKN graph typically does would
-    /// allocate a hundred strings per request to read something that cannot
-    /// change while the bundle is mapped. Build it beside the `Store` and share
-    /// it.
+    /// which is cheap once per open and wasteful once per request. An OKN
+    /// bundle declares the federation's shared table on top of its own
+    /// bindings, a hundred-odd prefixes and growing, and copying that per
+    /// request would allocate a few hundred strings to read something that
+    /// cannot change while the bundle is mapped. Build it beside the `Store`
+    /// and share it.
+    ///
+    /// [`compact_iri`](Self::compact_iri) is a linear scan of that map per
+    /// rendered IRI. At today's size that is some hundreds of thousands of
+    /// short prefix comparisons on the largest page, a few milliseconds; a
+    /// namespace-keyed index is the change to make if the table grows past
+    /// what that tolerates, not before.
     pub fn from_manifest(manifest: &Manifest) -> Self {
         Self::from_prefixes(manifest.prefixes.clone())
     }
@@ -299,7 +307,16 @@ pub enum TermSyntaxError {
     EmptyIri,
 
     /// `<_:x>`: a blank node wearing an IRI's brackets.
-    #[error("`{token}` brackets a blank node; write it unbracketed, as `_:{label}`")]
+    ///
+    /// The remedy is not "write it unbracketed". A stored blank-node label is
+    /// local to whichever document was loaded, so it addresses nothing here in
+    /// either spelling; sending `_:{label}` would be accepted and then match
+    /// nothing, which is a worse place to leave a client than an error.
+    #[error(
+        "`{token}` brackets the blank node `_:{label}`; a stored label addresses nothing \
+         here, because it means nothing outside the document it was parsed from — ask for \
+         the scoped `urn:fdc:…` IRI this API publishes for that node"
+    )]
     BracketedBlankNode {
         /// The offending token.
         token: String,
@@ -336,6 +353,34 @@ pub enum TermSyntaxError {
     EmptyBlankNodeLabel {
         /// The offending token.
         token: String,
+    },
+
+    /// An IRI in Hydra ExplicitRepresentation that RDF cannot represent.
+    #[error("`{token}` is not an absolute RDF IRI ({detail})")]
+    InvalidExplicitIri {
+        /// The offending token.
+        token: String,
+        /// The RDF parser's reason.
+        detail: String,
+    },
+
+    /// A blank-node label in Hydra ExplicitRepresentation that RDF cannot
+    /// represent.
+    #[error("`{token}` is not a valid RDF blank node ({detail})")]
+    InvalidBlankNode {
+        /// The offending token.
+        token: String,
+        /// The RDF parser's reason.
+        detail: String,
+    },
+
+    /// A language tag that cannot be represented as an RDF literal.
+    #[error("`{token}` has an invalid language tag ({detail})")]
+    InvalidLanguageTag {
+        /// The offending token.
+        token: String,
+        /// The RDF parser's reason.
+        detail: String,
     },
 
     /// Something followed the closing quote that is neither `@` nor `^^`.
@@ -383,7 +428,8 @@ impl<'a> Term<'a> {
             return Err(TermSyntaxError::Empty);
         }
         if text.starts_with('"') {
-            return parse_literal_syntax(text, prefixes).map(Term::Literal);
+            return parse_literal_syntax(text, |datatype| parse_iri_syntax(datatype, prefixes))
+                .map(Term::Literal);
         }
         if let Some(label) = text.strip_prefix("_:") {
             if label.is_empty() {
@@ -394,6 +440,30 @@ impl<'a> Term<'a> {
             return Ok(Term::BlankNode(Cow::Borrowed(label)));
         }
         parse_iri_syntax(text, prefixes).map(Term::Iri)
+    }
+
+    /// Parse Hydra ExplicitRepresentation, whose IRIs are bare and never
+    /// expanded through the manifest prefix map.
+    pub fn parse_explicit(text: &'a str) -> Result<Self, TermSyntaxError> {
+        if text.is_empty() {
+            return Err(TermSyntaxError::Empty);
+        }
+        if text.starts_with('"') {
+            return parse_literal_syntax(text, parse_explicit_iri).map(Term::Literal);
+        }
+        if let Some(label) = text.strip_prefix("_:") {
+            if label.is_empty() {
+                return Err(TermSyntaxError::EmptyBlankNodeLabel {
+                    token: text.to_owned(),
+                });
+            }
+            BlankNodeRef::new(label).map_err(|error| TermSyntaxError::InvalidBlankNode {
+                token: text.to_owned(),
+                detail: error.to_string(),
+            })?;
+            return Ok(Term::BlankNode(Cow::Borrowed(label)));
+        }
+        parse_explicit_iri(text).map(Term::Iri)
     }
 
     /// Read a term out of the bytes the dictionary stores.
@@ -645,7 +715,7 @@ fn parse_iri_syntax<'a>(
 /// through a response and back into a request comes out different.
 fn parse_literal_syntax<'a>(
     text: &'a str,
-    prefixes: &PrefixMap,
+    parse_datatype: impl FnOnce(&'a str) -> Result<Cow<'a, str>, TermSyntaxError>,
 ) -> Result<Literal<'a>, TermSyntaxError> {
     let Some(close) = text.rfind('"').filter(|close| *close > 0) else {
         return Err(TermSyntaxError::UnterminatedLiteral {
@@ -664,6 +734,12 @@ fn parse_literal_syntax<'a>(
                 token: text.to_owned(),
             });
         }
+        RdfLiteral::new_language_tagged_literal("", language).map_err(|error| {
+            TermSyntaxError::InvalidLanguageTag {
+                token: text.to_owned(),
+                detail: error.to_string(),
+            }
+        })?;
         return Ok(Literal::tagged(value, language));
     }
     if let Some(datatype) = suffix.strip_prefix("^^") {
@@ -672,12 +748,20 @@ fn parse_literal_syntax<'a>(
                 token: text.to_owned(),
             });
         }
-        return Ok(Literal::typed(value, parse_iri_syntax(datatype, prefixes)?));
+        return Ok(Literal::typed(value, parse_datatype(datatype)?));
     }
     Err(TermSyntaxError::LiteralSuffix {
         token: text.to_owned(),
         suffix: suffix.to_owned(),
     })
+}
+
+fn parse_explicit_iri(value: &str) -> Result<Cow<'_, str>, TermSyntaxError> {
+    NamedNodeRef::new(value).map_err(|error| TermSyntaxError::InvalidExplicitIri {
+        token: value.to_owned(),
+        detail: error.to_string(),
+    })?;
+    Ok(Cow::Borrowed(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +863,13 @@ impl<'a> Term<'a> {
             "bnode" if value.starts_with("_:") => {
                 Err(malformed("a `bnode` value is the bare label, without `_:`"))
             }
+            // The mirror of `<_:x>` in request syntax: a spelling the
+            // dictionary can only have written as a blank node, refused where
+            // it is written rather than left to resolve as an IRI.
+            "iri" if value.starts_with("_:") => Err(malformed(
+                "an `iri` value may not be a blank-node label; a blank node is addressed \
+                 by the scoped `urn:fdc:…` IRI this API publishes for it",
+            )),
             "iri" => Ok(Term::Iri(Cow::Borrowed(value))),
             "bnode" => Ok(Term::BlankNode(Cow::Borrowed(value))),
             "literal" => match (string("lang")?, string("datatype")?) {
@@ -936,7 +1027,7 @@ impl TermCache {
 }
 
 /// The bytes a term object occupies, without producing them.
-fn serialized_bytes(term: &Term<'_>) -> u64 {
+pub(crate) fn serialized_bytes(term: &Term<'_>) -> u64 {
     struct Counter(u64);
     impl std::io::Write for Counter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -1297,6 +1388,19 @@ mod tests {
                 .to_dictionary(),
             "\"x\"@en-gb"
         );
+    }
+
+    #[test]
+    fn both_request_grammars_validate_language_tags_in_one_parser() {
+        let prefixes = PrefixMap::default();
+        assert!(matches!(
+            Term::parse("\"x\"@not a tag", &prefixes),
+            Err(TermSyntaxError::InvalidLanguageTag { .. })
+        ));
+        assert!(matches!(
+            Term::parse_explicit("\"x\"@not a tag"),
+            Err(TermSyntaxError::InvalidLanguageTag { .. })
+        ));
     }
 
     #[test]

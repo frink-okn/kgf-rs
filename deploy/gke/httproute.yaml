@@ -1,0 +1,33 @@
+# apps.okn.us/kgf -> the server's root. The qlever pattern, not LDF's: the
+# prefix is stripped here and `--public-base` on the server puts it back on
+# every link. PathPrefix matching is per path element, so /kgf and /kgf/... match
+# and /kgfoo does not; ReplacePrefixMatch "/" turns both /kgf and /kgf/ into /.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: frink-kgf-route
+  namespace: frink
+  labels:
+    app: frink-kgf-server
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: ingress-gateway
+      namespace: ingress
+  hostnames:
+    - apps.okn.us
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /kgf
+      filters:
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      backendRefs:
+        - name: frink-kgf-service
+          port: 80

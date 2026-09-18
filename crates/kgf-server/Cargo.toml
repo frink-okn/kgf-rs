@@ -55,3 +55,9 @@ mediatype_021 = { package = "mediatype", version = "0.21" }
 # The hdtc-built golden bundles, so cursor resumption is checked against real
 # enumerations rather than a hand-written stand-in.
 kgf-store = { workspace = true, features = ["testing"] }
+# `ServiceExt::oneshot`, to drive the assembled router in-process. Already in
+# the tree under axum; named here so a test may depend on it. The one thing it
+# is for is checking route precedence, which is a property of the router we
+# rely on rather than of our own code, and therefore worth a test that would
+# notice it changing.
+tower = "0.5"

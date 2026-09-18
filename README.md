@@ -30,6 +30,7 @@ cargo build --workspace
 ## Status
 
 The mapped read layer and HTTP server are operational. `kgf serve` answers all eight
-triple-pattern shapes, exact counts, describe, sample, `o.text`, and bindings-restricted
-QUERY/POST fragment and count requests with bounded paging and stable cursors. `/void`
-and `/summary` remain before this implementation can claim doc 03's core profile.
+triple-pattern shapes, exact counts, describe, sample, search, labels, dictionary prefix
+scans and their exact counts, the description surface, and bindings-restricted
+QUERY/POST fragment and count requests with bounded paging and stable cursors. A dedicated `/tpf` route provides TPF/brTPF with Hydra
+`ExplicitRepresentation`; N-Quads, TriG, and JSON-LD keep its controls in a named graph.

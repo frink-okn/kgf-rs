@@ -17,10 +17,14 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–22 are complete: all of M1 plus `o.text`, bindings, entity search,
+Units 1–29 are complete: all of M1 plus `o.text`, bindings, entity search,
 live labels, the browser workbench, the mandatory description surface, standard RDF
-serialization, stock Comunica TPF/brTPF interoperability, the bundle builder, and
-structured request logging. Each completed unit
+serialization, stock Comunica TPF/brTPF interoperability, the bundle builder,
+structured request logging, public-base mounting, the dedicated `/tpf` route, an
+admission policy measured against the work it classes, the sorted dictionary as an
+operation, a capability gate that fires only where an artifact can be absent, and a
+prefix count that reports every position it was measured cheap enough to report, and
+the review findings that measurement settled. Each completed unit
 carries a **What landed** section written after the fact, which is where a unit's plan
 and its outcome are reconciled.
 
@@ -1420,9 +1424,10 @@ JSON-LD for both `/void` and `/fragment`; handwritten RDF escaping is gone. Frag
 RDF carries a three-mapping Hydra form, exact ordinary-pattern count, and absolute
 page/continuation IRIs keyed to the exact request URL. Complete-document byte fitting
 retains a first-omitted-row cursor rather than interrupting a serializer. RDF fragment
-requests are admitted as heavy work: complete-document fitting is bounded but has the
-same `Z·(1 + log limit)` worst case that doc 03 already records for schema fitting.
-`kgf serve --public-origin https://…` supplied a typed, trusted external origin for
+requests were admitted as heavy work on the reasoning that complete-document fitting
+carries the same `Z·(1 + log limit)` worst case as schema fitting; that classification
+was **withdrawn after measurement** — see "Admission does not price the
+representation" below. `kgf serve --public-origin https://…` supplied a typed, trusted external origin for
 Hydra page, dataset, template, and continuation IRIs behind TLS or host-rewriting
 proxies; forwarded headers remain untrusted unless an embedding deployment handles
 that trust boundary itself. Unit 23 generalized the flag into `--public-base`, which
@@ -1626,24 +1631,464 @@ identities, the page's brand link, form action, and every root-relative link, th
 problem `instance`, and the 404 for the prefixed spelling. The existing root-relative
 assertions in `tests/serve.rs` are the no-base regression suite and needed no edits.
 
+### 24. `/tpf` — a spec-exact Triple Pattern Fragments route ✅
+
+**Implemented 2026-09-08; the work plan is [`notes/tpf-route.md`](tpf-route.md).** This
+reverses unit 20's first paragraph and `notes/comunica-brtpf.md`: TPF and brTPF stop
+being representations of `/fragment` and become a route of their own,
+`GET /{dataset}/v/{version}/tpf{?subject,predicate,object}`, whose term grammar is Hydra
+`ExplicitRepresentation` verbatim (bare IRIs, `"lex"`, `"lex"@tag`, `"lex"^^IRI`,
+nothing else) and whose document puts metadata and controls in a named graph, served as
+N-Quads and TriG first. JSON-LD also preserves that named graph rather than flattening
+controls into its default graph. `/fragment` becomes strictly doc 03 §3.3 in every
+representation, loses `BoundTerm::parse_fragment`, GET `?name` variables and GET
+`values=`, and its RDF representations carry data only.
+
+Why, in one paragraph: the public deployment's Comunica evaluation
+(`../kgf-sparql/docs/public-deployment-comunica-evaluation.md`) found that the
+representation-selected fallback of question 44 accepts bare IRIs but not the bare
+datatype IRI inside a typed literal that the TPF specification prescribes and Comunica
+sends, which 400s and kills the client process on three corpus tasks; that a `values=`
+table with no pattern variable is silently ignored; that Comunica's default `Accept`
+lands on JSON-LD, the one format it parses slowly and with a known streaming bug; and
+that in any single-graph format Comunica cannot separate the Hydra controls from the
+data, so `SELECT ?s ?p ?o` returns them as rows. Selecting the grammar by route rather
+than by `Accept` removes the whole class instead of patching the fallback.
+
+Eight steps, each mergeable: the `ExplicitRepresentation` parser; N-Quads and TriG
+through `oxrdfio`; the two-graph document with `foaf:primaryTopic`/`void:subset`,
+exactly three mappings, `hydra:variableRepresentation`, `hydra:itemsPerPage`, and a
+`void:inDataset` link; the route, `Operation::Tpf`, `AccessOperation::Tpf`, descriptor
+links; stripping `/fragment`; the Comunica conformance harness retargeted to `/tpf`
+with typed-literal, skolem-subject, and no-control-leak assertions; the
+`../kgf-sparql` corpus rerun as the external gate; and the documents. Outbound spec
+edits are question 66.
+
+**What landed.** `/tpf` is a GET-only operation with its own request and cursor
+operation types, access-log identity, descriptor links, and workbench form. RDF and
+bindings-restricted requests were admitted as heavy work with the plain HTML view
+ordinary; only the bindings half of that survived measurement, below. Its parser
+uses conventional `subject`/`predicate`/`object` names and Hydra
+`ExplicitRepresentation`; brTPF `values=` is still parsed by `spargebra`, now rejects
+tables with no pattern column while retaining Comunica's upstream join-context columns,
+and always projects distinct RDF. N-Quads, TriG, and JSON-LD put
+data in the default graph and the complete control document in `<U#metadata>`; Turtle
+necessarily flattens the two. `/fragment` now uses the native grammar for every
+representation, refuses GET variables and `values=`, and emits data-only RDF. Manifest
+prefixes remain bundle metadata: TPF never consults them, while native terms keep IRIs
+and CURIEs disjoint by requiring brackets around an IRI.
+
+Post-implementation review tightened the boundary without changing the route shape:
+plain repeated variables are refused unless `values=` bounds them; TPF terms are any
+literal absolute IRI accepted by the RDF library (including CURIE-looking schemes,
+which are never expanded); the canonical fragment identity excludes `format` as well
+as paging controls; `hydra:itemsPerPage` reports the effective request limit; and
+`rdfs:seeAlso` is emitted only when the release really publishes `/void`. `Target`
+now carries the typed operation, request URLs are escaped into legal RDF IRIs, and
+invariant metadata is constructed once before byte-fitting probes. `Store` deliberately
+continues to admit the `{}` placeholder used while an offline bundle is being assembled,
+and manifests with scheme-named prefixes remain valid because the TPF grammar never
+consults them.
+
+*Verified by* the parser's specification-example tests, `oxrdfio` round trips of every
+format including JSON-LD's named graph, real-listener tests of the document, route
+separation, cursor separation, and `/fragment` refusals, plus the pinned Comunica suite
+against `/tpf`. The `../kgf-sparql` corpus rerun remains the external deployment gate;
+it is not part of this repository's local test suite.
+
 ### What the implementation still is not
 
 **The mandatory core profile is now implemented; M1 alone was not that profile.** Doc
 20 §20.8's M1 omitted bindings-restricted fragments, `/void`, and `/summary`, while
 adding optional `/sample`. Unit 16 supplied the bindings operation, unit 19 supplied
 the complete description surface, and unit 20 made the same `/fragment` operation a
-standard TPF/brTPF RDF source. A current deployment therefore answers `fragment`
-(plain, QUERY/POST bindings, and Comunica's GET `values=` transport), `count`,
+standard TPF/brTPF RDF source (unit 24 moves that surface to its own `/tpf` route). A current deployment therefore answers `fragment`
+(plain plus QUERY/POST bindings), `tpf` (plain plus Comunica's GET `values=` transport), `count`,
 `describe`, `manifest`, `void`, and `summary`. `/sample` and `o.text` remain optional
 extensions rather than conformance requirements.
 
-What remains is beyond that core profile: graph-scoped reads and their four-position
-QPF form; later composed operations such as ranges, stars, and key resolution; and
-doc 04 §4.4's component DAG, which unit 21's `kgf build` recognizes and refuses
-rather than implements.
+M2's read operations are complete with unit 26's `/terms`, whose prefix scan was the
+last of them needing no artifact a bundle does not already carry. What remains is beyond
+the core profile: graph-scoped reads and their four-position QPF form; later composed
+operations such as ranges, stars, and key resolution — the last of which is the half of
+§3.4.8 that needs an index no bundle carries, question 67; and doc 04 §4.4's component
+DAG, which unit 21's `kgf build` recognizes and refuses rather than implements.
 The corresponding decisions recorded below still need to be applied to the sibling
 `../kgf` specifications so the working design and this implementation say the same
 thing.
+
+### 25. Admission does not price the representation ✅
+
+Two rules had accumulated in `GetRequest::work_class` that classed a request by how
+its answer would be spelled: a `/fragment` was heavy in any RDF representation, and
+since `/tpf` offers no JSON, every machine representation of that route was heavy.
+The stated reason was `fit_fragment_rdf`, which binary-searches complete-document
+serializations to fit `max_response_bytes` and so costs `Z·(1 + log limit)` in the
+worst case. Measurement retired the rule on three independent grounds.
+
+**The worst case is unreachable at the default budgets.** `materialize` already trims
+a page to `max_response_bytes` measured as compact JSON, *before* anything is
+serialized. The fitting loop runs only if the RDF document then exceeds that same
+budget — that is, only if RDF is larger than the JSON measure of the identical rows.
+It is not: over a 10 000-row page of DREAM-KG, Turtle came out 3.2× smaller than the
+JSON envelope, N-Quads 2.1×, JSON-LD 2.4×. Reaching the loop needs rows big enough to
+fill 64 MiB (huge literals, where JSON's per-term overhead is proportionally
+smallest) *and* RDF larger than JSON (short IRIs against a long graph name) at the
+same time, which are opposing requirements. The loop is a correct guard and stays;
+`tpf_rdf_byte_fitting_keeps_a_complete_parseable_document_and_cursor` still reaches
+it, by setting `max_response_bytes` a hundred bytes under one page.
+
+**The measured cost is a small constant, and the rule had its sign wrong.** Median
+service time, warm, keep-alive, same page:
+
+| page | JSON | Turtle | N-Quads | JSON-LD | HTML |
+|---|---:|---:|---:|---:|---:|
+| `limit=100` | 0.19 ms | 0.28 ms | 0.29 ms | 0.40 ms | **0.68 ms** |
+| `limit=1000` | 0.89 ms | 1.34 ms | 1.43 ms | 1.77 ms | **4.89 ms** |
+| `limit=10000` | 8.96 ms | 14.69 ms | 14.60 ms | 19.19 ms | — |
+
+RDF costs 1.0–2.1× the JSON page, never the 4× a heavy permit charges, and at the
+default page size the spread across all of them is a few hundred microseconds. The
+HTML page — which resolves a display label per distinct term, real random dictionary
+and index work — costs 2.4–3.6× the Turtle page and was classed ordinary throughout.
+The rule charged the cheapest representation four permits and the most expensive one.
+
+**The gate it entered was not protecting anything.** Driving `/tpf?limit=10000` in
+Turtle at concurrency 32 against the defaults, the request spent p50 52 ms queueing
+for a permit against 17 ms of work, with 23 of 128 waiting slots occupied, while an
+identically sized JSON page queued zero. Reclassifying moves that contention into the
+blocking pool rather than removing it — goodput went 440/s → 522/s at concurrency 16
+and was unchanged at 32, with a longer tail — which is the honest result: the gate was
+reshaping latency for the same throughput, not rationing a scarce resource. It matches
+what `../kgf docs/gcp-deployment-plan.md` §6.0c found from the other direction, that
+heavy traffic starves ordinary traffic *downstream* of the semaphore, so widening the
+heavy class buys no protection.
+
+Doc 03 §3.5 is on the same side: its `fragment` GET row is `O(log N + limit)` with no
+representation term, and `Z·(1 + log limit)` appears only on the `schema` rows. The
+code had grown a cost class the normative table does not carry.
+
+**What landed.** `Fragment::work_class` is heavy iff the pattern carries a text
+constraint, matching `/count`; `Tpf::Plain` delegates to it and `Tpf::Values` stays
+heavy, because brTPF's distinct union really is bounded by `candidate_budget` and
+`O(k²)` normalization rather than by its page. `Fragment::rdf_serialization`,
+`Fragment::parse_represented`, and `Tpf::parse_represented` are deleted; with no
+request type left reading the negotiated representation, the `Representation`
+argument threaded into every `operate`/`operate_represented` parse closure went with
+them. `WorkClass` now states the criterion it is classifying on — *what bounds the
+work*, not what it costs in the large — so the next operation is not argued into the
+class on the strength of feeling expensive.
+
+*Verified by* the request-layer class tests and a new
+`a_page_is_admitted_the_same_way_in_every_representation_it_offers`, which drives one
+page through all six representations of `/fragment` and all five of `/tpf` and asserts
+every access record reads `ordinary`, with a text-filtered fragment beside them
+reading `heavy`.
+
+Two adjacent inconsistencies this surfaced and did **not** fix, both worth their own
+decision:
+
+- `operate_body` hardcodes `WorkClass::Heavy` for every body request rather than
+  deriving it, so `/labels` — a batch dictionary lookup — is classed with a bindings
+  QUERY, and body requests have no `work_class()` at all. Classification lives in two
+  places.
+- If large pages should cost more, `limit` predicts service time far better than the
+  representation does: a JSON page at 10 000 rows costs 32× a Turtle page at 100, and
+  both are ordinary. That would be a uniform rule across representations, and needs
+  its own justification and measurement rather than being smuggled in here.
+
+### 26. `GET /terms` — the sorted dictionary as an operation ✅
+
+**Implemented 2026-09-08.** The last M2 read operation, and the only remaining one that
+needs no artifact a bundle does not already carry: every published release answers it
+against the PFC sections standard HDT already stores sorted. Two shapes at one URL —
+`GET /terms{?prefix,role,count,limit,labels,cursor}` returns a lexicographic page of
+the terms starting with a byte prefix, or with `count=true` their exact number without
+enumerating any of them.
+
+Why this one next, of everything left: the count is the cheapest useful question in the
+protocol. Two binary searches bracket a prefix, so "does this KG use MONDO at all, and
+in which positions" is `O(log D)` per dataset — measured at **1 ms for the whole
+dictionary** of a 95 000-triple release, and unchanged by how many terms match. Fanned
+across the federation that is one round trip per KG to decide which ones are worth
+asking anything else, and until now a client could only approximate it by guessing a
+full IRI and calling `/count`, which tests one term rather than a namespace. The page
+half is the same index read as IRI autocompletion.
+
+Unit 4 left the store side half-built on purpose and said so: `Dictionary::prefix_bounds`
+has been there since M1, unused, with the note that "the server will merge the two
+sorted runs when it implements `/terms`". This is that merge.
+
+**What landed, store side.** `Dictionary::terms(ScanRole, prefix)` brackets each covered
+section and returns a `TermScan`; `TermScan::page` merges the runs and hands each term to
+a visitor, `TermScan::count` answers the count without one. Three decisions carried the
+design:
+
+- **One order over several sections, not several sections in a row.** A subject or
+  object role spans the shared and role-only sections, and `role=any` spans all four.
+  Each is sorted independently, so a lexicographic answer is a merge — and a merge needs
+  the strings, which is why the scan decodes once and visits rather than yielding ids for
+  a caller to re-decode. Set semantics fall out of it: a term in several sections is one
+  row, and *the sections it occupied come free from the same step*. That is what lets a
+  row report `roles: ["subject", "object"]` at no cost, which is more than doc 03 asks
+  for and is the answer to the question a namespace probe is really asking.
+- **A cursor names the last term delivered, not the next positions.** Resuming a merge
+  needs every run advanced past a common boundary, and the boundary is one term. So the
+  token carries one `DictPosition` — a term's position over the four sections taken in
+  order, which is the one number that names a stored term independently of role, since a
+  `TermId` means different terms in different id spaces. Resume costs one block decode
+  plus a binary search per section, and every run skips past the term itself, which is
+  what keeps a multi-section term one row across a page boundary. A set of per-run
+  offsets would have needed one wire field per run and would have let an edited token
+  pair them inconsistently.
+- **The count is exact, including for `role=any`, and says what that costs.** The
+  shared, subject-only, and object-only sections partition their terms by construction,
+  so a single role's count is arithmetic on searches already done. Predicates are the one
+  section whose string can repeat one of the others, so an exact distinct count probes
+  each matching predicate against the rest — bounded by the bundle's published predicate
+  count rather than by the page. That shape was first classed as heavy work on the
+  strength of the bound alone; unit 28 measured it and retracted the class.
+
+**What landed, server side.** `Operation::Terms`, `PositionSpace::DictionaryPrefix`,
+`AccessOperation::Terms`, a `RequestShape::Terms` whose census fields are the prefix's
+*length* and never its bytes, the route, descriptor links, the manifest operation table,
+and a workbench form. `prefix` is deliberately a bare byte prefix rather than a §3.3
+term — question 10 settled that when it required brackets on an IRI — so a leading `<`
+is refused by naming the bare spelling instead of matching nothing. `labels` defaults on
+as it does for `/search`: an unlabelled page of opaque identifiers answers "which terms"
+without answering "which things", and a term the scan met only as a predicate is looked
+up in the subject sections it never read, so a predicate carries its `rdfs:label` like
+anything else. Label bytes are weighed into `max_response_bytes` with the row, and the
+first row of a page is served whatever it costs, for the reason `materialize` has always
+kept its first row: a page that carries nothing hands back a cursor that resumes where it
+was issued.
+
+`count=true` refuses `limit`, `labels`, and `cursor` rather than ignoring them, and the
+form therefore has no count control — the count is reached from the answer page, by a
+link built from the two parameters that determine it. `Capability::Terms` is now derived
+for every bundle, as `sample` and `labels` are, and it is scoped in its own
+documentation to the prefix half: key resolution shares the path in the protocol but
+needs a derived key-to-id index no bundle carries, and QUERY on the route is a plain
+405. The route is not gated on that declaration, for the reason unit 27 gives.
+
+*Verified by* a differential store test that compares all four roles over seven prefixes
+against hdtc's own independent sequential PFC reader, including the term that is both a
+predicate and a shared subject; exhaustive paging at six page sizes per role per prefix,
+asserting the concatenation is the whole scan term for term; refusal of resume points
+naming a term outside the prefix, outside the role, or past the dictionary; the visitor's
+reject path resuming at the term it dropped; and at the HTTP layer, the same
+differential against the dictionary, cursor binding to one prefix and one role, the byte
+budget's truncation reason, and the page's links. On the live demo corpus, `count=true`
+agreed with exhaustive enumeration for every role and prefix tried, paging was identical
+at limits 1, 2, 7, 13 and 97, a 10 000-term page took 20 ms, and the whole-dictionary
+distinct count took 1 ms.
+
+### 27. A capability gate belongs where an artifact can be absent ✅
+
+**Implemented 2026-09-08, out of unit 26's review.** `/terms` was first gated on
+`Capability::Terms` the way `/sample` and `/labels` were gated on theirs, and the
+question that broke it was direct: why is a declaration the authority when the operation
+needs no additional file? It is not, and the rule was imprecise rather than the new
+operation being special.
+
+**What the field is.** The whole capability set is derived from which artifact files a
+bundle carries, so it tells a server holding that bundle nothing it could not work out
+itself. Its audience is the consumer that has the *manifest* and not the bundle — a
+registry building linksets, a mirror verifying a copy, a client choosing among forty
+endpoints — which is why `filters` is declared at all despite gating no operation here.
+
+**What follows.** `search`, `graphs`, and the sketch families stay gated: an artifact
+can genuinely be absent, and answering `g=` from a bundle with no graph sidecar is a
+wrong answer carrying no sign of being wrong. `sample`, `labels`, and `terms` are not
+gated any more. Each composes artifacts every bundle is *required* to carry, so no
+published bundle exists that cannot answer them, their manifest entries restate "yes,
+always", and the only thing such a check can do is fail — suppressing work the bytes
+support because the metadata is older than the code. The demo corpus shows the staleness
+runs both ways: `demo/dreamkg/0.0.5` declares `star` and `export`, which this build does
+not route at all, so a client trusting that list gets a bare 404.
+
+The two questions were being answered by one field, and they are now answered separately.
+The manifest says what the bundle *carries*; the service descriptor's release links say
+what this deployment *routes*, and `sample`, `terms`, and `labels` appear there
+unconditionally. Both `DatasetSummary::capabilities` and `ReleaseLinks` now document
+which of the two they are, because they sit next to each other in one JSON object and
+legitimately disagree in both directions.
+
+One consequence not fixed here: serve startup validates a manifest's id, version, and
+description-artifact set but never its capability list, so an out-of-date list is silent
+rather than loud. `kgf manifest --check` compares declared against derived and demands
+equality, but only when someone runs it. A startup check could derive the expected set
+from the manifest's own `artifacts` map with no I/O at all, which would catch both the
+under- and over-declaring cases without touching the lazy-open design. That is its own
+unit.
+
+Why this could not be fixed by reading the derived set instead: the gate runs in the
+parse closure, *before* the bundle is opened and deliberately so — a refusal must not
+cost an open, still less the fd and eviction machinery on a cold bundle. The manifest is
+the only thing available at that point. So for the artifact-free capabilities the answer
+is not a better source of truth but no check: the build implementing the operation is the
+whole of the fact, and it needs neither.
+
+*Verified by* `an_operation_whose_artifact_a_bundle_lacks_is_refused_before_it_is_opened`
+(withdraw `search` from a text bundle's manifest; `/search` and `o.text` both 501 while
+`/fragment` is untouched) and its counterpart
+`an_operation_needing_no_sidecar_is_not_gated_on_its_declaration` (withdraw all three
+artifact-free entries; `/sample`, `/terms`, `/terms?labels=true` and `QUERY /labels` all
+answer, and all three stay advertised in the descriptor's links).
+
+### 28. What a prefix scan should say, and what it should cost ✅
+
+**Implemented 2026-09-08, out of three questions against unit 26.** All three had the
+same answer and it was measurement, not argument.
+
+**The count was not heavy work.** `Terms::work_class` classed a `role=any` count as heavy
+because its cost is bounded by the bundle's predicate count rather than by a page — the
+letter of unit 25's criterion. Measured against the four widest predicate sets in the
+corpus, warm, median of 25:
+
+| bundle | predicates | `count` `role=any` | `count` `role=subject` | page 100 | page 10 000 | `/fragment` 10 000 |
+|---|---:|---:|---:|---:|---:|---:|
+| climatemodelskg | 119 | **0.36 ms** | 0.20 ms | 0.30 ms | 6.58 ms | 9.66 ms |
+| biobricks-aopwiki | 68 | **0.30 ms** | 0.24 ms | 2.96 ms | 18.28 ms | 8.78 ms |
+| ruralkg | 57 | **0.27 ms** | 0.23 ms | 0.32 ms | 10.17 ms | 7.92 ms |
+| rdkg | 22 | **0.22 ms** | 0.19 ms | 0.29 ms | 7.05 ms | 6.23 ms |
+
+The deduplication probe adds about a tenth of a millisecond at 119 predicates, while an
+*ordinary* page of the same operation costs fifty times the whole request. Four permits
+for the cheapest shape and one for the dearest is the inversion unit 25 found in the
+representation rule and removed; this reproduced it from the other direction, so
+`Terms::work_class` is gone and every shape of `/terms` is ordinary.
+
+`WorkClass`'s own documentation is what allowed it, and now carries the missing half: **a
+different bound is not automatically a large one.** `candidate_budget` is deliberately
+large and a `values=` union is quadratic in its input; a published per-bundle count of a
+few hundred is not a bound worth rationing. The class is a claim about contention, and
+contention is observable — so measure before classifying.
+
+**A page states its own cardinality.** `/fragment` has always returned the exact size of
+the result set beside its rows; `/terms` did not, so a paging client could not tell how
+far through a scan it was without a second request. It does now, exactly, in every role —
+which the measurement above is what made affordable, since exactness in the `any` case is
+the same probe that was mistaken for heavy work. Bracketing the prefix is what produced
+the page, so the number was already in hand.
+
+**A count answers every position, not the one that was asked.** The question behind this
+operation is not "how many MONDO terms" but *how* a dataset uses a namespace, and the
+four numbers fall out of the same four bracketing searches — three of them free. So a
+count response carries `counts: {subject, predicate, object, any}` always, beside the
+requested role's `count` in the shape `/count` uses. `role` keeps its meaning rather than
+being refused on a count, because `?prefix=X&role=predicate&count=true` is what a client
+naturally writes; the breakdown is additive to it. `any` is not the sum of the other
+three and the response says so, in the JSON note and in the HTML table.
+
+Fanned across the demo corpus, one request per dataset, this is the difference between
+knowing a namespace is present and knowing what it is doing there:
+
+```text
+=== http://purl.obolibrary.org/obo/
+  biobricks-aopwiki      subject=    800 predicate=  14 object=   1138 distinct=   1149
+  rdkg                   subject=  33884 predicate=   0 object=  28913 distinct=  33884
+  phaseskg               subject=    176 predicate=  24 object=    161 distinct=    242
+  (12 datasets in 13 ms, one request each)
+```
+
+`rdkg` carries 33 884 OBO terms and no OBO predicates — it uses the ontology as an
+identifier scheme. `phaseskg` carries 24 OBO predicates — it uses it as a vocabulary. A
+single `any` number cannot tell a planner which, and both readings change what a join
+against that dataset should look like.
+
+*Verified by* a store test that checks the breakdown against each role counted alone over
+every fixture prefix, including the term stored as both a shared subject and a predicate;
+the HTTP differential extended to assert the page's cardinality and every number of the
+breakdown against the dictionary; a fixture whose positions add up to more than its
+distinct total, so a regression to summing would fail; and the work-class test extended
+over five `/terms` shapes, all ordinary.
+
+### 29. Three review findings, and what measurement did to them ✅
+
+**Implemented 2026-09-09, from an agent code review of units 26–28.** All three were real;
+one reversed the reviewer's remedy, one reversed a decision of unit 26, and one was
+simply a gap.
+
+**The `any` count is bounded, and stays exact.** The finding was that deduplicating
+`role=any` loops over every matching predicate with no cap, against a normative
+`O(log D + limit)`, and could monopolise an ordinary admission slot. Two facts had to be
+established rather than argued. First, unit 28 had made it *worse* than the review
+described: adding the page's exact cardinality put the loop on the default page path,
+since `role` defaults to `any`. Second, the extrapolated cost was wrong, so a synthetic
+bundle settled it — 5 000 and 50 000 distinct predicates, none of them also a subject or
+object, so no probe short-circuits:
+
+| bundle | predicates | `count` any | `count` subject | page 100 | page 10 000 | `/fragment` 10 000 |
+|---|---:|---:|---:|---:|---:|---:|
+| p5k | 5 000 | 3.1 ms | 3.1 ms | 3.2 ms | 8.6 ms | 7.7 ms |
+| p50k | 50 000 | 33.4 ms | 33.2 ms | 33.2 ms | 38.6 ms | 8.5 ms |
+
+The corpus this serves peaks at 119 predicates, where the same work is a tenth of a
+millisecond. So the worst case is a synthetic vocabulary two orders of magnitude wider
+than anything real, costing about what one full-sized page of the same operation costs.
+
+The argument that decided it is that **the request cannot amplify the cost**. The empty
+prefix is the maximum and the maximum is a per-version constant the manifest publishes;
+a narrower prefix asks for less. That is categorically unlike `candidate_budget` work,
+where the query text decides how much scanning happens. Bounded cost is the project's
+thesis, and a fixed per-bundle ceiling of tens of milliseconds meets it. Estimating
+`any` instead would have been cheap — the error is at most the matching predicate count,
+observed as 1 in 28 841 — but exactness is the operation's whole point, and there was no
+cost that justified giving it up.
+
+What the measurement *did* buy was a skip the code was missing. A predicate can only
+repeat a term one of the other three sections holds, so when none of them matches the
+prefix there is nothing to deduplicate — and the old loop decoded every matching
+predicate anyway to search sections that could not answer. That case went from 4.6 ms to
+0.3 ms, and it is why every prefix narrower than "matches most predicates *and* something
+else" is now flat. The prices above are unchanged by it, because the empty prefix
+populates every section.
+
+Also noted and left alone: the breakdown means `role=predicate&count=true` pays the `any`
+deduplication too, since one `term_counts` produces all four numbers. That is inherent to
+returning the breakdown always, which was unit 28's point, and it is a tenth of a
+millisecond at real scale.
+
+**A bundle cannot declare `terms`.** The capability names two operations — the prefix scan,
+which needs no sidecar, and key resolution, which needs a key-to-id index no bundle
+carries — and declaring a capability commits to its full contract, methods included. Unit
+26 bent the definition instead, scoping `Capability::Terms` to the prefix half in its own
+documentation. What made the honest answer cheap was unit 27, which came afterwards: with
+the route no longer gated on the declaration, *not declaring it costs nothing*. The route
+answers regardless, the descriptor advertises it, the forms offer it. So `capabilities_for`
+no longer derives it, and the variant remains only because the name is protocol vocabulary
+a manifest written elsewhere may use — `kgf manifest --check` reports such a declaration as
+one the artifacts do not support, which is exactly what it is.
+
+The same "bundle-invariant, therefore uninformative" reasoning applies to `sample` and
+`labels`, but their contracts are met in full, so there is no defect to fix and they stay.
+Whether a capability that is true of every bundle belongs in the vocabulary at all is a
+question for the design documents rather than a change to make here.
+
+**`prefix` is held to `max_term_bytes`.** Every other term-valued parameter is, and this
+one was not: it is hashed into the cursor binding, copied to build its successor, compared
+against every block head a search touches, and echoed in the response. A GET target never
+reaches the body-size layer, so the only ceiling was whatever the HTTP stack happened to
+allow — not a published number a client can size a request by.
+
+**And one the review did not catch.** The terms page linked a term whose row said only
+`predicate` to `/fragment?p=` rather than to its own `/describe`, on the reasoning that
+such a term has no neighborhood to describe. The reasoning was wrong twice over. Most
+predicates *are* subjects — they carry the label and definition that say what they mean,
+which is exactly the page a reader wants from one. And the row could not have supported
+the claim anyway: `roles` reports the sections a scan *read*, so a `role=predicate` scan
+calls every row a predicate whether or not the term is described elsewhere, and the
+override fired hardest on the best-documented vocabularies. The same insight was already
+being applied correctly one layer down, where label hydration looks a scanned predicate up
+in the subject sections its own scan never read. The override is gone, every term links
+the way every other page links it, and `ScannedTerm::sections` now says in its own
+documentation that an absent section is silence rather than evidence.
+
+*Verified by* the store's role-breakdown and paging tests over the amended count, a
+request-layer test that the largest permitted prefix is accepted and one byte more is
+`cap_exceeded`, the capability-gate pair rewritten around a `terms` that is no longer
+declared, and the two stress bundles above driven through a real listener.
 
 ## Testing spine
 
@@ -1727,6 +2172,49 @@ those follow a profile. This is the innermost read in the system, so it will get
 **No `madvise` tuning yet.** Random versus sequential access hints trade against each
 other — bindings joins want `RANDOM`, full-page enumeration wants readahead — and
 picking without measurement is guessing. Revisit with the §20.6 cold-start numbers.
+
+**The bundle's prefix map is the shared tables layered under the dataset's own
+bindings, built once.** `prefix_tables` — then under `contents.stats`, now
+`semantics.prefix_tables`, renamed the day it started shaping the manifest —
+used to reach only the namespace inventory, while the manifest declared the
+well-known four plus `semantics.prefixes`. Two readers of "the prefixes" with two answers: the
+inventory for biobricks-aopwiki counted 1,149 IRIs under `obo:` while its pages
+rendered every OBO term in full and a request could not write `obo:…`.
+`build/prefixes.rs` now layers the tables in order, later files winning, with the
+resolved plan's own map last, and hands that one map to both the manifest and
+the inventory — the inventory as a single written table, so the identity it
+publishes is the digest of exactly what the manifest declares. The alternative
+of declaring only the table prefixes the data actually uses was rejected: it
+would make the CURIE contract vary by dataset and by version, and an agent that
+learned `obo:` on one KG should be able to use it on the next. Table entries are
+held to the manifest's contract, a name that is a Turtle/SPARQL prefix name
+and an IRI namespace, and are read in the pre-flight that `--dry-run` shares
+with a real build, so a malformed table fails in milliseconds rather than after
+the text index. The name rule is stricter than hdtc's own loader, on purpose,
+and the loader is a temporary copy of hdtc's until its façade exports one (hdtc
+handoff). Existing bundles gain the map only by being rebuilt.
+
+Two consequences recorded rather than solved. Declaring the federation table
+shadows same-named URI schemes for *bare* tokens — `geo:…` unbracketed is now
+the GeoSPARQL CURIE where it used to be a 400 — which is the reason brackets are
+mandatory and changes nothing for a client that follows the rule. And the RDF
+representations declare only `kgfbn:` today; if the manifest's prefixes are
+ever handed to the serializer, they must first be filtered to the namespaces
+that occur in the triples being written, because oxttl prints every declared
+prefix whether or not the document uses it, and a hundred unused `@prefix`
+lines on every fragment would be the wrong trade.
+
+**The term grammar is selected by route, never by `Accept`.** Doc 03 §3.3 brackets
+IRIs and reserves bare tokens for CURIEs; the TPF specification and Hydra's
+`ExplicitRepresentation` require bare IRIs and bare datatype IRIs. Unit 20 reconciled
+them on one URL with a representation-selected fallback (question 44), which covered
+whole-value IRIs and nothing else, so the spec's own typed-literal example was a 400
+that terminated the client. Unit 24 gives each grammar its own route: `/fragment` is
+§3.3 in every representation, `/tpf` is `ExplicitRepresentation` in every
+representation, and a value that belongs to the other route is refused with a hint
+naming it. One URL means one grammar, and a client's `Accept` header chooses a
+serialization, not a language. `notes/tpf-route.md` is the design record.
+
 
 ## Questions for `../kgf`
 
@@ -1835,7 +2323,10 @@ following the code.
     IRIs, literals and variables only, so `_:b1` would parse as an IRI under the letter
     of the rules. Treating a leading `_:` as a blank node is the only reading that lets a
     client ask about a term the server just returned. Worth one line in §3.3. Found in
-    unit 11.
+    unit 11. *Resolved September 2026:* §3.3 now carries that line, with the
+    justification narrowed by item 65 — `_:` parses so the term can be *reported*, not
+    so it can be matched. What the server returns is the scoped IRI of item 46, which
+    is what a client asks about.
 13. **Does the JSON term-object form expand CURIEs?** §3.3 offers it as "the canonical
     form for terms that are awkward to escape", and it is described as the form "as in
     response rows", where IRIs are always full — so this implementation treats a term
@@ -1965,7 +2456,10 @@ following the code.
     Refusing them makes part of a bundle unreachable, which is the failure requiring
     brackets in §3.3 was introduced to remove. Either §3.4.6 should say "term", or the
     restriction should be stated so implementations agree on it. Found in unit 14's
-    review.
+    review. *Amended September 2026:* the blank-node half of this is now served by the
+    scoped IRI — a row returns one, and `/describe` takes it as the IRI it is — so the
+    argument for "term, not IRI" rests on literals alone. It still holds: `o=` reaches
+    a literal, so `/describe` must too.
 25. **What does a budget truncation look like where there is nothing to resume?** §3.5
     says exhausting any budget returns what completed, "marked `complete: false` with a
     `truncation_reason` and cursor" — but `/sample` draws `n` members and never pages
@@ -2164,36 +2658,73 @@ following the code.
     should specify this as the TPF ingress grammar rather than weakening §3.3 for every
     route.
     Found by the pinned Comunica 5.3.0 conformance test in unit 20.
-45. **Doc 03 §3.5 understates RDF fragment cost.** Its fragment rows describe selection
-    and paging as `O(log N + limit)` (or `O(k·log N + limit)` for bindings), but a
-    complete Turtle or JSON-LD document cannot be interrupted at the byte boundary.
-    The implementation uses the same bounded complete-prefix fitting already specified
-    for `/schema`, whose worst case is `Z·(1 + log limit)`, and admits RDF fragments as
-    heavy work. brTPF's distinct union also examines at most `candidate_budget`
-    compatibility rows against at most `k` restrictions after `O(k²)` normalization
-    when filtering partial overlaps before the page limit. The two fragment table rows
-    should name both terms; the implementation is bounded and the cost table is the
-    stale side of this disagreement.
-46. **Resolved: fragment RDF uses content-scoped blank-node identities.** A stored `_:`
-    label cannot be emitted unchanged in Turtle or JSON-LD pages: RDF scopes that
-    identity to one document, so the same HDT node would become unrelated nodes across
-    pages and a brTPF bind join could return a wrong answer. Fragment RDF now
-    skolemizes data blank nodes as
+45. **Doc 03 §3.5 should name brTPF's union term; its RDF-fitting half is withdrawn.**
+    As first raised, this said the fragment rows understate RDF cost: a complete Turtle
+    or JSON-LD document cannot be interrupted at the byte boundary, so the
+    implementation fits it with the same bounded complete-prefix search specified for
+    `/schema`, worst case `Z·(1 + log limit)`. **That half is withdrawn** — unit 25
+    measured it. The search is unreachable at the default budgets, because a page is
+    already trimmed to `max_response_bytes` measured as compact JSON and every RDF
+    serialization of those rows is 2–3× smaller than that measure, so the first
+    complete document fits and returns. Doc 03's representation-independent
+    `O(log N + limit)` was right and the implementation's heavy classification of RDF
+    fragments was the stale side; the classification is gone.
+    What stands is the other term: brTPF's distinct union examines at most
+    `candidate_budget` compatibility rows against at most `k` restrictions after
+    `O(k²)` normalization when filtering partial overlaps before the page limit, and
+    that is genuinely not bounded by the page. The bindings row should name it, and
+    `/tpf` with `values=` carries the same cost.
+46. **Resolved: one blank-node identity, in every representation.** A stored `_:`
+    label cannot be emitted unchanged in Turtle or JSON-LD: RDF scopes that identity to
+    one document, so the same HDT node would become unrelated nodes across pages and a
+    brTPF bind join could return a wrong answer. Fragment responses skolemize data
+    blank nodes as
     `urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:{hdt-data-digest}:{section}-{local-id}`.
     The digest is hdtc's existing identity over the HDT dictionary and triples (not its
-    mutable header). The suffix uses `sh`, `s`, or `o` plus the canonical one-based id
-    within the shared, subjects-only, or objects-only `dictionaryFour` section. A shared
-    node therefore has one identity in subject and object positions without carrying
-    its parser-local label on the wire. Subject/object ingress reverses a URN only when
-    its digest, section, role, range, and referenced blank-node term all agree; a foreign
-    bundle's URN remains an ordinary IRI. Prefix-capable RDF documents bind `kgfbn:` to
-    the digest-scoped namespace. Identical immutable HDT content therefore intentionally
-    gives its blank nodes identical identities across versions, datasets, deployments
-    and mirrors. Native JSON deliberately retains its `bnode` term object and dictionary
-    label: it is not an RDF document, preserves the term's RDF type, and round-trips only
-    in the scope of the addressed immutable release. `../kgf` doc 03 §3.4.1 now
-    makes this wire rule normative; docs 04, 07, 14, 15, 17, and 18 record its storage,
-    lifecycle, sketch, and exact-key-set consequences.
+    mutable header); because that scope is a suffix of `data.hdt` itself, anyone holding
+    the HDT can recompute every one of these names offline, which is what keeps a bulk
+    download and the API telling the same story. The suffix uses `sh`, `s`, or `o` plus
+    the canonical one-based id within the shared, subjects-only, or objects-only
+    `dictionaryFour` section. A shared node therefore has one identity in subject and
+    object positions without carrying its parser-local label on the wire. Identical
+    immutable HDT content intentionally gives its blank nodes identical identities
+    across versions, datasets, deployments and mirrors.
+
+    **This originally exempted native JSON, and that exemption is withdrawn (September
+    2026).** The recorded reasons were that JSON is not an RDF document, that a `bnode`
+    term object preserves the term's RDF type, and that the label round-trips against
+    the addressed release. The first is a statement about which spec text applies rather
+    than about identity; the third is void, since `locate_scoped` reverses the URN on
+    every ingress path and so the scoped IRI round-trips too; only the second had
+    content, and it is a format problem with a format fix. What the exemption cost was
+    real: one node had two names at one server depending only on `Accept`, and a client
+    federating native rows across the ~40 OKN graphs — the deployment this project
+    exists for — would conflate `_:b1` from one bundle with `_:b1` from another. The
+    normative text made that the client's problem ("Clients combining native results
+    MUST scope such blank-node terms to their addressed release"), which is an
+    unverifiable obligation to carry out of band exactly the context the URN carries in
+    band. Native JSON now emits `{"type":"iri","value":"urn:fdc:…"}`.
+
+    **Abbreviation is allowed only where the format defines the expansion.** Turtle
+    binds `kgfbn:` and its parser expands it, so `kgfbn:sh-7` *is* the IRI to every
+    consumer. Native JSON has no such contract, so it carries the full IRI — the same
+    reasoning `Term::to_request` already used to refuse CURIEs in links. `kgfbn` is
+    deliberately not in the manifest prefix map, which is the dataset's published
+    vocabulary: the namespace embeds the bundle's digest, so a client reusing the prefix
+    against another dataset would spell a valid-looking term that names nothing there.
+    It is likewise not accepted as a CURIE prefix in request syntax. Response byte cost
+    is much smaller than it looks, since gzip collapses a constant prefix repeated once
+    per row; what remains is that `max_response_bytes` is counted pre-compression, so a
+    blank-node-heavy page carries fewer rows.
+
+    **HTML displays `_:{section}-{local-id}`.** It is a display form only — nothing
+    expands it and it is not a request spelling — but `_:` is the one token every RDF
+    reader already recognizes, so the page needs no legend for a synthetic prefix, and
+    `sh-7` is the canonical identity component rather than the parser-local label. A
+    CURIE-shaped `kgfbn:sh-7` was rejected for the page precisely because HTML declares
+    nothing: it would imitate a syntax no request honours. The cell's link and tooltip
+    carry the full IRI, which is the spelling that works.
+
 47. **`max_request_bytes` must cover query-carried brTPF input, not only bodies.**
     `values=` is SPARQL syntax in the request target, and parsing the whole table before
     applying `max_bindings` otherwise spends CPU and memory outside the published cost
@@ -2348,6 +2879,169 @@ following the code.
     not links. That is a decision, not a question, but doc 03 §3.4.10's "typed links"
     wording should not be read as requiring absolute IRIs outside the RDF
     representations.
+
+63. **The manifest prefix map is the federation table layered under the dataset's
+    bindings; doc 03 §3.3 and doc 04 §4.3 should say so.** Doc 03 has CURIEs
+    resolve "against a prefix declared in the manifest prefix map" without saying
+    where that map comes from, and doc 04's namespace-inventory paragraph describes
+    the shared table "unioned with any per-dataset `prefixes` from the manifest" as
+    if the two were separate inputs. Since 2026-09-05 they are one map: the
+    configured tables, later winning, then the dataset's own bindings, declared in
+    the manifest and counted by the inventory. Two consequences worth writing down.
+    A shared-table edit changes a version's CURIE contract, so it is a rebuild
+    trigger and not a statistics refresh. And `authoritative_namespaces` is still
+    validated at plan time against the well-known four plus `semantics.prefixes`,
+    because table files are machine paths `--check-config` cannot read, so a
+    dataset that is authoritative for a prefix the shared table already defines
+    must repeat that binding in its own block.
+
+64. **The URL space has room beside it, and the room has to be reserved.** Probing a
+    resource conflates two failures — "this process cannot answer" and "this bundle is
+    cold" — and puts tens of thousands of identical records a day into the shape
+    census, which on a quiet service is substantially all of it. `/` was the probe
+    because it opens no bundle, but it is also a resource clients fetch, so it could
+    not be filtered without losing real traffic. A dedicated `/healthz` fixes both:
+    the probe reads nothing, and the exclusion matches the route rather than sniffing
+    a `User-Agent` any client can send. Two things follow that had to be written down
+    rather than assumed. Doc 03 §3.2's tree is the *client-facing* space, not the set
+    of paths a deployment answers — now stated there, along with the rule that an
+    operational endpoint at the root reserves the dataset id spelling it, since
+    `/{dataset}` is a wildcard a static segment always beats. And the reservation is
+    enforced where ids are parsed, in `kgf build`, because by serve time the bundle
+    exists and is listed. Doc 12 §12.1 gained the matching census rule: exclude
+    uneventful probes, keep the ones that failed or were slow, since those are the
+    findings a probe exists to produce.
+
+65. **Inbound blank-node syntax must never match, and the envelope has to say why.**
+    The scoped IRI is the only spelling that addresses a blank node; `_:label` in a
+    parameter and `{"type":"bnode","value":"label"}` in a body are parsed and then
+    resolved to nothing, with no dictionary probe at all. Not probing is the point
+    rather than an optimization: a stored label is local to whichever document was
+    loaded, so `_:b1` names something in a great many bundles, and a lookup that
+    succeeded would silently join across knowledge graphs — the exact failure the
+    scoped IRI exists to prevent, reintroduced at the request boundary where it
+    produces wrong rows rather than merely ambiguous names. The digest is the whole
+    safety mechanism, so any spelling that omits it must not resolve. `values=` cannot
+    reach this at all: it parses to spargebra `GroundTerm`s, and SPARQL's
+    `DataBlockValue` admits no blank nodes. The live paths are all KGF's own JSON —
+    `bindings.rows`, `pattern.{s,p,o}`, and `labels.iris` — plus `?s=`/`?o=`/`iri=`.
+
+    **The refusal is anchored on the canonical spelling, not on the parsed kind**,
+    because two forms can carry a label under an IRI's type. A
+    `{"type": "iri", "value": "_:b1"}` term object is one, now refused where it is
+    written, as `<_:x>` already was in request syntax. The other is a CURIE: manifest
+    prefix namespaces are not validated, so a bundle may declare one expanding to
+    blank-node syntax, and `x:b1` then arrives as an `Iri` by kind whose dictionary
+    spelling is `_:b1`. Both would have resolved to the stored node. Nothing
+    legitimate is caught by testing the spelling — an RFC 3986 scheme cannot begin
+    with `_`, so no IRI is written this way, and the dictionary can only have stored
+    such a term as a blank node. A `values=` table cannot reach this at all: SPARQL
+    admits no blank node in `DataBlockValue`, and `<_:b1>`, whose characters do
+    satisfy the IRIREF grammar, is rejected by the parser as not a valid IRI.
+
+    **Not matching, rather than rejecting**, follows unit 11's call recorded in item 23:
+    a generic tool submitting a mixed batch of IRIs and blank nodes should get one
+    successful response in which the blank nodes matched nothing, not a 400 that spoils
+    the batch. A binding row containing one already drops out through
+    `resolve_binding`'s `Ok(None)`, identically to an unknown IRI, so that path needs no
+    new machinery.
+
+    That leaves one confusing case, and it is the one the HTML display form creates:
+    pasting `_:sh-7` out of a page yields 200 with `absent_terms`, which reads as "this
+    bundle does not have that node" when the truth is "that is not how this API
+    addresses blank nodes." So `absent_terms` should distinguish a term this API cannot
+    address from one this bundle merely does not hold. Doc 03 still has no
+    `absent_terms` field at all (item 23), so both the field and this reason want
+    defining together in §3.4.1's envelope.
+
+66. **A `/tpf` route replaces question 44's TPF ingress grammar on `/fragment`.** Unit
+    24 (`notes/tpf-route.md`) moves TPF and brTPF to `GET /{dataset}/v/{version}/tpf`
+    with Hydra `ExplicitRepresentation` as its only grammar, quad formats first, and
+    metadata and controls in a named graph in N-Quads, TriG, and JSON-LD; `/fragment` is §3.3 only, in every
+    representation, and its RDF is data without hypermedia. Doc 03 §3.2 should add the
+    route to the URL tree; §3.4.1 should lose the sentences making `/fragment`'s RDF the
+    TPF surface (the TPF data rule paragraph moves with them); a new §3.4 entry for
+    `GET /tpf` should be normative for the grammar, the document, and the `values=`
+    transport, with §3.8's TPF entry pointing at it; §3.3 should say in one sentence
+    that bare IRIs are the TPF route's grammar; §3.5 should carry `/tpf` with
+    `/fragment`'s cost — representation-independent, per question 45 — plus that
+    question's union term where `values=` is present; and doc 06 §6.4 should type
+    Comunica sources as `brtpf` on `…/tpf` and describe `void:inDataset` discovery for
+    the selectivity actor. The grammar should say that CURIE-looking strings such as
+    `rdfs:label` are valid absolute IRIs by syntax and are taken literally: without a
+    prefix map, `ExplicitRepresentation` cannot distinguish them from custom URI
+    schemes, and `/tpf` deliberately performs no prefix expansion. Found by the
+    public-deployment evaluation in `../kgf-sparql` and implementation review.
+67. **§3.4.8's `terms` capability covers two operations, and only one of them can be
+    declared from a bundle's bytes.** The prefix scan and its count need nothing beyond
+    the sorted dictionary every bundle carries. Key resolution needs the derived
+    key-to-id index §3.4.8 itself describes, which no bundle carries and which doc 07
+    §7.5 item 19 has not yet decided is mandatory. One capability name cannot mean both
+    without a client that reads `terms` from a manifest being wrong about half of it, so
+    unit 29 declares it for no bundle at all: the route answers unconditionally (item 8
+    of CLAUDE.md's rules) and QUERY on it is a plain 405 with `Allow`, which is the
+    honest pair. The proposal is to let `terms` mean the prefix scan — declarable by
+    everything, and therefore arguably not worth declaring — and gate key resolution on
+    `keysets`, the capability it exists to complete and the one whose artifacts imply the
+    index, rather than mint a third name.
+68. **§3.4.8's `O(log D)` count holds per role; `role=any` carries one more term.** The
+    shared, subject-only, and object-only sections partition their terms, so those counts
+    are arithmetic on the two bracketing searches. Predicates are the one section whose
+    string may repeat one of the others, so an exact distinct count over `any` probes each
+    matching predicate against the rest: `O(P·log D)` where `P` is the bundle's published
+    predicate count. §3.4.8's "regardless of how many terms match" is still true — the
+    bound is in the schema, not the match set — and §3.5's `terms` row should carry the
+    extra term rather than leave the reading to a server, with the sentence that makes it
+    harmless: **a request cannot raise it.** The empty prefix is the maximum, the maximum
+    is a per-version constant the manifest publishes, and a narrower prefix asks for
+    less, which is what separates this from the budgeted operations §3.5 caps. It should
+    not imply a cost class either: unit 29 measured a tenth of a millisecond at the
+    corpus's widest vocabulary and 33 ms at a synthetic 50 000 predicates, against 38 ms
+    for one full-sized page of the same operation. The alternative, an estimate for
+    `any`, was cheap and rejected — the error is at most `P`, observed as 1 in 28 841 —
+    because an exact count is the operation's whole point.
+69. **`role=any` needs a stated meaning, and a row can afford to say more than doc 03
+    asks.** §3.4.8 lists `any` among the roles without saying whether a term occupying
+    several positions is one row or several. Unit 26 answers one row, because a merge that
+    is already ordering strings deduplicates for free — and because "how many distinct
+    terms are in this namespace" is the question a federation probe is asking. The same
+    step yields *which* positions the term occupies at no extra cost, so each row carries
+    `roles`, and §3.4.8 should specify both: the response shape (a term object, its
+    `roles`, and its `label` when asked), and that `roles` is complete for `any` while for
+    a single role it reports only the sections that role reads. Predicate membership is
+    the one thing a subject or object scan cannot report without an unbounded skip over a
+    section it is not returning from. Two further shape additions belong with it, both
+    from unit 28 and both free: a page states the exact `cardinality` of the scan it is
+    paging, as every other row operation does, and a count carries `counts` for all four
+    positions rather than only the one requested — because "does this dataset use MONDO"
+    is answered by *how*, and one probe should not have to be sent four times to find
+    out.
+70. **§3.4.8 gives `terms` a `limit` but no continuation, and `limit` is a page size
+    everywhere else.** Unit 26 issues a cursor, since a truncated page that offered
+    nothing to resume would be the silent truncation §3.6 prohibits. Doc 03 should say so,
+    and §3.5's `terms` row should read `O(log D + limit)` per page rather than per
+    request. The cursor is a dictionary position over the four sections in order — the one
+    number that names a stored term independently of role — and it binds to `prefix` and
+    `role`, not to `limit` or `labels`, so a client may change page size or ask for labels
+    mid-scan and keep paging.
+71. **`labels=true` now applies to three operations and not the other three.** `/search`,
+    `/schema`, and now `/terms` hydrate the release's frozen label cascade; `/fragment`,
+    `/describe`, and `/sample` still refuse the parameter and label only their HTML. Item
+    35 asked for the uniform rule and this widens the inconsistency by one operation
+    rather than resolving it, deliberately: an IRI list is the one response whose rows are
+    unreadable without labels, so it was the operation least able to wait. The remaining
+    gap is item 35's, and `/terms` is now the worked example of what the uniform answer
+    looks like — the label weighed into `max_response_bytes` with the row it belongs to.
+
+72. **§3.4.8's `prefix` needs a stated ceiling, and §3.3's term budget is the one to
+    name.** `prefix` is a byte prefix rather than a term (question 10), which left it
+    outside the `max_term_bytes` §3.3 applies to every term-valued parameter — and
+    outside `max_request_bytes` too, since a GET target never reaches a body-size layer.
+    Unit 29 holds it to `max_term_bytes` on the reasoning that a prefix of a stored term
+    cannot usefully exceed the terms it selects, and that a published cap a server does
+    not apply is worse than none, because a client sizes its requests by it. Doc 03
+    should say which cap governs it rather than leaving the answer to whatever an HTTP
+    stack happens to allow.
 
 ## Not in this plan
 

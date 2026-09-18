@@ -77,6 +77,72 @@ const SUMMARY_CARD_JSON: &str = r#"{
 "#;
 
 #[test]
+fn a_304_carries_the_encoding_metadata_its_200_would_have_carried() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    let server = deployment.serve();
+    let target = "/tox/v/v1/fragment?limit=100";
+
+    // Compression is negotiated, so the resource varies on the coding and an
+    // encoded body must not claim the identity body's strong validator. The trap
+    // is the `304`: it carries no body, so nothing marks it downstream, and
+    // RFC 9110 §15.4.5 still requires it to carry the `ETag` and `Vary` a `200`
+    // to the same request would have sent. A cache updating stored headers from
+    // that `304` (RFC 9111 §4.3.4) would otherwise drop the field keeping its
+    // stored encoded bytes from an `Accept-Encoding: identity` request.
+    //
+    // The spellings matter as much as the statuses. Anything that decided from
+    // the request would have to re-derive the compression layer's own
+    // negotiation, and these are the cases where a narrower reading diverges: a
+    // header split across field lines is one list, `x-gzip` is `gzip`, and a
+    // zero quality is a refusal. The rule here is unconditional, so every
+    // spelling has to come out the same.
+    let spellings: [(&str, &[(&str, &str)]); 6] = [
+        ("absent", &[]),
+        ("identity", &[("accept-encoding", "identity")]),
+        ("gzip", &[("accept-encoding", "gzip")]),
+        ("zero quality", &[("accept-encoding", "gzip;q=0")]),
+        ("x-gzip", &[("accept-encoding", "x-gzip")]),
+        (
+            "split field lines",
+            &[("accept-encoding", "deflate"), ("accept-encoding", "gzip")],
+        ),
+    ];
+
+    for (label, headers) in spellings {
+        let ok = server.request("GET", target, headers);
+        ok.assert_status(200);
+        let etag = ok.header("etag").expect("a versioned GET carries an ETag");
+        assert!(
+            etag.starts_with("W/"),
+            "{label}: a negotiable representation carries a weak validator, got {etag}"
+        );
+        assert_encoding_vary(&ok, label);
+
+        let mut conditional = headers.to_vec();
+        conditional.push(("if-none-match", etag.as_str()));
+        let revalidated = server.request("GET", target, &conditional);
+        revalidated.assert_status(304);
+        assert_eq!(
+            revalidated.header("etag").as_deref(),
+            Some(etag.as_str()),
+            "{label}: the 304 must carry the validator its 200 sent"
+        );
+        assert_encoding_vary(&revalidated, label);
+    }
+}
+
+#[track_caller]
+fn assert_encoding_vary(response: &Response, context: &str) {
+    let vary = response.header("vary").unwrap_or_default();
+    assert!(
+        vary.split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("accept-encoding")),
+        "Vary must name accept-encoding for {context}, got {vary:?}"
+    );
+}
+
+#[test]
 fn the_url_space_answers_over_a_real_listener() {
     let deployment = Deployment::new();
     deployment.publish("tox", "2026-01-09", TINY_NT, "2026-01-09T09:00:00Z");
@@ -224,14 +290,24 @@ fn schema_omits_requested_labels_when_the_release_has_no_label_cascade() {
 }
 
 #[test]
-fn fragment_rdf_is_one_parseable_tpf_graph_in_turtle_and_jsonld() {
+fn tpf_quad_formats_keep_controls_out_of_the_default_graph() {
     const HYDRA: &str = "http://www.w3.org/ns/hydra/core#";
     const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    const VOID: &str = "http://rdfs.org/ns/void#";
+    const FOAF_PRIMARY_TOPIC: &str = "http://xmlns.com/foaf/0.1/primaryTopic";
 
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    deployment.set_dataset_iri("tox", "v1", "http://example.org/dataset/tox");
     let server = deployment.serve();
-    let target = "/tox/v/v1/fragment?p=ex%3Aknows&limit=1";
+    let target = "/tox/v/v1/tpf?predicate=http%3A%2F%2Fexample.org%2Fknows&limit=1";
+    let page = format!("http://{}{}", server.address, target);
+    let fragment = format!(
+        "http://{}/tox/v/v1/tpf?predicate=http%3A%2F%2Fexample.org%2Fknows",
+        server.address
+    );
+    let metadata = format!("{page}#metadata");
+    let dataset = format!("http://{}/tox/v/v1/tpf", server.address);
 
     let turtle = server.request("GET", target, &[("Accept", "text/turtle")]);
     turtle.assert_status(200);
@@ -245,21 +321,7 @@ fn fragment_rdf_is_one_parseable_tpf_graph_in_turtle_and_jsonld() {
     let turtle_graph: HashSet<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
         .for_slice(&turtle.body)
         .collect::<Result<_, _>>()
-        .expect("fragment Turtle parses");
-
-    let jsonld = server.request("GET", target, &[("Accept", "application/ld+json")]);
-    jsonld.assert_status(200);
-    jsonld.assert_header("content-type", "application/ld+json");
-    let jsonld_graph: HashSet<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::JsonLd {
-        profile: oxrdfio::JsonLdProfile::Streaming | oxrdfio::JsonLdProfile::Expanded,
-    })
-    .for_slice(&jsonld.body)
-    .collect::<Result<_, _>>()
-    .expect("fragment JSON-LD parses");
-    assert_eq!(jsonld_graph, turtle_graph, "both syntaxes carry one graph");
-
-    let dataset = format!("http://{}/tox/v/v1/fragment", server.address);
-    let page = format!("http://{}{}", server.address, target);
+        .expect("TPF Turtle parses");
     let predicate_count = |iri: &str| {
         turtle_graph
             .iter()
@@ -287,7 +349,11 @@ fn fragment_rdf_is_one_parseable_tpf_graph_in_turtle_and_jsonld() {
         .collect();
     assert_eq!(
         variables,
-        HashSet::from(["s".to_owned(), "p".to_owned(), "o".to_owned()])
+        HashSet::from([
+            "subject".to_owned(),
+            "predicate".to_owned(),
+            "object".to_owned(),
+        ])
     );
 
     let properties: HashSet<_> = turtle_graph
@@ -317,10 +383,312 @@ fn fragment_rdf_is_one_parseable_tpf_graph_in_turtle_and_jsonld() {
             && quad.predicate.as_str() == format!("{HYDRA}next")
             && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str().starts_with(&dataset))
     }));
+
+    let mut datasets = Vec::new();
+    for (accept, format) in [
+        ("application/n-quads", oxrdfio::RdfFormat::NQuads),
+        ("application/trig", oxrdfio::RdfFormat::TriG),
+        (
+            "application/ld+json",
+            oxrdfio::RdfFormat::JsonLd {
+                profile: oxrdfio::JsonLdProfile::Streaming | oxrdfio::JsonLdProfile::Expanded,
+            },
+        ),
+    ] {
+        let response = server.request("GET", target, &[("Accept", accept)]);
+        response.assert_status(200);
+        let quads: HashSet<_> = oxrdfio::RdfParser::from_format(format)
+            .for_slice(&response.body)
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|error| panic!("{accept} did not parse: {error}"));
+        assert!(quads.iter().any(|quad| {
+            quad.graph_name == oxrdf::GraphName::DefaultGraph
+                && quad.predicate.as_str() == "http://example.org/knows"
+        }));
+        assert!(
+            !quads.iter().any(|quad| {
+                quad.graph_name == oxrdf::GraphName::DefaultGraph
+                    && (quad.predicate.as_str().starts_with(HYDRA)
+                        || quad.predicate.as_str().starts_with(VOID)
+                        || quad.predicate.as_str() == FOAF_PRIMARY_TOPIC)
+            }),
+            "{accept} leaked controls into the default graph"
+        );
+        assert!(quads.iter().any(|quad| {
+            matches!(&quad.graph_name, oxrdf::GraphName::NamedNode(node) if node.as_str() == metadata)
+                && matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == metadata)
+                && quad.predicate.as_str() == FOAF_PRIMARY_TOPIC
+                && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str() == fragment)
+        }));
+        assert!(quads.iter().any(|quad| {
+            matches!(&quad.graph_name, oxrdf::GraphName::NamedNode(node) if node.as_str() == metadata)
+                && matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == fragment)
+                && quad.predicate.as_str() == format!("{VOID}subset")
+                && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str() == page)
+        }));
+        assert!(quads.iter().any(|quad| {
+            matches!(&quad.graph_name, oxrdf::GraphName::NamedNode(node) if node.as_str() == metadata)
+                && matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == dataset)
+                && quad.predicate.as_str() == format!("{VOID}subset")
+                && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str() == fragment)
+        }));
+        assert!(quads.iter().any(|quad| {
+            matches!(&quad.graph_name, oxrdf::GraphName::NamedNode(node) if node.as_str() == metadata)
+                && matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == dataset)
+                && quad.predicate.as_str() == format!("{HYDRA}search")
+        }));
+        assert!(quads.iter().any(|quad| {
+            matches!(&quad.graph_name, oxrdf::GraphName::NamedNode(node) if node.as_str() == metadata)
+                && quad.predicate.as_str() == format!("{HYDRA}variableRepresentation")
+                && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str() == format!("{HYDRA}ExplicitRepresentation"))
+        }));
+        assert!(quads.iter().any(|quad| {
+            matches!(&quad.graph_name, oxrdf::GraphName::NamedNode(node) if node.as_str() == metadata)
+                && matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == page)
+                && quad.predicate.as_str() == format!("{HYDRA}itemsPerPage")
+                && matches!(&quad.object, oxrdf::Term::Literal(value) if value.value() == "1")
+        }));
+        assert!(quads.iter().any(|quad| {
+            matches!(&quad.graph_name, oxrdf::GraphName::NamedNode(node) if node.as_str() == metadata)
+                && matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == page)
+                && quad.predicate.as_str() == format!("{VOID}inDataset")
+                && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str() == "http://example.org/dataset/tox")
+        }));
+        assert!(!quads.iter().any(|quad| {
+            matches!(&quad.graph_name, oxrdf::GraphName::NamedNode(node) if node.as_str() == metadata)
+                && matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == "http://example.org/dataset/tox")
+                && quad.predicate.as_str() == "http://www.w3.org/2000/01/rdf-schema#seeAlso"
+        }), "{accept} advertised an unavailable VoID description");
+        datasets.push(quads);
+    }
+    assert_eq!(datasets[0], datasets[1]);
+    assert_eq!(
+        datasets[0], datasets[2],
+        "JSON-LD must preserve the named control graph"
+    );
+
+    let selected = server.get(&format!("{target}&format=nq"));
+    let selected_quads: HashSet<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
+        .for_slice(&selected.body)
+        .collect::<Result<_, _>>()
+        .expect("format-selected N-Quads parses");
+    assert!(selected_quads.iter().any(|quad| {
+        quad.predicate.as_str() == FOAF_PRIMARY_TOPIC
+            && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str() == fragment)
+    }));
+
+    let unavailable = server.get("/tox/v/v1/void");
+    unavailable.assert_status(501);
 }
 
 #[test]
-fn fragment_json_preserves_blank_node_terms_while_rdf_uses_wire_iris() {
+fn tpf_links_a_void_description_only_when_it_is_published() {
+    let deployment = Deployment::new();
+    deployment.publish_description("tox", "v1", "2026-08-08T12:00:00Z");
+    deployment.set_dataset_iri("tox", "v1", "http://example.org/dataset/tox");
+    let server = deployment.serve();
+
+    server.get("/tox/v/v1/void").assert_status(200);
+    let response = server.request(
+        "GET",
+        "/tox/v/v1/tpf?limit=1",
+        &[("Accept", "application/n-quads")],
+    );
+    response.assert_status(200);
+    let quads: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
+        .for_slice(&response.body)
+        .collect::<Result<_, _>>()
+        .expect("TPF N-Quads parses");
+    assert!(quads.iter().any(|quad| {
+        matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == "http://example.org/dataset/tox")
+            && quad.predicate.as_str() == "http://www.w3.org/2000/01/rdf-schema#seeAlso"
+            && matches!(&quad.object, oxrdf::Term::NamedNode(node) if node.as_str() == format!("http://{}/tox/v/v1/void", server.address))
+    }));
+}
+
+#[test]
+fn tpf_escapes_raw_query_punctuation_in_its_page_iri() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let target = "/tox/v/v1/tpf?object=%3Fo&values=(%3Fo)%20{%20(%22[x]%22)%20}";
+    let response = server.request("GET", target, &[("Accept", "application/n-quads")]);
+    response.assert_status(200);
+
+    let quads: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
+        .for_slice(&response.body)
+        .collect::<Result<_, _>>()
+        .expect("the response with escaped page metadata parses");
+    let page = format!(
+        "http://{}/tox/v/v1/tpf?object=%3Fo&values=(%3Fo)%20%7B%20(%22%5Bx%5D%22)%20%7D",
+        server.address
+    );
+    assert!(quads.iter().any(|quad| {
+        matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == page)
+            && quad.predicate.as_str() == "http://www.w3.org/ns/hydra/core#itemsPerPage"
+    }));
+}
+
+#[test]
+fn every_tpf_page_names_one_canonical_fragment() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let target =
+        "/tox/v/v1/tpf?subject=%3Fs&predicate=http%3A%2F%2Fexample.org%2Fknows&object=%3Fo&limit=1";
+
+    let first = server.request("GET", target, &[("Accept", "application/n-quads")]);
+    first.assert_status(200);
+    let first_quads: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
+        .for_slice(&first.body)
+        .collect::<Result<_, _>>()
+        .expect("the first page parses");
+    let object_for = |quads: &[oxrdf::Quad], predicate: &str| {
+        quads.iter().find_map(|quad| {
+            (quad.predicate.as_str() == predicate)
+                .then(|| match &quad.object {
+                    oxrdf::Term::NamedNode(node) => Some(node.as_str().to_owned()),
+                    _ => None,
+                })
+                .flatten()
+        })
+    };
+    let primary_topic = "http://xmlns.com/foaf/0.1/primaryTopic";
+    let next_predicate = "http://www.w3.org/ns/hydra/core#next";
+    let fragment = object_for(&first_quads, primary_topic).expect("page names its fragment");
+    assert_eq!(
+        fragment,
+        format!(
+            "http://{}/tox/v/v1/tpf?object=%3Fo&predicate=http%3A%2F%2Fexample.org%2Fknows&subject=%3Fs",
+            server.address
+        )
+    );
+    let next = object_for(&first_quads, next_predicate).expect("first page has a continuation");
+    let origin = format!("http://{}", server.address);
+    let second = server.request(
+        "GET",
+        next.strip_prefix(&origin).unwrap(),
+        &[("Accept", "application/n-quads")],
+    );
+    second.assert_status(200);
+    let second_quads: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
+        .for_slice(&second.body)
+        .collect::<Result<_, _>>()
+        .expect("the second page parses");
+    assert_eq!(object_for(&second_quads, primary_topic), Some(fragment));
+}
+
+#[test]
+fn tpf_and_native_fragment_keep_their_protocols_disjoint() {
+    const HYDRA: &str = "http://www.w3.org/ns/hydra/core#";
+
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let bare = "http%3A%2F%2Fexample.org%2Fknows";
+
+    server
+        .get("/tox/v/v1/tpf")
+        .assert_header("content-type", "application/n-quads; charset=utf-8");
+
+    for (accept, content_type) in [
+        ("application/n-quads", "application/n-quads; charset=utf-8"),
+        ("application/trig", "application/trig; charset=utf-8"),
+        ("text/turtle", "text/turtle; charset=utf-8"),
+        ("application/ld+json", "application/ld+json"),
+        ("text/html", "text/html; charset=utf-8"),
+    ] {
+        let tpf = server.request(
+            "GET",
+            &format!("/tox/v/v1/tpf?predicate={bare}"),
+            &[("Accept", accept)],
+        );
+        tpf.assert_status(200);
+        tpf.assert_header("content-type", content_type);
+        if accept == "text/html" {
+            let page = tpf.text();
+            assert!(page.contains("format=nq"));
+            assert!(!page.contains("format=json"));
+            assert!(page.contains("<dt>subject</dt>"));
+            assert!(page.contains("<dt>predicate</dt>"));
+            assert!(page.contains("<dt>object</dt>"));
+            assert!(!page.contains("<dt>s</dt>"));
+        }
+
+        let native = server.request(
+            "GET",
+            &format!("/tox/v/v1/fragment?p={bare}"),
+            &[("Accept", accept)],
+        );
+        native.assert_status(400);
+        assert!(
+            String::from_utf8_lossy(&native.body).contains("bad_term_syntax"),
+            "{accept}"
+        );
+    }
+
+    for format in ["nq", "trig", "ttl", "jsonld"] {
+        let native = server.get(&format!(
+            "/tox/v/v1/fragment?p=ex%3Aknows&limit=1&format={format}"
+        ));
+        native.assert_status(200);
+        assert!(
+            !String::from_utf8_lossy(&native.body).contains(HYDRA),
+            "native {format} carried TPF controls"
+        );
+    }
+
+    for target in [
+        "/tox/v/v1/tpf?s=http%3A%2F%2Fexample.org%2Falice",
+        "/tox/v/v1/tpf?page=2",
+        "/tox/v/v1/tpf?o.text=alice",
+        "/tox/v/v1/tpf?subject=%3Fx&object=%3Fx",
+    ] {
+        let refused = server.get(target);
+        refused.assert_status(400);
+        assert_eq!(refused.json()["code"], "malformed_request", "{target}");
+        assert!(refused.json()["detail"].as_str().unwrap().contains("tpf"));
+    }
+
+    let values = kgf_server::url::encode_value("(?undeclared) { (<http://example.org/alice>) }");
+    let undeclared = server.get(&format!("/tox/v/v1/tpf?values={values}"));
+    undeclared.assert_status(400);
+    assert_eq!(undeclared.json()["code"], "malformed_request");
+
+    let native_page = server.get("/tox/v/v1/fragment?limit=1");
+    let native_cursor = native_page.header("kgf-next-cursor").unwrap();
+    let wrong_tpf_cursor = server.get(&format!(
+        "/tox/v/v1/tpf?cursor={}",
+        kgf_server::url::encode_value(&native_cursor)
+    ));
+    wrong_tpf_cursor.assert_status(400);
+    assert_eq!(wrong_tpf_cursor.json()["code"], "stale_cursor");
+
+    let tpf_page = server.get("/tox/v/v1/tpf?limit=1&format=nq");
+    let tpf_cursor = tpf_page.header("kgf-next-cursor").unwrap();
+    let wrong_native_cursor = server.get(&format!(
+        "/tox/v/v1/fragment?cursor={}",
+        kgf_server::url::encode_value(&tpf_cursor)
+    ));
+    wrong_native_cursor.assert_status(400);
+    assert_eq!(wrong_native_cursor.json()["code"], "stale_cursor");
+
+    let native_values = server.get(&format!("/tox/v/v1/fragment?values={values}"));
+    native_values.assert_status(400);
+    assert_eq!(native_values.json()["code"], "malformed_request");
+
+    for method in ["QUERY", "POST"] {
+        let refused = server.request(method, "/tox/v/v1/tpf", &[]);
+        refused.assert_status(405);
+        assert_eq!(refused.json()["code"], "method_not_allowed");
+    }
+}
+
+#[test]
+fn every_representation_names_a_blank_node_the_same_way() {
+    // One node, one name, whatever a client negotiated. The native and RDF
+    // representations must agree exactly, because a client that combines them —
+    // or federates over several bundles — has nothing else to join on.
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
     let server = deployment.serve();
@@ -328,10 +696,12 @@ fn fragment_json_preserves_blank_node_terms_while_rdf_uses_wire_iris() {
 
     let json = server.get(target);
     json.assert_status(200);
-    assert_eq!(
-        json.json()["rows"][0]["s"],
-        serde_json::json!({"type": "bnode", "value": "b1"}),
-        "native term objects preserve the RDF term type and round-trip spelling"
+    let subject = json.json()["rows"][0]["s"].clone();
+    let iri = subject["value"].as_str().expect("a term value").to_owned();
+    assert_eq!(subject["type"], serde_json::json!("iri"));
+    assert!(
+        iri.starts_with("urn:fdc:") && iri.ends_with(":s-1"),
+        "native JSON publishes the scoped IRI, not a dictionary label: {iri}"
     );
 
     let turtle = server.request("GET", target, &[("Accept", "text/turtle")]);
@@ -344,30 +714,185 @@ fn fragment_json_preserves_blank_node_terms_while_rdf_uses_wire_iris() {
         .find(|quad| quad.predicate.as_str() == "http://example.org/type")
         .expect("the fragment contains its data triple")
         .subject;
-    assert!(
-        matches!(
-            data_subject,
-            oxrdf::NamedOrBlankNode::NamedNode(node)
-                if node.as_str().contains(":s-")
+    match data_subject {
+        oxrdf::NamedOrBlankNode::NamedNode(node) => assert_eq!(
+            node.as_str(),
+            iri,
+            "the RDF and native representations name one node identically"
         ),
-        "RDF fragments use the subject-only dictionary-section identity"
+        oxrdf::NamedOrBlankNode::BlankNode(_) => panic!("RDF kept a document-local blank node"),
+    }
+
+    // The scoped IRI is what addresses it, in either spelling a client holds.
+    let asked = server.get(&format!(
+        "/tox/v/v1/fragment?s={}",
+        kgf_server::url::encode_value(&format!("<{iri}>"))
+    ));
+    asked.assert_status(200);
+    assert_eq!(asked.json()["cardinality"]["value"], serde_json::json!(1));
+}
+
+#[test]
+fn blank_node_syntax_addresses_nothing_and_says_so() {
+    // A stored `_:` label is local to whatever document was loaded, so the same
+    // label names unrelated nodes at different bundles. Resolving one would join
+    // across knowledge graphs on a coincidence of spelling — so it never
+    // matches, and is reported rather than rejected so a mixed batch survives.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    let asked = server.get("/tox/v/v1/fragment?s=_%3Ab1");
+    asked.assert_status(200);
+    assert_eq!(asked.json()["rows"], serde_json::json!([]));
+    assert_eq!(
+        asked.json()["absent_terms"],
+        serde_json::json!([{"parameter": "s", "reason": "blank_node"}]),
+        "the diagnostic separates \"not addressable here\" from \"not in this bundle\""
+    );
+    assert_eq!(asked.json()["complete"], serde_json::json!(true));
+}
+
+/// A blank node carrying a label, so the page has something to show for it.
+const LABELLED_BNODE_NT: &str = concat!(
+    "_:b1 <http://example.org/name> \"A blank thing\" .\n",
+    "_:b1 <http://example.org/type> <http://example.org/Thing> .\n",
+    "<http://example.org/alice> <http://example.org/name> \"Alice\" .\n",
+);
+
+#[test]
+fn a_blank_node_is_labelled_however_the_page_reached_it() {
+    // The label cascade runs on whatever spelling a position put on the page:
+    // the dictionary label for a row cell, the scoped IRI for a term the
+    // request bound. They are one node, so one label — otherwise a node is
+    // labelled when a row happens to carry it and bare when you ask about it,
+    // which is the sort of difference nobody can explain from the outside.
+    //
+    // Both requests fix `ex:type`, which keeps the labelling triple out of the
+    // rows: the label text can then only have come from a cell's annotation.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", LABELLED_BNODE_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    const ANNOTATED: &str = "<span class=\"t-label\">A blank thing</span>";
+
+    let found = server.get("/tox/v/v1/fragment?p=ex%3Atype");
+    found.assert_status(200);
+    let iri = found.json()["rows"][0]["s"]["value"]
+        .as_str()
+        .expect("a scoped IRI")
+        .to_owned();
+
+    // Reached as a row cell, where the subject is a variable.
+    let by_row = server.request(
+        "GET",
+        "/tox/v/v1/fragment?p=ex%3Atype",
+        &[("Accept", "text/html")],
+    );
+    by_row.assert_status(200);
+    assert!(
+        by_row.text().contains(ANNOTATED),
+        "a blank node found in a row carries its label"
+    );
+
+    // Reached as the bound term, where the page merges the request back in.
+    let by_request = server.request(
+        "GET",
+        &format!(
+            "/tox/v/v1/fragment?p=ex%3Atype&s={}",
+            kgf_server::url::encode_value(&format!("<{iri}>"))
+        ),
+        &[("Accept", "text/html")],
+    );
+    by_request.assert_status(200);
+    assert!(
+        by_request.text().contains(ANNOTATED),
+        "and the same node carries it when the request is what named it"
     );
 }
 
 #[test]
-fn an_rdf_fragment_without_an_authority_is_a_client_error() {
+fn a_blank_node_label_cannot_be_smuggled_in_under_an_iri() {
+    // The digest is the whole safety mechanism, so every spelling that omits it
+    // has to miss. A `{"type": "iri"}` term object could otherwise carry a
+    // label straight past the blank-node refusal and resolve to the stored
+    // node, which is a cross-bundle join on a coincidence of spelling.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", LABELLED_BNODE_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    let body = serde_json::json!({
+        "pattern": {"s": {"type": "iri", "value": "_:b1"}, "p": "?p", "o": "?o"},
+        "bindings": {"vars": [], "rows": [[]]}
+    })
+    .to_string();
+    let object_form = server.request_with_body(
+        "POST",
+        "/tox/v/v1/fragment",
+        &[("Content-Type", "application/json")],
+        body.as_bytes(),
+    );
+    object_form.assert_status(400);
+    assert_eq!(object_form.json()["code"], "bad_term_syntax");
+
+    // The query-carried table cannot reach this at all — SPARQL admits no blank
+    // node in `DataBlockValue`, and `<_:b1>`, whose characters do satisfy the
+    // IRIREF grammar, is rejected by the parser as not a valid IRI. Pinned so
+    // the refusal is known to come from somewhere rather than assumed.
+    let values = server.get(&format!(
+        "/tox/v/v1/fragment?values={}",
+        kgf_server::url::encode_value("(?s) { (<_:b1>) }")
+    ));
+    values.assert_status(400);
+    assert_eq!(values.json()["code"], "malformed_request");
+
+    // And the honest spelling still reaches the node these failed to name.
+    let found = server.get("/tox/v/v1/fragment?p=ex%3Atype");
+    assert_eq!(found.json()["rows"].as_array().expect("rows").len(), 1);
+}
+
+#[test]
+fn a_browser_page_spells_a_blank_node_as_one() {
+    // `_:` is the one token an RDF reader recognizes without a legend, so the
+    // page shows the identity's tail that way — while the link and the tooltip
+    // carry the full IRI, which is the spelling any parameter accepts.
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
     let server = deployment.serve();
-    let target = "/tox/v/v1/fragment?p=ex%3Aknows";
+
+    let page = server.request(
+        "GET",
+        "/tox/v/v1/fragment?p=ex%3Atype",
+        &[("Accept", "text/html")],
+    );
+    page.assert_status(200);
+    let html = page.text();
+    assert!(
+        html.contains("_:s-1"),
+        "the page spells the node as a blank node"
+    );
+    assert!(
+        html.contains("urn:fdc:") && html.contains("%3As-1%3E"),
+        "and links it by the IRI that actually resolves"
+    );
+}
+
+#[test]
+fn a_tpf_document_without_an_authority_is_a_client_error() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let target = "/tox/v/v1/tpf?predicate=http%3A%2F%2Fexample.org%2Fknows";
 
     let rdf = server.request_without_host(target, &[("Accept", "text/turtle")]);
     rdf.assert_status(400);
     assert_eq!(rdf.json()["code"], "malformed_request");
 
-    // Only an RDF representation needs its absolute URL for Hydra metadata.
+    // Native RDF is data-only and therefore needs no absolute control IRIs.
     server
-        .request_without_host(target, &[("Accept", "application/json")])
+        .request_without_host(
+            "/tox/v/v1/fragment?p=ex%3Aknows",
+            &[("Accept", "text/turtle")],
+        )
         .assert_status(200);
 }
 
@@ -379,14 +904,14 @@ fn a_trusted_public_origin_drives_hydra_identity_and_continuations() {
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
     let server = deployment.serve_with_public_base("https://data.example");
-    let target = "/tox/v/v1/fragment?p=ex%3Aknows&limit=1";
+    let target = "/tox/v/v1/tpf?predicate=http%3A%2F%2Fexample.org%2Fknows&limit=1";
     let response = server.request_without_host(target, &[("Accept", "text/turtle")]);
     response.assert_status(200);
     let graph: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
         .for_slice(&response.body)
         .collect::<Result<_, _>>()
         .expect("fragment Turtle parses");
-    let dataset = "https://data.example/tox/v/v1/fragment";
+    let dataset = "https://data.example/tox/v/v1/tpf";
     let page = format!("https://data.example{target}");
 
     assert!(graph.iter().any(|quad| {
@@ -399,7 +924,7 @@ fn a_trusted_public_origin_drives_hydra_identity_and_continuations() {
     }));
     assert!(graph.iter().any(|quad| {
         quad.predicate.as_str() == HYDRA_TEMPLATE
-            && matches!(&quad.object, oxrdf::Term::Literal(value) if value.value() == format!("{dataset}{{?s,p,o}}"))
+            && matches!(&quad.object, oxrdf::Term::Literal(value) if value.value() == format!("{dataset}{{?subject,predicate,object}}"))
     }));
 }
 
@@ -450,14 +975,15 @@ fn a_public_base_with_a_path_prefixes_every_emitted_link() {
 
     // The Hydra identities are the whole base followed by the server-seen
     // path: the prefix once, never twice.
-    let turtle = server.request_without_host(target, &[("Accept", "text/turtle")]);
+    let tpf_target = "/tox/v/v1/tpf?predicate=http%3A%2F%2Fexample.org%2Fknows&limit=1";
+    let turtle = server.request_without_host(tpf_target, &[("Accept", "text/turtle")]);
     turtle.assert_status(200);
     let graph: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
         .for_slice(&turtle.body)
         .collect::<Result<_, _>>()
         .expect("fragment Turtle parses");
-    let operation = "https://apps.okn.us/kgf/tox/v/v1/fragment";
-    let page = format!("https://apps.okn.us/kgf{target}");
+    let operation = "https://apps.okn.us/kgf/tox/v/v1/tpf";
+    let page = format!("https://apps.okn.us/kgf{tpf_target}");
     assert!(graph.iter().any(|quad| {
         matches!(&quad.subject, oxrdf::NamedOrBlankNode::NamedNode(node) if node.as_str() == page)
             && quad.predicate.as_str() == "http://www.w3.org/ns/hydra/core#totalItems"
@@ -468,7 +994,7 @@ fn a_public_base_with_a_path_prefixes_every_emitted_link() {
     }));
     assert!(graph.iter().any(|quad| {
         quad.predicate.as_str() == HYDRA_TEMPLATE
-            && matches!(&quad.object, oxrdf::Term::Literal(value) if value.value() == format!("{operation}{{?s,p,o}}"))
+            && matches!(&quad.object, oxrdf::Term::Literal(value) if value.value() == format!("{operation}{{?subject,predicate,object}}"))
     }));
     assert!(
         !String::from_utf8_lossy(&turtle.body).contains("/kgf/kgf/"),
@@ -534,9 +1060,9 @@ fn brtpf_values_accept_undef_and_project_overlapping_rows_to_distinct_rdf() {
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
     let server = deployment.serve();
-    let values = "(?person ?foreign) { (<http://example.org/alice> UNDEF) (UNDEF \"ignored\"@en) }";
+    let values = "(?person ?known) { (<http://example.org/alice> UNDEF) (UNDEF UNDEF) }";
     let mut target = format!(
-        "/tox/v/v1/fragment?s=%3Fperson&p=ex%3Aknows&o=%3Fknown&limit=1&values={}",
+        "/tox/v/v1/tpf?subject=%3Fperson&predicate=http%3A%2F%2Fexample.org%2Fknows&object=%3Fknown&limit=1&values={}",
         kgf_server::url::encode_value(values)
     );
     let origin = format!("http://{}", server.address);
@@ -620,7 +1146,7 @@ fn brtpf_partial_overlap_spends_the_candidate_budget_and_resumes() {
     let values =
         "(?person ?known) { (<http://example.org/alice> UNDEF) (UNDEF <http://example.org/bob>) }";
     let target = format!(
-        "/overlap/v/v1/fragment?s=%3Fperson&p=ex%3Aknows&o=%3Fknown&limit=2&values={}",
+        "/overlap/v/v1/tpf?subject=%3Fperson&predicate=http%3A%2F%2Fexample.org%2Fknows&object=%3Fknown&limit=2&values={}",
         kgf_server::url::encode_value(values)
     );
 
@@ -672,19 +1198,19 @@ fn brtpf_partial_overlap_spends_the_candidate_budget_and_resumes() {
 }
 
 #[test]
-fn fragment_rdf_byte_fitting_keeps_a_complete_parseable_document_and_cursor() {
+fn tpf_rdf_byte_fitting_keeps_a_complete_parseable_document_and_cursor() {
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
     let unlimited = deployment.serve();
-    let target = "/tox/v/v1/fragment?limit=8";
-    let full = unlimited.request("GET", target, &[("Accept", "text/turtle")]);
+    let target = "/tox/v/v1/tpf?limit=8";
+    let full = unlimited.request("GET", target, &[("Accept", "application/n-quads")]);
     full.assert_status(200);
     full.assert_header("kgf-complete", "true");
 
     let mut budgets = kgf_server::Budgets::new();
     budgets.max_response_bytes = (full.body.len() - 100) as u64;
     let limited = deployment.serve_with_limits(kgf_server::Caps::new(), budgets);
-    let response = limited.request("GET", target, &[("Accept", "text/turtle")]);
+    let response = limited.request("GET", target, &[("Accept", "application/n-quads")]);
     response.assert_status(200);
     response.assert_header("kgf-complete", "false");
     response.assert_header("kgf-truncation-reason", "response_bytes");
@@ -695,7 +1221,7 @@ fn fragment_rdf_byte_fitting_keeps_a_complete_parseable_document_and_cursor() {
         budgets.max_response_bytes,
         full.body.len()
     );
-    let graph: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+    let graph: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
         .for_slice(&response.body)
         .collect::<Result<_, _>>()
         .expect("the fitted RDF response is still a complete document");
@@ -704,21 +1230,34 @@ fn fragment_rdf_byte_fitting_keeps_a_complete_parseable_document_and_cursor() {
             .iter()
             .any(|quad| { quad.predicate.as_str() == "http://www.w3.org/ns/hydra/core#next" })
     );
+    let data_items = graph
+        .iter()
+        .filter(|quad| quad.graph_name == oxrdf::GraphName::DefaultGraph)
+        .count();
+    assert!(data_items < 8, "the byte budget should shorten the page");
+    assert!(graph.iter().any(|quad| {
+        quad.predicate.as_str() == "http://www.w3.org/ns/hydra/core#itemsPerPage"
+            && matches!(&quad.object, oxrdf::Term::Literal(value) if value.value() == "8")
+    }));
 }
 
 #[test]
 #[ignore = "requires npm ci --prefix interop/comunica"]
-fn stock_comunica_5_3_queries_the_fragment_endpoint() {
+fn stock_comunica_5_3_queries_the_tpf_endpoint() {
     let deployment = Deployment::new();
-    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let source = format!(
+        "{TINY_NT}<http://example.org/alice> <http://example.org/born> \
+         \"1998-04-20\"^^<http://www.w3.org/2001/XMLSchema#date> .\n"
+    );
+    deployment.publish("tox", "v1", &source, "2026-06-01T14:03:22Z");
     let mut caps = kgf_server::Caps::new();
     caps.default_limit = 1;
     let server = deployment.serve_with(caps);
-    let endpoint = format!("http://{}/tox/v/v1/fragment", server.address);
+    let endpoint = format!("http://{}/tox/v/v1/tpf", server.address);
     let remote = Deployment::new();
     remote.publish("remote", "v1", REMOTE_NT, "2026-06-01T14:03:22Z");
     let remote_server = remote.serve_with(caps);
-    let remote_endpoint = format!("http://{}/remote/v/v1/fragment", remote_server.address);
+    let remote_endpoint = format!("http://{}/remote/v/v1/tpf", remote_server.address);
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("interop/comunica/test.mjs");
@@ -1200,6 +1739,103 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
 }
 
 #[test]
+fn terms_pages_the_dictionary_and_counts_it_over_the_wire() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", GROWN_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    // Discoverable from the service descriptor rather than guessed at, and
+    // browsable with no parameters at all: an empty prefix is the first page of
+    // the whole dictionary.
+    let descriptor = server.get("/").json();
+    assert_eq!(
+        descriptor["datasets"][0]["links"]["terms"],
+        "/tox/v/v1/terms"
+    );
+    server.get("/tox/v/v1/terms").assert_status(200);
+
+    let page = server.get("/tox/v/v1/terms?prefix=http%3A%2F%2Fexample.org%2F&role=any&limit=2");
+    page.assert_status(200);
+    page.assert_header("content-type", "application/json");
+    page.assert_cache_control(&["public", "max-age=31536000", "immutable"]);
+    let body = page.json();
+    assert_eq!(
+        body["terms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["term"]["value"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["http://example.org/alice", "http://example.org/bob"]
+    );
+    assert_eq!(body["terms"][0]["roles"], serde_json::json!(["subject"]));
+    assert_eq!(
+        body["terms"][1]["roles"],
+        serde_json::json!(["subject", "object"])
+    );
+    assert_eq!(body["terms"][0]["label"], "Alice");
+    // The page carries the size of the scan it is paging through.
+    assert_eq!(
+        body["cardinality"],
+        serde_json::json!({"value": 5, "exact": true})
+    );
+    page.assert_header("kgf-complete", "false");
+    page.assert_header("kgf-truncation-reason", "page_limit");
+    page.assert_header(
+        "kgf-next-cursor",
+        body["next"].as_str().expect("a cursor in the body"),
+    );
+
+    // The count is the whole answer, so it says so in both channels and offers
+    // nothing to continue.
+    let counted = server.get("/tox/v/v1/terms?prefix=http%3A%2F%2Fexample.org%2F&count=true");
+    counted.assert_status(200);
+    counted.assert_header("kgf-complete", "true");
+    assert!(counted.header("kgf-next-cursor").is_none());
+    assert_eq!(
+        counted.json()["count"],
+        serde_json::json!({"value": 5, "exact": true}),
+        "three subjects and two predicates under the prefix"
+    );
+    // Every position, in one request: the fan-out probe this operation exists
+    // for wants to know *how* a namespace is used, not only whether it is.
+    // `bob` is the one term under the prefix in both positions, so it is stored
+    // once and `any` is five rather than the six the positions add up to.
+    assert_eq!(
+        counted.json()["counts"],
+        serde_json::json!({"subject": 3, "predicate": 2, "object": 1, "any": 5})
+    );
+
+    // Empty controls are how a browser submits an untouched form, and each of
+    // these selects the same default as its omission.
+    server
+        .get("/tox/v/v1/terms?prefix=&role=&limit=&labels=")
+        .assert_status(200);
+
+    // And the same URL is a page in a browser.
+    let html = server.request(
+        "GET",
+        "/tox/v/v1/terms?prefix=http%3A%2F%2Fexample.org%2F&role=any&limit=2",
+        &[("Accept", "text/html")],
+    );
+    html.assert_status(200);
+    html.assert_header("content-type", "text/html; charset=utf-8");
+    let text = html.text();
+    assert!(text.contains("<h1>“http://example.org/…”</h1>"), "{text}");
+    assert!(text.contains("Terms · tox v1"), "{text}");
+    // The term is a link into its own neighborhood, and the label the request
+    // asked for sits under it rather than in a column of its own.
+    assert!(
+        text.contains(">ex:alice<span class=\"t-label\">Alice</span></a>"),
+        "{text}"
+    );
+    assert!(text.contains("How many in total?"), "{text}");
+
+    // A manifest that predates the operation does not withdraw it: see
+    // `an_operation_needing_no_sidecar_is_not_gated_on_its_declaration`.
+}
+
+#[test]
 fn one_url_serves_a_page_to_a_browser_and_data_to_everything_else() {
     const BROWSER: &str =
         "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
@@ -1274,6 +1910,70 @@ fn every_error_response_carries_a_code() {
     // And it negotiates, like every other error.
     let page = server.request("GET", "/%FF", &[("Accept", "text/html")]);
     page.assert_header("content-type", "text/html; charset=utf-8");
+}
+
+#[test]
+fn a_page_is_admitted_the_same_way_in_every_representation_it_offers() {
+    // Admission classes what bounds the work, not how the answer is spelled.
+    // A page costs its `limit` rows in JSON, in RDF and in HTML alike, so
+    // charging the RDF forms a heavy permit priced the format rather than the
+    // work — and priced it backwards, since the HTML page resolves a label per
+    // distinct term and the Turtle page resolves none.
+    let deployment = Deployment::new();
+    deployment.publish_text("tox", "v1", GROWN_NT, "2026-06-01T14:03:22Z");
+    let records = RecordingAccessLog::default();
+    let server = deployment.serve_with_access(Arc::new(records.clone()), false);
+
+    let representations = [
+        "application/json",
+        "text/turtle",
+        "application/n-quads",
+        "application/trig",
+        "application/ld+json",
+        "text/html",
+    ];
+    for accept in representations {
+        server
+            .request("GET", "/tox/v/v1/fragment?limit=2", &[("Accept", accept)])
+            .assert_status(200);
+    }
+    // `/tpf` offers no JSON, so every machine representation of it is RDF.
+    for accept in representations
+        .iter()
+        .filter(|accept| **accept != "application/json")
+    {
+        server
+            .request("GET", "/tox/v/v1/tpf?limit=2", &[("Accept", *accept)])
+            .assert_status(200);
+    }
+    // The one thing on these routes that does leave the page behind.
+    server
+        .request(
+            "GET",
+            "/tox/v/v1/fragment?o.text=Alice",
+            &[("Accept", "text/turtle")],
+        )
+        .assert_status(200);
+
+    let records = records.records();
+    let (pages, filtered) = records
+        .split_last()
+        .map(|(filtered, pages)| (pages, filtered))
+        .expect("one record per request");
+    assert_eq!(pages.len(), representations.len() * 2 - 1);
+    for record in pages {
+        assert_eq!(
+            record.work_class,
+            Some(kgf_server::access::AccessWorkClass::Ordinary),
+            "{:?} in {:?} is a page, not candidate-sized work",
+            record.operation,
+            record.representation
+        );
+    }
+    assert_eq!(
+        filtered.work_class,
+        Some(kgf_server::access::AccessWorkClass::Heavy)
+    );
 }
 
 #[test]
@@ -1463,7 +2163,7 @@ fn shape_logging_excludes_content_and_raw_logging_is_explicit() {
     let values = format!("(?person) {{ (<http://example.org/{SECRET}>) }}");
     server
         .get(&format!(
-            "/tox/v/v1/fragment?s=%3Fperson&p=ex%3Aknows&o=%3Fknown&values={}",
+            "/tox/v/v1/tpf?subject=%3Fperson&predicate=http%3A%2F%2Fexample.org%2Fknows&object=%3Fknown&values={}",
             kgf_server::url::encode_value(&values)
         ))
         .assert_status(200);
@@ -1492,6 +2192,10 @@ fn shape_logging_excludes_content_and_raw_logging_is_explicit() {
     assert_eq!(
         shape_records[4].transport,
         Some(kgf_server::access::Transport::GetValues)
+    );
+    assert_eq!(
+        shape_records[4].operation,
+        Some(kgf_server::access::AccessOperation::Tpf)
     );
     assert_eq!(
         serde_json::to_value(&shape_records[2]).unwrap()["shape"],
@@ -1823,6 +2527,31 @@ fn a_manifest_that_disagrees_with_its_directory_stops_startup() {
 }
 
 #[test]
+fn a_dataset_directory_named_after_a_route_stops_startup() {
+    // `kgf build` refuses to mint this id, so the only way one reaches a bundle
+    // root is the way this test makes it: a directory put there by something
+    // else. Loud rather than degraded, for the same reason a mislabelled
+    // version is — the alternative is a dataset that is on disk, listed in the
+    // service descriptor, and answers the health probe at every one of its URLs.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    std::fs::create_dir_all(deployment.root_path().join("healthz/v1"))
+        .expect("a hand-assembled bundle directory");
+
+    let error = Service::build(kgf_server::Config::new(
+        kgf::serve::published_root(deployment.root_path()).unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    ))
+    .expect_err("a shadowed dataset is not servable");
+    let message = error.to_string();
+    assert!(message.contains("healthz"), "{message}");
+    assert!(
+        message.contains("rename"),
+        "the operator needs the fix: {message}"
+    );
+}
+
+#[test]
 fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() {
     // `operations.rs` checks what the read operations *answer*, headless. What
     // only a socket can show is the rest of the response: completeness metadata in
@@ -1999,7 +2728,7 @@ fn the_operations_answer_over_the_wire_with_their_completeness_on_the_headers() 
         "the finite version manifest remains discoverable"
     );
     let manifest_html = manifest.text();
-    for operation in ["fragment", "count", "describe", "sample"] {
+    for operation in ["fragment", "tpf", "count", "describe", "sample"] {
         assert!(
             manifest_html.contains(&format!("action=\"{base}/{operation}\"")),
             "manifest omitted the {operation} form"
@@ -2061,30 +2790,96 @@ fn a_validator_moves_when_the_configuration_does() {
 }
 
 #[test]
-fn an_operation_a_bundle_does_not_declare_is_refused_before_it_is_opened() {
-    // Sampling is optional, so a bundle that does not declare it is
-    // answered 501 — the request is well formed and the shortfall is what this
-    // bundle offers, which is exactly what `capability_not_available` says.
+fn an_operation_whose_artifact_a_bundle_lacks_is_refused_before_it_is_opened() {
+    // Search needs the text index, so a bundle without one is answered 501 — the
+    // request is well formed and the shortfall is what this bundle carries, which
+    // is exactly what `capability_not_available` says.
     let deployment = Deployment::new();
-    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    deployment.publish_text("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
     let server = deployment.serve();
-    server.get("/tox/v/v1/sample?n=2").assert_status(200);
+    server.get("/tox/v/v1/search?q=Alice").assert_status(200);
+    server
+        .get("/tox/v/v1/fragment?o.text=Alice")
+        .assert_status(200);
 
-    // Withdraw it, and only `/sample` changes.
+    // Withdraw it, and only the operations that read those bytes change.
     let manifest = deployment.bundle("tox", "v1").join("manifest.json");
     let mut document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
     document["capabilities"]
         .as_object_mut()
         .unwrap()
-        .remove("sample");
+        .remove("search");
     std::fs::write(&manifest, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
     let server = deployment.serve();
 
-    let refused = server.get("/tox/v/v1/sample?n=2");
-    refused.assert_status(501);
-    assert_eq!(refused.json()["code"], "capability_not_available");
+    for target in [
+        "/tox/v/v1/search?q=Alice",
+        "/tox/v/v1/fragment?o.text=Alice",
+    ] {
+        let refused = server.get(target);
+        refused.assert_status(501);
+        assert_eq!(
+            refused.json()["code"],
+            "capability_not_available",
+            "{target}"
+        );
+    }
     server.get("/tox/v/v1/fragment?limit=2").assert_status(200);
+}
+
+#[test]
+fn an_operation_needing_no_sidecar_is_not_gated_on_its_declaration() {
+    // The other half of the rule. `sample`, `labels`, and `terms` compose the
+    // artifacts every bundle is required to carry, so nothing published can fail
+    // to answer them. A manifest that omits one is therefore not a bundle that
+    // cannot serve it, and out-of-date metadata must not be able to withdraw
+    // work the bytes support — the failure a gate here would cause and could not
+    // prevent. `terms` is not declared at all, which makes the point twice over.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let manifest = deployment.bundle("tox", "v1").join("manifest.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    let capabilities = document["capabilities"].as_object_mut().unwrap();
+    assert!(
+        !capabilities.contains_key("terms"),
+        "a bundle cannot honestly declare a capability half of which it cannot answer"
+    );
+    for capability in ["sample", "labels"] {
+        assert!(
+            capabilities.remove(capability).is_some(),
+            "a core bundle declares {capability}"
+        );
+    }
+    std::fs::write(&manifest, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    let server = deployment.serve();
+
+    server.get("/tox/v/v1/sample?n=2").assert_status(200);
+    server.get("/tox/v/v1/terms?limit=2").assert_status(200);
+    server
+        .get("/tox/v/v1/terms?limit=2&labels=true")
+        .assert_status(200);
+    let body = serde_json::to_vec(&serde_json::json!({"iris": ["ex:alice"]})).unwrap();
+    server
+        .request_with_body(
+            "QUERY",
+            "/tox/v/v1/labels",
+            &[("Content-Type", "application/json")],
+            &body,
+        )
+        .assert_status(200);
+
+    // And they stay advertised, because what this deployment routes is the
+    // descriptor's statement rather than the bundle's.
+    let links = &server.get("/").json()["datasets"][0]["links"];
+    for operation in ["sample", "terms", "labels"] {
+        assert_eq!(
+            links[operation],
+            serde_json::json!(format!("/tox/v/v1/{operation}")),
+            "{operation}"
+        );
+    }
 }
 
 #[test]
@@ -2248,6 +3043,14 @@ impl Deployment {
         let mut document: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         document["created"] = serde_json::json!(created);
+        std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    }
+
+    fn set_dataset_iri(&self, dataset: &str, version: &str, iri: &str) {
+        let path = self.bundle(dataset, version).join("manifest.json");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["dataset_iri"] = serde_json::json!(iri);
         std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
     }
 

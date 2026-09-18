@@ -58,8 +58,10 @@ COPY --from=build /src/hdtc/target/release/hdtc /usr/local/bin/hdtc
 USER kgf
 WORKDIR /home/kgf
 
-# The service descriptor at `/` is the health probe: it opens no bundle, so no
-# `/healthz` is needed.
+# `/healthz` is the health probe: it opens no bundle and is not part of the API,
+# so a failed check means this process cannot answer rather than that some
+# bundle is slow, and the server does not write an access record for an
+# uneventful one.
 EXPOSE 8080
 ENTRYPOINT ["kgf"]
 CMD ["--help"]

@@ -57,6 +57,11 @@ pub const KEYSET_ROLES: &str = "subjects-only,objects-only,shared";
 /// into a dot-prefixed sibling of its output, and `Catalog::scan` walks
 /// `{root}/{dataset}/{version}` without knowing which directories are still
 /// being written.
+///
+/// Being the first path component is what makes a handful of names unusable:
+/// the server answers a few static routes directly under the root, and those
+/// win the match against `/{dataset}`. Such an id is refused here rather than
+/// diagnosed at serve time, because by then the bundle exists and is listed.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct DatasetId(String);
@@ -93,7 +98,23 @@ fn parse_path_component(kind: &str, value: &str) -> Result<String> {
 impl FromStr for DatasetId {
     type Err = anyhow::Error;
     fn from_str(value: &str) -> Result<Self> {
-        parse_path_component("dataset id", value).map(Self)
+        let value = parse_path_component("dataset id", value)?;
+        // The server mounts a few static routes directly under the root, and a
+        // static segment beats the `/{dataset}` wildcard whatever the
+        // registration order. A dataset spelling one of them would build,
+        // publish, and appear in the service descriptor while every URL for it
+        // answered something else entirely — a failure with nothing to report.
+        //
+        // Refused here so no build produces one, and refused again where the
+        // server turns a scanned tree into a URL space, because a bundle root
+        // is a directory and can be filled by something that is not this
+        // toolchain.
+        ensure!(
+            !kgf_server::routes::RESERVED_DATASET_IDS.contains(&value.as_str()),
+            "a dataset id may not be {value:?}; the server answers /{value} \
+             itself, which would leave the dataset published and unreachable"
+        );
+        Ok(Self(value))
     }
 }
 
@@ -380,7 +401,12 @@ pub struct Publisher {
 /// Prefixes, roles and authoritative namespaces, validated against each other.
 #[derive(Debug, Clone, Serialize)]
 pub struct Semantics {
-    /// Prefix bindings for CURIE syntax in parameters.
+    /// Shared prefix tables, layered with later files winning, under
+    /// `prefixes`. Paths on the build machine; the build reads them, the
+    /// config check cannot, so nothing here is resolved from their contents.
+    pub prefix_tables: Vec<PathBuf>,
+    /// Prefix bindings for CURIE syntax in parameters: the well-known four and
+    /// the config's own. The tables layer under these at build time.
     pub prefixes: BTreeMap<String, String>,
     /// Empty means "the manifest's standard profile", not "no roles".
     pub roles: BTreeMap<String, Vec<String>>,
@@ -460,12 +486,11 @@ pub struct Keysets {
     pub encoding: KeysetEncoding,
 }
 
-/// `stats/`.
+/// `stats/`. Always built, and with no knobs yet: the prefix tables that used
+/// to live here shape the whole bundle and moved to `semantics`. Kept so the
+/// key stays where the next statistics setting will go.
 #[derive(Debug, Clone, Serialize)]
-pub struct Stats {
-    /// Prefix tables, layered with later files winning.
-    pub prefix_tables: Vec<PathBuf>,
-}
+pub struct Stats {}
 
 /// Limits handed to the external builders.
 #[derive(Debug, Clone, Serialize)]
@@ -618,19 +643,10 @@ fn resolve_semantics(semantics: config::Semantics) -> Result<Semantics> {
         .map(|(prefix, namespace)| ((*prefix).to_owned(), (*namespace).to_owned()))
         .collect();
 
+    // The same rule a shared table's entries meet at build time, so a binding
+    // is held to one contract wherever it enters.
     for (prefix, expansion) in &semantics.prefixes {
-        ensure!(
-            !prefix.is_empty()
-                && prefix
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
-            "prefix name {prefix:?} is not a usable CURIE prefix"
-        );
-        oxiri::Iri::parse(expansion.as_str()).map_err(|error| {
-            anyhow::anyhow!(
-                "prefix {prefix:?} expands to {expansion:?}, which is not an IRI: {error}"
-            )
-        })?;
+        super::prefixes::validate_binding(prefix, expansion)?;
     }
     prefixes.extend(semantics.prefixes);
 
@@ -666,11 +682,15 @@ fn resolve_semantics(semantics: config::Semantics) -> Result<Semantics> {
     for namespace in &semantics.authoritative_namespaces {
         ensure!(
             prefixes.contains_key(namespace),
-            "authoritative namespace {namespace:?} is not one of the declared prefixes"
+            "authoritative namespace {namespace:?} is not bound in this config's \
+             semantics.prefixes; a prefix a shared table binds has to be repeated \
+             there to be named here, because tables are files on the build machine \
+             and are not read when the config is checked"
         );
     }
 
     Ok(Semantics {
+        prefix_tables: semantics.prefix_tables,
         prefixes,
         roles: semantics.roles,
         authoritative_namespaces: semantics.authoritative_namespaces,
@@ -765,9 +785,7 @@ fn resolve_contents(contents: config::Contents) -> Result<Contents> {
         text,
         filters,
         keysets,
-        stats: Stats {
-            prefix_tables: contents.stats.prefix_tables,
-        },
+        stats: Stats {},
     })
 }
 
@@ -1118,6 +1136,26 @@ mod tests {
         );
         assert!("..".parse::<DatasetId>().is_err());
         assert!("".parse::<DatasetId>().is_err());
+    }
+
+    /// A dataset whose id is a route the server already answers would build and
+    /// publish, appear in the service descriptor, and resolve to something else
+    /// at every one of its URLs.
+    #[test]
+    fn a_dataset_may_not_be_named_after_a_root_route() {
+        for reserved in kgf_server::routes::RESERVED_DATASET_IDS {
+            let refused = reserved.parse::<DatasetId>();
+            assert!(refused.is_err(), "{reserved}");
+            assert!(
+                refused.unwrap_err().to_string().contains(reserved),
+                "the message must name the id it refused"
+            );
+            // Only the first path component collides, so the same word is an
+            // ordinary version label under `/{dataset}/v/{version}`.
+            assert!(reserved.parse::<VersionLabel>().is_ok(), "{reserved}");
+        }
+        assert!("healthzz".parse::<DatasetId>().is_ok());
+        assert!("dreamkg".parse::<DatasetId>().is_ok());
     }
 
     #[test]

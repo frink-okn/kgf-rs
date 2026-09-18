@@ -59,6 +59,36 @@ const VOID_SOURCE: &str = concat!(
 );
 
 #[test]
+fn a_manifest_may_not_claim_a_dataset_id_no_build_would_write() {
+    // This tool exists for bundles assembled by hand, which makes it the one
+    // producer that could otherwise mint an id `kgf build` refuses. Both
+    // spellings are checked: taken from the directory name, and passed
+    // outright.
+    let root = tempfile::tempdir().unwrap();
+    let shadowed = root.path().join("healthz").join("2026-08-01");
+    std::fs::create_dir_all(&shadowed).unwrap();
+    build_artifacts(&shadowed, SOURCE);
+
+    let message = kgf(&["manifest", path(&shadowed)]).failure();
+    assert!(message.contains("healthz"), "{message}");
+
+    let ordinary = root.path().join("demo-kg").join("2026-08-01");
+    std::fs::create_dir_all(&ordinary).unwrap();
+    build_artifacts(&ordinary, SOURCE);
+    let message = kgf(&["manifest", path(&ordinary), "--id", "healthz"]).failure();
+    assert!(message.contains("healthz"), "{message}");
+
+    // The directory it refused is left without a manifest rather than half
+    // described, so the failure is not something a later run has to undo.
+    assert!(!shadowed.join("manifest.json").exists());
+    assert!(!ordinary.join("manifest.json").exists());
+
+    // An ordinary id still works from the same directory.
+    kgf(&["manifest", path(&ordinary)]).success();
+    assert_eq!(Manifest::read(&ordinary).unwrap().id, "demo-kg");
+}
+
+#[test]
 fn a_hand_assembled_bundle_becomes_servable_and_stays_honest() {
     let root = tempfile::tempdir().unwrap();
     let bundle = root.path().join("demo-kg").join("2026-08-01");
@@ -157,9 +187,8 @@ fn a_build_publishes_one_verified_description_set() {
                 "  iri: https://example.org/typed-kg\n",
                 "  title: Typed KG\n",
                 "  description: Publisher supplied text.\n",
-                "contents:\n",
-                "  stats:\n",
-                "    prefix_tables: ['{}']\n",
+                "semantics:\n",
+                "  prefix_tables: ['{}']\n",
             ),
             path(table)
         )

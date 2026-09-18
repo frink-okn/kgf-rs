@@ -473,6 +473,16 @@ fn build(
         "cannot infer a dataset id from the bundle path; pass --id \
          (the catalog layout is {root}/{dataset}/{version})",
     )?;
+    // Through the same type `kgf build` mints ids with, whether the id was
+    // passed, carried over from a previous manifest, or taken from the
+    // directory name. This tool describes bundles assembled by hand, which is
+    // exactly the path that can otherwise produce an id no build would have
+    // written: one that is not a single path component, or one the server
+    // answers as a route and would leave the dataset published and unreachable.
+    let id = id
+        .parse::<crate::build::plan::DatasetId>()
+        .context("the dataset id this manifest would carry is not usable")?
+        .to_string();
 
     let version = pick(
         &requested.version,

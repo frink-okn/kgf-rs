@@ -104,15 +104,15 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
             runner: &runner,
             data: &layout.data,
             dataset_iri: plan.config.dataset.iri.as_str(),
-            prefix_tables: &plan.config.contents.stats.prefix_tables,
-            extra_prefixes: &plan.config.semantics.prefixes,
+            prefixes: &build.prefixes,
+            prefix_tables: &plan.config.semantics.prefix_tables,
             card,
             work: work.path(),
         },
         &staged_stats,
     )?;
 
-    let requested = requested_manifest(plan, inputs, &build.hdtc)?;
+    let requested = requested_manifest(plan, inputs, &build.hdtc, build.prefixes.clone())?;
     let manifest =
         crate::manifest::write_description_manifest(staging.path(), &requested, &outcome.metadata)?;
 
@@ -308,6 +308,12 @@ pub(super) fn rehearse(build: &Build) -> String {
     };
 
     let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# prefix map: {} bindings, {} table(s) layered under the dataset's own",
+        build.prefixes.len(),
+        plan.config.semantics.prefix_tables.len()
+    );
     if let Input::Hdt { path, adopt } = &plan.input {
         let verb = if *adopt { "move" } else { "copy" };
         let _ = writeln!(
@@ -420,6 +426,7 @@ fn requested_manifest(
     plan: &BundlePlan,
     inputs: Vec<SourceInput>,
     hdtc: &Path,
+    prefixes: BTreeMap<String, String>,
 ) -> Result<Requested> {
     Ok(Requested {
         id: Some(plan.config.dataset.id.to_string()),
@@ -442,7 +449,10 @@ fn requested_manifest(
             .as_ref()
             .and_then(|publisher| publisher.contact.clone()),
         previous_version: plan.previous_version.as_ref().map(ToString::to_string),
-        prefixes: plan.config.semantics.prefixes.clone(),
+        // The layered map, not the plan's own: shared tables under the
+        // dataset's bindings, the same map the namespace inventory counted
+        // against.
+        prefixes,
         roles: plan.config.semantics.roles.clone(),
         source: Some(Source {
             inputs,

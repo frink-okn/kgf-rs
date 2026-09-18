@@ -75,6 +75,14 @@ pub struct DatasetSummary<'a> {
     description: Option<&'a str>,
     triples: u64,
     current: &'a str,
+    /// What the current release's manifest declares it *carries*.
+    ///
+    /// A statement about bytes, and the one a consumer reading manifests without
+    /// opening bundles depends on. It is not the list of operations this server
+    /// answers — [`links`](Self::links) is — and the two differ legitimately in
+    /// both directions: an operation needing no sidecar is routed whether or not
+    /// an older manifest happens to name it, and a capability this build does not
+    /// implement can be declared by a bundle built for one that does.
     capabilities: Vec<&'a str>,
     /// The dataset descriptor, relative to this origin (see [`ReleaseEntry::url`]).
     url: String,
@@ -83,10 +91,16 @@ pub struct DatasetSummary<'a> {
 }
 
 /// Machine-discoverable resources belonging to one immutable release.
+///
+/// What this deployment *routes*, which is the question a client asking "can I
+/// send this request" is really asking. Present means the build implements the
+/// operation and this release can answer it; absent means one of the two is
+/// missing, and the manifest's capability list says which.
 #[derive(Debug, Serialize)]
 pub struct ReleaseLinks {
     manifest: String,
     fragment: String,
+    tpf: String,
     count: String,
     describe: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -99,6 +113,8 @@ pub struct ReleaseLinks {
     sample: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     search: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terms: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     labels: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -401,6 +417,9 @@ impl Resource for DatasetDescriptor<'_> {
                         a href=(&current_links.fragment) {
                             "Browse the data →"
                         }
+                        a href=(&current_links.tpf) {
+                            "Use TPF →"
+                        }
                         a href=(&current_links.manifest) {
                             "Latest manifest →"
                         }
@@ -456,23 +475,24 @@ fn release_links(
     ReleaseLinks {
         manifest: operation("manifest"),
         fragment: operation("fragment"),
+        tpf: operation("tpf"),
         count: operation("count"),
         describe: operation("describe"),
         summary: description.then(|| operation("summary")),
         schema: description.then(|| operation("schema")),
         void: description.then(|| operation("void")),
-        sample: release
-            .declares(Capability::Sample)
-            .then(|| operation("sample")),
+        // `sample`, `terms`, and `labels` are unconditional: each composes the
+        // artifacts every bundle must carry, so a link to one is never a link a
+        // release cannot honour. This is where a client learns what *this
+        // deployment* routes, which is a different question from what the
+        // bundle's manifest declares it carries — see `routes::capability_gate`.
+        sample: Some(operation("sample")),
         search: release
             .declares(Capability::Search)
             .then(|| operation("search")),
-        labels: release
-            .declares(Capability::Labels)
-            .then(|| operation("labels")),
-        verbalize: release
-            .declares(Capability::Verbalize)
-            .then(|| operation("verbalize")),
+        terms: Some(operation("terms")),
+        labels: Some(operation("labels")),
+        verbalize: Some(operation("verbalize")),
     }
 }
 
@@ -714,6 +734,11 @@ fn operations(
     };
     let mut operations = vec![
         ("fragment", pattern_parameters, true),
+        (
+            "tpf",
+            "subject, predicate, object, values, limit, cursor",
+            true,
+        ),
         ("count", count_parameters, true),
         ("describe", "iri, direction, limit, cursor", false),
     ];
@@ -728,18 +753,16 @@ fn operations(
             ("summary", "format=md|json|html", true),
         ]);
     }
-    if manifest.declares(Capability::Sample) {
-        operations.push(("sample", "s, p, o, n, seed", true));
-    }
+    operations.push(("sample", "s, p, o, n, seed", true));
     if search {
         operations.push(("search", "q, role, predicate, labels, limit", false));
     }
-    if manifest.declares(Capability::Labels) {
-        operations.push(("labels", "QUERY/POST JSON body: iris", false));
-    }
-    if manifest.declares(Capability::Verbalize) {
-        operations.push(("verbalize", "config, target, iri, n, seed, plan", true));
-    }
+    // Browsable with no arguments: an empty prefix is the first page of the whole
+    // dictionary, which is a way into a KG whose vocabulary a client does not
+    // know yet.
+    operations.push(("terms", "prefix, role, count, limit, labels, cursor", true));
+    operations.push(("labels", "QUERY/POST JSON body: iris", false));
+    operations.push(("verbalize", "config, target, iri, n, seed, plan", true));
     operations
         .into_iter()
         .map(|(operation, parameters, browsable)| {
@@ -850,6 +873,7 @@ mod tests {
         // And onward into the data: a browser needs one link that works with
         // no arguments, or the API is only reachable by typing URLs.
         assert!(page.contains("href=\"/tox/v/2026-06-01/fragment\""));
+        assert!(page.contains("href=\"/tox/v/2026-06-01/tpf\""));
         assert!(page.contains("href=\"/tox/v/2026-06-01/count\""));
         // `/describe` is named without a link, because it needs a resource and
         // a link that 400s is worse than none.

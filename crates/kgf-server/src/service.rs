@@ -86,6 +86,23 @@ pub enum ServiceError {
         detail: String,
     },
 
+    /// A bundle directory is named after a path this server answers itself.
+    ///
+    /// Refused rather than skipped or served. Skipping leaves a published
+    /// dataset missing from the descriptor with nothing to say why; serving it
+    /// lists a dataset whose every URL resolves to the route that shadows it.
+    /// Neither is a state an operator can diagnose from outside, and the fix —
+    /// rename the directory — is one an operator can act on.
+    #[error(
+        "bundle root holds a dataset directory named {dataset:?}, but this server answers \
+         /{dataset} itself; rename it, or every URL for that dataset resolves to that route \
+         instead"
+    )]
+    ReservedDataset {
+        /// The directory name that collides with a route.
+        dataset: String,
+    },
+
     /// The catalog could not scan the bundle root.
     #[error(transparent)]
     Catalog(#[from] kgf_store::Error),
@@ -129,6 +146,11 @@ impl Service {
             .validate()
             .map_err(|detail| ServiceError::Configuration { detail })?;
         let catalog = Catalog::scan(config.bundle_root.clone(), OpenOptions::default())?;
+        // Before any manifest is read, because this is a fact about the
+        // directory name rather than about the bundle inside it: a hand-
+        // assembled or externally produced tree can carry a name `kgf build`
+        // would have refused, and the manifest may be perfectly well formed.
+        refuse_reserved_datasets(&catalog.ids())?;
         let mut manifests = Vec::new();
         for id in catalog.ids() {
             let bundle = catalog.bundle_dir(&id)?;
@@ -713,6 +735,11 @@ impl Release {
         &self.manifest
     }
 
+    /// The logical dataset identity declared by this immutable release.
+    pub fn dataset_iri(&self) -> Option<&str> {
+        self.manifest.parsed.dataset_iri.as_deref()
+    }
+
     /// The CURIE prefixes this version's parameters accept.
     pub fn prefixes(&self) -> &PrefixMap {
         &self.prefixes
@@ -745,6 +772,29 @@ impl Release {
 }
 
 // ---------------------------------------------------------------------------
+/// Refuse any scanned dataset whose name is a route this server answers.
+///
+/// `/{dataset}` is a wildcard directly under the root and a static segment
+/// beats it however the routes were registered, so such a dataset is
+/// unreachable at every one of its URLs while still being published, scanned,
+/// and listed. `kgf build` refuses these ids when it mints them, but a bundle
+/// root is a directory: it can be assembled by hand, mirrored from a bucket, or
+/// produced by something that is not this toolchain. This is the check that
+/// cannot be reached around, because it stands between the tree and the URL
+/// space rather than between a config and a tree.
+fn refuse_reserved_datasets(ids: &[BundleId]) -> Result<(), ServiceError> {
+    let reserved = ids
+        .iter()
+        .map(|id| id.dataset.as_str())
+        .find(|dataset| crate::routes::RESERVED_DATASET_IDS.contains(dataset));
+    match reserved {
+        Some(dataset) => Err(ServiceError::ReservedDataset {
+            dataset: dataset.to_owned(),
+        }),
+        None => Ok(()),
+    }
+}
+
 // Instants
 // ---------------------------------------------------------------------------
 
@@ -830,6 +880,28 @@ mod tests {
             dataset: dataset.to_owned(),
             version: version.to_owned(),
         }
+    }
+
+    #[test]
+    fn a_dataset_named_after_a_route_stops_startup() {
+        // The name is what collides, so nothing about the bundle inside it can
+        // make the dataset reachable and no manifest needs to be read to know.
+        for reserved in crate::routes::RESERVED_DATASET_IDS {
+            let scanned = [id("tox", "v1"), id(reserved, "v1")];
+            let refused =
+                refuse_reserved_datasets(&scanned).expect_err("a shadowed dataset is not servable");
+            let message = refused.to_string();
+            assert!(message.contains(reserved), "{message}");
+            assert!(
+                message.contains("rename"),
+                "the operator needs the fix, not just the diagnosis: {message}"
+            );
+        }
+
+        // A dataset that merely resembles one is ordinary.
+        let ordinary = [id("tox", "v1"), id("healthzz", "v1"), id("health", "v1")];
+        assert!(refuse_reserved_datasets(&ordinary).is_ok());
+        assert!(refuse_reserved_datasets(&[]).is_ok());
     }
 
     #[test]

@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
+use kgf_server::access::AccessOperation;
 use kgf_server::answer::{self, Target};
 use kgf_server::representation::Representation;
 use kgf_server::request;
@@ -21,6 +22,7 @@ use kgf_server::service::{Release, Service};
 use kgf_server::url::Params;
 use kgf_server::{Budgets, Caps, Limits};
 use kgf_store::catalog::BundleId;
+use kgf_store::dict::Section;
 use kgf_store::pattern::IdPattern;
 use kgf_store::testing::Fixture;
 use kgf_store::{IdTriple, Role, Store, TermId};
@@ -656,7 +658,10 @@ fn describe_is_two_enumerations_that_page_as_one() {
     // A resource the bundle does not hold is an empty answer that says why.
     let unknown = served.describe(&store, "iri=%3Chttp%3A%2F%2Fexample.org%2Fnobody%3E");
     assert_eq!(unknown["cardinality"]["value"], serde_json::json!(0));
-    assert_eq!(unknown["absent_terms"], serde_json::json!(["iri"]));
+    assert_eq!(
+        unknown["absent_terms"],
+        serde_json::json!([{"parameter": "iri", "reason": "not_in_bundle"}])
+    );
 
     // A literal has incoming edges like any other object, and a bundle that
     // holds one must be able to answer for it.
@@ -815,13 +820,19 @@ fn an_absent_term_is_an_empty_answer_that_says_which_position() {
     let answer = served.fragment(&store, "s=%3Chttp%3A%2F%2Fexample.org%2Fnobody%3E");
     assert_eq!(answer["cardinality"]["value"], serde_json::json!(0));
     assert_eq!(answer["rows"], serde_json::json!([]));
-    assert_eq!(answer["absent_terms"], serde_json::json!(["s"]));
+    assert_eq!(
+        answer["absent_terms"],
+        serde_json::json!([{"parameter": "s", "reason": "not_in_bundle"}])
+    );
     assert_eq!(answer["complete"], serde_json::json!(true));
 
     // Per role, because a term can be present as one thing and not another:
     // `ex:name` is a predicate and never an object.
     let as_object = served.fragment(&store, "o=%3Chttp%3A%2F%2Fexample.org%2Fname%3E");
-    assert_eq!(as_object["absent_terms"], serde_json::json!(["o"]));
+    assert_eq!(
+        as_object["absent_terms"],
+        serde_json::json!([{"parameter": "o", "reason": "not_in_bundle"}])
+    );
     let as_predicate = served.fragment(&store, "p=%3Chttp%3A%2F%2Fexample.org%2Fname%3E");
     assert!(as_predicate.get("absent_terms").is_none());
 
@@ -1565,7 +1576,7 @@ impl Served {
     fn target(&self, operation: &'static str, query: &str) -> Target {
         Target::new(
             self.id(),
-            operation,
+            access_operation(operation),
             params(query),
             self.release().prefixes().clone(),
             kgf_server::url::Mount::default(),
@@ -1661,7 +1672,7 @@ impl Served {
             store,
             Target::body(
                 self.id(),
-                "fragment",
+                AccessOperation::Fragment,
                 params(""),
                 self.release().prefixes().clone(),
                 kgf_server::url::Mount::default(),
@@ -1690,7 +1701,7 @@ impl Served {
                 store,
                 Target::body(
                     self.id(),
-                    "count",
+                    AccessOperation::Count,
                     params(""),
                     self.release().prefixes().clone(),
                     kgf_server::url::Mount::default(),
@@ -1809,6 +1820,51 @@ impl Served {
         json(answer, Representation::Json)
     }
 
+    fn parse_scan(&self, query: &str) -> request::Terms {
+        self.try_parse_scan(query)
+            .unwrap_or_else(|error| panic!("GET /terms?{query}: {error}"))
+    }
+
+    fn try_parse_scan(&self, query: &str) -> Result<request::Terms, kgf_server::envelope::Problem> {
+        request::Terms::parse(
+            &params(query),
+            self.limits(),
+            self.release().predicate_roles(),
+            &self.release().binding(),
+        )
+    }
+
+    /// `GET /terms`, as JSON.
+    fn scan(&self, store: &Store, query: &str) -> serde_json::Value {
+        self.try_scan(store, query)
+            .unwrap_or_else(|error| panic!("GET /terms?{query}: {error}"))
+    }
+
+    fn try_scan(
+        &self,
+        store: &Store,
+        query: &str,
+    ) -> Result<serde_json::Value, kgf_server::envelope::Problem> {
+        let request = self.try_parse_scan(query)?;
+        let answer = answer::terms(store, self.target("terms", query), &request)?;
+        Ok(json(answer, Representation::Json))
+    }
+
+    /// The same, under budgets a test chose.
+    fn scan_within(&self, store: &Store, query: &str, budgets: &Budgets) -> serde_json::Value {
+        let request = request::Terms::parse(
+            &params(query),
+            self.within(budgets),
+            self.release().predicate_roles(),
+            &self.release().binding(),
+        )
+        .unwrap_or_else(|error| panic!("GET /terms?{query}: {error}"));
+        json(
+            answer::terms(store, self.target("terms", query), &request).expect("an answer"),
+            Representation::Json,
+        )
+    }
+
     fn labels(&self, store: &Store, body: &serde_json::Value) -> serde_json::Value {
         let encoded = serde_json::to_vec(body).expect("a JSON body");
         let request = request::Labels::parse(
@@ -1824,7 +1880,7 @@ impl Served {
                 store,
                 Target::body(
                     self.id(),
-                    "labels",
+                    AccessOperation::Labels,
                     params(""),
                     self.release().prefixes().clone(),
                     kgf_server::url::Mount::default(),
@@ -1847,7 +1903,7 @@ impl Served {
 
         let target = Target::new(
             self.id(),
-            operation,
+            access_operation(operation),
             params(query),
             self.release().prefixes().clone(),
             kgf_server::url::Mount::default(),
@@ -1900,6 +1956,12 @@ impl Served {
                     .expect("an answer")
                     .render(representation)
             }
+            "terms" => {
+                let request = self.parse_scan(query);
+                answer::terms(store, target, &request)
+                    .expect("an answer")
+                    .render(representation)
+            }
             other => panic!("no such operation: {other}"),
         }
         .expect("render an operation answer");
@@ -1918,9 +1980,14 @@ impl Served {
                     .extract(role, TermId(id), &mut scratch)
                     .expect("a term the dictionary counted");
                 let text = std::str::from_utf8(stored).expect("a UTF-8 term");
+                // Written back the way the server published it. A stored blank
+                // node is asked about by its scoped IRI and by nothing else, so
+                // sending `_:b1` here would test a spelling no client is ever
+                // handed and that deliberately matches nothing.
+                let published = published_spelling(store, role, id, text);
                 terms.push((
                     id,
-                    kgf_server::term::Term::from_dictionary(text).to_request(),
+                    kgf_server::term::Term::from_dictionary(&published).to_request(),
                 ));
             }
             roles.push(terms);
@@ -1949,7 +2016,8 @@ impl Served {
             let bytes = dictionary
                 .extract(role, TermId(id), &mut scratch)
                 .expect("a term");
-            std::str::from_utf8(bytes).expect("UTF-8").to_owned()
+            let stored = std::str::from_utf8(bytes).expect("UTF-8");
+            published_spelling(store, role, id, stored)
         };
         selection
             .page(0, usize::MAX)
@@ -2041,6 +2109,442 @@ impl Terms {
     }
 }
 
+/// Every stored term the four sections hold, keyed by its stored spelling —
+/// which is the order a scan emits them in — and carrying the spelling a
+/// response publishes it under, plus the roles it occupies.
+///
+/// Read through the dictionary rather than through the operation under test.
+type DictionaryTerms = std::collections::BTreeMap<String, (String, Vec<&'static str>)>;
+
+fn dictionary_by_term(store: &Store) -> DictionaryTerms {
+    let dictionary = store.dict();
+    let mut scratch = Vec::new();
+    let mut terms = DictionaryTerms::new();
+    for (role, name) in [
+        (Role::Subject, "subject"),
+        (Role::Predicate, "predicate"),
+        (Role::Object, "object"),
+    ] {
+        for id in 1..=dictionary.counts().len(role) {
+            let stored = dictionary
+                .extract(role, TermId(id), &mut scratch)
+                .expect("a term the dictionary counted");
+            let stored = String::from_utf8(stored.to_vec()).expect("a UTF-8 term");
+            let published = published_spelling(store, role, id, &stored);
+            terms
+                .entry(stored)
+                .or_insert_with(|| (published, Vec::new()))
+                .1
+                .push(name);
+        }
+    }
+    terms
+}
+
+/// What `GET /terms` should answer for one role and prefix, derived from the
+/// dictionary: the terms the role's sections hold, and for each the roles the
+/// scan of that role can see it in.
+fn expected_scan(store: &Store, role: &str, prefix: &str) -> Vec<(String, Vec<&'static str>)> {
+    let visible: &[&str] = match role {
+        "predicate" => &["predicate"],
+        "subject" | "object" => &["subject", "object"],
+        _ => &["subject", "predicate", "object"],
+    };
+    let scanned: &[&str] = match role {
+        "subject" => &["subject"],
+        "predicate" => &["predicate"],
+        "object" => &["object"],
+        _ => &["subject", "predicate", "object"],
+    };
+    dictionary_by_term(store)
+        .into_iter()
+        .filter(|(stored, (_, roles))| {
+            stored.starts_with(prefix) && roles.iter().any(|role| scanned.contains(role))
+        })
+        .map(|(_, (published, roles))| {
+            let roles = roles
+                .into_iter()
+                .filter(|role| visible.contains(role))
+                .collect();
+            (published, roles)
+        })
+        .collect()
+}
+
+/// One response's rows as `(stored term, roles)`.
+fn scanned_rows(answer: &serde_json::Value) -> Vec<(String, Vec<String>)> {
+    answer["terms"]
+        .as_array()
+        .expect("terms is an array")
+        .iter()
+        .map(|row| {
+            (
+                dictionary_spelling(&row["term"]),
+                row["roles"]
+                    .as_array()
+                    .expect("roles is an array")
+                    .iter()
+                    .map(|role| role.as_str().expect("a role name").to_owned())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_prefix_scan_lists_what_the_dictionary_holds_and_counts_it_without_enumerating() {
+    let served = Served::new();
+    let store = served.store();
+
+    for role in ["subject", "predicate", "object", "any"] {
+        for prefix in [
+            "",
+            "http://example.org/",
+            "http://example.org/a",
+            "\"",
+            "_:",
+            "zz",
+        ] {
+            let query = format!(
+                "prefix={}&role={role}&labels=false&limit=100",
+                kgf_server::url::encode_value(prefix)
+            );
+            let answer = served.scan(&store, &query);
+            let expected = expected_scan(&store, role, prefix);
+
+            let rows = scanned_rows(&answer);
+            let terms: Vec<&str> = rows.iter().map(|(term, _)| term.as_str()).collect();
+            let expected_terms: Vec<&str> =
+                expected.iter().map(|(term, _)| term.as_str()).collect();
+            assert_eq!(terms, expected_terms, "{role} {prefix:?}");
+            for ((term, roles), (_, expected_roles)) in rows.iter().zip(&expected) {
+                assert_eq!(roles, expected_roles, "{role} {prefix:?} {term}");
+            }
+            assert_eq!(answer["complete"], serde_json::json!(true));
+            assert_eq!(answer["prefix"], serde_json::json!(prefix));
+            assert_eq!(answer["role"], serde_json::json!(role));
+            // A row carries no label unless one was asked for.
+            assert!(answer["terms"].as_array().unwrap().iter().all(|row| {
+                row.as_object()
+                    .is_some_and(|row| !row.contains_key("label"))
+            }));
+
+            // The page states how many terms it is paging through, so a client
+            // learns the total on page one rather than by asking again.
+            assert_eq!(
+                answer["cardinality"],
+                serde_json::json!({"value": expected.len(), "exact": true}),
+                "{role} {prefix:?}"
+            );
+
+            // The count answers the same question without enumerating — and
+            // answers it for every position, whichever one was asked for, since
+            // the four numbers come out of the same bracketing searches.
+            let counted = served.scan(
+                &store,
+                &format!(
+                    "prefix={}&role={role}&count=true",
+                    kgf_server::url::encode_value(prefix)
+                ),
+            );
+            assert_eq!(counted["count"]["value"], serde_json::json!(expected.len()));
+            assert_eq!(counted["count"]["exact"], serde_json::json!(true));
+            assert!(counted.get("terms").is_none());
+            assert_eq!(
+                counted["counts"][role], counted["count"]["value"],
+                "{role} {prefix:?}"
+            );
+            for other in ["subject", "predicate", "object", "any"] {
+                assert_eq!(
+                    counted["counts"][other],
+                    serde_json::json!(expected_scan(&store, other, prefix).len()),
+                    "{role} {prefix:?} reports {other}"
+                );
+            }
+        }
+    }
+
+    // The merge is one order over two sections, not one section after the
+    // other: these shared subjects and predicate-only terms interleave.
+    let ordered = served.scan(&store, "prefix=http://example.org/&role=any&labels=false");
+    let terms: Vec<String> = scanned_rows(&ordered)
+        .into_iter()
+        .map(|(term, _)| term.trim_start_matches("http://example.org/").to_owned())
+        .collect();
+    assert_eq!(
+        terms,
+        [
+            "age", "alice", "bob", "carol", "knows", "label", "name", "note", "self"
+        ]
+    );
+}
+
+#[test]
+fn a_role_breakdown_deduplicates_rather_than_adding_the_positions_up() {
+    let served = Served::new();
+    let store = served.store();
+
+    // `alice`, `bob` and `carol` are each a subject and an object, so they are
+    // stored once in the shared section; the predicates are their own terms. A
+    // client adding the three positions up would count every shared term twice.
+    let counted = served.scan(&store, "prefix=http://example.org/&count=true");
+    let counts = &counted["counts"];
+    assert_eq!(counts["subject"], serde_json::json!(3));
+    assert_eq!(counts["object"], serde_json::json!(3));
+    assert_eq!(counts["predicate"], serde_json::json!(6));
+    assert_eq!(counts["any"], serde_json::json!(9));
+    assert_eq!(counted["count"]["value"], counts["any"]);
+
+    // Which is the answer to the question the operation exists for: this
+    // namespace is used in every position, and a namespace that is not used at
+    // all says so in one request.
+    let absent = served.scan(&store, "prefix=http://purl.obolibrary.org/obo/&count=true");
+    assert_eq!(
+        absent["counts"],
+        serde_json::json!({"subject": 0, "predicate": 0, "object": 0, "any": 0})
+    );
+}
+
+#[test]
+fn a_scan_pages_exhaustively_at_every_size_and_resumes_from_its_cursor() {
+    let served = Served::new();
+    let store = served.store();
+
+    for role in ["subject", "predicate", "object", "any"] {
+        let whole = scanned_rows(&served.scan(&store, &format!("role={role}&labels=false")));
+        for limit in [1usize, 2, 3, 5, whole.len()] {
+            let mut paged = Vec::new();
+            let mut cursor = None;
+            loop {
+                let query = match &cursor {
+                    None => format!("role={role}&labels=false&limit={limit}"),
+                    Some(token) => {
+                        format!("role={role}&labels=false&limit={limit}&cursor={token}")
+                    }
+                };
+                let page = served.scan(&store, &query);
+                let rows = scanned_rows(&page);
+                assert!(rows.len() <= limit, "{role} at {limit}");
+                paged.extend(rows);
+                match page["next"].as_str() {
+                    None => {
+                        assert_eq!(page["complete"], serde_json::json!(true));
+                        break;
+                    }
+                    Some(token) => {
+                        assert_eq!(page["complete"], serde_json::json!(false));
+                        assert_eq!(page["truncation_reason"], serde_json::json!("page_limit"));
+                        cursor = Some(token.to_owned());
+                    }
+                }
+            }
+            assert_eq!(paged, whole, "{role} at limit {limit}");
+        }
+    }
+}
+
+#[test]
+fn a_scan_cursor_belongs_to_one_prefix_and_one_role() {
+    let served = Served::new();
+    let store = served.store();
+
+    let first = served.scan(&store, "role=any&labels=false&limit=1");
+    let token = first["next"]
+        .as_str()
+        .expect("a first page cursor")
+        .to_owned();
+    assert!(
+        served
+            .try_scan(
+                &store,
+                &format!("role=any&labels=false&limit=1&cursor={token}")
+            )
+            .is_ok()
+    );
+
+    // The prefix and the role determine the result set, so a token issued
+    // against one of them is refused by the other rather than resuming into a
+    // different enumeration.
+    for query in [
+        format!("role=subject&labels=false&limit=1&cursor={token}"),
+        format!("prefix=http://example.org/&role=any&labels=false&limit=1&cursor={token}"),
+    ] {
+        let error = served
+            .try_scan(&store, &query)
+            .expect_err("a cursor bound to another request");
+        assert_eq!(error.code(), kgf_server::envelope::ErrorCode::StaleCursor);
+    }
+
+    // `limit` and `labels` are not part of the binding: a client may change
+    // either between pages and keep paging.
+    assert!(
+        served
+            .try_scan(
+                &store,
+                &format!("role=any&labels=true&limit=3&cursor={token}")
+            )
+            .is_ok()
+    );
+}
+
+#[test]
+fn a_count_refuses_the_parameters_that_describe_a_page() {
+    let served = Served::new();
+    let store = served.store();
+    let first = served.scan(&store, "role=any&labels=false&limit=1");
+    let token = first["next"].as_str().expect("a cursor").to_owned();
+
+    for query in [
+        "count=true&limit=10".to_owned(),
+        "count=true&labels=true".to_owned(),
+        format!("count=true&cursor={token}"),
+    ] {
+        let error = served
+            .try_parse_scan(&query)
+            .expect_err("a count carrying page parameters");
+        assert_eq!(
+            error.code(),
+            kgf_server::envelope::ErrorCode::MalformedRequest
+        );
+    }
+
+    // An unknown role and a bracketed prefix are the two other ways to write
+    // this request wrongly, and each says what to write instead.
+    assert_eq!(
+        served
+            .try_parse_scan("role=graph")
+            .expect_err("no such role")
+            .code(),
+        kgf_server::envelope::ErrorCode::MalformedRequest
+    );
+    let bracketed = served
+        .try_parse_scan("prefix=%3Chttp%3A%2F%2Fexample.org%2F")
+        .expect_err("a bracketed prefix");
+    assert_eq!(
+        bracketed.code(),
+        kgf_server::envelope::ErrorCode::BadTermSyntax
+    );
+    assert!(
+        bracketed.to_string().contains("without angle brackets"),
+        "{bracketed}"
+    );
+
+    // A prefix selects terms, so it is held to the same published ceiling as a
+    // term. Nothing else bounds it: a GET target never reaches the body-size
+    // layer, and this one is hashed into the cursor binding and echoed back.
+    let huge = "a".repeat(BUDGETS.max_term_bytes as usize + 1);
+    let oversized = served
+        .try_parse_scan(&format!("prefix={huge}"))
+        .expect_err("a prefix over max_term_bytes");
+    assert_eq!(
+        oversized.code(),
+        kgf_server::envelope::ErrorCode::CapExceeded
+    );
+    assert!(
+        oversized.to_string().contains("max_term_bytes"),
+        "{oversized}"
+    );
+    // And one byte under it is accepted, so the check is a ceiling rather than a
+    // guess at what a prefix is for.
+    let largest = "a".repeat(BUDGETS.max_term_bytes as usize);
+    assert!(served.try_parse_scan(&format!("prefix={largest}")).is_ok());
+}
+
+#[test]
+fn a_scan_hydrates_labels_and_weighs_them_against_the_byte_budget() {
+    let served = Served::new();
+    let store = served.store();
+
+    let labelled = served.scan(&store, "prefix=http://example.org/a&role=any&labels=true");
+    let labels: Vec<(String, serde_json::Value)> = labelled["terms"]
+        .as_array()
+        .expect("terms")
+        .iter()
+        .map(|row| (dictionary_spelling(&row["term"]), row["label"].clone()))
+        .collect();
+    assert_eq!(
+        labels,
+        vec![
+            // A predicate is looked up in the subject sections its own scan
+            // never reads, so it can still carry a label. This one has none.
+            ("http://example.org/age".to_owned(), serde_json::Value::Null),
+            (
+                "http://example.org/alice".to_owned(),
+                serde_json::json!("Alice")
+            ),
+        ]
+    );
+
+    // One row over the budget beats a page a client cannot advance past, so the
+    // first row is served whatever it costs — and the stop is reported as the
+    // budget rather than as the page limit.
+    let squeezed = served.scan_within(
+        &store,
+        "role=any&labels=false&limit=100",
+        &Budgets {
+            max_response_bytes: 1,
+            ..BUDGETS
+        },
+    );
+    assert_eq!(scanned_rows(&squeezed).len(), 1);
+    assert_eq!(squeezed["complete"], serde_json::json!(false));
+    assert_eq!(
+        squeezed["truncation_reason"],
+        serde_json::json!("response_bytes")
+    );
+    let token = squeezed["next"].as_str().expect("a resumable stop");
+    let resumed = served.scan(&store, &format!("role=any&labels=false&cursor={token}"));
+    let whole = scanned_rows(&served.scan(&store, "role=any&labels=false"));
+    assert_eq!(scanned_rows(&resumed), whole[1..]);
+}
+
+#[test]
+fn a_scan_page_links_every_term_to_its_own_neighborhood() {
+    let served = Served::new();
+    let store = served.store();
+
+    let page = served.render(
+        &store,
+        "terms",
+        "prefix=http://example.org/&role=any&labels=true",
+        Representation::Html,
+    );
+    assert!(page.contains("<h1>“http://example.org/…”</h1>"));
+    assert!(page.contains("Terms · tox 2026-06-01"));
+    assert!(page.contains("<th>term</th><th>roles</th>"));
+    // Every term leads to its own neighborhood, whichever position it occupies:
+    // a predicate is usually a subject too, carrying the label and definition
+    // that describe it, and `roles` reports only the sections this scan read.
+    assert!(page.contains("/tox/v/2026-06-01/describe?iri=%3Chttp%3A%2F%2Fexample.org%2Falice%3E"));
+    assert!(page.contains("/tox/v/2026-06-01/describe?iri=%3Chttp%3A%2F%2Fexample.org%2Fknows%3E"));
+    assert!(
+        !page.contains("fragment?p="),
+        "a predicate links like any other term"
+    );
+    assert!(page.contains("subject, object"));
+    // The label the request asked for annotates the term rather than adding a
+    // column, and the exact total is one link away.
+    assert!(page.contains("Alice"));
+    assert!(page.contains("How many in total?"));
+    assert!(page.contains("count=true"));
+    // The page says how far through the scan it is, not just what it carried.
+    assert!(page.contains("<dt>matching</dt><dd>9</dd>"), "{page}");
+    assert!(page.contains("<dt>returned</dt>"));
+
+    let counted = served.render(&store, "terms", "role=any&count=true", Representation::Html);
+    assert!(counted.contains("<h1>Every term</h1>"));
+    assert!(counted.contains("The terms themselves"));
+    // And the count page is the per-position table, which is the useful shape of
+    // the answer rather than one number.
+    assert!(
+        counted.contains("<th>position</th><th>terms</th>"),
+        "{counted}"
+    );
+    for position in ["subject", "predicate", "object", "any"] {
+        assert!(counted.contains(position), "{position}");
+    }
+}
+
 /// Every term of a role, plus the variable.
 fn options(terms: &Terms, role: Role) -> Vec<Option<usize>> {
     std::iter::once(None)
@@ -2079,6 +2583,22 @@ fn pattern_query(
 
 fn params(query: &str) -> Params {
     Params::parse(Some(query)).unwrap_or_else(|error| panic!("query {query:?}: {error}"))
+}
+
+fn access_operation(operation: &str) -> AccessOperation {
+    match operation {
+        "fragment" => AccessOperation::Fragment,
+        "count" => AccessOperation::Count,
+        "describe" => AccessOperation::Describe,
+        "sample" => AccessOperation::Sample,
+        "search" => AccessOperation::Search,
+        "terms" => AccessOperation::Terms,
+        "schema" => AccessOperation::Schema,
+        "void" => AccessOperation::Void,
+        "summary" => AccessOperation::Summary,
+        "labels" => AccessOperation::Labels,
+        other => panic!("no such test operation: {other}"),
+    }
 }
 
 fn json(
@@ -2122,6 +2642,39 @@ fn describe_rows(answer: &serde_json::Value) -> Vec<(String, String, String, Str
             )
         })
         .collect()
+}
+
+/// The name this API publishes for a term the dictionary spells `stored`.
+///
+/// The oracle side of the blank-node rule: a stored `_:` label is never
+/// published, because it means nothing outside the document it was parsed from.
+/// Built here from `kgf_store`'s own section arithmetic and the wire format's
+/// constant prefix rather than by calling the server's own skolemizer, so the
+/// comparison still has two independent sides.
+fn published_spelling(store: &Store, role: Role, id: u64, stored: &str) -> String {
+    if !stored.starts_with("_:") {
+        return stored.to_owned();
+    }
+    let section = store
+        .dict()
+        .counts()
+        .section_id(role, TermId(id))
+        .expect("an id in its role's space");
+    let name = match section.section() {
+        Section::Shared => "sh",
+        Section::Subjects => "s",
+        Section::Objects => "o",
+        Section::Predicates => panic!("a predicate cannot be a blank node"),
+    };
+    let digest = store
+        .hdt_identity_digest()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:{digest}:{name}-{}",
+        section.local_id()
+    )
 }
 
 /// A term object, written the way the dictionary holds it.

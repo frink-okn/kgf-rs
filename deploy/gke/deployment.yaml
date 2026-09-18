@@ -1,0 +1,211 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frink-kgf-server
+  namespace: frink
+  labels:
+    app: frink-kgf-server
+    kace.frink/role: kgf
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: the bundle PVC is ReadWriteOnce, so a surged
+  # second pod could never mount it and the rollout would deadlock on
+  # Multi-Attach. A publish therefore costs a restart-length gap. That is the
+  # price of local-disk mmap over a shared NFS volume, accepted for now.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: frink-kgf-server
+  template:
+    metadata:
+      labels:
+        app: frink-kgf-server
+        kace.frink/role: kgf
+      annotations:
+        # `kubectl logs deploy/frink-kgf-server` without -c should still be the
+        # server's log now that a second container shares the pod.
+        kubectl.kubernetes.io/default-container: kgf-server
+        # Change this to force a restart, which is how a bundle already on disk
+        # becomes servable: the server fixes its catalog when it scans the root
+        # at startup and never rescans, so adoption is a restart and nothing
+        # else. `kubectl rollout restart` does the same thing. Nothing is
+        # fetched here — the sync sidecar has been doing that all along, which
+        # is what makes this restart cost seconds instead of a full mirror.
+        kgf.frink/publish: "init"
+    spec:
+      securityContext:
+        # The uid and gid the kgf image runs as. fsGroup hands that group the
+        # volume, so the sync sidecar can write it and the server can read it
+        # with no root anywhere in the pod.
+        runAsUser: 10001
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # First, so it is the default for `kubectl logs` and `kubectl exec`.
+        - name: kgf-server
+          image: ghcr.io/frink-okn/kgf:v0.2.0
+          # The image's entrypoint is `kgf`.
+          args:
+            - serve
+            - --bundle-root=/bundles
+            - --bind=0.0.0.0:8080
+            # The gateway strips /kgf before the request arrives; this puts it
+            # back on every emitted link and Hydra IRI.
+            - --public-base=https://apps.okn.us/kgf
+            # The global external load balancer appends two entries to
+            # X-Forwarded-For, the client it saw and its own address, so the
+            # client is two hops from the right. Only affects the pseudonymous
+            # client hash in access records; confirm against a known request
+            # once traffic flows.
+            - --trusted-proxies=2
+          ports:
+            - name: http
+              containerPort: 8080
+          # `/healthz` for both kubelet and the gateway's HealthCheckPolicy. It
+          # opens no bundle and is not part of the API, which is the point twice
+          # over: a failing probe means this process cannot answer rather than
+          # that some bundle is cold, and the server drops the access record for
+          # an uneventful one. Probing `/` instead put tens of thousands of
+          # identical descriptor records a day into the log and buried real
+          # traffic — and `/` is a resource clients fetch, so it could not be
+          # filtered without losing those too.
+          #
+          # Deliberately says nothing about the sync sidecar. Readiness is
+          # "this process answers", not "the bundle root matches the bucket":
+          # gating it on sync state would put bucket availability back on the
+          # serving path, which is the coupling this pod shape exists to
+          # remove. A server whose root is still filling serves the datasets it
+          # has, and the rest appear at the next restart.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          # Memory is mostly page cache for the mapped bundles, which the
+          # cgroup charges to this container. Requests equal limits because
+          # Autopilot enforces that anyway; raise both together, keeping memory
+          # within 6.5 GiB per vCPU or Autopilot bumps the CPU to match. That
+          # ratio is a whole-pod rule, so it is the sum of both containers that
+          # has to stay inside it: 2.25 vCPU to 8.25 GiB here.
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi
+              ephemeral-storage: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            # Writable, although the server only ever maps files and a published
+            # bundle is immutable by contract. Opening a text index takes
+            # tantivy's meta lock, and acquiring it opens `.tantivy-meta.lock`
+            # for writing; on a read-only mount every bundle with a text index
+            # fails to open ("Failed to acquire Lockfile ... Read-only file
+            # system"). Until hdtc's text reader opens without the lock, the
+            # immutability of this tree is a convention here rather than
+            # something the mount enforces. Nothing else is ever written.
+            - name: bundles
+              mountPath: /bundles
+
+        # Mirrors the bucket into the bundle root continuously, alongside the
+        # running server, rather than in front of it.
+        #
+        # This replaced an init container that did the same fetch before the
+        # server was allowed to start. That made every publish an outage as long
+        # as the copy — over twelve minutes for the largest bundle — and made a
+        # cold or resized PVC a full mirror with the API down for all of it. It
+        # bought nothing in exchange: the server's catalog is fixed at scan, so
+        # a version landing here mid-flight is invisible until a restart, and
+        # `sync.sh` stages under a dot-prefixed name that the catalog skips even
+        # then. Adoption was always a restart; only the waiting was avoidable.
+        #
+        # Sharing the pod is not incidental. The PVC is ReadWriteOnce, which
+        # binds to a node rather than a pod, so a separate Job would have to be
+        # pinned to the server's node with podAffinity and would then have to
+        # fit on a node Autopilot sized for the server alone — a hard affinity
+        # with nowhere to land is a Pending pod and no useful error. Same pod is
+        # same node by construction, and it also removes any chance of two
+        # syncers racing on the same staging directory.
+        - name: sync
+          image: peakcom/s5cmd:v2.2.2
+          command: ["/bin/sh", "/opt/kgf/sync-loop.sh"]
+          env:
+            - name: BUCKET
+              value: frink-kgf-bundles
+            - name: BUCKET_ENDPOINT
+              value: https://storage.googleapis.com
+            - name: BUNDLE_ROOT
+              value: /bundles
+            # Seconds between passes. A pass over an unchanged bucket is a
+            # listing per dataset and a log line.
+            - name: SYNC_INTERVAL
+              value: "300"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: kgf-bundles-reader
+                  key: access_key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kgf-bundles-reader
+                  key: secret_key
+          # Small on purpose, and small is affordable because nothing waits for
+          # this. As an init container its size was free — Autopilot bills a pod
+          # at max(init, sum(containers)), and anything under the server's 2 CPU
+          # and 8 GiB disappeared into that max. A sidecar joins the sum and is
+          # billed for the life of the pod, so the shape of the transfer now
+          # matters: `sync.sh` pins s5cmd to 4 workers x 2 parts x 8 MiB, a
+          # 64 MiB bound that this 256 MiB request covers several times over.
+          # Raise them together or not at all — s5cmd's defaults bound the same
+          # product at 64 GiB and will OOM whatever limit is set here.
+          #
+          # A slower sync is also a kinder one: these bytes compete for page
+          # cache and disk IOPS with the server mapping bundles beside it.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+              ephemeral-storage: 256Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+              ephemeral-storage: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: bundles
+              mountPath: /bundles
+            - name: sync-script
+              mountPath: /opt/kgf
+              readOnly: true
+      volumes:
+        - name: bundles
+          persistentVolumeClaim:
+            claimName: frink-kgf-bundles
+        - name: sync-script
+          configMap:
+            name: frink-kgf-sync
+            defaultMode: 0555
