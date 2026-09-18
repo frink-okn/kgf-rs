@@ -130,7 +130,7 @@ fn a_hand_assembled_bundle_becomes_servable_and_stays_honest() {
     // A core bundle declares only the optional operations this build serves.
     let mut capabilities: Vec<&str> = manifest.capabilities.keys().map(String::as_str).collect();
     capabilities.sort_unstable();
-    assert_eq!(capabilities, ["labels", "sample"]);
+    assert_eq!(capabilities, ["labels", "sample", "verbalize"]);
     assert!(manifest.predicate_roles.contains_key("label"));
 
     kgf(&["manifest", path(&bundle), "--check"]).success();
@@ -261,11 +261,13 @@ fn a_build_publishes_one_verified_description_set() {
             .unwrap()
             .contains("## Description")
     );
+    // Class-level rows carry exact distinct counts, not blanks: `knows` is
+    // one triple from one subject to one object.
     let class_properties =
         std::fs::read_to_string(bundle.join(artifact::CLASS_PROPERTIES)).unwrap();
     assert!(
         class_properties
-            .contains("design\thttp://example.org/Person\thttp://example.org/knows\t1\t\t"),
+            .contains("design\thttp://example.org/Person\thttp://example.org/knows\t1\t1\t1"),
         "{class_properties}"
     );
 

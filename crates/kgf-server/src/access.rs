@@ -315,6 +315,8 @@ pub enum AccessOperation {
     Summary,
     /// Preferred-label batch.
     Labels,
+    /// Verbalization preview.
+    Verbalize,
     /// Immutable bundle manifest.
     Manifest,
     /// Service descriptor.
@@ -344,6 +346,7 @@ impl AccessOperation {
             Self::Void => "void",
             Self::Summary => "summary",
             Self::Labels => "labels",
+            Self::Verbalize => "verbalize",
             Self::Manifest => "manifest",
             Self::Service => "service",
             Self::Dataset => "dataset",
@@ -476,6 +479,15 @@ pub enum RequestShape {
     Labels {
         /// Submitted IRIs.
         k: u64,
+    },
+    /// Verbalization preview.
+    Verbalize {
+        /// `iris`, `sample`, or `plan`.
+        mode: &'static str,
+        /// Targets the config declares.
+        targets: u64,
+        /// Roots the request asked to render.
+        roots: u64,
     },
     /// Description-graph request.
     Schema {
@@ -1021,6 +1033,7 @@ fn operation_for_route(route: &str) -> Option<AccessOperation> {
         "/{dataset}/v/{version}/void" => Some(AccessOperation::Void),
         "/{dataset}/v/{version}/summary" => Some(AccessOperation::Summary),
         "/{dataset}/v/{version}/labels" => Some(AccessOperation::Labels),
+        "/{dataset}/v/{version}/verbalize" => Some(AccessOperation::Verbalize),
         _ => None,
     }
 }

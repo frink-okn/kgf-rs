@@ -1,0 +1,23 @@
+[package]
+name = "kgf-verbalize"
+description = "A bundle's roots as embedding text, over the kgf-store read layer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kgf-store.workspace = true
+# `hdtc::format::parse_literal`: how a literal is spelled in the dictionary,
+# so a value's lexical form is read the way the store wrote it.
+hdtc.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+sha2.workspace = true
+# Absolute-IRI validation for configs, the same parser the store uses for
+# predicate-role profiles.
+oxiri.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

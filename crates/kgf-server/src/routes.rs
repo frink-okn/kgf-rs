@@ -127,6 +127,15 @@ pub fn router(service: Arc<Service>) -> Router {
                 .post(labels_post)
                 .fallback(labels_fallback),
         )
+        // The config travels as a GET parameter for a browser and as a JSON
+        // body for a program; QUERY is canonical for the body and POST the
+        // fallback, as on `/fragment`.
+        .route(
+            "/{dataset}/v/{version}/verbalize",
+            get(verbalize)
+                .post(verbalize_post)
+                .fallback(verbalize_fallback),
+        )
         .fallback(no_such_route)
         // Order matters more than usual here, and reads innermost first.
         //
@@ -930,6 +939,104 @@ async fn labels_operation(
                 )
             },
             answer::labels,
+        )
+        .await,
+    )
+}
+
+async fn verbalize(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate(
+        service,
+        BundleId { dataset, version },
+        AccessOperation::Verbalize,
+        wants,
+        |params, limits, release| {
+            // Ungated: a root's star and the label cascade read the artifacts
+            // every bundle carries. See `capability_gate`.
+            request::Verbalize::parse(
+                params,
+                limits,
+                release.prefixes(),
+                release.predicate_roles(),
+            )
+        },
+        answer::verbalize,
+    )
+    .await
+}
+
+async fn verbalize_post(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> Result<Response, Problem> {
+    verbalize_operation(
+        service,
+        BundleId { dataset, version },
+        wants,
+        headers,
+        body,
+        BodyMethod::Post,
+    )
+    .await
+}
+
+async fn verbalize_fallback(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    request: Request,
+) -> Result<Response, Problem> {
+    let method = request.method().clone();
+    if method != query_method() {
+        return Ok(method_not_allowed_for_bindings(method));
+    }
+    let (wants, headers, body) = binding_body(request, &service).await?;
+    verbalize_operation(
+        service,
+        BundleId { dataset, version },
+        wants,
+        headers,
+        body,
+        BodyMethod::Query,
+    )
+    .await
+}
+
+async fn verbalize_operation(
+    service: Arc<Service>,
+    id: BundleId,
+    wants: Wants,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+    method: BodyMethod,
+) -> Result<Response, Problem> {
+    require_json(&headers)?;
+    advertise_query(
+        operate_body(
+            service,
+            id,
+            AccessOperation::Verbalize,
+            BodyOperation {
+                wants,
+                body,
+                method,
+            },
+            |params, body, limits, release| {
+                request::Verbalize::parse_body(
+                    params,
+                    body,
+                    limits,
+                    release.prefixes(),
+                    release.predicate_roles(),
+                )
+            },
+            answer::verbalize,
         )
         .await,
     )

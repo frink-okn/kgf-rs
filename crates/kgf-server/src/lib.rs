@@ -299,6 +299,9 @@ pub struct Caps {
     pub max_search_results: u32,
     /// IRIs one `/labels` request may resolve.
     pub max_label_iris: u32,
+    /// Roots one `/verbalize` request may render, across every target it
+    /// samples or names.
+    pub max_verbalize_roots: u32,
     /// Child or class-relation rows in one `/schema` page.
     pub max_schema_items: u32,
 }
@@ -320,6 +323,7 @@ impl Caps {
             max_search_predicates: 128,
             max_search_results: 1_000,
             max_label_iris: 10_000,
+            max_verbalize_roots: 100,
             max_schema_items: 1_000,
         }
     }
@@ -386,6 +390,7 @@ impl Limits<'_> {
         rows("max_sample", self.caps.max_sample)?;
         rows("max_search_results", self.caps.max_search_results)?;
         rows("max_label_iris", self.caps.max_label_iris)?;
+        rows("max_verbalize_roots", self.caps.max_verbalize_roots)?;
         rows("max_schema_items", self.caps.max_schema_items)?;
 
         if self.caps.default_limit > self.caps.max_limit {
@@ -409,12 +414,13 @@ impl Limits<'_> {
             || self.caps.max_search_predicates == 0
             || self.caps.max_search_results == 0
             || self.caps.max_label_iris == 0
+            || self.caps.max_verbalize_roots == 0
             || self.caps.max_schema_items == 0
         {
             return Err(
                 "caps.max_limit, caps.default_limit, caps.max_sample, caps.max_bindings, \
-                 caps.max_search_predicates, caps.max_search_results, caps.max_label_iris and \
-                 caps.max_schema_items must be at least 1; \
+                 caps.max_search_predicates, caps.max_search_results, caps.max_label_iris, \
+                 caps.max_verbalize_roots and caps.max_schema_items must be at least 1; \
                  a zero-width operation is not usable"
                     .to_owned(),
             );

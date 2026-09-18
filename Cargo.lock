@@ -1069,6 +1069,7 @@ dependencies = [
  "hdtc",
  "kgf-server",
  "kgf-store",
+ "kgf-verbalize",
  "oxiri",
  "oxrdf",
  "oxrdfio",
@@ -1097,6 +1098,7 @@ dependencies = [
  "headers-accept",
  "jiff",
  "kgf-store",
+ "kgf-verbalize",
  "maud",
  "mediatype 0.21.0",
  "mediatype 0.23.0",
@@ -1105,6 +1107,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
+ "serde_norway",
  "sha2",
  "spargebra",
  "thiserror",
@@ -1127,6 +1130,19 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "kgf-verbalize"
+version = "0.2.0"
+dependencies = [
+ "hdtc",
+ "kgf-store",
+ "oxiri",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]

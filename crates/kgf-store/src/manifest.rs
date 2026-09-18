@@ -159,6 +159,10 @@ pub enum Capability {
     Search,
     /// `QUERY /labels`; resolved live from the core permutations.
     Labels,
+    /// `GET|QUERY /verbalize` — a config's texts for a few roots, rendered
+    /// live from the core permutations, for authoring an embedding config
+    /// against a served bundle.
+    Verbalize,
     /// Typed range bounds on objects; needs the range sidecar.
     Range,
     /// `GET /closure` — transitive expansion; needs the closure sidecar.
@@ -188,6 +192,7 @@ impl Capability {
             Self::Graphs => "graphs",
             Self::Search => "search",
             Self::Labels => "labels",
+            Self::Verbalize => "verbalize",
             Self::Range => "range",
             Self::Closure => "closure",
             Self::Filters => "filters",
@@ -286,9 +291,10 @@ impl BundleFacts {
 
 /// Which capabilities an artifact set supports.
 ///
-/// Two optional capabilities need nothing beyond the artifacts every bundle is
-/// required to carry: `sample` composes triple patterns, and `labels` resolves
-/// the manifest's predicate cascade through the core permutations. `star`,
+/// Three optional capabilities need nothing beyond the artifacts every bundle is
+/// required to carry: `sample` composes triple patterns, `labels` resolves the
+/// manifest's predicate cascade through the core permutations, and `verbalize`
+/// walks a root's star through both. `star`,
 /// `export`, and `terms` are not declared, each for its own reason — the first
 /// two have no implementation, and [`Capability::Terms`] names two operations of
 /// which only one can be answered from any bundle's bytes. The rest are gated on
@@ -296,14 +302,19 @@ impl BundleFacts {
 /// `closure` are therefore never derived here, since a bundle cannot acquire
 /// them without acquiring an artifact.
 ///
-/// Note what a bundle-invariant capability is worth to a reader: `sample` and
-/// `labels` are true of every bundle, so declaring them distinguishes nothing.
+/// Note what a bundle-invariant capability is worth to a reader: `sample`,
+/// `labels`, and `verbalize` are true of every bundle, so declaring them
+/// distinguishes nothing.
 /// They are kept because their contracts are met in full and because the list is
 /// what a consumer reading manifests without bundles has to go on. Whether such
 /// capabilities belong in the vocabulary at all is a separate question from
 /// whether this one can be declared honestly.
 fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
-    let mut capabilities = BTreeSet::from([Capability::Sample, Capability::Labels]);
+    let mut capabilities = BTreeSet::from([
+        Capability::Sample,
+        Capability::Labels,
+        Capability::Verbalize,
+    ]);
     if artifacts.graphs.is_some() {
         capabilities.insert(Capability::Graphs);
     }
@@ -1260,7 +1271,14 @@ mod tests {
         let fixture = Fixture::build(TINY_NT);
         let capabilities: Vec<_> = facts(&fixture).capabilities().collect();
 
-        assert_eq!(capabilities, vec![Capability::Sample, Capability::Labels]);
+        assert_eq!(
+            capabilities,
+            vec![
+                Capability::Sample,
+                Capability::Labels,
+                Capability::Verbalize
+            ]
+        );
         // Answerable by every bundle, and deliberately not declared: the name
         // covers a key-resolution operation no bundle can answer, and the route
         // is not gated on the declaration anyway.

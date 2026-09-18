@@ -3357,3 +3357,264 @@ impl Response {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// `/verbalize`
+// ---------------------------------------------------------------------------
+
+/// A typed graph for the verbalization preview: two classes, labels, one
+/// high-fanout predicate, and a mention from one class to the other.
+const TYPED_NT: &str = concat!(
+    "<http://example.org/site1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Site> .\n",
+    "<http://example.org/site1> <http://example.org/name> \"Site one\" .\n",
+    "<http://example.org/site1> <http://example.org/at> <http://example.org/loc1> .\n",
+    "<http://example.org/site1> <http://example.org/crop> \"corn\" .\n",
+    "<http://example.org/site1> <http://example.org/crop> \"rye\" .\n",
+    "<http://example.org/site1> <http://example.org/crop> \"soy\" .\n",
+    "<http://example.org/site1> <http://example.org/crop> \"wheat\" .\n",
+    "<http://example.org/site2> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Site> .\n",
+    "<http://example.org/site2> <http://example.org/name> \"Site two\" .\n",
+    "<http://example.org/loc1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Location> .\n",
+    "<http://example.org/loc1> <http://example.org/name> \"Auburn\" .\n",
+    "<http://example.org/loc1> <http://example.org/id> \"ALAU\" .\n",
+);
+
+const VERBALIZE_CONFIG: &str = r#"{
+  "predicate_limit": 2,
+  "profiles": {
+    "location": {"type": "http://example.org/Location", "template": "Location {id}",
+                 "fields": {"id": "http://example.org/id"}}
+  },
+  "targets": {
+    "site": {"type": "http://example.org/Site",
+             "ignore_predicates": ["http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]},
+    "location": {"type": "http://example.org/Location"}
+  }
+}"#;
+
+fn verbalize_url(query: &[(&str, &str)]) -> String {
+    let mut url = "/tox/v/2026-06-01/verbalize".to_owned();
+    for (index, (name, value)) in query.iter().enumerate() {
+        url.push(if index == 0 { '?' } else { '&' });
+        url.push_str(name);
+        url.push('=');
+        url.push_str(&kgf_server::url::encode_value(value));
+    }
+    url
+}
+
+#[test]
+fn verbalize_previews_a_config_in_three_modes_over_get_query_and_post() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", TYPED_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    // The capability is declared by every bundle, like `labels`, because it
+    // needs nothing beyond the core artifacts.
+    let manifest = server.get("/tox/v/2026-06-01/manifest").json();
+    assert!(manifest["capabilities"]["verbalize"].is_object());
+
+    // A bare config is a plan: every target, its member count, sampled texts.
+    let plan = server.get(&verbalize_url(&[("config", VERBALIZE_CONFIG)]));
+    plan.assert_status(200);
+    plan.assert_cache_control(&["public", "max-age=31536000", "immutable"]);
+    let body = plan.json();
+    assert_eq!(body["mode"], "plan");
+    assert_eq!(body["complete"], true);
+    let targets = body["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0]["name"], "location");
+    assert_eq!(targets[0]["members"], 1);
+    assert_eq!(targets[0]["sampled"], 1);
+    assert_eq!(targets[1]["name"], "site");
+    assert_eq!(targets[1]["members"], 2);
+    assert_eq!(targets[1]["sampled"], 2);
+    assert_eq!(body["records"].as_array().unwrap().len(), 3);
+    assert_eq!(body["unknown"].as_array().unwrap().len(), 0);
+
+    // One named root: the text, exactly as the build stage would write it.
+    // The site's mention of the location is named by the location's profile;
+    // the site's own type line is excluded by its target; four crops are
+    // sampled down to two.
+    let one = server.get(&verbalize_url(&[
+        ("config", VERBALIZE_CONFIG),
+        ("target", "site"),
+        ("iri", "ex:site1 ex:nowhere"),
+    ]));
+    one.assert_status(200);
+    let body = one.json();
+    assert_eq!(body["mode"], "iris");
+    assert_eq!(
+        body["absent"],
+        serde_json::json!(["http://example.org/nowhere"])
+    );
+    let records = body["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["target"], "site");
+    assert_eq!(records[0]["iri"]["value"], "http://example.org/site1");
+    assert_eq!(records[0]["label"], "Site one");
+    let text = records[0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("label: Site one\nat: Location ALAU\n"),
+        "{text}"
+    );
+    assert_eq!(text.matches("\ncrop: ").count(), 2, "{text}");
+    assert!(text.ends_with("\nname: Site one"), "{text}");
+    assert_eq!(records[0]["lines"], 5);
+    assert_eq!(records[0]["truncated"], false);
+
+    // A sample of one target is deterministic for a seed.
+    let sample = |seed: &str| {
+        server
+            .get(&verbalize_url(&[
+                ("config", VERBALIZE_CONFIG),
+                ("target", "site"),
+                ("n", "1"),
+                ("seed", seed),
+            ]))
+            .json()
+    };
+    let first = sample("3");
+    assert_eq!(first["mode"], "sample");
+    assert_eq!(first["target"], "site");
+    assert_eq!(first["records"].as_array().unwrap().len(), 1);
+    assert_eq!(first, sample("3"));
+
+    // The body forms carry the config as an object and answer the same.
+    let request = serde_json::json!({
+        "config": serde_json::from_str::<serde_json::Value>(VERBALIZE_CONFIG).unwrap(),
+        "target": "site",
+        "iris": ["ex:site1"],
+    });
+    let body = serde_json::to_vec(&request).unwrap();
+    let query = server.request_with_body(
+        "QUERY",
+        "/tox/v/2026-06-01/verbalize",
+        &[("Content-Type", "application/json")],
+        &body,
+    );
+    query.assert_status(200);
+    query.assert_cache_control(&["public", "max-age=31536000", "immutable"]);
+    assert_eq!(query.json()["records"][0]["text"], records[0]["text"]);
+    let post = server.request_with_body(
+        "POST",
+        "/tox/v/2026-06-01/verbalize",
+        &[("Content-Type", "application/json")],
+        &body,
+    );
+    post.assert_status(200);
+    post.assert_cache_control(&["no-store"]);
+    assert_eq!(post.json()["records"][0]["text"], records[0]["text"]);
+
+    // The page: the form to edit the config, and the texts.
+    let page = server.request(
+        "GET",
+        &verbalize_url(&[
+            ("config", VERBALIZE_CONFIG),
+            ("target", "site"),
+            ("iri", "ex:site1"),
+        ]),
+        &[("Accept", "text/html")],
+    );
+    page.assert_status(200);
+    let html = page.text();
+    assert!(
+        html.contains("<textarea"),
+        "the config is editable on the page"
+    );
+    assert!(html.contains("<pre>label: Site one"), "{html}");
+    assert!(html.contains("Location ALAU"));
+}
+
+#[test]
+fn verbalize_refuses_what_it_cannot_answer_by_name() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", TYPED_NT, "2026-06-01T14:03:22Z");
+    let mut caps = kgf_server::Caps::new();
+    caps.max_verbalize_roots = 3;
+    let server = deployment.serve_with(caps);
+
+    let missing = server.get("/tox/v/2026-06-01/verbalize");
+    missing.assert_status(400);
+    assert_eq!(missing.json()["code"], "malformed_request");
+
+    let unparseable = server.get(&verbalize_url(&[("config", "targets: [")]));
+    unparseable.assert_status(400);
+    assert!(
+        unparseable.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("config")
+    );
+
+    let empty = server.get(&verbalize_url(&[("config", "{}")]));
+    empty.assert_status(400);
+    assert!(
+        empty.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no targets")
+    );
+
+    let no_such_target = server.get(&verbalize_url(&[
+        ("config", VERBALIZE_CONFIG),
+        ("target", "nope"),
+    ]));
+    no_such_target.assert_status(400);
+    assert!(
+        no_such_target.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("\"site\"")
+    );
+
+    // Two targets and IRIs to render: which target is not a guess.
+    let ambiguous = server.get(&verbalize_url(&[
+        ("config", VERBALIZE_CONFIG),
+        ("iri", "ex:site1"),
+    ]));
+    ambiguous.assert_status(400);
+    assert!(
+        ambiguous.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("target is required")
+    );
+
+    // The root cap bounds a plan across its targets, and says what to do.
+    let over = server.get(&verbalize_url(&[
+        ("config", VERBALIZE_CONFIG),
+        ("plan", "true"),
+        ("n", "2"),
+    ]));
+    over.assert_status(400);
+    assert_eq!(over.json()["code"], "cap_exceeded");
+    assert!(
+        over.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("name one target")
+    );
+    let within = server.get(&verbalize_url(&[
+        ("config", VERBALIZE_CONFIG),
+        ("n", "2"),
+        ("target", "site"),
+    ]));
+    within.assert_status(200);
+
+    // A config naming what the bundle lacks is answered, and told.
+    let unknown = server.get(&verbalize_url(&[(
+        "config",
+        r#"{"targets": {"ghost": {"type": "http://example.org/Ghost",
+            "ignore_predicates": ["http://example.org/nope"]}}}"#,
+    )]));
+    unknown.assert_status(200);
+    let body = unknown.json();
+    assert_eq!(body["targets"][0]["members"], 0);
+    assert_eq!(body["unknown"].as_array().unwrap().len(), 2);
+    assert_eq!(body["unknown"][0]["at"], "targets.ghost.type");
+
+    // A body operation without JSON is refused as one.
+    let not_json = server.request_with_body("QUERY", "/tox/v/2026-06-01/verbalize", &[], b"{}");
+    not_json.assert_status(415);
+}
