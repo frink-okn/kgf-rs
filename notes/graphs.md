@@ -60,12 +60,24 @@ promise to a client rather than an internal choice:
   triple, then the named graphs in the sidecar's dictionary order, and the cursor is
   the next id to list. That order is a contract, as every enumeration order here is:
   it is what an outstanding token indexes.
-- **A graph whose stored name is a blank node** is published under the same
-  bundle-scoped IRI a blank node in the data gets, in a section of its own keyed by
-  layer id. A request may send that IRI back, and the layer id in it is checked
-  against the sidecar rather than trusted: an id out of range, or one whose layer
-  carries an ordinary IRI, names no graph. `_:label` itself addresses nothing, here
-  as in every other position. Such a graph has no *description* view: see below.
+- **A graph whose stored name is a blank node** is published as an IRI, as a data
+  blank node is, and which IRI depends on whether the node is in the data. One that
+  also fills a triple position is that node — in `_:g :p :o _:g` the graph and the
+  subject are one resource — so it is published under the node's data IRI
+  (`…:sha256:{hdt-digest}:s-1`), and a statement about the graph joins with the
+  graph. hdtc scopes a document's blank labels once for every position, so the
+  sidecar and the dictionary spell one node alike, and the lookup that finds it is a
+  join between two artifacts of one build, not the inbound label match this API
+  refuses. One found nowhere in the data has no dictionary id, and is published as
+  `…:sha256:{sidecar-digest}:g-{layer}`: the same URN form, scoped by the digest of
+  the whole membership sidecar (which the graph index records), because a layer id
+  means nothing across sidecars — two bundles with the same triples grouped
+  differently would otherwise mint one IRI for two graphs. A request may send
+  either IRI back, and what it carries is checked rather than trusted: an id out of
+  range, one whose layer carries an ordinary IRI, and the graph-only spelling of a
+  node the data holds all name no graph, so every graph has exactly one IRI.
+  `_:label` itself addresses nothing, here as in every other position. Such a graph
+  has no *description* view: see below.
 - **The RDF representations of `/fragment` follow the serving table below**, not just
   `/tpf`'s: a scope tags every statement with the graph it named, the quad view tags
   per row, and a single-graph syntax refuses the quad view with 406.
@@ -178,6 +190,13 @@ either way. `/graphs` pages every graph whatever the
 description holds, and `stats/summary.json` names the largest ten with
 `graphs_total` beside them, so the card stays a card.
 
+Described one by one, the statistics read the memberships as well as the HDT, so
+`stats/void.hdt` declares `data.hdt.graphs` as a second parent. Two sidecars can
+group one union's triples differently, and the parent is what makes regenerating
+the manifest over a replaced sidecar refuse to carry statistics that describe the
+old grouping; publication refuses per-graph views whose statistics do not declare
+it.
+
 **A graph a component claims is described under the component's id.** A bundle
 may declare the parts of itself — the canonical release, an entailment, a derived
 overlay — and bind each to the graph holding it. Such a graph is then described as
@@ -187,7 +206,18 @@ say who built it, and `kgf build` runs no component DAG.
 
 One of them is the *design view*, which `/schema?view=design` reads and the summary
 card is rendered from: `design:` nominates it, defaulting to the canonical
-component. The default suits a KG whose own encoding is the one its readers want.
+component, the single `role: source` one. The design view *is* that component's
+own subset — the node its `component:<id>` view is rooted at, which publication
+verifies. Where no component is the design view — none declared, or none canonical
+among those declared, as when a bundle declares only its entailed overlay — the
+design view describes the dataset itself, the queryable root under a second name,
+exactly as in a componentless bundle. A design component with a graph the build
+will not describe is refused rather than answered with the union, which would
+publish the whole dataset under the component's name: `contents.graphs.describe:
+false` beside it fails `--check-config`, and more graphs than the threshold above
+fail the build as soon as the sidecar says how many there are.
+
+The default suits a KG whose own encoding is the one its readers want.
 It does not suit one modelled in OWL, where the canonical component holds
 restrictions and blank nodes and the legible view is a projection of it, so the
 publisher nominates the projection instead. Every view is reachable either way —
@@ -230,7 +260,11 @@ forged run trailer refused as a stale cursor rather than skipping the rest of a
 triple — including on the last triple of an enumeration, where the rows run out
 before anything is checked; a blank-node graph fixture whose minted IRI round-trips
 while neither an out-of-range id nor the id of an IRI-named layer resolves through
-it; the build refusing a quad in graph `urn:x-kgf:union`; and, in
+it; a blank node naming both a graph and a subject, published under one IRI in the
+listing, the quad view and the data, with the graph-only spelling of its layer
+naming nothing; two bundles holding the same triples grouped differently, where
+one's graph-only IRI names nothing in the other; `g=_:g` answering empty in every
+RDF syntax; the build refusing a quad in graph `urn:x-kgf:union`; and, in
 `interop/comunica/test.mjs`, stock Comunica as both a `qpf` and a `brtpf` source with
 no `unionDefaultGraph` context, against one-row pages, reading 3 rows for a bare
 `SELECT * { ?s ?p ?o }`, 3 for `GRAPH ?g`, 2 for `GRAPH <urn:x-kgf:unnamed>`, 2 for

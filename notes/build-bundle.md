@@ -169,7 +169,17 @@ restrictions and blank nodes, and a card rendered from it describes RDF
 scaffolding rather than the classes and relations a reader came for, so the
 publisher nominates whichever projection is worth reading. A nomination must
 name a declared component that has a graph, since a component with no extent
-has nothing to describe.
+has nothing to describe. Where nothing is the design view — no component
+declared, or only derived ones — the design view describes the dataset itself,
+as it always did for a componentless bundle.
+
+The design view is its component's own graph description, so a design component
+whose graph the build will not describe is refused, never swapped for the union
+under the component's name. `contents.graphs.describe: false` beside one fails
+`--check-config`; more graphs than `GRAPH_DESCRIPTION_THRESHOLD` with `describe`
+unset fails the build once the sidecar says how many there are, before any
+expensive step. Either way the fix is to describe the graphs or to make no
+component with a graph the design view.
 
 A declaration is *trusted*: nothing checks that the graph named `asserted` holds
 the asserted axioms. What is checked is that the graph exists, that ids are

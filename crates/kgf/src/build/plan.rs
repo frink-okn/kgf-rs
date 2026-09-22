@@ -724,7 +724,7 @@ impl ConfigPlan {
         let resources = resolve_resources(config.resources)?;
         let components = resolve_components(config.components, config.design.as_deref())?;
 
-        Ok(Self {
+        let plan = Self {
             schema: config.schema,
             dataset,
             semantics,
@@ -732,7 +732,49 @@ impl ConfigPlan {
             resources,
             components,
             design: config.design,
-        })
+        };
+        // Settled by the config alone, so refused before any step runs. The
+        // graph count can refuse the same thing, but only once the sidecar
+        // says how many graphs there are.
+        if plan.contents.graphs.describe == Some(false) {
+            plan.refuse_design(
+                "contents.graphs.describe: false describes no graph on its own",
+                "Remove that key so each graph is described",
+            )?;
+        }
+        Ok(plan)
+    }
+
+    /// The component the design view describes and the graph holding it, when
+    /// the design view is a component's own subset rather than the dataset.
+    pub fn design_graph(&self) -> Option<(&kgf_store::manifest::Component, &str)> {
+        let component =
+            kgf_store::manifest::design_component(&self.components, self.design.as_deref())?;
+        Some((component, component.graph.as_deref()?))
+    }
+
+    /// Refuse a design view this build cannot describe, if there is one.
+    ///
+    /// The design view is its component's own subset, and that exists only
+    /// where the analysis describes the component's graph. Describing the
+    /// union in its place would publish the whole dataset under the
+    /// component's name, so a caller that knows the graph will not be
+    /// described stops the build here: `obstacle` says why not, and `remedy`
+    /// the way out that fits it.
+    pub fn refuse_design(&self, obstacle: &str, remedy: &str) -> Result<()> {
+        let Some((component, graph)) = self.design_graph() else {
+            return Ok(());
+        };
+        let why = match &self.design {
+            Some(_) => format!("`design: {}` nominates it", component.id),
+            None => "it is the canonical component, the one `role: source` marks".to_owned(),
+        };
+        bail!(
+            "the design view describes component {:?}, held in graph {graph}, because {why}; \
+             but {obstacle}, so there is nothing to describe it from. {remedy}, or make no \
+             component with a graph the design view",
+            component.id
+        )
     }
 }
 

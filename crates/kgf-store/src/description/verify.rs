@@ -10,10 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::indexed::IndexedHdt;
-use crate::manifest::{Counts, Manifest};
+use crate::manifest::{Component, Counts, Manifest};
 use crate::map::PublishedBundle;
 use crate::pattern::IdPattern;
-use crate::store::{ArtifactSet, description_set_disagreement};
+use crate::store::{ArtifactSet, artifact, description_set_disagreement};
 use crate::{Role, TermId};
 
 use super::documents::verify_summary_json;
@@ -45,12 +45,13 @@ pub fn verify_description_artifacts(bundle: &PublishedBundle, manifest: &Manifes
     let dir = bundle.path();
     manifest.validate(dir)?;
     verify_component_views(dir, manifest)?;
+    verify_graph_parents(dir, manifest)?;
     let artifacts = ArtifactSet::resolve(dir)?;
     let entries = manifest.description_artifacts();
     match (artifacts.description.as_ref(), entries) {
         (Some(_), Some(entries)) => {
             let description = DescriptionStore::open(bundle, &artifacts, entries)?;
-            description.verify_artifacts()?;
+            description.verify_artifacts(manifest.design_component())?;
             verify_queryable_totals(&description, manifest.counts)
         }
         (None, None) => Ok(()),
@@ -170,9 +171,12 @@ impl DescriptionStore {
     /// allocates selector maps proportional to the description, and queries the
     /// VoID graph. [`DescriptionStore::open`](super::DescriptionStore::open)
     /// deliberately does none of that work.
-    pub fn verify_artifacts(&self) -> Result<()> {
+    ///
+    /// `design` is the component the manifest says the design view describes,
+    /// which only the manifest knows.
+    pub fn verify_artifacts(&self, design: Option<&Component>) -> Result<()> {
         let selectors = verify_schema_table(&self.schema_nodes, &self.void)?;
-        verify_schema_bindings(&self.void, &selectors, self.schema_nodes.path())?;
+        verify_schema_bindings(&self.void, &selectors, design, self.schema_nodes.path())?;
         verify_schema_children(&self.void, &selectors, self.schema_nodes.path())?;
         verify_count_facts(&self.void)?;
         let relations = verify_relation_table(&self.class_relations)?;
@@ -426,15 +430,28 @@ fn expanded_iri(value: &str, field: &str, path: &Path, offset: u64) -> Result<St
     Ok(value.to_owned())
 }
 
-fn verify_schema_bindings(void: &IndexedHdt, indexes: &SelectorIndex, path: &Path) -> Result<()> {
-    let queryable = indexes
-        .get(&StatsView::Queryable)
-        .and_then(|index| index.get(&VerifiedSelector::Dataset))
-        .copied()
+fn verify_schema_bindings(
+    void: &IndexedHdt,
+    indexes: &SelectorIndex,
+    design: Option<&Component>,
+    path: &Path,
+) -> Result<()> {
+    let queryable = dataset_root(indexes, &StatsView::Queryable)
         .ok_or_else(|| malformed(path, "queryable view has no dataset selector".to_owned()))?;
-    let has_component_views = indexes
-        .keys()
-        .any(|view| matches!(view, StatsView::Component(_)));
+    let design_root = dataset_root(indexes, &StatsView::Design)
+        .ok_or_else(|| malformed(path, "design view has no dataset selector".to_owned()))?;
+    if let (Some(component), Some(expected)) = (design, component_root(indexes, design, path)?)
+        && design_root != expected
+    {
+        return Err(malformed(
+            path,
+            format!(
+                "the design view is rooted at subject {}, but it describes component {:?}, \
+                 whose own view is rooted at subject {}",
+                design_root.0, component.id, expected.0
+            ),
+        ));
+    }
 
     for (view, index) in indexes {
         let root = index
@@ -447,9 +464,8 @@ fn verify_schema_bindings(void: &IndexedHdt, indexes: &SelectorIndex, path: &Pat
                 )
             })?;
         ensure_named_triple(void, root, RDF_TYPE, VOID_DATASET, path, "dataset type")?;
-        let componentless_design_alias =
-            *view == StatsView::Design && !has_component_views && root == queryable;
-        if *view != StatsView::Queryable && !componentless_design_alias {
+        let design_alias = *view == StatsView::Design && root == queryable;
+        if *view != StatsView::Queryable && !design_alias {
             ensure_link(void, queryable, VOID_SUBSET, root, path, "view root")?;
         }
 
@@ -1239,6 +1255,94 @@ fn compare_class_properties(
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+/// The dataset selector a view is rooted at, if the description carries it.
+fn dataset_root(indexes: &SelectorIndex, view: &StatsView) -> Option<TermId> {
+    indexes
+        .get(view)
+        .and_then(|index| index.get(&VerifiedSelector::Dataset))
+        .copied()
+}
+
+/// Where the design view must be rooted, when a component fixes it.
+///
+/// The design view describes a component by being that component's own
+/// subset: the very node its `component:<id>` view is rooted at. With no
+/// component to describe, or one the description does not break out because
+/// nothing says which triples are its, nothing fixes the root — the design
+/// view is the dataset itself under a second name, or a subset of it that a
+/// description assembled by hand chose. A component that *has* a graph and no
+/// view of its own is the one case that cannot be either: the manifest names a
+/// part of the dataset the analysis never described, and a design view rooted
+/// anywhere would describe something else under its name.
+fn component_root(
+    indexes: &SelectorIndex,
+    design: Option<&Component>,
+    path: &Path,
+) -> Result<Option<TermId>> {
+    let Some(component) = design else {
+        return Ok(None);
+    };
+    let own =
+        StatsView::component(component.id.clone()).and_then(|view| dataset_root(indexes, &view));
+    match (own, component.graph.as_deref()) {
+        (Some(root), _) => Ok(Some(root)),
+        (None, None) => Ok(None),
+        (None, Some(graph)) => Err(malformed(
+            path,
+            format!(
+                "the design view describes component {:?}, held in graph {graph}, but the \
+                 description has no view of that component; rebuild the description set \
+                 with `kgf build`, describing the bundle's graphs",
+                component.id
+            ),
+        )),
+    }
+}
+
+/// Check that statistics describing graphs one by one name the memberships
+/// they were computed from.
+///
+/// A graph view, or the view of a component bound to a graph, is one graph's
+/// own subset, which only an analysis of the memberships produces. The
+/// sidecar is then as much an input of `stats/void.hdt` as the HDT is, and
+/// declaring it a parent is what makes regenerating a manifest notice the
+/// sidecar being replaced under statistics that still describe the old one. A
+/// component with no graph can have a view too, assembled by other means, and
+/// says nothing about memberships.
+fn verify_graph_parents(dir: &Path, manifest: &Manifest) -> Result<()> {
+    let Some(schema) = manifest.artifacts.get(artifact::SCHEMA_NODES) else {
+        return Ok(());
+    };
+    let per_graph = schema
+        .views
+        .keys()
+        .any(|view| match StatsView::from_manifest_key(view) {
+            Some(StatsView::Graph(_)) => true,
+            Some(StatsView::Component(id)) => manifest
+                .components
+                .iter()
+                .any(|component| component.id == id.as_str() && component.graph.is_some()),
+            _ => false,
+        });
+    let declared = manifest
+        .artifacts
+        .get(artifact::VOID_HDT)
+        .is_some_and(|void| void.parents.iter().any(|parent| parent == artifact::GRAPHS));
+    if per_graph && !declared {
+        return Err(description_set_disagreement(
+            dir,
+            &format!(
+                "{} describes graphs one by one but does not declare {} as a parent, so a \
+                 replaced sidecar would go unnoticed; rebuild the description set with \
+                 `kgf build`",
+                artifact::VOID_HDT,
+                artifact::GRAPHS
+            ),
+        ));
     }
     Ok(())
 }

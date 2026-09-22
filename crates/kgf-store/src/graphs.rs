@@ -110,6 +110,7 @@ pub struct Graphs {
     sidecar: Mapping,
     index: Mapping,
     facts: GraphFacts,
+    sidecar_identity_digest: [u8; 32],
     dictionary: PfcLayout,
     spo: LayerSetSpec,
     pos: LayerSetSpec,
@@ -226,6 +227,7 @@ impl Graphs {
             named_graphs: header.named_graphs,
             memberships: header.memberships,
         };
+        let sidecar_identity_digest = index_header.sidecar_digest;
 
         let dictionary = {
             let mut cursor = Cursor::new(sidecar.as_bytes());
@@ -350,6 +352,7 @@ impl Graphs {
             sidecar,
             index,
             facts,
+            sidecar_identity_digest,
             dictionary,
             spo,
             pos,
@@ -373,6 +376,19 @@ impl Graphs {
     /// Triples, named graphs, and memberships.
     pub fn facts(&self) -> GraphFacts {
         self.facts
+    }
+
+    /// SHA-256 identity of the whole membership sidecar.
+    ///
+    /// The digest the index records for the sidecar it was built from, read
+    /// the way [`crate::Store::hdt_identity_digest`] reads the HDT's from the
+    /// permutation index: open checks the cheap bindings, and publication
+    /// verification establishes the full cryptographic one
+    /// (`hdtc/docs/graphs-index-format.md` §6). The sidecar binds the HDT in
+    /// turn, so this one digest identifies the triples, which graphs hold
+    /// them, and what each graph is called.
+    pub fn sidecar_identity_digest(&self) -> [u8; 32] {
+        self.sidecar_identity_digest
     }
 
     /// Whether the index carries the SPO transpose's run boundaries, which

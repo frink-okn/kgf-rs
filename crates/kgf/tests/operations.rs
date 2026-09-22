@@ -3043,6 +3043,151 @@ fn a_blank_node_graph_name_is_published_under_a_bundle_scoped_iri() {
     }
 }
 
+/// A blank node is one node however many positions it fills. One that names a
+/// graph and is also a triple's subject is published under a single IRI in
+/// both places, so a statement about the graph joins with the graph it
+/// describes — and that IRI is its only spelling: the graph-only form of the
+/// same layer names nothing.
+#[test]
+fn a_blank_node_naming_a_graph_and_a_subject_is_one_node() {
+    let served = Served::from_fixture(Fixture::build_quads(concat!(
+        "_:g <http://example.org/p> <http://example.org/o> _:g .\n",
+        "<http://example.org/a> <http://example.org/b> <http://example.org/c> .\n",
+    )));
+    let store = served.store();
+    let about = format!(
+        "p={}&limit=10",
+        kgf_server::url::encode_value("<http://example.org/p>")
+    );
+    let page = served.fragment(&store, &about);
+    let subject = dictionary_spelling(&page["rows"][0]["s"]);
+    assert!(
+        !subject.starts_with("_:") && subject.contains(":s-"),
+        "the subject is published under its data IRI: {subject}"
+    );
+
+    // The listing names the graph by that IRI, and the quad view tags the
+    // statement with its own subject.
+    let names = blank_graph_names(&served, &store);
+    assert_eq!(names, vec![subject.clone()]);
+    let quads = served.fragment(&store, &format!("g=*&{about}"));
+    assert_eq!(dictionary_spelling(&quads["rows"][0]["g"]), subject);
+
+    // The IRI scopes a request to the graph it names.
+    let scoped = served.fragment(&store, &format!("{}&limit=10", g(&subject)));
+    assert_eq!(
+        rows(&scoped),
+        vec![vec![
+            subject.clone(),
+            "http://example.org/p".to_owned(),
+            "http://example.org/o".to_owned()
+        ]]
+    );
+
+    // The graph-only spelling of the same layer is not a second name for it.
+    let digest: String = store
+        .graphs()
+        .expect("a quad bundle carries memberships")
+        .sidecar_identity_digest()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let graph_only =
+        format!("urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:{digest}:g-1");
+    let refused = served.fragment(&store, &format!("{}&limit=10", g(&graph_only)));
+    assert_eq!(refused["cardinality"]["value"], 0);
+    assert_eq!(
+        refused["absent_terms"],
+        serde_json::json!([{"parameter": "g", "reason": "not_in_bundle"}])
+    );
+}
+
+/// Two bundles can hold the same triples grouped into different graphs. A
+/// graph-only blank name is scoped by the memberships it was minted from, so
+/// one bundle's name for a graph never selects another graph in the other —
+/// though a layer id alone would, since both put the blank graph first.
+#[test]
+fn a_graph_only_blank_name_is_scoped_by_the_memberships_it_came_from() {
+    let first = Served::from_fixture(Fixture::build_quads(concat!(
+        "<http://example.org/a> <http://example.org/b> <http://example.org/c> _:g .\n",
+        "<http://example.org/x> <http://example.org/y> <http://example.org/z> <http://example.org/g1> .\n",
+    )));
+    let second = Served::from_fixture(Fixture::build_quads(concat!(
+        "<http://example.org/a> <http://example.org/b> <http://example.org/c> <http://example.org/g1> .\n",
+        "<http://example.org/x> <http://example.org/y> <http://example.org/z> _:g .\n",
+    )));
+    let (first_store, second_store) = (first.store(), second.store());
+    assert_eq!(
+        first_store.hdt_identity_digest(),
+        second_store.hdt_identity_digest(),
+        "the two bundles publish the same triples"
+    );
+
+    let [minted] = blank_graph_names(&first, &first_store)
+        .try_into()
+        .expect("one blank graph name");
+    let [other] = blank_graph_names(&second, &second_store)
+        .try_into()
+        .expect("one blank graph name");
+    assert_ne!(minted, other, "one IRI for two different graphs");
+
+    let page = first.fragment(&first_store, &format!("{}&limit=10", g(&minted)));
+    assert_eq!(
+        rows(&page),
+        vec![vec![
+            "http://example.org/a",
+            "http://example.org/b",
+            "http://example.org/c"
+        ]]
+    );
+    let foreign = second.fragment(&second_store, &format!("{}&limit=10", g(&minted)));
+    assert_eq!(foreign["cardinality"]["value"], 0, "{foreign}");
+    assert_eq!(
+        foreign["absent_terms"],
+        serde_json::json!([{"parameter": "g", "reason": "not_in_bundle"}])
+    );
+}
+
+/// `g=_:g` is well-formed and names nothing, so it answers empty in every
+/// representation and not only in JSON: a scope that selected no graph has no
+/// statement to tag, and so no graph name to spell as RDF.
+#[test]
+fn a_blank_node_graph_selector_answers_empty_in_rdf() {
+    let served = Served::quads();
+    let store = served.store();
+    let query = format!("g={}&limit=10", kgf_server::url::encode_value("_:g"));
+    for representation in [
+        Representation::Turtle,
+        Representation::NQuads,
+        Representation::TriG,
+        Representation::JsonLd,
+    ] {
+        let body = served.render(&store, "fragment", &query, representation);
+        assert!(
+            !body.contains("http://example.org/a"),
+            "{representation:?} carries no statement: {body}"
+        );
+    }
+}
+
+/// The published names of a bundle's graphs, less the fixtures' ordinary ones.
+fn blank_graph_names(served: &Served, store: &Store) -> Vec<String> {
+    let request =
+        request::GraphList::parse(&params(""), served.limits(), &served.release().binding())
+            .expect("a listing");
+    let listing = json(
+        answer::graphs_list(store, served.target("graphs", ""), &request).expect("a listing"),
+        Representation::Json,
+    );
+    listing["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| dictionary_spelling(&entry["g"]))
+        .filter(|name| name != UNNAMED && name != G1)
+        .collect()
+}
+
 /// The quad view's cursor carries how many of a triple's memberships the last
 /// page delivered. A trailer past the end of that run would silently drop the
 /// rest of the triple, so it is refused rather than clamped.

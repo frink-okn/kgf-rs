@@ -2348,7 +2348,7 @@ mod tests {
             store
                 .description()
                 .expect("description")
-                .verify_artifacts()
+                .verify_artifacts(candidate.design_component())
                 .expect("valid description indexes");
         }
 
@@ -2372,7 +2372,7 @@ mod tests {
         let error = store
             .description()
             .expect("description still opens with bounded checks")
-            .verify_artifacts()
+            .verify_artifacts(manifest.design_component())
             .expect_err("offline proof must reject the shifted range");
         assert!(
             error.to_string().contains("expected contiguous offset"),

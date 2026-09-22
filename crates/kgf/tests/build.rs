@@ -2127,3 +2127,251 @@ fn a_declared_component_is_described_under_its_id_and_becomes_the_design_view() 
     assert!(stderr.contains("is not one this bundle holds"), "{stderr}");
     assert!(!refused.exists());
 }
+
+/// Build `source` into `out` under `config`, as the tests below all do.
+fn build_quads(out: &Path, config: &str, source: &Path) -> Run {
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(out),
+            "--input",
+            path(source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        config,
+    )
+}
+
+/// The design view is its component's own subset. A build that will not
+/// describe that component's graph has nothing to project it from, and
+/// publishing the union there instead would describe the whole dataset under
+/// the component's name — so it is refused, and says which of the two to drop.
+#[test]
+fn a_design_component_the_build_would_not_describe_is_refused() {
+    let components = concat!(
+        "components:\n",
+        "  asserted: {role: source, graph: 'http://example.org/g1'}\n",
+        "  closure: {role: entailment, graph: 'http://example.org/g2', inputs: [asserted]}\n",
+    );
+    let declined = "contents:\n  graphs: {describe: false}\n";
+
+    // Stated in the config, so refused before anything is built — for the
+    // canonical component the design view defaults to, and for a nominated one.
+    let stderr = kgf(
+        &["build", "--config", "-", "--check-config"],
+        &format!("{MINIMAL}{components}{declined}"),
+    )
+    .err();
+    assert!(
+        stderr.contains("component \"asserted\"")
+            && stderr.contains("canonical component")
+            && stderr.contains("contents.graphs.describe: false"),
+        "{stderr}"
+    );
+    let stderr = kgf(
+        &["build", "--config", "-", "--check-config"],
+        &format!("{MINIMAL}{components}design: closure\n{declined}"),
+    )
+    .err();
+    assert!(
+        stderr.contains("component \"closure\"") && stderr.contains("`design: closure`"),
+        "{stderr}"
+    );
+
+    // A component with no graph is not a subset anything could describe, so
+    // declining the per-graph views costs it nothing.
+    kgf(
+        &["build", "--config", "-", "--check-config"],
+        &format!("{MINIMAL}components:\n  asserted: {{role: source}}\n{declined}"),
+    )
+    .ok();
+
+    // Past the threshold the sidecar decides, so the refusal comes once it has
+    // said how many graphs there are — and still before anything is published.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("many.nq");
+    let mut quads = String::new();
+    for graph in 0..300 {
+        quads.push_str(&format!(
+            "<http://example.org/s{graph}> <http://example.org/p> \
+             <http://example.org/o> <http://example.org/g{graph:04}> .\n"
+        ));
+    }
+    std::fs::write(&source, &quads).unwrap();
+    let out = dir.path().join("root/tinykg/many");
+    let stderr = build_quads(
+        &out,
+        &format!(
+            "{CONFIG}components:\n  first: {{role: source, graph: 'http://example.org/g0000'}}\n"
+        ),
+        &source,
+    )
+    .err();
+    assert!(
+        stderr.contains("holds 300 graphs") && stderr.contains("contents.graphs.describe: true"),
+        "{stderr}"
+    );
+    assert!(!out.exists());
+
+    // Saying so outright describes every graph, the design component's too.
+    let asked = dir.path().join("root/tinykg/asked");
+    build_quads(
+        &asked,
+        &format!(
+            "{CONFIG}components:\n  first: {{role: source, graph: 'http://example.org/g0000'}}\n\
+             contents:\n  graphs: {{describe: true}}\n"
+        ),
+        &source,
+    )
+    .ok();
+    kgf(&["manifest", path(&asked), "--check"], "").ok();
+}
+
+/// Declaring only a derived part of a dataset leaves no component to be the
+/// design view. The design view then describes the dataset itself, as it does
+/// for a bundle declaring no components at all, and the derived part is
+/// described under its own id beside it.
+#[test]
+fn a_derived_component_alone_leaves_the_design_view_the_dataset() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+    build_quads(
+        &out,
+        &format!(
+            "{CONFIG}components:\n  closure: {{role: entailment, graph: 'http://example.org/g2'}}\n"
+        ),
+        &source,
+    )
+    .ok();
+
+    assert_eq!(
+        views_of(&out, "stats/schema-nodes.tsv"),
+        [
+            "design",
+            "queryable",
+            "component:closure",
+            "graph:http://example.org/g1",
+            "graph:urn:x-kgf:unnamed",
+        ]
+    );
+    let rows = |view: &str| -> Vec<String> {
+        std::fs::read_to_string(out.join("stats/schema-nodes.tsv"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix(&format!("{view}\t")).map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(rows("design"), rows("queryable"));
+    assert_ne!(rows("design"), rows("component:closure"));
+    kgf(&["manifest", path(&out), "--check"], "").ok();
+}
+
+/// Statistics computed one graph at a time read the memberships as well as
+/// the HDT, so the sidecar is a parent of `stats/void.hdt`. That is what makes
+/// regenerating the manifest notice a sidecar replaced under the statistics:
+/// the union can be byte for byte the same while every graph holds something
+/// else.
+#[test]
+fn per_graph_statistics_name_the_memberships_they_were_computed_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+    build_quads(&out, CONFIG, &source).ok();
+
+    let parents = |bundle: &Path| -> serde_json::Value {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+        manifest["artifacts"]["stats/void.hdt"]["parents"].clone()
+    };
+    assert_eq!(
+        parents(&out),
+        serde_json::json!(["data.hdt", "data.hdt.graphs"])
+    );
+
+    // Statistics that describe no graph on their own read no memberships.
+    let declined = dir.path().join("root/tinykg/declined");
+    build_quads(
+        &declined,
+        &format!("{CONFIG}contents:\n  graphs: {{describe: false}}\n"),
+        &source,
+    )
+    .ok();
+    assert_eq!(parents(&declined), serde_json::json!(["data.hdt"]));
+
+    // The same three triples, grouped differently: `g1` and `g2` trade the
+    // triple they do not share.
+    let regrouped_source = dir.path().join("regrouped.nq");
+    std::fs::write(
+        &regrouped_source,
+        QUADS.replace(
+            "<http://example.org/c> <http://example.org/g1>",
+            "<http://example.org/c> <http://example.org/g2>",
+        ),
+    )
+    .unwrap();
+    let regrouped = dir.path().join("root/tinykg/regrouped");
+    build_quads(&regrouped, CONFIG, &regrouped_source).ok();
+    assert_ne!(
+        sha256(&out.join("data.hdt.graphs")),
+        sha256(&regrouped.join("data.hdt.graphs")),
+        "the two builds must disagree about the memberships"
+    );
+
+    // Swapped under statistics that still describe the first grouping, the
+    // new pair binds to the unchanged union and opens — and regeneration
+    // refuses to carry the old statistics over it.
+    for artifact in ["data.hdt.graphs", "data.hdt.graphs.idx"] {
+        std::fs::copy(regrouped.join(artifact), out.join(artifact)).unwrap();
+    }
+    let stderr = kgf(&["manifest", path(&out)], "").err();
+    assert!(
+        stderr.contains("its parent data.hdt.graphs changed"),
+        "{stderr}"
+    );
+}
+
+/// A graph index names the sidecar it was built from by digest, and a server
+/// takes that digest as the sidecar's identity — it scopes the IRIs of graphs
+/// named by blank nodes. An index built from another sidecar with the same
+/// counts passes every check an open can afford, so the manifest, which hashes
+/// the sidecar anyway, compares the two.
+#[test]
+fn a_graph_index_from_another_sidecar_is_refused_even_when_the_counts_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+    build_quads(&out, CONFIG, &source).ok();
+
+    // Two graphs, five memberships and three triples, like the original.
+    let regrouped_source = dir.path().join("regrouped.nq");
+    std::fs::write(
+        &regrouped_source,
+        QUADS.replace(
+            "<http://example.org/c> <http://example.org/g1>",
+            "<http://example.org/c> <http://example.org/g2>",
+        ),
+    )
+    .unwrap();
+    let regrouped = dir.path().join("root/tinykg/regrouped");
+    build_quads(&regrouped, CONFIG, &regrouped_source).ok();
+
+    std::fs::copy(
+        regrouped.join("data.hdt.graphs.idx"),
+        out.join("data.hdt.graphs.idx"),
+    )
+    .unwrap();
+    let stderr = kgf(&["manifest", path(&out)], "").err();
+    assert!(
+        stderr.contains("was built from a graph sidecar with sha256")
+            && stderr.contains("hdtc graphs-index"),
+        "{stderr}"
+    );
+}

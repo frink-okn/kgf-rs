@@ -162,7 +162,8 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
         OsString::from("--partition-distinct-counts"),
         OsString::from("dataset-properties"),
     ];
-    if graphs.is_some_and(|facts| facts.describe) {
+    let describes_graphs = graphs.is_some_and(|facts| facts.describe);
+    if describes_graphs {
         // A bundle with memberships is described one graph at a time as well
         // as whole: the analysis adds one `void:subset` per graph, and the
         // projection below turns each into a view of its own. It reads the
@@ -214,30 +215,32 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
     };
     // The design view is one component's own subset: the part of the dataset
     // worth describing, which is the canonical component unless the publisher
-    // nominated another. A componentless bundle has one real graph, so there
-    // `design` and `queryable` stay API aliases for that same root rather than
-    // distinct RDF datasets.
-    let nominated = match design {
-        Some(id) => components.iter().find(|component| component.id == id),
-        None => {
-            let mut sources = components
+    // nominated another. Where no component with a graph is the design view —
+    // a componentless bundle, or one whose components leave none canonical —
+    // `design` and `queryable` are API aliases for the dataset root rather
+    // than distinct RDF datasets. A design component whose graph the analysis
+    // did not describe is refused rather than answered with the union, which
+    // would publish the whole dataset under the component's name; the build
+    // refuses the configurations that lead here before any of this runs.
+    let design_graph = kgf_store::manifest::design_component(components, design)
+        .and_then(|component| Some((component, component.graph.as_deref()?)));
+    let design = match design_graph {
+        Some((component, name)) => {
+            let node = subsets
                 .iter()
-                .filter(|component| component.role == kgf_store::manifest::ComponentRole::Source);
-            sources.next().filter(|_| sources.next().is_none())
+                .find(|(graph, _)| graph == name)
+                .map(|(_, node)| node)
+                .with_context(|| {
+                    format!(
+                        "the design view describes component {:?}, and the analysis \
+                         described no graph {name} to project it from",
+                        component.id
+                    )
+                })?;
+            graph
+                .project(node, &subject_ids)
+                .context("projecting the design component's description")?
         }
-    };
-    let canonical = nominated
-        .and_then(|component| component.graph.as_deref())
-        .and_then(|graph| {
-            subsets
-                .iter()
-                .find(|(name, _)| name == graph)
-                .map(|(_, node)| node.clone())
-        });
-    let design = match &canonical {
-        Some(node) => graph
-            .project(node, &subject_ids)
-            .context("projecting the canonical component's description")?,
         None => graph.project(&root, &subject_ids)?,
     };
     for (name, node) in &subsets {
@@ -390,6 +393,7 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
             schema_nodes: schema.metadata,
             class_relations: relations.metadata,
             class_properties: class_properties.metadata,
+            per_graph: describes_graphs,
         },
         schema_rows,
         relation_rows,

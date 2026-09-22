@@ -748,17 +748,7 @@ impl Manifest {
     /// several `role: source` components leave no canonical one to pick, which
     /// is refused when a bundle is built rather than guessed here.
     pub fn design_component(&self) -> Option<&Component> {
-        match &self.design {
-            Some(id) => self.components.iter().find(|component| &component.id == id),
-            None => {
-                let mut sources = self
-                    .components
-                    .iter()
-                    .filter(|component| component.role == ComponentRole::Source);
-                let first = sources.next()?;
-                sources.next().is_none().then_some(first)
-            }
-        }
+        design_component(&self.components, self.design.as_deref())
     }
 
     /// The component a graph holds, if one claims it.
@@ -766,6 +756,29 @@ impl Manifest {
         self.components
             .iter()
             .find(|component| component.graph.as_deref() == Some(graph))
+    }
+}
+
+/// The component the design view describes, among `components`.
+///
+/// `design` when it names one; otherwise the canonical component, which is the
+/// single `role: source` one. `None` for no components, and for several
+/// sources with nothing nominating among them. One rule, shared by the build
+/// that writes a design view and the verifier that checks it, so the two
+/// cannot disagree about which part of a dataset the view is.
+pub fn design_component<'a>(
+    components: &'a [Component],
+    design: Option<&str>,
+) -> Option<&'a Component> {
+    match design {
+        Some(id) => components.iter().find(|component| component.id == id),
+        None => {
+            let mut sources = components
+                .iter()
+                .filter(|component| component.role == ComponentRole::Source);
+            let first = sources.next()?;
+            sources.next().is_none().then_some(first)
+        }
     }
 }
 

@@ -1095,7 +1095,9 @@ const SD_DEFAULT_GRAPH: &str = "http://www.w3.org/ns/sparql-service-description#
 enum GraphTagging {
     /// Every statement in the default graph: the union, unnamed.
     Untagged,
-    /// Every statement tagged with one graph name.
+    /// Every statement tagged with one graph name: the one the request sent,
+    /// which need not name a graph of this bundle, or even be an IRI, when
+    /// the answer has no statements.
     Fixed(String),
     /// Each statement tagged with its row's graph, the unnamed graph excepted.
     PerRow,
@@ -1279,10 +1281,16 @@ impl Answer {
             ));
         }
         // A scope that fixed one graph names it once for the whole page
-        // rather than parsing the same IRI again for every row.
+        // rather than parsing the same IRI again for every row — and only when
+        // a statement needs it. The name is the one the request sent, which is
+        // the graph's published IRI whenever it selected a graph; one that
+        // selected none, `_:label` among them, answers with no rows, and has
+        // nothing to tag and no reason to be an IRI.
         let fixed_graph = match &self.tagging {
-            GraphTagging::Fixed(name) => Some(GraphName::NamedNode(rdf_graph_name(name)?)),
-            GraphTagging::Untagged | GraphTagging::PerRow => None,
+            GraphTagging::Fixed(name) if keep > 0 => {
+                Some(GraphName::NamedNode(rdf_graph_name(name)?))
+            }
+            GraphTagging::Fixed(_) | GraphTagging::Untagged | GraphTagging::PerRow => None,
         };
         let mut statements = Vec::with_capacity(keep);
         let mut data = HashSet::with_capacity(keep);
@@ -3281,8 +3289,7 @@ pub fn void(
         .map_err(|error| unreadable("reading the VoID graph", &error))?;
     let total = selection.count().value;
     let dictionary = description.dict();
-    let data_dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *data_dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let prefixes = &[("kgfbn", blank_nodes.iri_prefix())];
 
     let (body, emitted, complete) = match representation {
@@ -4226,7 +4233,7 @@ pub fn fragment(
     request: &request::Fragment,
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let echo = Echo::Fragment {
         pattern: request.pattern.clone(),
         g: request.graph.requested().map(str::to_owned),
@@ -4328,7 +4335,7 @@ pub fn count(
     request: &request::Count,
 ) -> Result<CountAnswer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     if request.cursor.is_some() && request.pattern.text().is_none() {
         // Parsing enforces this too; keep the operation correct for callers
         // constructing the public request type directly.
@@ -4393,7 +4400,7 @@ pub fn binding_fragment(
     request: &request::BindingFragment,
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let mut cache = LookupCache::new(dictionary, blank_nodes.clone());
     let mut restrictions = Vec::new();
     for row in request.rows() {
@@ -4470,7 +4477,7 @@ pub fn binding_count(
     request: &request::BindingCount,
 ) -> Result<BindingCountAnswer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let mut cache = LookupCache::new(dictionary, blank_nodes.clone());
     // A graph this bundle does not hold makes every row zero, and the answer
     // says so rather than letting a client read the zeros as data.
@@ -4503,7 +4510,9 @@ pub fn binding_count(
 ///
 /// One directory entry and one dictionary lookup per graph listed: a layer's
 /// count is a field of its entry, and its name is a term of the sidecar's own
-/// PFC section. The unnamed graph is listed first, under its reserved name, and
+/// PFC section. A graph named by a blank node costs two more lookups at most,
+/// in the data's dictionary, to publish the node under the IRI it has there
+/// when it has one. The unnamed graph is listed first, under its reserved name, and
 /// only when it holds a triple; the named graphs follow in the sidecar's
 /// dictionary order. The cursor is the next id to list, so a page resumes by
 /// arithmetic rather than by search.
@@ -4513,7 +4522,7 @@ pub fn graphs_list(
     request: &request::GraphList,
 ) -> Result<GraphsAnswer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let graphs = graphs(store, &target)?;
     let facts = graphs.facts();
     let unnamed_count = graphs
@@ -4536,7 +4545,7 @@ pub fn graphs_list(
         next = 1;
     }
 
-    let mut names = GraphNames::new(&blank_nodes);
+    let mut names = GraphNames::new(dictionary, &blank_nodes);
     let mut rows = Vec::with_capacity(request.limit as usize);
     let mut spent = 0u64;
     let mut stop = None;
@@ -4606,7 +4615,7 @@ pub fn search(
     request: &request::Search,
 ) -> Result<SearchAnswer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let searcher = searcher(store, &target)?;
     let found = searcher
         .search_up_to(
@@ -4843,7 +4852,7 @@ pub fn labels(
     request: &request::Labels,
 ) -> Result<LabelsAnswer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let label_predicates = resolve_predicate_ids(&dictionary, &request.label_predicates)?;
     let mut cache = TermCache::new();
     let mut resolved_labels: HashMap<String, Option<String>> = HashMap::new();
@@ -4951,7 +4960,7 @@ pub fn terms(
         }
     };
 
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let label_predicates = resolve_predicate_ids(&dictionary, &request.label_predicates)?;
     let mut cache = TermCache::new();
     let mut published = PublishedTerms::new(blank_nodes.clone());
@@ -5208,7 +5217,7 @@ pub fn describe(
     request: &request::Describe,
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let echo = Echo::Describe {
         resource: request.resource.requested().to_owned(),
         direction: request.direction,
@@ -5285,7 +5294,7 @@ pub fn describe(
 /// `GET /sample` — pseudo-random members of a pattern's results.
 pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Result<Answer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let echo = Echo::Sample {
         pattern: request.pattern.clone(),
         n: request.n,
@@ -5550,7 +5559,7 @@ impl<'a> Scope<'a> {
             },
             GraphSelector::Named(term) => {
                 let graphs = graphs(store, target)?;
-                match named_layer(graphs, blank_nodes, term)? {
+                match named_layer(&store.dict(), graphs, blank_nodes, term)? {
                     Some(graph) => Self::Layer(graphs, graph),
                     None => {
                         return Ok(Err(AbsentTerm::new(scope.parameter().as_str(), term)));
@@ -5580,13 +5589,16 @@ impl<'a> Scope<'a> {
 /// The layer a request's graph name selects, or `None` when this bundle holds
 /// no such graph.
 ///
-/// A graph whose stored name is a blank node is published under a
-/// bundle-scoped IRI, and a request may send that IRI back. The layer id it
-/// carries is checked against the sidecar rather than trusted: the spelling
-/// names a *blank* layer of this bundle, so an id out of range names no graph
-/// — and neither does one whose layer carries an ordinary IRI, because that
-/// graph is addressed by the IRI itself and by nothing else.
+/// A graph whose stored name is a blank node is published under an IRI this
+/// bundle mints (see [`blank_graph_iri`]), and a request may send that IRI
+/// back. Whatever it carries is checked rather than trusted, and each graph is
+/// reachable by exactly the one IRI it is published under: an id out of range
+/// names no graph, and neither does one whose layer carries an ordinary IRI,
+/// because that graph is addressed by the IRI itself — nor a graph-only IRI
+/// for a node that also fills a triple position, because that node is
+/// published under its data IRI.
 fn named_layer(
+    dictionary: &Dictionary<'_>,
     graphs: &Graphs,
     blank_nodes: &SkolemScope,
     term: &BoundTerm,
@@ -5599,7 +5611,23 @@ fn named_layer(
         let stored = graphs
             .name(id, &mut buffer)
             .map_err(|error| unreadable("reading a graph's name", &error))?;
-        return Ok(stored.starts_with(b"_:").then_some(id));
+        let graph_only =
+            stored.starts_with(b"_:") && data_blank_node(dictionary, stored)?.is_none();
+        return Ok(graph_only.then_some(id));
+    }
+    // A blank node of the data names a graph when the sidecar holds a graph
+    // by the same label, which is the same node.
+    for role in [Role::Subject, Role::Object] {
+        let Some(id) = reverse_scoped(dictionary, blank_nodes, role, term.dictionary())? else {
+            continue;
+        };
+        let mut buffer = Vec::new();
+        let stored = dictionary
+            .extract(role, TermId(id), &mut buffer)
+            .map_err(|error| unreadable("reversing a blank-node IRI", &error))?;
+        return graphs
+            .resolve(stored)
+            .map_err(|error| unreadable("looking a graph up", &error));
     }
     if term.denotes_blank_node() {
         // `_:label` names nothing outside the document it was parsed from,
@@ -5609,6 +5637,56 @@ fn named_layer(
     graphs
         .resolve(term.dictionary().as_bytes())
         .map_err(|error| unreadable("looking a graph up", &error))
+}
+
+/// The IRI a graph named by a blank node is published under.
+///
+/// One node is one node however many positions it fills: in `_:g <p> <o> _:g`
+/// the graph name and the subject are the same resource, and a statement about
+/// the graph has to join with the graph it describes. So a blank graph name
+/// that occurs in the data is published under the IRI that node gets there, and
+/// only one found nowhere else gets a graph-only IRI of the sidecar's own.
+///
+/// Looking a sidecar label up in the dictionary is a join between two artifacts
+/// of one build, not the inbound `_:label` lookup [`locate`] refuses: hdtc
+/// scopes a document's blank nodes once for every position, so the two files
+/// spell one node alike (`hdtc/docs/graphs-sidecar-format.md` §5). Two
+/// `O(log D)` probes at most, once per distinct graph a page names.
+///
+/// `None` for a graph whose stored name is an ordinary IRI.
+fn blank_graph_iri(
+    dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    graph: GraphId,
+    stored: &str,
+) -> Result<Option<String>, Problem> {
+    if !stored.starts_with("_:") {
+        return Ok(None);
+    }
+    Ok(match data_blank_node(dictionary, stored.as_bytes())? {
+        Some((role, id)) => blank_nodes.iri(role, id, stored),
+        None => blank_nodes.graph_iri(graph),
+    })
+}
+
+/// Where a blank label from the sidecar occurs in the data, if it does.
+///
+/// Subject first, then object: the shared section answers either, and a node
+/// only in one role-specific section is found by that role alone. The IRI
+/// [`SkolemScope::iri`] mints is the same whichever role found it.
+fn data_blank_node(
+    dictionary: &Dictionary<'_>,
+    label: &[u8],
+) -> Result<Option<(Role, TermId)>, Problem> {
+    for role in [Role::Subject, Role::Object] {
+        let found = dictionary
+            .locate(role, label)
+            .map_err(|error| unreadable("looking a blank graph name up in the data", &error))?;
+        if let Some(id) = found {
+            return Ok(Some((role, id)));
+        }
+    }
+    Ok(None)
 }
 
 /// Resolve one pattern under a graph scope.
@@ -6657,7 +6735,7 @@ fn materialize(
 ) -> Result<(Vec<Row>, Option<usize>), Problem> {
     let mut cache = TermCache::new();
     let mut published = PublishedTerms::new(blank_nodes.clone());
-    let mut graph_names = GraphNames::new(blank_nodes);
+    let mut graph_names = GraphNames::new(*dictionary, blank_nodes);
     let mut rows: Vec<Row> = Vec::with_capacity(steps.len());
     let mut spent = 0u64;
     for (index, step) in steps.iter().enumerate() {
@@ -6712,18 +6790,20 @@ fn materialize(
 ///
 /// A graph's name is spelled once per distinct graph rather than once per
 /// row: the quad view repeats a handful of graphs down a page. A graph named
-/// by a blank node is published as this bundle's scoped IRI, as a data blank
+/// by a blank node is published as an IRI this bundle mints, as a data blank
 /// node is, because a `_:` label means nothing outside the document it came
-/// from.
+/// from; see [`blank_graph_iri`].
 struct GraphNames<'a> {
+    dictionary: Dictionary<'a>,
     blank_nodes: &'a SkolemScope,
     names: HashMap<GraphId, (Rc<str>, u64)>,
     buffer: Vec<u8>,
 }
 
 impl<'a> GraphNames<'a> {
-    fn new(blank_nodes: &'a SkolemScope) -> Self {
+    fn new(dictionary: Dictionary<'a>, blank_nodes: &'a SkolemScope) -> Self {
         Self {
+            dictionary,
             blank_nodes,
             names: HashMap::new(),
             buffer: Vec::new(),
@@ -6741,10 +6821,11 @@ impl<'a> GraphNames<'a> {
         let stored = std::str::from_utf8(stored).map_err(|error| {
             unreadable("reading a graph's name", &format!("not UTF-8: {error}"))
         })?;
-        let published: Rc<str> = match self.blank_nodes.graph_iri(graph, stored) {
-            Some(iri) => Rc::from(iri.as_str()),
-            None => Rc::from(stored),
-        };
+        let published: Rc<str> =
+            match blank_graph_iri(&self.dictionary, self.blank_nodes, graph, stored)? {
+                Some(iri) => Rc::from(iri.as_str()),
+                None => Rc::from(stored),
+            };
         let serialized = serialized_bytes(&Term::Iri(Cow::Borrowed(published.as_ref())));
         self.names
             .insert(graph, (Rc::clone(&published), serialized));

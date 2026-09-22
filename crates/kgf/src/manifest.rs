@@ -216,6 +216,20 @@ pub(crate) struct DescriptionArtifactMetadata {
     pub(crate) class_relations: RowArtifactMetadata,
     /// Bounds for `stats/class-properties.tsv`.
     pub(crate) class_properties: RowArtifactMetadata,
+    /// Whether the analysis read the memberships to describe each graph, which
+    /// makes the sidecar a parent of `stats/void.hdt` beside the HDT.
+    pub(crate) per_graph: bool,
+}
+
+impl DescriptionArtifactMetadata {
+    /// What `stats/void.hdt` was computed from.
+    fn void_parents(&self) -> Vec<String> {
+        let mut parents = vec![artifact::HDT.to_owned()];
+        if self.per_graph {
+            parents.push(artifact::GRAPHS.to_owned());
+        }
+        parents
+    }
 }
 
 /// Run `kgf manifest`.
@@ -835,7 +849,48 @@ fn checksum_artifacts(dir: &Path, facts: &BundleFacts) -> Result<Vec<(String, Ar
         entries.push((name.to_owned(), entry));
     }
     verify_key_decomposition(dir, &entries)?;
+    verify_graph_index_binding(dir, &entries)?;
     Ok(entries)
+}
+
+/// Check that the graph index records the digest of the sidecar beside it.
+///
+/// The index binds itself to its sidecar by that digest, and a server takes it
+/// as the sidecar's identity: it scopes the IRI of every graph named by a blank
+/// node that no triple mentions, so a layer id reverses only against the
+/// memberships it was minted from. Opening compares the cheap fields alone,
+/// which a sidecar re-encoded with the same counts would pass. The whole-file
+/// checksum computed above is exactly the digest the index should carry, so
+/// the comparison costs one header read.
+fn verify_graph_index_binding(dir: &Path, entries: &[(String, ArtifactEntry)]) -> Result<()> {
+    let checksum = |name: &str| {
+        entries
+            .iter()
+            .find(|(entry_name, _)| entry_name == name)
+            .map(|(_, entry)| entry.sha256.as_str())
+    };
+    let (Some(sidecar), Some(_)) = (checksum(artifact::GRAPHS), checksum(artifact::GRAPHS_IDX))
+    else {
+        return Ok(());
+    };
+    let index = dir.join(artifact::GRAPHS_IDX);
+    let directory = hdtc::format::GraphIndex::directory(&index, &dir.join(artifact::HDT))
+        .with_context(|| format!("reading the graph index {}", index.display()))?;
+    let recorded: String = directory
+        .header()
+        .sidecar_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    ensure!(
+        recorded == sidecar,
+        "{} was built from a graph sidecar with sha256 {recorded}, but {} is sha256 \
+         {sidecar}; rebuild the index with `hdtc graphs-index {} --positions pos,ops`",
+        index.display(),
+        dir.join(artifact::GRAPHS).display(),
+        dir.join(artifact::HDT).display(),
+    );
+    Ok(())
 }
 
 /// Read a `filters/` or `keysets/` artifact's own header, if this is one.
@@ -1095,16 +1150,16 @@ fn carry_artifact_metadata(
         .collect();
 
     for (name, current) in artifacts {
-        if generated_description.is_some()
-            && let Some(parent) = match name.as_str() {
-                artifact::VOID_HDT => Some(artifact::HDT),
-                artifact::VOID_PERM => Some(artifact::VOID_HDT),
+        if let Some(description) = generated_description
+            && let Some(parents) = match name.as_str() {
+                artifact::VOID_HDT => Some(description.void_parents()),
+                artifact::VOID_PERM => Some(vec![artifact::VOID_HDT.to_owned()]),
                 _ => None,
             }
         {
             // This producer owns the binding. Do not let identical bytes carry
             // a legacy manifest's absent or stale parent back over it.
-            current.parents = vec![parent.to_owned()];
+            current.parents = parents;
             continue;
         }
         let generated = generated_description.and_then(|description| match name.as_str() {

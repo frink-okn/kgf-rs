@@ -95,6 +95,7 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
         .then(|| sidecar_facts(plan, &layout.data))
         .transpose()?;
     if let Some(facts) = graph_facts {
+        refuse_undescribed_design(plan, facts)?;
         runner.run(&graphs_index_step(&layout, wants_transpose(plan, facts)))?;
         // Before the expensive sidecars, not after: a sidecar this server
         // cannot read is worth hearing about now rather than once the text
@@ -300,6 +301,37 @@ fn sidecar_facts(plan: &BundlePlan, data: &Path) -> Result<stats::GraphFacts> {
             .describe
             .unwrap_or(header.named_graphs <= GRAPH_DESCRIPTION_THRESHOLD),
     })
+}
+
+/// Refuse a design component whose graph this bundle will not describe.
+///
+/// Decided by what the sidecar says, so it runs as soon as that is known and
+/// before any step that would be wasted: past the threshold an unset
+/// `contents.graphs.describe` describes no graph on its own, and a graph named
+/// by a blank node leaves the unnamed graph's subset indistinguishable from its
+/// own, so the unnamed graph is not described either.
+fn refuse_undescribed_design(plan: &BundlePlan, facts: stats::GraphFacts) -> Result<()> {
+    let Some((_, graph)) = plan.config.design_graph() else {
+        return Ok(());
+    };
+    if !facts.describe {
+        plan.config.refuse_design(
+            &format!(
+                "the bundle holds {} graphs, and past {GRAPH_DESCRIPTION_THRESHOLD} each is \
+                 described on its own only when contents.graphs.describe says so",
+                facts.named_graphs
+            ),
+            "Set contents.graphs.describe: true to describe every graph",
+        )?;
+    }
+    if graph == kgf_store::UNNAMED_GRAPH_IRI && facts.blank_names {
+        plan.config.refuse_design(
+            "a graph named by a blank node is described by a subset nothing can tell apart \
+             from the unnamed graph's, so neither is described",
+            "Name that graph by an IRI in the source",
+        )?;
+    }
+    Ok(())
 }
 
 /// The sidecar steps, in the order they run.

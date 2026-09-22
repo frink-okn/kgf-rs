@@ -2217,6 +2217,22 @@ source against one-row pages, and a bundle assembled by `kgf build` and served, 
 is the only test that can catch the build and the server disagreeing about what a view
 is called.
 
+**After review (2026-09-18): one IRI per node, and a design view that means what it
+says.** A blank graph name that is also a subject is now published under the
+subject's IRI, and a graph-only blank name is scoped by the membership sidecar's
+digest, which the graph index records and `kgf manifest` now checks against the
+sidecar it hashes anyway (question 77). The design view is its component's own subset,
+and publication verifies that rather than the proxy it checked before — that a bundle
+with component views never aliased `design` to `queryable` — which refused a bundle
+declaring only a derived component, where the dataset itself is the only design view
+there is. The converse was silent: a design component whose graph went undescribed,
+by `contents.graphs.describe: false` or by the graph-count threshold, got the union
+under its name. It is now refused, at `--check-config` when the config says so and
+as soon as the sidecar is read otherwise. Per-graph statistics declare
+`data.hdt.graphs` as a parent of `stats/void.hdt`, so regenerating a manifest over a
+replaced sidecar is refused. And `g=_:g` in an RDF syntax answers its empty page
+rather than a 500: the graph tag is built only when a statement needs it.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
@@ -3208,10 +3224,16 @@ following the code.
     doc 03 rather than only in this implementation.
 77. **A graph named by a blank node needs a stated spelling.** The sidecar stores such a
     name as `_:label`, which means nothing outside the document it was parsed from. This
-    implementation publishes it as the bundle-scoped IRI a data blank node gets, in a
-    section of its own keyed by layer id, and checks the id against the sidecar when one
-    comes back. Whether that is the federation's answer, and whether a graph so named
-    should be listed at all, is a doc 03 question.
+    implementation publishes a node that also fills a triple position under its data
+    IRI, since the graph and the subject of `_:g :p :o _:g` are one resource, and one
+    found only as a graph name as `…:sha256:{sidecar-digest}:g-{layer}` — scoped by the
+    membership sidecar's digest rather than the HDT's, because a layer id means nothing
+    across two sidecars over one HDT. Every graph then has exactly one IRI, checked
+    against the sidecar when it comes back. A first cut keyed every blank graph by
+    layer id under the HDT's digest, which split the shared node in two and gave two
+    bundles with the same triples grouped differently one IRI for different graphs.
+    Whether this is the federation's answer, and whether a graph so named should be
+    listed at all, is a doc 03 question.
 78. **hdtc could refuse the two reserved graph IRIs at build time.** `kgf build` refuses
     them by opening the finished sidecar the way a server does, which is after the whole
     HDT has been built. hdtc knows a quad's graph as it reads it and could refuse there,
@@ -3225,6 +3247,13 @@ following the code.
     neither rather than describing one under the other's name, and a bundle can list
     more graphs through `/graphs` than its summary describes. A `sd:namedGraph` whose
     `sd:name` is the blank node, or any other discriminator, would close it.
+80. **hdtc's sidecar format should say a blank graph name is scoped as the data is.**
+    Publishing a blank graph name under its data IRI when the node is in the data
+    rests on the sidecar and `data.hdt` spelling one node alike. hdtc does — its parser
+    applies one blank prefix to the subject, object and graph of a quad, and its design
+    notes say so — but `docs/graphs-sidecar-format.md` §5 says only "after input
+    blank-node scoping", which a conforming writer could read as a scoping of its own.
+    The normative text should say it is the scoping applied to `data.hdt`'s terms.
 
 ## Not in this plan
 
