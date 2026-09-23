@@ -603,7 +603,6 @@ fn resolve_components(
     use kgf_store::manifest::{Component, ComponentRole};
 
     let mut resolved = Vec::with_capacity(components.len());
-    let mut sources = Vec::new();
     for (id, component) in components {
         for (field, value) in [("files", &component.files), ("tool", &component.tool)] {
             ensure!(
@@ -632,9 +631,6 @@ fn resolve_components(
                 format!("component {id:?} names graph {graph:?}, which is not an absolute IRI")
             })?;
         }
-        if role == ComponentRole::Source {
-            sources.push(id.clone());
-        }
         resolved.push(Component {
             id,
             role,
@@ -645,16 +641,12 @@ fn resolve_components(
         });
     }
 
-    // Without a nomination the canonical component is the design view, so a
-    // config naming two leaves the summary card with no answer to which the
-    // dataset is. Refused here rather than picked arbitrarily later.
-    ensure!(
-        design.is_some() || sources.len() <= 1,
-        "components {} all claim `role: source`, and the canonical one is what the \
-         design view describes. Give exactly one that role, or nominate the design \
-         view with `design:`",
-        sources.join(", ")
-    );
+    // Several `role: source` components and no nomination is a dataset
+    // assembled from several contributed parts, none of them canonical. The
+    // design view is then the dataset itself, exactly as when no component is
+    // declared: every source is the contributor's own modeling, so describing
+    // the whole is not a choice made on the publisher's behalf, where picking
+    // one of them would be.
     if let Some(design) = design {
         let component = resolved
             .iter()

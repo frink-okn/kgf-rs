@@ -668,9 +668,11 @@ pub struct Manifest {
     ///
     /// Absent, the canonical component is it — the one and only `role: source`
     /// — which is the legible view of a dataset whose native encoding is the
-    /// one its readers want. Where it is not, the publisher nominates: a KG
-    /// written in OWL has its restrictions and blank nodes in the canonical
-    /// component, and the view worth describing is a projection of it.
+    /// one its readers want. With several sources none is canonical, and the
+    /// design view is the dataset itself. Where the native encoding is not the
+    /// legible one, the publisher nominates: a KG written in OWL has its
+    /// restrictions and blank nodes in the canonical component, and the view
+    /// worth describing is a projection of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design: Option<String>,
     /// How this bundle was built, for re-derivation.

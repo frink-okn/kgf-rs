@@ -2233,6 +2233,17 @@ as soon as the sidecar is read otherwise. Per-graph statistics declare
 replaced sidecar is refused. And `g=_:g` in an RDF syntax answers its empty page
 rather than a 500: the graph tag is built only when a statement needs it.
 
+**Several sources (2026-09-22): the design view is the dataset.** The build refused a
+config declaring more than one `role: source` component without `design:`, because
+the design doc had no rule for it. KnowWhereGraph is that shape: each of its bundles
+clumps several KWG source subgraphs, one component each, and none of them is the
+dataset. The rule is now the one a derived-only declaration already had: no component
+is canonical, so `design` aliases `queryable` at the dataset root. The store's
+`design_component` already answered `None` there, and the description set and
+publication check already handled it, so only the build's refusal went. Nominating one
+source stays available for a publisher who wants that part on the card. Doc 04 now
+states the rule.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that

@@ -209,9 +209,9 @@ card is rendered from: `design:` nominates it, defaulting to the canonical
 component, the single `role: source` one. The design view *is* that component's
 own subset — the node its `component:<id>` view is rooted at, which publication
 verifies. Where no component is the design view — none declared, or none canonical
-among those declared, as when a bundle declares only its entailed overlay — the
-design view describes the dataset itself, the queryable root under a second name,
-exactly as in a componentless bundle. A design component with a graph the build
+among those declared, as when a bundle declares only its entailed overlay or several
+sources with none nominated — the design view describes the dataset itself, the
+queryable root under a second name, exactly as in a componentless bundle. A design component with a graph the build
 will not describe is refused rather than answered with the union, which would
 publish the whole dataset under the component's name: `contents.graphs.describe:
 false` beside it fails `--check-config`, and more graphs than the threshold above

@@ -952,6 +952,24 @@ fn a_component_recipe_is_refused_and_a_declaration_is_not() {
     assert_eq!(plan["components"][0]["role"], "source");
     assert_eq!(plan["components"][1]["inputs"][0], "asserted");
 
+    // Several sources and no nomination is a dataset of several parts, none
+    // canonical, so nothing is nominated on the publisher's behalf.
+    let plan = kgf(
+        &["build", "--config", "-", "--check-config"],
+        &format!(
+            "{MINIMAL}{}",
+            concat!(
+                "components:\n",
+                "  a: {role: source, graph: 'http://example.org/g1'}\n",
+                "  b: {role: source, graph: 'http://example.org/g2'}\n",
+            )
+        ),
+    )
+    .ok();
+    let plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
+    assert_eq!(plan["components"].as_array().unwrap().len(), 2);
+    assert!(plan.get("design").is_none(), "{plan}");
+
     // A recipe names the DAG this build has no orchestrator for.
     for recipe in ["files: [kg.nt.gz]", "tool: {argv: [owl-rl]}"] {
         let stderr = kgf(
@@ -973,14 +991,6 @@ fn a_component_recipe_is_refused_and_a_declaration_is_not() {
 
     // What a declaration must be internally consistent about.
     for (config, expected) in [
-        (
-            concat!(
-                "components:\n",
-                "  a: {role: source, graph: 'http://example.org/g1'}\n",
-                "  b: {role: source, graph: 'http://example.org/g2'}\n",
-            ),
-            "canonical",
-        ),
         (
             "components:\n  a: {role: nonsense, graph: 'http://example.org/g1'}\n",
             "use `source`",
@@ -2269,6 +2279,49 @@ fn a_derived_component_alone_leaves_the_design_view_the_dataset() {
     };
     assert_eq!(rows("design"), rows("queryable"));
     assert_ne!(rows("design"), rows("component:closure"));
+    kgf(&["manifest", path(&out), "--check"], "").ok();
+}
+
+/// A dataset assembled from several contributed parts declares each as a
+/// source, and with none nominated none is canonical. The design view is the
+/// dataset itself, and each part is described under its own id.
+#[test]
+fn several_source_components_leave_the_design_view_the_dataset() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+    build_quads(
+        &out,
+        &format!(
+            "{CONFIG}components:\n  \
+             first: {{role: source, graph: 'http://example.org/g1'}}\n  \
+             second: {{role: source, graph: 'http://example.org/g2'}}\n"
+        ),
+        &source,
+    )
+    .ok();
+
+    assert_eq!(
+        views_of(&out, "stats/schema-nodes.tsv"),
+        [
+            "design",
+            "queryable",
+            "component:first",
+            "component:second",
+            "graph:urn:x-kgf:unnamed",
+        ]
+    );
+    let rows = |view: &str| -> Vec<String> {
+        std::fs::read_to_string(out.join("stats/schema-nodes.tsv"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix(&format!("{view}\t")).map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(rows("design"), rows("queryable"));
+    assert_ne!(rows("design"), rows("component:first"));
+    assert_ne!(rows("design"), rows("component:second"));
     kgf(&["manifest", path(&out), "--check"], "").ok();
 }
 

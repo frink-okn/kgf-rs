@@ -59,7 +59,9 @@ pub struct Config {
 
     /// The component the design view describes, by id.
     ///
-    /// Omitted, the canonical component is it. A KG whose native encoding is
+    /// Omitted, the canonical component is it: the single `role: source` one.
+    /// Where several components claim that role, none is canonical and the
+    /// design view describes the whole dataset. A KG whose native encoding is
     /// the one its readers want needs nothing here; one that publishes a
     /// projection worth reading instead of its own encoding says so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
