@@ -777,7 +777,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hdtc"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
@@ -1063,7 +1063,7 @@ checksum = "574b0cd5e90ee2ba03a66d0611fc9a09c9a0c28b2ecc2dc8a181dd31a53ca5d7"
 
 [[package]]
 name = "kgf"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1085,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "kgf-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1117,7 +1117,7 @@ dependencies = [
 
 [[package]]
 name = "kgf-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "hdtc",
