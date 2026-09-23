@@ -2,3 +2,18 @@
 **/*.rs.bk
 .DS_Store
 /interop/comunica/node_modules/
+
+# Local corpora and bundle trees. `tools/okn-build-config.py` fetches HDT into
+# `demo/` or `build/hdt/` and writes bundles beside it; `demo-prev/` is the
+# previous corpus kept for comparison, and `ubergraph-kgf/` a bundle assembled by
+# hand. Gigabytes each, all of it rebuildable from the registry and lakeFS.
+/build/
+/demo/
+/demo-prev/
+/temp/
+/ubergraph-kgf/
+
+# Scratch SPARQL and the Comunica source lists that point at a locally running
+# server. The interoperability suite's own fixtures live in `interop/comunica/`.
+/*.rq
+/demo-config.json

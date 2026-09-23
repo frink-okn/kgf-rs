@@ -117,6 +117,8 @@ pub struct ReleaseLinks {
     terms: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     labels: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    graphs: Option<String>,
 }
 
 /// Which build and protocol answered.
@@ -489,6 +491,9 @@ fn release_links(
             .then(|| operation("search")),
         terms: Some(operation("terms")),
         labels: Some(operation("labels")),
+        graphs: release
+            .declares(Capability::Graphs)
+            .then(|| operation("graphs")),
     }
 }
 
@@ -718,15 +723,18 @@ fn operations(
     manifest: &Manifest,
 ) -> Vec<Vec<Value<'static>>> {
     let search = manifest.declares(Capability::Search);
-    let pattern_parameters = if search {
-        "s, p, o, o.text, limit, cursor"
-    } else {
-        "s, p, o, limit, cursor"
+    let graphs = manifest.declares(Capability::Graphs);
+    let pattern_parameters = match (search, graphs) {
+        (true, true) => "s, p, o, o.text, g, limit, cursor",
+        (true, false) => "s, p, o, o.text, limit, cursor",
+        (false, true) => "s, p, o, g, limit, cursor",
+        (false, false) => "s, p, o, limit, cursor",
     };
-    let count_parameters = if search {
-        "s, p, o, o.text, cursor"
-    } else {
-        "s, p, o"
+    let count_parameters = match (search, graphs) {
+        (true, true) => "s, p, o, o.text, g, cursor",
+        (true, false) => "s, p, o, o.text, cursor",
+        (false, true) => "s, p, o, g",
+        (false, false) => "s, p, o",
     };
     let mut operations = vec![
         ("fragment", pattern_parameters, true),
@@ -757,6 +765,9 @@ fn operations(
     // dictionary, which is a way into a KG whose vocabulary a client does not
     // know yet.
     operations.push(("terms", "prefix, role, count, limit, labels, cursor", true));
+    if graphs {
+        operations.push(("graphs", "limit, cursor", true));
+    }
     operations.push(("labels", "QUERY/POST JSON body: iris", false));
     operations
         .into_iter()
@@ -785,6 +796,8 @@ mod tests {
     fn manifest() -> Manifest {
         Manifest {
             id: "tox".to_owned(),
+            components: Vec::new(),
+            design: None,
             dataset_iri: Some("https://okn.example/id/tox".to_owned()),
             version: "2026-06-01".to_owned(),
             content_digest: "sha256:0123456789abcdef0123456789abcdef".to_owned(),

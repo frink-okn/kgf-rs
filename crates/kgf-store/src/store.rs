@@ -12,11 +12,12 @@
 
 use std::path::{Path, PathBuf};
 
-use hdtc::format::{GraphIndexOpenError, TextSearcher};
+use hdtc::format::TextSearcher;
 
 use crate::description::DescriptionStore;
 use crate::dict::Dictionary;
 use crate::error::{Error, Result};
+use crate::graphs::Graphs;
 use crate::indexed::IndexedHdt;
 use crate::map::{PublishedBundle, open_published};
 use crate::pattern::{IdPattern, Selection};
@@ -130,6 +131,7 @@ pub struct OpenOptions {}
 pub struct Store {
     bundle: PublishedBundle,
     data: IndexedHdt,
+    graphs: Option<Graphs>,
     description: Option<DescriptionStore>,
     text: Option<TextSearcher>,
 }
@@ -143,6 +145,7 @@ impl std::fmt::Debug for Store {
         f.debug_struct("Store")
             .field("bundle", &self.bundle)
             .field("data", &self.data)
+            .field("graphs", &self.graphs.is_some())
             .field("description", &self.description.is_some())
             .field("text", &self.text.is_some())
             .finish()
@@ -177,16 +180,10 @@ impl Store {
         let perm = open_published(bundle, &artifacts.perm)?;
         let data = IndexedHdt::open(hdt, perm)?;
 
-        artifacts.verify_graph_index()?;
+        let graphs = artifacts.open_graphs(bundle)?;
         let document = crate::manifest::ManifestDocument::read(dir)?
             .expect("manifest existence was required immediately above");
         let manifest_description = document.lists_description_artifacts();
-        if manifest_description && document.declares_components() {
-            return Err(description_set_disagreement(
-                dir,
-                "this build does not yet support component description views; use a componentless bundle or wait for the full `kgf build` component contract",
-            ));
-        }
         let description = match (artifacts.description.as_ref(), manifest_description) {
             (Some(_), true) => {
                 let manifest = document.into_parsed()?;
@@ -220,6 +217,7 @@ impl Store {
         Ok(Self {
             bundle: bundle.clone(),
             data,
+            graphs,
             description,
             text: artifacts.open_text()?,
         })
@@ -238,6 +236,15 @@ impl Store {
     /// The permutations.
     pub fn perms(&self) -> &Permutations {
         self.data.permutations()
+    }
+
+    /// The graph memberships, if this bundle carries the sidecar pair.
+    ///
+    /// `None` when there is no `data.hdt.graphs`, which is also when the
+    /// manifest declares no `graphs` capability — one condition, read two ways.
+    /// An unscoped request never needs this: the union is `data.hdt` itself.
+    pub fn graphs(&self) -> Option<&Graphs> {
+        self.graphs.as_ref()
     }
 
     /// The full-text index over this bundle's literals, if it published one.
@@ -421,41 +428,21 @@ impl ArtifactSet {
             })
     }
 
-    /// Refuse a graph index that does not belong to this HDT.
+    /// Open the graph sidecar pair, if the bundle carries it.
     ///
-    /// `verify_binding` rather than `open`: graph scoping is not implemented,
-    /// so opening only needs to refuse an index that does not bind. Opening the
-    /// index would additionally build its two
-    /// per-query layer readers — a file handle each — and then drop them.
-    ///
-    /// Shared with [`crate::manifest::BundleFacts::read`] so that the two paths
-    /// cannot disagree about whether a bundle is sound. A manifest describing a
-    /// bundle that then refuses to open would be worse than useless.
-    pub(crate) fn verify_graph_index(&self) -> Result<()> {
-        let Some(index) = &self.graph_index else {
-            return Ok(());
+    /// Every binding check happens here — the sidecar against the HDT, the
+    /// index against both — and the index must carry both position-keyed
+    /// layer sets. Shared with [`crate::manifest::BundleFacts::read`] so that
+    /// the two paths cannot disagree about whether a bundle is sound: a
+    /// manifest describing a bundle that then refuses to open would be worse
+    /// than useless.
+    pub(crate) fn open_graphs(&self, bundle: &PublishedBundle) -> Result<Option<Graphs>> {
+        let (Some(graphs), Some(index)) = (&self.graphs, &self.graph_index) else {
+            return Ok(None);
         };
-        hdtc::format::GraphIndex::verify_binding(index, &self.hdt).map_err(|error| match error {
-            GraphIndexOpenError::Binding { source } => Error::ArtifactBindingMismatch {
-                artifact: index.clone(),
-                hdt: self.hdt.clone(),
-                detail: format!("{source:#}"),
-            },
-            GraphIndexOpenError::Index { source } => {
-                Error::Format(source.context(format!("opening graph index {}", index.display())))
-            }
-            GraphIndexOpenError::Source { source } => Error::Format(
-                source.context(format!("validating source HDT {}", self.hdt.display())),
-            ),
-            GraphIndexOpenError::Sidecar { source } => {
-                let graphs = self
-                    .graphs
-                    .as_deref()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| PathBuf::from(artifact::GRAPHS));
-                Error::Format(source.context(format!("opening graph sidecar {}", graphs.display())))
-            }
-        })
+        let sidecar = open_published(bundle, graphs)?;
+        let index = open_published(bundle, index)?;
+        Graphs::open(&self.hdt, sidecar, index).map(Some)
     }
 }
 

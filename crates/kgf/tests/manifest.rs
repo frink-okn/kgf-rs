@@ -335,6 +335,8 @@ fn a_build_publishes_one_verified_description_set() {
     let after = std::fs::read(bundle.join(artifact::MANIFEST)).unwrap();
     kgf(&["manifest", path(&bundle), "--check"]).success();
 
+    // A component with no graph is provenance and nothing more: it names no
+    // view, so a componentless description set still opens and still checks.
     let manifest_path = bundle.join(artifact::MANIFEST);
     let mut document: serde_json::Value = serde_json::from_slice(&after).unwrap();
     document["components"] = serde_json::json!([{"id": "canonical", "role": "source"}]);
@@ -343,16 +345,28 @@ fn a_build_publishes_one_verified_description_set() {
         serde_json::to_vec_pretty(&document).unwrap(),
     )
     .unwrap();
-    let open_error = open(&bundle).expect_err("component views are not silently misclassified");
-    assert!(
-        open_error
-            .to_string()
-            .contains("does not yet support component description views"),
-        "{open_error}"
-    );
+    open(&bundle).expect("a component without a graph describes nothing and breaks nothing");
+    kgf(&["manifest", path(&bundle), "--check"]).success();
+
+    // A description view for a component the manifest does not declare is the
+    // shape a stale manifest leaves behind, and it is refused.
+    let mut document: serde_json::Value = serde_json::from_slice(&after).unwrap();
+    for artifact in [
+        "stats/schema-nodes.tsv",
+        "stats/class-relations.tsv",
+        "stats/class-properties.tsv",
+    ] {
+        document["artifacts"][artifact]["views"]["component:ghost"] =
+            serde_json::json!({"offset": 0, "bytes": 0, "rows": 0});
+    }
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&document).unwrap(),
+    )
+    .unwrap();
     let error = kgf(&["manifest", path(&bundle), "--check"]).failure();
     assert!(
-        error.contains("does not yet verify component description views"),
+        error.contains("component \"ghost\", which this manifest does not declare"),
         "{error}"
     );
 }

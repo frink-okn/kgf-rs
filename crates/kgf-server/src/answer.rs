@@ -42,6 +42,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use maud::html;
@@ -54,6 +55,7 @@ use serde::{Deserialize, Serialize};
 use hdtc::format::{TextScanPosition, TextSearcher, parse_literal};
 use kgf_store::catalog::BundleId;
 use kgf_store::dict::{DictPosition, Dictionary, RoleCounts, ScanFlow, ScannedTerm};
+use kgf_store::manifest::Manifest;
 use kgf_store::pattern::{IdPattern, Selection};
 use kgf_store::{
     ClassPropertyStop, ClassRelationStop, IdTriple, Role, SchemaCollection,
@@ -78,9 +80,12 @@ use crate::request::{
     ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter, role_name,
     term_role_name,
 };
+use crate::request::{GraphScope, GraphSelector};
 use crate::skolem::SkolemScope;
 use crate::term::{DictionaryTermError, LiteralKind, PrefixMap, Term, TermCache, serialized_bytes};
 use crate::url::{self, Mount, Params};
+use kgf_store::graphs::{GraphId, Graphs};
+use kgf_store::scope::{QuadSelection, ScopedSelection};
 
 // ---------------------------------------------------------------------------
 // Where a response came from
@@ -103,10 +108,14 @@ pub struct Target {
     /// against it, from the same place the prefix map is read.
     mount: Mount,
     body: bool,
-    has_search: bool,
+    offers: Offers,
     /// Logical dataset identity and the description link this release can
     /// actually answer, from the immutable manifest.
     dataset: Option<DatasetMetadata>,
+    /// The parts of the dataset this release declares, from the same manifest.
+    /// Held as the manifest itself, which the release already keeps behind an
+    /// `Arc`, so attaching it to a target costs a refcount rather than a copy.
+    declarations: Option<Arc<Manifest>>,
     /// The exact absolute GET URL received over HTTP. Hydra metadata keys its
     /// page controls by this IRI, so a merely equivalent canonical URL is not
     /// enough for an LDF client looking up controls for its request URL.
@@ -117,6 +126,17 @@ pub struct Target {
 struct DatasetMetadata {
     iri: String,
     void_available: bool,
+}
+
+/// The optional capabilities a release declares that a page's controls are
+/// shaped by: whether to offer a text constraint, and whether to offer a
+/// graph scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Offers {
+    /// The release declares `search`, so `o.text` is a control.
+    pub search: bool,
+    /// The release declares `graphs`, so `g` is a control.
+    pub graphs: bool,
 }
 
 impl Target {
@@ -130,7 +150,15 @@ impl Target {
         prefixes: PrefixMap,
         mount: Mount,
     ) -> Self {
-        Self::get(id, operation, params, prefixes, mount, false, None)
+        Self::get(
+            id,
+            operation,
+            params,
+            prefixes,
+            mount,
+            Offers::default(),
+            None,
+        )
     }
 
     /// A GET target with the release capabilities its page may expose.
@@ -140,7 +168,7 @@ impl Target {
         params: Params,
         prefixes: PrefixMap,
         mount: Mount,
-        has_search: bool,
+        offers: Offers,
         request_url: Option<String>,
     ) -> Self {
         Self {
@@ -150,10 +178,31 @@ impl Target {
             prefixes,
             mount,
             body: false,
-            has_search,
+            offers,
             request_url,
             dataset: None,
+            declarations: None,
         }
+    }
+
+    /// Attach the release's manifest, for the declarations a page renders.
+    pub(crate) fn with_declarations(mut self, manifest: Arc<Manifest>) -> Self {
+        self.declarations = Some(manifest);
+        self
+    }
+
+    /// The parts of the dataset this release declares.
+    fn components(&self) -> &[kgf_store::manifest::Component] {
+        self.declarations
+            .as_deref()
+            .map_or(&[], |manifest| manifest.components.as_slice())
+    }
+
+    /// The component a graph holds, if this release says one does.
+    fn component_of_graph(&self, graph: &str) -> Option<&kgf_store::manifest::Component> {
+        self.components()
+            .iter()
+            .find(|component| component.graph.as_deref() == Some(graph))
     }
 
     /// Attach the release's logical dataset identity and whether its VoID
@@ -185,9 +234,10 @@ impl Target {
             prefixes,
             mount,
             body: true,
-            has_search: false,
+            offers: Offers::default(),
             request_url: None,
             dataset: None,
+            declarations: None,
         }
     }
 
@@ -336,6 +386,7 @@ impl Target {
             AccessOperation::Sample => "Sample",
             AccessOperation::Search => "Search",
             AccessOperation::Terms => "Terms",
+            AccessOperation::Graphs => "Graphs",
             AccessOperation::Schema => "Schema",
             AccessOperation::Labels => "Labels",
             AccessOperation::Void => "void",
@@ -358,7 +409,7 @@ impl Target {
                 &self.id.version,
                 self.operation.path_segment(),
                 &self.params,
-                self.has_search,
+                self.offers,
             )
         }
     }
@@ -586,11 +637,16 @@ impl PublishedTerms {
 #[derive(Debug, Clone)]
 pub struct Row {
     cells: Vec<(Position, RowTerm)>,
+    /// The graph this membership belongs to, in the quad view.
+    graph: Option<Rc<str>>,
     binding: Option<u32>,
     direction: Option<Direction>,
     ranking: Option<Ranking>,
     serialized: u64,
 }
+
+/// The key under which a quad-view row reports its graph.
+const GRAPH: &str = "g";
 
 /// What a text-ranked row says about how it matched.
 ///
@@ -612,6 +668,9 @@ impl Serialize for Row {
         }
         for (position, term) in &self.cells {
             map.serialize_entry(position.as_str(), &Term::from_dictionary(&term.published))?;
+        }
+        if let Some(graph) = &self.graph {
+            map.serialize_entry(GRAPH, &Term::from_dictionary(graph))?;
         }
         if let Some(direction) = self.direction {
             map.serialize_entry(DIRECTION, &direction)?;
@@ -642,6 +701,7 @@ impl Row {
     fn new(
         cells: Vec<(Position, RowTerm)>,
         terms: u64,
+        graph: Option<(Rc<str>, u64)>,
         binding: Option<u32>,
         direction: Option<Direction>,
         ranking: Option<Ranking>,
@@ -655,6 +715,11 @@ impl Row {
         for (position, _) in &cells {
             serialized += quoted_key(position.as_str());
         }
+        let graph = graph.map(|(graph, measured)| {
+            entries += 1;
+            serialized += quoted_key(GRAPH) + measured;
+            graph
+        });
         if let Some(direction) = direction {
             entries += 1;
             serialized += quoted_key(DIRECTION) + direction.as_str().len() as u64 + 2;
@@ -671,6 +736,7 @@ impl Row {
         }
         Self {
             cells,
+            graph,
             binding,
             direction,
             ranking,
@@ -735,9 +801,13 @@ fn serialized_score(score: f32) -> u64 {
 enum Echo {
     Fragment {
         pattern: Pattern,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        g: Option<String>,
     },
     BindingsFragment {
         pattern: BindingPattern,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        g: Option<String>,
     },
     Describe {
         resource: String,
@@ -748,6 +818,54 @@ enum Echo {
         n: u32,
         seed: u64,
     },
+}
+
+/// The keys a page's rows carry: the unbound positions, and `g` in the quad
+/// view.
+///
+/// `g` is a column rather than a position because it is not a term of the
+/// triple: a row's graph comes from the membership sidecar, and the same
+/// triple recurs once per graph it is in.
+#[derive(Debug, Clone)]
+pub struct Vars {
+    positions: Vec<Position>,
+    graph: bool,
+}
+
+impl Vars {
+    fn new(positions: Vec<Position>, graph: bool) -> Self {
+        Self { positions, graph }
+    }
+
+    /// The triple positions rows report.
+    fn positions(&self) -> &[Position] {
+        &self.positions
+    }
+
+    /// Whether rows report `g`.
+    fn has_graph(&self) -> bool {
+        self.graph
+    }
+
+    /// Whether a row has nothing to report: every position bound, and no
+    /// graph column.
+    fn is_empty(&self) -> bool {
+        self.positions.is_empty() && !self.graph
+    }
+
+    /// Every key, in row order.
+    fn keys(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.positions
+            .iter()
+            .map(|position| position.as_str())
+            .chain(self.graph.then_some(GRAPH))
+    }
+}
+
+impl Serialize for Vars {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.keys())
+    }
 }
 
 /// A page of rows in the envelope shared by `/fragment`,
@@ -769,7 +887,7 @@ pub struct Answer {
     /// reported here if absent.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     absent_terms: Vec<AbsentTerm>,
-    vars: Vec<Position>,
+    vars: Vars,
     rows: Vec<Row>,
     #[serde(skip)]
     row_resumes: Vec<RowResume>,
@@ -808,6 +926,9 @@ pub struct Answer {
     /// show its label. `None` for every operation but `/describe`.
     #[serde(skip)]
     described: Option<String>,
+    /// How an RDF representation tags each statement's graph.
+    #[serde(skip)]
+    tagging: GraphTagging,
 }
 
 impl Renders for Answer {
@@ -843,7 +964,7 @@ impl Renders for Answer {
         let mut wanted: Vec<&str> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
         let named = |text: &str| !text.starts_with('"');
-        if let Echo::Fragment { pattern } | Echo::Sample { pattern, .. } = &self.echo {
+        if let Echo::Fragment { pattern, .. } | Echo::Sample { pattern, .. } = &self.echo {
             for position in Position::ALL {
                 if let Some(bound) = pattern.bound(position) {
                     let text = bound.dictionary();
@@ -954,6 +1075,44 @@ const HYDRA_VARIABLE_REPRESENTATION: &str =
     "http://www.w3.org/ns/hydra/core#variableRepresentation";
 const HYDRA_EXPLICIT_REPRESENTATION: &str =
     "http://www.w3.org/ns/hydra/core#ExplicitRepresentation";
+const SD_GRAPH: &str = "http://www.w3.org/ns/sparql-service-description#graph";
+const SD_DEFAULT_DATASET: &str = "http://www.w3.org/ns/sparql-service-description#defaultDataset";
+const SD_DEFAULT_GRAPH: &str = "http://www.w3.org/ns/sparql-service-description#defaultGraph";
+
+/// How an RDF representation names the graph of each data statement.
+///
+/// The rule a graph-unbound request follows is the one a SPARQL client's
+/// `GRAPH ?g` needs: the unnamed graph's statements go untagged, in the
+/// document's default graph, and every other membership is tagged with its
+/// graph. A request that named a graph gets every statement tagged with that
+/// name, except the union, whose statements are the document's default graph
+/// whether the request named the constant or left `graph` out. The union is
+/// what a client's default-graph pattern reads, and a paging client matches
+/// every page after the first against the pattern's literal graph term, so
+/// tagging union rows with the constant would lose them from the second page
+/// on. The union constant therefore never appears as a tag in any response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GraphTagging {
+    /// Every statement in the default graph: the union, unnamed.
+    Untagged,
+    /// Every statement tagged with one graph name: the one the request sent,
+    /// which need not name a graph of this bundle, or even be an IRI, when
+    /// the answer has no statements.
+    Fixed(String),
+    /// Each statement tagged with its row's graph, the unnamed graph excepted.
+    PerRow,
+}
+
+impl GraphTagging {
+    fn for_scope(scope: &GraphScope) -> Self {
+        match scope.selector() {
+            GraphSelector::Union => Self::Untagged,
+            GraphSelector::Unnamed => Self::Fixed(kgf_store::UNNAMED_GRAPH_IRI.to_owned()),
+            GraphSelector::Named(term) => Self::Fixed(term.dictionary().to_owned()),
+            GraphSelector::All => Self::PerRow,
+        }
+    }
+}
 
 struct TpfMetadata {
     page: NamedNode,
@@ -1113,13 +1272,33 @@ impl Answer {
                 "the fragment page could not be represented as RDF",
             ));
         }
-        let mut triples = Vec::with_capacity(keep);
+        // The quad view has no single graph to serve, so a graph syntax cannot
+        // carry it; every other form is one graph and serializes untagged.
+        if matches!(syntax, RdfSyntax::Graph(_)) && self.tagging == GraphTagging::PerRow {
+            return Err(Problem::new(
+                ErrorCode::NotAcceptable,
+                request::QUAD_VIEW_NEEDS_A_DATASET,
+            ));
+        }
+        // A scope that fixed one graph names it once for the whole page
+        // rather than parsing the same IRI again for every row — and only when
+        // a statement needs it. The name is the one the request sent, which is
+        // the graph's published IRI whenever it selected a graph; one that
+        // selected none, `_:label` among them, answers with no rows, and has
+        // nothing to tag and no reason to be an IRI.
+        let fixed_graph = match &self.tagging {
+            GraphTagging::Fixed(name) if keep > 0 => {
+                Some(GraphName::NamedNode(rdf_graph_name(name)?))
+            }
+            GraphTagging::Fixed(_) | GraphTagging::Untagged | GraphTagging::PerRow => None,
+        };
+        let mut statements = Vec::with_capacity(keep);
         let mut data = HashSet::with_capacity(keep);
         for row in self.rows.iter().take(keep) {
             let cell = |position| {
                 let bound = match &self.echo {
-                    Echo::Fragment { pattern } => pattern.bound(position),
-                    Echo::BindingsFragment { pattern } => pattern.bound(position),
+                    Echo::Fragment { pattern, .. } => pattern.bound(position),
+                    Echo::BindingsFragment { pattern, .. } => pattern.bound(position),
                     Echo::Describe { .. } | Echo::Sample { .. } => None,
                 };
                 rdf_fragment_cell(bound, row, position)
@@ -1140,8 +1319,18 @@ impl Answer {
                     .map_err(|error| unreadable("parsing an RDF predicate IRI", &error))?,
                 rdf_object(object.as_bytes())?,
             );
-            if data.insert(triple.clone()) {
-                triples.push(triple);
+            let graph_name = match &self.tagging {
+                GraphTagging::Untagged | GraphTagging::Fixed(_) => {
+                    fixed_graph.clone().unwrap_or(GraphName::DefaultGraph)
+                }
+                GraphTagging::PerRow => match row.graph.as_deref() {
+                    None | Some(kgf_store::UNNAMED_GRAPH_IRI) => GraphName::DefaultGraph,
+                    Some(name) => GraphName::NamedNode(rdf_graph_name(name)?),
+                },
+            };
+            let quad = triple.in_graph(graph_name);
+            if data.insert(quad.clone()) {
+                statements.push(quad);
             }
         }
 
@@ -1152,7 +1341,12 @@ impl Answer {
         let prefixes = [("kgfbn", self.blank_nodes.iri_prefix())];
         let serialized = match syntax {
             RdfSyntax::Graph(format) => {
-                let mut graph = triples;
+                // One graph, so the statements' graph names are dropped: a
+                // scoped or union answer serialized as Turtle is its triples.
+                let mut graph: Vec<Triple> = statements
+                    .into_iter()
+                    .map(|quad| Triple::new(quad.subject, quad.predicate, quad.object))
+                    .collect();
                 if let Some(metadata) = metadata {
                     graph.reserve(metadata.quads.len() + usize::from(next.is_some()));
                     graph.extend(metadata.quads.iter().map(|quad| {
@@ -1168,13 +1362,8 @@ impl Answer {
             }
             RdfSyntax::Dataset(format) => {
                 let metadata_len = metadata.as_ref().map_or(0, |value| value.quads.len());
-                let mut quads =
-                    Vec::with_capacity(triples.len() + metadata_len + usize::from(next.is_some()));
-                quads.extend(
-                    triples
-                        .into_iter()
-                        .map(|triple| triple.in_graph(GraphName::DefaultGraph)),
-                );
+                let mut quads = statements;
+                quads.reserve(metadata_len + usize::from(next.is_some()));
                 if let Some(metadata) = metadata {
                     quads.extend(metadata.quads.iter().cloned());
                 }
@@ -1235,7 +1424,7 @@ impl Answer {
         // blank nodes, which have already been replaced by stable IRIs.
         let mut used = HashSet::new();
         let search = metadata_blank_node("kgf-hydra-search", &mut used);
-        let mappings = [
+        let mut mappings = vec![
             (
                 "subject",
                 RDF_SUBJECT,
@@ -1252,7 +1441,19 @@ impl Answer {
                 metadata_blank_node("kgf-hydra-object", &mut used),
             ),
         ];
-        let mut triples = Vec::with_capacity(24);
+        // A bundle with memberships publishes the four-position form, and
+        // declares the union as its default graph — under a blank node,
+        // because that is one of the subjects a client reads the declaration
+        // from; the dataset resource itself is not.
+        let graphs = self.target.offers.graphs;
+        if graphs {
+            mappings.push((
+                "graph",
+                SD_GRAPH,
+                metadata_blank_node("kgf-hydra-graph", &mut used),
+            ));
+        }
+        let mut triples = Vec::with_capacity(32);
         triples.push(Triple::new(
             metadata_graph.clone(),
             metadata_iri(FOAF_PRIMARY_TOPIC, "foaf:primaryTopic")?,
@@ -1281,11 +1482,25 @@ impl Answer {
         triples.push(Triple::new(
             search.clone(),
             metadata_iri(HYDRA_TEMPLATE, "hydra:template")?,
-            Literal::new_simple_literal(format!(
-                "{}{{?subject,predicate,object}}",
-                dataset.as_str()
-            )),
+            Literal::new_simple_literal(if graphs {
+                format!("{}{{?subject,predicate,object,graph}}", dataset.as_str())
+            } else {
+                format!("{}{{?subject,predicate,object}}", dataset.as_str())
+            }),
         ));
+        if graphs {
+            let default_dataset = metadata_blank_node("kgf-default-dataset", &mut used);
+            triples.push(Triple::new(
+                dataset.clone(),
+                metadata_iri(SD_DEFAULT_DATASET, "sd:defaultDataset")?,
+                default_dataset.clone(),
+            ));
+            triples.push(Triple::new(
+                default_dataset,
+                metadata_iri(SD_DEFAULT_GRAPH, "sd:defaultGraph")?,
+                metadata_iri(kgf_store::UNION_GRAPH_IRI, "the union graph IRI")?,
+            ));
+        }
         triples.push(Triple::new(
             search.clone(),
             metadata_iri(
@@ -1431,6 +1646,21 @@ fn id_patterns_overlap(left: IdPattern, right: IdPattern) -> bool {
         && compatible(left.object, right.object)
 }
 
+/// A data statement's graph name, as an RDF term.
+///
+/// Separate from [`metadata_iri`] because the value is a graph of the bundle
+/// or the one the request scoped to, so a failure is about the data rather
+/// than about the page's description of itself, and the message has to say so.
+fn rdf_graph_name(value: &str) -> Result<NamedNode, Problem> {
+    NamedNode::new(value).map_err(|error| {
+        tracing::error!(%error, value, "a graph name is not an IRI");
+        Problem::new(
+            ErrorCode::InternalError,
+            "a graph name could not be represented as RDF",
+        )
+    })
+}
+
 fn metadata_iri(value: &str, what: &'static str) -> Result<NamedNode, Problem> {
     NamedNode::new(value).map_err(|error| {
         tracing::error!(%error, value, what, "could not construct fragment metadata IRI");
@@ -1461,6 +1691,8 @@ pub struct CountAnswer {
     dataset: String,
     version: String,
     pattern: Pattern,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    g: Option<String>,
     count: Cardinality,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     absent_terms: Vec<AbsentTerm>,
@@ -1495,6 +1727,12 @@ pub struct BindingCountAnswer {
     dataset: String,
     version: String,
     pattern: BindingPattern,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    g: Option<String>,
+    /// The scope named a graph this bundle does not hold, which is why every
+    /// count is zero.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    absent_terms: Vec<AbsentTerm>,
     counts: Vec<PerBindingCount>,
     #[serde(flatten)]
     completeness: Completeness,
@@ -1626,6 +1864,96 @@ impl Serialize for SearchEvidence {
             _ => map.serialize_entry("literal", self.literal.as_ref())?,
         }
         map.end()
+    }
+}
+
+/// One graph of a `/graphs` listing.
+#[derive(Debug)]
+struct GraphEntry {
+    published: Rc<str>,
+    count: u64,
+    /// The component this graph holds, when the manifest says one does. It is
+    /// the graph's stable handle: a consumer keyed on the component id follows
+    /// an upstream rename of the IRI, and it is what `/schema` describes this
+    /// graph under.
+    component: Option<Rc<str>>,
+    /// The `view=` this graph is described under, when the bundle describes it.
+    /// Absent where it does not: describing each graph is a build choice, and
+    /// a page offers only the link it can honour.
+    view: Option<String>,
+    serialized: u64,
+}
+
+impl GraphEntry {
+    fn new(
+        published: Rc<str>,
+        term: u64,
+        count: u64,
+        component: Option<Rc<str>>,
+        view: Option<String>,
+    ) -> Self {
+        let component_bytes = component
+            .as_deref()
+            .map_or(0, |id| serialized_bytes(&Term::Iri(Cow::Borrowed(id))));
+        let serialized = serialized_object([
+            (GRAPH, term),
+            ("count", count.to_string().len() as u64),
+            ("component", component_bytes),
+        ]);
+        Self {
+            published,
+            count,
+            component,
+            view,
+            serialized,
+        }
+    }
+}
+
+impl Serialize for GraphEntry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2 + usize::from(self.component.is_some())))?;
+        map.serialize_entry(GRAPH, &Term::from_dictionary(&self.published))?;
+        map.serialize_entry("count", &self.count)?;
+        if let Some(component) = &self.component {
+            map.serialize_entry("component", component.as_ref())?;
+        }
+        map.end()
+    }
+}
+
+/// `GET /graphs`' page of the bundle's graphs.
+#[derive(Debug, Serialize)]
+pub struct GraphsAnswer {
+    dataset: String,
+    version: String,
+    /// Distinct triples: what the union counts.
+    triples: u64,
+    /// Memberships over every graph: what the quad view counts. At least
+    /// `triples`, and equal to it only when no triple is in two graphs.
+    memberships: u64,
+    /// The graphs listed across every page: the named graphs, plus the
+    /// unnamed graph when it holds any triple.
+    cardinality: Cardinality,
+    graphs: Vec<GraphEntry>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+    #[serde(skip)]
+    blank_nodes: SkolemScope,
+}
+
+impl Renders for GraphsAnswer {
+    fn render(self, representation: Representation) -> Result<Rendered, Problem> {
+        let body = standard_body(&self, representation);
+        let rows = Some(self.graphs.len() as u64);
+        Ok(Rendered {
+            body,
+            completeness: self.completeness,
+            rows,
+            cardinality: Some(self.cardinality),
+        })
     }
 }
 
@@ -2122,6 +2450,9 @@ pub struct SchemaNavigationAnswer {
     dataset: String,
     version: String,
     view: String,
+    /// The views this bundle published, for the page's own navigation.
+    #[serde(skip)]
+    views: Vec<String>,
     selector: SchemaSelectorResource,
     node: Option<SchemaResource>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2150,6 +2481,9 @@ pub struct SchemaRelationsAnswer {
     dataset: String,
     version: String,
     view: String,
+    /// The views this bundle published, for the page's own navigation.
+    #[serde(skip)]
+    views: Vec<String>,
     projection: &'static str,
     filters: SchemaProjectionFilters,
     order: SchemaProjectionOrder,
@@ -2175,6 +2509,9 @@ pub struct SchemaClassPropertiesAnswer {
     dataset: String,
     version: String,
     view: String,
+    /// The views this bundle published, for the page's own navigation.
+    #[serde(skip)]
+    views: Vec<String>,
     projection: &'static str,
     filters: SchemaProjectionFilters,
     order: SchemaProjectionOrder,
@@ -2582,6 +2919,18 @@ struct SummaryCard {
     top_properties: Vec<SummaryProperty>,
     #[serde(default)]
     leading_class_relations: Vec<SummaryRelation>,
+    /// Every graph the dataset holds, on a bundle that carries memberships.
+    #[serde(default)]
+    graphs: Vec<SummaryGraph>,
+}
+
+/// One graph of the dataset, with the counts it publishes for itself.
+#[derive(Debug, Deserialize)]
+struct SummaryGraph {
+    graph: String,
+    counts: SummaryCounts,
+    #[serde(default)]
+    links: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2690,6 +3039,38 @@ impl SummaryResource {
                 ]
             })
             .collect();
+        // Both ways in, because they answer different questions: the name
+        // links to the graph's triples and the last cell to its description.
+        // No other page leads to one graph's description.
+        let graph_cells: Vec<_> = card
+            .graphs
+            .iter()
+            .map(|entry| {
+                [
+                    summary_iri_cell(
+                        &self.target,
+                        &entry.graph,
+                        entry.links.get("fragment").cloned(),
+                    ),
+                    Cell::link("schema", entry.links.get("schema").cloned()),
+                ]
+            })
+            .collect();
+        let graph_rows: Vec<_> = card
+            .graphs
+            .iter()
+            .zip(&graph_cells)
+            .map(|(entry, cells)| {
+                vec![
+                    cells[0].value(),
+                    Value::Number(entry.counts.triples),
+                    Value::Number(entry.counts.subjects),
+                    Value::Number(entry.counts.predicates),
+                    Value::Number(entry.counts.objects),
+                    cells[1].value(),
+                ]
+            })
+            .collect();
         let title = card.dataset.title.as_deref().unwrap_or(&card.dataset.id);
         operation_page(
             &self.target.mount,
@@ -2727,6 +3108,22 @@ impl SummaryResource {
                         (table(&["Property", "Triples"], &property_rows))
                     }
                 }
+                @if !graph_rows.is_empty() {
+                    section."section-block" {
+                        h2 { "Named graphs" }
+                        (note(
+                            "The largest graphs of this dataset, with the counts each \
+                             publishes for itself: a triple in two graphs is counted by \
+                             both, so these can sum to more than the dataset's. Each \
+                             name links to that graph's triples, and its schema to the \
+                             description of that graph alone."
+                        ))
+                        (results_table(
+                            &["Graph", "Triples", "Subjects", "Predicates", "Objects", ""],
+                            &graph_rows,
+                        ))
+                    }
+                }
                 section."section-block" {
                     h2 { "Leading typed class relations" }
                     (note(
@@ -2740,6 +3137,35 @@ impl SummaryResource {
                 }
             },
         )
+    }
+}
+
+/// The other views of this dataset, with the current one marked.
+///
+/// A view is one part of the dataset described on its own: a declared
+/// component, a named graph, or the `design` and `queryable` readings of the
+/// whole. Which one a reader wants depends on what they came to find out, and
+/// a KG that publishes both its own encoding and a projection of it has no
+/// single answer, so the page offers them all rather than leaving a reader to
+/// edit the parameter. Switching returns to that view's overview, because a
+/// class selected in one view need not exist in another.
+fn schema_views(target: &Target, views: &[String], current: &str) -> maud::Markup {
+    html! {
+        @if views.len() > 1 {
+            nav."schema-views" aria-label="Description views" {
+                ul {
+                    @for view in views {
+                        li {
+                            @if view == current {
+                                strong."current" { (view) }
+                            } @else {
+                                a href=(target.ask("schema", "view", view)) { (view) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2863,8 +3289,7 @@ pub fn void(
         .map_err(|error| unreadable("reading the VoID graph", &error))?;
     let total = selection.count().value;
     let dictionary = description.dict();
-    let data_dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *data_dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let prefixes = &[("kgfbn", blank_nodes.iri_prefix())];
 
     let (body, emitted, complete) = match representation {
@@ -3127,6 +3552,11 @@ pub fn schema(
             "this bundle does not carry the complete tier-1 description artifact set needed by `/schema`",
         )
     })?;
+    // The views this bundle published, so a page can offer the others.
+    let views: Vec<String> = description
+        .views()
+        .map(|view| view.manifest_key().into_owned())
+        .collect();
     let view = description
         .view(&request.view)
         .ok_or_else(|| match &request.view {
@@ -3136,6 +3566,38 @@ pub fn schema(
                     "this bundle has no description view for component `{}`",
                     component.as_str()
                 ),
+            ),
+            // A graph the bundle does not describe: it holds no such graph,
+            // it holds no graphs at all, or it describes fewer than it holds.
+            // `/graphs` says which it has — but only where there are any, so a
+            // bundle without memberships says that rather than naming a route
+            // that would answer 501.
+            StatsView::Graph(graph) => Problem::new(
+                ErrorCode::NotFound,
+                match (
+                    target.component_of_graph(graph.as_str()),
+                    store.graphs().is_some(),
+                ) {
+                    // A graph a component claims is described under the
+                    // component's id, which is the stable handle for it.
+                    (Some(component), _) => format!(
+                        "graph `{}` holds component `{}` and is described under it; ask for \
+                         `view=component:{}`",
+                        graph.as_str(),
+                        component.id,
+                        component.id
+                    ),
+                    (None, true) => format!(
+                        "this bundle has no description view for graph `{}`; `/graphs` lists \
+                         the graphs it holds, which can be more than it describes",
+                        graph.as_str()
+                    ),
+                    (None, false) => format!(
+                        "this bundle carries no named graphs, so it has no description view \
+                         for `{}`",
+                        graph.as_str()
+                    ),
+                },
             ),
             StatsView::Design | StatsView::Queryable => {
                 tracing::error!(?request.view, "a tier-1 description is missing a required view");
@@ -3166,6 +3628,7 @@ pub fn schema(
                 dataset: target.id.dataset.clone(),
                 version: target.id.version.clone(),
                 view: schema_view_name(&request.view),
+                views,
                 selector: selection_resource(selection),
                 node,
                 collection: None,
@@ -3179,11 +3642,13 @@ pub fn schema(
             }))
         }
         SchemaQuery::Children(children) => {
-            schema_children(description, view, target, request, children)
+            schema_children(description, view, target, request, children, views)
         }
-        SchemaQuery::ClassRelations(filter) => schema_relations(view, target, request, filter),
+        SchemaQuery::ClassRelations(filter) => {
+            schema_relations(view, target, request, filter, views)
+        }
         SchemaQuery::ClassProperties(filter) => {
-            schema_class_properties(view, target, request, filter)
+            schema_class_properties(view, target, request, filter, views)
         }
     }
 }
@@ -3194,6 +3659,7 @@ fn schema_children(
     target: Target,
     request: &request::Schema,
     children: &SchemaChildren,
+    views: Vec<String>,
 ) -> Result<SchemaAnswer, Problem> {
     let from = request.cursor.as_ref().map_or(0, |cursor| cursor.position);
     let limit = nonzero_schema_limit(request.limit.expect("children carry a page limit"));
@@ -3240,6 +3706,7 @@ fn schema_children(
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
         view: schema_view_name(&request.view),
+        views,
         selector: child_parent_selection_resource(children),
         node,
         collection: Some(SchemaCollectionResource {
@@ -3315,6 +3782,7 @@ fn schema_relations(
     target: Target,
     request: &request::Schema,
     filter: &request::SchemaRelationFilter,
+    views: Vec<String>,
 ) -> Result<SchemaAnswer, Problem> {
     let from = match request.cursor.as_ref() {
         None => None,
@@ -3352,6 +3820,7 @@ fn schema_relations(
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
         view: schema_view_name(&request.view),
+        views,
         projection: "class-relations",
         filters: projection_filters(&filter.class, &filter.predicate),
         order: CLASS_RELATION_ORDER,
@@ -3370,6 +3839,7 @@ fn schema_class_properties(
     target: Target,
     request: &request::Schema,
     filter: &request::SchemaClassPropertyFilter,
+    views: Vec<String>,
 ) -> Result<SchemaAnswer, Problem> {
     let from = match request.cursor.as_ref() {
         None => None,
@@ -3408,6 +3878,7 @@ fn schema_class_properties(
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
         view: schema_view_name(&request.view),
+        views,
         projection: "class-properties",
         filters: projection_filters(&filter.class, &filter.predicate),
         order: CLASS_PROPERTY_ORDER,
@@ -3549,11 +4020,7 @@ fn selector_term(bound: &BoundTerm) -> SchemaTerm {
 }
 
 fn schema_view_name(view: &StatsView) -> String {
-    match view {
-        StatsView::Design => "design".to_owned(),
-        StatsView::Queryable => "queryable".to_owned(),
-        StatsView::Component(component) => format!("component:{}", component.as_str()),
-    }
+    view.manifest_key().into_owned()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3766,11 +4233,12 @@ pub fn fragment(
     request: &request::Fragment,
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let echo = Echo::Fragment {
         pattern: request.pattern.clone(),
+        g: request.graph.requested().map(str::to_owned),
     };
-    let vars = request.pattern.vars();
+    let vars = Vars::new(request.pattern.vars(), request.graph.is_quad_view());
 
     let paging = Paging {
         cursor: request.cursor.as_ref(),
@@ -3785,6 +4253,7 @@ pub fn fragment(
         bindings: false,
         absent_terms: Vec::new(),
         blank_nodes,
+        tagging: GraphTagging::for_scope(&request.graph),
     };
 
     match (
@@ -3792,7 +4261,7 @@ pub fn fragment(
         request.pattern.text(),
     ) {
         (Resolved::Absent(absent), _) => paged(
-            &dictionary,
+            store,
             target,
             Envelope {
                 absent_terms: absent,
@@ -3801,13 +4270,27 @@ pub fn fragment(
             Vec::new(),
             paging,
         ),
-        (Resolved::Ids(ids), None) => paged(
-            &dictionary,
-            target,
-            envelope,
-            vec![phase(select(store, ids)?, None)],
-            paging,
-        ),
+        (Resolved::Ids(ids), None) => {
+            match scoped(store, &target, &envelope.blank_nodes, ids, &request.graph)? {
+                Ok(enumeration) => paged(
+                    store,
+                    target,
+                    envelope,
+                    vec![phase(enumeration, None)?],
+                    paging,
+                ),
+                Err(absent) => paged(
+                    store,
+                    target,
+                    Envelope {
+                        absent_terms: vec![absent],
+                        ..envelope
+                    },
+                    Vec::new(),
+                    paging,
+                ),
+            }
+        }
         (Resolved::Ids(ids), Some(filter)) => {
             let searcher = searcher(store, &target)?;
             let found = ranked(
@@ -3819,7 +4302,7 @@ pub fn fragment(
                 paging.want(),
                 request.candidates,
             )?;
-            ranked_page(&dictionary, target, envelope, found, paging)
+            ranked_page(store, target, envelope, found, paging)
         }
     }
 }
@@ -3852,7 +4335,7 @@ pub fn count(
     request: &request::Count,
 ) -> Result<CountAnswer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     if request.cursor.is_some() && request.pattern.text().is_none() {
         // Parsing enforces this too; keep the operation correct for callers
         // constructing the public request type directly.
@@ -3864,12 +4347,23 @@ pub fn count(
     ) {
         // Exact and free of the enumeration: a range width after bounded
         // descent for seven shapes, and for `s ? o` the same bounded
-        // predicate-group probe the enumeration would run.
-        (Resolved::Ids(ids), None) => (
-            Cardinality::exact(select(store, ids)?.count().value),
-            Completeness::complete(),
-            Vec::new(),
-        ),
+        // predicate-group probe the enumeration would run. Scoped to a
+        // graph, two ranks over its layer; in the quad view, the memberships
+        // of the range.
+        (Resolved::Ids(ids), None) => {
+            match scoped(store, &target, &blank_nodes, ids, &request.graph)? {
+                Ok(enumeration) => (
+                    Cardinality::exact(enumeration.count()?),
+                    Completeness::complete(),
+                    Vec::new(),
+                ),
+                Err(absent) => (
+                    Cardinality::exact(0),
+                    Completeness::complete(),
+                    vec![absent],
+                ),
+            }
+        }
         (Resolved::Absent(_), Some(_)) if request.cursor.is_some() => {
             return Err(Problem::from(StaleCursor));
         }
@@ -3891,6 +4385,7 @@ pub fn count(
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
         pattern: request.pattern.clone(),
+        g: request.graph.requested().map(str::to_owned),
         count,
         absent_terms,
         completeness,
@@ -3905,7 +4400,7 @@ pub fn binding_fragment(
     request: &request::BindingFragment,
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let mut cache = LookupCache::new(dictionary, blank_nodes.clone());
     let mut restrictions = Vec::new();
     for row in request.rows() {
@@ -3918,23 +4413,33 @@ pub fn binding_fragment(
         normalize_rdf_restrictions(&mut restrictions);
     }
 
+    // A graph this bundle does not hold empties every row at once.
+    let scope = Scope::resolve(store, &target, &blank_nodes, &request.graph)?;
     let mut phases = Vec::with_capacity(restrictions.len());
     let mut restriction_counts = Vec::with_capacity(restrictions.len());
-    for (row_index, ids) in restrictions.iter().copied() {
-        let selection = select(store, ids)?;
-        restriction_counts.push((ids, selection.count().value));
-        phases.push(binding_phase(selection, row_index));
-    }
+    let absent_graph = match &scope {
+        Ok(scope) => {
+            for (row_index, ids) in restrictions.iter().copied() {
+                let phase = binding_phase(scope.enumerate(select(store, ids)?)?, row_index)?;
+                restriction_counts.push((ids, phase.count));
+                phases.push(phase);
+            }
+            None
+        }
+        Err(absent) => Some(*absent),
+    };
 
     let envelope = Envelope {
         echo: Echo::BindingsFragment {
             pattern: request.pattern.clone(),
+            g: request.graph.requested().map(str::to_owned),
         },
-        vars: request.pattern.vars(),
+        vars: Vars::new(request.pattern.vars(), request.graph.is_quad_view()),
         directed: false,
         bindings: true,
-        absent_terms: Vec::new(),
+        absent_terms: absent_graph.into_iter().collect(),
         blank_nodes,
+        tagging: GraphTagging::for_scope(&request.graph),
     };
     let paging = Paging {
         cursor: request.cursor.as_ref(),
@@ -3943,13 +4448,17 @@ pub fn binding_fragment(
         binding: &request.binding,
     };
     if !request.distinct_rdf() {
-        return paged(&dictionary, target, envelope, phases, paging);
+        return paged(store, target, envelope, phases, paging);
     }
 
     let base_pattern = resolve_binding_pattern(&mut cache, &request.pattern)?;
-    let rdf_cardinality = rdf_projection_cardinality(store, base_pattern, &restriction_counts)?;
+    // Reached only with rows to count, which an absent graph cannot produce.
+    let rdf_cardinality = match &scope {
+        Ok(scope) => rdf_projection_cardinality(store, scope, base_pattern, &restriction_counts)?,
+        Err(_) => Cardinality::exact(0),
+    };
     let mut answer = paged_distinct_bindings(
-        &dictionary,
+        store,
         target,
         envelope,
         phases,
@@ -3968,26 +4477,133 @@ pub fn binding_count(
     request: &request::BindingCount,
 ) -> Result<BindingCountAnswer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
-    let mut cache = LookupCache::new(dictionary, blank_nodes);
+    let blank_nodes = SkolemScope::of(store);
+    let mut cache = LookupCache::new(dictionary, blank_nodes.clone());
+    // A graph this bundle does not hold makes every row zero, and the answer
+    // says so rather than letting a client read the zeros as data.
+    let scope = Scope::resolve(store, &target, &blank_nodes, &request.graph)?;
     let mut counts = Vec::new();
     for row in request.rows() {
-        let value = match resolve_binding(&mut cache, row)? {
-            Some(ids) => select(store, ids)?.count().value,
-            None => 0,
+        let value = match (&scope, resolve_binding(&mut cache, row)?) {
+            (Ok(scope), Some(ids)) => scope.enumerate(select(store, ids)?)?.count()?,
+            _ => 0,
         };
         counts.push(PerBindingCount {
             binding: row.index(),
             count: Cardinality::exact(value),
         });
     }
+    let absent_graph = scope.err();
     Ok(BindingCountAnswer {
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
         pattern: request.pattern.clone(),
+        g: request.graph.requested().map(str::to_owned),
+        absent_terms: absent_graph.into_iter().collect(),
         counts,
         completeness: Completeness::complete(),
         target,
+    })
+}
+
+/// `GET /graphs` — every graph with its membership count, paged by graph id.
+///
+/// One directory entry and one dictionary lookup per graph listed: a layer's
+/// count is a field of its entry, and its name is a term of the sidecar's own
+/// PFC section. A graph named by a blank node costs two more lookups at most,
+/// in the data's dictionary, to publish the node under the IRI it has there
+/// when it has one. The unnamed graph is listed first, under its reserved name, and
+/// only when it holds a triple; the named graphs follow in the sidecar's
+/// dictionary order. The cursor is the next id to list, so a page resumes by
+/// arithmetic rather than by search.
+pub fn graphs_list(
+    store: &Store,
+    target: Target,
+    request: &request::GraphList,
+) -> Result<GraphsAnswer, Problem> {
+    let dictionary = store.dict();
+    let blank_nodes = SkolemScope::of(store);
+    let graphs = graphs(store, &target)?;
+    let facts = graphs.facts();
+    let unnamed_count = graphs
+        .count(GraphId::UNNAMED)
+        .map_err(|error| unreadable("reading the unnamed graph's count", &error))?;
+    let listed = facts.named_graphs + u64::from(unnamed_count > 0);
+
+    // The first id to list: after the cursor, or the unnamed graph — skipped
+    // when empty, so an empty unnamed graph never appears under its name.
+    let mut next = match &request.cursor {
+        None => 0,
+        Some(cursor) => {
+            if cursor.position == 0 || cursor.position > facts.named_graphs {
+                return Err(Problem::from(StaleCursor));
+            }
+            cursor.position
+        }
+    };
+    if next == 0 && unnamed_count == 0 {
+        next = 1;
+    }
+
+    let mut names = GraphNames::new(dictionary, &blank_nodes);
+    let mut rows = Vec::with_capacity(request.limit as usize);
+    let mut spent = 0u64;
+    let mut stop = None;
+    while next <= facts.named_graphs {
+        if rows.len() >= request.limit as usize {
+            stop = Some(Completeness::page_limit(
+                Cursor::at_graph(&request.binding, next).encode(),
+            ));
+            break;
+        }
+        let id = GraphId(next);
+        let count = if id.is_unnamed() {
+            unnamed_count
+        } else {
+            graphs
+                .count(id)
+                .map_err(|error| unreadable("reading a graph's count", &error))?
+        };
+        let (published, term) = names.measured(graphs, id)?;
+        let claimed = target.component_of_graph(&published);
+        // The view this graph is described under, offered only where the
+        // bundle really carries it.
+        let view = match claimed {
+            Some(component) => kgf_store::StatsView::component(component.id.clone()),
+            None => kgf_store::StatsView::graph(published.as_ref()),
+        }
+        .filter(|view| {
+            store
+                .description()
+                .is_some_and(|description| description.view(view).is_some())
+        })
+        .map(|view| view.manifest_key().into_owned());
+        let component = claimed.map(|component| Rc::from(component.id.as_str()));
+        let row = GraphEntry::new(published, term, count, component, view);
+        spent = spent.saturating_add(row.serialized);
+        // Never on the first row, for the reason every page keeps its first
+        // row: a page that carries nothing would resume where it was issued.
+        if spent > request.bytes.0 && !rows.is_empty() {
+            stop = Some(Completeness::budget_exhausted(
+                BudgetReason::ResponseBytes,
+                Cursor::at_graph(&request.binding, next).encode(),
+            ));
+            break;
+        }
+        rows.push(row);
+        next += 1;
+    }
+
+    Ok(GraphsAnswer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        triples: facts.triples,
+        memberships: facts.memberships,
+        cardinality: Cardinality::exact(listed),
+        graphs: rows,
+        completeness: stop.unwrap_or_else(Completeness::complete),
+        target,
+        blank_nodes,
     })
 }
 
@@ -3999,7 +4615,7 @@ pub fn search(
     request: &request::Search,
 ) -> Result<SearchAnswer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let searcher = searcher(store, &target)?;
     let found = searcher
         .search_up_to(
@@ -4236,7 +4852,7 @@ pub fn labels(
     request: &request::Labels,
 ) -> Result<LabelsAnswer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let label_predicates = resolve_predicate_ids(&dictionary, &request.label_predicates)?;
     let mut cache = TermCache::new();
     let mut resolved_labels: HashMap<String, Option<String>> = HashMap::new();
@@ -4344,7 +4960,7 @@ pub fn terms(
         }
     };
 
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let label_predicates = resolve_predicate_ids(&dictionary, &request.label_predicates)?;
     let mut cache = TermCache::new();
     let mut published = PublishedTerms::new(blank_nodes.clone());
@@ -4601,7 +5217,7 @@ pub fn describe(
     request: &request::Describe,
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let echo = Echo::Describe {
         resource: request.resource.requested().to_owned(),
         direction: request.direction,
@@ -4620,7 +5236,10 @@ pub fn describe(
                 object: None,
             },
         )?;
-        phases.push(phase(selection, Some(Direction::Out)));
+        phases.push(phase(
+            Enumeration::Triples(selection),
+            Some(Direction::Out),
+        )?);
     }
     if request.direction.walks_in()
         && let Some(object) =
@@ -4634,7 +5253,7 @@ pub fn describe(
                 object: Some(object),
             },
         )?;
-        phases.push(phase(selection, Some(Direction::In)));
+        phases.push(phase(Enumeration::Triples(selection), Some(Direction::In))?);
     }
     // Absent in the sense that matters for *this* request: the bundle holds no
     // term that could match it in any of the roles the direction walks.
@@ -4645,7 +5264,7 @@ pub fn describe(
     };
 
     let mut answer = paged(
-        &dictionary,
+        store,
         target,
         Envelope {
             echo,
@@ -4653,11 +5272,12 @@ pub fn describe(
             // is no single bound position — and a row shape that changed with
             // `direction` would make the wrapper harder to consume than the
             // `/fragment` it wraps.
-            vars: Position::ALL.to_vec(),
+            vars: Vars::new(Position::ALL.to_vec(), false),
             directed: true,
             bindings: false,
             absent_terms,
             blank_nodes,
+            tagging: GraphTagging::Untagged,
         },
         phases,
         Paging {
@@ -4674,13 +5294,13 @@ pub fn describe(
 /// `GET /sample` — pseudo-random members of a pattern's results.
 pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Result<Answer, Problem> {
     let dictionary = store.dict();
-    let blank_nodes = SkolemScope::new(store.hdt_identity_digest(), *dictionary.counts());
+    let blank_nodes = SkolemScope::of(store);
     let echo = Echo::Sample {
         pattern: request.pattern.clone(),
         n: request.n,
         seed: request.seed,
     };
-    let vars = request.pattern.vars();
+    let vars = Vars::new(request.pattern.vars(), false);
 
     let (count, triples, absent_terms) = match resolve(&dictionary, &blank_nodes, &request.pattern)?
     {
@@ -4695,6 +5315,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         .into_iter()
         .map(|triple| Step {
             triple,
+            graph: None,
             // A sample never pages, so nothing reads these.
             space: PositionSpace::Spo,
             resume: 0,
@@ -4705,7 +5326,14 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         })
         .collect();
 
-    let (rows, spent_at) = materialize(&dictionary, &blank_nodes, &vars, &steps, request.bytes)?;
+    let (rows, spent_at) = materialize(
+        &dictionary,
+        &blank_nodes,
+        None,
+        &vars,
+        &steps,
+        request.bytes,
+    )?;
     Ok(Answer {
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
@@ -4737,6 +5365,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         blank_nodes,
         page_labels: HashMap::new(),
         described: None,
+        tagging: GraphTagging::Untagged,
     })
 }
 
@@ -4746,30 +5375,336 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
 
 /// One enumeration a paged operation walks.
 struct Phase<'a> {
-    selection: Selection<'a>,
+    enumeration: Enumeration<'a>,
     space: PositionSpace,
+    /// The cardinality this phase contributes: triples, or memberships in the
+    /// quad view.
     count: u64,
+    /// The triples this phase enumerates, which is what a resume offset is
+    /// checked against — one triple carries several quad-view rows.
+    triples: u64,
     binding_index: Option<u32>,
     direction: Option<Direction>,
 }
 
-fn phase(selection: Selection<'_>, direction: Option<Direction>) -> Phase<'_> {
-    Phase {
-        space: PositionSpace::of(&selection),
-        count: selection.count().value,
-        selection,
-        binding_index: None,
-        direction,
+/// What a phase enumerates: the union, one graph, or every membership.
+///
+/// All three read the pattern's own permutation and share its cursor
+/// positions; the quad view adds one row per graph a triple belongs to and a
+/// second number, the memberships of the current triple already delivered,
+/// to resume inside that run.
+enum Enumeration<'a> {
+    Triples(Selection<'a>),
+    Scoped(ScopedSelection<'a>),
+    Quads(QuadSelection<'a>),
+}
+
+/// One row of an enumeration, before its resume position is assigned.
+struct EnumeratedRow {
+    triple: IdTriple,
+    /// The graph, in the quad view.
+    graph: Option<GraphId>,
+    /// The quad view's index of this row among its triple's memberships.
+    delivered: Option<u64>,
+}
+
+impl<'a> Enumeration<'a> {
+    fn space(&self) -> PositionSpace {
+        match self {
+            Self::Triples(selection) => PositionSpace::of(selection),
+            Self::Scoped(scoped) => PositionSpace::of_parts(
+                scoped.permutation(),
+                scoped.subject_object_route().is_some(),
+            ),
+            Self::Quads(quads) => {
+                PositionSpace::of_parts(quads.permutation(), quads.subject_object_route().is_some())
+            }
+        }
+    }
+
+    fn count(&self) -> Result<u64, Problem> {
+        match self {
+            Self::Triples(selection) => Ok(selection.count().value),
+            Self::Scoped(scoped) => scoped
+                .count()
+                .map_err(|error| unreadable("counting a graph's triples", &error)),
+            Self::Quads(quads) => quads
+                .count()
+                .map_err(|error| unreadable("counting memberships", &error)),
+        }
+    }
+
+    fn is_quad_view(&self) -> bool {
+        matches!(self, Self::Quads(_))
+    }
+
+    /// Rows from `from` — an offset or the last predicate id — skipping the
+    /// first `skip` memberships of the first triple in the quad view.
+    fn rows(
+        &'a self,
+        from: u64,
+        skip: u64,
+    ) -> Box<dyn Iterator<Item = Result<EnumeratedRow, Problem>> + 'a> {
+        match self {
+            Self::Triples(selection) => Box::new(selection.page(from, usize::MAX).map(|triple| {
+                Ok(EnumeratedRow {
+                    triple,
+                    graph: None,
+                    delivered: None,
+                })
+            })),
+            Self::Scoped(scoped) => Box::new(scoped.page(from, usize::MAX).map(|row| {
+                row.map(|triple| EnumeratedRow {
+                    triple,
+                    graph: None,
+                    delivered: None,
+                })
+                .map_err(|error| unreadable("enumerating a graph's triples", &error))
+            })),
+            Self::Quads(quads) => Box::new(quads.page(from, skip, usize::MAX).map(|row| {
+                row.map(|row| EnumeratedRow {
+                    triple: row.triple,
+                    graph: Some(row.graph),
+                    delivered: Some(row.delivered),
+                })
+                .map_err(|error| unreadable("enumerating memberships", &error))
+            })),
+        }
     }
 }
 
-fn binding_phase(selection: Selection<'_>, binding_index: u32) -> Phase<'_> {
-    Phase {
-        space: PositionSpace::of(&selection),
-        count: selection.count().value,
-        selection,
+fn phase(enumeration: Enumeration<'_>, direction: Option<Direction>) -> Result<Phase<'_>, Problem> {
+    // Counted once. The quad view's two numbers differ and it holds both
+    // already; everywhere else the triples *are* the rows, and counting a
+    // scoped selection twice would pay for its ranks twice.
+    let count = enumeration.count()?;
+    let triples = match &enumeration {
+        Enumeration::Quads(quads) => quads.triples(),
+        Enumeration::Triples(_) | Enumeration::Scoped(_) => count,
+    };
+    Ok(Phase {
+        space: enumeration.space(),
+        count,
+        triples,
+        enumeration,
+        binding_index: None,
+        direction,
+    })
+}
+
+fn binding_phase(enumeration: Enumeration<'_>, binding_index: u32) -> Result<Phase<'_>, Problem> {
+    Ok(Phase {
         binding_index: Some(binding_index),
-        direction: None,
+        ..phase(enumeration, None)?
+    })
+}
+
+/// The graph memberships, or the 501 that says this bundle has none.
+///
+/// Reached only for a scope that needs the sidecar, and only after the
+/// handler has checked the manifest declares `graphs` — the second half of one
+/// condition, as for the text index.
+fn graphs<'a>(store: &'a Store, target: &Target) -> Result<&'a Graphs, Problem> {
+    store.graphs().ok_or_else(|| {
+        tracing::error!(
+            dataset = %target.id.dataset,
+            version = %target.id.version,
+            "a bundle declaring `graphs` has no membership sidecar",
+        );
+        Problem::new(
+            ErrorCode::CapabilityNotAvailable,
+            "this bundle declares `graphs` but carries no membership sidecar",
+        )
+    })
+}
+
+/// A request's graph scope, resolved against this bundle once.
+///
+/// The lookup belongs to the request rather than to the pattern it scopes: a
+/// bindings request enumerates one pattern per input row under one scope, and
+/// resolving per row would read the sidecar's dictionary again for every row
+/// to arrive at the same layer.
+enum Scope<'a> {
+    /// Every triple once: the union, and the unnamed graph of a bundle whose
+    /// triples are all unnamed.
+    Union,
+    /// One layer's triples.
+    Layer(&'a Graphs, GraphId),
+    /// One row per membership.
+    Quads(&'a Graphs),
+}
+
+impl<'a> Scope<'a> {
+    /// Resolve a request's `g` against this bundle's memberships.
+    ///
+    /// `Err(absent)` is the well-formed request naming a graph this bundle
+    /// does not hold. It is returned rather than carried as a fourth variant
+    /// so that a resolved scope is always one that can enumerate: the empty
+    /// answer is decided once, by the caller, instead of guarded at every
+    /// later use.
+    fn resolve(
+        store: &'a Store,
+        target: &Target,
+        blank_nodes: &SkolemScope,
+        scope: &GraphScope,
+    ) -> Result<Result<Self, AbsentTerm>, Problem> {
+        Ok(Ok(match scope.selector() {
+            GraphSelector::Union => Self::Union,
+            // Without memberships every triple is unnamed, so the unnamed
+            // graph is the union — the same rows, under the name the client
+            // used.
+            GraphSelector::Unnamed => match store.graphs() {
+                None => Self::Union,
+                Some(graphs) => Self::Layer(graphs, GraphId::UNNAMED),
+            },
+            GraphSelector::Named(term) => {
+                let graphs = graphs(store, target)?;
+                match named_layer(&store.dict(), graphs, blank_nodes, term)? {
+                    Some(graph) => Self::Layer(graphs, graph),
+                    None => {
+                        return Ok(Err(AbsentTerm::new(scope.parameter().as_str(), term)));
+                    }
+                }
+            }
+            GraphSelector::All => Self::Quads(graphs(store, target)?),
+        }))
+    }
+
+    /// Enumerate one resolved pattern under this scope.
+    fn enumerate(&self, selection: Selection<'a>) -> Result<Enumeration<'a>, Problem> {
+        Ok(match self {
+            Self::Union => Enumeration::Triples(selection),
+            Self::Layer(graphs, graph) => selection
+                .in_graph(graphs, *graph)
+                .map(Enumeration::Scoped)
+                .map_err(|error| unreadable("opening a graph's layer", &error))?,
+            Self::Quads(graphs) => selection
+                .memberships(graphs)
+                .map(Enumeration::Quads)
+                .map_err(|error| unreadable("preparing the quad view", &error))?,
+        })
+    }
+}
+
+/// The layer a request's graph name selects, or `None` when this bundle holds
+/// no such graph.
+///
+/// A graph whose stored name is a blank node is published under an IRI this
+/// bundle mints (see [`blank_graph_iri`]), and a request may send that IRI
+/// back. Whatever it carries is checked rather than trusted, and each graph is
+/// reachable by exactly the one IRI it is published under: an id out of range
+/// names no graph, and neither does one whose layer carries an ordinary IRI,
+/// because that graph is addressed by the IRI itself — nor a graph-only IRI
+/// for a node that also fills a triple position, because that node is
+/// published under its data IRI.
+fn named_layer(
+    dictionary: &Dictionary<'_>,
+    graphs: &Graphs,
+    blank_nodes: &SkolemScope,
+    term: &BoundTerm,
+) -> Result<Option<GraphId>, Problem> {
+    if let Some(id) = blank_nodes.graph_id(term.dictionary()) {
+        if id.0 == 0 || id.0 > graphs.facts().named_graphs {
+            return Ok(None);
+        }
+        let mut buffer = Vec::new();
+        let stored = graphs
+            .name(id, &mut buffer)
+            .map_err(|error| unreadable("reading a graph's name", &error))?;
+        let graph_only =
+            stored.starts_with(b"_:") && data_blank_node(dictionary, stored)?.is_none();
+        return Ok(graph_only.then_some(id));
+    }
+    // A blank node of the data names a graph when the sidecar holds a graph
+    // by the same label, which is the same node.
+    for role in [Role::Subject, Role::Object] {
+        let Some(id) = reverse_scoped(dictionary, blank_nodes, role, term.dictionary())? else {
+            continue;
+        };
+        let mut buffer = Vec::new();
+        let stored = dictionary
+            .extract(role, TermId(id), &mut buffer)
+            .map_err(|error| unreadable("reversing a blank-node IRI", &error))?;
+        return graphs
+            .resolve(stored)
+            .map_err(|error| unreadable("looking a graph up", &error));
+    }
+    if term.denotes_blank_node() {
+        // `_:label` names nothing outside the document it was parsed from,
+        // in this position as in every other.
+        return Ok(None);
+    }
+    graphs
+        .resolve(term.dictionary().as_bytes())
+        .map_err(|error| unreadable("looking a graph up", &error))
+}
+
+/// The IRI a graph named by a blank node is published under.
+///
+/// One node is one node however many positions it fills: in `_:g <p> <o> _:g`
+/// the graph name and the subject are the same resource, and a statement about
+/// the graph has to join with the graph it describes. So a blank graph name
+/// that occurs in the data is published under the IRI that node gets there, and
+/// only one found nowhere else gets a graph-only IRI of the sidecar's own.
+///
+/// Looking a sidecar label up in the dictionary is a join between two artifacts
+/// of one build, not the inbound `_:label` lookup [`locate`] refuses: hdtc
+/// scopes a document's blank nodes once for every position, so the two files
+/// spell one node alike (`hdtc/docs/graphs-sidecar-format.md` §5). Two
+/// `O(log D)` probes at most, once per distinct graph a page names.
+///
+/// `None` for a graph whose stored name is an ordinary IRI.
+fn blank_graph_iri(
+    dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    graph: GraphId,
+    stored: &str,
+) -> Result<Option<String>, Problem> {
+    if !stored.starts_with("_:") {
+        return Ok(None);
+    }
+    Ok(match data_blank_node(dictionary, stored.as_bytes())? {
+        Some((role, id)) => blank_nodes.iri(role, id, stored),
+        None => blank_nodes.graph_iri(graph),
+    })
+}
+
+/// Where a blank label from the sidecar occurs in the data, if it does.
+///
+/// Subject first, then object: the shared section answers either, and a node
+/// only in one role-specific section is found by that role alone. The IRI
+/// [`SkolemScope::iri`] mints is the same whichever role found it.
+fn data_blank_node(
+    dictionary: &Dictionary<'_>,
+    label: &[u8],
+) -> Result<Option<(Role, TermId)>, Problem> {
+    for role in [Role::Subject, Role::Object] {
+        let found = dictionary
+            .locate(role, label)
+            .map_err(|error| unreadable("looking a blank graph name up in the data", &error))?;
+        if let Some(id) = found {
+            return Ok(Some((role, id)));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve one pattern under a graph scope.
+///
+/// `Err(absent)` is the well-formed request that names a graph this bundle
+/// does not hold — an empty answer that says which parameter, exactly as an
+/// absent term is reported. An operation enumerating many patterns resolves
+/// the scope once with [`Scope::resolve`] instead.
+fn scoped<'a>(
+    store: &'a Store,
+    target: &Target,
+    blank_nodes: &SkolemScope,
+    ids: IdPattern,
+    scope: &GraphScope,
+) -> Result<Result<Enumeration<'a>, AbsentTerm>, Problem> {
+    match Scope::resolve(store, target, blank_nodes, scope)? {
+        Ok(resolved) => Ok(Ok(resolved.enumerate(select(store, ids)?)?)),
+        Err(absent) => Ok(Err(absent)),
     }
 }
 
@@ -4782,11 +5717,15 @@ fn binding_phase(selection: Selection<'_>, binding_index: u32) -> Phase<'_> {
 /// the first one and would be refused as out of range.
 struct Step {
     triple: IdTriple,
+    /// The graph this row's membership is in, in the quad view.
+    graph: Option<GraphId>,
     space: PositionSpace,
     resume: u64,
-    /// The second half of a [`PositionSpace::TextRank`] position: how many of
-    /// this hit's statements come before this row. `None` in every space whose
-    /// position is a single number.
+    /// The second number of a position that needs two: for
+    /// [`PositionSpace::TextRank`], how many of this hit's statements come
+    /// before this row; in the quad view, how many of this triple's
+    /// memberships come before this row. `None` in every space whose position
+    /// is a single number.
     scan: Option<u64>,
     binding_index: Option<u32>,
     direction: Option<Direction>,
@@ -4808,19 +5747,13 @@ struct RowResume {
 
 impl RowResume {
     fn cursor(self, binding: &CursorBinding) -> CursorToken {
-        match self.space {
-            PositionSpace::TextRank => {
-                Cursor::at_rank(binding, self.position, self.scan.unwrap_or(0))
-            }
-            space if self.binding_index.is_some() => Cursor::at_binding(
-                binding,
-                self.binding_index.expect("checked above"),
-                space,
-                self.position,
-            ),
-            space => Cursor::at(binding, space, self.position),
-        }
-        .encode()
+        let mut cursor = Cursor::at(binding, self.space, self.position);
+        cursor.binding_index = self.binding_index;
+        // The trailer means "how far into this position's run" in every space
+        // that has runs: a ranked hit's statements, or a triple's memberships
+        // in the quad view. A space without runs never sets it.
+        cursor.scan_position = self.scan;
+        cursor.encode()
     }
 }
 
@@ -4980,22 +5913,23 @@ fn ranked(
         {
             return Err(Problem::from(StaleCursor));
         }
-        steps.extend(
-            positioned(&selection, space, within)
-                .take(want - steps.len())
-                .map(|(triple, at)| Step {
-                    triple,
-                    space: PositionSpace::TextRank,
-                    resume: rank as u64,
-                    scan: Some(at),
-                    binding_index: None,
-                    direction: None,
-                    ranking: Some(Ranking {
-                        score: hit.score,
-                        kind: match_kind(hit.kind),
-                    }),
+        let enumeration = Enumeration::Triples(selection);
+        for row in positioned(&enumeration, space, within, 0).take(want - steps.len()) {
+            let row = row?;
+            steps.push(Step {
+                triple: row.triple,
+                graph: None,
+                space: PositionSpace::TextRank,
+                resume: rank as u64,
+                scan: Some(row.resume),
+                binding_index: None,
+                direction: None,
+                ranking: Some(Ranking {
+                    score: hit.score,
+                    kind: match_kind(hit.kind),
                 }),
-        );
+            });
+        }
     }
 
     let spent = (steps.len() < want && !found.complete).then_some(Spent::Deepest);
@@ -5224,11 +6158,12 @@ fn select(store: &Store, ids: IdPattern) -> Result<Selection<'_>, Problem> {
 /// The parts of an answer that the enumeration does not produce.
 struct Envelope {
     echo: Echo,
-    vars: Vec<Position>,
+    vars: Vars,
     directed: bool,
     bindings: bool,
     absent_terms: Vec<AbsentTerm>,
     blank_nodes: SkolemScope,
+    tagging: GraphTagging,
 }
 
 /// Where a page starts, how far it may go, and what a cursor out of it binds to.
@@ -5253,19 +6188,20 @@ impl Paging<'_> {
 
 /// Build a page of rows out of `phases`, resuming where `paging` says.
 fn paged(
-    dictionary: &Dictionary<'_>,
+    store: &Store,
     target: Target,
     envelope: Envelope,
     phases: Vec<Phase<'_>>,
     paging: Paging<'_>,
 ) -> Result<Answer, Problem> {
+    let dictionary = store.dict();
     let predicates = dictionary.counts().len(Role::Predicate);
     let steps = walk(&phases, paging.cursor, predicates, paging.want())?;
     // Exact, and known before the walk: a pattern's cardinality is a range
     // width after bounded descent, so the enumeration is not what produces it.
     let cardinality = exact_cardinality_sum(phases.iter().map(|phase| phase.count))?;
 
-    finish(dictionary, target, envelope, steps, paging, None, |_, _| {
+    finish(store, target, envelope, steps, paging, None, |_, _| {
         cardinality
     })
 }
@@ -5274,7 +6210,7 @@ fn paged(
 /// distinct triple union. Filtering happens before the page limit, so overlap
 /// cannot turn a full native page into an empty Hydra page.
 fn paged_distinct_bindings(
-    dictionary: &Dictionary<'_>,
+    store: &Store,
     target: Target,
     envelope: Envelope,
     phases: Vec<Phase<'_>>,
@@ -5282,6 +6218,7 @@ fn paged_distinct_bindings(
     candidates: Candidates,
     paging: Paging<'_>,
 ) -> Result<Answer, Problem> {
+    let dictionary = store.dict();
     let predicates = dictionary.counts().len(Role::Predicate);
     let (steps, spent) = walk_distinct_bindings(
         &phases,
@@ -5292,15 +6229,9 @@ fn paged_distinct_bindings(
         candidates,
     )?;
     let cardinality = exact_cardinality_sum(phases.iter().map(|phase| phase.count))?;
-    finish(
-        dictionary,
-        target,
-        envelope,
-        steps,
-        paging,
-        spent,
-        |_, _| cardinality,
-    )
+    finish(store, target, envelope, steps, paging, spent, |_, _| {
+        cardinality
+    })
 }
 
 /// Sum independently resolved phase cardinalities without letting a valid
@@ -5325,10 +6256,14 @@ fn exact_cardinality_sum(counts: impl IntoIterator<Item = u64>) -> Result<Cardin
 /// others gives the union exactly. Arbitrary partial overlaps would require an
 /// unbounded union enumeration, so report a bounded upper estimate: no larger
 /// than either the relation sum or the base triple pattern containing every
-/// restriction. TPF cardinalities are planning estimates; query correctness
-/// continues to come from paging the distinct projection to exhaustion.
-fn rdf_projection_cardinality(
-    store: &Store,
+/// restriction. That base is counted under the request's own scope, so a quad
+/// view is bounded by its memberships rather than by the smaller number of
+/// distinct triples they belong to. TPF cardinalities are planning estimates;
+/// query correctness continues to come from paging the distinct projection to
+/// exhaustion.
+fn rdf_projection_cardinality<'a>(
+    store: &'a Store,
+    scope: &Scope<'a>,
     base_pattern: Option<IdPattern>,
     restrictions: &[(IdPattern, u64)],
 ) -> Result<Cardinality, Problem> {
@@ -5366,7 +6301,7 @@ fn rdf_projection_cardinality(
             "the RDF fragment cardinality could not be determined",
         ));
     };
-    let base_count = select(store, base_pattern)?.count().value;
+    let base_count = scope.enumerate(select(store, base_pattern)?)?.count()?;
     Ok(Cardinality::estimated(total.min(base_count)))
 }
 
@@ -5377,7 +6312,7 @@ fn rdf_projection_cardinality(
 /// cardinality depend on how the page ended rather than being known before it
 /// started.
 fn ranked_page(
-    dictionary: &Dictionary<'_>,
+    store: &Store,
     target: Target,
     envelope: Envelope,
     found: Ranked,
@@ -5392,7 +6327,7 @@ fn ranked_page(
     let from_start = paging.cursor.is_none();
 
     finish(
-        dictionary,
+        store,
         target,
         envelope,
         steps,
@@ -5419,7 +6354,7 @@ fn ranked_page(
 /// that ran out from the top has enumerated its own answer, and can say so
 /// exactly.
 fn finish(
-    dictionary: &Dictionary<'_>,
+    store: &Store,
     target: Target,
     envelope: Envelope,
     mut steps: Vec<Step>,
@@ -5427,6 +6362,7 @@ fn finish(
     spent: Option<Spent>,
     cardinality: impl FnOnce(&Completeness, &[Row]) -> Cardinality,
 ) -> Result<Answer, Problem> {
+    let dictionary = store.dict();
     // The row this page cannot carry, kept because it is where the next one
     // begins rather than merely because it exists.
     let dropped = (steps.len() == paging.want())
@@ -5440,12 +6376,20 @@ fn finish(
         bindings,
         absent_terms,
         blank_nodes,
+        tagging,
     } = envelope;
 
     // Materializing is where the bytes appear, so it is where the byte budget
     // applies — before the response exists rather than after, which also bounds
     // the memory a page can take.
-    let (rows, spent_at) = materialize(dictionary, &blank_nodes, &vars, &steps, paging.bytes)?;
+    let (rows, spent_at) = materialize(
+        &dictionary,
+        &blank_nodes,
+        store.graphs(),
+        &vars,
+        &steps,
+        paging.bytes,
+    )?;
     let row_resumes = steps[..rows.len()].iter().map(Step::row_resume).collect();
 
     // Whichever bound was reached first names the reason and the resume point.
@@ -5488,6 +6432,7 @@ fn finish(
         blank_nodes,
         page_labels: HashMap::new(),
         described: None,
+        tagging,
     })
 }
 
@@ -5548,7 +6493,7 @@ fn walk(
     predicates: u64,
     want: usize,
 ) -> Result<Vec<Step>, Problem> {
-    let (start, mut from) = walk_start(phases, cursor, predicates)?;
+    let (start, mut from, mut skip) = walk_start(phases, cursor, predicates)?;
 
     let mut steps = Vec::new();
     for phase in &phases[start..] {
@@ -5556,20 +6501,21 @@ fn walk(
             break;
         }
         let remaining = want - steps.len();
-        steps.extend(
-            positioned(&phase.selection, phase.space, from)
-                .take(remaining)
-                .map(|(triple, resume)| Step {
-                    triple,
-                    space: phase.space,
-                    resume,
-                    scan: None,
-                    binding_index: phase.binding_index,
-                    direction: phase.direction,
-                    ranking: None,
-                }),
-        );
+        for row in positioned(&phase.enumeration, phase.space, from, skip).take(remaining) {
+            let row = row?;
+            steps.push(Step {
+                triple: row.triple,
+                graph: row.graph,
+                space: phase.space,
+                resume: row.resume,
+                scan: row.delivered,
+                binding_index: phase.binding_index,
+                direction: phase.direction,
+                ranking: None,
+            });
+        }
         from = 0;
+        skip = 0;
     }
     Ok(steps)
 }
@@ -5585,19 +6531,21 @@ fn walk_distinct_bindings(
     want: usize,
     candidates: Candidates,
 ) -> Result<(Vec<Step>, Option<Spent>), Problem> {
-    let (start, mut from) = walk_start(phases, cursor, predicates)?;
+    let (start, mut from, mut skip) = walk_start(phases, cursor, predicates)?;
     let mut steps = Vec::new();
     let mut examined = 0u64;
     for phase in &phases[start..] {
         let binding_index = phase
             .binding_index
             .expect("a distinct binding walk contains only binding phases");
-        for (triple, resume) in positioned(&phase.selection, phase.space, from) {
+        for row in positioned(&phase.enumeration, phase.space, from, skip) {
+            let row = row?;
             let candidate = Step {
-                triple,
+                triple: row.triple,
+                graph: row.graph,
                 space: phase.space,
-                resume,
-                scan: None,
+                resume: row.resume,
+                scan: row.delivered,
                 binding_index: phase.binding_index,
                 direction: phase.direction,
                 ranking: None,
@@ -5607,7 +6555,7 @@ fn walk_distinct_bindings(
             }
             examined += 1;
             if restrictions.iter().any(|(owner, pattern)| {
-                *owner < binding_index && id_pattern_matches(*pattern, triple)
+                *owner < binding_index && id_pattern_matches(*pattern, row.triple)
             }) {
                 continue;
             }
@@ -5617,6 +6565,7 @@ fn walk_distinct_bindings(
             }
         }
         from = 0;
+        skip = 0;
     }
     Ok((steps, None))
 }
@@ -5625,9 +6574,9 @@ fn walk_start(
     phases: &[Phase<'_>],
     cursor: Option<&Cursor>,
     predicates: u64,
-) -> Result<(usize, u64), Problem> {
+) -> Result<(usize, u64, u64), Problem> {
     match cursor {
-        None => Ok((0, 0)),
+        None => Ok((0, 0, 0)),
         Some(cursor) => {
             let index = phases
                 .iter()
@@ -5635,43 +6584,94 @@ fn walk_start(
                     phase.space == cursor.space && phase.binding_index == cursor.binding_index
                 })
                 .ok_or_else(|| Problem::from(StaleCursor))?;
-            Ok((index, resume_position(cursor, &phases[index], predicates)?))
+            let (from, skip) = resume_position(cursor, &phases[index], predicates)?;
+            Ok((index, from, skip))
         }
     }
 }
 
-/// Pair each triple with the position a page resumes at to return it first.
+/// A row with the position a page resumes at to return it first.
+struct PositionedRow {
+    triple: IdTriple,
+    graph: Option<GraphId>,
+    resume: u64,
+    delivered: Option<u64>,
+}
+
+/// Pair each row with the position a page resumes at to return it first.
 ///
-/// The running position *before* each row, in whichever space this phase counts
-/// in: an offset for the three permutation spaces, and for `s ? o` the previous
-/// row's predicate id — route-independent and strictly
-/// increasing, since one (s, p, o) occurs at most once.
+/// The running position *before* each triple, in whichever space this phase
+/// counts in: an offset for the three permutation spaces, and for `s ? o` the
+/// previous triple's predicate id — route-independent and strictly increasing,
+/// since one (s, p, o) occurs at most once. In the quad view every row of one
+/// triple shares the triple's position; the row's own place in the triple's
+/// run travels beside it.
 fn positioned<'a>(
-    selection: &'a Selection<'a>,
+    enumeration: &'a Enumeration<'a>,
     space: PositionSpace,
     from: u64,
-) -> impl Iterator<Item = (IdTriple, u64)> + 'a {
+    skip: u64,
+) -> impl Iterator<Item = Result<PositionedRow, Problem>> + 'a {
     let mut resume = from;
-    // `usize::MAX` rather than a page size: `Selection::page` is lazy, so the
-    // caller's `take` is what bounds the work, and a multi-phase walk cannot
-    // know its own bound per phase up front.
-    selection.page(from, usize::MAX).map(move |triple| {
-        let at = resume;
-        resume = match space {
-            PositionSpace::Predicate => triple.predicate,
-            _ => resume + 1,
+    let mut current: Option<IdTriple> = None;
+    let mut first = true;
+    // The enumeration is lazy, so the caller's `take` is what bounds the work,
+    // and a multi-phase walk cannot know its own bound per phase up front.
+    let mut rows = enumeration.rows(from, skip);
+    std::iter::from_fn(move || {
+        // The trailer says how many of this triple's memberships the previous
+        // page delivered, and an enumeration clamps one that runs past them:
+        // it either starts the run later than the token names, or — on the
+        // last triple of the enumeration — produces no row at all. Either way
+        // the first row is not the one the token names, and honouring the
+        // token would drop the rest of the triple and call the page complete.
+        let Some(row) = rows.next() else {
+            return (std::mem::take(&mut first) && skip > 0)
+                .then(|| Err(Problem::from(StaleCursor)));
         };
-        (triple, at)
+        let row = match row {
+            Ok(row) => row,
+            Err(problem) => return Some(Err(problem)),
+        };
+        if std::mem::take(&mut first) && row.delivered.unwrap_or(0) != skip {
+            return Some(Err(Problem::from(StaleCursor)));
+        }
+        // A new triple, unless this row continues the run the last one was in.
+        // The first triple of a page resumes at `from` itself, which for the
+        // predicate space is the predicate *before* it — what a page that ends
+        // inside this triple's run must carry to start this triple again.
+        if current != Some(row.triple) {
+            if let Some(previous) = current {
+                resume = match space {
+                    PositionSpace::Predicate => previous.predicate,
+                    _ => resume + 1,
+                };
+            }
+            current = Some(row.triple);
+        }
+        Some(Ok(PositionedRow {
+            triple: row.triple,
+            graph: row.graph,
+            resume,
+            delivered: row.delivered,
+        }))
     })
 }
 
-/// Where a cursor resumes this phase, or `stale_cursor`.
-fn resume_position(cursor: &Cursor, phase: &Phase<'_>, predicates: u64) -> Result<u64, Problem> {
+/// Where a cursor resumes this phase — the triple's position, and how many of
+/// its memberships to skip — or `stale_cursor`.
+fn resume_position(
+    cursor: &Cursor,
+    phase: &Phase<'_>,
+    predicates: u64,
+) -> Result<(u64, u64), Problem> {
     let stale = || Problem::from(StaleCursor);
-    // A phase's binding trailer must match it exactly; `scan_position` belongs
-    // to text spaces, which are not phases. Any other shape was not issued by
-    // the request it arrived on.
-    if cursor.binding_index != phase.binding_index || cursor.scan_position.is_some() {
+    // A phase's binding trailer must match it exactly. The run trailer belongs
+    // to the quad view alone here — the text spaces that also use it are not
+    // phases — so a quad-view cursor carries it and no other cursor may.
+    if cursor.binding_index != phase.binding_index
+        || cursor.scan_position.is_some() != phase.enumeration.is_quad_view()
+    {
         return Err(stale());
     }
     // A position past the end would otherwise page to an empty response, which
@@ -5681,11 +6681,17 @@ fn resume_position(cursor: &Cursor, phase: &Phase<'_>, predicates: u64) -> Resul
             (1..=predicates).contains(&cursor.position)
                 // At a binding-row boundary there is no previous predicate;
                 // zero is the sentinel for the first result of the new row.
-                || (cursor.position == 0 && phase.binding_index.is_some())
+                // Nor is there one for a quad-view page that ended inside
+                // the first triple's run, which resumes that triple from the
+                // start of the enumeration and skips the rows it delivered.
+                || (cursor.position == 0
+                    && (phase.binding_index.is_some() || phase.enumeration.is_quad_view()))
         }
-        _ => cursor.position < phase.count,
+        _ => cursor.position < phase.triples,
     };
-    within.then_some(cursor.position).ok_or_else(stale)
+    within
+        .then_some((cursor.position, cursor.scan_position.unwrap_or(0)))
+        .ok_or_else(stale)
 }
 
 /// Turn ids into terms once per distinct term, within
@@ -5722,18 +6728,20 @@ fn resume_position(cursor: &Cursor, phase: &Phase<'_>, predicates: u64) -> Resul
 fn materialize(
     dictionary: &Dictionary<'_>,
     blank_nodes: &SkolemScope,
-    vars: &[Position],
+    graphs: Option<&Graphs>,
+    vars: &Vars,
     steps: &[Step],
     bytes: ResponseBytes,
 ) -> Result<(Vec<Row>, Option<usize>), Problem> {
     let mut cache = TermCache::new();
     let mut published = PublishedTerms::new(blank_nodes.clone());
+    let mut graph_names = GraphNames::new(*dictionary, blank_nodes);
     let mut rows: Vec<Row> = Vec::with_capacity(steps.len());
     let mut spent = 0u64;
     for (index, step) in steps.iter().enumerate() {
-        let mut cells = Vec::with_capacity(vars.len());
+        let mut cells = Vec::with_capacity(vars.positions().len());
         let mut terms = 0u64;
-        for position in vars {
+        for position in vars.positions() {
             let (term, serialized) = published
                 .measured(
                     &mut cache,
@@ -5745,9 +6753,21 @@ fn materialize(
             terms += serialized;
             cells.push((*position, term));
         }
+        let graph = match (vars.has_graph(), step.graph, graphs) {
+            (true, Some(graph), Some(graphs)) => Some(graph_names.measured(graphs, graph)?),
+            (true, _, _) => {
+                tracing::error!("a quad-view row has no graph to report");
+                return Err(Problem::new(
+                    ErrorCode::InternalError,
+                    "the quad view could not name a row's graph",
+                ));
+            }
+            (false, _, _) => None,
+        };
         let row = Row::new(
             cells,
             terms,
+            graph,
             step.binding_index,
             step.direction,
             step.ranking,
@@ -5764,6 +6784,53 @@ fn materialize(
         rows.push(row);
     }
     Ok((rows, None))
+}
+
+/// Graph names as this API publishes them, memoized for one page.
+///
+/// A graph's name is spelled once per distinct graph rather than once per
+/// row: the quad view repeats a handful of graphs down a page. A graph named
+/// by a blank node is published as an IRI this bundle mints, as a data blank
+/// node is, because a `_:` label means nothing outside the document it came
+/// from; see [`blank_graph_iri`].
+struct GraphNames<'a> {
+    dictionary: Dictionary<'a>,
+    blank_nodes: &'a SkolemScope,
+    names: HashMap<GraphId, (Rc<str>, u64)>,
+    buffer: Vec<u8>,
+}
+
+impl<'a> GraphNames<'a> {
+    fn new(dictionary: Dictionary<'a>, blank_nodes: &'a SkolemScope) -> Self {
+        Self {
+            dictionary,
+            blank_nodes,
+            names: HashMap::new(),
+            buffer: Vec::new(),
+        }
+    }
+
+    /// The published spelling, and the bytes its term object takes.
+    fn measured(&mut self, graphs: &Graphs, graph: GraphId) -> Result<(Rc<str>, u64), Problem> {
+        if let Some(found) = self.names.get(&graph) {
+            return Ok(found.clone());
+        }
+        let stored = graphs
+            .name(graph, &mut self.buffer)
+            .map_err(|error| unreadable("reading a graph's name", &error))?;
+        let stored = std::str::from_utf8(stored).map_err(|error| {
+            unreadable("reading a graph's name", &format!("not UTF-8: {error}"))
+        })?;
+        let published: Rc<str> =
+            match blank_graph_iri(&self.dictionary, self.blank_nodes, graph, stored)? {
+                Some(iri) => Rc::from(iri.as_str()),
+                None => Rc::from(stored),
+            };
+        let serialized = serialized_bytes(&Term::Iri(Cow::Borrowed(published.as_ref())));
+        self.names
+            .insert(graph, (Rc::clone(&published), serialized));
+        Ok((published, serialized))
+    }
 }
 
 /// A bundle this server published and cannot read is the server's problem, not
@@ -6003,6 +7070,7 @@ impl SchemaNavigationAnswer {
                         ("complete", Value::Text(completeness_text(&self.completeness))),
                     ]))
                 }
+                (schema_views(&self.target, &self.views, &self.view))
                 section."section-block" {
                     h2 { (schema_node_heading(self.selector.kind())) }
                     @if let Some(node) = &self.node {
@@ -6172,6 +7240,7 @@ impl SchemaRelationsAnswer {
                         ("complete", Value::Text(completeness_text(&self.completeness))),
                     ]))
                 }
+                (schema_views(&self.target, &self.views, &self.view))
                 section."section-block" {
                     h2 { "Observed class relations" }
                     (note(
@@ -6273,6 +7342,7 @@ impl SchemaClassPropertiesAnswer {
                         ("complete", Value::Text(completeness_text(&self.completeness))),
                     ]))
                 }
+                (schema_views(&self.target, &self.views, &self.view))
                 section."section-block" {
                     h2 { "Properties by class" }
                     (note(
@@ -6547,7 +7617,7 @@ impl Answer {
 
     fn fragment_pattern(&self) -> Option<&Pattern> {
         match &self.echo {
-            Echo::Fragment { pattern } => Some(pattern),
+            Echo::Fragment { pattern, .. } => Some(pattern),
             _ => None,
         }
     }
@@ -6555,9 +7625,15 @@ impl Answer {
     /// The fields above the table: what was asked, and how much of it came back.
     fn summary<'a>(&'a self, completeness: &'a str) -> Vec<(&'a str, Value<'a>)> {
         let mut summary = match &self.echo {
-            Echo::Fragment { pattern } => pattern_fields(pattern, self.target.operation),
-            Echo::BindingsFragment { pattern } => {
-                binding_pattern_fields(pattern, self.target.operation)
+            Echo::Fragment { pattern, g } => {
+                let mut fields = pattern_fields(pattern, self.target.operation);
+                fields.extend(graph_field(g.as_deref()));
+                fields
+            }
+            Echo::BindingsFragment { pattern, g } => {
+                let mut fields = binding_pattern_fields(pattern, self.target.operation);
+                fields.extend(graph_field(g.as_deref()));
+                fields
             }
             Echo::Describe { direction, .. } => {
                 vec![("direction", Value::Text(direction.as_str()))]
@@ -6601,8 +7677,15 @@ impl Answer {
                 .map(|position| position.as_str())
                 .collect()
         } else {
-            self.vars.iter().map(|position| position.as_str()).collect()
+            self.vars
+                .positions()
+                .iter()
+                .map(|position| position.as_str())
+                .collect()
         };
+        if self.vars.has_graph() {
+            headers.push(GRAPH);
+        }
         if self.bindings {
             headers.insert(0, BINDING);
         }
@@ -6653,6 +7736,9 @@ impl Answer {
                             .map(|(_, term)| self.cell(&term.published, &term.stored)),
                     );
                 }
+                if let Some(graph) = &row.graph {
+                    cells.push(self.graph_cell(graph));
+                }
                 if let Some(direction) = row.direction {
                     cells.push(Cell::text(direction.as_str().to_owned()));
                 }
@@ -6663,6 +7749,23 @@ impl Answer {
                 cells
             })
             .collect()
+    }
+
+    /// A graph's name, linking to the same pattern scoped to that graph — the
+    /// question a quad-view row invites.
+    fn graph_cell<'a>(&'a self, graph: &'a str) -> Cell<'a> {
+        let request = Term::from_dictionary(graph).to_request();
+        let mut cell = term_cell(&self.target, &self.blank_nodes, graph, None);
+        cell.href = Some(query(
+            self.target.base(),
+            &self
+                .target
+                .params
+                .without("cursor")
+                .without("format")
+                .with(GRAPH, &request),
+        ));
+        cell
     }
 
     /// One term, and the request that asks about it.
@@ -6708,6 +7811,113 @@ fn completeness_text(completeness: &Completeness) -> &'static str {
         Some(TruncationReason::ResponseBytes) => "no — the response byte budget filled",
         Some(TruncationReason::CellOverflow) => "no — a cell overflowed its cap",
         Some(TruncationReason::PartialFailure) => "no — part of the request failed",
+    }
+}
+
+impl Resource for GraphsAnswer {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let cells: Vec<(Cell<'_>, u64)> = self
+            .graphs
+            .iter()
+            .map(|entry| {
+                let request = Term::from_dictionary(&entry.published).to_request();
+                let mut cell = term_cell(&self.target, &self.blank_nodes, &entry.published, None);
+                cell.href = Some(self.target.ask("fragment", GRAPH, &request));
+                (cell, entry.count)
+            })
+            .collect();
+        // Each optional column appears only where something fills it, so a
+        // bundle that declares no components, or describes no graph, keeps the
+        // shorter listing.
+        let components = self.graphs.iter().any(|entry| entry.component.is_some());
+        let described = self.graphs.iter().any(|entry| entry.view.is_some());
+        let schema: Vec<Cell<'_>> = self
+            .graphs
+            .iter()
+            .map(|entry| {
+                Cell::link(
+                    "schema",
+                    entry
+                        .view
+                        .as_deref()
+                        .map(|view| self.target.ask("schema", "view", view)),
+                )
+            })
+            .collect();
+        let rows: Vec<Vec<Value<'_>>> = cells
+            .iter()
+            .zip(&self.graphs)
+            .zip(&schema)
+            .map(|(((cell, count), entry), schema)| {
+                let mut row = vec![cell.value(), Value::Number(*count)];
+                if components {
+                    row.push(match &entry.component {
+                        Some(component) => Value::Code(component),
+                        None => Value::Text(""),
+                    });
+                }
+                if described {
+                    row.push(schema.value());
+                }
+                row
+            })
+            .collect();
+        let mut headers = vec![GRAPH, "count"];
+        if components {
+            headers.push("component");
+        }
+        if described {
+            headers.push("");
+        }
+        let summary = [
+            ("triples", Value::Number(self.triples)),
+            ("memberships", Value::Number(self.memberships)),
+            ("graphs", Value::Number(self.cardinality.value())),
+            ("returned", Value::Number(self.graphs.len() as u64)),
+            (
+                "complete",
+                Value::Text(completeness_text(&self.completeness)),
+            ),
+        ];
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        operation_page(
+            &self.target.mount,
+            "Graphs",
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" {
+                    (fields(&summary))
+                }
+                (note(
+                    "Every graph the bundle's triples belong to, with the number of triples in \
+                     each. The unnamed graph holds the statements that carried no graph; the \
+                     union of all graphs is what an unscoped request reads, and a triple in \
+                     several graphs counts once there. Each graph links to its triples."
+                ))
+                // No query editor: `limit` is the only control this listing
+                // takes, and the pager already offers it.
+                section."section-block" {
+                    h2 { "Graphs" }
+                    @if rows.is_empty() {
+                        (note("No graphs."))
+                    } @else {
+                        (results_table(&headers, &rows))
+                    }
+                }
+                @if let Some(token) = self.completeness.next_cursor() {
+                    @if let Some(next) = self.target.next(token) {
+                        (pager(&next, "Next page →"))
+                    }
+                }
+            },
+        )
     }
 }
 
@@ -7035,6 +8245,7 @@ impl Resource for CountAnswer {
 
     fn to_html(&self) -> String {
         let mut summary = pattern_fields(&self.pattern, self.target.operation);
+        summary.extend(graph_field(self.g.as_deref()));
         summary.push(("count", Value::Number(self.count.value())));
         summary.push((
             "exact",
@@ -7115,7 +8326,17 @@ impl Resource for BindingCountAnswer {
             canonical.as_deref(),
             html! {
                 div."answer-summary" {
-                    (fields(&binding_pattern_fields(&self.pattern, self.target.operation)))
+                    (fields(&{
+                        let mut fields = binding_pattern_fields(&self.pattern, self.target.operation);
+                        fields.extend(graph_field(self.g.as_deref()));
+                        fields
+                    }))
+                }
+                @if !self.absent_terms.is_empty() {
+                    (note(&format!(
+                        "{}, so every count is zero.",
+                        absent_terms_text(&self.absent_terms)
+                    )))
                 }
                 section."section-block" {
                     h2 { "Counts" }
@@ -7128,6 +8349,11 @@ impl Resource for BindingCountAnswer {
             },
         )
     }
+}
+
+/// The `g` field, when the request scoped its pattern.
+fn graph_field(requested: Option<&str>) -> Option<(&str, Value<'_>)> {
+    requested.map(|g| (GRAPH, Value::Code(g)))
 }
 
 /// The three pattern positions, as page fields.
@@ -7224,6 +8450,18 @@ struct Cell<'a> {
 }
 
 impl<'a> Cell<'a> {
+    /// A cell that is a link and not a term: a named way out of a row.
+    fn link(label: &str, href: Option<String>) -> Self {
+        Self {
+            label: label.to_owned(),
+            qualifier: None,
+            annotation: None,
+            href,
+            full_iri: None,
+            structured: false,
+        }
+    }
+
     /// A plain unlinked cell: a binding index, a direction, a score.
     fn text(label: String) -> Self {
         Self {
@@ -7368,8 +8606,14 @@ mod tests {
                                 .expect("a term serializes")
                                 .len() as u64;
 
-                            let row =
-                                Row::new(cells, each * width as u64, binding, direction, score);
+                            let row = Row::new(
+                                cells,
+                                each * width as u64,
+                                None,
+                                binding,
+                                direction,
+                                score,
+                            );
                             assert_eq!(
                                 row.serialized,
                                 serde_json::to_vec(&row).expect("a row serializes").len() as u64,

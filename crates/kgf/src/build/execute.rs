@@ -21,7 +21,10 @@ use sha2::{Digest, Sha256};
 
 use super::Build;
 use super::hdtc::{Runner, Step, render};
-use super::plan::{BundlePlan, Input, KEYSET_ROLES, SKETCH_ROLES};
+use super::plan::{
+    BundlePlan, GRAPH_DESCRIPTION_THRESHOLD, GRAPH_POSITIONS, GRAPH_TRANSPOSE_THRESHOLD, Input,
+    KEYSET_ROLES, PositionMap, SKETCH_ROLES,
+};
 use crate::build::stats;
 use crate::manifest::Requested;
 
@@ -82,7 +85,35 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
         staging: staging.path().to_path_buf(),
         data: staging.path().join(artifact::HDT),
     };
-    let inputs = materialize(plan, &runner, &layout)?;
+    let graphs = plan.builds_graphs()?;
+    let Materialized { inputs, adopted } = materialize(plan, &runner, &layout, graphs)?;
+
+    // Read once, from the sidecar the core step just wrote: how many graphs
+    // there are decides the transpose, and whether any is named by a blank
+    // node decides what can be described.
+    let graph_facts = graphs
+        .then(|| sidecar_facts(plan, &layout.data))
+        .transpose()?;
+    if let Some(facts) = graph_facts {
+        refuse_undescribed_design(plan, facts)?;
+        runner.run(&graphs_index_step(&layout, wants_transpose(plan, facts)))?;
+        // Before the expensive sidecars, not after: a sidecar this server
+        // cannot read is worth hearing about now rather than once the text
+        // index, the sketches, the key sets and the description set have been
+        // built over bytes that will never be published.
+        crate::manifest::check_staged_graphs(&layout.staging, &plan.config.components)
+            .with_context(|| {
+                format!(
+                    "the memberships built from {} cannot be read back, so nothing was \
+                     published",
+                    plan.input.describe()
+                )
+            })?;
+    } else {
+        // Without memberships there is no graph to bind a component to, and a
+        // declaration the data cannot back is refused rather than published.
+        crate::manifest::check_component_graphs(&layout.staging, &plan.config.components)?;
+    }
 
     for step in sidecar_steps(plan, &layout) {
         runner.run(&step)?;
@@ -108,6 +139,9 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
             prefix_tables: &plan.config.semantics.prefix_tables,
             card,
             work: work.path(),
+            graphs: graph_facts,
+            components: &plan.config.components,
+            design: plan.config.design.as_deref(),
         },
         &staged_stats,
     )?;
@@ -138,7 +172,7 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
         )
     })?;
     let _ = staging.keep();
-    release_adopted_input(plan);
+    release_adopted_input(plan, adopted);
     Ok(Built {
         manifest,
         description: outcome,
@@ -159,7 +193,7 @@ struct Layout {
 /// existing HDT is the more expensive route rather than the cheaper one: it
 /// pays a separate `hdtc perm` over bytes the create step would have permuted
 /// while it already had them.
-fn core_step(plan: &BundlePlan, layout: &Layout) -> Step {
+fn core_step(plan: &BundlePlan, layout: &Layout, graphs: bool) -> Step {
     let position_maps = plan
         .config
         .contents
@@ -192,6 +226,14 @@ fn core_step(plan: &BundlePlan, layout: &Layout) -> Step {
                 OsString::from("--dataset-uri"),
                 OsString::from(plan.config.dataset.iri.as_str()),
             ];
+            if graphs {
+                // The sidecar only. Its index is a step of its own, because
+                // that is where the positions this server requires and the
+                // transpose it may want are chosen, and one step is one place
+                // to state them.
+                args.push(OsString::from("--mode"));
+                args.push(OsString::from("quads"));
+            }
             if !position_maps.is_empty() {
                 args.push(OsString::from("--perm-position-maps"));
                 args.push(OsString::from(&position_maps));
@@ -204,6 +246,92 @@ fn core_step(plan: &BundlePlan, layout: &Layout) -> Step {
             }
         }
     }
+}
+
+/// The invocation that indexes the membership sidecar.
+///
+/// Run for both kinds of input, and separately from the build that wrote the
+/// sidecar: `hdtc create --graphs-index` would write an index too, but with
+/// its own defaults, and the layer sets a bundle must carry are not a default
+/// to inherit.
+fn graphs_index_step(layout: &Layout, transpose: bool) -> Step {
+    let mut args = vec![
+        OsString::from("graphs-index"),
+        layout.data.as_os_str().to_owned(),
+        OsString::from("--positions"),
+        OsString::from(GRAPH_POSITIONS),
+    ];
+    if transpose {
+        args.push(OsString::from("--transpose-ids"));
+    }
+    Step {
+        name: "graph membership index",
+        args,
+        temp: Some("graphs-index"),
+    }
+}
+
+/// Whether the membership index carries the transpose.
+///
+/// Stated by the config, or read from the sidecar this build just wrote: the
+/// number of graphs is a field of its header, and it is what the choice turns
+/// on.
+fn wants_transpose(plan: &BundlePlan, facts: stats::GraphFacts) -> bool {
+    plan.config
+        .contents
+        .graphs
+        .transpose
+        .unwrap_or(facts.named_graphs > GRAPH_TRANSPOSE_THRESHOLD)
+}
+
+/// What the sidecar this build just wrote says about its graphs, and what the
+/// plan makes of it.
+fn sidecar_facts(plan: &BundlePlan, data: &Path) -> Result<stats::GraphFacts> {
+    let sidecar = hdtc::format::graph_sidecar_path(data);
+    let directory = hdtc::format::GraphSidecarDirectory::read(&sidecar, data)
+        .with_context(|| format!("reading the graph sidecar {}", sidecar.display()))?;
+    let header = directory.header();
+    Ok(stats::GraphFacts {
+        named_graphs: header.named_graphs,
+        blank_names: header.has_blank_graph_names(),
+        describe: plan
+            .config
+            .contents
+            .graphs
+            .describe
+            .unwrap_or(header.named_graphs <= GRAPH_DESCRIPTION_THRESHOLD),
+    })
+}
+
+/// Refuse a design component whose graph this bundle will not describe.
+///
+/// Decided by what the sidecar says, so it runs as soon as that is known and
+/// before any step that would be wasted: past the threshold an unset
+/// `contents.graphs.describe` describes no graph on its own, and a graph named
+/// by a blank node leaves the unnamed graph's subset indistinguishable from its
+/// own, so the unnamed graph is not described either.
+fn refuse_undescribed_design(plan: &BundlePlan, facts: stats::GraphFacts) -> Result<()> {
+    let Some((_, graph)) = plan.config.design_graph() else {
+        return Ok(());
+    };
+    if !facts.describe {
+        plan.config.refuse_design(
+            &format!(
+                "the bundle holds {} graphs, and past {GRAPH_DESCRIPTION_THRESHOLD} each is \
+                 described on its own only when contents.graphs.describe says so",
+                facts.named_graphs
+            ),
+            "Set contents.graphs.describe: true to describe every graph",
+        )?;
+    }
+    if graph == kgf_store::UNNAMED_GRAPH_IRI && facts.blank_names {
+        plan.config.refuse_design(
+            "a graph named by a blank node is described by a subset nothing can tell apart \
+             from the unnamed graph's, so neither is described",
+            "Name that graph by an IRI in the source",
+        )?;
+    }
+    Ok(())
 }
 
 /// The sidecar steps, in the order they run.
@@ -286,7 +414,7 @@ fn sidecar_steps(plan: &BundlePlan, layout: &Layout) -> Vec<Step> {
 /// bar its random suffix, so the output is a script a person can follow rather
 /// than a sketch of one — which is the point, since the place this is read is a
 /// build job's logs.
-pub(super) fn rehearse(build: &Build) -> String {
+pub(super) fn rehearse(build: &Build) -> Result<String> {
     use std::fmt::Write;
 
     let plan = &build.plan;
@@ -314,6 +442,8 @@ pub(super) fn rehearse(build: &Build) -> String {
         build.prefixes.len(),
         plan.config.semantics.prefix_tables.len()
     );
+    let graphs = plan.builds_graphs()?;
+    let adopts_permutation = plan.input.adopts_permutation();
     if let Input::Hdt { path, adopt } = &plan.input {
         let verb = if *adopt { "move" } else { "copy" };
         let _ = writeln!(
@@ -322,10 +452,57 @@ pub(super) fn rehearse(build: &Build) -> String {
             path.display(),
             layout.data.display()
         );
+        if graphs {
+            let _ = writeln!(
+                out,
+                "# {verb} {} beside it",
+                hdtc::format::graph_sidecar_path(path).display()
+            );
+        }
+        if adopts_permutation {
+            let _ = writeln!(
+                out,
+                "# {verb} {} beside it, instead of building one",
+                hdtc::format::permutation_index_path(path).display()
+            );
+        }
     }
-    for step in std::iter::once(core_step(plan, &layout)).chain(sidecar_steps(plan, &layout)) {
+    // The rehearsal cannot read a sidecar that does not exist yet, so an unset
+    // transpose prints as the choice a bundle under the threshold gets, and
+    // the line below says what really decides it.
+    let transpose = plan.config.contents.graphs.transpose;
+    let mut steps = Vec::new();
+    if !adopts_permutation {
+        steps.push((core_step(plan, &layout, graphs), Vec::new()));
+    }
+    if graphs {
+        let mut notes = Vec::new();
+        if transpose.is_none() {
+            notes.push(format!(
+                "#   …plus --transpose-ids above {GRAPH_TRANSPOSE_THRESHOLD} graphs, which \
+                 this bundle's sidecar states once it is built"
+            ));
+        }
+        notes.push(
+            "#   then open the staged memberships as a server would, before the steps below"
+                .to_owned(),
+        );
+        steps.push((
+            graphs_index_step(&layout, transpose.unwrap_or(false)),
+            notes,
+        ));
+    }
+    steps.extend(
+        sidecar_steps(plan, &layout)
+            .into_iter()
+            .map(|step| (step, Vec::new())),
+    );
+    for (step, notes) in &steps {
         let _ = writeln!(out, "# {}", step.name);
-        let _ = writeln!(out, "{}", render(&runner.hdtc_argv(&step)));
+        let _ = writeln!(out, "{}", render(&runner.hdtc_argv(step)));
+        for note in notes {
+            let _ = writeln!(out, "{note}");
+        }
     }
     let _ = writeln!(
         out,
@@ -343,7 +520,25 @@ pub(super) fn rehearse(build: &Build) -> String {
         layout.staging.display(),
         plan.output.display()
     );
-    out
+    Ok(out)
+}
+
+/// What a build took from beside its input rather than building.
+///
+/// Only the files it actually placed: `--adopt` promises the input goes away,
+/// and a file this build did not take is not its to remove.
+#[derive(Debug, Clone, Copy, Default)]
+struct Adopted {
+    /// The graph membership sidecar.
+    graphs: bool,
+    /// The permutation index.
+    permutation: bool,
+}
+
+/// `data.hdt` and everything that came with it, and what was read to hash it.
+struct Materialized {
+    inputs: Vec<SourceInput>,
+    adopted: Adopted,
 }
 
 /// Put `data.hdt` and its permutation sidecar in place, and hash what was read.
@@ -351,7 +546,8 @@ fn materialize(
     plan: &BundlePlan,
     runner: &Runner<'_>,
     layout: &Layout,
-) -> Result<Vec<SourceInput>> {
+    graphs: bool,
+) -> Result<Materialized> {
     let data = &layout.data;
     match &plan.input {
         Input::Hdt { path, adopt } => {
@@ -367,8 +563,38 @@ fn materialize(
             // soon as the bytes are read, and `hdtc perm` over a large HDT is
             // hours — a corrupt download should not buy them.
             verify_asserted_digest(plan, &inputs)?;
-            runner.run(&core_step(plan, layout))?;
-            Ok(inputs)
+            // The sidecar travels with the HDT it describes. It binds to those
+            // bytes, so the copy beside the copy stays valid, and it is not a
+            // second source input: one input arrived, in two files, and the
+            // manifest covers the second as an artifact like every other.
+            if graphs {
+                place_unhashed(
+                    &hdtc::format::graph_sidecar_path(path),
+                    &hdtc::format::graph_sidecar_path(data),
+                    *adopt,
+                )
+                .with_context(|| {
+                    format!(
+                        "copying the graph sidecar beside {}; `contents.graphs` asked for \
+                         memberships",
+                        path.display()
+                    )
+                })?;
+            }
+            // The graph *index* beside an input is deliberately not taken. It
+            // is derived from the sidecar in minutes, and this server requires
+            // layer sets an arbitrary one need not carry.
+            let permutation = adopt_permutation(plan, path, layout, *adopt)?;
+            if !permutation {
+                runner.run(&core_step(plan, layout, graphs))?;
+            }
+            Ok(Materialized {
+                inputs,
+                adopted: Adopted {
+                    graphs,
+                    permutation,
+                },
+            })
         }
         Input::Rdf { paths } => {
             // One `url` for several inputs cannot be apportioned, so it names
@@ -391,10 +617,73 @@ fn materialize(
             // Hashing the inputs is cheap beside `hdtc create --perm`, so the
             // assertion is settled first.
             verify_asserted_digest(plan, &inputs)?;
-            runner.run(&core_step(plan, layout))?;
-            Ok(inputs)
+            runner.run(&core_step(plan, layout, graphs))?;
+            Ok(Materialized {
+                inputs,
+                adopted: Adopted::default(),
+            })
         }
     }
+}
+
+/// Take the permutation index that sits beside an HDT input, if one does.
+///
+/// `hdtc perm` over a large HDT is hours, and an index already beside it is
+/// the index this build would produce. Taking it is the same trade as taking
+/// the graph sidecar: both bind to the HDT's own bytes, and opening one checks
+/// that binding before anything is published, so an index belonging to another
+/// HDT is refused here rather than served later.
+///
+/// What the config asks for still has to be there. An index carrying fewer
+/// position maps than `contents.perm.position_maps` names would publish a
+/// bundle that cannot answer what its own config promised, so it is refused
+/// with the two ways out. Extra maps are kept: the manifest describes the
+/// artifact that is there.
+fn adopt_permutation(
+    plan: &BundlePlan,
+    source: &Path,
+    layout: &Layout,
+    adopt: bool,
+) -> Result<bool> {
+    if !plan.input.adopts_permutation() {
+        return Ok(false);
+    }
+    let existing = hdtc::format::permutation_index_path(source);
+    let index = hdtc::format::PermutationIndex::open(&existing, source).with_context(|| {
+        format!(
+            "reading the permutation index {}, which sits beside the input and would be \
+             taken as this bundle's; remove it to build a fresh one instead",
+            existing.display()
+        )
+    })?;
+    for map in &plan.config.contents.perm.position_maps {
+        let component = match map {
+            PositionMap::Pos => hdtc::format::PermutationComponent::Pos,
+            PositionMap::Ops => hdtc::format::PermutationComponent::Ops,
+        };
+        let wanted = component.section_type(hdtc::format::PermutationSectionKind::PositionMap);
+        ensure!(
+            index
+                .sections()
+                .iter()
+                .any(|section| section.section_type == wanted),
+            "contents.perm.position_maps asks for the {} map and {} carries none. Remove that \
+             index so this build makes one with it, or drop the key",
+            map.as_str(),
+            existing.display()
+        );
+    }
+    place_unhashed(
+        &existing,
+        &hdtc::format::permutation_index_path(&layout.data),
+        adopt,
+    )
+    .with_context(|| format!("taking the permutation index {}", existing.display()))?;
+    tracing::info!(
+        source = %existing.display(),
+        "took the permutation index beside the input rather than building one"
+    );
+    Ok(true)
 }
 
 /// Check an asserted input digest against the bytes actually read.
@@ -429,6 +718,8 @@ fn requested_manifest(
     prefixes: BTreeMap<String, String>,
 ) -> Result<Requested> {
     Ok(Requested {
+        components: plan.config.components.clone(),
+        design: plan.config.design.clone(),
         id: Some(plan.config.dataset.id.to_string()),
         version: Some(plan.version.to_string()),
         dataset_iri: Some(plan.config.dataset.iri.as_str().to_owned()),
@@ -485,26 +776,49 @@ fn hdtc_version(hdtc: &Path) -> Option<String> {
 /// twice. Moving cannot, and pays a second read — which is still the cheaper
 /// option overall, since it skips writing a second copy of the file.
 fn place(source: &Path, dest: &Path, adopt: bool) -> Result<String> {
-    if adopt {
-        // A hard link, never a rename. Staging is a temporary directory that is
-        // deleted on *any* later failure — a bad digest, a failed sidecar, a
-        // full disk — and a rename would put the caller's only copy of the
-        // input inside it. Linking leaves the source in place until the build
-        // has actually published, so a failed `--adopt` costs nothing.
-        match std::fs::hard_link(source, dest) {
-            Ok(()) => return hash_file(dest),
-            // Across filesystems there is no link to make, and every other
-            // failure is worth one attempt at a copy too: the fallback is
-            // strictly more capable, so telling the causes apart would only
-            // turn recoverable cases into errors.
-            Err(error) => tracing::debug!(
+    if adopt && linked(source, dest) {
+        return hash_file(dest);
+    }
+    copy_hashing(source, dest)
+}
+
+/// Put an existing file at `dest` without hashing it.
+///
+/// For a file the manifest does not record as a source input: the bundle's own
+/// per-artifact checksum covers it once it is in place, and hashing it here
+/// would be a second full read for a number nothing asks for.
+fn place_unhashed(source: &Path, dest: &Path, adopt: bool) -> Result<()> {
+    if adopt && linked(source, dest) {
+        return Ok(());
+    }
+    std::fs::copy(source, dest)
+        .map(|_| ())
+        .with_context(|| format!("copying {} to {}", source.display(), dest.display()))
+}
+
+/// Try to hard-link the input into staging, reporting whether it worked.
+///
+/// A hard link, never a rename. Staging is a temporary directory that is
+/// deleted on *any* later failure — a bad digest, a failed sidecar, a full
+/// disk — and a rename would put the caller's only copy of the input inside
+/// it. Linking leaves the source in place until the build has actually
+/// published, so a failed `--adopt` costs nothing.
+fn linked(source: &Path, dest: &Path) -> bool {
+    match std::fs::hard_link(source, dest) {
+        Ok(()) => true,
+        // Across filesystems there is no link to make, and every other failure
+        // is worth one attempt at a copy too: the fallback is strictly more
+        // capable, so telling the causes apart would only turn recoverable
+        // cases into errors.
+        Err(error) => {
+            tracing::debug!(
                 %error,
                 source = %source.display(),
                 "linking the input failed; copying instead"
-            ),
+            );
+            false
         }
     }
-    copy_hashing(source, dest)
 }
 
 /// Drop the adopted input, once the bundle that replaced it is published.
@@ -517,16 +831,33 @@ fn place(source: &Path, dest: &Path, adopt: bool) -> Result<String> {
 /// A failure here is reported and not fatal. The bundle is already published
 /// and correct; a leftover input is untidy, not wrong, and unpublishing a good
 /// bundle over it would be the worse trade.
-fn release_adopted_input(plan: &BundlePlan) {
+fn release_adopted_input(plan: &BundlePlan, adopted: Adopted) {
     let Input::Hdt { path, adopt: true } = &plan.input else {
         return;
     };
-    if let Err(error) = std::fs::remove_file(path) {
-        tracing::warn!(
-            %error,
-            source = %path.display(),
-            "the bundle is published, but the adopted input could not be removed"
-        );
+    // Each companion goes only when this build took it: leaving one beside a
+    // deleted HDT would leave a file that binds to nothing, but a build that
+    // deliberately dropped the memberships never took the sidecar, and
+    // deleting the caller's only copy of it would be this command's own data
+    // loss.
+    let sidecar = adopted
+        .graphs
+        .then(|| hdtc::format::graph_sidecar_path(path));
+    let permutation = adopted
+        .permutation
+        .then(|| hdtc::format::permutation_index_path(path));
+    let released = std::iter::once(path.as_path())
+        .chain(sidecar.as_deref())
+        .chain(permutation.as_deref())
+        .filter(|file| file.is_file());
+    for file in released {
+        if let Err(error) = std::fs::remove_file(file) {
+            tracing::warn!(
+                %error,
+                source = %file.display(),
+                "the bundle is published, but the adopted input could not be removed"
+            );
+        }
     }
 }
 

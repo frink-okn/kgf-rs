@@ -98,6 +98,8 @@ pub enum Operation {
     Tpf = 5,
     /// `GET /terms`.
     Terms = 6,
+    /// `GET /graphs`.
+    Graphs = 7,
 }
 
 impl Operation {
@@ -114,6 +116,7 @@ impl Operation {
             4 => Some(Self::Schema),
             5 => Some(Self::Tpf),
             6 => Some(Self::Terms),
+            7 => Some(Self::Graphs),
             _ => None,
         }
     }
@@ -184,6 +187,10 @@ pub enum PositionSpace {
     /// sections one row across a page boundary, since every run resumes strictly
     /// past it.
     DictionaryPrefix = 10,
+    /// The next graph id a `/graphs` page lists: the unnamed graph is 0 and
+    /// the named graphs follow in the sidecar's dictionary order, so the id
+    /// is the page's own offset into that order.
+    Graph = 11,
 }
 
 impl PositionSpace {
@@ -203,10 +210,20 @@ impl PositionSpace {
     /// a selection per matching literal, so the space is a property of the
     /// *operation* rather than of anything this function can see.
     pub fn of(selection: &Selection<'_>) -> Self {
-        if selection.subject_object_route().is_some() {
+        Self::of_parts(
+            selection.permutation(),
+            selection.subject_object_route().is_some(),
+        )
+    }
+
+    /// The space of a selection's positions, from the two facts that decide
+    /// it — for the graph-scoped and quad-view forms of a selection, which
+    /// keep its permutation and its route and therefore its space.
+    pub fn of_parts(permutation: Permutation, subject_object: bool) -> Self {
+        if subject_object {
             return Self::Predicate;
         }
-        match selection.permutation() {
+        match permutation {
             Permutation::Spo => Self::Spo,
             Permutation::Pos => Self::Pos,
             Permutation::Ops => Self::Ops,
@@ -225,6 +242,7 @@ impl PositionSpace {
             8 => Some(Self::ClassRelation),
             9 => Some(Self::ClassProperty),
             10 => Some(Self::DictionaryPrefix),
+            11 => Some(Self::Graph),
             _ => None,
         }
     }
@@ -410,8 +428,10 @@ pub struct Cursor {
     pub position: u64,
     /// Row index, for bindings operations.
     pub binding_index: Option<u32>,
-    /// Secondary position: an offset within a ranked hit, or an accumulated
-    /// count for an unranked text scan.
+    /// Secondary position, for the spaces whose position has a run inside it:
+    /// an offset within a ranked hit, an accumulated count for an unranked
+    /// text scan, or the memberships of one triple a quad-view page already
+    /// delivered.
     pub scan_position: Option<u64>,
 }
 
@@ -481,6 +501,11 @@ impl Cursor {
     /// Resume a `/terms` prefix scan after the term at `position`.
     pub fn at_dictionary_position(binding: &CursorBinding, position: DictPosition) -> Self {
         Self::at(binding, PositionSpace::DictionaryPrefix, position.as_u64())
+    }
+
+    /// Resume a `/graphs` listing at graph id `next`.
+    pub fn at_graph(binding: &CursorBinding, next: u64) -> Self {
+        Self::at(binding, PositionSpace::Graph, next)
     }
 
     /// Encode to the opaque token clients round-trip.
@@ -558,9 +583,14 @@ impl Cursor {
             return Err(StaleCursor);
         }
 
-        // Optional trailers are not independent state. Each current position
-        // space has one exact shape; accepting another lets an edited token
-        // silently restart a ranked hit or reinterpret a scan accumulator.
+        // Optional trailers are not independent state. Each position space
+        // has the shapes its operations issue and no other; accepting another
+        // lets an edited token silently restart a ranked hit or reinterpret a
+        // scan accumulator. The four permutation spaces take the run trailer
+        // in the quad view only, where it counts a triple's memberships
+        // already delivered; whether the request *is* a quad view is fixed by
+        // the request hash, and the operation checks the trailer's presence
+        // against that.
         let shape_is_valid = match space {
             PositionSpace::TextRank | PositionSpace::TextScan => {
                 binding_index.is_none() && scan_position.is_some()
@@ -568,11 +598,12 @@ impl Cursor {
             PositionSpace::SchemaChild
             | PositionSpace::ClassRelation
             | PositionSpace::ClassProperty
-            | PositionSpace::DictionaryPrefix => binding_index.is_none() && scan_position.is_none(),
+            | PositionSpace::DictionaryPrefix
+            | PositionSpace::Graph => binding_index.is_none() && scan_position.is_none(),
             PositionSpace::Spo
             | PositionSpace::Pos
             | PositionSpace::Ops
-            | PositionSpace::Predicate => scan_position.is_none(),
+            | PositionSpace::Predicate => true,
         };
         if !shape_is_valid {
             return Err(StaleCursor);
@@ -664,6 +695,7 @@ mod tests {
             Cursor::at_binding(&binding(), u32::MAX, PositionSpace::Predicate, 0),
             Cursor::at_rank(&binding(), 7, u64::MAX),
             Cursor::at_text_scan(&binding(), 42, 1_000),
+            Cursor::at_graph(&binding(), 5),
             Cursor::at_schema_child(&binding(), 99),
             Cursor::at_class_relation(&binding(), 4_096),
         ] {
@@ -674,8 +706,14 @@ mod tests {
         }
 
         // A trailer is part of its position space's shape, not an optional
-        // field an edited token may add or remove.
-        let mut unexpected = sample();
+        // field an edited token may add or remove. The permutation spaces
+        // take the run trailer — the quad view's memberships already
+        // delivered — and the operation checks its presence against the
+        // request; the other spaces without one refuse it outright.
+        let mut run = sample();
+        run.scan_position = Some(7);
+        assert_eq!(Cursor::decode(run.encode().as_str(), &binding()), Ok(run));
+        let mut unexpected = Cursor::at_schema_child(&binding(), 99);
         unexpected.scan_position = Some(7);
         assert_eq!(
             Cursor::decode(unexpected.encode().as_str(), &binding()),

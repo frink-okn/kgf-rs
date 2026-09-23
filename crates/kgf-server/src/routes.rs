@@ -118,6 +118,7 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/{dataset}/v/{version}/sample", read(get(sample)))
         .route("/{dataset}/v/{version}/search", read(get(search)))
         .route("/{dataset}/v/{version}/terms", read(get(terms)))
+        .route("/{dataset}/v/{version}/graphs", read(get(graphs)))
         .route("/{dataset}/v/{version}/schema", read(get(schema)))
         .route("/{dataset}/v/{version}/void", read(get(void)))
         .route("/{dataset}/v/{version}/summary", read(get(summary)))
@@ -460,6 +461,7 @@ async fn fragment(
                     &release.binding(),
                 )?;
                 declares_search(release, request.pattern.text().is_some())?;
+                declares_graphs(release, &request.graph)?;
                 Ok(request)
             },
             answer::fragment,
@@ -479,7 +481,16 @@ async fn tpf(
         AccessOperation::Tpf,
         wants,
         Representation::TPF,
-        |params, limits, release| request::Tpf::parse(params, limits, &release.binding()),
+        |params, limits, release| {
+            let memberships = release.declares(Capability::Graphs);
+            let request = request::Tpf::parse(params, limits, &release.binding(), memberships)?;
+            let graph = match &request {
+                request::Tpf::Plain(request) => &request.graph,
+                request::Tpf::Values(request) => &request.graph,
+            };
+            declares_graphs(release, graph)?;
+            Ok(request)
+        },
         answer::tpf,
     )
     .await
@@ -500,6 +511,7 @@ async fn count(
                 let request =
                     request::Count::parse(params, limits, release.prefixes(), &release.binding())?;
                 declares_search(release, request.pattern.text().is_some())?;
+                declares_graphs(release, &request.graph)?;
                 Ok(request)
             },
             answer::count,
@@ -567,13 +579,15 @@ async fn binding_fragment(
                 method,
             },
             |params, body, limits, release| {
-                request::BindingFragment::parse(
+                let request = request::BindingFragment::parse(
                     params,
                     body,
                     limits,
                     release.prefixes(),
                     &release.binding(),
-                )
+                )?;
+                declares_graphs(release, &request.graph)?;
+                Ok(request)
             },
             answer::binding_fragment,
         )
@@ -640,7 +654,10 @@ async fn binding_count(
                 method,
             },
             |params, body, limits, release| {
-                request::BindingCount::parse(params, body, limits, release.prefixes())
+                let request =
+                    request::BindingCount::parse(params, body, limits, release.prefixes())?;
+                declares_graphs(release, &request.graph)?;
+                Ok(request)
             },
             answer::binding_count,
         )
@@ -796,6 +813,27 @@ async fn terms(
             )
         },
         answer::terms,
+    )
+    .await
+}
+
+async fn graphs(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate(
+        service,
+        BundleId { dataset, version },
+        AccessOperation::Graphs,
+        wants,
+        // Gated: the listing reads the membership sidecar, which a bundle
+        // may not carry. See `capability_gate`.
+        |params, limits, release| {
+            capability_gate(release, Capability::Graphs)?;
+            request::GraphList::parse(params, limits, &release.binding())
+        },
+        answer::graphs_list,
     )
     .await
 }
@@ -991,6 +1029,30 @@ fn declares_search(release: &Release, wanted: bool) -> Result<(), Problem> {
     Ok(())
 }
 
+/// Refuse a graph scope the bundle has no memberships for.
+///
+/// Only the forms that read the sidecar are gated: a named graph and the quad
+/// view. The union and the unnamed graph are answerable on every release —
+/// the union is `data.hdt` itself, and a bundle without memberships is one
+/// whose triples are all unnamed — so they pass whether or not the release
+/// declares `graphs`.
+fn declares_graphs(release: &Release, graph: &request::GraphScope) -> Result<(), Problem> {
+    if graph.needs_sidecar() && !release.declares(Capability::Graphs) {
+        let parameter = graph.parameter();
+        return Err(Problem::new(
+            ErrorCode::CapabilityNotAvailable,
+            format!(
+                "this form of `{}` needs the `graphs` capability, which this bundle does not \
+                 declare; its manifest lists the ones it does. {} are answerable on every \
+                 release",
+                parameter.as_str(),
+                parameter.reserved_forms(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The shape every operation has.
 ///
 /// Read in order, because the order is the decision: negotiate, resolve the
@@ -1061,6 +1123,9 @@ where
     // failed to parse selected none and stays plain GET.
     observation.transport = Some(request.transport());
     observation.request(&request, work_class);
+    if let Err(problem) = request.representable(representation) {
+        return observed_result(Err(problem), observation);
+    }
 
     // A versioned operation is a deterministic function of immutable bytes,
     // so the URL and the representation fix the response
@@ -1088,10 +1153,14 @@ where
         params,
         release.prefixes().clone(),
         service.mount().clone(),
-        release.declares(Capability::Search),
+        answer::Offers {
+            search: release.declares(Capability::Search),
+            graphs: release.declares(Capability::Graphs),
+        },
         wants.request_url.clone(),
     )
-    .with_dataset_metadata(release.dataset_iri(), release.carries_description());
+    .with_dataset_metadata(release.dataset_iri(), release.carries_description())
+    .with_declarations(release.declarations());
     let labels = PageLabelProfile::for_request(
         &service,
         release,
@@ -1161,6 +1230,9 @@ where
     };
     let work_class = request.work_class();
     observation.request(&request, work_class);
+    if let Err(problem) = request.representable(representation) {
+        return observed_result(Err(problem), observation);
+    }
     let validator = etag(
         release.digest(),
         service.descriptor_digest(),
@@ -1183,10 +1255,14 @@ where
         params,
         release.prefixes().clone(),
         service.mount().clone(),
-        release.declares(Capability::Search),
+        answer::Offers {
+            search: release.declares(Capability::Search),
+            graphs: release.declares(Capability::Graphs),
+        },
         wants.request_url.clone(),
     )
-    .with_dataset_metadata(release.dataset_iri(), release.carries_description());
+    .with_dataset_metadata(release.dataset_iri(), release.carries_description())
+    .with_declarations(release.declarations());
     let opened = Arc::clone(&service);
     let timed = blocking(&service, work_class, move || {
         let (store, open) = opened.open_observed(target.id())?;
@@ -1333,6 +1409,9 @@ where
         Err(problem) => return observed_result(Err(problem), observation),
     };
     observation.request(&request, WorkClass::Heavy);
+    if let Err(problem) = request.representable(representation) {
+        return observed_result(Err(problem), observation);
+    }
     let validator = etag_for_body(
         release.digest(),
         service.descriptor_digest(),

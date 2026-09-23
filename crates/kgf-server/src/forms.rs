@@ -11,6 +11,7 @@ use kgf_store::Capability;
 use kgf_store::manifest::Manifest;
 use maud::{Markup, html};
 
+use crate::answer::Offers;
 use crate::url::{Mount, Params};
 
 /// All runnable GET forms for one bundle manifest.
@@ -21,7 +22,11 @@ pub(crate) fn manifest_forms(
     manifest: &Manifest,
 ) -> Markup {
     let empty = Params::default();
-    let search = manifest.declares(Capability::Search);
+    let offers = Offers {
+        search: manifest.declares(Capability::Search),
+        graphs: manifest.declares(Capability::Graphs),
+    };
+    let search = offers.search;
 
     html! {
         h2 { "Try a query" }
@@ -30,9 +35,9 @@ pub(crate) fn manifest_forms(
             "listed above, bracketed IRIs, blank nodes and quoted literals."
         }
         div."query-stack" {
-            (fragment(mount, dataset, version, &empty, search, true))
-            (tpf(mount, dataset, version, &empty, false))
-            (count(mount, dataset, version, &empty, search, false))
+            (fragment(mount, dataset, version, &empty, offers, true))
+            (tpf(mount, dataset, version, &empty, offers, false))
+            (count(mount, dataset, version, &empty, offers, false))
             (describe(mount, dataset, version, &empty, false))
             (sample(mount, dataset, version, &empty, false))
             @if search {
@@ -50,12 +55,12 @@ pub(crate) fn operation_form(
     version: &str,
     operation: &str,
     params: &Params,
-    has_search: bool,
+    offers: Offers,
 ) -> Option<Markup> {
     let form = match operation {
-        "fragment" => Some(fragment(mount, dataset, version, params, has_search, false)),
-        "tpf" => Some(tpf(mount, dataset, version, params, false)),
-        "count" => Some(count(mount, dataset, version, params, has_search, false)),
+        "fragment" => Some(fragment(mount, dataset, version, params, offers, false)),
+        "tpf" => Some(tpf(mount, dataset, version, params, offers, false)),
+        "count" => Some(count(mount, dataset, version, params, offers, false)),
         "describe" => Some(describe(mount, dataset, version, params, false)),
         "sample" => Some(sample(mount, dataset, version, params, false)),
         "search" => Some(search_form(mount, dataset, version, params, false)),
@@ -65,8 +70,15 @@ pub(crate) fn operation_form(
     Some(html! { div."query-stack" { (form) } })
 }
 
-fn tpf(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
-    let controls = vec![
+fn tpf(
+    mount: &Mount,
+    dataset: &str,
+    version: &str,
+    params: &Params,
+    offers: Offers,
+    open: bool,
+) -> Markup {
+    let mut controls = vec![
         term_control(
             "tpf",
             "subject",
@@ -88,15 +100,25 @@ fn tpf(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bool)
             params.get("object"),
             "http://example.org/object or \"text\"@en",
         ),
-        number_control(
-            "tpf",
-            "limit",
-            "Rows",
-            params.get("limit"),
-            1,
-            "server default",
-        ),
     ];
+    if offers.graphs {
+        controls.push(text_control(
+            "tpf",
+            "graph",
+            "Graph",
+            params.get("graph"),
+            "urn:x-kgf:union, a graph IRI, or blank for every graph",
+            false,
+        ));
+    }
+    controls.push(number_control(
+        "tpf",
+        "limit",
+        "Rows",
+        params.get("limit"),
+        1,
+        "server default",
+    ));
     form(
         "TPF",
         "Browse the standard Triple Pattern Fragments interface. IRIs are bare, not CURIEs or angle-bracketed.",
@@ -112,7 +134,7 @@ fn fragment(
     dataset: &str,
     version: &str,
     params: &Params,
-    has_search: bool,
+    offers: Offers,
     open: bool,
 ) -> Markup {
     let mut controls = vec![
@@ -126,7 +148,7 @@ fn fragment(
             "ex:object or \"text\"@en",
         ),
     ];
-    if has_search {
+    if offers.search {
         controls.push(text_control(
             "fragment",
             "o.text",
@@ -135,6 +157,9 @@ fn fragment(
             "matching words",
             false,
         ));
+    }
+    if offers.graphs {
+        controls.push(graph_control("fragment", params.get("g")));
     }
     controls.push(number_control(
         "fragment",
@@ -159,7 +184,7 @@ fn count(
     dataset: &str,
     version: &str,
     params: &Params,
-    has_search: bool,
+    offers: Offers,
     open: bool,
 ) -> Markup {
     let mut controls = vec![
@@ -173,7 +198,7 @@ fn count(
             "ex:object or \"text\"@en",
         ),
     ];
-    if has_search {
+    if offers.search {
         controls.push(text_control(
             "count",
             "o.text",
@@ -182,6 +207,9 @@ fn count(
             "matching words",
             false,
         ));
+    }
+    if offers.graphs {
+        controls.push(graph_control("count", params.get("g")));
     }
     form(
         "Count",
@@ -414,6 +442,18 @@ fn form(
     }
 }
 
+/// The `g` control: a graph IRI, one of the two reserved names, or `*`.
+fn graph_control(operation: &str, value: Option<&str>) -> Markup {
+    text_control(
+        operation,
+        "g",
+        "Graph",
+        value,
+        "<urn:x-kgf:unnamed>, a graph IRI, or *",
+        false,
+    )
+}
+
 fn term_control(
     operation: &str,
     name: &str,
@@ -509,6 +549,8 @@ mod tests {
             predicate_roles: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             previous_version: None,
+            components: Vec::new(),
+            design: None,
             source: None,
         }
     }
@@ -543,9 +585,16 @@ mod tests {
     #[test]
     fn an_answer_form_is_prefilled_but_never_carries_paging_or_format() {
         let params = Params::parse(Some("p=ex%3Aknows&limit=7&cursor=opaque&format=html")).unwrap();
-        let rendered = operation_form(&Mount::default(), "tox", "v1", "fragment", &params, false)
-            .unwrap()
-            .into_string();
+        let rendered = operation_form(
+            &Mount::default(),
+            "tox",
+            "v1",
+            "fragment",
+            &params,
+            Offers::default(),
+        )
+        .unwrap()
+        .into_string();
         assert!(rendered.contains("name=\"p\" value=\"ex:knows\""));
         assert!(rendered.contains("name=\"limit\" value=\"7\""));
         assert!(!rendered.contains("name=\"cursor\""));
@@ -581,9 +630,16 @@ mod tests {
     #[test]
     fn form_values_and_actions_are_escaped_by_maud() {
         let params = Params::parse(Some("s=%22%3E%3Cscript%3E")).unwrap();
-        let rendered = operation_form(&Mount::default(), "a b", "v?1", "fragment", &params, false)
-            .unwrap()
-            .into_string();
+        let rendered = operation_form(
+            &Mount::default(),
+            "a b",
+            "v?1",
+            "fragment",
+            &params,
+            Offers::default(),
+        )
+        .unwrap()
+        .into_string();
         assert!(rendered.contains("action=\"/a%20b/v/v%3F1/fragment\""));
         assert!(!rendered.contains("<script>"));
         assert!(rendered.contains("&lt;script&gt;"));

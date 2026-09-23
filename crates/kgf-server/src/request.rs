@@ -21,7 +21,8 @@
 //! is ignored produces a *larger* answer that looks like a correct one, and
 //! nothing downstream can tell. `g=` is the sharpest case — a request scoped to
 //! one named graph, answered from the whole dataset, is wrong in a way a client
-//! has no way to detect.
+//! has no way to detect — which is why a scope that needs the graph sidecar is
+//! refused before the bundle opens when the release does not declare it.
 //!
 //! # Terms are canonical before they are hashed
 //!
@@ -49,15 +50,17 @@ use kgf_store::{
     Capability, ClassPropertyFilter as StoreClassPropertyFilter,
     ClassRelationFilter as StoreClassRelationFilter, Role,
     SchemaChildQuery as StoreSchemaChildQuery, SchemaSelector as StoreSchemaSelector, StatsView,
+    UNION_GRAPH_IRI, UNNAMED_GRAPH_IRI,
 };
 
 use crate::Limits;
 use crate::access::{RequestShape, Transport};
 use crate::admission::WorkClass;
 use crate::cursor::{
-    BundleBinding, CanonicalRequest, Cursor, CursorBinding, Operation, StaleCursor,
+    BundleBinding, CanonicalRequest, Cursor, CursorBinding, Operation, PositionSpace, StaleCursor,
 };
 use crate::envelope::{ErrorCode, Problem, reflected};
+use crate::representation::{RdfSyntax, Representation};
 use crate::service::PredicateRoles;
 use crate::term::{Literal as KgfLiteral, PrefixMap, Term};
 use crate::url::Params;
@@ -736,6 +739,305 @@ fn profile_terms(profile: &PredicateRoles, role: &str) -> Vec<BoundTerm> {
         .collect()
 }
 
+/// Which memberships a fragment or count reads: the `g` parameter.
+///
+/// Four forms. Absent, or the union's reserved name, reads the union — one row
+/// per distinct triple, what an unscoped request has always read. The unnamed
+/// graph's reserved name reads the statements that carried no graph in the
+/// source; it is accepted on every release, because a bundle without
+/// memberships is one whose triples are all unnamed. A named graph reads that
+/// graph's triples, and `*` reads the quad view — one row per membership, with
+/// a `g` column. The last two need the graph sidecar and are refused before
+/// the open on a release that does not declare it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphScope {
+    selector: GraphSelector,
+    /// The client's spelling, for the echo; `None` when the parameter was
+    /// absent.
+    requested: Option<String>,
+    /// How this request spelled the scope, so a message about it names the
+    /// parameter the client actually sent.
+    parameter: GraphParameter,
+}
+
+/// How a route spells the graph scope.
+///
+/// The two differ in more than the name. `g` takes a term in request syntax,
+/// where an IRI is written inside angle brackets, while TPF's `graph` takes
+/// the bare IRI its Hydra mapping declares. A message that names one
+/// parameter has to name its syntax with it, or it tells the client to send
+/// something that route would refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphParameter {
+    /// `g=<IRI>`, on `/fragment` and `/count`.
+    G,
+    /// `graph=IRI`, on `/tpf`.
+    Graph,
+}
+
+impl GraphParameter {
+    /// The parameter's name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::G => "g",
+            Self::Graph => "graph",
+        }
+    }
+
+    /// How this route spells a request for the two reserved names.
+    pub fn reserved_forms(self) -> &'static str {
+        match self {
+            Self::G => "`g=<urn:x-kgf:union>` and `g=<urn:x-kgf:unnamed>`",
+            Self::Graph => "`graph=urn:x-kgf:union` and `graph=urn:x-kgf:unnamed`",
+        }
+    }
+}
+
+/// What a [`GraphScope`] selects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphSelector {
+    /// The union: `g` absent or `urn:x-kgf:union`.
+    Union,
+    /// The unnamed graph: `urn:x-kgf:unnamed`.
+    Unnamed,
+    /// One named graph.
+    Named(BoundTerm),
+    /// Every membership: `g=*`.
+    All,
+}
+
+impl GraphScope {
+    /// The union, as an absent `g` selects it.
+    pub fn union() -> Self {
+        Self {
+            selector: GraphSelector::Union,
+            requested: None,
+            parameter: GraphParameter::G,
+        }
+    }
+
+    /// Read `g` in request-term syntax, as `/fragment` and `/count` take it.
+    fn parse(params: &Params, limits: Limits<'_>, prefixes: &PrefixMap) -> Result<Self, Problem> {
+        match params.get("g").filter(|text| !text.is_empty()) {
+            None => Ok(Self::union()),
+            Some(text) => Self::from_text(text, GraphParameter::G, |text| {
+                BoundTerm::parse("g", text, limits, prefixes)
+            }),
+        }
+    }
+
+    /// Read `/tpf`'s `graph`, in Hydra's explicit representation: a bare IRI,
+    /// or a variable as a bindings-restricted client sends it.
+    ///
+    /// The route's default differs from `/fragment`'s. A bundle with
+    /// memberships publishes the four-position form, and a client that leaves
+    /// `graph` out — or sends a variable — is asking for every membership,
+    /// tagged by the serving rule: its graph, and the document's default
+    /// graph for the unnamed one. The union is what the page metadata
+    /// declares as the default graph, so a client reaches it by sending no
+    /// pattern graph at all. A bundle without memberships has only the union
+    /// to offer, so there the absent parameter reads it.
+    fn parse_tpf(params: &Params, limits: Limits<'_>, memberships: bool) -> Result<Self, Problem> {
+        let unbound = || {
+            if memberships {
+                GraphSelector::All
+            } else {
+                GraphSelector::Union
+            }
+        };
+        match params.get("graph").filter(|text| !text.is_empty()) {
+            None => Ok(Self {
+                selector: unbound(),
+                requested: None,
+                parameter: GraphParameter::Graph,
+            }),
+            Some(text) if text.starts_with('?') => {
+                Variable::parse(text, "graph")?;
+                Ok(Self {
+                    selector: unbound(),
+                    requested: Some(text.to_owned()),
+                    parameter: GraphParameter::Graph,
+                })
+            }
+            Some(text) => {
+                let term = BoundTerm::parse_tpf("graph", text, limits)?;
+                if term.kind != BoundKind::Iri {
+                    return Err(Problem::new(
+                        ErrorCode::BadTermSyntax,
+                        format!(
+                            "`graph` names a graph by IRI, or a variable; {} is not one",
+                            reflected(text)
+                        ),
+                    ));
+                }
+                let selector = match term.dictionary() {
+                    UNION_GRAPH_IRI => GraphSelector::Union,
+                    UNNAMED_GRAPH_IRI => GraphSelector::Unnamed,
+                    _ => GraphSelector::Named(term),
+                };
+                Ok(Self {
+                    selector,
+                    requested: Some(text.to_owned()),
+                    parameter: GraphParameter::Graph,
+                })
+            }
+        }
+    }
+
+    /// The variable a bindings-restricted TPF client named for the graph,
+    /// if it sent one.
+    fn tpf_variable(&self) -> Option<&str> {
+        self.requested
+            .as_deref()
+            .filter(|text| text.starts_with('?'))
+    }
+
+    /// Read a body's `g`, which carries the same syntax as the parameter.
+    fn parse_body(
+        text: Option<&str>,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+    ) -> Result<Self, Problem> {
+        // An empty `g` is an absent one, as it is in the query string: a
+        // client building a body from a form sends the field it has, and a
+        // blank one selects this operation's default rather than failing to
+        // parse as a term.
+        match text.filter(|text| !text.is_empty()) {
+            None => Ok(Self::union()),
+            Some(text) => Self::from_text(text, GraphParameter::G, |text| {
+                BoundTerm::parse("g", text, limits, prefixes)
+            }),
+        }
+    }
+
+    fn from_text(
+        text: &str,
+        parameter: GraphParameter,
+        parse: impl FnOnce(&str) -> Result<BoundTerm, Problem>,
+    ) -> Result<Self, Problem> {
+        if text == "*" {
+            return Ok(Self {
+                selector: GraphSelector::All,
+                requested: Some(text.to_owned()),
+                parameter,
+            });
+        }
+        let term = parse(text)?;
+        if term.kind == BoundKind::Literal {
+            return Err(Problem::new(
+                ErrorCode::BadTermSyntax,
+                format!(
+                    "`{}` names a graph by IRI, or `*` for every graph; {} is a literal",
+                    parameter.as_str(),
+                    reflected(text)
+                ),
+            ));
+        }
+        let selector = match term.dictionary() {
+            UNION_GRAPH_IRI => GraphSelector::Union,
+            UNNAMED_GRAPH_IRI => GraphSelector::Unnamed,
+            _ => GraphSelector::Named(term),
+        };
+        Ok(Self {
+            selector,
+            requested: Some(text.to_owned()),
+            parameter,
+        })
+    }
+
+    /// What the scope selects.
+    pub fn selector(&self) -> &GraphSelector {
+        &self.selector
+    }
+
+    /// How this request spelled the scope.
+    pub fn parameter(&self) -> GraphParameter {
+        self.parameter
+    }
+
+    /// The client's spelling of `g`, for the response echo.
+    pub fn requested(&self) -> Option<&str> {
+        self.requested.as_deref()
+    }
+
+    /// Whether answering needs the graph sidecar, and therefore the `graphs`
+    /// capability. The two reserved names do not: the union is `data.hdt`
+    /// itself, and the unnamed graph of a bundle without memberships is every
+    /// triple.
+    pub fn needs_sidecar(&self) -> bool {
+        matches!(self.selector, GraphSelector::Named(_) | GraphSelector::All)
+    }
+
+    /// Whether rows carry a `g` column.
+    pub fn is_quad_view(&self) -> bool {
+        matches!(self.selector, GraphSelector::All)
+    }
+
+    /// The value a cursor binds to: absent for the union, however it was
+    /// spelled, so `g=<urn:x-kgf:union>` and no `g` are one request.
+    fn canonical(&self) -> Option<&str> {
+        match &self.selector {
+            GraphSelector::Union => None,
+            GraphSelector::Unnamed => Some(UNNAMED_GRAPH_IRI),
+            GraphSelector::Named(term) => Some(term.dictionary()),
+            GraphSelector::All => Some("*"),
+        }
+    }
+
+    /// The content-free kind, for the access log; `None` for the union.
+    fn shape(&self) -> Option<&'static str> {
+        match &self.selector {
+            GraphSelector::Union => None,
+            GraphSelector::Unnamed => Some("unnamed"),
+            GraphSelector::Named(_) => Some("named"),
+            GraphSelector::All => Some("all"),
+        }
+    }
+}
+
+/// Refuse the quad view in a syntax that serializes one graph.
+///
+/// Every row of the quad view is a statement in the graph it belongs to, and
+/// Turtle has nowhere to put that name — a page in it would be the right
+/// triples under the wrong claim about where they live. The message names
+/// both ways out: a dataset syntax, or a request scoped to one graph.
+fn one_graph_syntax_carries(
+    graph: &GraphScope,
+    representation: Representation,
+) -> Result<(), Problem> {
+    if graph.is_quad_view() && matches!(representation.rdf_syntax(), Some(RdfSyntax::Graph(_))) {
+        return Err(Problem::new(
+            ErrorCode::NotAcceptable,
+            QUAD_VIEW_NEEDS_A_DATASET,
+        ));
+    }
+    Ok(())
+}
+
+/// What a client is told when it asks for the quad view in Turtle.
+///
+/// Shared with the serializer, which checks again as it builds the page: two
+/// spellings of one refusal would drift, and a client that hit the second
+/// would be told something the first never said.
+pub(crate) const QUAD_VIEW_NEEDS_A_DATASET: &str = "the quad view puts each statement in its graph, which a single-graph syntax cannot \
+     represent; ask for N-Quads, TriG or JSON-LD, or scope the request with a graph";
+
+/// Refuse a graph scope beside a text constraint.
+///
+/// A ranked text page is assembled from one selection per matching literal,
+/// and this build does not scope those. Refused rather than answered from the
+/// union, for the reason every ignored filter is refused.
+fn refuse_scoped_text(pattern: &Pattern, graph: &GraphScope) -> Result<(), Problem> {
+    if pattern.text().is_some() && graph.canonical().is_some() {
+        return Err(Problem::new(
+            ErrorCode::MalformedRequest,
+            "`g` and `o.text` cannot be combined in this build; scope the pattern or \
+             search its text, not both",
+        ));
+    }
+    Ok(())
+}
+
 impl Serialize for TextFilter {
     /// The request echo puts the constraint inside the pattern's object position, as
     /// `{"text": "atrazine"}`.
@@ -1383,6 +1685,8 @@ fn unbounded_plain_tpf_variable(variable: &Variable) -> Problem {
 pub struct BindingFragment {
     /// The explicit body pattern.
     pub pattern: BindingPattern,
+    /// Which memberships every row's pattern is read over.
+    pub graph: GraphScope,
     bindings: Bindings,
     /// Global result-row limit across the whole input table.
     pub limit: u32,
@@ -1412,11 +1716,14 @@ impl BindingFragment {
         let wire: WireBindingFragment = parse_body(body)?;
         let pattern = BindingPattern::parse(wire.pattern, limits, prefixes)?;
         let bindings = Bindings::parse(wire.bindings, &pattern, limits, prefixes)?;
+        let graph = GraphScope::parse_body(wire.g.as_deref(), limits, prefixes)?;
         let limit = body_page_size(wire.limit, limits)?;
         let canonical = bindings.canonicalize(pattern.canonicalize(String::new()));
         let binding = CursorBinding::new(
             bundle,
-            &CanonicalRequest::new(Operation::Fragment).with("bindings", &canonical),
+            &CanonicalRequest::new(Operation::Fragment)
+                .with("bindings", &canonical)
+                .with_opt("g", graph.canonical()),
         );
         let cursor = wire
             .cursor
@@ -1425,6 +1732,7 @@ impl BindingFragment {
             .transpose()?;
         Ok(Self {
             pattern,
+            graph,
             bindings,
             limit,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
@@ -1441,11 +1749,32 @@ impl BindingFragment {
     fn parse_values(
         params: &Params,
         pattern: BindingPattern,
+        graph: GraphScope,
         limits: Limits<'_>,
         bundle: &BundleBinding,
     ) -> Result<Self, Problem> {
         let values = params.get("values").expect("the caller selected values=");
         let bindings = Bindings::parse_values(values, &pattern, limits)?;
+        // A table column for the graph variable would scope each row to its
+        // own graph. This build scopes a request to one graph or to every
+        // graph, so such a column is refused rather than ignored. A graph
+        // variable that repeats a pattern variable never reaches this: the
+        // route refuses the repeat itself, with the reason that fits it.
+        if let Some(variable) = graph.tpf_variable()
+            && bindings
+                .columns
+                .keys()
+                .any(|column| column.as_str() == variable)
+        {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "`values` binds the graph variable {}, which this build does not support; \
+                     scope the request with `graph=<IRI>` instead",
+                    reflected(variable)
+                ),
+            ));
+        }
         let limit = page_size(
             params,
             "limit",
@@ -1456,10 +1785,13 @@ impl BindingFragment {
         let canonical = bindings.canonicalize(pattern.canonicalize(String::new()));
         let binding = CursorBinding::new(
             bundle,
-            &CanonicalRequest::new(Operation::Tpf).with("bindings", &canonical),
+            &CanonicalRequest::new(Operation::Tpf)
+                .with("bindings", &canonical)
+                .with_opt("g", graph.canonical()),
         );
         Ok(Self {
             pattern,
+            graph,
             bindings,
             limit,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
@@ -1487,6 +1819,8 @@ impl BindingFragment {
 pub struct BindingCount {
     /// The explicit body pattern.
     pub pattern: BindingPattern,
+    /// Which memberships every row's pattern is counted over.
+    pub graph: GraphScope,
     bindings: Bindings,
 }
 
@@ -1502,7 +1836,12 @@ impl BindingCount {
         let wire: WireBindingCount = parse_body(body)?;
         let pattern = BindingPattern::parse(wire.pattern, limits, prefixes)?;
         let bindings = Bindings::parse(wire.bindings, &pattern, limits, prefixes)?;
-        Ok(Self { pattern, bindings })
+        let graph = GraphScope::parse_body(wire.g.as_deref(), limits, prefixes)?;
+        Ok(Self {
+            pattern,
+            graph,
+            bindings,
+        })
     }
 
     /// Input rows in their contractual enumeration order.
@@ -1559,6 +1898,8 @@ fn parse_body<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, Problem> {
 struct WireBindingFragment {
     pattern: WirePattern,
     bindings: WireBindings,
+    /// The graph scope, in the parameter's own syntax.
+    g: Option<String>,
     limit: Option<u32>,
     cursor: Option<String>,
 }
@@ -1568,6 +1909,8 @@ struct WireBindingFragment {
 struct WireBindingCount {
     pattern: WirePattern,
     bindings: WireBindings,
+    /// The graph scope, in the parameter's own syntax.
+    g: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1686,6 +2029,8 @@ impl<'de> Visitor<'de> for WireTermVisitor {
 pub struct Fragment {
     /// The pattern to enumerate, text constraint included.
     pub pattern: Pattern,
+    /// Which memberships the pattern is read over.
+    pub graph: GraphScope,
     /// Rows this page may carry.
     pub limit: u32,
     /// Bytes its rows may occupy.
@@ -1700,7 +2045,7 @@ pub struct Fragment {
 
 impl Fragment {
     const PARAMETERS: &'static [&'static str] =
-        &["s", "p", "o", "o.text", "limit", "cursor", "format"];
+        &["s", "p", "o", "o.text", "g", "limit", "cursor", "format"];
 
     /// Read the parameters of a `/fragment` request.
     pub fn parse(
@@ -1711,6 +2056,8 @@ impl Fragment {
     ) -> Result<Self, Problem> {
         accept_only(params, FRAGMENT, Self::PARAMETERS)?;
         let pattern = Pattern::parse(params, limits, prefixes)?;
+        let graph = GraphScope::parse(params, limits, prefixes)?;
+        refuse_scoped_text(&pattern, &graph)?;
         let limit = page_size(
             params,
             "limit",
@@ -1720,10 +2067,13 @@ impl Fragment {
         )?;
         let binding = CursorBinding::new(
             bundle,
-            &pattern.canonicalize(CanonicalRequest::new(Operation::Fragment)),
+            &pattern
+                .canonicalize(CanonicalRequest::new(Operation::Fragment))
+                .with_opt("g", graph.canonical()),
         );
         Ok(Self {
             pattern,
+            graph,
             limit,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
             candidates: Candidates(limits.budgets.candidate_budget),
@@ -1747,6 +2097,7 @@ impl Tpf {
         "subject",
         "predicate",
         "object",
+        "graph",
         "values",
         "limit",
         "cursor",
@@ -1754,16 +2105,38 @@ impl Tpf {
     ];
 
     /// Parse only Hydra `ExplicitRepresentation`; this route never consults
-    /// the manifest prefix map.
+    /// the manifest prefix map. `memberships` says whether the release
+    /// declares `graphs`, which decides what an absent `graph` reads.
     pub fn parse(
         params: &Params,
         limits: Limits<'_>,
         bundle: &BundleBinding,
+        memberships: bool,
     ) -> Result<Self, Problem> {
         accept_only(params, TPF, Self::PARAMETERS)?;
         let pattern = BindingPattern::parse_tpf(params, limits)?;
+        let graph = GraphScope::parse_tpf(params, limits, memberships)?;
+        // A graph variable that repeats a pattern variable asks for each
+        // statement's graph to equal one of its own terms. This build scopes a
+        // request to one graph or to every graph and joins neither, so the
+        // repeat is refused rather than answered with the unjoined quad view —
+        // a superset, and silently the wrong answer for a client that does not
+        // filter it again.
+        if let Some(variable) = graph.tpf_variable()
+            && pattern.variables().any(|named| named.as_str() == variable)
+        {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "`graph` names {}, which the pattern already binds; this build does not \
+                     join a statement's graph to one of its own terms. Give the graph a \
+                     variable of its own, or scope the request with `graph=<IRI>`",
+                    reflected(variable)
+                ),
+            ));
+        }
         if params.get("values").is_some() {
-            return BindingFragment::parse_values(params, pattern, limits, bundle)
+            return BindingFragment::parse_values(params, pattern, graph, limits, bundle)
                 .map(Self::Values);
         }
 
@@ -1777,10 +2150,13 @@ impl Tpf {
         )?;
         let binding = CursorBinding::new(
             bundle,
-            &pattern.canonicalize(CanonicalRequest::new(Operation::Tpf)),
+            &pattern
+                .canonicalize(CanonicalRequest::new(Operation::Tpf))
+                .with_opt("g", graph.canonical()),
         );
         Ok(Self::Plain(Fragment {
             pattern,
+            graph,
             limit,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
             candidates: Candidates(limits.budgets.candidate_budget),
@@ -1795,6 +2171,8 @@ impl Tpf {
 pub struct Count {
     /// The pattern to count, text constraint included.
     pub pattern: Pattern,
+    /// Which memberships the pattern is counted over.
+    pub graph: GraphScope,
     /// Candidates a text constraint may examine.
     pub candidates: Candidates,
     /// Where to resume a budgeted text scan.
@@ -1805,7 +2183,7 @@ pub struct Count {
 
 impl Count {
     /// No `limit`: each request spends at most the published candidate budget.
-    const PARAMETERS: &'static [&'static str] = &["s", "p", "o", "o.text", "cursor", "format"];
+    const PARAMETERS: &'static [&'static str] = &["s", "p", "o", "o.text", "g", "cursor", "format"];
 
     /// Read the parameters of a `/count` request.
     pub fn parse(
@@ -1816,9 +2194,13 @@ impl Count {
     ) -> Result<Self, Problem> {
         accept_only(params, COUNT, Self::PARAMETERS)?;
         let pattern = Pattern::parse(params, limits, prefixes)?;
+        let graph = GraphScope::parse(params, limits, prefixes)?;
+        refuse_scoped_text(&pattern, &graph)?;
         let binding = CursorBinding::new(
             bundle,
-            &pattern.canonicalize(CanonicalRequest::new(Operation::Count)),
+            &pattern
+                .canonicalize(CanonicalRequest::new(Operation::Count))
+                .with_opt("g", graph.canonical()),
         );
         let cursor = resume(params, &binding)?;
         if cursor.is_some() && pattern.text().is_none() {
@@ -1828,10 +2210,82 @@ impl Count {
         }
         Ok(Self {
             pattern,
+            graph,
             candidates: Candidates(limits.budgets.candidate_budget),
             cursor,
             binding,
         })
+    }
+}
+
+/// `GET /graphs` — every graph of the bundle with its membership count.
+///
+/// Paged by graph id: the unnamed graph first, under its reserved name, when
+/// it holds any triple; then the named graphs in the sidecar's dictionary
+/// order. There is nothing to scope, so the request is only its page.
+#[derive(Debug)]
+pub struct GraphList {
+    /// Rows this page may carry.
+    pub limit: u32,
+    /// Bytes its rows may occupy.
+    pub bytes: ResponseBytes,
+    /// Where to resume, if the request carried a cursor.
+    pub cursor: Option<Cursor>,
+    /// What a cursor this request issues must match.
+    pub binding: CursorBinding,
+}
+
+impl GraphList {
+    const PARAMETERS: &'static [&'static str] = &["limit", "cursor", "format"];
+
+    /// Read the parameters of a `/graphs` request.
+    pub fn parse(
+        params: &Params,
+        limits: Limits<'_>,
+        bundle: &BundleBinding,
+    ) -> Result<Self, Problem> {
+        accept_only(params, GRAPHS, Self::PARAMETERS)?;
+        let limit = page_size(
+            params,
+            "limit",
+            limits.caps.default_limit,
+            limits.caps.max_limit,
+            "a listing has at least one row",
+        )?;
+        let binding = CursorBinding::new(bundle, &CanonicalRequest::new(Operation::Graphs));
+        let cursor = resume(params, &binding)?;
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.space != PositionSpace::Graph)
+        {
+            return Err(Problem::from(StaleCursor));
+        }
+        Ok(Self {
+            limit,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            cursor,
+            binding,
+        })
+    }
+}
+
+impl ObservedRequest for GraphList {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Graphs { limit: self.limit }
+    }
+
+    fn resumed(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    fn request_hash(&self) -> Option<[u8; 8]> {
+        Some(self.binding.request_hash())
+    }
+}
+
+impl GetRequest for GraphList {
+    fn normalize_params(params: &Params) -> Params {
+        params.without_empty(&["limit"])
     }
 }
 
@@ -2461,33 +2915,30 @@ impl Schema {
     }
 }
 
+/// Which description layer `/schema` reads.
+///
+/// The grammar is the store's, so a name this accepts is one a bundle can
+/// carry: `design`, `queryable`, `component:<id>`, and `graph:<IRI>` — a graph
+/// being a subset of the published triples, which is the same axis a component
+/// is on rather than a second one.
 fn schema_view(params: &Params) -> Result<StatsView, Problem> {
     match params.get("view") {
-        None | Some("design") => Ok(StatsView::Design),
-        Some("queryable") => Ok(StatsView::Queryable),
-        Some(value) => value
-            .strip_prefix("component:")
-            .and_then(StatsView::component)
-            .ok_or_else(|| {
-                Problem::new(
-                    ErrorCode::MalformedRequest,
-                    format!(
-                        "view={} is not a schema view; use `design`, `queryable`, or `component:<id>`",
-                        reflected(value)
-                    ),
-                )
-            }),
+        None => Ok(StatsView::Design),
+        Some(value) => StatsView::from_manifest_key(value).ok_or_else(|| {
+            Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "view={} is not a schema view; use `design`, `queryable`, \
+                     `component:<id>`, or `graph:<IRI>`",
+                    reflected(value)
+                ),
+            )
+        }),
     }
 }
 
 fn canonicalize_schema_view(view: &StatsView, request: CanonicalRequest) -> CanonicalRequest {
-    match view {
-        StatsView::Design => request.with("view", "design"),
-        StatsView::Queryable => request.with("view", "queryable"),
-        StatsView::Component(component) => {
-            request.with("view", &format!("component:{}", component.as_str()))
-        }
-    }
+    request.with("view", &view.manifest_key())
 }
 
 fn parse_schema_query(
@@ -2696,6 +3147,17 @@ pub(crate) trait ObservedRequest {
     /// Parsed structure and magnitudes, excluding client-supplied values.
     fn shape(&self) -> RequestShape;
 
+    /// Whether this request's answer can be written in the syntax that was
+    /// negotiated for it.
+    ///
+    /// Asked before the bundle opens, where every other refusal this request
+    /// can earn is decided, so a representation that cannot carry the answer
+    /// costs no mapping. The serializer checks again as it builds the page,
+    /// because it is the half that cannot be wrong.
+    fn representable(&self, _representation: Representation) -> Result<(), Problem> {
+        Ok(())
+    }
+
     /// Whether this request resumes a previous page.
     fn resumed(&self) -> bool {
         false
@@ -2745,8 +3207,13 @@ impl ObservedRequest for Fragment {
         RequestShape::Pattern {
             pattern: self.pattern.shape(),
             text: self.pattern.text().is_some(),
+            graph: self.graph.shape(),
             limit: Some(self.limit),
         }
+    }
+
+    fn representable(&self, representation: Representation) -> Result<(), Problem> {
+        one_graph_syntax_carries(&self.graph, representation)
     }
 
     fn resumed(&self) -> bool {
@@ -2763,6 +3230,13 @@ impl ObservedRequest for Tpf {
         match self {
             Self::Plain(request) => request.shape(),
             Self::Values(request) => request.shape(),
+        }
+    }
+
+    fn representable(&self, representation: Representation) -> Result<(), Problem> {
+        match self {
+            Self::Plain(request) => request.representable(representation),
+            Self::Values(request) => request.representable(representation),
         }
     }
 
@@ -2786,6 +3260,7 @@ impl ObservedRequest for Count {
         RequestShape::Pattern {
             pattern: self.pattern.shape(),
             text: self.pattern.text().is_some(),
+            graph: self.graph.shape(),
             limit: None,
         }
     }
@@ -2843,10 +3318,13 @@ impl ObservedRequest for Schema {
             SchemaQuery::ClassRelations(_) => ("root", None, Some("class-relations")),
             SchemaQuery::ClassProperties(_) => ("root", None, Some("class-properties")),
         };
+        // The kind, never the identity: a component id or a graph IRI is
+        // request content, and the access log records shapes.
         let view = match &self.view {
             StatsView::Design => "design",
             StatsView::Queryable => "queryable",
             StatsView::Component(_) => "component",
+            StatsView::Graph(_) => "graph",
         };
         RequestShape::Schema {
             selection,
@@ -2927,10 +3405,15 @@ impl ObservedRequest for BindingFragment {
         RequestShape::Bindings {
             pattern: self.pattern.shape(),
             text: false,
+            graph: self.graph.shape(),
             limit: Some(self.limit),
             k: self.bindings.row_count(),
             columns: self.bindings.column_count(),
         }
+    }
+
+    fn representable(&self, representation: Representation) -> Result<(), Problem> {
+        one_graph_syntax_carries(&self.graph, representation)
     }
 
     fn resumed(&self) -> bool {
@@ -2947,6 +3430,7 @@ impl ObservedRequest for BindingCount {
         RequestShape::Bindings {
             pattern: self.pattern.shape(),
             text: false,
+            graph: self.graph.shape(),
             limit: None,
             k: self.bindings.row_count(),
             columns: self.bindings.column_count(),
@@ -2975,7 +3459,7 @@ fn normalize_pattern_params(params: &Params, additional: &[&str]) -> Params {
 
 impl GetRequest for Fragment {
     fn normalize_params(params: &Params) -> Params {
-        normalize_pattern_params(params, &["o.text", "limit"])
+        normalize_pattern_params(params, &["o.text", "g", "limit"])
     }
 
     /// A text constraint is the only thing that takes this operation off its
@@ -2994,7 +3478,7 @@ impl GetRequest for Fragment {
 
 impl GetRequest for Tpf {
     fn normalize_params(params: &Params) -> Params {
-        params.without_empty(&["subject", "predicate", "object", "limit"])
+        params.without_empty(&["subject", "predicate", "object", "graph", "limit"])
     }
 
     fn work_class(&self) -> WorkClass {
@@ -3016,7 +3500,7 @@ impl GetRequest for Tpf {
 
 impl GetRequest for Count {
     fn normalize_params(params: &Params) -> Params {
-        normalize_pattern_params(params, &["o.text"])
+        normalize_pattern_params(params, &["o.text", "g"])
     }
 
     fn work_class(&self) -> WorkClass {
@@ -3132,20 +3616,20 @@ impl GetRequest for Terms {
 /// Protocol parameters for these operations that this deployment does not
 /// answer, and the capability each one needs.
 ///
-/// Refused, never ignored, and `g` is why the rule is absolute rather than
-/// pragmatic: a request scoped to one named graph and answered from the whole
-/// dataset is a wrong answer that carries no sign of being wrong. These are
-/// coded `capability_not_available` with **501**: the request is well
-/// formed, and the shortfall is the server's.
-/// Which operations define each one *for* is the third column, and it
-/// is load-bearing rather than documentation: `g=` on a `/sample` is not a
-/// graph-scoped sample this deployment cannot run; it is not a sample
-/// parameter. Answering that 501 would send an agent to look for a bundle
-/// declaring `graphs`, where the identical request would fail again.
+/// Refused, never ignored: a filter that is ignored produces a larger answer
+/// that carries no sign of being wrong. These are coded
+/// `capability_not_available` with **501**: the request is well formed, and
+/// the shortfall is the server's. Which operations define each one *for* is
+/// the third column, and it is load-bearing rather than documentation: a
+/// filter on an operation that does not define it is not a filter this
+/// deployment cannot run; it is not that operation's parameter. Answering
+/// that 501 would send an agent to look for a bundle declaring the
+/// capability, where the identical request would fail again.
 ///
 /// The table gives `/fragment` and `/count` the same filters but no `labels` on
-/// a count, since it has no rows to label. `labels=true` applies to operations
-/// that return rows, while graph scope applies only to fragment and count.
+/// a count, since it has no rows to label. `g` is not here any more: it is a
+/// parameter of `/fragment` and `/count`, and whether *this release* can
+/// answer a given form of it is decided per bundle, by the routes.
 const NOT_OFFERED: &[(&str, Option<Capability>, &[&str])] = &[
     ("o.lang", None, &[FRAGMENT, COUNT]),
     ("o.dt", None, &[FRAGMENT, COUNT]),
@@ -3158,7 +3642,6 @@ const NOT_OFFERED: &[(&str, Option<Capability>, &[&str])] = &[
         Some(Capability::Labels),
         &[FRAGMENT, DESCRIBE, SAMPLE],
     ),
-    ("g", Some(Capability::Graphs), &[FRAGMENT, COUNT]),
 ];
 
 const FRAGMENT: &str = "fragment";
@@ -3172,6 +3655,7 @@ const SUMMARY: &str = "summary";
 const SEARCH: &str = "search";
 const TERMS: &str = "terms";
 const LABELS: &str = "labels";
+const GRAPHS: &str = "graphs";
 
 /// Refuse anything `operation` does not take.
 fn accept_only(params: &Params, operation: &str, accepted: &[&str]) -> Result<(), Problem> {
@@ -3429,7 +3913,7 @@ mod tests {
     }
 
     fn tpf(query: &str) -> Result<Tpf, Problem> {
-        Tpf::parse(&params(query), limits(), &bundle())
+        Tpf::parse(&params(query), limits(), &bundle(), false)
     }
 
     fn schema(query: &str) -> Result<Schema, Problem> {
@@ -3574,7 +4058,7 @@ mod tests {
     #[test]
     fn an_explicit_empty_tpf_values_table_is_not_silently_ignored() {
         let normalized = Tpf::normalize_params(&params("values="));
-        let error = Tpf::parse(&normalized, limits(), &bundle()).unwrap_err();
+        let error = Tpf::parse(&normalized, limits(), &bundle(), false).unwrap_err();
         assert_eq!(error.code(), ErrorCode::MalformedRequest);
     }
 
@@ -3832,15 +4316,11 @@ mod tests {
 
     #[test]
     fn a_parameter_this_deployment_cannot_honour_is_refused_and_not_dropped() {
-        // The sharpest case: `g=` scopes a request to one named graph, so
-        // answering it from the whole dataset is wrong in a way the client
-        // cannot see. It gets 501: the request is fine, the server
-        // is not.
-        for (query, expected) in [
-            ("p=ex:a&g=%3Chttp%3A%2F%2Fexample.org%2Fg%3E", "graphs"),
-            ("o.ge=%2242%22", "range"),
-            ("labels=true", "labels"),
-        ] {
+        // A filter this build does not implement gets 501: the request is
+        // fine, the server is not. (`g=` used to be the sharpest case here;
+        // it is now a parameter of these operations, and whether one release
+        // can answer a given form of it is the route's decision.)
+        for (query, expected) in [("o.ge=%2242%22", "range"), ("labels=true", "labels")] {
             let refused = fragment(query).unwrap_err();
             assert_eq!(refused.code(), ErrorCode::CapabilityNotAvailable, "{query}");
             assert_eq!(refused.status(), 501);
@@ -3870,20 +4350,34 @@ mod tests {
     fn a_parameter_is_classified_against_the_operation_it_was_sent_to() {
         // 501 says "another bundle could answer this", so it is only the right
         // answer where the parameter is defined for the operation. `g=` belongs
-        // to fragment and count only, so a graph-scoped `/sample` is not a
-        // capability this deployment lacks; it is not a sample parameter, and sending an agent to look
-        // for a bundle declaring `graphs` would waste its next request.
+        // to fragment and count, which parse every form of it; a graph-scoped
+        // `/sample` is not a capability this deployment lacks, it is not a
+        // sample parameter, and sending an agent to look for a bundle
+        // declaring `graphs` would waste its next request.
         let scoped = "g=%3Chttp%3A%2F%2Fexample.org%2Fg%3E";
-        assert_eq!(
-            fragment(scoped).unwrap_err().code(),
-            ErrorCode::CapabilityNotAvailable
+        let parsed = fragment(scoped).expect("a named graph parses");
+        assert!(
+            matches!(parsed.graph.selector(), GraphSelector::Named(term) if term.dictionary() == "http://example.org/g")
         );
-        assert_eq!(
-            Count::parse(&params(scoped), limits(), &prefixes(), &bundle())
-                .unwrap_err()
-                .code(),
-            ErrorCode::CapabilityNotAvailable
-        );
+        assert!(parsed.graph.needs_sidecar());
+        assert_eq!(parsed.graph.requested(), Some("<http://example.org/g>"));
+        let quads = fragment("g=*").expect("the quad view parses");
+        assert!(quads.graph.is_quad_view() && quads.graph.needs_sidecar());
+        let unnamed = Count::parse(
+            &params("g=%3Curn%3Ax-kgf%3Aunnamed%3E"),
+            limits(),
+            &prefixes(),
+            &bundle(),
+        )
+        .expect("the unnamed graph parses");
+        assert!(matches!(unnamed.graph.selector(), GraphSelector::Unnamed));
+        assert!(!unnamed.graph.needs_sidecar());
+        let union = fragment("g=%3Curn%3Ax-kgf%3Aunion%3E").expect("the union constant parses");
+        assert!(matches!(union.graph.selector(), GraphSelector::Union));
+        // The union constant is no scope at all, so it binds the same cursor
+        // as an absent `g` — and any other scope binds a different one.
+        assert_eq!(union.binding, fragment("").unwrap().binding);
+        assert_ne!(parsed.binding, fragment("").unwrap().binding);
         assert_eq!(
             Sample::parse(&params(scoped), limits(), &prefixes())
                 .unwrap_err()
@@ -4114,11 +4608,101 @@ mod tests {
             crate::url::encode_value(empty_values)
         );
         assert_eq!(
-            Tpf::parse(&params(&query), limits(), &bundle())
+            Tpf::parse(&params(&query), limits(), &bundle(), false)
                 .unwrap_err()
                 .code(),
             ErrorCode::MalformedRequest,
             "a TPF values column not declared by its pattern must not be ignored"
+        );
+    }
+
+    /// What an absent `graph` reads depends on the release: a bundle with
+    /// memberships answers every membership, one without has only the union
+    /// to offer.
+    #[test]
+    fn an_absent_tpf_graph_reads_the_quad_view_only_where_memberships_exist() {
+        let unbound = "subject=%3Fs&predicate=%3Fp&object=%3Fo";
+        for (query, memberships, expected) in [
+            (unbound, true, GraphSelector::All),
+            (unbound, false, GraphSelector::Union),
+            ("graph=%3Fg", true, GraphSelector::All),
+            ("graph=%3Fg", false, GraphSelector::Union),
+            ("graph=urn%3Ax-kgf%3Aunion", true, GraphSelector::Union),
+            ("graph=urn%3Ax-kgf%3Aunnamed", true, GraphSelector::Unnamed),
+        ] {
+            let parsed = Tpf::parse(&params(query), limits(), &bundle(), memberships)
+                .unwrap_or_else(|error| panic!("{query}: {error}"));
+            let Tpf::Plain(fragment) = parsed else {
+                panic!("{query} carries no values table");
+            };
+            assert_eq!(
+                fragment.graph.selector(),
+                &expected,
+                "{query} with memberships={memberships}"
+            );
+        }
+
+        // A named graph parses as one whether or not the release declares the
+        // capability: the route refuses it afterwards, by capability, and its
+        // message names `graph` rather than `g`.
+        let named = Tpf::parse(
+            &params("graph=http%3A%2F%2Fexample.org%2Fg1"),
+            limits(),
+            &bundle(),
+            false,
+        )
+        .expect("a bare IRI is what this route's mapping declares");
+        let Tpf::Plain(fragment) = named else {
+            panic!("a plain pattern");
+        };
+        assert!(fragment.graph.needs_sidecar());
+        assert_eq!(fragment.graph.parameter().as_str(), "graph");
+        assert!(
+            fragment
+                .graph
+                .parameter()
+                .reserved_forms()
+                .contains("graph=urn:x-kgf:union")
+        );
+
+        // The route takes an IRI or a variable there, never a literal.
+        assert_eq!(
+            Tpf::parse(&params("graph=%22text%22"), limits(), &bundle(), true)
+                .unwrap_err()
+                .code(),
+            ErrorCode::BadTermSyntax
+        );
+    }
+
+    /// A graph variable that repeats a pattern variable asks for the graph to
+    /// equal a term of its own statement, and a table column for the graph
+    /// variable asks for a per-row scope. This build does neither, and says so
+    /// rather than answering the superset.
+    #[test]
+    fn a_tpf_graph_variable_is_refused_where_it_would_mean_a_join() {
+        let repeated = Tpf::parse(
+            &params("subject=%3Fg&predicate=%3Fp&object=%3Fo&graph=%3Fg"),
+            limits(),
+            &bundle(),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(repeated.code(), ErrorCode::MalformedRequest);
+        assert!(
+            repeated.to_string().contains("the pattern already binds"),
+            "a repeat is a different mistake from a table column: {repeated}"
+        );
+
+        let values = "(?s ?g) { (<http://example.org/x> <http://example.org/g1>) }";
+        let query = format!(
+            "subject=%3Fs&graph=%3Fg&values={}",
+            crate::url::encode_value(values)
+        );
+        let bound = Tpf::parse(&params(&query), limits(), &bundle(), true).unwrap_err();
+        assert_eq!(bound.code(), ErrorCode::MalformedRequest);
+        assert!(
+            bound.to_string().contains("binds the graph variable"),
+            "a table column is a different mistake from a repeat: {bound}"
         );
     }
 
@@ -4137,7 +4721,7 @@ mod tests {
             "subject=%3Fs&predicate=%3Fp&object=%3Fo&values={}",
             crate::url::encode_value(values)
         );
-        let error = Tpf::parse(&params(&query), limits, &bundle()).unwrap_err();
+        let error = Tpf::parse(&params(&query), limits, &bundle(), false).unwrap_err();
         assert_eq!(error.code(), ErrorCode::PayloadTooLarge);
         assert_eq!(error.status(), 413);
     }
@@ -4157,7 +4741,7 @@ mod tests {
 
         let query = "subject=%3F%3Fperson&predicate=http%3A%2F%2Fexample.org%2Fknows&object=%3Fknown&values=%28%3Fperson%29%20%7B%20%28%3Chttp%3A%2F%2Fexample.org%2Falice%3E%29%20%7D";
         assert_eq!(
-            Tpf::parse(&params(query), limits(), &bundle())
+            Tpf::parse(&params(query), limits(), &bundle(), false)
                 .unwrap_err()
                 .code(),
             ErrorCode::MalformedRequest
@@ -4171,7 +4755,7 @@ mod tests {
             "subject=%3Fp&object=%3Fknown&values={}",
             crate::url::encode_value(values)
         );
-        let parsed = Tpf::parse(&params(&query), limits(), &bundle()).unwrap();
+        let parsed = Tpf::parse(&params(&query), limits(), &bundle(), false).unwrap();
         let Tpf::Values(parsed) = parsed else {
             panic!("values= must select the bindings grammar")
         };
@@ -4198,7 +4782,7 @@ mod tests {
             crate::url::encode_value("http://example.org/knows"),
             crate::url::encode_value(values)
         );
-        let parsed = Tpf::parse(&params(&query), limits(), &bundle()).unwrap();
+        let parsed = Tpf::parse(&params(&query), limits(), &bundle(), false).unwrap();
         let Tpf::Values(parsed) = parsed else {
             panic!("values= must select the bindings grammar")
         };
@@ -4225,7 +4809,7 @@ mod tests {
             "subject=%3Fs&predicate=%3Fp&object=%3Fvalue&values={}",
             crate::url::encode_value(values)
         );
-        let parsed = Tpf::parse(&params(&query), limits(), &bundle()).unwrap();
+        let parsed = Tpf::parse(&params(&query), limits(), &bundle(), false).unwrap();
         let Tpf::Values(parsed) = parsed else {
             panic!("values= must select the bindings grammar")
         };

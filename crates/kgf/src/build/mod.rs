@@ -98,7 +98,7 @@ pub fn run(args: Args) -> Result<()> {
     let build = resolve_build(args, config)?;
 
     if build.dry_run {
-        print!("{}", execute::rehearse(&build));
+        print!("{}", execute::rehearse(&build)?);
         return Ok(());
     }
 
@@ -211,6 +211,16 @@ fn resolve_input(args: &Args) -> Result<Input> {
         (None, paths) => {
             for path in paths {
                 ensure!(path.exists(), "--input {} does not exist", path.display());
+                // A directory is not an input this command can take: every
+                // input is hashed into the manifest's provenance, and a
+                // directory has no digest. It also has no syntax, so nothing
+                // could say whether what is inside it carries named graphs.
+                ensure!(
+                    path.is_file(),
+                    "--input {} is a directory; name the files, one --input each, \
+                     so each one's digest reaches the manifest",
+                    path.display()
+                );
             }
             Ok(Input::Rdf {
                 paths: paths.to_vec(),

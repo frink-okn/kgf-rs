@@ -233,7 +233,7 @@ impl BundleFacts {
         let perm = open_published(bundle, &artifacts.perm)?;
         let data = IndexedHdt::open(hdt, perm)?;
 
-        artifacts.verify_graph_index()?;
+        let _graphs = artifacts.open_graphs(bundle)?;
         let _description = artifacts.open_description(bundle)?;
         // A manifest must not describe an optional capability whose complete
         // artifact cannot be opened. Reading only hdtc-text.meta would accept
@@ -661,9 +661,127 @@ pub struct Manifest {
     /// The version this one supersedes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_version: Option<String>,
+    /// The parts of this dataset the publisher named.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<Component>,
+    /// The component the design view describes, by id.
+    ///
+    /// Absent, the canonical component is it — the one and only `role: source`
+    /// — which is the legible view of a dataset whose native encoding is the
+    /// one its readers want. With several sources none is canonical, and the
+    /// design view is the dataset itself. Where the native encoding is not the
+    /// legible one, the publisher nominates: a KG written in OWL has its
+    /// restrictions and blank nodes in the canonical component, and the view
+    /// worth describing is a projection of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design: Option<String>,
     /// How this bundle was built, for re-derivation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<Source>,
+}
+
+/// One named part of the dataset.
+///
+/// A component is whatever the publisher declares one: the contributor's
+/// canonical release, an entailment, a derived overlay. It is not a claim about
+/// who built it — a bundle assembled elsewhere declares the components that
+/// arrived, and one this toolchain derives declares the ones it made.
+///
+/// Its extent is a named graph, so a component of a bundle carrying memberships
+/// is scopable (`g=`), counted, and described on its own. A component without a
+/// `graph` is provenance and nothing more: it records what went in and by what,
+/// and nothing can say which triples are its.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Component {
+    /// Stable handle for this part, and the `view=component:<id>` selector.
+    ///
+    /// The publisher's own name, which outlives the graph IRI that holds it: a
+    /// consumer keyed on the id survives an upstream rename.
+    pub id: String,
+    /// What kind of part it is.
+    pub role: ComponentRole,
+    /// The graph holding it, when the bundle can say which triples are its.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<String>,
+    /// The components it was computed over, by id.
+    ///
+    /// What the publisher says it was derived from. For a component this
+    /// toolchain did not build, that is a statement rather than a record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<String>,
+    /// What produced it, as the publisher names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator: Option<String>,
+    /// The entailment regime a `role: entailment` component was closed under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime: Option<String>,
+}
+
+/// What kind of part of the dataset a component is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ComponentRole {
+    /// The contributor's own data: the canonical component, and the one whose
+    /// schema the design view describes.
+    Source,
+    /// Triples derived from other components by some tool.
+    Derived,
+    /// Triples a reasoner entailed from other components.
+    Entailment,
+}
+
+impl ComponentRole {
+    /// The name this role is spelled by in a manifest and a build config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Derived => "derived",
+            Self::Entailment => "entailment",
+        }
+    }
+}
+
+impl Manifest {
+    /// The component the design view describes.
+    ///
+    /// The nominated one, or the canonical one where nothing nominates. `None`
+    /// where neither exists: a bundle declaring no components, or one whose
+    /// several `role: source` components leave no canonical one to pick, which
+    /// is refused when a bundle is built rather than guessed here.
+    pub fn design_component(&self) -> Option<&Component> {
+        design_component(&self.components, self.design.as_deref())
+    }
+
+    /// The component a graph holds, if one claims it.
+    pub fn component_of_graph(&self, graph: &str) -> Option<&Component> {
+        self.components
+            .iter()
+            .find(|component| component.graph.as_deref() == Some(graph))
+    }
+}
+
+/// The component the design view describes, among `components`.
+///
+/// `design` when it names one; otherwise the canonical component, which is the
+/// single `role: source` one. `None` for no components, and for several
+/// sources with nothing nominating among them. One rule, shared by the build
+/// that writes a design view and the verifier that checks it, so the two
+/// cannot disagree about which part of a dataset the view is.
+pub fn design_component<'a>(
+    components: &'a [Component],
+    design: Option<&str>,
+) -> Option<&'a Component> {
+    match design {
+        Some(id) => components.iter().find(|component| component.id == id),
+        None => {
+            let mut sources = components
+                .iter()
+                .filter(|component| component.role == ComponentRole::Source);
+            let first = sources.next()?;
+            sources.next().is_none().then_some(first)
+        }
+    }
 }
 
 /// Provenance: what this bundle was built from, and by what.
@@ -754,7 +872,72 @@ impl Manifest {
     /// same checks to an existing document. The path is used only to identify
     /// `manifest.json` in an error.
     pub fn validate(&self, bundle_dir: &Path) -> Result<()> {
+        self.validate_components()?;
         self.validate_description_artifacts(bundle_dir)
+    }
+
+    /// Check the declared components against each other.
+    ///
+    /// Only what the document itself can settle. Whether a component's graph is
+    /// one this bundle holds needs the membership sidecar, so it is checked
+    /// where the declaration is made rather than on every open.
+    fn validate_components(&self) -> Result<()> {
+        let syntax = |detail: String| Error::ManifestSyntax {
+            path: PathBuf::from("manifest.json"),
+            detail,
+        };
+        let mut ids = BTreeSet::new();
+        let mut graphs = BTreeSet::new();
+        for component in &self.components {
+            if crate::description::StatsView::component(component.id.clone()).is_none() {
+                return Err(syntax(format!(
+                    "component id {:?} cannot name a description view",
+                    component.id
+                )));
+            }
+            if !ids.insert(component.id.as_str()) {
+                return Err(syntax(format!(
+                    "component {:?} is declared twice",
+                    component.id
+                )));
+            }
+            if let Some(graph) = &component.graph
+                && !graphs.insert(graph.as_str())
+            {
+                return Err(syntax(format!(
+                    "graph {graph:?} is claimed by two components"
+                )));
+            }
+        }
+        for component in &self.components {
+            for input in &component.inputs {
+                if !ids.contains(input.as_str()) {
+                    return Err(syntax(format!(
+                        "component {:?} names input {input:?}, which no component declares",
+                        component.id
+                    )));
+                }
+            }
+        }
+        if let Some(design) = &self.design {
+            let Some(component) = self
+                .components
+                .iter()
+                .find(|component| &component.id == design)
+            else {
+                return Err(syntax(format!(
+                    "the design view names component {design:?}, which this manifest does \
+                     not declare"
+                )));
+            };
+            if component.graph.is_none() {
+                return Err(syntax(format!(
+                    "the design view names component {design:?}, which has no graph and so \
+                     no triples to describe"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Serialize to the canonical on-disk bytes: two-space indent, trailing
@@ -885,11 +1068,10 @@ impl Manifest {
                 }
             }
             for (view, range) in &entry.views {
-                let valid_name = matches!(view.as_str(), "design" | "queryable")
-                    || view
-                        .strip_prefix("component:")
-                        .is_some_and(|component| !component.is_empty());
-                if !valid_name {
+                // The grammar lives in `StatsView`, which is what a mapped
+                // bundle parses these names with: a name this accepts and that
+                // cannot parse would be a view no request could ever select.
+                if crate::description::StatsView::from_manifest_key(view).is_none() {
                     return Err(syntax(format!(
                         "artifact {name} has invalid view name {view:?}"
                     )));
@@ -1389,6 +1571,8 @@ mod tests {
             id: "tiny".to_owned(),
             dataset_iri: None,
             version: "2026-08-01".to_owned(),
+            components: Vec::new(),
+            design: None,
             content_digest: "sha256:0".to_owned(),
             created: None,
             formats: Formats::default(),

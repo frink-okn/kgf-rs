@@ -105,11 +105,25 @@ contents:                      # what changes bytes
     exclude_datatypes: []
     index_all_datatypes: false
     untagged_language: en
+  graphs:                      # named-graph memberships; every key tri-state
+    enabled: null              # null follows the input; true | false state it
+    transpose: null            # null follows the graph count
+    describe: null             # per-graph description views; null follows it too
   filters:                     # hdtc sketch — always built, doc 17 §17.3
     filter_bits: 16            # MinHash k is fixed federation-wide, §17.2
   keysets:                     # hdtc keyset — always built, doc 18 §18.4
     encoding: elias-fano
   stats: {}                  # always built; no knobs yet
+
+components:                    # the parts of this dataset, by id
+  asserted:                    # `role: source` is the canonical one
+    role: source               # source | derived | entailment
+    graph: http://example.org/asserted
+  closure:
+    role: entailment
+    graph: http://example.org/closure
+    inputs: [asserted]         # what the publisher says it was computed over
+design: asserted               # which component the design view describes
 
 resources:
   memory_limit: 4G
@@ -130,6 +144,100 @@ Two naming decisions worth stating, because both will look arbitrary later.
 §4.3's capability map calls them; `hdtc sketch` and `hdtc keyset` are the tools
 that happen to produce them today. The config describes the bundle, so renaming
 an hdtc subcommand must not be a config break.
+
+**`components:` declares, it does not build.** A component is whatever the
+publisher names one: the canonical release, an entailment, a derived overlay.
+Declaring it says what a part of the dataset *is* and binds it to the graph
+holding it; it does not ask this command to produce anything. An entry carrying
+a recipe — `files`, or a `tool` and its `inputs` — is the component DAG, which
+this build has no orchestrator for, and is refused with that reason rather than
+half-obeyed. So is `publish:`, which selects what such a DAG would merge.
+
+Three things follow from a declaration. The graph is described under
+`component:<id>` instead of `graph:<IRI>`, so a consumer keyed on the
+publisher's own handle survives an upstream rename of the IRI. `GET /graphs`
+says which graphs are components, and links each to its description. And one
+component becomes the *design view*, which `/schema?view=design` reads and the
+summary card is rendered from. A component with no `graph` is provenance and
+nothing more — it gets no view and no `g=` scope, because nothing can say which
+triples are its.
+
+**`design:` nominates that component**, and defaults to the canonical one. The
+default is right where a KG's own encoding is the one its readers want. It is
+wrong where the encoding is OWL: the canonical component then holds
+restrictions and blank nodes, and a card rendered from it describes RDF
+scaffolding rather than the classes and relations a reader came for, so the
+publisher nominates whichever projection is worth reading. A nomination must
+name a declared component that has a graph, since a component with no extent
+has nothing to describe. Where nothing is the design view — no component
+declared, or only derived ones — the design view describes the dataset itself,
+as it always did for a componentless bundle.
+
+The design view is its component's own graph description, so a design component
+whose graph the build will not describe is refused, never swapped for the union
+under the component's name. `contents.graphs.describe: false` beside one fails
+`--check-config`; more graphs than `GRAPH_DESCRIPTION_THRESHOLD` with `describe`
+unset fails the build once the sidecar says how many there are, before any
+expensive step. Either way the fix is to describe the graphs or to make no
+component with a graph the design view.
+
+A declaration is *trusted*: nothing checks that the graph named `asserted` holds
+the asserted axioms. What is checked is that the graph exists, that ids are
+usable and unique, that `inputs` name declared components, and that at most one
+component claims `role: source`, since the canonical one is what the design view
+describes.
+
+**`contents.graphs` is tri-state, not a boolean.** A bundle carries memberships
+when the input has memberships to carry, which neither `true` nor `false` can
+express: `null` (the default) follows the input — RDF written in a quad syntax,
+and an HDT with a `.graphs` sidecar beside it, carry graphs; everything else has
+none. The two stated values exist because both mistakes are real. `false` drops a
+quad source's graphs into the union *deliberately*, which is a thing to be able to
+say and not a thing to do by accident; `true` asks for them from any input and
+refuses an HDT that arrives without a sidecar, rather than publishing a bundle
+whose graphs went missing somewhere upstream. Whichever way it resolves, the
+sidecar is written by `hdtc create --mode quads` and indexed by a separate `hdtc
+graphs-index --positions pos,ops`: the index is where the two position-keyed layer
+sets a server requires are chosen, and `create --graphs-index` would choose them
+by its own default instead.
+
+**An HDT input brings its companions.** A `.graphs` sidecar beside it is taken
+when the bundle carries memberships, and a `.hdt.perm` beside it is taken
+instead of being rebuilt. Both bind to the HDT's own bytes, and opening one
+checks that binding before anything is published, so an index belonging to a
+different HDT is refused at the start rather than served later. The permutation
+is the hours in a build over a large graph, so taking one already built is what
+makes a second pass over the rest of the bundle affordable. An index carrying
+fewer position maps than `contents.perm.position_maps` names is refused, with
+the two ways out. The graph *index* is deliberately not taken: it is derived
+from the sidecar in minutes, and a server requires layer sets an arbitrary one
+need not carry. `--adopt` releases exactly what was taken.
+
+Two limits worth stating. Every `--input` is a file: each one's digest goes into
+the manifest's provenance, a directory has no digest, and a directory name says
+nothing about the syntax inside it either, so a directory is refused with that
+reason rather than walked. And which syntaxes carry graphs is hdtc's table, read
+through `hdtc::format::rdf_input_carries_graphs`, so this command cannot drift
+from what the builder will actually preserve — N-Quads, TriG and JSON-LD today.
+
+`transpose` is the same shape for the same reason. The quad view reads the graphs
+of one statement per row: from the transpose that is one lookup, without it one
+probe per graph, and the transpose's own size grows with the memberships it
+copies. `null` reads the graph count out of the sidecar the build just wrote and
+adds `--transpose-ids` above 32 graphs (`GRAPH_TRANSPOSE_THRESHOLD` in
+`build/plan.rs`). A bundle that knows better says so.
+
+`describe` is the same shape and bounds a different thing. The analysis itself
+costs about one pass over the memberships however they are divided up, since the
+graphs of a dataset partition its statements and describing all of them is
+describing each statement once. What grows with the *number* of graphs is the
+published description: three view ranges per graph in the manifest, which is
+served whole, and a class-and-property projection per graph in each of the three
+artifacts. So `null` describes each graph up to 256 of them
+(`GRAPH_DESCRIPTION_THRESHOLD`) and none above, which is where a manifest stops
+being a document. A KG split by source, by release or by inference layer is well
+under that and is the case the per-graph view exists for. Whatever it resolves
+to, the memberships are complete and `/graphs` pages them all.
 
 **`contents.perm`, `contents.filters`, and `contents.keysets` have no
 `enabled`.** `data.hdt.perm` is required by rule 1: no fallback for a missing
@@ -607,6 +715,9 @@ unknown fields, so a config written against doc 04's DAG fails with an
 explanation. Claiming the keys stays additive: when the DAG lands the refusal
 becomes an implementation, and no config that works today breaks. That is the whole reason for the `schema: 1` line.
 
-Named graphs are off for this deployment (plan §9): `hdtc create` drops the graph
-component of quads, so there is no `.graphs` sidecar and no `graphs` capability
-to declare.
+Named graphs are **not** on that list any more (2026-09-17). A quad input keeps
+its graphs, `contents.graphs` says what a build does with them, and the bundle
+declares `graphs` and describes each graph of its own. What is still absent is
+graphs *per component*: a component DAG would give each component its own
+subset, and how that composes with a source's own named graphs is a question
+for the DAG rather than for this command.

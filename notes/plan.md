@@ -2090,6 +2090,160 @@ request-layer test that the largest permitted prefix is accepted and one byte mo
 `cap_exceeded`, the capability-gate pair rewritten around a `terms` that is no longer
 declared, and the two stress bundles above driven through a real listener.
 
+### 30. Named graphs — the `graphs` capability
+
+**Planned 2026-09-16.** [`graphs.md`](graphs.md) is the read contract this unit meets;
+what follows is the order the work lands in, and the decisions each step had to make
+that the contract left to the implementation. hdtc already builds everything: `hdtc
+create --mode quads --graphs-index` writes `data.hdt.graphs` and `data.hdt.graphs.idx`,
+and `hdtc void --graph-view dataset` describes every graph as a `void:subset`. What was
+missing was on this side: the store never read the two artifacts it binding-checked,
+`g=` answered 501 from `NOT_OFFERED`, and `kgf build` could only make a triples bundle.
+
+The steps, each a commit reviewed on its own:
+
+1. **hdtc façade** (`../hdtc`, branch `graphs-facade`). A mapped reader needs the
+   sidecar's header and the index's typed section directory the way it already gets the
+   permutation index's, plus parsers for the three fixed-size records it must address
+   lazily — the 96-byte layer entry, the 48-byte chunk entry, and the 160-byte
+   Elias–Fano header — because a bundle may carry thousands of graphs and reading every
+   layer entry at open would make opening proportional to `G`. Nothing else is shared:
+   hdtc's seek-based `GraphSidecarReader` is its CLI's, as `PermutationIndex::triples`
+   is.
+2. **`rank::select0`.** Elias–Fano rank needs the position of the `h`-th zero of the
+   upper bitmap, over the same two-level directory `select1` walks.
+3. **`kgf-store::graphs`.** The mapped sidecar and index: header facts, the graph
+   dictionary as one more PFC section, one layer-set reader parameterised by which file
+   and which position space, and the three layer encodings behind one `Layer` API —
+   `count`, `rank`, `select`, `access`, `next_member` — each returning `Result` because
+   the chunk directories and Elias–Fano headers are validated on first touch rather than
+   at open. `graphs_of` and `memberships` read the transpose when the index carries it
+   and probe or sum the layers otherwise; that is one algorithm choosing on cost between
+   two structures the format defines as equivalent, not a fallback for a missing
+   artifact. `Store::open` requires the index to carry **both** POS and OPS layer sets,
+   naming `hdtc graphs-index` otherwise, and refuses a sidecar whose dictionary holds
+   either reserved IRI. Differential tests against `hdtc search`'s four-position
+   patterns and a naive oracle over every layer of a synthetic bundle wide enough to
+   produce all three encodings.
+4. **Scoped and quad-view selections.** `Selection::in_graph` and
+   `Selection::memberships` over all eight patterns in each pattern's native position
+   space: scoped counts are two ranks, scoped pages are `select`-driven, `s ? o` filters
+   its bounded probe by `access`; the quad view yields one row per membership in
+   position order then ascending graph id, counting by rank differences summed over the
+   layers or by the transpose. Cursors keep their existing spaces — the request binding
+   already carries `g` — and the quad view reuses the token's trailer for "memberships
+   of this triple already delivered", so a page may end inside one triple's graphs in
+   any space, the predicate space included.
+5. **`g=` on `/fragment` and `/count`**, GET and bindings bodies alike: the four forms,
+   the two constants accepted on every release, `g=<G>` and `g=*` gated on the
+   capability before the open, the `g` column and `vars` entry in the quad view, the
+   forms and answer pages, the access-log shape. The worked example of `graphs.md` as a
+   fixture, every count in both of its tables.
+6. **`GET /graphs`**: every named graph with its layer count, the unnamed graph under
+   its constant when non-empty, paged by graph id; the descriptor link and the manifest
+   page row.
+7. **`/tpf`**: the `graph` parameter in `ExplicitRepresentation`, the four-mapping Hydra
+   form with `sd:graph`, the blank-node `sd:defaultDataset [ sd:defaultGraph
+   <urn:x-kgf:union> ]` declaration, the per-row tagging rule of the serving table, and
+   the refusal of the quad view in Turtle. The Comunica harness gains the `GRAPH` cases.
+8. **`kgf build`**: `contents.graphs.enabled` selects `--mode quads --graphs-index` for
+   RDF input and, for an HDT input, requires and adopts the sidecar beside it and builds
+   the index; the reserved IRIs are refused before anything is published.
+9. **Per-graph statistics**: `hdtc void --graph-view dataset` on a graphs bundle, each
+   subset projected into `graph:<name>` views of the three TSVs beside `design` and
+   `queryable`, a `graphs` section in the summary, `StatsView::Graph` in the store, and
+   `g=` on `/schema` to select one.
+10. **Notes**: this unit's *What landed*, `graphs.md`'s status, and the questions for
+    `../kgf` the work raised.
+
+**What landed (2026-09-17).** All ten steps, in that order, each reviewed on its own.
+The contract in [`graphs.md`](graphs.md) held, with four amendments the code forced.
+
+**The union is untagged, always.** The contract had `g=<urn:x-kgf:union>` tag every
+statement with the constant, measured on an implementation whose fixture fit one page.
+It does not survive paging. Comunica 5.3.0 hands only a fragment's *first* page to its
+QPF source, whose filter honours the page's `sd:defaultGraph` declaration; every later
+page is identified as a plain RDF document and matched against the pattern's literal
+graph term, which knows nothing of the declaration. Tagged union rows therefore vanish
+from the second page on: a bare `?s ?p ?o` over one-row pages read one triple of three.
+Untagged rows page to the end, so the union is the document's default graph whether the
+request named the constant or left `graph` out. The cost is that stock Comunica reads
+nothing through an explicit `GRAPH <urn:x-kgf:union>`; that idiom belongs to this API
+and to a KGF-aware source, where the union is the default graph. The bare pattern is
+the query every client sends, and it is the one that must work.
+
+**A graph is a description view, not a second kind of description.** The plan said
+`g=` on `/schema`; what landed is `view=graph:<IRI>`, beside `design`, `queryable` and
+`component:<id>`. A graph and a component are on the same axis — both name a subset of
+the published triples, and the analysis expresses both as a `void:subset` — so the
+parameter that already chooses a subset is the one to extend. It also keeps `/schema`
+from having to explain what `g=*` would mean there. The grammar for these names now
+lives in `StatsView` alone: the manifest validates a name by parsing it, a mapped
+bundle parses it the same way, and a request is checked against it, so the three cannot
+drift. The build parses every name it emits for the same reason, and lays the views out
+in the order a mapped bundle walks them, which a reader requires.
+
+**`contents.graphs` is tri-state.** Whether a bundle carries memberships depends on the
+input, which neither `true` nor `false` can express. Omitted follows the input; `false`
+drops a quad source's graphs into the union deliberately; `true` refuses an HDT that
+arrives without a sidecar. `transpose` is the same shape: the quad view's `g` column
+costs one lookup per row with the transpose and one probe per graph without, while the
+transpose's size grows with the memberships it copies, so an unset value reads the
+graph count out of the sidecar the build just wrote and takes it above 32.
+
+**The reserved names are refused by running the runtime check.** `graphs.md` said no
+runtime check would be needed because the build refuses them. The build refuses them
+*with* that check: it opens the staged bundle as a server would, as soon as the two
+artifacts exist and before the text index, the sketches, the key sets and the
+description set. Refusing at parse time would be cheaper and needs hdtc to know these
+names, which is question 78 below rather than a table to duplicate here.
+
+Two bugs worth recording because both are the same shape — a check that cannot fire.
+The quad view's cursor carries how many of a triple's memberships the last page
+delivered, and comparing that against the first row the enumeration produced misses the
+forged trailer that produces *no* first row, which is what a trailer past the last
+triple's run does: the page came back empty and called itself complete. And `--adopt`
+released the caller's sidecar whether or not the bundle had taken it, so a build that
+deliberately dropped the graphs deleted the only copy of them. Neither was reachable
+from a passing test until one was written for it.
+
+*Verified by* the worked example of `graphs.md` as a fixture — every count in both of
+its tables, on every representation — differential tests against `hdtc search`'s
+four-position patterns and a naive oracle over a synthetic bundle wide enough to
+produce all three layer encodings, exhaustive paging of every form of `g` and `graph`
+at adversarial page sizes, forged cursors at every position and inside a bindings
+phase, a blank-node graph fixture, stock Comunica 5.3.0 as both a `qpf` and a `brtpf`
+source against one-row pages, and a bundle assembled by `kgf build` and served, which
+is the only test that can catch the build and the server disagreeing about what a view
+is called.
+
+**After review (2026-09-18): one IRI per node, and a design view that means what it
+says.** A blank graph name that is also a subject is now published under the
+subject's IRI, and a graph-only blank name is scoped by the membership sidecar's
+digest, which the graph index records and `kgf manifest` now checks against the
+sidecar it hashes anyway (question 77). The design view is its component's own subset,
+and publication verifies that rather than the proxy it checked before — that a bundle
+with component views never aliased `design` to `queryable` — which refused a bundle
+declaring only a derived component, where the dataset itself is the only design view
+there is. The converse was silent: a design component whose graph went undescribed,
+by `contents.graphs.describe: false` or by the graph-count threshold, got the union
+under its name. It is now refused, at `--check-config` when the config says so and
+as soon as the sidecar is read otherwise. Per-graph statistics declare
+`data.hdt.graphs` as a parent of `stats/void.hdt`, so regenerating a manifest over a
+replaced sidecar is refused. And `g=_:g` in an RDF syntax answers its empty page
+rather than a 500: the graph tag is built only when a statement needs it.
+
+**Several sources (2026-09-22): the design view is the dataset.** The build refused a
+config declaring more than one `role: source` component without `design:`, because
+the design doc had no rule for it. KnowWhereGraph is that shape: each of its bundles
+clumps several KWG source subgraphs, one component each, and none of them is the
+dataset. The rule is now the one a derived-only declaration already had: no component
+is canonical, so `design` aliases `queryable` at the dataset root. The store's
+`design_component` already answered `None` there, and the description set and
+publication check already handled it, so only the build's refusal went. Nominating one
+source stays available for a publisher who wants that part on the card. Doc 04 now
+states the rule.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
@@ -3043,12 +3197,81 @@ following the code.
     should say which cap governs it rather than leaving the answer to whatever an HTTP
     stack happens to allow.
 
+73. **`/search`'s `complete: true` says a top-k finished, not that the matches are
+    exhausted, and §3.6 has no word for the difference.** Unit 17 reads `limit` as a
+    requested top-k rather than a page size, so the entity loop stops the moment it has
+    kept `limit` subjects and the completeness decision weighs only the response-byte,
+    RDF-resolution, and text-candidate budgets. The two requests recorded in
+    `notes/search-completeness.md` are the symptom: over Ubergraph, `q=buffalo` at
+    `limit=100` answers 100 entities `complete: true, next: null`, and the same query at
+    `limit=1000` answers 742 the same way. Every other paged operation asks for
+    `limit + 1` and keeps `limit` precisely so a full page cannot claim completeness,
+    and §3.6 forbids silent truncation. So one of three has to be written down: §3.6
+    gains a term for a bounded ranking that exhausted no budget; or `/search` owes a
+    `page_limit` truncation with no cursor behind it, which the envelope contract must
+    then permit; or ranked entity paging gets specified along with the state it costs.
+    The note argues the third is the expensive one — ranking is over literals and the
+    response unit is entities, so deduplication happens after ranking and a cursor
+    naming a literal rank cannot keep a subject from reappearing. Found serving
+    Ubergraph.
+74. **The union must be untagged in every RDF representation, and the design should say
+    why.** [`graphs.md`](graphs.md) now carries the corrected serving table, but the
+    reasoning belongs to anyone implementing doc 03 over a quads bundle: a paging client
+    matches pages after the first against the pattern's literal graph term, so a union
+    row tagged with the reserved constant is dropped from the second page on. The
+    consequence is that `GRAPH <urn:x-kgf:union>` is not an idiom stock Comunica can
+    page, and the union is reached by a bare pattern plus the `sd:defaultGraph`
+    declaration. Measured against Comunica 5.3.0 at one row per page.
+75. **`g` beside `o.text` is refused, and §3.4 should say which error it is.** A ranked
+    text page is assembled from one selection per matching literal and this build scopes
+    none of them, so the request is well-formed and unanswerable: 400, not the 501 an
+    undeclared capability earns. If a later milestone scopes ranked pages the refusal
+    goes away, but until then the distinction is a client's only way to tell "not here"
+    from "not ever".
+76. **`/graphs` needs its response shape and its enumeration order in the spec.** What
+    landed lists the unnamed graph first when it holds a triple, then the named graphs
+    in the sidecar's dictionary order, with the cursor naming the next layer id. That
+    order is a cursor contract like every other enumeration order here, so it belongs in
+    doc 03 rather than only in this implementation.
+77. **A graph named by a blank node needs a stated spelling.** The sidecar stores such a
+    name as `_:label`, which means nothing outside the document it was parsed from. This
+    implementation publishes a node that also fills a triple position under its data
+    IRI, since the graph and the subject of `_:g :p :o _:g` are one resource, and one
+    found only as a graph name as `…:sha256:{sidecar-digest}:g-{layer}` — scoped by the
+    membership sidecar's digest rather than the HDT's, because a layer id means nothing
+    across two sidecars over one HDT. Every graph then has exactly one IRI, checked
+    against the sidecar when it comes back. A first cut keyed every blank graph by
+    layer id under the HDT's digest, which split the shared node in two and gave two
+    bundles with the same triples grouped differently one IRI for different graphs.
+    Whether this is the federation's answer, and whether a graph so named should be
+    listed at all, is a doc 03 question.
+78. **hdtc could refuse the two reserved graph IRIs at build time.** `kgf build` refuses
+    them by opening the finished sidecar the way a server does, which is after the whole
+    HDT has been built. hdtc knows a quad's graph as it reads it and could refuse there,
+    in seconds rather than hours — but the names are KGF's, not hdtc's, so this is a
+    question about where the federation's reserved vocabulary lives rather than a patch.
+79. **hdtc's dataset VoID view cannot say which subset is a blank-named graph.**
+    `--graph-view dataset` links a graph with an IRI for a name through
+    `sd:namedGraph`/`sd:name`, and emits a graph named by a blank node as a bare
+    `void:subset` with no link at all — which is exactly the shape the unnamed graph's
+    own subset has. A consumer cannot tell the two apart, so `kgf build` describes
+    neither rather than describing one under the other's name, and a bundle can list
+    more graphs through `/graphs` than its summary describes. A `sd:namedGraph` whose
+    `sd:name` is the blank node, or any other discriminator, would close it.
+80. **hdtc's sidecar format should say a blank graph name is scoped as the data is.**
+    Publishing a blank graph name under its data IRI when the node is in the data
+    rests on the sidecar and `data.hdt` spelling one node alike. hdtc does — its parser
+    applies one blank prefix to the subject, object and graph of a quad, and its design
+    notes say so — but `docs/graphs-sidecar-format.md` §5 says only "after input
+    blank-node scoping", which a conforming writer could read as a scoping of its own.
+    The normative text should say it is the scoping applied to `data.hdt`'s terms.
+
 ## Not in this plan
 
-Remaining composed operations (ranges, star, key resolution), graph scoping, and
-everything requiring a sidecar beyond `.perm` and the existing exhaustive text index.
-Those are doc 20 §20.8's later milestones and compose through the `Store`, envelope,
-cursor, term, and live-profile layers this plan builds.
+Remaining composed operations (ranges, star, key resolution) and everything requiring a
+sidecar beyond `.perm`, the exhaustive text index, and the graph memberships unit 30
+added. Those are doc 20 §20.8's later milestones and compose through the `Store`,
+envelope, cursor, term, and live-profile layers this plan builds.
 
 `kgf build` was deliberately absent from units 1–18 and landed as unit 21, once unit
 19 had settled enough of the consumer contract to say what a description set must

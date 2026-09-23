@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 use kgf_server::service::Service;
 use kgf_server::{AccessLog, AccessRecord};
-use kgf_store::testing::{Fixture, TINY_NT};
+use kgf_store::testing::{Fixture, TINY_NT, WORKED_EXAMPLE_NQ};
 use sha2::{Digest, Sha256};
 
 /// A second fixture graph, so two versions of one dataset differ in content and
@@ -1258,6 +1258,10 @@ fn stock_comunica_5_3_queries_the_tpf_endpoint() {
     remote.publish("remote", "v1", REMOTE_NT, "2026-06-01T14:03:22Z");
     let remote_server = remote.serve_with(caps);
     let remote_endpoint = format!("http://{}/remote/v/v1/tpf", remote_server.address);
+    let quads = Deployment::new();
+    quads.publish_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-06-01T14:03:22Z");
+    let quads_server = quads.serve_with(caps);
+    let quads_endpoint = format!("http://{}/quads/v/v1/tpf", quads_server.address);
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("interop/comunica/test.mjs");
@@ -1265,6 +1269,7 @@ fn stock_comunica_5_3_queries_the_tpf_endpoint() {
         .arg(script)
         .arg(endpoint)
         .arg(remote_endpoint)
+        .arg(quads_endpoint)
         .status()
         .expect("run Node.js; install it and run npm ci --prefix interop/comunica first");
     assert!(
@@ -1360,6 +1365,400 @@ fn void_and_summary_serve_the_published_description_in_every_format() {
     for operation in ["schema", "void", "summary"] {
         assert!(manifest.contains(&format!("href=\"/tox/v/v1/{operation}\"")));
     }
+}
+
+/// The graph scope over the wire: gated on the capability before any bundle
+/// opens, answerable in its reserved forms on every release, and paged
+/// through the quad view with the cursor the envelope carries.
+#[test]
+fn graph_scope_is_gated_on_the_capability_and_pages_over_the_wire() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    deployment.publish_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-01-09T09:00:00Z");
+    let server = deployment.serve();
+    let g1 = kgf_server::url::encode_value("<http://example.org/g1>");
+    let unnamed = kgf_server::url::encode_value("<urn:x-kgf:unnamed>");
+
+    // No memberships: a named graph and the quad view are 501 before the
+    // open; the two reserved names answer.
+    for target in [
+        format!("/tox/v/v1/fragment?g={g1}"),
+        format!("/tox/v/v1/count?g={g1}"),
+        "/tox/v/v1/fragment?g=*".to_owned(),
+    ] {
+        let refused = server.request("GET", &target, &[]);
+        refused.assert_status(501);
+        assert_eq!(
+            refused.json()["code"],
+            "capability_not_available",
+            "{target}"
+        );
+    }
+    let whole = server.request("GET", "/tox/v/v1/count", &[]).json()["count"]["value"]
+        .as_u64()
+        .unwrap();
+    let unnamed_count = server.request("GET", &format!("/tox/v/v1/count?g={unnamed}"), &[]);
+    unnamed_count.assert_status(200);
+    assert_eq!(unnamed_count.json()["count"]["value"], whole);
+
+    // The capability is declared for the quad bundle, and every form answers.
+    let manifest = server.request("GET", "/quads/v/v1/manifest", &[]).json();
+    assert!(
+        manifest["capabilities"]
+            .as_object()
+            .unwrap()
+            .contains_key("graphs"),
+        "{manifest}"
+    );
+    let count = server.request("GET", &format!("/quads/v/v1/count?g={g1}"), &[]);
+    count.assert_status(200);
+    assert_eq!(count.json()["count"]["value"], 2);
+    let quads = server.request("GET", "/quads/v/v1/count?g=*", &[]);
+    assert_eq!(quads.json()["count"]["value"], 5);
+
+    // Paged at one row: five pages, each resumed from the previous cursor,
+    // including the boundaries inside a triple's run.
+    let mut target = "/quads/v/v1/fragment?g=*&limit=1".to_owned();
+    let mut graphs = Vec::new();
+    loop {
+        let page = server.request("GET", &target, &[]);
+        page.assert_status(200);
+        let body = page.json();
+        assert_eq!(body["vars"], serde_json::json!(["s", "p", "o", "g"]));
+        graphs.push(body["rows"][0]["g"]["value"].as_str().unwrap().to_owned());
+        match body["next"].as_str() {
+            Some(next) => target = format!("/quads/v/v1/fragment?g=*&limit=1&cursor={next}"),
+            None => break,
+        }
+    }
+    assert_eq!(
+        graphs,
+        [
+            "urn:x-kgf:unnamed",
+            "http://example.org/g1",
+            "urn:x-kgf:unnamed",
+            "http://example.org/g1",
+            "http://example.org/g2",
+        ]
+    );
+
+    // The browser form offers the control only where it can be answered.
+    let form = server
+        .request("GET", "/quads/v/v1/fragment", &[("accept", "text/html")])
+        .text();
+    assert!(
+        form.contains("name=\"g\""),
+        "the quad bundle offers a graph control"
+    );
+    let form = server
+        .request("GET", "/tox/v/v1/fragment", &[("accept", "text/html")])
+        .text();
+    assert!(
+        !form.contains("name=\"g\""),
+        "a bundle without memberships does not"
+    );
+
+    // The listing is routed and linked only where the capability is declared.
+    let refused = server.request("GET", "/tox/v/v1/graphs", &[]);
+    refused.assert_status(501);
+    assert_eq!(refused.json()["code"], "capability_not_available");
+    let listing = server.request("GET", "/quads/v/v1/graphs", &[]);
+    listing.assert_status(200);
+    assert_eq!(listing.json()["graphs"].as_array().unwrap().len(), 3);
+    let page = server.request("GET", "/quads/v/v1/graphs", &[("accept", "text/html")]);
+    page.assert_status(200);
+    assert!(page.text().contains("urn:x-kgf:unnamed"));
+    let links = |dataset: &str| {
+        server.request("GET", &format!("/{dataset}"), &[]).json()["releases"][0]["links"].clone()
+    };
+    assert_eq!(links("quads")["graphs"], "/quads/v/v1/graphs");
+    assert!(links("tox").get("graphs").is_none());
+}
+
+/// The TPF route over a bundle with memberships: the four-position Hydra
+/// form with the union declared as the default graph, and the serving rule
+/// for every form of `graph` — the quad view with unnamed statements
+/// untagged, the union constant untagged like an absent `graph` but one row
+/// per distinct triple, and a named graph or the unnamed constant tagging
+/// with itself — with `hydra:totalItems` the count of the view requested.
+#[test]
+fn tpf_serves_the_quad_view_and_scoped_views_by_the_serving_table() {
+    const HYDRA: &str = "http://www.w3.org/ns/hydra/core#";
+    const SD: &str = "http://www.w3.org/ns/sparql-service-description#";
+    const UNION: &str = "urn:x-kgf:union";
+    const UNNAMED: &str = "urn:x-kgf:unnamed";
+
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    deployment.publish_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let nquads = |target: &str| -> Vec<oxrdf::Quad> {
+        let response = server.request("GET", target, &[("Accept", "application/n-quads")]);
+        response.assert_status(200);
+        oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
+            .for_slice(&response.body)
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|error| panic!("{target} did not parse: {error}"))
+    };
+    // Data statements: everything outside the page's metadata graph.
+    let data = |quads: &[oxrdf::Quad]| -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = quads
+            .iter()
+            .filter(|quad| {
+                !matches!(&quad.graph_name, oxrdf::GraphName::NamedNode(node)
+                    if node.as_str().ends_with("#metadata"))
+            })
+            .map(|quad| {
+                let graph = match &quad.graph_name {
+                    oxrdf::GraphName::DefaultGraph => String::new(),
+                    oxrdf::GraphName::NamedNode(node) => node.as_str().to_owned(),
+                    other => panic!("unexpected graph name {other}"),
+                };
+                (quad.object.to_string(), graph)
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let total_items = |quads: &[oxrdf::Quad]| -> u64 {
+        quads
+            .iter()
+            .find(|quad| quad.predicate.as_str() == format!("{HYDRA}totalItems"))
+            .and_then(|quad| match &quad.object {
+                oxrdf::Term::Literal(literal) => literal.value().parse().ok(),
+                _ => None,
+            })
+            .expect("hydra:totalItems")
+    };
+    let mappings = |quads: &[oxrdf::Quad]| -> Vec<String> {
+        let mut properties: Vec<String> = quads
+            .iter()
+            .filter(|quad| quad.predicate.as_str() == format!("{HYDRA}property"))
+            .map(|quad| quad.object.to_string())
+            .collect();
+        properties.sort();
+        properties
+    };
+    let default_graph = |quads: &[oxrdf::Quad]| -> Option<(bool, String)> {
+        quads
+            .iter()
+            .find(|quad| quad.predicate.as_str() == format!("{SD}defaultGraph"))
+            .map(|quad| {
+                (
+                    matches!(quad.subject, oxrdf::NamedOrBlankNode::BlankNode(_)),
+                    quad.object.to_string(),
+                )
+            })
+    };
+
+    // The graph-unbound quad view: five memberships, layer 0 untagged.
+    let unbound = nquads("/quads/v/v1/tpf?limit=10");
+    assert_eq!(total_items(&unbound), 5);
+    assert_eq!(
+        data(&unbound),
+        vec![
+            ("<http://example.org/c>".to_owned(), String::new()),
+            (
+                "<http://example.org/c>".to_owned(),
+                "http://example.org/g1".to_owned()
+            ),
+            ("<http://example.org/d>".to_owned(), String::new()),
+            (
+                "<http://example.org/z>".to_owned(),
+                "http://example.org/g1".to_owned()
+            ),
+            (
+                "<http://example.org/z>".to_owned(),
+                "http://example.org/g2".to_owned()
+            ),
+        ]
+    );
+    assert_eq!(
+        mappings(&unbound),
+        vec![
+            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#object>",
+            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#predicate>",
+            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#subject>",
+            "<http://www.w3.org/ns/sparql-service-description#graph>",
+        ],
+        "a bundle with memberships publishes the four-position form"
+    );
+    assert_eq!(
+        default_graph(&unbound),
+        Some((true, format!("<{UNION}>"))),
+        "the union is declared as the default graph under a blank-node subject"
+    );
+    assert!(unbound.iter().any(|quad| {
+        quad.predicate.as_str() == format!("{HYDRA}template")
+            && quad
+                .object
+                .to_string()
+                .contains("{?subject,predicate,object,graph}")
+    }));
+    // A variable, as a bindings-restricted client sends it, is the same view.
+    assert_eq!(
+        data(&nquads("/quads/v/v1/tpf?graph=%3Fg&limit=10")),
+        data(&unbound)
+    );
+
+    // The union constant: each triple once, in the document's default graph
+    // like the rows a bare pattern reads, never tagged with the constant.
+    let union = nquads(&format!("/quads/v/v1/tpf?graph={UNION}&limit=10"));
+    assert_eq!(total_items(&union), 3);
+    assert!(
+        data(&union).iter().all(|(_, graph)| graph.is_empty()) && data(&union).len() == 3,
+        "{:?}",
+        data(&union)
+    );
+
+    // A named graph and the unnamed graph, tagged with themselves.
+    let g1 = nquads("/quads/v/v1/tpf?graph=http%3A%2F%2Fexample.org%2Fg1&limit=10");
+    assert_eq!(total_items(&g1), 2);
+    assert_eq!(
+        data(&g1),
+        vec![
+            (
+                "<http://example.org/c>".to_owned(),
+                "http://example.org/g1".to_owned()
+            ),
+            (
+                "<http://example.org/z>".to_owned(),
+                "http://example.org/g1".to_owned()
+            ),
+        ]
+    );
+    let unnamed = nquads(&format!("/quads/v/v1/tpf?graph={UNNAMED}&limit=10"));
+    assert_eq!(total_items(&unnamed), 2);
+    assert!(data(&unnamed).iter().all(|(_, graph)| graph == UNNAMED));
+
+    // TriG names graphs too, so the quad view serializes in it unchanged.
+    let trig = server.request(
+        "GET",
+        "/quads/v/v1/tpf?limit=10",
+        &[("Accept", "application/trig")],
+    );
+    trig.assert_status(200);
+    let parsed: Vec<oxrdf::Quad> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::TriG)
+        .for_slice(&trig.body)
+        .collect::<Result<_, _>>()
+        .expect("TriG parses");
+    assert_eq!(data(&parsed), data(&unbound));
+
+    // Every form pages to the same rows one row at a time, following the
+    // `hydra:next` link of each page — which carries the scope it was issued
+    // under, and for the quad view a run trailer that resumes inside one
+    // triple's memberships.
+    let origin = format!("http://{}", server.address);
+    let next_link = |quads: &[oxrdf::Quad]| -> Option<String> {
+        quads
+            .iter()
+            .find(|quad| quad.predicate.as_str() == format!("{HYDRA}next"))
+            .and_then(|quad| match &quad.object {
+                oxrdf::Term::NamedNode(node) => Some(node.as_str().to_owned()),
+                _ => None,
+            })
+    };
+    let walk = |target: &str| -> Vec<(String, String)> {
+        let mut collected = Vec::new();
+        let mut next = Some(target.to_owned());
+        let mut pages = 0;
+        while let Some(target) = next {
+            pages += 1;
+            assert!(pages < 20, "{target} did not terminate");
+            let page = nquads(&target);
+            collected.extend(data(&page));
+            next = next_link(&page).map(|link| {
+                let path = link
+                    .strip_prefix(&origin)
+                    .unwrap_or_else(|| panic!("a page link addresses this server: {link}"));
+                path.to_owned()
+            });
+        }
+        collected.sort();
+        collected
+    };
+    for scope in [
+        String::new(),
+        format!("graph={UNION}&"),
+        "graph=http%3A%2F%2Fexample.org%2Fg1&".to_owned(),
+        format!("graph={UNNAMED}&"),
+    ] {
+        assert_eq!(
+            walk(&format!("/quads/v/v1/tpf?{scope}limit=1")),
+            data(&nquads(&format!("/quads/v/v1/tpf?{scope}limit=10"))),
+            "paging {scope:?} one row at a time"
+        );
+    }
+
+    // Turtle can carry one graph: the union and scoped views, not the quad view.
+    let refused = server.request(
+        "GET",
+        "/quads/v/v1/tpf?limit=10",
+        &[("Accept", "text/turtle")],
+    );
+    refused.assert_status(406);
+    assert_eq!(refused.json()["code"], "not_acceptable");
+    let turtle = server.request(
+        "GET",
+        &format!("/quads/v/v1/tpf?graph={UNION}&limit=10"),
+        &[("Accept", "text/turtle")],
+    );
+    turtle.assert_status(200);
+    let triples: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+        .for_slice(&turtle.body)
+        .collect::<Result<_, _>>()
+        .expect("Turtle parses");
+    assert_eq!(
+        triples
+            .iter()
+            .filter(|quad| quad.predicate.as_str() == "http://example.org/b"
+                || quad.predicate.as_str() == "http://example.org/y")
+            .count(),
+        3
+    );
+
+    // A bindings-restricted request keeps the same rule.
+    let values = kgf_server::url::encode_value("(?s) { (<http://example.org/x>) }");
+    let restricted = nquads(&format!(
+        "/quads/v/v1/tpf?subject=%3Fs&graph=%3Fg&values={values}&limit=10"
+    ));
+    assert_eq!(
+        data(&restricted),
+        vec![
+            (
+                "<http://example.org/z>".to_owned(),
+                "http://example.org/g1".to_owned()
+            ),
+            (
+                "<http://example.org/z>".to_owned(),
+                "http://example.org/g2".to_owned()
+            ),
+        ]
+    );
+    let bound_graph = server.request(
+        "GET",
+        &format!(
+            "/quads/v/v1/tpf?subject=%3Fs&graph=%3Fg&values={}&limit=10",
+            kgf_server::url::encode_value(
+                "(?s ?g) { (<http://example.org/x> <http://example.org/g1>) }"
+            )
+        ),
+        &[("Accept", "application/n-quads")],
+    );
+    bound_graph.assert_status(400);
+
+    // Without memberships: the three-position form, no default-graph
+    // declaration, and every statement untagged.
+    let plain = nquads("/tox/v/v1/tpf?limit=10");
+    assert_eq!(mappings(&plain).len(), 3);
+    assert_eq!(default_graph(&plain), None);
+    assert!(data(&plain).iter().all(|(_, graph)| graph.is_empty()));
+    let refused = server.request(
+        "GET",
+        "/tox/v/v1/tpf?graph=http%3A%2F%2Fexample.org%2Fg1&limit=10",
+        &[("Accept", "application/n-quads")],
+    );
+    refused.assert_status(501);
 }
 
 #[test]
@@ -1980,6 +2379,7 @@ fn a_page_is_admitted_the_same_way_in_every_representation_it_offers() {
 fn access_logging_emits_one_correlated_record_for_every_response() {
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    deployment.publish_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-06-01T14:03:22Z");
     let records = RecordingAccessLog::default();
     let server = deployment.serve_with_access(Arc::new(records.clone()), false);
     let fragment_path = "/tox/v/v1/fragment?limit=2";
@@ -2014,6 +2414,8 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
     malformed_rdf.assert_header("content-type", "application/problem+json");
     let latest_query = server.request("QUERY", "/tox/latest/fragment", &[]);
     latest_query.assert_status(307);
+    let graphs = server.request("GET", "/quads/v/v1/graphs?limit=1", &[]);
+    graphs.assert_status(200);
 
     let responses = [
         &page,
@@ -2024,6 +2426,7 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
         &latest,
         &malformed_rdf,
         &latest_query,
+        &graphs,
     ];
     let records = records.records();
     assert_eq!(records.len(), responses.len());
@@ -2109,6 +2512,23 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
     assert_eq!(
         records[7].transport,
         Some(kgf_server::access::Transport::Query)
+    );
+
+    // A listing records the shape of what it was asked for and how much of the
+    // answer it delivered, exactly as a pattern page does.
+    let listing = &records[8];
+    assert_eq!(
+        listing.operation,
+        Some(kgf_server::access::AccessOperation::Graphs)
+    );
+    assert_eq!(listing.dataset.as_deref(), Some("quads"));
+    assert_eq!(listing.rows, Some(1));
+    assert_eq!(listing.cardinality, Some(3));
+    assert_eq!(listing.complete, Some(false));
+    assert_eq!(listing.truncation_reason, Some("page_limit"));
+    assert_eq!(
+        serde_json::to_value(listing).unwrap()["shape"],
+        serde_json::json!({"limit": 1})
     );
 }
 
@@ -2947,6 +3367,63 @@ impl Deployment {
         self.publish_bundle(dataset, version, source, created, true);
     }
 
+    /// Build a quad bundle — sidecar and index beside the HDT — and describe it.
+    fn publish_quads(&self, dataset: &str, version: &str, source: &str, created: &str) {
+        self.publish_fixture(dataset, version, Fixture::build_quads(source), created);
+    }
+
+    /// Assemble a quad bundle with `kgf build`, the way a deployment does.
+    ///
+    /// The whole pipeline rather than a fixture: the description of each graph
+    /// is produced by the build and read back by the server, so this is the
+    /// only kind of test that can catch the two disagreeing about what a view
+    /// is called or where its rows are.
+    fn publish_built_quads(&self, dataset: &str, version: &str, source: &str, created: &str) {
+        self.publish_built(dataset, version, source, created, "");
+    }
+
+    /// The same, with extra build config appended — components, say.
+    fn publish_built(
+        &self,
+        dataset: &str,
+        version: &str,
+        source: &str,
+        created: &str,
+        extra: &str,
+    ) {
+        let workspace = tempfile::tempdir().expect("build scratch");
+        let input = workspace.path().join("source.nq");
+        std::fs::write(&input, source).expect("write the build's input");
+        let config = workspace.path().join("build.yaml");
+        std::fs::write(
+            &config,
+            format!(
+                "schema: 1\ndataset: {{id: {dataset}, iri: 'https://example.org/{dataset}'}}\n\
+                 semantics: {{prefixes: {{ex: 'http://example.org/'}}}}\n{extra}"
+            ),
+        )
+        .expect("write the build config");
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: kgf::build::Args,
+        }
+        let cli = Cli::parse_from([
+            "kgf-build",
+            "--config",
+            config.to_str().unwrap(),
+            "--out",
+            self.bundle(dataset, version).to_str().unwrap(),
+            "--input",
+            input.to_str().unwrap(),
+            "--hdtc",
+            kgf_store::testing::hdtc_binary().to_str().unwrap(),
+        ]);
+        kgf::build::run(cli.args).expect("build a quad bundle");
+        self.set_created(&self.bundle(dataset, version), created);
+    }
+
     fn publish_description(&self, dataset: &str, version: &str, created: &str) {
         self.publish_description_with_labels(dataset, version, created, true);
     }
@@ -3010,9 +3487,13 @@ impl Deployment {
         created: &str,
         text: bool,
     ) {
-        let bundle = self.bundle(dataset, version);
         let fixture = Fixture::build(source);
         let fixture = if text { fixture.with_text() } else { fixture };
+        self.publish_fixture(dataset, version, fixture, created);
+    }
+
+    fn publish_fixture(&self, dataset: &str, version: &str, fixture: Fixture, created: &str) {
+        let bundle = self.bundle(dataset, version);
         fixture.copy_bundle_to(&bundle);
 
         #[derive(Parser)]
@@ -3355,5 +3836,219 @@ impl Response {
             "header {name}; all headers were {:?}",
             self.headers
         );
+    }
+}
+
+/// A bundle the build assembled from quads describes every graph it holds, and
+/// the server reads those descriptions back under the names `/graphs` lists.
+///
+/// The whole pipeline in one test, because the two halves are only correct
+/// together: the build names a view after the graph, lays the rows out in the
+/// order a mapped bundle walks them, and records the ranges; the server parses
+/// the name a request sends with the same grammar and reads those ranges.
+#[test]
+fn a_built_quad_bundle_describes_each_of_its_graphs() {
+    const G1: &str = "http://example.org/g1";
+    const UNNAMED: &str = "urn:x-kgf:unnamed";
+
+    let deployment = Deployment::new();
+    deployment.publish_built_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-09-17T09:00:00Z");
+    let server = deployment.serve();
+
+    // The graphs the bundle holds, and the counts of the worked example.
+    let graphs = server.get("/quads/v/v1/graphs");
+    graphs.assert_status(200);
+    let listed: Vec<(String, u64)> = graphs.json()["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["g"]["value"].as_str().unwrap().to_owned(),
+                entry["count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            (UNNAMED.to_owned(), 2),
+            (G1.to_owned(), 2),
+            ("http://example.org/g2".to_owned(), 1),
+        ]
+    );
+
+    // Each graph has a description of its own, under the name it is listed by,
+    // and its counts are the graph's rather than the dataset's.
+    for (graph, triples) in [(UNNAMED, 2), (G1, 2), ("http://example.org/g2", 1)] {
+        let view = kgf_server::url::encode_value(&format!("graph:{graph}"));
+        let schema = server.get(&format!("/quads/v/v1/schema?view={view}"));
+        schema.assert_status(200);
+        let body = schema.json();
+        assert_eq!(body["view"], format!("graph:{graph}"), "{graph}");
+        assert_eq!(body["node"]["counts"]["triples"], triples, "{graph}");
+    }
+    // The union is what the dataset's own views describe, and it counts each
+    // distinct triple once rather than once per graph.
+    let whole = server.get("/quads/v/v1/schema?view=queryable");
+    assert_eq!(whole.json()["node"]["counts"]["triples"], 3);
+
+    // The persisted summary names the same graphs, and its links work.
+    let summary = server.get("/quads/v/v1/summary?format=json");
+    summary.assert_status(200);
+    let summary = summary.json();
+    let named: Vec<String> = summary["graphs"]
+        .as_array()
+        .expect("a quad bundle's summary names its graphs")
+        .iter()
+        .map(|entry| entry["graph"].as_str().unwrap().to_owned())
+        .collect();
+    // The card ranks by size; `/graphs` above lists by layer id.
+    assert_eq!(named, vec![G1, UNNAMED, "http://example.org/g2"]);
+    assert_eq!(summary["graphs_total"], 3);
+    for entry in summary["graphs"].as_array().unwrap() {
+        for link in ["schema", "fragment"] {
+            let followed = server.get(&format!(
+                "/quads/v/v1/{}",
+                entry["links"][link].as_str().unwrap()
+            ));
+            followed.assert_status(200);
+        }
+    }
+
+    // The browser page shows them too, with the way into each graph's triples.
+    let page = server.request("GET", "/quads/v/v1/summary", &[("Accept", "text/html")]);
+    page.assert_status(200);
+    let page = String::from_utf8(page.body.to_vec()).unwrap();
+    assert!(page.contains("Named graphs"), "{page}");
+    assert!(
+        page.contains("g=%3Chttp%3A%2F%2Fexample.org%2Fg1%3E"),
+        "{page}"
+    );
+
+    // A graph this bundle does not hold is a 404 that says where to look, and
+    // a view name of no known kind is refused before anything opens.
+    let missing = server.get("/quads/v/v1/schema?view=graph%3Ahttp%3A%2F%2Fexample.org%2Fnope");
+    missing.assert_status(404);
+    assert!(
+        missing.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("/graphs"),
+        "{missing:?}",
+        missing = missing.json()
+    );
+    let malformed = server.get("/quads/v/v1/schema?view=nonsense");
+    malformed.assert_status(400);
+    assert!(
+        malformed.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("graph:<IRI>"),
+        "{malformed:?}",
+        malformed = malformed.json()
+    );
+}
+
+/// A declared component is a graph with a name of its own: `/graphs` says which
+/// graph holds it, `/schema` describes it under that name, and the design view
+/// follows the canonical one rather than the merged whole.
+#[test]
+fn a_bundle_serves_the_components_it_declares() {
+    const G1: &str = "http://example.org/g1";
+
+    let deployment = Deployment::new();
+    deployment.publish_built(
+        "quads",
+        "v1",
+        WORKED_EXAMPLE_NQ,
+        "2026-09-17T09:00:00Z",
+        concat!(
+            "components:\n",
+            "  asserted: {role: source, graph: 'http://example.org/g1'}\n",
+            "  closure: {role: entailment, graph: 'http://example.org/g2', ",
+            "inputs: [asserted]}\n",
+        ),
+    );
+    let server = deployment.serve();
+
+    // The listing says which graphs are components, and which are not.
+    let graphs = server.get("/quads/v/v1/graphs");
+    graphs.assert_status(200);
+    let claimed: Vec<(String, Option<String>)> = graphs.json()["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["g"]["value"].as_str().unwrap().to_owned(),
+                entry["component"].as_str().map(str::to_owned),
+            )
+        })
+        .collect();
+    assert_eq!(
+        claimed,
+        vec![
+            ("urn:x-kgf:unnamed".to_owned(), None),
+            (G1.to_owned(), Some("asserted".to_owned())),
+            (
+                "http://example.org/g2".to_owned(),
+                Some("closure".to_owned())
+            ),
+        ]
+    );
+
+    // Its description is under the component's id, and asking for the graph's
+    // own name says where to look instead.
+    let component = server.get("/quads/v/v1/schema?view=component%3Aasserted");
+    component.assert_status(200);
+    assert_eq!(component.json()["node"]["counts"]["triples"], 2);
+    let by_graph = server.get("/quads/v/v1/schema?view=graph%3Ahttp%3A%2F%2Fexample.org%2Fg1");
+    by_graph.assert_status(404);
+    assert!(
+        by_graph.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("view=component:asserted"),
+        "{:?}",
+        by_graph.json()
+    );
+
+    // The design view is the canonical component, not the merged graph: two of
+    // the three distinct triples.
+    let design = server.get("/quads/v/v1/schema?view=design");
+    design.assert_status(200);
+    assert_eq!(design.json()["node"]["counts"]["triples"], 2);
+    let queryable = server.get("/quads/v/v1/schema?view=queryable");
+    assert_eq!(queryable.json()["node"]["counts"]["triples"], 3);
+
+    // And the manifest publishes what was declared.
+    let manifest = server.get("/quads/v/v1/manifest").json();
+    assert_eq!(manifest["components"][0]["id"], "asserted");
+    assert_eq!(manifest["components"][1]["role"], "entailment");
+    assert_eq!(manifest["components"][1]["inputs"][0], "asserted");
+
+    // A reader can get from the listing to each part's description, and from
+    // one description to another: which view answers a question depends on
+    // what the reader came to find out, so no page is a dead end.
+    let listing = server.request("GET", "/quads/v/v1/graphs", &[("Accept", "text/html")]);
+    listing.assert_status(200);
+    let listing = String::from_utf8(listing.body.to_vec()).unwrap();
+    for view in ["component%3Aasserted", "component%3Aclosure"] {
+        assert!(
+            listing.contains(&format!("schema?view={view}")),
+            "{listing}"
+        );
+    }
+    let page = server.request(
+        "GET",
+        "/quads/v/v1/schema?view=component%3Aasserted",
+        &[("Accept", "text/html")],
+    );
+    page.assert_status(200);
+    let page = String::from_utf8(page.body.to_vec()).unwrap();
+    assert!(page.contains("schema-views"), "{page}");
+    for view in ["design", "queryable", "component%3Aclosure"] {
+        assert!(page.contains(&format!("view={view}")), "missing {view}");
     }
 }
