@@ -173,7 +173,13 @@ pub(crate) fn produce(inputs: Inputs<'_>, into: &Path) -> Result<Outcome> {
     }
     runner.run(&super::hdtc::Step {
         name: "queryable VoID analysis",
-        temp: None,
+        // The dataset view transposes graph memberships into triple order, by
+        // external sort once there are more graphs than a k-way merge holds
+        // open — 128 layers, inside the 256 graphs described by default.
+        // Without a directory of its own that sort spills into the node's
+        // system temp, which on a cluster may be small or backed by the job's
+        // own memory.
+        temp: Some("void"),
         args: void_args,
     })?;
 
