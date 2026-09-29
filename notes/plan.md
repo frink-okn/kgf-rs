@@ -2525,6 +2525,26 @@ fixed, two recorded below as open.
   the pages behind (`posix_fadvise(DONTNEED)`) would avoid it, at the cost of a second
   read path. Worth measuring on the largest bundles before building.
 
+### 32. The human view, revisited — an idea
+
+**Noted 2026-09-29; not yet planned.** Unit 18 made the HTML a browser workbench, and
+every route since has added its page to that frame one at a time. The idea is to
+reconsider the human view as a whole — what a visitor arriving at the catalog, a
+dataset, or a release is there to do, and whether the pages lead them to it —
+rather than patch each page as a feature lands.
+
+The first concrete gap is the one that prompted the note: unit 31's download is
+advertised in HTML only by a "Download" section near the bottom of a release's manifest
+page, below its configuration tables. The service page's dataset cards and the dataset
+page's row of links (understand, schema, browse, TPF, manifest) do not mention it, though
+the dataset descriptor's JSON carries the link, and sizes appear only as exact byte
+counts. So a visitor wanting the data goes catalog → dataset → "Latest manifest" →
+scroll. Candidates, to fold into the revamp rather than land piecemeal: a "Download HDT
+(26.4 MB)" link on the dataset page pointing at the current release's versioned URL;
+the manifest page's download panel beside its operations rather than after its
+configuration; human-readable sizes beside exact ones; possibly a download link on each
+catalog card; and step 3's `/export` listing as the download's own page.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
