@@ -26,6 +26,7 @@ use kgf_store::Capability;
 use kgf_store::manifest::{Manifest, Publisher};
 use serde::Serialize;
 
+use crate::export::ExportArtifact;
 use crate::forms;
 use crate::html::{
     Crumb, Resource, SITE, Value, chips, compact_number, fields, group_digits, json_body, note,
@@ -119,6 +120,8 @@ pub struct ReleaseLinks {
     labels: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     graphs: Option<String>,
+    /// The whole dataset as standard HDT, resumable by byte range.
+    hdt: String,
 }
 
 /// Which build and protocol answered.
@@ -494,6 +497,8 @@ fn release_links(
         graphs: release
             .declares(Capability::Graphs)
             .then(|| operation("graphs")),
+        // Unconditional for the same reason: `data.hdt` is required.
+        hdt: mount.export(dataset, version, ExportArtifact::Hdt.name()),
     }
 }
 
@@ -563,6 +568,31 @@ impl Resource for BundleManifest {
             .keys()
             .zip(&role_members)
             .map(|(role, predicates)| vec![Value::Code(role), Value::Code(predicates)])
+            .collect();
+        let downloads: Vec<(ExportArtifact, String, String)> = ExportArtifact::ALL
+            .iter()
+            .map(|&artifact| {
+                (
+                    artifact,
+                    self.mount
+                        .export(&self.dataset, &self.version, artifact.name()),
+                    artifact.saved_name(&self.dataset, &self.version),
+                )
+            })
+            .collect();
+        let download_rows: Vec<_> = downloads
+            .iter()
+            .map(|(artifact, href, _)| {
+                let entry = manifest.artifacts.get(artifact.name());
+                vec![
+                    Value::Link {
+                        href: href.clone(),
+                        label: artifact.name(),
+                    },
+                    entry.map_or(Value::Absent, |entry| Value::Number(entry.bytes)),
+                    entry.map_or(Value::Absent, |entry| Value::Code(&entry.sha256)),
+                ]
+            })
             .collect();
         let artifacts: Vec<_> = manifest
             .artifacts
@@ -696,6 +726,25 @@ impl Resource for BundleManifest {
                             (note("The federation label defaults apply."))
                         } @else {
                             (table(&["Role", "Predicates (strongest first)"], &predicate_roles))
+                        }
+                    }
+                }
+
+                section."section-block" {
+                    h2 { "Download" }
+                    (note(
+                        "The whole dataset as standard HDT. Downloads resume by byte range, are \
+                         compressed in transit when the client asks, and carry their SHA-256 as \
+                         the ETag and Repr-Digest. Use this versioned URL rather than latest, so a \
+                         resume can never continue into a different release."
+                    ))
+                    (table(&["Artifact", "Bytes", "SHA-256"], &download_rows))
+                    pre {
+                        code {
+                            @for (_, href, saved) in &downloads {
+                                "curl -fL -C - -o " (saved) " \"$KGF" (href) "\"\n"
+                                "shasum -a 256 " (saved) "\n"
+                            }
                         }
                     }
                 }

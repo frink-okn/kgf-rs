@@ -59,6 +59,7 @@ use crate::access::{AccessState, OpenTiming, millis};
 use crate::admission::AdmissionController;
 use crate::cursor::BundleBinding;
 use crate::envelope::{ErrorCode, Problem, reflected};
+use crate::export::{ArtifactIdentity, ExportArtifact};
 use crate::representation::ContentDigest;
 use crate::term::PrefixMap;
 use crate::url::Mount;
@@ -462,6 +463,11 @@ impl Datasets {
                     refuse(format!("created {text:?} is not an RFC 3339 timestamp"))
                 })?),
             };
+            // Every download's validator and digest come from here, so a
+            // manifest that cannot supply them is refused with the rest of its
+            // defects rather than discovered by the first client to ask.
+            let hdt =
+                ArtifactIdentity::from_manifest(&manifest, ExportArtifact::Hdt).map_err(&refuse)?;
 
             datasets.entry(id.dataset).or_default().insert(
                 id.version,
@@ -475,6 +481,7 @@ impl Datasets {
                     // allocate a hundred strings to read something fixed.
                     prefixes: PrefixMap::from_manifest(&manifest),
                     predicate_roles,
+                    hdt,
                     manifest: published,
                 },
             );
@@ -716,6 +723,7 @@ pub struct Release {
     created: Option<Instant>,
     prefixes: PrefixMap,
     predicate_roles: PredicateRoles,
+    hdt: ArtifactIdentity,
     manifest: PublishedManifest,
 }
 
@@ -770,6 +778,21 @@ impl Release {
     /// Whether this bundle declares `capability`.
     pub fn declares(&self, capability: Capability) -> bool {
         self.manifest.parsed.declares(capability)
+    }
+
+    /// The length and digest of an artifact this release serves whole.
+    pub fn export(&self, artifact: ExportArtifact) -> ArtifactIdentity {
+        match artifact {
+            ExportArtifact::Hdt => self.hdt,
+        }
+    }
+
+    /// When this release was published, as `Last-Modified` states it.
+    ///
+    /// `None` for a manifest without `created`, and for one dated before the
+    /// Unix epoch, which an HTTP date cannot express.
+    pub fn last_modified(&self) -> Option<std::time::SystemTime> {
+        crate::export::http_instant(self.created?.as_second())
     }
 
     /// Whether this release carries the complete Tier-1 description set.
@@ -851,7 +874,7 @@ mod tests {
     use super::*;
     use crate::descriptor::DatasetDescriptor;
     use crate::html::Resource;
-    use kgf_store::manifest::{Counts, Formats};
+    use kgf_store::manifest::{ArtifactEntry, Counts, Formats};
 
     fn published(version: &str, digest_byte: &str, created: Option<&str>) -> PublishedManifest {
         PublishedManifest::of(Manifest {
@@ -875,7 +898,10 @@ mod tests {
             capabilities: BTreeMap::new(),
             prefixes: BTreeMap::new(),
             predicate_roles: BTreeMap::new(),
-            artifacts: BTreeMap::new(),
+            artifacts: BTreeMap::from([(
+                artifact::HDT.to_owned(),
+                ArtifactEntry::checksum(1024, "ab".repeat(32)),
+            )]),
             previous_version: None,
             components: Vec::new(),
             design: None,
@@ -1091,6 +1117,37 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("kgf manifest"), "{message}");
+    }
+
+    #[test]
+    fn a_manifest_without_the_hdt_checksum_stops_the_server() {
+        // Every download's validator and digest are the manifest's, so a
+        // manifest that cannot supply them is a defect found at startup.
+        for sha256 in [None, Some("AB".repeat(32)), Some("ab".repeat(31))] {
+            let mut manifest = (*published("v1", "1", None).parsed()).clone();
+            match sha256 {
+                None => {
+                    manifest.artifacts.remove(artifact::HDT);
+                }
+                Some(sha256) => {
+                    manifest.artifacts.insert(
+                        artifact::HDT.to_owned(),
+                        ArtifactEntry::checksum(1024, sha256),
+                    );
+                }
+            }
+            let error = Datasets::derive(
+                [(
+                    id("tox", "v1"),
+                    PublishedManifest::of(manifest).expect("serializes"),
+                )],
+                Mount::default(),
+            )
+            .expect_err("a download could not be validated");
+            let message = error.to_string();
+            assert!(message.contains("data.hdt"), "{message}");
+            assert!(message.contains("kgf manifest"), "{message}");
+        }
     }
 
     #[test]

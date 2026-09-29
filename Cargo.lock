@@ -1066,7 +1066,9 @@ name = "kgf"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
+ "flate2",
  "hdtc",
  "kgf-server",
  "kgf-store",
@@ -1081,6 +1083,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]
@@ -1092,10 +1095,12 @@ dependencies = [
  "axum-extra",
  "base64",
  "bytes",
+ "flate2",
  "getrandom 0.3.4",
  "hdtc",
  "headers",
  "headers-accept",
+ "http-body",
  "jiff",
  "kgf-store",
  "maud",
@@ -1113,6 +1118,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

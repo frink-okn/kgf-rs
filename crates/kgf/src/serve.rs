@@ -64,6 +64,14 @@ pub struct Args {
     #[arg(long, default_value_t = 500)]
     pub queue_timeout_ms: u64,
 
+    /// Whole-artifact downloads streaming at once; each holds its slot until the transfer ends.
+    #[arg(long, default_value_t = 16)]
+    pub max_concurrent_downloads: u32,
+
+    /// Downloads one client (an IPv4 address or IPv6 /64, per --trusted-proxies) may stream at once.
+    #[arg(long, default_value_t = 4)]
+    pub max_downloads_per_client: u32,
+
     /// Structured access-record destination.
     #[arg(long, value_enum, default_value_t = AccessLogOutput::Stdout)]
     pub access_log: AccessLogOutput,
@@ -107,6 +115,8 @@ pub fn run(args: Args) -> Result<()> {
         heavy_request_weight: args.heavy_request_weight,
         max_queued_requests: args.max_queued_requests,
         queue_timeout_ms: args.queue_timeout_ms,
+        max_concurrent_downloads: args.max_concurrent_downloads,
+        max_downloads_per_client: args.max_downloads_per_client,
     };
     config.access_log = args.access_log.sink()?;
     config.log_raw = args.log_raw;

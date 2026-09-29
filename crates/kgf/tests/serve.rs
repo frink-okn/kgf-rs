@@ -1817,6 +1817,401 @@ fn a_versioned_manifest_is_immutable_cacheable_and_conditional() {
     assert_ne!(page.header("etag"), Some(etag));
 }
 
+/// The published `data.hdt`, as a download: whole, by range, conditionally,
+/// and with the validators that make a resume safe.
+#[test]
+fn a_download_is_the_published_hdt_resumable_and_verifiable() {
+    use base64::Engine as _;
+
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    let file = std::fs::read(deployment.bundle("tox", "v1").join("data.hdt")).expect("the HDT");
+    let len = file.len();
+    let digest = Sha256::digest(&file);
+    let strong = format!("\"sha256:{digest:x}\"");
+    let repr_digest = format!(
+        "sha-256=:{}:",
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    );
+    let server = deployment.serve();
+    let target = "/tox/v/v1/export/data.hdt";
+
+    // The whole artifact, byte for byte, under its own digest.
+    let whole = server.get(target);
+    whole.assert_status(200);
+    assert_eq!(whole.body, file);
+    whole.assert_header("content-type", "application/vnd.hdt");
+    whole.assert_header("content-length", &len.to_string());
+    whole.assert_header("accept-ranges", "bytes");
+    whole.assert_header("etag", &strong);
+    whole.assert_header("repr-digest", &repr_digest);
+    whole.assert_header("last-modified", "Fri, 09 Jan 2026 09:00:00 GMT");
+    whole.assert_header("content-disposition", "attachment; filename=\"tox-v1.hdt\"");
+    whole.assert_cache_control(&["public", "max-age=31536000", "immutable", "no-transform"]);
+    assert_encoding_vary(&whole, "identity download");
+    assert_eq!(whole.header("content-encoding"), None);
+
+    // HEAD describes that GET exactly.
+    let head = server.request("HEAD", target, &[]);
+    head.assert_status(200);
+    for name in [
+        "content-length",
+        "etag",
+        "repr-digest",
+        "accept-ranges",
+        "content-type",
+    ] {
+        assert_eq!(head.header(name), whole.header(name), "{name}");
+    }
+
+    // Every range form, each carrying the whole representation's digest.
+    let ranges = [
+        ("bytes=10-19".to_owned(), 10..20),
+        ("bytes=-7".to_owned(), len - 7..len),
+        (format!("bytes={}-", len - 5), len - 5..len),
+        (format!("bytes=3-{}", len * 2), 3..len),
+    ];
+    for (header, span) in ranges {
+        let part = server.request("GET", target, &[("range", &header)]);
+        part.assert_status(206);
+        assert_eq!(part.body, file[span.clone()], "{header}");
+        part.assert_header(
+            "content-range",
+            &format!("bytes {}-{}/{len}", span.start, span.end - 1),
+        );
+        part.assert_header("content-length", &span.len().to_string());
+        part.assert_header("etag", &strong);
+        part.assert_header("repr-digest", &repr_digest);
+    }
+
+    // A resume that names this artifact is honoured; one naming anything else
+    // gets the whole file rather than a splice.
+    let resumed = server.request(
+        "GET",
+        target,
+        &[("range", "bytes=10-"), ("if-range", &strong)],
+    );
+    resumed.assert_status(206);
+    assert_eq!(resumed.body, file[10..]);
+    let stale = server.request(
+        "GET",
+        target,
+        &[("range", "bytes=10-"), ("if-range", "\"sha256:00\"")],
+    );
+    stale.assert_status(200);
+    assert_eq!(stale.body, file);
+
+    // A range is identity even to a client that accepts compression, which
+    // is what makes a decoding client's file length a valid resume offset.
+    let identity = server.request(
+        "GET",
+        target,
+        &[("range", "bytes=10-19"), ("accept-encoding", "zstd, gzip")],
+    );
+    identity.assert_status(206);
+    assert_eq!(identity.header("content-encoding"), None);
+    assert_eq!(identity.body, file[10..20]);
+
+    // Several distant ranges are one multipart response.
+    let tail = len - 4;
+    let multi = server.request("GET", target, &[("range", &format!("bytes={tail}-,0-3"))]);
+    multi.assert_status(206);
+    let content_type = multi.header("content-type").unwrap();
+    let boundary = content_type
+        .strip_prefix("multipart/byteranges; boundary=")
+        .unwrap_or_else(|| panic!("a multipart type, got {content_type}"));
+    multi.assert_header("content-length", &multi.body.len().to_string());
+    let parts = multipart_parts(&multi.body, boundary);
+    assert_eq!(
+        parts,
+        vec![
+            (format!("bytes 0-3/{len}"), file[..4].to_vec()),
+            (
+                format!("bytes {tail}-{}/{len}", len - 1),
+                file[tail..].to_vec()
+            ),
+        ]
+    );
+
+    // Nothing inside the artifact: 416, saying how long it is.
+    let beyond = server.request("GET", target, &[("range", &format!("bytes={len}-"))]);
+    beyond.assert_status(416);
+    beyond.assert_header("content-range", &format!("bytes */{len}"));
+    assert_eq!(beyond.json()["code"], "range_not_satisfiable");
+    // An invalid Range is ignored rather than refused.
+    let invalid = server.request("GET", target, &[("range", "bytes=9-3")]);
+    invalid.assert_status(200);
+    assert_eq!(invalid.body, file);
+
+    // Preconditions.
+    let unchanged = server.request("GET", target, &[("if-none-match", &strong)]);
+    unchanged.assert_status(304);
+    assert!(unchanged.body.is_empty());
+    unchanged.assert_header("etag", &strong);
+    unchanged.assert_cache_control(&["public", "max-age=31536000", "immutable", "no-transform"]);
+    let refused = server.request("GET", target, &[("if-match", "\"sha256:00\"")]);
+    refused.assert_status(412);
+    assert_eq!(refused.json()["code"], "precondition_failed");
+    server
+        .request("GET", target, &[("if-match", &strong)])
+        .assert_status(200);
+
+    // Only the artifacts this server exports are routes.
+    for other in ["data.hdt.perm", "manifest.json", "nonsense"] {
+        let missing = server.get(&format!("/tox/v/v1/export/{other}"));
+        missing.assert_status(404);
+        assert_eq!(missing.json()["code"], "not_found");
+    }
+    let posted = server.request("POST", target, &[]);
+    posted.assert_status(405);
+
+    // Clients find it from the descriptor and the manifest page.
+    let descriptor = server.get("/").json();
+    assert_eq!(descriptor["datasets"][0]["links"]["hdt"], target);
+    let page = server.request("GET", "/tox/v/v1/manifest", &[("accept", "text/html")]);
+    assert!(
+        links(&page.text()).iter().any(|(href, _)| href == target),
+        "the manifest page links the download"
+    );
+}
+
+/// A full-body download is compressed when the client asks, and decodes to
+/// the artifact exactly.
+#[test]
+fn a_download_is_compressed_when_asked_and_decodes_to_the_artifact() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    let file = std::fs::read(deployment.bundle("tox", "v1").join("data.hdt")).expect("the HDT");
+    let digest = Sha256::digest(&file);
+    let weak = format!("W/\"sha256:{digest:x}\"");
+    let server = deployment.serve();
+    let target = "/tox/v/v1/export/data.hdt";
+
+    for (accept, coding) in [
+        ("zstd", "zstd"),
+        ("gzip, deflate, br, zstd", "zstd"),
+        ("gzip", "gzip"),
+        ("x-gzip", "gzip"),
+    ] {
+        let compressed = server.request("GET", target, &[("accept-encoding", accept)]);
+        compressed.assert_status(200);
+        compressed.assert_header("content-encoding", coding);
+        compressed.assert_header("etag", &weak);
+        assert_encoding_vary(&compressed, accept);
+        // None of these can be known before the body has been produced.
+        for absent in [
+            "content-length",
+            "accept-ranges",
+            "repr-digest",
+            "last-modified",
+        ] {
+            assert_eq!(compressed.header(absent), None, "{accept}: {absent}");
+        }
+        let decoded = match coding {
+            "zstd" => zstd::stream::decode_all(compressed.content().as_slice()).unwrap(),
+            _ => {
+                let mut decoded = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut flate2::read::GzDecoder::new(compressed.content().as_slice()),
+                    &mut decoded,
+                )
+                .unwrap();
+                decoded
+            }
+        };
+        assert_eq!(decoded, file, "{accept}");
+
+        // Its HEAD makes no claim about a length it does not know.
+        let head = server.request("HEAD", target, &[("accept-encoding", accept)]);
+        head.assert_status(200);
+        head.assert_header("content-encoding", coding);
+        assert_eq!(head.header("content-length"), None, "{accept}");
+
+        // And it revalidates under its own validator.
+        let unchanged = server.request(
+            "GET",
+            target,
+            &[("accept-encoding", accept), ("if-none-match", &weak)],
+        );
+        unchanged.assert_status(304);
+        unchanged.assert_header("etag", &weak);
+    }
+
+    // A client weighting identity above the codings gets identity, with the
+    // strong validator intact: the compression layer every other route passes
+    // through would have gzipped this, and must leave a download alone.
+    let identity = server.request(
+        "GET",
+        target,
+        &[("accept-encoding", "gzip;q=0.5, identity")],
+    );
+    identity.assert_status(200);
+    assert_eq!(identity.header("content-encoding"), None);
+    identity.assert_header("etag", &format!("\"sha256:{digest:x}\""));
+    assert_eq!(identity.body, file);
+}
+
+#[test]
+fn a_download_is_recorded_by_its_shape() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    let log = RecordingAccessLog::default();
+    let server = deployment.serve_with_access(Arc::new(log.clone()), false);
+    server
+        .request(
+            "GET",
+            "/tox/v/v1/export/data.hdt",
+            &[("range", "bytes=0-9, 20-29"), ("accept-encoding", "zstd")],
+        )
+        .assert_status(206);
+    server
+        .request(
+            "GET",
+            "/tox/v/v1/export/data.hdt",
+            &[("accept-encoding", "zstd")],
+        )
+        .assert_status(200);
+
+    let records = log.records();
+    let exports: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record.route.as_deref() == Some("/{dataset}/v/{version}/export/{artifact}")
+        })
+        .map(|record| serde_json::to_value(record).unwrap())
+        .collect();
+    assert_eq!(exports.len(), 2, "{records:?}");
+    assert_eq!(exports[0]["operation"], "export");
+    assert_eq!(exports[0]["status"], 206);
+    assert_eq!(
+        exports[0]["shape"],
+        serde_json::json!({"artifact": "data.hdt", "coding": "identity", "ranges": 2})
+    );
+    assert_eq!(
+        exports[1]["shape"],
+        serde_json::json!({"artifact": "data.hdt", "coding": "zstd", "ranges": 0})
+    );
+}
+
+/// A client that stops reading keeps its download slot, and only its own:
+/// another client still downloads, the same client is told it is at its
+/// limit, and the slot comes back as soon as the stalled client goes away.
+#[test]
+fn download_slots_are_counted_per_client_and_given_back_when_a_client_leaves() {
+    // Large and incompressible, so a client that never reads leaves the server
+    // with most of the body unsent: more than every buffer between the two
+    // ends of a loopback connection can hold.
+    let deployment = Deployment::new();
+    deployment.publish(
+        "big",
+        "v1",
+        &incompressible_nt(32 << 20),
+        "2026-01-09T09:00:00Z",
+    );
+    let server = deployment.serve_configured(|config| {
+        config.trusted_proxies = 1;
+        config.admission.max_downloads_per_client = 1;
+    });
+    let target = "/big/v/v1/export/data.hdt";
+    let from = |client: &'static str| [("x-forwarded-for", client), ("range", "bytes=0-9")];
+
+    let stalled = server.stall("GET", target, &[("x-forwarded-for", "192.0.2.1")]);
+    assert!(
+        stalled.status_line.contains(" 200 "),
+        "{}",
+        stalled.status_line
+    );
+
+    let refused = server.request("GET", target, &from("192.0.2.1"));
+    refused.assert_status(429);
+    assert_eq!(refused.json()["code"], "rate_limited");
+    assert!(
+        refused.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("this client"),
+        "{}",
+        refused.text()
+    );
+    refused.assert_header("retry-after", "30");
+    // A HEAD streams nothing and is never refused for want of a slot.
+    server
+        .request("HEAD", target, &[("x-forwarded-for", "192.0.2.1")])
+        .assert_status(200);
+
+    server
+        .request("GET", target, &from("192.0.2.2"))
+        .assert_status(206);
+
+    drop(stalled);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let retried = server.request("GET", target, &from("192.0.2.1"));
+        if retried.status == 206 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slot was not given back: {}",
+            retried.status
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// N-Triples of about `bytes` whose literals share no prefixes, so the HDT
+/// built from it is about as large as the text.
+fn incompressible_nt(bytes: usize) -> String {
+    let mut source = String::with_capacity(bytes + 1024);
+    let mut index = 0u64;
+    while source.len() < bytes {
+        let mut literal = String::with_capacity(512);
+        for part in 0..8u64 {
+            literal.push_str(&format!(
+                "{:x}",
+                Sha256::digest([index.to_be_bytes(), part.to_be_bytes()].concat())
+            ));
+        }
+        source.push_str(&format!(
+            "<http://example.org/s{index}> <http://example.org/p> \"{literal}\" .\n"
+        ));
+        index += 1;
+    }
+    source
+}
+
+/// The parts of a `multipart/byteranges` body: each part's `Content-Range`
+/// and its bytes.
+fn multipart_parts(body: &[u8], boundary: &str) -> Vec<(String, Vec<u8>)> {
+    let delimiter = format!("--{boundary}");
+    let mut parts = Vec::new();
+    let mut rest = body;
+    loop {
+        let start = find(rest, delimiter.as_bytes()).expect("a delimiter") + delimiter.len();
+        rest = &rest[start..];
+        if rest.starts_with(b"--") {
+            return parts;
+        }
+        let headers_end = find(rest, b"\r\n\r\n").expect("part headers end");
+        let headers = std::str::from_utf8(&rest[2..headers_end]).unwrap();
+        let range = headers
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix("Content-Range: "))
+            .expect("a part's Content-Range")
+            .to_owned();
+        rest = &rest[headers_end + 4..];
+        let end = find(rest, format!("\r\n{delimiter}").as_bytes()).expect("the next delimiter");
+        parts.push((range, rest[..end].to_vec()));
+        rest = &rest[end..];
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 #[test]
 fn latest_redirects_to_the_current_version_and_keeps_the_method() {
     let deployment = Deployment::new();
@@ -3676,6 +4071,29 @@ impl Server {
         self.exchange(method, &request, body)
     }
 
+    /// Send a request and read only its status and headers, leaving the body
+    /// unread for as long as the returned connection is held.
+    fn stall(&self, method: &str, target: &str, headers: &[(&str, &str)]) -> Stalled {
+        let mut request = format!("{method} {target} HTTP/1.1\r\nHost: {}\r\n", self.address);
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        let mut stream = TcpStream::connect(self.address).expect("connect");
+        stream.write_all(request.as_bytes()).expect("write");
+        let mut head = Vec::new();
+        let mut byte = [0u8];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).expect("a response head");
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).expect("headers are ASCII");
+        Stalled {
+            status_line: head.lines().next().unwrap_or_default().to_owned(),
+            _stream: stream,
+        }
+    }
+
     fn request_without_host(&self, target: &str, headers: &[(&str, &str)]) -> Response {
         let mut request = format!("GET {target} HTTP/1.0\r\nConnection: close\r\n");
         for (name, value) in headers {
@@ -3724,6 +4142,12 @@ fn links(html: &str) -> Vec<(String, bool)> {
         found.push((href.to_owned(), tag.contains("rel=\"nofollow\"")));
     }
     found
+}
+
+/// A connection whose response body is not being read.
+struct Stalled {
+    status_line: String,
+    _stream: TcpStream,
 }
 
 struct Response {
@@ -3786,6 +4210,27 @@ impl Response {
 
     fn text(&self) -> String {
         String::from_utf8(self.body.clone()).expect("a UTF-8 body")
+    }
+
+    /// The body with any chunked transfer framing removed.
+    fn content(&self) -> Vec<u8> {
+        if self.header("transfer-encoding").as_deref() != Some("chunked") {
+            return self.body.clone();
+        }
+        let mut content = Vec::new();
+        let mut rest = self.body.as_slice();
+        loop {
+            let line_end = find(rest, b"\r\n").expect("a chunk-size line");
+            let size = std::str::from_utf8(&rest[..line_end]).unwrap();
+            let size = usize::from_str_radix(size.split(';').next().unwrap().trim(), 16)
+                .expect("a hexadecimal chunk size");
+            rest = &rest[line_end + 2..];
+            if size == 0 {
+                return content;
+            }
+            content.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
     }
 
     fn json(&self) -> serde_json::Value {

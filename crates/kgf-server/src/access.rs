@@ -7,7 +7,7 @@
 //! has been produced, or when the request was abandoned before that.
 
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -325,6 +325,8 @@ pub enum AccessOperation {
     Dataset,
     /// Moving-version redirect.
     Latest,
+    /// Whole-artifact download.
+    Export,
 }
 
 impl AccessOperation {
@@ -351,6 +353,7 @@ impl AccessOperation {
             Self::Service => "service",
             Self::Dataset => "dataset",
             Self::Latest => "latest",
+            Self::Export => "export",
         }
     }
 }
@@ -505,6 +508,15 @@ pub enum RequestShape {
         /// Requested item limit, if this shape pages items.
         limit: Option<u32>,
     },
+    /// Whole-artifact download.
+    Export {
+        /// The artifact's name in the bundle.
+        artifact: &'static str,
+        /// The content coding negotiated for the response.
+        coding: &'static str,
+        /// Byte-range specs the request carried; zero for a whole body.
+        ranges: u64,
+    },
     /// An operation with no request-shape fields.
     Empty {},
 }
@@ -598,6 +610,13 @@ impl Observation {
             self.shape = Some(RequestShape::Empty {});
         }
         self
+    }
+
+    /// Record a request shape an operation built itself.
+    pub(crate) fn shaped(&mut self, shape: RequestShape) {
+        if self.recording() {
+            self.shape = Some(shape);
+        }
     }
 
     /// Describe a successfully parsed request and the work class it earned.
@@ -973,6 +992,28 @@ fn forwarded_client(headers: &HeaderMap, trusted_proxies: u8) -> Option<&str> {
     Some(entries[index]).filter(|entry| !entry.is_empty())
 }
 
+/// The address a request is attributed to: the client the trusted forwarding
+/// chain reports, else the direct peer.
+///
+/// The same reading of `X-Forwarded-For` as the access record's
+/// `forwarded_hash`, so a client is one client to the log and to anything that
+/// limits by client. An entry the chain reports but that is not an address —
+/// some proxies append a port, which is accepted, and anything else is not —
+/// falls back to the peer rather than to a string a caller may have chosen.
+pub(crate) fn client_address(
+    headers: &HeaderMap,
+    peer: Option<IpAddr>,
+    trusted_proxies: u8,
+) -> Option<IpAddr> {
+    let forwarded = forwarded_client(headers, trusted_proxies).and_then(|entry| {
+        entry
+            .parse::<IpAddr>()
+            .ok()
+            .or_else(|| entry.parse::<SocketAddr>().ok().map(|address| address.ip()))
+    });
+    forwarded.or(peer).map(|address| address.to_canonical())
+}
+
 fn truncate(value: &str) -> String {
     if value.len() <= TEXT_LIMIT {
         return value.to_owned();
@@ -1037,6 +1078,7 @@ fn operation_for_route(route: &str) -> Option<AccessOperation> {
         "/{dataset}/v/{version}/void" => Some(AccessOperation::Void),
         "/{dataset}/v/{version}/summary" => Some(AccessOperation::Summary),
         "/{dataset}/v/{version}/labels" => Some(AccessOperation::Labels),
+        "/{dataset}/v/{version}/export/{artifact}" => Some(AccessOperation::Export),
         _ => None,
     }
 }
@@ -1088,6 +1130,12 @@ mod tests {
                 "no route table entry for {route}"
             );
         }
+        // A download's route names its artifact below the operation segment.
+        let route = format!(
+            "/{{dataset}}/v/{{version}}/{}/{{artifact}}",
+            AccessOperation::Export.path_segment()
+        );
+        assert_eq!(operation_for_route(&route), Some(AccessOperation::Export));
     }
     use axum::body::Body;
     use axum::http::StatusCode;
@@ -1164,6 +1212,26 @@ mod tests {
 
         assert_eq!(forwarded_client(&headers(&[]), 1), None);
         assert_eq!(forwarded_client(&headers(&["192.0.2.8,"]), 1), None);
+    }
+
+    #[test]
+    fn a_client_address_is_the_trusted_hops_report_or_else_the_peer() {
+        let peer: IpAddr = "10.1.1.1".parse().unwrap();
+        let address = |lines: &[&str], hops| client_address(&headers(lines), Some(peer), hops);
+        let ip = |text: &str| Some(text.parse::<IpAddr>().unwrap());
+
+        assert_eq!(address(&["10.0.0.1, 192.0.2.9"], 1), ip("192.0.2.9"));
+        // Untrusted, the header is ignored and the peer is the client.
+        assert_eq!(address(&["192.0.2.9"], 0), Some(peer));
+        // A proxy that appends a port still names an address.
+        assert_eq!(address(&["192.0.2.9:4711"], 1), ip("192.0.2.9"));
+        assert_eq!(address(&["[2001:db8::7]:443"], 1), ip("2001:db8::7"));
+        // An IPv4 client reported in IPv6's mapped form is the IPv4 client.
+        assert_eq!(address(&["::ffff:192.0.2.9"], 1), ip("192.0.2.9"));
+        // A short chain, or an entry that is not an address, is not trusted.
+        assert_eq!(address(&[], 1), Some(peer));
+        assert_eq!(address(&["unknown"], 1), Some(peer));
+        assert_eq!(client_address(&headers(&[]), None, 1), None);
     }
 
     #[test]

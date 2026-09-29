@@ -395,6 +395,7 @@ impl Target {
             AccessOperation::Service => "service",
             AccessOperation::Dataset => "dataset",
             AccessOperation::Latest => "latest",
+            AccessOperation::Export => "export",
         }
     }
 

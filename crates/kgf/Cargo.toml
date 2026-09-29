@@ -45,3 +45,8 @@ tempfile.workspace = true
 # `testing::hdtc_binary`, so the integration test does not carry its own copy
 # of where the sibling checkout lives.
 kgf-store = { workspace = true, features = ["testing"] }
+# Decoders for the downloads the server compresses, so the tests check what a
+# client actually reassembles rather than the server's own encoder.
+flate2.workspace = true
+zstd.workspace = true
+base64.workspace = true

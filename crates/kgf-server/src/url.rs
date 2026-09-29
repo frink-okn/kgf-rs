@@ -144,6 +144,15 @@ impl Mount {
         format!("{}{operation}", self.bundle_base(dataset, version))
     }
 
+    /// A whole-artifact download: `/{dataset}/v/{version}/export/{artifact}`.
+    pub fn export(&self, dataset: &str, version: &str, artifact: &str) -> String {
+        format!(
+            "{}export/{}",
+            self.bundle_base(dataset, version),
+            encode_segment(artifact)
+        )
+    }
+
     /// The public spelling of a path this server received.
     ///
     /// For a message or a problem's `instance`: the path the client sent was

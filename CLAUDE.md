@@ -89,7 +89,18 @@ the doc 19 §19.4 label cascade; `/labels` exposes the same frozen cascade direc
 **Every route has machine and HTML representations at one URL**, chosen by `Accept` —
 a page in a browser, data from `curl` — so a new route implements `html::Resource` or
 it does not compile. `/void` uses Turtle/JSON-LD and `/summary` Markdown/JSON rather
-than forcing those resources into the default JSON representation.
+than forcing those resources into the default JSON representation. The one exception
+is a download: a browser following a link to `/export/data.hdt` must get the file, so
+it has a single representation and the manifest page's download panel is its page.
+
+`/export/data.hdt` serves the published HDT with static-file semantics (unit 31): byte
+ranges including multipart, `If-Range` and the other RFC 9110 preconditions, the
+artifact's SHA-256 as a strong `ETag` shared by every mirror and as `Repr-Digest`, and
+zstd or gzip transfer compression for a full body. A range is always identity bytes.
+It negotiates its own coding and marks its responses so the global compression layer
+and the ETag-weakening middleware pass them through, and it takes a slot from a
+download gate separate from query admission, at most `--max-downloads-per-client` of
+them per client (an IPv4 address or IPv6 /64, as `--trusted-proxies` reports it).
 
 `todo!()` is a convention, not laziness — an unimplemented path panics rather than
 returning a plausible wrong answer. Do not replace one with a stub that returns a

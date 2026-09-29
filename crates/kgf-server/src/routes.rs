@@ -24,11 +24,12 @@
 //! code, so none of them can be the one that forgets `Vary` or answers a
 //! browser with raw JSON.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, OriginalUri, Request, State};
 use axum::http::header::{
     ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_TYPE, ETAG, LOCATION, RETRY_AFTER, VARY,
 };
@@ -36,22 +37,23 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, any, get};
-use axum::{Router, middleware};
+use axum::{Extension, Router, middleware};
 use headers::{ETag, HeaderMapExt, Host, IfNoneMatch};
 use kgf_store::Capability;
 use kgf_store::catalog::BundleId;
 use mediatype::{MediaTypeBuf, names};
 use tower_http::CompressionLevel;
 use tower_http::compression::CompressionLayer;
-use tower_http::compression::predicate::SizeAbove;
+use tower_http::compression::predicate::{Predicate, SizeAbove};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::access::{AccessOperation, Observation, OpenTiming, Timed, Transport, millis};
-use crate::admission::WorkClass;
+use crate::admission::{DownloadClient, WorkClass};
 use crate::answer::{self, Rendered, Renders, Target};
 use crate::descriptor::{BundleManifest, DatasetDescriptor, ServiceDescriptor};
 use crate::envelope::{ErrorCode, PROBLEM_MEDIA_TYPE, Problem, reflected};
+use crate::export::{Conditions, Decision, Delivery, ExportArtifact, SelfEncoded};
 use crate::html::Resource;
 use crate::representation::{CachePolicy, Representation, etag, etag_for_body, negotiate};
 use crate::request;
@@ -123,6 +125,10 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/{dataset}/v/{version}/void", read(get(void)))
         .route("/{dataset}/v/{version}/summary", read(get(summary)))
         .route(
+            "/{dataset}/v/{version}/export/{artifact}",
+            read(get(export)),
+        )
+        .route(
             "/{dataset}/v/{version}/labels",
             MethodRouter::new()
                 .post(labels_post)
@@ -179,16 +185,33 @@ pub fn router(service: Arc<Service>) -> Router {
         // that stays free even when the server is CPU-bound. `SizeAbove`
         // raises tower-http's 32-byte floor: below about a kilobyte the
         // framing costs more than the saving.
+        //
+        // A download is the exception: it negotiates its own coding, because
+        // the coding decides its validator and length headers, and it marks
+        // its responses so this layer passes them through untouched.
         .layer(
             CompressionLayer::new()
                 .quality(CompressionLevel::Fastest)
-                .compress_when(SizeAbove::new(1024)),
+                .compress_when(SizeAbove::new(1024).and(NotSelfEncoded)),
         )
         // Outermost, because it must observe the `Content-Encoding` the layer
         // below may have added — and must also reach the responses that layer
         // never handles, a `304` in particular.
         .layer(middleware::from_fn(mark_encoding_negotiated))
         .with_state(service)
+}
+
+/// Compress only responses whose handler left the coding to this layer.
+#[derive(Debug, Clone, Copy)]
+struct NotSelfEncoded;
+
+impl Predicate for NotSelfEncoded {
+    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
+    where
+        B: http_body::Body,
+    {
+        response.extensions().get::<SelfEncoded>().is_none()
+    }
 }
 
 /// RFC 10008's method. Not a constant in `http`, which is the whole reason this
@@ -892,6 +915,110 @@ async fn summary(
         answer::summary,
     )
     .await
+}
+
+/// `GET|HEAD /{dataset}/v/{version}/export/{artifact}`: an artifact, whole or
+/// by range. See [`crate::export`] for the response's semantics.
+///
+/// Everything but the body is decided from the manifest before the bundle is
+/// opened, so a revalidation, a failed precondition, and an unsatisfiable range
+/// all answer without touching a mapping — and without a download slot, which
+/// only a response that streams takes.
+async fn export(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version, artifact)): Path<(String, String, String)>,
+    method: Method,
+    headers: HeaderMap,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+) -> Result<Response, Problem> {
+    let release = service.datasets().release(&dataset, &version)?;
+    let artifact = ExportArtifact::from_name(&artifact).ok_or_else(|| {
+        Problem::new(
+            ErrorCode::NotFound,
+            format!(
+                "{} is not an artifact this server exports; \
+                 the release's links in the dataset descriptor name the ones it does",
+                reflected(&artifact)
+            ),
+        )
+    })?;
+    let mut observation = Observation::new(service.access(), AccessOperation::Export)
+        .resolved(&dataset, Some(&version));
+    observation.transport = Some(Transport::Get);
+
+    let delivery = Delivery::new(
+        &dataset,
+        &version,
+        artifact,
+        release.export(artifact),
+        release.last_modified(),
+    );
+    let conditions = Conditions::read(&headers, &method);
+    let decision = conditions.decide(delivery.identity, delivery.last_modified);
+    observation.shaped(conditions.shape(artifact, &decision));
+    let (coding, extent) = match decision {
+        Decision::NotModified { coding } => {
+            return observed_result(Ok(delivery.not_modified(coding)), observation);
+        }
+        Decision::PreconditionFailed => {
+            let problem = Problem::new(
+                ErrorCode::PreconditionFailed,
+                format!(
+                    "If-Match or If-Unmodified-Since does not hold for this {}; \
+                     its current validator is in the ETag of a HEAD",
+                    artifact.name()
+                ),
+            );
+            return observed_result(Err(problem), observation);
+        }
+        Decision::RangeNotSatisfiable { excessive } => {
+            return observed_result(Ok(delivery.not_satisfiable(excessive)), observation);
+        }
+        Decision::Send { coding, extent } => (coding, extent),
+    };
+
+    // Before the open: a full gate costs the refused client nothing, and a
+    // `HEAD` streams nothing, so it takes no slot at all. The client is the
+    // one the access log attributes the request to.
+    let slot = if method == Method::HEAD {
+        None
+    } else {
+        let client = crate::access::client_address(
+            &headers,
+            peer.map(|Extension(ConnectInfo(address))| address.ip()),
+            service.config().trusted_proxies,
+        )
+        .map(DownloadClient::of);
+        match service.admission().download(client) {
+            Ok(slot) => Some(slot),
+            Err(problem) => return observed_result(Err(problem), observation),
+        }
+    };
+
+    // Opened for a `HEAD` as well: a bundle that cannot be opened must not be
+    // described as downloadable, and the `HEAD` must answer as its `GET` would.
+    let id = BundleId { dataset, version };
+    let opened = Arc::clone(&service);
+    observation.work_class = Some(WorkClass::Ordinary);
+    let timed = blocking(&service, WorkClass::Ordinary, move || {
+        opened.open_observed(&id)
+    })
+    .await;
+    observation.queue_ms = Some(timed.queue_ms);
+    observation.work_ms = timed.work_ms;
+    let store = match timed.result {
+        Ok((store, open)) => {
+            observation.open_ms = Some(open.open_ms);
+            observation.first_open = Some(open.first_open);
+            store
+        }
+        Err(problem) => return observed_result(Err(problem), observation),
+    };
+    let response = match slot {
+        None => delivery.head(&store, coding),
+        Some(slot) => delivery.send(store, coding, &extent, slot),
+    };
+    observed_result(response, observation)
 }
 
 async fn labels_post(
@@ -1966,15 +2093,21 @@ impl IntoResponse for Problem {
 /// the exact disagreement this exists to prevent, reachable by nothing worse
 /// than an unusual spelling. An unconditional rule cannot drift.
 ///
-/// It costs a strong validator on identity responses, and that is free here.
-/// Strong validators are only required for `Range` and `If-Match`, and this
-/// server implements neither; `If-None-Match` compares weakly (RFC 9110
-/// §13.1.2), so revalidation is unaffected. A weak tag also states the truth
-/// that a shared one asserts: the encoded and identity bodies are semantically
-/// equivalent, not byte-identical. Adding `Range` support later would mean
-/// revisiting this.
+/// It costs a strong validator on identity responses, and that is free for
+/// every resource this rule covers. Strong validators are only required for
+/// `Range` and `If-Match`, which only downloads implement; `If-None-Match`
+/// compares weakly (RFC 9110 §13.1.2), so revalidation is unaffected. A weak
+/// tag also states the truth that a shared one asserts: the encoded and
+/// identity bodies are semantically equivalent, not byte-identical. A download
+/// negotiates its own coding, keeps its strong tag on identity bytes, and is
+/// passed through untouched.
 async fn mark_encoding_negotiated(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
+    // A download chose its own coding and validator, and a strong tag on its
+    // identity bytes is what makes `If-Range` work; see `crate::export`.
+    if response.extensions().get::<SelfEncoded>().is_some() {
+        return response;
+    }
     declare_encoding_vary(response.headers_mut());
     // Only a strong tag needs weakening, and only a well-formed one is touched:
     // anything else is left exactly as the handler set it.
