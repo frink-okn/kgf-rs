@@ -330,6 +330,24 @@ pub enum AccessOperation {
 }
 
 impl AccessOperation {
+    /// Every operation mounted under `/{dataset}/v/{version}/`.
+    pub const VERSIONED: &'static [Self] = &[
+        Self::Fragment,
+        Self::Tpf,
+        Self::Count,
+        Self::Describe,
+        Self::Sample,
+        Self::Search,
+        Self::Terms,
+        Self::Graphs,
+        Self::Schema,
+        Self::Void,
+        Self::Summary,
+        Self::Labels,
+        Self::Manifest,
+        Self::Export,
+    ];
+
     /// The operation's URL path segment.
     ///
     /// This spelling is the wire contract: it names the resource in strong
@@ -719,7 +737,7 @@ impl AccessState {
 
     fn request_id(&self) -> String {
         let sequence = self.counter.fetch_add(1, Ordering::Relaxed);
-        format!("{}-{sequence:08x}", hex(self.nonce))
+        format!("{}-{sequence:08x}", crate::hex::encode(&self.nonce))
     }
 
     /// `SHA-256(salt ‖ value)`, truncated to 64 bits: one-way, stable within
@@ -732,7 +750,7 @@ impl AccessState {
         let prefix: [u8; 8] = digest[..8]
             .try_into()
             .expect("a SHA-256 digest has at least eight bytes");
-        hex(prefix)
+        crate::hex::encode(&prefix)
     }
 }
 
@@ -944,7 +962,9 @@ impl Pending {
             cardinality: observation.cardinality,
             exact: observation.exact,
             cursor: observation.cursor,
-            request_hash: observation.request_hash.map(hex),
+            request_hash: observation
+                .request_hash
+                .map(|hash| crate::hex::encode(&hash)),
             open_ms: observation.open_ms,
             first_open: observation.first_open,
             client_hash: self.client_hash,
@@ -1083,15 +1103,6 @@ fn operation_for_route(route: &str) -> Option<AccessOperation> {
     }
 }
 
-fn hex(bytes: [u8; 8]) -> String {
-    use std::fmt::Write as _;
-    let mut text = String::with_capacity(16);
-    for byte in bytes {
-        write!(text, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    text
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -1108,34 +1119,22 @@ mod tests {
     /// match and forgetting the lookup table fails here.
     #[test]
     fn every_versioned_operation_is_recoverable_from_its_route() {
-        for operation in [
-            AccessOperation::Fragment,
-            AccessOperation::Tpf,
-            AccessOperation::Count,
-            AccessOperation::Describe,
-            AccessOperation::Sample,
-            AccessOperation::Search,
-            AccessOperation::Terms,
-            AccessOperation::Graphs,
-            AccessOperation::Schema,
-            AccessOperation::Void,
-            AccessOperation::Summary,
-            AccessOperation::Labels,
-            AccessOperation::Manifest,
-        ] {
-            let route = format!("/{{dataset}}/v/{{version}}/{}", operation.path_segment());
+        for &operation in AccessOperation::VERSIONED {
+            // A download's route names its artifact below the operation
+            // segment; every other operation is the last segment itself.
+            let route = match operation {
+                AccessOperation::Export => format!(
+                    "/{{dataset}}/v/{{version}}/{}/{{artifact}}",
+                    operation.path_segment()
+                ),
+                _ => format!("/{{dataset}}/v/{{version}}/{}", operation.path_segment()),
+            };
             assert_eq!(
                 operation_for_route(&route),
                 Some(operation),
                 "no route table entry for {route}"
             );
         }
-        // A download's route names its artifact below the operation segment.
-        let route = format!(
-            "/{{dataset}}/v/{{version}}/{}/{{artifact}}",
-            AccessOperation::Export.path_segment()
-        );
-        assert_eq!(operation_for_route(&route), Some(AccessOperation::Export));
     }
     use axum::body::Body;
     use axum::http::StatusCode;

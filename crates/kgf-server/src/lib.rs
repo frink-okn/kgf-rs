@@ -48,6 +48,7 @@ pub mod descriptor;
 pub mod envelope;
 pub mod export;
 mod forms;
+mod hex;
 pub mod html;
 mod rdf;
 pub mod representation;

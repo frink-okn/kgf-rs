@@ -14,22 +14,24 @@
 //!   the tag does not mix in the deployment: these bytes do not depend on the
 //!   configuration or the code, so any server or mirror publishing the bundle
 //!   agrees on the tag, and a client may resume from whichever it reaches.
-//! - **Compressed in transit when asked.** A full body is sent zstd- or
-//!   gzip-coded if the client accepts one; a range is always served from the
-//!   identity bytes, because a range of a compressed stream is only meaningful
-//!   if the compressor reproduces that stream exactly, and nothing promises
-//!   that. A client that decodes as it stores holds identity bytes, so the
-//!   length of its partial file is a valid resume offset.
+//! - **Uncompressed unless the client prefers otherwise.** Only an identity
+//!   body has a length, byte ranges, and a strong validator, which is what a
+//!   browser needs to show progress and resume. A client that weights zstd or
+//!   gzip above identity gets a coded full body; a range, and a request that
+//!   asserts the artifact is unchanged, are always served from the identity
+//!   bytes, because a range of a compressed stream is only meaningful if the
+//!   compressor reproduces that stream exactly, and nothing promises that. A
+//!   client that decodes as it stores holds identity bytes, so the length of
+//!   its partial file is a valid resume offset.
 //!
 //! A download has one representation per coding and no page: a browser that
 //! follows a link to `data.hdt` must get the file. That makes these routes the
 //! one exception to "every URL answers HTML too".
 //!
 //! Because the coding decides the validator and which length and digest
-//! headers can be sent, the negotiation is done here rather than by the
-//! compression layer every other route passes through, and responses carry
-//! `SelfEncoded` so that layer, and the one that weakens every other `ETag`,
-//! leave them alone.
+//! headers can be sent, the negotiation is done here, and the routes are
+//! mounted outside the compression layer every other resource passes through
+//! and the middleware that weakens every other `ETag`.
 
 mod body;
 mod coding;
@@ -58,6 +60,7 @@ use kgf_store::store::artifact;
 use crate::access::RequestShape;
 use crate::admission::DownloadSlot;
 use crate::envelope::{ErrorCode, Problem};
+use crate::hex;
 use crate::representation::CachePolicy;
 
 use body::{Download, Segment, Source, Unmeasured};
@@ -146,14 +149,18 @@ impl Source for Mapped {
 }
 
 /// What a release's manifest says about an exported artifact: its length and
-/// its SHA-256.
+/// its SHA-256, and every header value derived from the digest.
 ///
 /// Read once at startup, so every validator, length, and digest a download
-/// sends is fixed before any request arrives and no request hashes a file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// sends is fixed before any request arrives: no request hashes a file, and
+/// none formats a digest either.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactIdentity {
     len: u64,
-    sha256: [u8; 32],
+    sha256_hex: String,
+    strong: ETag,
+    weak: ETag,
+    repr_digest: HeaderValue,
 }
 
 impl ArtifactIdentity {
@@ -166,84 +173,65 @@ impl ArtifactIdentity {
         let entry = manifest.artifacts.get(name).ok_or_else(|| {
             format!("the manifest lists no size and checksum for {name}; regenerate it with `kgf manifest`")
         })?;
-        let sha256 = parse_sha256(&entry.sha256).ok_or_else(|| {
+        let sha256 = hex::decode::<32>(&entry.sha256).ok_or_else(|| {
             format!(
                 "the manifest's checksum for {name} is not 64 lowercase hex digits; \
                  regenerate it with `kgf manifest`"
             )
         })?;
-        Ok(Self {
-            len: entry.bytes,
-            sha256,
-        })
+        Ok(Self::new(entry.bytes, sha256))
+    }
+
+    /// An artifact of `len` bytes with this digest.
+    pub(crate) fn new(len: u64, sha256: [u8; 32]) -> Self {
+        let sha256_hex = hex::encode(&sha256);
+        let tag = |prefix: &str| {
+            format!("{prefix}\"sha256:{sha256_hex}\"")
+                .parse()
+                .unwrap_or_else(|error| unreachable!("a hex digest is a valid entity tag: {error}"))
+        };
+        let encoded = base64::engine::general_purpose::STANDARD.encode(sha256);
+        Self {
+            len,
+            strong: tag(""),
+            weak: tag("W/"),
+            repr_digest: HeaderValue::from_str(&format!("sha-256=:{encoded}:"))
+                .expect("base64 is a valid header value"),
+            sha256_hex,
+        }
     }
 
     /// The artifact's size in bytes.
-    pub fn size(self) -> u64 {
+    pub fn size(&self) -> u64 {
         self.len
     }
 
     /// The artifact's SHA-256, as lowercase hex.
-    pub fn sha256_hex(self) -> String {
-        hex(&self.sha256)
+    pub fn sha256_hex(&self) -> &str {
+        &self.sha256_hex
     }
 
     /// The strong validator of the identity bytes.
-    fn etag(self) -> ETag {
-        self.tag(false)
+    fn etag(&self) -> &ETag {
+        &self.strong
     }
 
     /// The validator of a content-coded body: weak, because the encoded bytes
     /// are equivalent to the artifact rather than identical to anything fixed.
-    fn weak_etag(self) -> ETag {
-        self.tag(true)
-    }
-
-    fn tag(self, weak: bool) -> ETag {
-        let prefix = if weak { "W/" } else { "" };
-        format!("{prefix}\"sha256:{}\"", self.sha256_hex())
-            .parse()
-            .unwrap_or_else(|error| unreachable!("a hex digest is a valid entity tag: {error}"))
+    fn weak_etag(&self) -> &ETag {
+        &self.weak
     }
 
     /// `Repr-Digest`'s structured-field value.
-    fn repr_digest(self) -> HeaderValue {
-        let encoded = base64::engine::general_purpose::STANDARD.encode(self.sha256);
-        HeaderValue::from_str(&format!("sha-256=:{encoded}:"))
-            .expect("base64 is a valid header value")
+    fn repr_digest(&self) -> &HeaderValue {
+        &self.repr_digest
     }
 
     /// A multipart boundary that cannot occur in this artifact's bytes except
     /// by a collision in its own digest.
-    fn boundary(self) -> String {
-        format!("kgf-byteranges-{}", &self.sha256_hex()[..32])
+    fn boundary(&self) -> String {
+        format!("kgf-byteranges-{}", &self.sha256_hex[..32])
     }
-}
-
-fn parse_sha256(text: &str) -> Option<[u8; 32]> {
-    let text = text.as_bytes();
-    if text.len() != 64 {
-        return None;
-    }
-    let digit = |byte: u8| match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
-    };
-    let mut digest = [0u8; 32];
-    for (index, pair) in text.chunks_exact(2).enumerate() {
-        digest[index] = digit(pair[0])? << 4 | digit(pair[1])?;
-    }
-    Some(digest)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(text, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    text
 }
 
 /// An instant as `Last-Modified` can state it: whole seconds.
@@ -311,16 +299,20 @@ impl Conditions {
 
     /// Decide the response, in RFC 9110 §13.2.2's order.
     ///
-    /// `If-Range` is settled first because it decides *which* representation
-    /// the others are evaluated against: an honoured range is served from the
-    /// identity bytes, and otherwise the body may be content-coded, with a
-    /// different validator and no modification date. `last_modified` is the
-    /// identity representation's; a coded one states none, so the date
-    /// preconditions do not apply to it (§13.1.3–§13.1.4 evaluate them only
-    /// against a representation that has one).
+    /// Which representation the preconditions are evaluated against is settled
+    /// first, because an identity body and a coded one carry different
+    /// validators. `If-Range` goes first of all: an honoured range is served
+    /// from the identity bytes. So is a request carrying `If-Match` or
+    /// `If-Unmodified-Since`, which asserts the artifact is unchanged — a
+    /// coded body's tag is weak and states no date, so against one `If-Match`
+    /// could never pass and `If-Unmodified-Since` could never be evaluated, and
+    /// an unchanged artifact would answer `412` to any client that also accepts
+    /// compression. Only a request asserting neither may be coded, and a coded
+    /// representation states no modification date, so `If-Modified-Since` does
+    /// not bind it (§13.1.4 evaluates it only against one that has one).
     pub(crate) fn decide(
         &self,
-        identity: ArtifactIdentity,
+        identity: &ArtifactIdentity,
         last_modified: Option<SystemTime>,
     ) -> Decision {
         let strong = identity.etag();
@@ -332,13 +324,15 @@ impl Conditions {
             // one. A versioned artifact never changes, so any date the client
             // could hold names these same bytes.
             let stated = last_modified.map(LastModified::from);
-            if if_range.is_modified(Some(&strong), stated.as_ref()) {
+            if if_range.is_modified(Some(strong), stated.as_ref()) {
                 ranges = None;
             }
         }
-        let coding = match ranges {
-            Some(_) => ContentCoding::Identity,
-            None => ContentCoding::negotiate(self.accept_encoding.as_deref()),
+        let asserts_unchanged = self.if_match.is_some() || self.if_unmodified_since.is_some();
+        let coding = if ranges.is_some() || asserts_unchanged {
+            ContentCoding::Identity
+        } else {
+            ContentCoding::negotiate(self.accept_encoding.as_deref())
         };
         let (tag, modified) = match coding {
             ContentCoding::Identity => (strong, last_modified),
@@ -346,7 +340,7 @@ impl Conditions {
         };
 
         if let Some(if_match) = &self.if_match {
-            if !if_match.precondition_passes(&tag) {
+            if !if_match.precondition_passes(tag) {
                 return Decision::PreconditionFailed;
             }
         } else if let (Some(since), Some(modified)) = (&self.if_unmodified_since, modified)
@@ -355,7 +349,7 @@ impl Conditions {
             return Decision::PreconditionFailed;
         }
         if let Some(if_none_match) = &self.if_none_match {
-            if !if_none_match.precondition_passes(&tag) {
+            if !if_none_match.precondition_passes(tag) {
                 return Decision::NotModified { coding };
             }
         } else if let (Some(since), Some(modified)) = (&self.if_modified_since, modified)
@@ -419,36 +413,29 @@ pub(crate) enum Extent {
     Whole,
     /// One span: a single-part `206`.
     One(Range<u64>),
-    /// Several disjoint spans, ascending: a `multipart/byteranges` `206`.
+    /// Several disjoint spans, in request order: a `multipart/byteranges`
+    /// `206`.
     Several(Vec<Range<u64>>),
 }
-
-/// Marks a response whose content coding and validator the handler decided.
-///
-/// The compression layer skips a response carrying it, and so does the
-/// middleware that weakens every other `ETag`: a download's identity tag must
-/// stay strong for `If-Range` to work, and its coded bodies are already coded.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct SelfEncoded;
 
 /// One release's download of one artifact: everything its headers are built
 /// from, fixed before the bundle is opened.
 #[derive(Debug)]
-pub(crate) struct Delivery {
+pub(crate) struct Delivery<'a> {
     pub(crate) artifact: ExportArtifact,
-    pub(crate) identity: ArtifactIdentity,
+    pub(crate) identity: &'a ArtifactIdentity,
     pub(crate) last_modified: Option<SystemTime>,
     /// The saved file's name: `{dataset}-{version}.{extension}`.
     pub(crate) file_name: String,
 }
 
-impl Delivery {
+impl<'a> Delivery<'a> {
     /// Describe `artifact` of one release.
     pub(crate) fn new(
         dataset: &str,
         version: &str,
         artifact: ExportArtifact,
-        identity: ArtifactIdentity,
+        identity: &'a ArtifactIdentity,
         last_modified: Option<SystemTime>,
     ) -> Self {
         Self {
@@ -467,7 +454,6 @@ impl Delivery {
         let mut response = Response::new(Body::empty());
         *response.status_mut() = StatusCode::NOT_MODIFIED;
         self.validation_headers(response.headers_mut(), coding);
-        response.extensions_mut().insert(SelfEncoded);
         response
     }
 
@@ -617,7 +603,7 @@ impl Delivery {
             ContentCoding::Identity => {
                 headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
                 headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-                headers.insert(REPR_DIGEST, self.identity.repr_digest());
+                headers.insert(REPR_DIGEST, self.identity.repr_digest().clone());
                 if let Some(modified) = self.last_modified {
                     headers.typed_insert(LastModified::from(modified));
                 }
@@ -629,7 +615,6 @@ impl Delivery {
                 headers.insert(CONTENT_ENCODING, HeaderValue::from_static(coding.token()));
             }
         }
-        response.extensions_mut().insert(SelfEncoded);
         response
     }
 
@@ -639,7 +624,7 @@ impl Delivery {
             ContentCoding::Identity => self.identity.etag(),
             ContentCoding::Zstd | ContentCoding::Gzip => self.identity.weak_etag(),
         };
-        headers.typed_insert(tag);
+        headers.typed_insert(tag.clone());
         headers.typed_insert(CachePolicy::Immutable.header().with_no_transform());
         headers.insert(VARY, HeaderValue::from_static("accept-encoding"));
     }
@@ -679,10 +664,7 @@ mod tests {
     const DIGEST: &str = "35f3d0b7114f5880217e947cfd2ea8524780090425c4f4cc61d984131a44b443";
 
     fn identity() -> ArtifactIdentity {
-        ArtifactIdentity {
-            len: 1000,
-            sha256: parse_sha256(DIGEST).unwrap(),
-        }
+        ArtifactIdentity::new(1000, hex::decode(DIGEST).unwrap())
     }
 
     fn created() -> SystemTime {
@@ -701,7 +683,7 @@ mod tests {
                 HeaderValue::from_str(value).unwrap(),
             );
         }
-        Conditions::read(&map, &method).decide(identity(), Some(created()))
+        Conditions::read(&map, &method).decide(&identity(), Some(created()))
     }
 
     fn strong() -> String {
@@ -730,26 +712,32 @@ mod tests {
     #[test]
     fn the_digest_is_parsed_exactly_and_is_the_tag() {
         assert_eq!(identity().sha256_hex(), DIGEST);
-        assert!(parse_sha256(&DIGEST.to_uppercase()).is_none());
-        assert!(parse_sha256(&DIGEST[1..]).is_none());
-        assert!(parse_sha256(&format!("{}g", &DIGEST[1..])).is_none());
-        assert_eq!(rendered(identity().etag()), strong());
-        assert_eq!(rendered(identity().weak_etag()), format!("W/{}", strong()));
+        assert_eq!(rendered(identity().etag().clone()), strong());
+        assert_eq!(
+            rendered(identity().weak_etag().clone()),
+            format!("W/{}", strong())
+        );
         assert_eq!(
             identity().repr_digest(),
             "sha-256=:NfPQtxFPWIAhfpR8/S6oUkeACQQlxPTMYdmEExpEtEM=:"
         );
     }
 
+    /// What a client that prefers compression to identity sends.
+    const PREFERS_ZSTD: (&str, &str) = ("accept-encoding", "zstd, identity;q=0.5");
+    const PREFERS_GZIP: (&str, &str) = ("accept-encoding", "gzip, identity;q=0.5");
+
     #[test]
     fn a_range_is_identity_and_a_whole_body_is_negotiated() {
         assert_eq!(decide(&[]), whole(ContentCoding::Identity));
+        // A browser's default is identity: a download it can size and resume.
         assert_eq!(
-            decide(&[("accept-encoding", "gzip, zstd")]),
-            whole(ContentCoding::Zstd)
+            decide(&[("accept-encoding", "gzip, deflate, br, zstd")]),
+            whole(ContentCoding::Identity)
         );
+        assert_eq!(decide(&[PREFERS_ZSTD]), whole(ContentCoding::Zstd));
         assert_eq!(
-            decide(&[("accept-encoding", "gzip, zstd"), ("range", "bytes=10-19")]),
+            decide(&[PREFERS_ZSTD, ("range", "bytes=10-19")]),
             Decision::Send {
                 coding: ContentCoding::Identity,
                 extent: Extent::One(10..20),
@@ -797,11 +785,7 @@ mod tests {
         );
         // A failed If-Range falls back to the full body, which is negotiable.
         assert_eq!(
-            decide(&[
-                range,
-                ("if-range", "\"other\""),
-                ("accept-encoding", "gzip")
-            ]),
+            decide(&[range, ("if-range", "\"other\""), PREFERS_GZIP]),
             whole(ContentCoding::Gzip)
         );
     }
@@ -809,7 +793,6 @@ mod tests {
     #[test]
     fn preconditions_are_evaluated_in_rfc_9110_order() {
         let weak = format!("W/{}", strong());
-        // If-Match compares strongly, so it fails against a coded body.
         assert_eq!(
             decide(&[("if-match", &strong())]),
             whole(ContentCoding::Identity)
@@ -819,9 +802,22 @@ mod tests {
             decide(&[("if-match", "\"other\"")]),
             Decision::PreconditionFailed
         );
+        // A request asserting the artifact is unchanged is answered from the
+        // identity bytes, whose tag is strong and whose date is stated, even
+        // from a client that prefers compression: against a coded body's weak
+        // tag, If-Match could never pass.
         assert_eq!(
-            decide(&[("if-match", &strong()), ("accept-encoding", "gzip")]),
+            decide(&[("if-match", &strong()), PREFERS_GZIP]),
+            whole(ContentCoding::Identity)
+        );
+        assert_eq!(decide(&[("if-match", &weak)]), Decision::PreconditionFailed);
+        assert_eq!(
+            decide(&[("if-unmodified-since", &date(-1)), PREFERS_GZIP]),
             Decision::PreconditionFailed
+        );
+        assert_eq!(
+            decide(&[("if-unmodified-since", &date(0)), PREFERS_GZIP]),
+            whole(ContentCoding::Identity)
         );
         assert_eq!(
             decide(&[("if-unmodified-since", &date(-1))]),
@@ -847,7 +843,7 @@ mod tests {
                 }
             );
             assert_eq!(
-                decide(&[("if-none-match", &tag), ("accept-encoding", "zstd")]),
+                decide(&[("if-none-match", &tag), PREFERS_ZSTD]),
                 Decision::NotModified {
                     coding: ContentCoding::Zstd
                 }
@@ -873,7 +869,7 @@ mod tests {
         );
         // A coded body states no date, so date preconditions do not bind it.
         assert_eq!(
-            decide(&[("if-modified-since", &date(0)), ("accept-encoding", "gzip")]),
+            decide(&[("if-modified-since", &date(0)), PREFERS_GZIP]),
             whole(ContentCoding::Gzip)
         );
         // A precondition failure outranks a range the artifact cannot satisfy.
@@ -889,10 +885,11 @@ mod tests {
 
     #[test]
     fn a_multipart_body_is_framed_by_rfc_9110_and_its_length_is_exact() {
-        let delivery = Delivery::new("tox", "v1", ExportArtifact::Hdt, identity(), None);
+        let identity = identity();
+        let delivery = Delivery::new("tox", "v1", ExportArtifact::Hdt, &identity, None);
         let spans = vec![0..10, 500..510];
         let segments = delivery.segments(&Extent::Several(spans));
-        let boundary = identity().boundary();
+        let boundary = identity.boundary();
         let framing: Vec<String> = segments
             .iter()
             .filter_map(|segment| match segment {
@@ -921,9 +918,10 @@ mod tests {
 
     #[test]
     fn a_saved_file_is_named_for_its_version_and_nothing_else() {
-        let delivery = Delivery::new("tox", "2026-06-01", ExportArtifact::Hdt, identity(), None);
+        let identity = identity();
+        let delivery = Delivery::new("tox", "2026-06-01", ExportArtifact::Hdt, &identity, None);
         assert_eq!(delivery.file_name, "tox-2026-06-01.hdt");
-        let odd = Delivery::new("t\"o x", "v/1\r\n", ExportArtifact::Hdt, identity(), None);
+        let odd = Delivery::new("t\"o x", "v/1\r\n", ExportArtifact::Hdt, &identity, None);
         assert_eq!(odd.file_name, "t_o_x-v_1__.hdt");
     }
 

@@ -1912,7 +1912,8 @@ fn a_download_is_the_published_hdt_resumable_and_verifiable() {
     assert_eq!(identity.header("content-encoding"), None);
     assert_eq!(identity.body, file[10..20]);
 
-    // Several distant ranges are one multipart response.
+    // Several distant ranges are one multipart response, its parts in the
+    // order they were asked for.
     let tail = len - 4;
     let multi = server.request("GET", target, &[("range", &format!("bytes={tail}-,0-3"))]);
     multi.assert_status(206);
@@ -1925,11 +1926,11 @@ fn a_download_is_the_published_hdt_resumable_and_verifiable() {
     assert_eq!(
         parts,
         vec![
-            (format!("bytes 0-3/{len}"), file[..4].to_vec()),
             (
                 format!("bytes {tail}-{}/{len}", len - 1),
                 file[tail..].to_vec()
             ),
+            (format!("bytes 0-3/{len}"), file[..4].to_vec()),
         ]
     );
 
@@ -1975,8 +1976,9 @@ fn a_download_is_the_published_hdt_resumable_and_verifiable() {
     );
 }
 
-/// A full-body download is compressed when the client asks, and decodes to
-/// the artifact exactly.
+/// A full-body download is sent uncompressed to every client that has not
+/// said it prefers otherwise — which is every client's default — and
+/// compressed for one that has, decoding to the artifact exactly.
 #[test]
 fn a_download_is_compressed_when_asked_and_decodes_to_the_artifact() {
     let deployment = Deployment::new();
@@ -1987,11 +1989,23 @@ fn a_download_is_compressed_when_asked_and_decodes_to_the_artifact() {
     let server = deployment.serve();
     let target = "/tox/v/v1/export/data.hdt";
 
+    // What browsers, `requests`, Go and `curl --compressed` send by default:
+    // each gets a download it can size and resume.
+    for accept in ["gzip, deflate, br, zstd", "gzip, deflate", "gzip", "zstd"] {
+        let default = server.request("GET", target, &[("accept-encoding", accept)]);
+        default.assert_status(200);
+        assert_eq!(default.header("content-encoding"), None, "{accept}");
+        default.assert_header("content-length", &file.len().to_string());
+        default.assert_header("accept-ranges", "bytes");
+        default.assert_header("etag", &format!("\"sha256:{digest:x}\""));
+        assert_eq!(default.body, file, "{accept}");
+    }
+
     for (accept, coding) in [
-        ("zstd", "zstd"),
-        ("gzip, deflate, br, zstd", "zstd"),
-        ("gzip", "gzip"),
-        ("x-gzip", "gzip"),
+        ("zstd, identity;q=0.5", "zstd"),
+        ("gzip, deflate, br, zstd, identity;q=0.1", "zstd"),
+        ("gzip, identity;q=0.5", "gzip"),
+        ("x-gzip, identity;q=0", "gzip"),
     ] {
         let compressed = server.request("GET", target, &[("accept-encoding", accept)]);
         compressed.assert_status(200);
@@ -2061,14 +2075,17 @@ fn a_download_is_recorded_by_its_shape() {
         .request(
             "GET",
             "/tox/v/v1/export/data.hdt",
-            &[("range", "bytes=0-9, 20-29"), ("accept-encoding", "zstd")],
+            &[
+                ("range", "bytes=0-9, 20-29"),
+                ("accept-encoding", "zstd, identity;q=0.5"),
+            ],
         )
         .assert_status(206);
     server
         .request(
             "GET",
             "/tox/v/v1/export/data.hdt",
-            &[("accept-encoding", "zstd")],
+            &[("accept-encoding", "zstd, identity;q=0.5")],
         )
         .assert_status(200);
 

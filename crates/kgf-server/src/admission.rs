@@ -286,6 +286,7 @@ impl AdmissionController {
         Ok(DownloadSlot {
             _claim: claim,
             _slot: slot,
+            work: Arc::clone(&self.active),
         })
     }
 
@@ -314,6 +315,30 @@ pub(crate) struct AdmissionGuard {
 pub(crate) struct DownloadSlot {
     _claim: Option<ClientClaim>,
     _slot: OwnedSemaphorePermit,
+    /// The work gate, which admits each chunk of the download.
+    work: Arc<Semaphore>,
+}
+
+impl DownloadSlot {
+    /// Wait, with no deadline, for one ordinary unit of work to produce the
+    /// download's next chunk.
+    ///
+    /// Neither a queue slot nor a timeout, unlike a query's admission. The
+    /// transfer is already admitted, and refusing its next chunk would cut a
+    /// download the client can only resume; waiting its turn behind queries,
+    /// which a chunk's few milliseconds of work never makes long, is the right
+    /// price. The download gate bounds how many chunks wait at once.
+    pub(crate) fn chunk(
+        &self,
+    ) -> impl std::future::Future<Output = Result<AdmissionGuard, Problem>> + Send + 'static {
+        let work = Arc::clone(&self.work);
+        async move {
+            work.acquire_owned()
+                .await
+                .map(|active| AdmissionGuard { _active: active })
+                .map_err(|_| closed_problem())
+        }
+    }
 }
 
 /// Who a download is counted against: an IPv4 address, or an IPv6 /64.

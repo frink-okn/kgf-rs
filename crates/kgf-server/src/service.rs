@@ -781,9 +781,9 @@ impl Release {
     }
 
     /// The length and digest of an artifact this release serves whole.
-    pub fn export(&self, artifact: ExportArtifact) -> ArtifactIdentity {
+    pub fn export(&self, artifact: ExportArtifact) -> &ArtifactIdentity {
         match artifact {
-            ExportArtifact::Hdt => self.hdt,
+            ExportArtifact::Hdt => &self.hdt,
         }
     }
 

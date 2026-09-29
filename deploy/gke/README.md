@@ -18,6 +18,7 @@ already running.
 | `service.yaml` | Service `frink-kgf-service` | Port 80 to the pod's 8080. |
 | `httproute.yaml` | HTTPRoute `frink-kgf-route` | `apps.okn.us/kgf` with the prefix stripped. |
 | `healthcheckpolicy.yaml` | HealthCheckPolicy `frink-kgf-health-check` | The gateway probes `/healthz` on 8080. |
+| `backendpolicy.yaml` | GCPBackendPolicy `frink-kgf-backend-policy` | The gateway lets one response run for an hour, not 30 s, so `/export` downloads finish. |
 
 Outside this directory and created once by hand: the bucket
 `gs://frink-kgf-bundles` (us-east4, uniform access, no lifecycle rule), the

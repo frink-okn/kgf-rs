@@ -21,8 +21,8 @@ pub(crate) enum ContentCoding {
 
 impl ContentCoding {
     /// The compressed codings in this server's order of preference, which
-    /// decides a tie between equally weighted codings: zstd compresses N-Triples
-    /// smaller than gzip does, and several times faster.
+    /// decides a tie between equally weighted codings: zstd compresses smaller
+    /// than gzip does, and several times faster.
     const COMPRESSED: [Self; 2] = [Self::Zstd, Self::Gzip];
 
     /// The token as it appears in `Content-Encoding` and in access records.
@@ -36,35 +36,36 @@ impl ContentCoding {
 
     /// The coding a full-body response takes for this `Accept-Encoding`.
     ///
-    /// No header means identity. RFC 9110 §12.5.3 reads an absent field as
-    /// "anything is acceptable", but a client that did not ask is a client that
-    /// may not decode: `curl` without `--compressed` would save compressed bytes
-    /// under an `.hdt` name.
+    /// **Identity unless the client prefers a coding to it.** Identity is
+    /// acceptable to every client that has not excluded it (RFC 9110 §12.5.3),
+    /// and a tie goes to it: a coded body has no `Content-Length`, no
+    /// `Accept-Ranges`, and only a weak validator, so a browser shows no
+    /// progress and restarts an interrupted download from zero. Every browser,
+    /// Python's `requests`, Go's client, and `curl --compressed` send
+    /// `Accept-Encoding` by default, at equal weight for every coding, so a
+    /// server that preferred compression would give all of them a download
+    /// they cannot resume, of an HDT that compresses by about half. A client
+    /// that wants the smaller transfer says so with weights —
+    /// `Accept-Encoding: zstd, identity;q=0.5` — and between codings at equal
+    /// weight zstd wins.
     ///
-    /// A listed coding is chosen over identity unless identity is itself listed
-    /// with a higher weight: unlisted, identity is acceptable but only as the
-    /// fallback. When nothing is acceptable — identity excluded and no coding
-    /// here offered — the response is sent uncoded anyway, which the RFC
+    /// No header is identity. When identity is excluded and nothing offered
+    /// here is acceptable, the response is sent uncoded anyway, which the RFC
     /// permits and which is more useful to the client than a `406`.
     pub(crate) fn negotiate(accept_encoding: Option<&str>) -> Self {
         let Some(header) = accept_encoding else {
             return Self::Identity;
         };
         let weights = Weights::parse(header);
-        let mut best: Option<(Self, u32)> = None;
+        let identity = weights.identity();
+        let mut chosen = (Self::Identity, identity);
         for coding in Self::COMPRESSED {
-            let Some(weight) = weights.of(coding).filter(|weight| *weight > 0) else {
-                continue;
-            };
-            if best.is_none_or(|(_, held)| weight > held) {
-                best = Some((coding, weight));
+            let weight = weights.of(coding).unwrap_or(0);
+            if weight > chosen.1 {
+                chosen = (coding, weight);
             }
         }
-        match (best, weights.identity()) {
-            (Some((_, weight)), Some(identity)) if identity > weight => Self::Identity,
-            (Some((coding, _)), _) => coding,
-            (None, _) => Self::Identity,
-        }
+        chosen.0
     }
 }
 
@@ -131,10 +132,10 @@ impl Weights {
         own.or(self.any)
     }
 
-    /// Identity's weight when the header states one, directly or through the
-    /// wildcard; `None` when it is only implicitly acceptable.
-    fn identity(&self) -> Option<u32> {
-        self.identity.or(self.any)
+    /// Identity's weight: its own, else the wildcard's, else fully acceptable,
+    /// since only `identity;q=0` or an unqualified `*;q=0` excludes it.
+    fn identity(&self) -> u32 {
+        self.identity.or(self.any).unwrap_or(1000)
     }
 }
 
@@ -144,62 +145,73 @@ mod tests {
     use ContentCoding::{Gzip, Identity, Zstd};
 
     #[test]
-    fn what_real_clients_send_gets_the_coding_they_can_decode() {
-        let cases = [
+    fn what_real_clients_send_by_default_gets_a_resumable_download() {
+        for header in [
             // No header: plain `curl`, `wget`, `aria2c`.
-            (None, Identity),
+            None,
             // A current browser.
-            (Some("gzip, deflate, br, zstd"), Zstd),
-            // `curl --compressed` built without zstd, and Python `requests`.
-            (Some("deflate, gzip"), Gzip),
-            (Some("gzip, deflate"), Gzip),
-            (Some("br"), Identity),
-            (Some("identity"), Identity),
-            (Some(""), Identity),
-            (Some("*"), Zstd),
-        ];
-        for (header, expected) in cases {
-            assert_eq!(ContentCoding::negotiate(header), expected, "{header:?}");
+            Some("gzip, deflate, br, zstd"),
+            // `curl --compressed`, Python `requests`, Go.
+            Some("deflate, gzip, br, zstd"),
+            Some("gzip, deflate"),
+            Some("gzip"),
+            Some("zstd"),
+            Some("*"),
+            Some("br"),
+            Some("identity"),
+            Some(""),
+        ] {
+            assert_eq!(ContentCoding::negotiate(header), Identity, "{header:?}");
         }
     }
 
     #[test]
-    fn weights_decide_before_this_servers_preference() {
-        assert_eq!(ContentCoding::negotiate(Some("zstd;q=0.5, gzip")), Gzip);
+    fn a_coding_is_chosen_only_when_weighted_above_identity() {
+        assert_eq!(ContentCoding::negotiate(Some("zstd, identity;q=0.5")), Zstd);
+        assert_eq!(ContentCoding::negotiate(Some("gzip, identity;q=0.5")), Gzip);
         assert_eq!(
-            ContentCoding::negotiate(Some("gzip;q=0.5, zstd;q=0.5")),
-            Zstd
+            ContentCoding::negotiate(Some("x-gzip, identity;q=0.5")),
+            Gzip
         );
-        assert_eq!(ContentCoding::negotiate(Some("GZIP;Q=0.9")), Gzip);
-        assert_eq!(ContentCoding::negotiate(Some("x-gzip")), Gzip);
-        // Zero is a refusal, not a low preference.
-        assert_eq!(
-            ContentCoding::negotiate(Some("zstd;q=0, gzip;q=0")),
-            Identity
-        );
-        assert_eq!(ContentCoding::negotiate(Some("*;q=0, gzip")), Gzip);
-        assert_eq!(ContentCoding::negotiate(Some("*, zstd;q=0")), Gzip);
-    }
-
-    #[test]
-    fn identity_wins_only_when_it_is_weighted_above_the_coding() {
-        assert_eq!(ContentCoding::negotiate(Some("gzip;q=0.1")), Gzip);
+        assert_eq!(ContentCoding::negotiate(Some("GZIP, IDENTITY;Q=0.5")), Gzip);
         assert_eq!(
             ContentCoding::negotiate(Some("gzip;q=0.5, identity")),
             Identity
         );
-        assert_eq!(ContentCoding::negotiate(Some("gzip, identity")), Gzip);
-        assert_eq!(ContentCoding::negotiate(Some("gzip;q=0.5, *;q=0.8")), Zstd);
-        // Everything refused: the RFC lets the server send identity anyway.
-        assert_eq!(ContentCoding::negotiate(Some("identity;q=0")), Identity);
+        assert_eq!(ContentCoding::negotiate(Some("*;q=0, gzip")), Gzip);
+        assert_eq!(
+            ContentCoding::negotiate(Some("identity;q=0, zstd;q=0.1")),
+            Zstd
+        );
+        // Between codings, the weights decide first and this server's order
+        // breaks a tie.
+        assert_eq!(
+            ContentCoding::negotiate(Some("zstd;q=0.5, gzip, identity;q=0.1")),
+            Gzip
+        );
+        assert_eq!(
+            ContentCoding::negotiate(Some("gzip, zstd, identity;q=0.1")),
+            Zstd
+        );
+        // Zero is a refusal, and everything refused is answered uncoded anyway.
+        assert_eq!(
+            ContentCoding::negotiate(Some("zstd;q=0, gzip;q=0, identity;q=0")),
+            Identity
+        );
+        assert_eq!(
+            ContentCoding::negotiate(Some("*, zstd;q=0, identity;q=0.5")),
+            Gzip
+        );
     }
 
     #[test]
     fn a_malformed_weight_drops_its_element_and_only_its_element() {
-        assert_eq!(ContentCoding::negotiate(Some("zstd;q=2, gzip")), Gzip);
-        assert_eq!(ContentCoding::negotiate(Some("zstd;q, gzip")), Gzip);
-        assert_eq!(ContentCoding::negotiate(Some("zstd;q=0.5x")), Identity);
+        let negotiate =
+            |header: &str| ContentCoding::negotiate(Some(&format!("{header}, identity;q=0.5")));
+        assert_eq!(negotiate("zstd;q=2, gzip"), Gzip);
+        assert_eq!(negotiate("zstd;q, gzip"), Gzip);
+        assert_eq!(negotiate("zstd;q=0.5x"), Identity);
         // The first occurrence of a coding is the one that counts.
-        assert_eq!(ContentCoding::negotiate(Some("zstd;q=0, zstd")), Identity);
+        assert_eq!(negotiate("zstd;q=0, zstd"), Identity);
     }
 }

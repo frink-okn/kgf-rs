@@ -88,13 +88,15 @@ is a download: a browser following a link to `/export/data.hdt` must get the fil
 it has a single representation and the manifest page's download panel is its page.
 
 `/export/data.hdt` serves the published HDT with static-file semantics (unit 31): byte
-ranges including multipart, `If-Range` and the other RFC 9110 preconditions, the
-artifact's SHA-256 as a strong `ETag` shared by every mirror and as `Repr-Digest`, and
-zstd or gzip transfer compression for a full body. A range is always identity bytes.
-It negotiates its own coding and marks its responses so the global compression layer
-and the ETag-weakening middleware pass them through, and it takes a slot from a
-download gate separate from query admission, at most `--max-downloads-per-client` of
-them per client (an IPv4 address or IPv6 /64, as `--trusted-proxies` reports it).
+ranges including multipart, `If-Range` and the other RFC 9110 preconditions, and the
+artifact's SHA-256 as a strong `ETag` shared by every mirror and as `Repr-Digest`. It is
+sent uncompressed unless a client weights zstd or gzip above identity, because only an
+identity body can be sized and resumed; a range, and a request carrying `If-Match` or
+`If-Unmodified-Since`, are always identity. The download routes are mounted outside
+the compression layer and the ETag-weakening middleware the rest of the API sits
+behind. A download takes a slot from a gate separate from query admission, at most
+`--max-downloads-per-client` of them per client (an IPv4 address or IPv6 /64, as
+`--trusted-proxies` reports it), and each chunk it reads passes the query work gate.
 
 `todo!()` is a convention, not laziness — an unimplemented path panics rather than
 returning a plausible wrong answer. Do not replace one with a stub that returns a

@@ -44,7 +44,7 @@ use kgf_store::catalog::BundleId;
 use mediatype::{MediaTypeBuf, names};
 use tower_http::CompressionLevel;
 use tower_http::compression::CompressionLayer;
-use tower_http::compression::predicate::{Predicate, SizeAbove};
+use tower_http::compression::predicate::SizeAbove;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -53,7 +53,7 @@ use crate::admission::{DownloadClient, WorkClass};
 use crate::answer::{self, Rendered, Renders, Target};
 use crate::descriptor::{BundleManifest, DatasetDescriptor, ServiceDescriptor};
 use crate::envelope::{ErrorCode, PROBLEM_MEDIA_TYPE, Problem, reflected};
-use crate::export::{Conditions, Decision, Delivery, ExportArtifact, SelfEncoded};
+use crate::export::{Conditions, Decision, Delivery, ExportArtifact};
 use crate::html::Resource;
 use crate::representation::{CachePolicy, Representation, etag, etag_for_body, negotiate};
 use crate::request;
@@ -81,11 +81,18 @@ pub const HEALTH_PATH: &str = "/healthz";
 pub const RESERVED_DATASET_IDS: &[&str] = &["healthz"];
 
 /// The KGF routes over a built service.
+///
+/// Two stacks, merged. Every resource but the downloads sits behind transfer
+/// compression and the middleware that gives compressed and identity bodies a
+/// shared weak validator. The downloads do not: they negotiate their own
+/// coding, because it decides their validator and length headers, and a range
+/// or `If-Range` is only safe against the strong tag of identity bytes, which
+/// either of those layers would take away. Mounting them outside the two layers
+/// is what keeps each layer free of a special case, and a layer added to one
+/// stack is a decision about that stack alone. Everything else — body limits,
+/// problem rendering, CORS, access records — is the shared stack both carry.
 pub fn router(service: Arc<Service>) -> Router {
-    let body_limit =
-        usize::try_from(service.config().budgets.max_request_bytes).unwrap_or(usize::MAX);
-
-    Router::new()
+    let api = Router::new()
         .route("/", read(get(service_descriptor)))
         // Before the dataset wildcard in reading order, though not in
         // matching order: the router prefers a static segment to a
@@ -125,16 +132,53 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/{dataset}/v/{version}/void", read(get(void)))
         .route("/{dataset}/v/{version}/summary", read(get(summary)))
         .route(
-            "/{dataset}/v/{version}/export/{artifact}",
-            read(get(export)),
-        )
-        .route(
             "/{dataset}/v/{version}/labels",
             MethodRouter::new()
                 .post(labels_post)
                 .fallback(labels_fallback),
         )
-        .fallback(no_such_route)
+        .fallback(no_such_route);
+    let api = shared_layers(api, &service)
+        // Compression sits *outside* access logging on purpose, so `bytes_out`
+        // keeps meaning the entity's size rather than the wire's. That is the
+        // number the published response caps bound and the one earlier records
+        // are comparable with; a client that does not negotiate `gzip` receives
+        // exactly those bytes. Outside `render_problems` is also required:
+        // that layer `insert`s `Vary: Accept`, and compression only *appends*
+        // `accept-encoding`, so the reverse order would drop it.
+        //
+        // Fastest, not the default: on a real fragment response level 1 is
+        // 11.3x for ~0.03 ms, where level 6 buys 13.0x for ~0.06 ms. At
+        // roughly 1% of a request's service time the cheap setting is the one
+        // that stays free even when the server is CPU-bound. `SizeAbove`
+        // raises tower-http's 32-byte floor: below about a kilobyte the
+        // framing costs more than the saving.
+        .layer(
+            CompressionLayer::new()
+                .quality(CompressionLevel::Fastest)
+                .compress_when(SizeAbove::new(1024)),
+        )
+        // Outermost, because it must observe the `Content-Encoding` the layer
+        // below may have added — and must also reach the responses that layer
+        // never handles, a `304` in particular.
+        .layer(middleware::from_fn(mark_encoding_negotiated));
+
+    let downloads = shared_layers(
+        Router::new().route(
+            "/{dataset}/v/{version}/export/{artifact}",
+            read(get(export)),
+        ),
+        &service,
+    );
+
+    api.merge(downloads).with_state(service)
+}
+
+/// The layers every resource carries, downloads included.
+fn shared_layers(router: Router<Arc<Service>>, service: &Arc<Service>) -> Router<Arc<Service>> {
+    let body_limit =
+        usize::try_from(service.config().budgets.max_request_bytes).unwrap_or(usize::MAX);
+    router
         // Order matters more than usual here, and reads innermost first.
         //
         // `render_problems` must sit *outside* the body limit, or the 413 that
@@ -151,7 +195,7 @@ pub fn router(service: Arc<Service>) -> Router {
         .layer(RequestBodyLimitLayer::new(body_limit))
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(middleware::from_fn_with_state(
-            Arc::clone(&service),
+            Arc::clone(service),
             render_problems,
         ))
         // Permissive CORS, because the data is public and browser and WASM
@@ -164,54 +208,13 @@ pub fn router(service: Arc<Service>) -> Router {
                 .allow_methods([Method::GET, Method::HEAD, Method::POST, query_method()])
                 .expose_headers(Any),
         )
-        // Axum applies the last layer outermost. Access logging therefore sees
+        // Applied last, so outermost of these. Access logging therefore sees
         // CORS preflights and responses produced by the body limit as well as
         // ordinary handler responses.
         .layer(middleware::from_fn_with_state(
-            Arc::clone(&service),
+            Arc::clone(service),
             crate::access::record_request,
         ))
-        // Compression sits *outside* access logging on purpose, so `bytes_out`
-        // keeps meaning the entity's size rather than the wire's. That is the
-        // number the published response caps bound and the one earlier records
-        // are comparable with; a client that does not negotiate `gzip` receives
-        // exactly those bytes. Outside `render_problems` is also required:
-        // that layer `insert`s `Vary: Accept`, and compression only *appends*
-        // `accept-encoding`, so the reverse order would drop it.
-        //
-        // Fastest, not the default: on a real fragment response level 1 is
-        // 11.3x for ~0.03 ms, where level 6 buys 13.0x for ~0.06 ms. At
-        // roughly 1% of a request's service time the cheap setting is the one
-        // that stays free even when the server is CPU-bound. `SizeAbove`
-        // raises tower-http's 32-byte floor: below about a kilobyte the
-        // framing costs more than the saving.
-        //
-        // A download is the exception: it negotiates its own coding, because
-        // the coding decides its validator and length headers, and it marks
-        // its responses so this layer passes them through untouched.
-        .layer(
-            CompressionLayer::new()
-                .quality(CompressionLevel::Fastest)
-                .compress_when(SizeAbove::new(1024).and(NotSelfEncoded)),
-        )
-        // Outermost, because it must observe the `Content-Encoding` the layer
-        // below may have added — and must also reach the responses that layer
-        // never handles, a `304` in particular.
-        .layer(middleware::from_fn(mark_encoding_negotiated))
-        .with_state(service)
-}
-
-/// Compress only responses whose handler left the coding to this layer.
-#[derive(Debug, Clone, Copy)]
-struct NotSelfEncoded;
-
-impl Predicate for NotSelfEncoded {
-    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
-    where
-        B: http_body::Body,
-    {
-        response.extensions().get::<SelfEncoded>().is_none()
-    }
 }
 
 /// RFC 10008's method. Not a constant in `http`, which is the whole reason this
@@ -242,6 +245,25 @@ fn method_not_allowed_problem(method: Method) -> Problem {
         ),
     )
 }
+
+/// Every resource under a version, as a 404 lists them for a client to
+/// correct against.
+const VERSION_RESOURCES: &[&str] = &[
+    "manifest",
+    "fragment",
+    "tpf",
+    "count",
+    "describe",
+    "sample",
+    "search",
+    "terms",
+    "labels",
+    "graphs",
+    "schema",
+    "void",
+    "summary",
+    "export/data.hdt",
+];
 
 /// The fallback, in the client's own spelling: behind a prefix-stripping
 /// gateway the path this server saw is not the one the client sent, so both
@@ -276,10 +298,10 @@ async fn no_such_route(
         ErrorCode::NotFound,
         format!(
             "no resource at {}; this server serves {prefix}/ (service descriptor), \
-             {prefix}/{{dataset}}, and {prefix}/{{dataset}}/v/{{version}}/{{manifest,fragment,tpf,\
-             count,describe,sample,search,labels,schema,void,summary}}; version resources \
-             are also available under {prefix}/{{dataset}}/latest/{hint}",
-            reflected(&mount.public_path(path))
+             {prefix}/{{dataset}}, and {prefix}/{{dataset}}/v/{{version}}/{{{}}}; version \
+             resources are also available under {prefix}/{{dataset}}/latest/{hint}",
+            reflected(&mount.public_path(path)),
+            VERSION_RESOURCES.join(","),
         ),
     )
 }
@@ -423,6 +445,10 @@ async fn bundle_manifest(
         &version,
         release.manifest().bytes(),
         release.manifest().parsed(),
+        ExportArtifact::ALL
+            .iter()
+            .map(|&artifact| (artifact, release.export(artifact).clone()))
+            .collect(),
     );
 
     // The manifest itself is already in memory, but a bundle that cannot be
@@ -2109,19 +2135,13 @@ impl IntoResponse for Problem {
 ///
 /// It costs a strong validator on identity responses, and that is free for
 /// every resource this rule covers. Strong validators are only required for
-/// `Range` and `If-Match`, which only downloads implement; `If-None-Match`
-/// compares weakly (RFC 9110 §13.1.2), so revalidation is unaffected. A weak
-/// tag also states the truth that a shared one asserts: the encoded and
-/// identity bodies are semantically equivalent, not byte-identical. A download
-/// negotiates its own coding, keeps its strong tag on identity bytes, and is
-/// passed through untouched.
+/// `Range` and `If-Match`, which only downloads implement, and downloads are
+/// mounted outside this layer; `If-None-Match` compares weakly (RFC 9110
+/// §13.1.2), so revalidation is unaffected. A weak tag also states the truth
+/// that a shared one asserts: the encoded and identity bodies are semantically
+/// equivalent, not byte-identical.
 async fn mark_encoding_negotiated(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
-    // A download chose its own coding and validator, and a strong tag on its
-    // identity bytes is what makes `If-Range` work; see `crate::export`.
-    if response.extensions().get::<SelfEncoded>().is_some() {
-        return response;
-    }
     declare_encoding_vary(response.headers_mut());
     // Only a strong tag needs weakening, and only a well-formed one is touched:
     // anything else is left exactly as the handler set it.
@@ -2371,6 +2391,25 @@ mod tests {
         );
         // A cached probe reports on the cache, not the process.
         assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+    }
+
+    #[test]
+    fn a_404_lists_every_resource_under_a_version() {
+        // The list is what an agent corrects a mistyped path against, so a
+        // route missing from it is one no correction ever reaches.
+        for operation in AccessOperation::VERSIONED {
+            let segment = operation.path_segment();
+            assert!(
+                VERSION_RESOURCES
+                    .iter()
+                    .any(|resource| resource.split('/').next() == Some(segment)),
+                "{segment} is routed but not listed"
+            );
+        }
+        for &artifact in ExportArtifact::ALL {
+            let resource = format!("export/{}", artifact.name());
+            assert!(VERSION_RESOURCES.contains(&resource.as_str()), "{resource}");
+        }
     }
 
     #[test]

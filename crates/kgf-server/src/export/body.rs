@@ -2,12 +2,17 @@
 //!
 //! Every chunk is read — and, for a compressed response, encoded — on the
 //! blocking pool, because a slice of a mapping faults pages as it is read and a
-//! page fault stalls whichever thread takes it. The next chunk is not produced
-//! until hyper asks for it, which is when the socket has taken the previous
-//! one: a client that stops reading holds its download slot, but no thread and
-//! no more than one chunk of memory.
+//! page fault stalls whichever thread takes it. And every chunk is admitted to
+//! that pool through the same work gate as a query, one ordinary unit for the
+//! chunk's duration: a transfer's page faults and compression are exactly the
+//! blocking work the gate bounds, and a download admitted past its own gate
+//! must not then use the pool outside the bound queries are held to. The next
+//! chunk is not produced until hyper asks for it, which is when the socket has
+//! taken the previous one: a client that stops reading holds its download
+//! slot, but no thread, no unit of work, and no more than one chunk of memory.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io::{self, Write as _};
 use std::ops::Range;
 use std::pin::Pin;
@@ -19,7 +24,8 @@ use http_body::{Body, Frame, SizeHint};
 use tokio::task::JoinHandle;
 
 use super::coding::ContentCoding;
-use crate::admission::DownloadSlot;
+use crate::admission::{AdmissionGuard, DownloadSlot};
+use crate::envelope::Problem;
 
 /// Where a download's bytes come from: an artifact, whole.
 ///
@@ -43,8 +49,11 @@ const CHUNK: usize = 512 * 1024;
 /// on N-Triples and HDT, at a speed that keeps a core ahead of most links.
 const ZSTD_LEVEL: i32 = 3;
 
-/// flate2's default level, the one `gzip` itself uses.
-const GZIP_LEVEL: u32 = 6;
+/// gzip's fastest level, for the reason the API's own compression uses it:
+/// every coded chunk is CPU on the shared blocking pool, and on an HDT level 1
+/// comes within a few points of level 6 (52% of the size against 48% on the
+/// demo corpus) at about twice the speed.
+const GZIP_LEVEL: u32 = 1;
 
 /// One piece of a response body, in order.
 #[derive(Debug, Clone)]
@@ -82,9 +91,13 @@ pub(crate) struct Download {
 
 enum State {
     Ready(Box<Producer>),
+    /// Waiting for the work gate to admit the next chunk.
+    Admitting(Box<Producer>, Admission),
     Producing(JoinHandle<(Box<Producer>, io::Result<Option<Bytes>>)>),
     Done,
 }
+
+type Admission = Pin<Box<dyn Future<Output = Result<AdmissionGuard, Problem>> + Send>>;
 
 impl Download {
     /// Stream `segments` of `source`, encoded as `coding`.
@@ -102,7 +115,7 @@ impl Download {
                 source,
                 segments: segments.into(),
                 encoder,
-                _slot: slot,
+                slot,
             })),
             remaining,
         })
@@ -122,12 +135,29 @@ impl Body for Download {
             match std::mem::replace(&mut this.state, State::Done) {
                 State::Done => return Poll::Ready(None),
                 State::Ready(producer) => {
-                    this.state = State::Producing(tokio::task::spawn_blocking(move || {
-                        let mut producer = producer;
-                        let chunk = producer.next_chunk();
-                        (producer, chunk)
-                    }));
+                    let admission = Box::pin(producer.slot.chunk());
+                    this.state = State::Admitting(producer, admission);
                 }
+                State::Admitting(producer, mut admission) => match admission.as_mut().poll(cx) {
+                    Poll::Pending => {
+                        this.state = State::Admitting(producer, admission);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Ok(admitted)) => {
+                        this.state = State::Producing(tokio::task::spawn_blocking(move || {
+                            // Held for the chunk's work and no longer, inside
+                            // the task for the reason the slot is: the work
+                            // outlives a body dropped while it runs.
+                            let _admitted = admitted;
+                            let mut producer = producer;
+                            let chunk = producer.next_chunk();
+                            (producer, chunk)
+                        }));
+                    }
+                    Poll::Ready(Err(problem)) => {
+                        return Poll::Ready(Some(Err(io::Error::other(problem.to_string()))));
+                    }
+                },
                 State::Producing(mut task) => match Pin::new(&mut task).poll(cx) {
                     Poll::Pending => {
                         this.state = State::Producing(task);
@@ -203,8 +233,9 @@ struct Producer {
     source: Arc<dyn Source>,
     segments: VecDeque<Segment>,
     encoder: Option<Encoder>,
-    /// This download's claim on the download gate, held wherever the work is.
-    _slot: DownloadSlot,
+    /// This download's claim on the download gate, held wherever the work is,
+    /// and through which each chunk is admitted to the work gate.
+    slot: DownloadSlot,
 }
 
 impl Producer {
@@ -220,11 +251,14 @@ impl Producer {
                     None => Ok(None),
                 };
             };
-            let input: Bytes = match segment {
+            let output = match segment {
                 Segment::Literal(bytes) => {
                     let bytes = bytes.clone();
                     self.segments.pop_front();
-                    bytes
+                    match &mut self.encoder {
+                        None => bytes,
+                        Some(encoder) => encoder.encode(&bytes)?,
+                    }
                 }
                 Segment::Artifact(span) => {
                     let start = span.start;
@@ -233,31 +267,28 @@ impl Producer {
                     if span.start == span.end {
                         self.segments.pop_front();
                     }
-                    let bytes = self.source.bytes();
                     let (Ok(from), Ok(to)) =
                         (usize::try_from(start), usize::try_from(start + take))
                     else {
                         return Err(io::Error::other("a span does not fit this platform"));
                     };
-                    let Some(slice) = bytes.get(from..to) else {
+                    let Some(slice) = self.source.bytes().get(from..to) else {
                         // The handler checked the mapping's length against the
                         // manifest before streaming, so this is a bug here.
                         return Err(io::Error::other(
                             "a download span lies outside the mapped artifact",
                         ));
                     };
-                    Bytes::copy_from_slice(slice)
-                }
-            };
-            match &mut self.encoder {
-                None if input.is_empty() => {}
-                None => return Ok(Some(input)),
-                Some(encoder) => {
-                    let output = encoder.encode(&input)?;
-                    if !output.is_empty() {
-                        return Ok(Some(output));
+                    // Identity hands hyper a copy it owns; a coded body is
+                    // encoded straight from the mapping, with no copy between.
+                    match &mut self.encoder {
+                        None => Bytes::copy_from_slice(slice),
+                        Some(encoder) => encoder.encode(slice)?,
                     }
                 }
+            };
+            if !output.is_empty() {
+                return Ok(Some(output));
             }
         }
     }
@@ -407,6 +438,46 @@ mod tests {
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
+        });
+    }
+
+    #[test]
+    fn a_chunk_is_read_only_when_the_work_gate_admits_it() {
+        use crate::admission::{Admission, AdmissionController, WorkClass};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let admission = AdmissionController::new(Admission {
+                max_concurrent_work: 1,
+                heavy_request_weight: 1,
+                max_queued_requests: 0,
+                ..Admission::new()
+            });
+            let query = admission.enter(WorkClass::Ordinary).await.unwrap();
+
+            let source: Arc<dyn Source> = Arc::new(vec![7u8; 2 * CHUNK]);
+            let segments = vec![Segment::Artifact(0..2 * CHUNK as u64)];
+            let slot = admission.download(None).unwrap();
+            let mut body = Download::new(source, segments, ContentCoding::Identity, slot).unwrap();
+
+            // Every unit of work is taken, so nothing is read...
+            let mut context = Context::from_waker(std::task::Waker::noop());
+            assert!(Pin::new(&mut body).poll_frame(&mut context).is_pending());
+            assert!(matches!(body.state, State::Admitting(..)));
+
+            // ...until the query holding it is done.
+            drop(query);
+            let frame = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+                .await
+                .expect("a frame")
+                .expect("a chunk");
+            assert_eq!(frame.into_data().unwrap().len(), CHUNK);
+
+            // The chunk's unit is given back once the chunk has been produced.
+            admission.enter(WorkClass::Ordinary).await.unwrap();
         });
     }
 

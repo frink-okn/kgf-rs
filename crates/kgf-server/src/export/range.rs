@@ -50,7 +50,8 @@ pub(crate) struct ByteRangeSet {
 pub(crate) enum RangeSelection {
     /// One contiguous span: a single-part `206`.
     One(Range<u64>),
-    /// Two or more disjoint spans, ascending: `multipart/byteranges`.
+    /// Two or more disjoint spans, in the order they were asked for:
+    /// `multipart/byteranges`.
     Several(Vec<Range<u64>>),
     /// No spec names a byte inside the artifact.
     Unsatisfiable,
@@ -97,33 +98,43 @@ impl ByteRangeSet {
 
     /// Resolve against an artifact of `len` bytes.
     ///
-    /// Overlapping spans, and spans closer than a part's framing, are merged;
-    /// merging needs an order, so a multipart response lists its parts
-    /// ascending rather than in request order.
+    /// Overlapping spans, and spans closer than a part's framing, are merged.
+    /// The parts then go out in the order they were asked for, as RFC 9110
+    /// §15.3.7.2 asks, with a merged part taking the place of the earliest
+    /// spec it absorbed: a client reading an HDT's trailer before its header
+    /// gets them in that order.
     pub(crate) fn select(&self, len: u64) -> RangeSelection {
         if self.excessive {
             return RangeSelection::Excessive;
         }
-        let mut spans: Vec<Range<u64>> = self
+        // Each span with its position in the request, so merging — which
+        // needs them by offset — can be undone for the order they are sent in.
+        let mut spans: Vec<(usize, Range<u64>)> = self
             .specs
             .iter()
-            .filter_map(|spec| spec.span(len))
+            .enumerate()
+            .filter_map(|(asked, spec)| Some((asked, spec.span(len)?)))
             .collect();
-        spans.sort_unstable_by_key(|span| span.start);
-        let mut merged: Vec<Range<u64>> = Vec::with_capacity(spans.len());
-        for span in spans {
+        spans.sort_unstable_by_key(|(_, span)| span.start);
+        let mut merged: Vec<(usize, Range<u64>)> = Vec::with_capacity(spans.len());
+        for (asked, span) in spans {
             match merged.last_mut() {
-                Some(previous) if span.start <= previous.end.saturating_add(COALESCE_GAP) => {
+                Some((first_asked, previous))
+                    if span.start <= previous.end.saturating_add(COALESCE_GAP) =>
+                {
                     previous.end = previous.end.max(span.end);
+                    *first_asked = (*first_asked).min(asked);
                 }
-                _ => merged.push(span),
+                _ => merged.push((asked, span)),
             }
         }
-        match merged.len() {
+        merged.sort_unstable_by_key(|(asked, _)| *asked);
+        let mut parts: Vec<Range<u64>> = merged.into_iter().map(|(_, span)| span).collect();
+        match parts.len() {
             0 => RangeSelection::Unsatisfiable,
-            1 => RangeSelection::One(merged.remove(0)),
-            parts if parts > MAX_PARTS => RangeSelection::Excessive,
-            _ => RangeSelection::Several(merged),
+            1 => RangeSelection::One(parts.remove(0)),
+            count if count > MAX_PARTS => RangeSelection::Excessive,
+            _ => RangeSelection::Several(parts),
         }
     }
 }
@@ -273,10 +284,15 @@ mod tests {
             select("bytes=0-9, 100-109", 10_000),
             RangeSelection::One(0..110)
         );
-        // Distant spans stay parts, ascending whatever order they were asked in.
+        // Distant spans stay parts, in the order they were asked for.
         assert_eq!(
             select("bytes=5000-5009, 0-9", 10_000),
-            RangeSelection::Several(vec![0..10, 5000..5010])
+            RangeSelection::Several(vec![5000..5010, 0..10])
+        );
+        // A merged part takes the place of the earliest spec it absorbed.
+        assert_eq!(
+            select("bytes=9000-9009, 5000-5009, 0-9, 5005-5019", 10_000),
+            RangeSelection::Several(vec![9000..9010, 5000..5020, 0..10])
         );
 
         let many: Vec<String> = (0..=MAX_PARTS as u64)
@@ -330,7 +346,9 @@ mod tests {
                             panic!("{header}: two specs are not excessive")
                         }
                     };
-                    for pair in spans.windows(2) {
+                    let mut ordered = spans.clone();
+                    ordered.sort_unstable_by_key(|span| span.start);
+                    for pair in ordered.windows(2) {
                         assert!(pair[0].end < pair[1].start, "{header} at {len}: {spans:?}");
                     }
                     let served: std::collections::BTreeSet<u64> =
