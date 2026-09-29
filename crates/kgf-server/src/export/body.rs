@@ -16,12 +16,22 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
-use kgf_store::Store;
 use tokio::task::JoinHandle;
 
-use super::ExportArtifact;
 use super::coding::ContentCoding;
 use crate::admission::DownloadSlot;
+
+/// Where a download's bytes come from: an artifact, whole.
+///
+/// The body needs nothing of a bundle but the bytes and a name to log, and
+/// asking only for those keeps its scheduling testable without one.
+pub(crate) trait Source: Send + Sync + 'static {
+    /// The artifact's bytes. May fault pages; called on the blocking pool only.
+    fn bytes(&self) -> &[u8];
+
+    /// The artifact's name, for a log line.
+    fn name(&self) -> &'static str;
+}
 
 /// Artifact bytes read per blocking task.
 ///
@@ -56,13 +66,18 @@ impl Segment {
 }
 
 /// A download's body.
+///
+/// The download slot lives in the [`Producer`], not here. A blocking task
+/// cannot be cancelled once it starts, so a body dropped while a chunk is
+/// being produced — the client went away — leaves that task running to the
+/// end of its chunk; the slot has to stay claimed until it does, or a client
+/// cancelling and retrying could put more reads and compressions in flight
+/// than the gate admits. Travelling with the producer, the slot is released
+/// with the body when no chunk is in progress, and with the task otherwise.
 pub(crate) struct Download {
     state: State,
     /// Bytes still to send, when the response declared a length.
     remaining: Option<u64>,
-    /// Released when the body is dropped, which is when the transfer ends for
-    /// any reason.
-    _slot: DownloadSlot,
 }
 
 enum State {
@@ -72,10 +87,9 @@ enum State {
 }
 
 impl Download {
-    /// Stream `segments` of `artifact` from `store`, encoded as `coding`.
+    /// Stream `segments` of `source`, encoded as `coding`.
     pub(crate) fn new(
-        store: Arc<Store>,
-        artifact: ExportArtifact,
+        source: Arc<dyn Source>,
         segments: Vec<Segment>,
         coding: ContentCoding,
         slot: DownloadSlot,
@@ -85,13 +99,12 @@ impl Download {
         let remaining = encoder.is_none().then_some(total);
         Ok(Self {
             state: State::Ready(Box::new(Producer {
-                store,
-                artifact,
+                source,
                 segments: segments.into(),
                 encoder,
+                _slot: slot,
             })),
             remaining,
-            _slot: slot,
         })
     }
 }
@@ -133,7 +146,7 @@ impl Body for Download {
                     // short transfer it can resume, never wrong bytes.
                     Poll::Ready(Ok((producer, Err(error)))) => {
                         tracing::error!(
-                            artifact = producer.artifact.name(),
+                            artifact = producer.source.name(),
                             %error,
                             "a download failed while producing its body",
                         );
@@ -187,10 +200,11 @@ impl Body for Unmeasured {
 
 /// The state that moves to the blocking pool and back for each chunk.
 struct Producer {
-    store: Arc<Store>,
-    artifact: ExportArtifact,
+    source: Arc<dyn Source>,
     segments: VecDeque<Segment>,
     encoder: Option<Encoder>,
+    /// This download's claim on the download gate, held wherever the work is.
+    _slot: DownloadSlot,
 }
 
 impl Producer {
@@ -219,7 +233,7 @@ impl Producer {
                     if span.start == span.end {
                         self.segments.pop_front();
                     }
-                    let bytes = self.artifact.bytes(&self.store);
+                    let bytes = self.source.bytes();
                     let (Ok(from), Ok(to)) =
                         (usize::try_from(start), usize::try_from(start + take))
                     else {
@@ -339,6 +353,61 @@ mod tests {
             .unwrap();
             assert_eq!(decoded, input);
         }
+    }
+
+    impl Source for Vec<u8> {
+        fn bytes(&self) -> &[u8] {
+            self
+        }
+
+        fn name(&self) -> &'static str {
+            "fixture"
+        }
+    }
+
+    #[test]
+    fn a_dropped_body_keeps_its_slot_until_its_chunk_has_been_produced() {
+        use crate::admission::{Admission, AdmissionController};
+
+        // One blocking thread, occupied until the test says otherwise, so the
+        // chunk the body asks for is queued behind it: exactly the moment a
+        // client that goes away leaves work nothing can cancel.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let admission = AdmissionController::new(Admission {
+                max_concurrent_downloads: 1,
+                ..Admission::new()
+            });
+            let (release, hold) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || hold.recv());
+
+            let source: Arc<dyn Source> = Arc::new(vec![7u8; 3 * CHUNK]);
+            let segments = vec![Segment::Artifact(0..3 * CHUNK as u64)];
+            let slot = admission.download(None).unwrap();
+            let mut body = Download::new(source, segments, ContentCoding::Identity, slot).unwrap();
+            let mut context = Context::from_waker(std::task::Waker::noop());
+            assert!(Pin::new(&mut body).poll_frame(&mut context).is_pending());
+            drop(body);
+
+            // The client is gone, but its chunk is still to be produced.
+            assert!(admission.download(None).is_err());
+
+            release.send(()).unwrap();
+            occupied.await.unwrap().unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while admission.download(None).is_err() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the slot was not given back after its chunk"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
     }
 
     #[test]

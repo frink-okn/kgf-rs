@@ -2431,6 +2431,26 @@ same client is refused with the per-client message, another client downloads, a 
 from the stalled client is still answered, and the slot comes back once the stalled
 connection closes.
 
+**After review (2026-09-28): two findings, both fixed.**
+
+- *The route ignored its query.* `?g=<G>` and `?g=*` were answered with the union —
+  a `206` of union bytes where `/count` answers 501 — which is the silently dropped
+  filter every other operation refuses. Doc 03 §3.7 lists `g` on `export`, so it is
+  now parsed like `/fragment`'s and refused, as `capability_not_available`, unless the
+  scope is what the artifact holds: absent or the union's name, or the unnamed graph's
+  name on a release without memberships, whose triples are all unnamed. Every other
+  parameter is `malformed_request`. Both are decided before any precondition, since a
+  `304` or a `206` for such a query would pass the union off as what was asked.
+- *A cancelled download released its slot early.* The body held the slot while the
+  blocking task held the producer, so a client that went away mid-chunk freed its slot
+  while that chunk's read and compression carried on — cancelling and retrying could
+  put more work in flight than either limit admits. `blocking()` already keeps its
+  capacity inside the task for exactly this reason; the slot now travels with the
+  producer the same way. The body reads through a small `Source` trait rather than a
+  `Store`, which is what lets the unit test queue a chunk behind an occupied blocking
+  thread, drop the body, and see the slot still held — and it fails against the old
+  ownership.
+
 **Still open from step 1.** A client that stops reading still holds its slot — now one of
 its own few rather than one of everyone's — until TCP gives up on it or the gateway's
 backend timeout ends the response. A write-progress timeout on the connection would

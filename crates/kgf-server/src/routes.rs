@@ -928,6 +928,7 @@ async fn export(
     State(service): State<Arc<Service>>,
     Path((dataset, version, artifact)): Path<(String, String, String)>,
     method: Method,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
 ) -> Result<Response, Problem> {
@@ -945,6 +946,19 @@ async fn export(
     let mut observation = Observation::new(service.access(), AccessOperation::Export)
         .resolved(&dataset, Some(&version));
     observation.transport = Some(Transport::Get);
+    // Before any precondition: a `304` or a `206` answering a query this
+    // operation cannot honour would be the union passed off as what was asked.
+    let parsed = Params::parse(uri.query()).and_then(|params| {
+        request::Export::parse(
+            &params,
+            service.config().limits(),
+            release.prefixes(),
+            release.declares(Capability::Graphs),
+        )
+    });
+    if let Err(problem) = parsed {
+        return observed_result(Err(problem), observation);
+    }
 
     let delivery = Delivery::new(
         &dataset,

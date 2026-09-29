@@ -2093,6 +2093,71 @@ fn a_download_is_recorded_by_its_shape() {
     );
 }
 
+/// A download takes a graph scope only where the artifact is that scope, and
+/// refuses everything else before a precondition or a byte is considered:
+/// answering `g=<G>` with the union would be a larger file carrying no sign of
+/// being the wrong one.
+#[test]
+fn a_download_refuses_a_query_it_cannot_honour() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    deployment.publish_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-01-09T09:00:00Z");
+    let server = deployment.serve();
+    let scoped = |dataset: &str, g: &str| {
+        format!(
+            "/{dataset}/v/v1/export/data.hdt?g={}",
+            kgf_server::url::encode_value(g)
+        )
+    };
+    let refused = |target: &str, headers: &[(&str, &str)], status: u16, code: &str| {
+        let response = server.request("GET", target, headers);
+        response.assert_status(status);
+        assert_eq!(response.json()["code"], code, "{target}");
+    };
+
+    for dataset in ["tox", "quads"] {
+        // The union is the artifact, spelled either way.
+        let union = server.get(&scoped(dataset, "<urn:x-kgf:union>"));
+        union.assert_status(200);
+        assert_eq!(
+            union.body,
+            server.get(&format!("/{dataset}/v/v1/export/data.hdt")).body
+        );
+
+        for g in ["*", "<http://example.org/g1>"] {
+            refused(&scoped(dataset, g), &[], 501, "capability_not_available");
+            // Refused ahead of the preconditions and the range, which would
+            // otherwise have answered 304 or 206 with the union's bytes.
+            let etag = union.header("etag").unwrap();
+            refused(
+                &scoped(dataset, g),
+                &[("if-none-match", &etag), ("range", "bytes=0-9")],
+                501,
+                "capability_not_available",
+            );
+        }
+        refused(
+            &format!("/{dataset}/v/v1/export/data.hdt?format=json"),
+            &[],
+            400,
+            "malformed_request",
+        );
+        refused(&scoped(dataset, "<not an iri"), &[], 400, "bad_term_syntax");
+    }
+
+    // The unnamed graph is the whole artifact only where every triple is
+    // unnamed, which is a release without memberships.
+    server
+        .get(&scoped("tox", "<urn:x-kgf:unnamed>"))
+        .assert_status(200);
+    refused(
+        &scoped("quads", "<urn:x-kgf:unnamed>"),
+        &[],
+        501,
+        "capability_not_available",
+    );
+}
+
 /// A client that stops reading keeps its download slot, and only its own:
 /// another client still downloads, the same client is told it is at its
 /// limit, and the slot comes back as soon as the stalled client goes away.

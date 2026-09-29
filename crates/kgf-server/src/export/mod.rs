@@ -60,7 +60,7 @@ use crate::admission::DownloadSlot;
 use crate::envelope::{ErrorCode, Problem};
 use crate::representation::CachePolicy;
 
-use body::{Download, Segment, Unmeasured};
+use body::{Download, Segment, Source, Unmeasured};
 use coding::ContentCoding;
 use range::{ByteRangeSet, RangeSelection};
 
@@ -126,6 +126,22 @@ impl ExportArtifact {
         match self {
             Self::Hdt => store.hdt_bytes(),
         }
+    }
+}
+
+/// An exported artifact as its bundle maps it.
+struct Mapped {
+    store: Arc<Store>,
+    artifact: ExportArtifact,
+}
+
+impl Source for Mapped {
+    fn bytes(&self) -> &[u8] {
+        self.artifact.bytes(&self.store)
+    }
+
+    fn name(&self) -> &'static str {
+        self.artifact.name()
     }
 }
 
@@ -503,14 +519,17 @@ impl Delivery {
         let segments = self.segments(extent);
         let length = segments.iter().map(Segment::len).sum();
         let mut response = self.framed(coding, extent, length);
-        let download =
-            Download::new(store, self.artifact, segments, coding, slot).map_err(|error| {
-                tracing::error!(%error, "a download's encoder could not be created");
-                Problem::new(
-                    ErrorCode::InternalError,
-                    "the download could not be started",
-                )
-            })?;
+        let source = Arc::new(Mapped {
+            store,
+            artifact: self.artifact,
+        });
+        let download = Download::new(source, segments, coding, slot).map_err(|error| {
+            tracing::error!(%error, "a download's encoder could not be created");
+            Problem::new(
+                ErrorCode::InternalError,
+                "the download could not be started",
+            )
+        })?;
         *response.body_mut() = Body::new(download);
         Ok(response)
     }
