@@ -265,6 +265,11 @@ impl Permutations {
         self.hdt.path()
     }
 
+    /// The mapped host HDT, whole.
+    pub(crate) fn hdt_bytes(&self) -> &[u8] {
+        self.hdt.as_bytes()
+    }
+
     /// The dictionary projected from the host HDT.
     ///
     /// The layout and mapping remain encapsulated here so a caller cannot

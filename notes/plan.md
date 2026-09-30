@@ -2244,6 +2244,307 @@ publication check already handled it, so only the build's refusal went. Nominati
 source stays available for a publisher who wants that part on the card. Doc 04 now
 states the rule.
 
+### 31. Whole-dataset downloads — `/export`
+
+**Planned 2026-09-28.** Doc 03 §3.4.11 reserves `GET /export/data.hdt` "(Range requests
+supported)" and says nothing more about the response. The aim here is a download surface
+as dependable as a well-configured static file server: resumable after any
+interruption, verifiable end to end after a resume, cacheable by anything between the
+server and the client, and identical on every mirror serving the same bundle. Then
+N-Triples generated from the HDT, with the same properties. Three steps:
+
+1. **`/export/data.hdt`.** Static-file semantics over the mapped, publication-verified
+   HDT:
+   - *Validators.* A strong `ETag` that is the artifact's own SHA-256 from the manifest,
+     `"sha256:{hex}"`. Unlike every other validator here it does not mix in the
+     deployment digest: the bytes do not depend on the deployment, so two servers — or a
+     server and a mirror — publishing one bundle agree on the tag, and a client may
+     resume from either. `Last-Modified` is the manifest's `created`.
+   - *Ranges.* `Accept-Ranges: bytes`. One satisfiable range is a `206` with
+     `Content-Range`; several are coalesced and served as `multipart/byteranges` up to a
+     part cap, beyond which the request is refused with `416`, as RFC 9110 §14.2 allows
+     for many small ranges. None satisfiable is `416` carrying `Content-Range: bytes
+     */{len}`. A syntactically invalid `Range` is ignored, as the RFC requires; `HEAD`
+     never ranges.
+   - *Preconditions,* in RFC 9110 §13.2.2's order: `If-Match` then
+     `If-Unmodified-Since` can answer `412`; `If-None-Match` then `If-Modified-Since`
+     can answer `304`; `If-Range` — strong comparison, or an exact date — decides
+     whether a range is honoured or the full `200` is sent.
+   - *Integrity.* `Repr-Digest: sha-256=:{base64}:` (RFC 9530) on every identity
+     response, `206` included: it digests the whole representation, so it is exactly
+     what a client that assembled a file from several transfers checks it against.
+   - *Caching and naming.* `Cache-Control: public, max-age=31536000, immutable,
+     no-transform` — `no-transform` because an intermediary that re-encodes the bytes
+     invalidates both the ranges and the digest. `Content-Disposition: attachment;
+     filename="{dataset}-{version}.hdt"`, so a saved file names the version it holds.
+   - *Transfer compression* (revised after the second review, below). A full-body
+     response negotiates `zstd` or `gzip` from `Accept-Encoding`, but identity wins a
+     tie, so only a client weighting a coding above identity gets one; a honoured range,
+     and a request asserting `If-Match` or `If-Unmodified-Since`, are always identity.
+     Measured on the demo corpus, gzip takes an HDT to 20–59% of its size. A compressed
+     response carries a weak `ETag`, and no `Content-Length`, `Accept-Ranges`, or
+     `Repr-Digest`, because its bytes are not known before they are produced. A client
+     that decodes as it stores holds identity bytes, so its file length is an identity
+     offset and a `curl -C` resume works; a browser does not resume a coded download at
+     all, which is why identity is the default. The export negotiates and encodes for
+     itself, sets its own `Vary: Accept-Encoding`, and is mounted outside the global
+     compression layer and the middleware that weakens every other `ETag`: that
+     middleware's rule is right for resources nothing ranges over, and would make
+     `If-Range` unusable here.
+   - *Capacity.* A download is long-lived, so it must not hold the query admission gate
+     for its duration. It takes a slot from a separate, smaller gate
+     (`--max-concurrent-downloads`) for the life of its body, and a full gate answers
+     `429` with `Retry-After`. `HEAD`, `304`, `412`, and `416` take no slot. The body
+     reads, and compresses, one chunk at a time on the blocking pool, so a client that
+     stops reading holds its slot but no thread.
+2. **A block index, and `/export/data.nt` — `data.nq` for a bundle with graphs.** A
+   byte offset into generated N-Triples can be mapped back to a triple only by an index
+   built ahead of time. `kgf build` writes one (a new hdtc-owned format): per block of
+   about 1 MiB, cut at a triple boundary, the block's first triple and its byte offset,
+   plus the stream's total length and SHA-256. A request then costs `O(log B)` to find
+   its block and at most one block's serialization to reach its offset — a cost-table
+   row. Build and server must produce identical bytes, so hdtc's N-Triples writer is
+   exported through the façade and used by both: `hdtc dump data.hdt | sha256sum` then
+   equals `/export/data.nt`'s `Repr-Digest`, and anyone can check the dump against the
+   HDT alone. The server verifies each block it renders against the index and drops
+   the connection rather than send bytes that disagree. Blank nodes are the stored
+   labels, as `hdtc dump` writes them, so the HDT and N-Triples downloads carry one
+   graph. `data.nq` enumerates in SPO order, then graph id, through the transpose. The
+   same compression negotiation applies.
+3. **Discovery.** An `/export` listing with JSON and HTML: sizes, digests, and prefilled
+   commands, including the resumable compress-as-you-store recipe below. `void:dataDump`
+   and a DCAT distribution in `/void`, so standard linked-data tooling finds the
+   downloads.
+
+**No pre-compressed `.nt.gz`.** One was designed — a gzip member per index block, which
+is a valid gzip file, decodable in parallel, and range-addressable by block. Its length
+and offsets would have to be fixed at build time, which makes serving depend on the
+compressor producing the identical bytes it produced for the build: pinned versions,
+per-member verification, and a rebuild whenever a dependency moves. Transfer compression
+gives most of the benefit with no persisted state. What it loses is compressed resumes
+and a `Content-Length` on compressed responses, and a curl user who wants a compressed
+file on disk can get one resumably from the client side:
+
+```bash
+curl --compressed -fSL "$url" | (trap '' INT; exec gzip) > "$file"
+curl --compressed -fSL -C $(gzip -dc "$file" | wc -c) "$url" | (trap '' INT; exec gzip) >> "$file"
+```
+
+A dropped connection ends curl cleanly, so gzip writes its trailer and the file is
+valid; the resume appends a second gzip member, which every gzip reader concatenates;
+`-f` keeps an error body out of the data; and `trap '' INT` keeps Ctrl-C from
+truncating the last member. Tested against a range server that drops the connection
+mid-body, and with SIGINT delivered to the pipeline's process group.
+
+**`Transfer-Encoding: gzip` is not used.** It is the textbook fit — the wire compressed
+while ranges and validators stay on identity bytes — but HTTP/2 and HTTP/3 forbid
+transfer codings, browsers never request one, and the gateway in front of this service
+would not carry one through.
+
+**A file resource has one representation.** Every other route answers HTML to a
+browser. A browser navigating to `data.hdt` must get the file, so the export routes are
+the stated exception; their page is the listing (step 3), and the manifest page links
+the download meanwhile.
+
+**The manifest's `export` capability stays undeclared.** `data.hdt` is required, so the
+route is never gated (rule 8), and the release links advertise it unconditionally. Doc
+03 defines `export` as a list of artifacts this build does not all serve, and declaring
+a capability commits to its whole contract (question 81).
+
+**Operational.** The GKE gateway's backend timeout bounds a whole response, 30 s by
+default, so a large download needs a `GCPBackendPolicy` raising it. `latest` redirects
+make a resume across a release dangerous for clients that resume without `If-Range` —
+`curl -C -` and `wget -c` among them — so documentation and links name versioned URLs,
+and the version in the saved filename and the digest catch a splice after the fact.
+
+**What landed — step 1 (2026-09-28).** `GET|HEAD /{dataset}/v/{version}/export/data.hdt`,
+in `kgf-server::export`, with the decisions the plan left open:
+
+- *The manifest must identify `data.hdt`.* Its size and SHA-256 are read into the
+  release at startup, and a manifest without them — or with a checksum that is not 64
+  lowercase hex digits — stops the server, naming `kgf manifest`. Every validator,
+  length, and digest a download sends is then fixed before any request, and no request
+  hashes a file. Before streaming, the mapping's length is checked against the
+  manifest's, which is the one disagreement detectable without reading the file.
+- *Ranges.* Parsing and resolving are separate, because an unparseable header is
+  ignored while a parseable one naming nothing is a `416`. Spans are sorted and merged
+  when they overlap or sit within 128 bytes — about a part's framing — so a multipart
+  response lists parts ascending rather than in request order; more than 32 parts after
+  merging, or more than 256 specs, is `416`. The multipart boundary is derived from the
+  artifact's digest.
+- *`If-Range` by date accepts a date at or after `Last-Modified`,* which is `headers`'
+  reading rather than RFC 9110's exact match. At a versioned URL any such date names the
+  same bytes, so the leniency cannot splice.
+- *A compressed response states no date.* `Last-Modified` is the identity bytes', so a
+  coded response omits it and the date preconditions do not bind it — the strong and
+  weak tags carry revalidation. A compressed `HEAD` has no `Content-Length`, which took
+  an empty body with an unknown size: an empty body of exact size zero has the router
+  write `Content-Length: 0` into the `HEAD`.
+- *Levels.* zstd 3, its library default, and gzip 6 at first — gzip is now 1 (below). On
+  `climatemodelskg` the HDT goes from 26.4 MB to 12.2 MB with zstd and 12.9 MB with
+  gzip; zstd's frame records the content size and an XXH64 checksum. Neither level has
+  been measured under concurrent load in a release build, which is where to revisit
+  them.
+- *The gate.* `--max-concurrent-downloads`, default 16, refusing at once with
+  `Retry-After: 30` rather than queueing; per client, see below. A `HEAD`, a `304`, a
+  `412`, and a `416` take no slot, and neither does anything decided before the open.
+- *Discovery.* The release links carry `hdt` unconditionally, and the manifest page has
+  a download panel with the resumable `curl` command and the digest to check.
+- *`range_not_satisfiable` (416)* joins the error codes, beside `precondition_failed`
+  (question 84).
+
+*Verified by* unit tests of the range grammar — including an exhaustive check that
+the served spans cover every requested byte and nothing outside the artifact — of the
+`Accept-Encoding` weights against what real clients send, of every precondition in
+RFC 9110's order, and of encoder draining; and end to end over a socket: whole, `HEAD`,
+every range form, `If-Range` both ways, multipart parsed back into its parts, `416`,
+`304`, `412`, both codings decoded back to the file, a compressed `HEAD`, and a
+download the compression layer would otherwise have gzipped. Against the demo corpus
+with stock `curl`: a download verified by `shasum`, a truncated file resumed with `-C -`,
+and a `--compressed` download truncated and resumed to the identical file.
+
+**Per-client download limit (2026-09-28).** The deployment-wide gate alone is first come,
+first served: a parallel downloader asking for sixteen ranges at once, or a handful of
+clients that stop reading, holds every slot there is. `--max-downloads-per-client`,
+default 4, bounds what one client holds, which does more against both than a stall
+timeout would — a client reading a trickle makes progress and would keep its slot
+under any timeout. Decisions:
+
+- *A client is the access log's client.* The address the trusted forwarding chain
+  reports, else the peer — the same reading of `X-Forwarded-For` as the record's
+  `forwarded_hash`, now shared as `access::client_address`. An entry that is not an
+  address falls back to the peer rather than keying on a string a caller chose. The
+  cost is that the limit is only as right as `--trusted-proxies`: counted from the wrong
+  hop, every client is the gateway and the per-client limit becomes the deployment's.
+  The GKE deployment's setting of 2 has not yet been confirmed against real traffic.
+- *An IPv6 client is its /64.* Temporary addressing gives one host many addresses in
+  its /64, and keyed on the full address a client could open a download per address.
+  An IPv4 address can be a whole NAT, which is the price of counting by address.
+- *The client's own limit is checked first,* so a client at its limit is told so rather
+  than that the server is busy. A request with no peer address — only possible for an
+  embedder serving without connection info — counts against the deployment's limit only;
+  one shared bucket for all of them would make the per-client limit global.
+- *A lock, off every read path.* The per-client counts are a mutex-guarded map, taken
+  when a download is admitted and when its body is dropped, never per chunk; it holds
+  only clients with a download in progress, so it never outgrows the slot count.
+
+*Verified by* a stalled download over a real socket: 32 MB of incompressible literals,
+more than the loopback buffers hold, read to the end of its headers and then left. The
+same client is refused with the per-client message, another client downloads, a `HEAD`
+from the stalled client is still answered, and the slot comes back once the stalled
+connection closes.
+
+**After review (2026-09-28): two findings, both fixed.**
+
+- *The route ignored its query.* `?g=<G>` and `?g=*` were answered with the union —
+  a `206` of union bytes where `/count` answers 501 — which is the silently dropped
+  filter every other operation refuses. Doc 03 §3.7 lists `g` on `export`, so it is
+  now parsed like `/fragment`'s and refused, as `capability_not_available`, unless the
+  scope is what the artifact holds: absent or the union's name, or the unnamed graph's
+  name on a release without memberships, whose triples are all unnamed. Every other
+  parameter is `malformed_request`. Both are decided before any precondition, since a
+  `304` or a `206` for such a query would pass the union off as what was asked.
+- *A cancelled download released its slot early.* The body held the slot while the
+  blocking task held the producer, so a client that went away mid-chunk freed its slot
+  while that chunk's read and compression carried on — cancelling and retrying could
+  put more work in flight than either limit admits. `blocking()` already keeps its
+  capacity inside the task for exactly this reason; the slot now travels with the
+  producer the same way. The body reads through a small `Source` trait rather than a
+  `Store`, which is what lets the unit test queue a chunk behind an occupied blocking
+  thread, drop the body, and see the slot still held — and it fails against the old
+  ownership.
+
+**After a second review (2026-09-29).** Fourteen findings over both commits; twelve
+fixed, two recorded below as open.
+
+- *A compressed download could not be resumed, and every client got one.* Browsers,
+  `requests`, Go, and `curl --compressed` all send `Accept-Encoding` by default at equal
+  weight, and the server preferred compression on a tie, so the ordinary download of the
+  manifest page's link had no size, no progress, and no resume — a restart from zero
+  after any interruption, against a gateway that cut responses at 30 s. Identity now
+  wins a tie: a coding is chosen only when the client weights it above identity
+  (`zstd, identity;q=0.5`). HDT compresses by about half, so the default gives up little
+  to be resumable; N-Triples, at about a tenth, may want the other rule, and that is a
+  decision for step 2.
+- *`If-Match` failed on an unchanged artifact when compression was negotiated,* because
+  it compares strongly and a coded body's tag is weak; `If-Unmodified-Since` was not
+  evaluated at all against a coded body, which states no date. A request carrying
+  either is now answered from the identity bytes, as a range is — which keeps RFC 9110's
+  comparison against the selected representation and chooses the one the client's
+  assertion is about.
+- *The gateway cut every response at 30 s.* `deploy/gke/backendpolicy.yaml` raises the
+  backend-service timeout to an hour; Google documents it as bounding the whole
+  response, first request byte to last response byte, with an effective maximum of a
+  day. A download longer than that resumes by range, and the bound also caps how long a
+  stalled client holds a slot.
+- *Coded chunks burned CPU outside the work gate.* Each chunk, identity or coded, now
+  takes one ordinary unit of the query work gate for the few milliseconds it runs,
+  waiting without a deadline — refusing the next chunk of an admitted transfer would
+  only cut it. That bounds a transfer's page faults and compression by the same
+  published figure as a query's, and gzip drops to level 1 for the reason the API's own
+  compression does; a coded chunk is encoded straight from the mapping, without the
+  copy the identity path needs to hand hyper a buffer it owns.
+- *The download special-cased two global layers.* The export route is now its own
+  router carrying the shared layers — body limits, problem rendering, CORS, access
+  records — merged beside the API's, whose stack adds compression and the
+  ETag-weakening middleware. Neither layer knows downloads exist, and the marker both
+  checked is gone.
+- *The manifest page's commands doubled the mount prefix,* in the new download panel
+  and the older operations panel alike: `$KGF` is the base URL with its prefix, as the
+  service page defines it, and the paths after it were mounted. The download table now
+  reads the release's parsed identity — the digest the `ETag` carries — rather than
+  re-reading the manifest's text.
+- *Multipart parts go out in request order,* as RFC 9110 §15.3.7.2 asks, a merged part
+  taking the place of the earliest spec it absorbed.
+- *Smaller.* Validators and `Repr-Digest` are built once at startup rather than per
+  request; one lowercase-hex helper replaces three; and a 404's list of resources under
+  a version gained `terms`, `graphs`, and `export/data.hdt`, with a test that every
+  versioned operation appears in it.
+
+**Still open from step 1.**
+
+- *Stalled clients.* A client that stops reading still holds its slot — one of its own
+  few rather than one of everyone's — until TCP gives up on it or the gateway's backend
+  timeout ends the response. A write-progress timeout on the connection would release it
+  sooner; it needs a listener wrapping the socket, and `axum` implements its
+  client-address extractor only for its own listener types, so the access log would need
+  a connect-info type of its own.
+- *Whether a transfer finished.* The access record is emitted when the response's
+  headers are produced, so for a download it cannot say whether the transfer finished
+  or how much of it was sent.
+- *Trusting `X-Forwarded-For` by position.* With `--trusted-proxies` set, the client is
+  read from the chain whatever the peer, so a caller that reaches the pod without the
+  gateway — which, behind a ClusterIP Service, means from inside the cluster — can be
+  counted as another client, exhausting its download slots or evading its own. Trusting
+  the header only when the peer is in a configured proxy network (the gateway's
+  proxy-only subnet) closes it; that is a new setting, and it matters equally to the
+  access log's pseudonyms.
+- *Page-cache pressure.* A download reads the artifact through the mapping queries use,
+  so a multi-gigabyte transfer faults every page of it into the pod's page cache and can
+  push other bundles' hot index pages out. Reading downloads with `pread` and dropping
+  the pages behind (`posix_fadvise(DONTNEED)`) would avoid it, at the cost of a second
+  read path. Worth measuring on the largest bundles before building.
+
+### 32. The human view, revisited — an idea
+
+**Noted 2026-09-29; not yet planned.** Unit 18 made the HTML a browser workbench, and
+every route since has added its page to that frame one at a time. The idea is to
+reconsider the human view as a whole — what a visitor arriving at the catalog, a
+dataset, or a release is there to do, and whether the pages lead them to it —
+rather than patch each page as a feature lands.
+
+The first concrete gap is the one that prompted the note: unit 31's download is
+advertised in HTML only by a "Download" section near the bottom of a release's manifest
+page, below its configuration tables. The service page's dataset cards and the dataset
+page's row of links (understand, schema, browse, TPF, manifest) do not mention it, though
+the dataset descriptor's JSON carries the link, and sizes appear only as exact byte
+counts. So a visitor wanting the data goes catalog → dataset → "Latest manifest" →
+scroll. Candidates, to fold into the revamp rather than land piecemeal: a "Download HDT
+(26.4 MB)" link on the dataset page pointing at the current release's versioned URL;
+the manifest page's download panel beside its operations rather than after its
+configuration; human-readable sizes beside exact ones; possibly a download link on each
+catalog card; and step 3's `/export` listing as the download's own page.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
@@ -3265,6 +3566,27 @@ following the code.
     notes say so — but `docs/graphs-sidecar-format.md` §5 says only "after input
     blank-node scoping", which a conforming writer could read as a scoping of its own.
     The normative text should say it is the scoping applied to `data.hdt`'s terms.
+81. **§3.4.11's `export` is one capability over artifacts of different kinds.** Its list
+    mixes the required `data.hdt`, which every bundle can serve, with optional
+    artifacts and a later-phase Parquet partition, so no bundle can declare the
+    capability without committing to routes a deployment may not have. Generated
+    serializations (unit 31's N-Triples) are not artifacts at all and need their own
+    cost row: `O(log B)` plus one index block to start, then `O(bytes)`. Downloads also
+    sit outside §3.5's composite budgets — `max_response_bytes` and the time budget
+    cannot apply to a whole-dataset transfer — and are bounded by a download gate
+    instead, which §3.5 should say.
+82. **An export's validator is its content hash, not a deployment-scoped tag.** §3.6
+    says `ETag` = artifact checksum; for downloads that should be normative and exactly
+    the checksum, so every server and mirror publishing a bundle agrees and a client
+    can resume from any of them. It should also require `Repr-Digest` (RFC 9530) and
+    say that a range is always served from identity bytes while a full body may be
+    content-coded.
+83. **"Every URL has an HTML page" needs its exception.** §3.2's one-URL-two-readers
+    rule would put a page where a browser expects a file. The download resources should
+    be single-representation, with the listing as their page.
+84. **`range_not_satisfiable` (416) joins the error table.** A download needs it, with
+    `Content-Range: bytes */{len}`, for unsatisfiable and for refused multi-range
+    requests alike.
 
 ## Not in this plan
 

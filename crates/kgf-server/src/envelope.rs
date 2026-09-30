@@ -444,7 +444,8 @@ pub const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 /// are three ways to fail content negotiation with three remedies, and merging
 /// them would leave an agent unable to tell which applies. The protocol permits
 /// server-specific codes for otherwise uncovered conditions;
-/// [`PreconditionFailed`](Self::PreconditionFailed) is such an extension.
+/// [`PreconditionFailed`](Self::PreconditionFailed) and
+/// [`RangeNotSatisfiable`](Self::RangeNotSatisfiable) are such extensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
     /// A term parameter is not a term.
@@ -461,7 +462,8 @@ pub enum ErrorCode {
     NotFound,
     /// No representation satisfies `Accept`.
     NotAcceptable,
-    /// `If-None-Match` was false for a method other than GET or HEAD.
+    /// A precondition was false: `If-None-Match` on a method other than GET or
+    /// HEAD, or a download's `If-Match` or `If-Unmodified-Since`.
     PreconditionFailed,
     /// The method is not one this resource takes.
     ///
@@ -473,6 +475,10 @@ pub enum ErrorCode {
     MethodNotAllowed,
     /// A request body's media type is not supported; see `Accept-Query`.
     UnsupportedMediaType,
+    /// A download's `Range` names no byte inside the artifact, or asks for more
+    /// separate parts than one response carries. The response's
+    /// `Content-Range: bytes */{length}` says what can be asked for.
+    RangeNotSatisfiable,
     /// Serialized request input exceeds `max_request_bytes`.
     PayloadTooLarge,
     /// The server's current rate or concurrent-work capacity is exhausted.
@@ -503,6 +509,7 @@ impl ErrorCode {
         Self::PreconditionFailed,
         Self::PayloadTooLarge,
         Self::UnsupportedMediaType,
+        Self::RangeNotSatisfiable,
         Self::RateLimited,
         Self::InternalError,
         Self::CapabilityNotAvailable,
@@ -528,6 +535,7 @@ impl ErrorCode {
             Self::PreconditionFailed => ("precondition_failed", 412, "Precondition Failed"),
             Self::UnsupportedMediaType => ("unsupported_media_type", 415, "Unsupported Media Type"),
             Self::PayloadTooLarge => ("payload_too_large", 413, "Content Too Large"),
+            Self::RangeNotSatisfiable => ("range_not_satisfiable", 416, "Range Not Satisfiable"),
             Self::RateLimited => ("rate_limited", 429, "Too Many Requests"),
             Self::InternalError => ("internal_error", 500, "Internal Server Error"),
             Self::CapabilityNotAvailable => ("capability_not_available", 501, "Not Implemented"),
@@ -1064,7 +1072,7 @@ mod tests {
     #[test]
     fn every_code_has_its_normative_or_extended_wire_mapping() {
         // This table covers the protocol codes plus this server's RFC 9110
-        // precondition extension. An implementation that drifts from either
+        // precondition and range extensions. An implementation that drifts from either
         // makes agents' self-correction wrong in a way no other test notices.
         let table = [
             (ErrorCode::BadTermSyntax, "bad_term_syntax", 400u16),
@@ -1082,6 +1090,7 @@ mod tests {
                 "unsupported_media_type",
                 415,
             ),
+            (ErrorCode::RangeNotSatisfiable, "range_not_satisfiable", 416),
             (ErrorCode::RateLimited, "rate_limited", 429),
             (ErrorCode::InternalError, "internal_error", 500),
             (

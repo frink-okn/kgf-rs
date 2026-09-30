@@ -267,6 +267,17 @@ impl Store {
         self.description.as_ref()
     }
 
+    /// `data.hdt` exactly as published, for a caller that serves the artifact
+    /// itself rather than answering queries over it.
+    ///
+    /// The same mapping every query reads, so the bytes handed out are the ones
+    /// `open` bound to the permutation sidecar. A slice of a mapping faults
+    /// pages as it is read, so a caller copying out of it belongs on a blocking
+    /// thread, like any other store work.
+    pub fn hdt_bytes(&self) -> &[u8] {
+        self.data.bytes()
+    }
+
     /// Total triples in the bundle.
     pub fn triples(&self) -> u64 {
         self.data.triples()

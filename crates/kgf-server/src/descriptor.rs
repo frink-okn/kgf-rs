@@ -26,6 +26,7 @@ use kgf_store::Capability;
 use kgf_store::manifest::{Manifest, Publisher};
 use serde::Serialize;
 
+use crate::export::{ArtifactIdentity, ExportArtifact};
 use crate::forms;
 use crate::html::{
     Crumb, Resource, SITE, Value, chips, compact_number, fields, group_digits, json_body, note,
@@ -119,6 +120,8 @@ pub struct ReleaseLinks {
     labels: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     graphs: Option<String>,
+    /// The whole dataset as standard HDT, resumable by byte range.
+    hdt: String,
 }
 
 /// Which build and protocol answered.
@@ -494,6 +497,8 @@ fn release_links(
         graphs: release
             .declares(Capability::Graphs)
             .then(|| operation("graphs")),
+        // Unconditional for the same reason: `data.hdt` is required.
+        hdt: mount.export(dataset, version, ExportArtifact::Hdt.name()),
     }
 }
 
@@ -509,16 +514,22 @@ pub struct BundleManifest {
     version: String,
     published: bytes::Bytes,
     parsed: std::sync::Arc<Manifest>,
+    /// What the release serves whole, as the downloads themselves identify it
+    /// — so the page shows the digest the `ETag` carries, not a second reading
+    /// of the manifest's text.
+    downloads: Vec<(ExportArtifact, ArtifactIdentity)>,
 }
 
 impl BundleManifest {
-    /// Pair the bytes as published with the parse the page is rendered from.
+    /// Pair the bytes as published with the parse the page is rendered from,
+    /// and the release's downloads.
     pub fn new(
         mount: Mount,
         dataset: &str,
         version: &str,
         published: bytes::Bytes,
         parsed: std::sync::Arc<Manifest>,
+        downloads: Vec<(ExportArtifact, ArtifactIdentity)>,
     ) -> Self {
         Self {
             mount,
@@ -526,6 +537,7 @@ impl BundleManifest {
             version: version.to_owned(),
             published,
             parsed,
+            downloads,
         }
     }
 }
@@ -563,6 +575,36 @@ impl Resource for BundleManifest {
             .keys()
             .zip(&role_members)
             .map(|(role, predicates)| vec![Value::Code(role), Value::Code(predicates)])
+            .collect();
+        // `$KGF` is the base URL with its prefix, as the service page defines
+        // it, so the path written after it is the unmounted one: the mounted
+        // link would name the prefix twice.
+        let unmounted = Mount::default();
+        let download_rows: Vec<_> = self
+            .downloads
+            .iter()
+            .map(|(artifact, identity)| {
+                vec![
+                    Value::Link {
+                        href: self
+                            .mount
+                            .export(&self.dataset, &self.version, artifact.name()),
+                        label: artifact.name(),
+                    },
+                    Value::Number(identity.size()),
+                    Value::Code(identity.sha256_hex()),
+                ]
+            })
+            .collect();
+        let download_commands: Vec<(String, String)> = self
+            .downloads
+            .iter()
+            .map(|(artifact, _)| {
+                (
+                    artifact.saved_name(&self.dataset, &self.version),
+                    unmounted.export(&self.dataset, &self.version, artifact.name()),
+                )
+            })
             .collect();
         let artifacts: Vec<_> = manifest
             .artifacts
@@ -626,11 +668,11 @@ impl Resource for BundleManifest {
                         ))
                         pre {
                             code {
-                                "curl \"$KGF" (self.mount.operation(&self.dataset, &self.version, "fragment"))
+                                "curl \"$KGF" (unmounted.operation(&self.dataset, &self.version, "fragment"))
                                 "?limit=25\"\n"
-                                "curl \"$KGF" (self.mount.operation(&self.dataset, &self.version, "count"))
+                                "curl \"$KGF" (unmounted.operation(&self.dataset, &self.version, "count"))
                                 "?p=rdf:type\"\n"
-                                "curl \"$KGF" (self.mount.operation(&self.dataset, &self.version, "describe"))
+                                "curl \"$KGF" (unmounted.operation(&self.dataset, &self.version, "describe"))
                                 "?iri=<https://example.org/resource>\""
                             }
                         }
@@ -696,6 +738,25 @@ impl Resource for BundleManifest {
                             (note("The federation label defaults apply."))
                         } @else {
                             (table(&["Role", "Predicates (strongest first)"], &predicate_roles))
+                        }
+                    }
+                }
+
+                section."section-block" {
+                    h2 { "Download" }
+                    (note(
+                        "The whole dataset as standard HDT. Downloads are sent uncompressed, with \
+                         their size, resume by byte range, and carry their SHA-256 as the ETag and \
+                         Repr-Digest. Use this versioned URL rather than latest, so a resume can \
+                         never continue into a different release."
+                    ))
+                    (table(&["Artifact", "Bytes", "SHA-256"], &download_rows))
+                    pre {
+                        code {
+                            @for (saved, href) in &download_commands {
+                                "curl -fL -C - -o " (saved) " \"$KGF" (href) "\"\n"
+                                "shasum -a 256 " (saved) "\n"
+                            }
                         }
                     }
                 }
@@ -839,7 +900,41 @@ mod tests {
             "2026-06-01",
             bytes::Bytes::copy_from_slice(published.as_bytes()),
             std::sync::Arc::new(manifest()),
+            downloads(),
         )
+    }
+
+    fn downloads() -> Vec<(ExportArtifact, ArtifactIdentity)> {
+        vec![(ExportArtifact::Hdt, ArtifactIdentity::new(912, [0xab; 32]))]
+    }
+
+    #[test]
+    fn a_command_written_after_kgf_names_the_mount_prefix_once() {
+        // `$KGF` is the base URL with its prefix, as the service page defines
+        // it; a mounted path written after it would name the prefix twice and
+        // 404 behind the gateway.
+        let page = BundleManifest::new(
+            Mount::with_prefix("/kgf"),
+            "tox",
+            "2026-06-01",
+            bytes::Bytes::from_static(b"{}"),
+            std::sync::Arc::new(manifest()),
+            downloads(),
+        )
+        .to_html();
+        assert!(!page.contains("$KGF/kgf/"), "the prefix is doubled");
+        for command in [
+            "curl -fL -C - -o tox-2026-06-01.hdt &quot;$KGF/tox/v/2026-06-01/export/data.hdt",
+            "$KGF/tox/v/2026-06-01/fragment",
+            "$KGF/tox/v/2026-06-01/count",
+            "$KGF/tox/v/2026-06-01/describe",
+        ] {
+            assert!(page.contains(command), "missing {command}");
+        }
+        // The link a browser follows is mounted, and the digest shown is the
+        // one the download's ETag carries.
+        assert!(page.contains("href=\"/kgf/tox/v/2026-06-01/export/data.hdt\""));
+        assert!(page.contains(&"ab".repeat(32)));
     }
 
     #[test]
@@ -904,6 +999,7 @@ mod tests {
             "2026-06-01",
             bytes::Bytes::from_static(b"{}"),
             std::sync::Arc::new(manifest),
+            downloads(),
         )
         .to_html();
 

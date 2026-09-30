@@ -14,8 +14,6 @@
 //! give the same layer id to different graphs, so it is scoped by the
 //! sidecar's digest instead.
 
-use std::fmt::Write as _;
-
 use kgf_store::Store;
 use kgf_store::dict::{DictCounts, Section, SectionTermId};
 use kgf_store::graphs::GraphId;
@@ -153,9 +151,7 @@ impl SkolemScope {
 fn scoped_prefix(digest: [u8; 32]) -> String {
     let mut prefix = String::with_capacity(FDC_PREFIX.len() + 65);
     prefix.push_str(FDC_PREFIX);
-    for byte in digest {
-        write!(&mut prefix, "{byte:02x}").expect("writing to a String cannot fail");
-    }
+    crate::hex::push(&mut prefix, &digest);
     prefix.push(':');
     prefix
 }

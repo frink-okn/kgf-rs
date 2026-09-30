@@ -1,0 +1,26 @@
+# The gateway's backend-service timeout, attached to the Service. On the global
+# external Application Load Balancer it bounds a whole response — from the first
+# byte of the request to the last byte of the response — and defaults to 30 s,
+# which cuts off any /export download that takes longer than that to transfer.
+#
+# An hour: a multi-gigabyte HDT on an ordinary connection finishes inside it,
+# and one that does not is resumed by byte range from where it stopped, since an
+# identity download carries a strong ETag and Accept-Ranges. The bound also caps
+# how long a client that stops reading can hold one of its download slots. Every
+# other response the server sends is bounded by its own budgets and finishes in
+# milliseconds, so raising the ceiling costs them nothing. Google documents an
+# effective maximum of 86,400 s for this load balancer.
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: frink-kgf-backend-policy
+  namespace: frink
+  labels:
+    app: frink-kgf-server
+spec:
+  default:
+    timeoutSec: 3600
+  targetRef:
+    group: ""
+    kind: Service
+    name: frink-kgf-service

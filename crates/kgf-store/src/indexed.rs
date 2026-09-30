@@ -51,6 +51,11 @@ impl IndexedHdt {
         self.permutations.hdt_path()
     }
 
+    /// The mapped host HDT, whole.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.permutations.hdt_bytes()
+    }
+
     /// Dictionary sizes in the three role-scoped id spaces.
     pub(crate) fn dict_counts(&self) -> &DictCounts {
         self.permutations.dict_counts()

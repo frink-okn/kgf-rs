@@ -59,9 +59,12 @@ spec:
             - --public-base=https://apps.okn.us/kgf
             # The global external load balancer appends two entries to
             # X-Forwarded-For, the client it saw and its own address, so the
-            # client is two hops from the right. Only affects the pseudonymous
-            # client hash in access records; confirm against a known request
-            # once traffic flows.
+            # client is two hops from the right. Decides the pseudonymous
+            # client hash in access records and the client that
+            # --max-downloads-per-client counts against. Counted from the
+            # wrong hop, every client looks like the load balancer and the
+            # per-client download limit becomes the whole deployment's, so
+            # confirm it against a known request once traffic flows.
             - --trusted-proxies=2
           ports:
             - name: http

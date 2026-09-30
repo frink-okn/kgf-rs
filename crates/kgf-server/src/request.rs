@@ -2844,6 +2844,45 @@ impl Summary {
     }
 }
 
+/// A whole-artifact download's query: a graph scope, and of that only the
+/// scopes the artifact is.
+///
+/// `data.hdt` is the union of every graph, so an absent `g`, or the union's
+/// reserved name, selects exactly what it holds — and so does the unnamed
+/// graph's reserved name on a release without memberships, whose triples are
+/// all unnamed. Any narrower scope would need an export of its own, which
+/// this deployment does not build, and is refused as unavailable rather than
+/// answered with the union: a larger file carrying no sign of being the wrong
+/// one. There is no `format`, because a download has one representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Export;
+
+impl Export {
+    const PARAMETERS: &'static [&'static str] = &["g"];
+
+    /// Parse and type one download query before any precondition is read.
+    pub fn parse(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        memberships: bool,
+    ) -> Result<Self, Problem> {
+        accept_only(params, EXPORT, Self::PARAMETERS)?;
+        match GraphScope::parse(params, limits, prefixes)?.selector() {
+            GraphSelector::Union => Ok(Self),
+            GraphSelector::Unnamed if !memberships => Ok(Self),
+            GraphSelector::Unnamed | GraphSelector::Named(_) | GraphSelector::All => {
+                Err(Problem::new(
+                    ErrorCode::CapabilityNotAvailable,
+                    "a download scoped to less than the union is not exported: the artifact \
+                     holds every graph at once. Omit `g` for the whole dataset, or read one \
+                     graph's triples with `/fragment` and the same `g`",
+                ))
+            }
+        }
+    }
+}
+
 impl Schema {
     const PARAMETERS: &'static [&'static str] = &[
         "class",
@@ -3656,6 +3695,7 @@ const SEARCH: &str = "search";
 const TERMS: &str = "terms";
 const LABELS: &str = "labels";
 const GRAPHS: &str = "graphs";
+const EXPORT: &str = "export";
 
 /// Refuse anything `operation` does not take.
 fn accept_only(params: &Params, operation: &str, accepted: &[&str]) -> Result<(), Problem> {
