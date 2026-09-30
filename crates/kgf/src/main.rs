@@ -51,12 +51,20 @@ fn main() -> Result<()> {
 }
 
 /// Structured logs on stderr, filtered by `RUST_LOG` (default `info`).
+///
+/// Coloured only for a person watching a terminal. A redirected stderr feeds a
+/// file, a log collector, or a harness reading the `serving` line for the port
+/// it bound, and escape codes there are bytes every reader has to strip.
+/// `NO_COLOR` (https://no-color.org) turns colour off on a terminal too.
 fn install_logging() {
+    use std::io::IsTerminal;
     use tracing_subscriber::{EnvFilter, fmt};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
     fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal() && !no_color)
         .init();
 }
