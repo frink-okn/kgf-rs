@@ -2545,6 +2545,59 @@ the manifest page's download panel beside its operations rather than after its
 configuration; human-readable sizes beside exact ones; possibly a download link on each
 catalog card; and step 3's `/export` listing as the download's own page.
 
+The second, noted 2026-09-30 from an attempt at issue 7 that was set aside, is **which
+page says what about a dataset**. Issue 7 asks for the summary page to show the
+description its Markdown and JSON forms carry. Adding it was easy; deciding it belonged
+there was not, because the description is already the lede of `/{dataset}`, one
+breadcrumb up, and of the release's manifest page. The distinction the attempt turned up:
+
+- **The machine formats of one document are alternative spellings of it.** The summary
+  card's Markdown and JSON are standalone documents handed to an agent, which reads
+  nothing else first, so each carries the description and should carry whatever the
+  other does unless a reason is written down.
+- **An HTML page is one page of a site.** What it repeats from its neighbours is a
+  question about the site as a whole, and repeating the description on the summary page
+  duplicates the dataset page. Issue 7 should be answered from this review rather than
+  by adding the field.
+
+Where each authored field reaches a reader today:
+
+- `/{dataset}`, page and JSON: title, description, IRI, publisher. No homepage and no
+  license.
+- The manifest page: the description as its lede, IRI, license (as plain text),
+  publisher. The manifest JSON also has the homepage; the page omits it.
+- The summary card's JSON: id, version, IRI, title, description, license, homepage. Its
+  Markdown: title, id, version, license, description — no IRI and no homepage, for no
+  recorded reason. Its page: title, id, version.
+
+So the homepage is on no page at all. A candidate split: `/{dataset}` says what the
+dataset is and who stands behind it (IRI, title, description, publisher, homepage,
+releases, predicate roles); the card says what a release contains and how to start
+querying it (title, description, id, version, license, counts, the ranked lists,
+links), and drops the IRI and homepage from its JSON, which also closes that gap with
+its Markdown. License stays on the card because a release is what is licensed, and an
+agent needs the terms beside the content. A license is as often an identifier such as
+`CC-BY-4.0` as a URL, so a page should link it, and the homepage, only when the value
+is an `http` or `https` address.
+
+The card's Markdown and JSON also differ on content:
+
+- the namespace inventory is in the JSON only, and uncapped, where every other list on
+  the card is the leading ten;
+- `graphs_total`, each graph's component, and each graph's subject, predicate and
+  object counts are in the JSON only (the page shows the counts too);
+- the top properties' distinct subject and object counts are in the JSON only;
+- the version-relative links, and the view the ranked lists come from, are in the JSON
+  only.
+
+Two smaller findings. The dataset and manifest pages set the description in a single
+paragraph, so a description written in several paragraphs runs together once HTML folds
+its blank lines. And whatever the revamp changes will not reach a browser that has
+already cached a page: every versioned response, pages included, is sent `immutable`
+with a year's `max-age`, so a browser never revalidates, and the deployment digest in
+the `ETag` that would have caught a rendering change is never consulted. The caching
+policy for pages needs settling before or with the revamp.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
