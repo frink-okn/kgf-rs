@@ -11,10 +11,10 @@
 //! socket leaves nothing between the test and hyper's parser.
 
 use std::collections::{BTreeMap, HashSet};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
@@ -3139,6 +3139,60 @@ fn request_ids_are_minted_without_an_access_log() {
 }
 
 #[test]
+fn the_serving_line_is_plain_text_when_stderr_is_not_a_terminal() {
+    // A harness binds an ephemeral port and reads it back from the startup
+    // line, so a redirected line must parse exactly as written. `NO_COLOR` is
+    // removed so plain text is the binary's own decision rather than the test
+    // environment's, and `RUST_LOG` so the `info` line is not filtered out.
+    let deployment = Deployment::new();
+    let mut serve = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_kgf"))
+            .args(["serve", "--bundle-root"])
+            .arg(deployment.root_path())
+            .args(["--bind", "127.0.0.1:0", "--access-log", "off"])
+            .env_remove("NO_COLOR")
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn kgf serve"),
+    );
+    let stderr = BufReader::new(serve.0.stderr.take().expect("piped stderr"));
+
+    let mut seen = String::new();
+    let mut serving = None;
+    for line in stderr.lines() {
+        let line = line.expect("read kgf serve's stderr");
+        seen.push_str(&line);
+        seen.push('\n');
+        if line.contains("serving") {
+            serving = Some(line);
+            break;
+        }
+    }
+    let serving = serving.unwrap_or_else(|| panic!("kgf serve exited before serving:\n{seen}"));
+    assert!(
+        !serving.contains('\x1b'),
+        "a redirected log line carries escape codes: {serving:?}"
+    );
+
+    let address: SocketAddr = serving
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("address="))
+        .unwrap_or_else(|| panic!("no address field: {serving:?}"))
+        .parse()
+        .expect("the address field is a socket address");
+    assert_ne!(address.port(), 0, "the line reports the port bound");
+    let server = Server {
+        address,
+        stop: None,
+        runtime: None,
+    };
+    server.get("/").assert_status(200);
+}
+
+#[test]
 fn forwarded_identity_comes_from_the_trusted_hop_only() {
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
@@ -4099,6 +4153,16 @@ impl RecordingAccessLog {
 impl AccessLog for RecordingAccessLog {
     fn record(&self, record: &AccessRecord) {
         self.0.lock().expect("access records").push(record.clone());
+    }
+}
+
+/// A spawned `kgf serve`, stopped when the test ends however it ends.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
