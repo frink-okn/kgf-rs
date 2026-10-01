@@ -2944,6 +2944,16 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
     assert!(page_record.open_ms.is_some());
     assert!(page_record.queue_ms.is_some());
     assert!(page_record.work_ms.is_some());
+    // Only Linux counts faults per thread; elsewhere the record says nothing rather
+    // than report a process-wide figure.
+    assert_eq!(
+        page_record.major_faults.is_some(),
+        cfg!(target_os = "linux")
+    );
+    assert_eq!(
+        page_record.minor_faults.is_some(),
+        cfg!(target_os = "linux")
+    );
     assert_eq!(
         page_record.client_class,
         kgf_server::access::ClientClass::Curl
@@ -2965,6 +2975,7 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
     assert_eq!(records[1].status, Some(304));
     assert!(records[1].work_class.is_none());
     assert!(records[1].work_ms.is_none());
+    assert!(records[1].major_faults.is_none());
     assert_eq!(records[2].route, None);
     assert_eq!(records[2].operation, None);
     assert_eq!(records[2].code, Some("not_found"));

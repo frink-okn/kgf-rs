@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use crate::admission::WorkClass;
 use crate::answer::Rendered;
 use crate::envelope::ErrorCode;
+use crate::faults::PageFaults;
 use crate::representation::Representation;
 use crate::request::ObservedRequest;
 use crate::service::Service;
@@ -87,6 +88,11 @@ pub struct AccessRecord {
     pub queue_ms: Option<u64>,
     /// Time spent on the blocking worker, excluding its scheduling delay.
     pub work_ms: Option<u64>,
+    /// Pages the blocking worker read from storage during the work. `null` without
+    /// bundle work, and on platforms that do not count faults per thread.
+    pub major_faults: Option<u64>,
+    /// Pages already in memory that the work mapped in. `null` as for `major_faults`.
+    pub minor_faults: Option<u64>,
     /// Time from the middleware seeing the request to emitting this record.
     pub total_ms: u64,
     /// Requests in the admission waiting room when this one arrived.
@@ -569,6 +575,7 @@ pub(crate) struct Observation {
     pub(crate) work_class: Option<WorkClass>,
     pub(crate) queue_ms: Option<u64>,
     pub(crate) work_ms: Option<u64>,
+    pub(crate) faults: Option<PageFaults>,
     pub(crate) bytes_in: Option<u64>,
     pub(crate) complete: Option<bool>,
     pub(crate) truncation_reason: Option<&'static str>,
@@ -674,6 +681,7 @@ pub(crate) struct Timed<T> {
     pub(crate) result: Result<T, crate::envelope::Problem>,
     pub(crate) queue_ms: u64,
     pub(crate) work_ms: Option<u64>,
+    pub(crate) faults: Option<PageFaults>,
 }
 
 /// Bundle-open timing attached to a successful lookup.
@@ -952,6 +960,8 @@ impl Pending {
             work_class: observation.work_class.map(AccessWorkClass::from),
             queue_ms: observation.queue_ms,
             work_ms: observation.work_ms,
+            major_faults: observation.faults.map(|faults| faults.major),
+            minor_faults: observation.faults.map(|faults| faults.minor),
             total_ms: millis(self.started.elapsed()),
             waiting: self.waiting,
             bytes_in: observation.bytes_in,

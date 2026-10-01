@@ -80,6 +80,7 @@ the line is also readable by eye.
 | `code` | `ErrorCode::as_str()` or `null` | §3.2 | shape |
 | `work_class` | `ordinary` / `heavy` / `null` (no store work) | `GetRequest::work_class` | shape |
 | `queue_ms`, `work_ms`, `total_ms` | integers | §3.3 | shape |
+| `major_faults`, `minor_faults` | integers or `null` | the blocking worker thread's fault counters across the work, §3.3; `null` off Linux | shape |
 | `waiting` | requests in the admission waiting room at entry | §9 | shape |
 | `bytes_in`, `bytes_out` | integers or `null` | `bytes_in` is what a body handler read, never a declared `Content-Length`; `bytes_out` is the response body's exact size hint | shape |
 | `complete`, `truncation_reason` | bool, token or `null` | `Rendered.completeness` | shape |
@@ -189,6 +190,18 @@ Two plumbing changes make that possible:
   shared-storage gate. Once a bundle opens, `Opened<T>` carries `OpenTiming` beside
   the remaining operation result so a later execution, hydration, or rendering
   failure cannot erase the successful open.
+- **`blocking` also counts page faults** (added 2026-10-01). It reads the worker
+  thread's counters (`getrusage(RUSAGE_THREAD)`, through `nix`, because the crate
+  denies `unsafe`) before and after the closure and records the differences as
+  `major_faults`, pages read from storage, and `minor_faults`, pages already in memory.
+  `work_ms` alone cannot say whether the worker computed or waited for mapped pages,
+  and that decides whether admitting more concurrent work would keep storage busier or
+  only queue more computation. The question came from the public deployment: on
+  2026-09-30 it refused bursts with 429 while its CPU sat at 5–18% of the limit and
+  its page cache, about 7 GiB of the container's 8 GiB, held a few percent of the
+  bundles. A blocking task runs on one thread from start to end, so the counts are the
+  request's own. Only Linux counts per thread; elsewhere both fields are `null` rather
+  than a process-wide figure every concurrent request would share.
 
 The 304 path (`not_modified`, `routes.rs:1372`) and the redirect (`latest_redirect`)
 insert an `Observation` too — without timings or rows, but with operation, dataset
@@ -421,6 +434,7 @@ census rows:
 | Repetition rate, cacheability | `request_hash`; `status = 304` |
 | Failure telemetry | `status`, `code`, `truncation_reason` |
 | Traffic distribution, peak concurrency | `time`, `dataset`, `queued`, `queue_ms` |
+| Storage-bound work, page-cache misses | `major_faults` against `work_ms`, per `dataset` |
 | Cross-KG sessions | `client_hash` × `dataset` within a time window — approximate; exact sessions need the receipt join (§4) |
 | Client mix | `client_class`, `user_agent` |
 

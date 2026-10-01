@@ -54,6 +54,7 @@ use crate::answer::{self, Rendered, Renders, Target};
 use crate::descriptor::{BundleManifest, DatasetDescriptor, ServiceDescriptor};
 use crate::envelope::{ErrorCode, PROBLEM_MEDIA_TYPE, Problem, reflected};
 use crate::export::{Conditions, Decision, Delivery, ExportArtifact};
+use crate::faults::ThreadFaults;
 use crate::html::Resource;
 use crate::representation::{CachePolicy, Representation, etag, etag_for_body, negotiate};
 use crate::request;
@@ -466,6 +467,7 @@ async fn bundle_manifest(
     .await;
     observation.queue_ms = Some(timed.queue_ms);
     observation.work_ms = timed.work_ms;
+    observation.faults = timed.faults;
     match timed.result {
         Ok(open) => {
             observation.open_ms = Some(open.open_ms);
@@ -1046,6 +1048,7 @@ async fn export(
     .await;
     observation.queue_ms = Some(timed.queue_ms);
     observation.work_ms = timed.work_ms;
+    observation.faults = timed.faults;
     let store = match timed.result {
         Ok((store, open)) => {
             observation.open_ms = Some(open.open_ms);
@@ -1349,6 +1352,7 @@ where
     .await;
     observation.queue_ms = Some(timed.queue_ms);
     observation.work_ms = timed.work_ms;
+    observation.faults = timed.faults;
     let rendered = match record_open(&mut observation, timed.result) {
         Ok(rendered) => rendered,
         Err(problem) => return observed_result(Err(problem), observation),
@@ -1440,6 +1444,7 @@ where
     .await;
     observation.queue_ms = Some(timed.queue_ms);
     observation.work_ms = timed.work_ms;
+    observation.faults = timed.faults;
     let rendered = match record_open(&mut observation, timed.result) {
         Ok(rendered) => rendered,
         Err(problem) => return observed_result(Err(problem), observation),
@@ -1624,6 +1629,7 @@ where
     .await;
     observation.queue_ms = Some(timed.queue_ms);
     observation.work_ms = timed.work_ms;
+    observation.faults = timed.faults;
     let rendered = match record_open(&mut observation, timed.result) {
         Ok(rendered) => rendered,
         Err(problem) => return observed_result(Err(problem), observation),
@@ -2339,6 +2345,7 @@ where
                 result: Err(problem),
                 queue_ms: millis(queue_started.elapsed()),
                 work_ms: None,
+                faults: None,
             };
         }
     };
@@ -2349,16 +2356,20 @@ where
         // awaiting handler does not admit replacement work while this work is
         // still faulting pages or building a response.
         let _admitted = admitted;
+        // Read on this thread before and after, so the faults are this work's alone.
+        let faults_before = ThreadFaults::now();
         let work_started = Instant::now();
         let result = work();
-        (result, millis(work_started.elapsed()))
+        let work_ms = millis(work_started.elapsed());
+        (result, work_ms, faults_before.and_then(ThreadFaults::since))
     })
     .await
     {
-        Ok((result, work_ms)) => Timed {
+        Ok((result, work_ms, faults)) => Timed {
             result,
             queue_ms,
             work_ms: Some(work_ms),
+            faults,
         },
         Err(error) => {
             tracing::error!(%error, "a request panicked on the blocking pool");
@@ -2369,6 +2380,7 @@ where
                 )),
                 queue_ms,
                 work_ms: None,
+                faults: None,
             }
         }
     }

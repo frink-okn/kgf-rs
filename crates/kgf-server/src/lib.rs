@@ -47,6 +47,7 @@ pub mod cursor;
 pub mod descriptor;
 pub mod envelope;
 pub mod export;
+mod faults;
 mod forms;
 mod hex;
 pub mod html;
