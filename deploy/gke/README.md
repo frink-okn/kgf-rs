@@ -191,6 +191,13 @@ is still missing and does not restart.
 - Server size: `deployment.yaml` resources. Memory is page cache for the
   mapped bundles; the 6.5 GiB per vCPU ratio Autopilot enforces is a whole-pod
   rule, so it is both containers summed that has to stay inside it.
+- Admission: `--max-concurrent-work`, `--heavy-request-weight`,
+  `--max-queued-requests`, and `--queue-timeout-ms` in `deployment.yaml` args.
+  Requests carrying bindings are heavy and cost the weight in work units, so at
+  the defaults (32 units, weight 4) only 8 run at once across all clients; the
+  rest wait, and a full waiting room or an expired wait answers 429. Size them by
+  the access log's `queue_ms`, `work_ms`, and `major_faults`: refusals while work
+  stays short mean the gate, not the pod, is the limit.
 - Sync cadence: `SYNC_INTERVAL` on the sidecar, seconds between passes.
 - Sync transfer shape: `NUMWORKERS`, `CONCURRENCY`, `PART_SIZE_MIB`. Their
   product is the sidecar's buffer high-water mark, so raise them and its memory
