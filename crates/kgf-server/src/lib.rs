@@ -47,7 +47,6 @@ pub mod cursor;
 pub mod descriptor;
 pub mod envelope;
 pub mod export;
-mod faults;
 mod forms;
 mod hex;
 pub mod html;
@@ -59,6 +58,7 @@ pub mod service;
 mod skolem;
 pub mod term;
 pub mod url;
+mod usage;
 
 use std::sync::Arc;
 

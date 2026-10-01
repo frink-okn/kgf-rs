@@ -57,7 +57,7 @@ use kgf_store::Store;
 use kgf_store::manifest::Manifest;
 use kgf_store::store::artifact;
 
-use crate::access::RequestShape;
+use crate::access::{Ledger, RequestShape};
 use crate::admission::DownloadSlot;
 use crate::envelope::{ErrorCode, Problem};
 use crate::hex;
@@ -500,6 +500,7 @@ impl<'a> Delivery<'a> {
         coding: ContentCoding,
         extent: &Extent,
         slot: DownloadSlot,
+        ledger: Option<Arc<Ledger>>,
     ) -> Result<Response, Problem> {
         self.verify(&store)?;
         let segments = self.segments(extent);
@@ -509,7 +510,7 @@ impl<'a> Delivery<'a> {
             store,
             artifact: self.artifact,
         });
-        let download = Download::new(source, segments, coding, slot).map_err(|error| {
+        let download = Download::new(source, segments, coding, slot, ledger).map_err(|error| {
             tracing::error!(%error, "a download's encoder could not be created");
             Problem::new(
                 ErrorCode::InternalError,

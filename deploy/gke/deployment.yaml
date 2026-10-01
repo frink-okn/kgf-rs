@@ -67,17 +67,21 @@ spec:
             # confirm it against a known request once traffic flows.
             - --trusted-proxies=2
             # Admission, sized for this pod rather than the server's defaults (32
-            # work units, a bindings request costing 4, 128 waiting). Bundle work
-            # here mostly waits for mapped pages from the SSD persistent disk: on
-            # 2026-09-30, requests carrying bindings took about 1 ms of work, CPU
-            # stayed at 5-18% of its limit, and a full 128-request waiting room
-            # refused bursts with 429 that would have cleared in tens of
-            # milliseconds. 64 units let 16 bindings requests read the disk at
-            # once instead of 8. The waiting room stays bounded by the 500 ms wait;
-            # at 1,024 requests it holds at most 1 GiB of request bodies (1 MiB
-            # each at the cap, tens of KB in practice). After a change, compare
-            # `work_ms` and `major_faults` in the access log: work time that climbs
-            # with concurrency means the disk or CPU is full, and the step was too far.
+            # work units, a heavy request costing 4, 128 waiting). On 2026-09-30
+            # the gate, not the pod, was the limit: requests carrying bindings took
+            # about 1 ms of work, CPU stayed at 5-18% of its limit, and a full
+            # 128-request waiting room refused bursts with 429 that would have
+            # cleared in tens of milliseconds. A day later a bindings-heavy
+            # benchmark took no major faults, so that work was not waiting on the
+            # disk either. 64 units let 16 heavy requests run at once instead of 8,
+            # and 1,024 places absorb a burst; the 500 ms wait still bounds how
+            # long any request stays. A waiting bindings request holds its parsed
+            # bindings, which grow with its body (1 MiB at the cap, tens of KB in
+            # practice), so a full room holds on the order of 1 GiB at worst, and
+            # takes it from the page cache. After a change, compare `work_ms` with
+            # `cpu_ms` and `major_faults` in the access log: work time that climbs
+            # with concurrency while `cpu_ms` stays flat is waiting, on the disk if
+            # `major_faults` climbs too, and the step was too far.
             - --max-concurrent-work=64
             - --max-queued-requests=1024
           ports:

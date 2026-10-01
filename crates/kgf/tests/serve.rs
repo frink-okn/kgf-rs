@@ -2089,7 +2089,9 @@ fn a_download_is_recorded_by_its_shape() {
         )
         .assert_status(200);
 
-    let records = log.records();
+    // A download's record is written when its body is done with, which can be
+    // just after the client has read the last byte.
+    let records = log.wait_for(2);
     let exports: Vec<_> = records
         .iter()
         .filter(|record| {
@@ -2098,6 +2100,12 @@ fn a_download_is_recorded_by_its_shape() {
         .map(|record| serde_json::to_value(record).unwrap())
         .collect();
     assert_eq!(exports.len(), 2, "{records:?}");
+    // The open and every chunk read, each through the work gate.
+    for export in &exports {
+        assert!(export["queue_ms"].is_u64(), "{export}");
+        assert!(export["work_ms"].is_u64(), "{export}");
+        assert_eq!(export["cpu_ms"].is_u64(), cfg!(target_os = "linux"));
+    }
     assert_eq!(exports[0]["operation"], "export");
     assert_eq!(exports[0]["status"], 206);
     assert_eq!(
@@ -2944,8 +2952,9 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
     assert!(page_record.open_ms.is_some());
     assert!(page_record.queue_ms.is_some());
     assert!(page_record.work_ms.is_some());
-    // Only Linux counts faults per thread; elsewhere the record says nothing rather
-    // than report a process-wide figure.
+    // Only Linux is read for per-thread usage; elsewhere the record says nothing
+    // rather than report a process-wide figure.
+    assert_eq!(page_record.cpu_ms.is_some(), cfg!(target_os = "linux"));
     assert_eq!(
         page_record.major_faults.is_some(),
         cfg!(target_os = "linux")
@@ -2974,8 +2983,21 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
 
     assert_eq!(records[1].status, Some(304));
     assert!(records[1].work_class.is_none());
-    assert!(records[1].work_ms.is_none());
-    assert!(records[1].major_faults.is_none());
+    // No work, so no measurements: present in the line, as `null`.
+    let not_modified = serde_json::to_value(&records[1]).unwrap();
+    for key in [
+        "queue_ms",
+        "work_ms",
+        "cpu_ms",
+        "major_faults",
+        "minor_faults",
+    ] {
+        assert_eq!(
+            not_modified.get(key),
+            Some(&serde_json::Value::Null),
+            "{key}"
+        );
+    }
     assert_eq!(records[2].route, None);
     assert_eq!(records[2].operation, None);
     assert_eq!(records[2].code, Some("not_found"));
@@ -3097,6 +3119,17 @@ fn shape_logging_excludes_content_and_raw_logging_is_explicit() {
     assert_eq!(shape_records[0].bytes_in, None);
     assert_eq!(shape_records[2].bytes_in, Some(body.len() as u64));
     assert_eq!(shape_records[3].bytes_in, Some(body.len() as u64));
+    // A body-carrying request is measured like any other bundle work.
+    for bindings in &shape_records[2..4] {
+        assert_eq!(
+            bindings.work_class,
+            Some(kgf_server::access::AccessWorkClass::Heavy)
+        );
+        assert!(bindings.queue_ms.is_some());
+        assert!(bindings.work_ms.is_some());
+        assert_eq!(bindings.cpu_ms.is_some(), cfg!(target_os = "linux"));
+        assert_eq!(bindings.major_faults.is_some(), cfg!(target_os = "linux"));
+    }
     assert_eq!(
         shape_records[4].transport,
         Some(kgf_server::access::Transport::GetValues)
@@ -4158,6 +4191,19 @@ struct RecordingAccessLog(Arc<Mutex<Vec<AccessRecord>>>);
 impl RecordingAccessLog {
     fn records(&self) -> Vec<AccessRecord> {
         self.0.lock().expect("access records").clone()
+    }
+
+    /// The records once there are at least `count`, for a record written after
+    /// its response: a download's, when the server is done with its body.
+    fn wait_for(&self, count: usize) -> Vec<AccessRecord> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let records = self.records();
+            if records.len() >= count || std::time::Instant::now() >= deadline {
+                return records;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 

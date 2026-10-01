@@ -18,13 +18,15 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use tokio::task::JoinHandle;
 
 use super::coding::ContentCoding;
-use crate::admission::{AdmissionGuard, DownloadSlot};
+use crate::access::Ledger;
+use crate::admission::{AdmissionGuard, DownloadSlot, WorkClass};
 use crate::envelope::Problem;
 
 /// Where a download's bytes come from: an artifact, whole.
@@ -91,8 +93,8 @@ pub(crate) struct Download {
 
 enum State {
     Ready(Box<Producer>),
-    /// Waiting for the work gate to admit the next chunk.
-    Admitting(Box<Producer>, Admission),
+    /// Waiting, since the instant given, for the work gate to admit the next chunk.
+    Admitting(Box<Producer>, Admission, Instant),
     Producing(JoinHandle<(Box<Producer>, io::Result<Option<Bytes>>)>),
     Done,
 }
@@ -100,12 +102,14 @@ enum State {
 type Admission = Pin<Box<dyn Future<Output = Result<AdmissionGuard, Problem>> + Send>>;
 
 impl Download {
-    /// Stream `segments` of `source`, encoded as `coding`.
+    /// Stream `segments` of `source`, encoded as `coding`, charging each chunk's
+    /// admission and work to `ledger`.
     pub(crate) fn new(
         source: Arc<dyn Source>,
         segments: Vec<Segment>,
         coding: ContentCoding,
         slot: DownloadSlot,
+        ledger: Option<Arc<Ledger>>,
     ) -> io::Result<Self> {
         let total: u64 = segments.iter().map(Segment::len).sum();
         let encoder = Encoder::new(coding, total)?;
@@ -116,6 +120,7 @@ impl Download {
                 segments: segments.into(),
                 encoder,
                 slot,
+                ledger,
             })),
             remaining,
         })
@@ -136,28 +141,36 @@ impl Body for Download {
                 State::Done => return Poll::Ready(None),
                 State::Ready(producer) => {
                     let admission = Box::pin(producer.slot.chunk());
-                    this.state = State::Admitting(producer, admission);
+                    this.state = State::Admitting(producer, admission, Instant::now());
                 }
-                State::Admitting(producer, mut admission) => match admission.as_mut().poll(cx) {
-                    Poll::Pending => {
-                        this.state = State::Admitting(producer, admission);
-                        return Poll::Pending;
+                State::Admitting(producer, mut admission, waiting) => {
+                    match admission.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            this.state = State::Admitting(producer, admission, waiting);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(admitted)) => {
+                            if let Some(ledger) = &producer.ledger {
+                                ledger.queued(WorkClass::Ordinary, waiting.elapsed());
+                            }
+                            this.state = State::Producing(tokio::task::spawn_blocking(move || {
+                                // Held for the chunk's work and no longer, inside
+                                // the task for the reason the slot is: the work
+                                // outlives a body dropped while it runs.
+                                let _admitted = admitted;
+                                let mut producer = producer;
+                                let chunk = match producer.ledger.clone() {
+                                    Some(ledger) => ledger.run(|| producer.next_chunk()),
+                                    None => producer.next_chunk(),
+                                };
+                                (producer, chunk)
+                            }));
+                        }
+                        Poll::Ready(Err(problem)) => {
+                            return Poll::Ready(Some(Err(io::Error::other(problem.to_string()))));
+                        }
                     }
-                    Poll::Ready(Ok(admitted)) => {
-                        this.state = State::Producing(tokio::task::spawn_blocking(move || {
-                            // Held for the chunk's work and no longer, inside
-                            // the task for the reason the slot is: the work
-                            // outlives a body dropped while it runs.
-                            let _admitted = admitted;
-                            let mut producer = producer;
-                            let chunk = producer.next_chunk();
-                            (producer, chunk)
-                        }));
-                    }
-                    Poll::Ready(Err(problem)) => {
-                        return Poll::Ready(Some(Err(io::Error::other(problem.to_string()))));
-                    }
-                },
+                }
                 State::Producing(mut task) => match Pin::new(&mut task).poll(cx) {
                     Poll::Pending => {
                         this.state = State::Producing(task);
@@ -236,6 +249,9 @@ struct Producer {
     /// This download's claim on the download gate, held wherever the work is,
     /// and through which each chunk is admitted to the work gate.
     slot: DownloadSlot,
+    /// The request's record, held open until the last chunk's work has been
+    /// charged to it, wherever the producer is when the body ends.
+    ledger: Option<Arc<Ledger>>,
 }
 
 impl Producer {
@@ -420,7 +436,8 @@ mod tests {
             let source: Arc<dyn Source> = Arc::new(vec![7u8; 3 * CHUNK]);
             let segments = vec![Segment::Artifact(0..3 * CHUNK as u64)];
             let slot = admission.download(None).unwrap();
-            let mut body = Download::new(source, segments, ContentCoding::Identity, slot).unwrap();
+            let mut body =
+                Download::new(source, segments, ContentCoding::Identity, slot, None).unwrap();
             let mut context = Context::from_waker(std::task::Waker::noop());
             assert!(Pin::new(&mut body).poll_frame(&mut context).is_pending());
             drop(body);
@@ -461,7 +478,8 @@ mod tests {
             let source: Arc<dyn Source> = Arc::new(vec![7u8; 2 * CHUNK]);
             let segments = vec![Segment::Artifact(0..2 * CHUNK as u64)];
             let slot = admission.download(None).unwrap();
-            let mut body = Download::new(source, segments, ContentCoding::Identity, slot).unwrap();
+            let mut body =
+                Download::new(source, segments, ContentCoding::Identity, slot, None).unwrap();
 
             // Every unit of work is taken, so nothing is read...
             let mut context = Context::from_waker(std::task::Waker::noop());

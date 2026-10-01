@@ -48,13 +48,12 @@ use tower_http::compression::predicate::SizeAbove;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::access::{AccessOperation, Observation, OpenTiming, Timed, Transport, millis};
+use crate::access::{AccessOperation, Ledger, Observation, OpenTiming, Transport};
 use crate::admission::{DownloadClient, WorkClass};
 use crate::answer::{self, Rendered, Renders, Target};
 use crate::descriptor::{BundleManifest, DatasetDescriptor, ServiceDescriptor};
 use crate::envelope::{ErrorCode, PROBLEM_MEDIA_TYPE, Problem, reflected};
 use crate::export::{Conditions, Decision, Delivery, ExportArtifact};
-use crate::faults::ThreadFaults;
 use crate::html::Resource;
 use crate::representation::{CachePolicy, Representation, etag, etag_for_body, negotiate};
 use crate::request;
@@ -461,14 +460,11 @@ async fn bundle_manifest(
     let id = BundleId { dataset, version };
     let opened = Arc::clone(&service);
     observation.work_class = Some(WorkClass::Ordinary);
-    let timed = blocking(&service, WorkClass::Ordinary, move || {
+    let open = blocking(&service, WorkClass::Ordinary, move || {
         opened.open_observed(&id).map(|(_, timing)| timing)
     })
     .await;
-    observation.queue_ms = Some(timed.queue_ms);
-    observation.work_ms = timed.work_ms;
-    observation.faults = timed.faults;
-    match timed.result {
+    match open {
         Ok(open) => {
             observation.open_ms = Some(open.open_ms);
             observation.first_open = Some(open.first_open);
@@ -1042,14 +1038,11 @@ async fn export(
     let id = BundleId { dataset, version };
     let opened = Arc::clone(&service);
     observation.work_class = Some(WorkClass::Ordinary);
-    let timed = blocking(&service, WorkClass::Ordinary, move || {
+    let open = blocking(&service, WorkClass::Ordinary, move || {
         opened.open_observed(&id)
     })
     .await;
-    observation.queue_ms = Some(timed.queue_ms);
-    observation.work_ms = timed.work_ms;
-    observation.faults = timed.faults;
-    let store = match timed.result {
+    let store = match open {
         Ok((store, open)) => {
             observation.open_ms = Some(open.open_ms);
             observation.first_open = Some(open.first_open);
@@ -1059,7 +1052,7 @@ async fn export(
     };
     let response = match slot {
         None => delivery.head(&store, coding),
-        Some(slot) => delivery.send(store, coding, &extent, slot),
+        Some(slot) => delivery.send(store, coding, &extent, slot, Ledger::current()),
     };
     observed_result(response, observation)
 }
@@ -1338,7 +1331,7 @@ where
         request.labels_requested(),
     );
     let opened = Arc::clone(&service);
-    let timed = blocking(&service, work_class, move || {
+    let result = blocking(&service, work_class, move || {
         let (store, open) = opened.open_observed(target.id())?;
         Ok(Opened::run(open, || {
             // Serialized in here, not outside: strings are materialized only
@@ -1350,10 +1343,7 @@ where
         }))
     })
     .await;
-    observation.queue_ms = Some(timed.queue_ms);
-    observation.work_ms = timed.work_ms;
-    observation.faults = timed.faults;
-    let rendered = match record_open(&mut observation, timed.result) {
+    let rendered = match record_open(&mut observation, result) {
         Ok(rendered) => rendered,
         Err(problem) => return observed_result(Err(problem), observation),
     };
@@ -1435,17 +1425,14 @@ where
     .with_dataset_metadata(release.dataset_iri(), release.carries_description())
     .with_declarations(release.declarations());
     let opened = Arc::clone(&service);
-    let timed = blocking(&service, work_class, move || {
+    let result = blocking(&service, work_class, move || {
         let (store, open) = opened.open_observed(target.id())?;
         Ok(Opened::run(open, || {
             execute(&store, target, &request, representation)
         }))
     })
     .await;
-    observation.queue_ms = Some(timed.queue_ms);
-    observation.work_ms = timed.work_ms;
-    observation.faults = timed.faults;
-    let rendered = match record_open(&mut observation, timed.result) {
+    let rendered = match record_open(&mut observation, result) {
         Ok(rendered) => rendered,
         Err(problem) => return observed_result(Err(problem), observation),
     };
@@ -1608,6 +1595,9 @@ where
             ),
         };
     }
+    // Parsed and hashed, the body is not read again. Released before admission, so
+    // a request in the waiting room holds its parsed form and not the bytes too.
+    drop(body);
 
     let target = Target::body(
         id,
@@ -1618,7 +1608,7 @@ where
     );
     let labels = PageLabelProfile::for_request(&service, release, representation, false);
     let opened = Arc::clone(&service);
-    let timed = blocking(&service, WorkClass::Heavy, move || {
+    let result = blocking(&service, WorkClass::Heavy, move || {
         let (store, open) = opened.open_observed(target.id())?;
         Ok(Opened::run(open, || {
             let mut answer = execute(&store, target, &request)?;
@@ -1627,10 +1617,7 @@ where
         }))
     })
     .await;
-    observation.queue_ms = Some(timed.queue_ms);
-    observation.work_ms = timed.work_ms;
-    observation.faults = timed.faults;
-    let rendered = match record_open(&mut observation, timed.result) {
+    let rendered = match record_open(&mut observation, result) {
         Ok(rendered) => rendered,
         Err(problem) => return observed_result(Err(problem), observation),
     };
@@ -2332,58 +2319,41 @@ fn record_open<T>(
 /// convention for a path that is not built, so an unimplemented operation
 /// reached by a client should answer `internal_error` and log, not look like a
 /// network failure.
-async fn blocking<T, F>(service: &Service, class: WorkClass, work: F) -> Timed<T>
+///
+/// The wait for admission and the work itself are charged to the request's
+/// [`Ledger`] when a sink is recording. The ledger travels into the task, so a
+/// client that disconnects mid-work still has the work it left behind recorded.
+async fn blocking<T, F>(service: &Service, class: WorkClass, work: F) -> Result<T, Problem>
 where
     F: FnOnce() -> Result<T, Problem> + Send + 'static,
     T: Send + 'static,
 {
+    let ledger = Ledger::current();
     let queue_started = Instant::now();
-    let admitted = match service.admission().enter(class).await {
-        Ok(admitted) => admitted,
-        Err(problem) => {
-            return Timed {
-                result: Err(problem),
-                queue_ms: millis(queue_started.elapsed()),
-                work_ms: None,
-                faults: None,
-            };
-        }
-    };
-    let queue_ms = millis(queue_started.elapsed());
-    match tokio::task::spawn_blocking(move || {
+    let admitted = service.admission().enter(class).await;
+    if let Some(ledger) = &ledger {
+        ledger.queued(class, queue_started.elapsed());
+    }
+    let admitted = admitted?;
+    tokio::task::spawn_blocking(move || {
         // A blocking task cannot be cancelled after it starts. Keep its
         // capacity in the task itself, so a disconnected client dropping the
         // awaiting handler does not admit replacement work while this work is
         // still faulting pages or building a response.
         let _admitted = admitted;
-        // Read on this thread before and after, so the faults are this work's alone.
-        let faults_before = ThreadFaults::now();
-        let work_started = Instant::now();
-        let result = work();
-        let work_ms = millis(work_started.elapsed());
-        (result, work_ms, faults_before.and_then(ThreadFaults::since))
+        match &ledger {
+            Some(ledger) => ledger.run(work),
+            None => work(),
+        }
     })
     .await
-    {
-        Ok((result, work_ms, faults)) => Timed {
-            result,
-            queue_ms,
-            work_ms: Some(work_ms),
-            faults,
-        },
-        Err(error) => {
-            tracing::error!(%error, "a request panicked on the blocking pool");
-            Timed {
-                result: Err(Problem::new(
-                    ErrorCode::InternalError,
-                    "the request failed while reading the bundle",
-                )),
-                queue_ms,
-                work_ms: None,
-                faults: None,
-            }
-        }
-    }
+    .unwrap_or_else(|error| {
+        tracing::error!(%error, "a request panicked on the blocking pool");
+        Err(Problem::new(
+            ErrorCode::InternalError,
+            "the request failed while reading the bundle",
+        ))
+    })
 }
 
 #[cfg(test)]

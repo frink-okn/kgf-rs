@@ -79,8 +79,8 @@ the line is also readable by eye.
 | `status` | u16, or `null` when the client went away before a response existed | response, §3.1 | shape |
 | `code` | `ErrorCode::as_str()` or `null` | §3.2 | shape |
 | `work_class` | `ordinary` / `heavy` / `null` (no store work) | `GetRequest::work_class` | shape |
-| `queue_ms`, `work_ms`, `total_ms` | integers | §3.3 | shape |
-| `major_faults`, `minor_faults` | integers or `null` | the blocking worker thread's fault counters across the work, §3.3; `null` off Linux | shape |
+| `queue_ms`, `work_ms`, `total_ms` | integers; the first two `null` without admission or work | summed over every admission and run charged to the request's ledger — a download's open and each chunk — §3.3 | shape |
+| `cpu_ms`, `major_faults`, `minor_faults` | integers or `null` | the worker threads' CPU time and fault counters across the same work, §3.3; `null` without work, and off Linux | shape |
 | `waiting` | requests in the admission waiting room at entry | §9 | shape |
 | `bytes_in`, `bytes_out` | integers or `null` | `bytes_in` is what a body handler read, never a declared `Content-Length`; `bytes_out` is the response body's exact size hint | shape |
 | `complete`, `truncation_reason` | bool, token or `null` | `Rendered.completeness` | shape |
@@ -142,14 +142,18 @@ record to the sink (§6). Set `KGF-Request-Id` on the response before returning 
 When problem rendering selected the response representation, that rendered value wins
 over the operation representation retained in the handler observation.
 
-The facts gathered on the way in live in an `InFlight` guard whose `Drop` emits the
-record if the handler never returned. That is what happens when a client disconnects
-mid-request: hyper drops the service future, and without the guard the request would
+The facts gathered on the way in live in a per-request `Ledger`, shared between the
+middleware's `InFlight` guard and every piece of work the request admits, and the
+record is written from the ledger's `Drop`: when the last holder lets go. Usually that
+is the guard, as the response leaves. When a client disconnects mid-request, hyper
+drops the service future and the guard with it, but a blocking task cannot be
+cancelled, so the task still holds the ledger, and the record is written when the
+work ends, carrying what the work cost (§3.3). Without the ledger the request would
 vanish from the census while the bundle work it admitted ran to completion. Such a
-record has `status: null`, no `Observation`, and the time to the cancellation. When no
-sink is configured the guard mints only the request id, and every `Observation`
-setter is a no-op, so a deployment with `--access-log off` pays for nothing but the
-header.
+record has `status: null`, no `Observation`, and `total_ms` to the end of the work
+it left behind. When no sink is configured there is no ledger: the guard mints only
+the request id, no work is measured, and every `Observation` setter is a no-op, so
+a deployment with `--access-log off` pays for nothing but the header.
 
 `route` and `operation` come from axum's `MatchedPath` extension, which needs the
 `matched-path` feature on the workspace's `axum` dependency (currently `http1`,
@@ -174,7 +178,8 @@ The four `operate_*` functions (`operate`, `operate_represented`, `operate_speci
 insert it into the response extensions. The `Observation` is a plain struct:
 `dataset`, `version`, `operation`, `transport`, `representation`, `work_class`,
 `shape`, `cursor`, `request_hash`, and — filled in after the blocking call —
-timings, `rows`, `cardinality`, completeness, `open_ms`.
+`rows`, `cardinality`, completeness, `open_ms`. Admission and work timings do not
+pass through it; `blocking` charges them to the request's ledger.
 
 Two plumbing changes make that possible:
 
@@ -184,24 +189,49 @@ Two plumbing changes make that possible:
   `shape()`. `Pattern::bound` and `BoundTerm` already expose what §2.2 needs, except
   the term *kind*, which `BoundTerm` does not currently store — add it at parse
   (`term::Term` knows), do not re-parse the string to find out.
-- **`blocking` returns timings** (`routes.rs:1608`). Measure `admission.enter` as
-  `queue_ms` and time the closure body as `work_ms`; `total_ms` is the layer's.
+- **`blocking` charges timings to the ledger.** It measures `admission.enter` as
+  `queue_ms` and the closure body as `work_ms`; `total_ms` is the layer's.
   Pool scheduling delay is whatever is left, and it is worth seeing on the
   shared-storage gate. Once a bundle opens, `Opened<T>` carries `OpenTiming` beside
   the remaining operation result so a later execution, hydration, or rendering
   failure cannot erase the successful open.
-- **`blocking` also counts page faults** (added 2026-10-01). It reads the worker
-  thread's counters (`getrusage(RUSAGE_THREAD)`, through `nix`, because the crate
-  denies `unsafe`) before and after the closure and records the differences as
-  `major_faults`, pages read from storage, and `minor_faults`, pages already in memory.
-  `work_ms` alone cannot say whether the worker computed or waited for mapped pages,
-  and that decides whether admitting more concurrent work would keep storage busier or
-  only queue more computation. The question came from the public deployment: on
-  2026-09-30 it refused bursts with 429 while its CPU sat at 5–18% of the limit and
-  its page cache, about 7 GiB of the container's 8 GiB, held a few percent of the
-  bundles. A blocking task runs on one thread from start to end, so the counts are the
-  request's own. Only Linux counts per thread; elsewhere both fields are `null` rather
-  than a process-wide figure every concurrent request would share.
+- **Work is measured per thread and charged to a per-request ledger** (added
+  2026-10-01). `work_ms` alone cannot say whether the worker computed or waited, and
+  that decides whether admitting more concurrent work would keep storage busier or only
+  queue more computation. The question came from the public deployment: on 2026-09-30
+  it refused bursts with 429 while its CPU sat at 5–18% of the limit and its page
+  cache, about 7 GiB of the container's 8 GiB, held a few percent of the bundles.
+  `usage::measure` runs the closure and reads the worker thread's counters before and
+  after it (`getrusage(RUSAGE_THREAD)`, through `nix`, because the crate denies
+  `unsafe`). A closure cannot await, so it runs on one thread from start to end, and
+  `measure` is the only way to take a reading, so no reading can be compared against
+  another thread's counters. Three differences go into the record:
+  - `cpu_ms`, the thread's user and kernel time. What `work_ms` has beyond it was
+    waiting, on storage, on another request's open of the same bundle (the catalog's
+    singleflight), or for a core. This is the direct answer to the question.
+  - `major_faults`, faults that waited for storage. A count of faults, not of pages: a
+    fault on a mapped file reads ahead around the page, so one can bring in many. A
+    fault that waits on another thread's read of the same page counts as major too
+    (the kernel counts a retried fault as major), so concurrent records can each count
+    one read, and a sum over records overstates reads.
+  - `minor_faults`, faults resolved without storage: a cached page, including one an
+    earlier fault read ahead, but also the first touch of freshly allocated memory, so
+    it grows with response buffers and is not a count of cache hits.
+
+  The ledger rather than the `Observation` carries these, because two kinds of work
+  outlive the handler. A client that disconnects mid-work leaves the work running, and
+  the work keeps the ledger, and so the record, open until it ends. A download's
+  chunks are read on the blocking pool after its headers have gone, each through the
+  work gate; the body holds the ledger, so the download's record is written when the
+  transfer ends or its client leaves, with its open and every chunk summed into
+  `queue_ms`, `work_ms`, and the usage fields. Its `time` and `total_ms` therefore
+  cover the transfer. The middleware runs the handler inside a `tokio::task_local!`
+  scope holding the ledger, which is how `blocking` and the export handler find it
+  without every handler passing it along.
+
+  Only Linux is read, the platform the server is deployed and tested on; FreeBSD and
+  OpenBSD count per thread too but are untested. Elsewhere the usage fields are `null`
+  rather than a process-wide figure every concurrent request would share.
 
 The 304 path (`not_modified`, `routes.rs:1372`) and the redirect (`latest_redirect`)
 insert an `Observation` too — without timings or rows, but with operation, dataset
@@ -404,7 +434,9 @@ defaults `Admission::new` chose from the local load pass (32 active, 128 queued,
   response, equal to its record's `request_id` — and is still minted, distinct, and
   returned when no sink is configured.
 - **An abandoned request is still recorded.** A unit test drops the `InFlight` guard
-  without finishing it and reads back one record with `status: null`.
+  without finishing it and reads back one record with `status: null`. Another holds
+  the ledger as a blocking task would, drops the guard, and finds no record until the
+  work has been charged and the holder lets go, when the record carries that work.
 - **A stalled writer never blocks a caller.** A unit test gates the writer inside its
   first write, overfills the queue, and asserts the extra record was dropped and
   counted while every `push` returned; releasing the gate and dropping the log then
@@ -434,7 +466,7 @@ census rows:
 | Repetition rate, cacheability | `request_hash`; `status = 304` |
 | Failure telemetry | `status`, `code`, `truncation_reason` |
 | Traffic distribution, peak concurrency | `time`, `dataset`, `queued`, `queue_ms` |
-| Storage-bound work, page-cache misses | `major_faults` against `work_ms`, per `dataset` |
+| Waiting versus computing; storage-bound work | `work_ms` − `cpu_ms` (waiting), and `major_faults` beside it (storage), per `dataset` |
 | Cross-KG sessions | `client_hash` × `dataset` within a time window — approximate; exact sessions need the receipt join (§4) |
 | Client mix | `client_class`, `user_agent` |
 

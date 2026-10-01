@@ -1585,6 +1585,22 @@ The default `TraceLayer` and tower-http's `trace` feature are gone: enabling deb
 diagnostics can no longer disclose raw URIs as a second accidental access log.
 `notes/request-logging.md` is the detailed design record for this unit.
 
+**Work measured per thread, charged to a per-request ledger (2026-10-01).** The public
+deployment refused bursts with 429 while its CPU sat mostly idle, and `work_ms` could
+not say whether its work was computing or waiting. The record now carries `cpu_ms`,
+`major_faults`, and `minor_faults`, the blocking worker thread's own counters across
+the work (`getrusage(RUSAGE_THREAD)` through `nix`, read on Linux only, `null`
+elsewhere). `usage::measure` is the only way to take a reading and takes both on the
+thread that runs the closure. `work_ms − cpu_ms` is waiting of any kind; a major fault
+is a fault that waited for storage, counted as faults rather than pages because of
+readahead. Timings no longer pass through the handler's `Observation`: the middleware
+runs the handler in a task-local scope holding a `Ledger`, `blocking` and a download's
+chunks charge their waits and work to it, and the record is written from the ledger's
+`Drop`, when the last holder lets go. That replaces the drop guard and fixes two gaps
+the first version had. Work a disconnected client left running is now recorded when it
+ends, rather than lost. A download's record now counts every chunk it read through the
+work gate, not just the open, and is written when the transfer ends.
+
 ### 23. `--public-base` — serving under a path prefix ✅
 
 FRINK mounts every service under a path on one shared hostname, with the gateway
@@ -2509,9 +2525,11 @@ fixed, two recorded below as open.
   sooner; it needs a listener wrapping the socket, and `axum` implements its
   client-address extractor only for its own listener types, so the access log would need
   a connect-info type of its own.
-- *Whether a transfer finished.* The access record is emitted when the response's
-  headers are produced, so for a download it cannot say whether the transfer finished
-  or how much of it was sent.
+- *Whether a transfer finished.* A download's access record is now written when its
+  body is done with (unit 22's ledger), and counts every chunk's work, but `bytes_out`
+  is still the declared length, so it cannot say whether the transfer finished or how
+  much of it was sent. The body knows both when it drops, so reporting them is now a
+  small change.
 - *Trusting `X-Forwarded-For` by position.* With `--trusted-proxies` set, the client is
   read from the chain whatever the peer, so a caller that reaches the pod without the
   gateway — which, behind a ClusterIP Service, means from inside the cluster — can be
