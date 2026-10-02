@@ -24,7 +24,8 @@ use http_body::{Body, Frame, SizeHint};
 use tokio::task::JoinHandle;
 
 use super::coding::ContentCoding;
-use crate::admission::{AdmissionGuard, DownloadSlot};
+use crate::access::{Ledger, Transfer, TransferEnd, Wait};
+use crate::admission::{AdmissionGuard, DownloadSlot, WorkClass};
 use crate::envelope::Problem;
 
 /// Where a download's bytes come from: an artifact, whole.
@@ -83,16 +84,26 @@ impl Segment {
 /// cancelling and retrying could put more reads and compressions in flight
 /// than the gate admits. Travelling with the producer, the slot is released
 /// with the body when no chunk is in progress, and with the task otherwise.
+///
+/// The request's access record waits for the body: dropping it reports how the
+/// transfer ended and how many bytes were handed to the connection.
 pub(crate) struct Download {
     state: State,
     /// Bytes still to send, when the response declared a length.
     remaining: Option<u64>,
+    /// Bytes handed to the connection so far.
+    sent: u64,
+    /// How the body ended, once it has. A body dropped without one was cut short.
+    end: Option<TransferEnd>,
+    /// The request's record, told how the transfer ended when the body drops.
+    ledger: Option<Arc<Ledger>>,
 }
 
 enum State {
     Ready(Box<Producer>),
-    /// Waiting for the work gate to admit the next chunk.
-    Admitting(Box<Producer>, Admission),
+    /// Waiting for the work gate to admit the next chunk; the wait is charged to
+    /// the request when it ends, however it ends.
+    Admitting(Box<Producer>, Admission, Option<Wait>),
     Producing(JoinHandle<(Box<Producer>, io::Result<Option<Bytes>>)>),
     Done,
 }
@@ -100,12 +111,14 @@ enum State {
 type Admission = Pin<Box<dyn Future<Output = Result<AdmissionGuard, Problem>> + Send>>;
 
 impl Download {
-    /// Stream `segments` of `source`, encoded as `coding`.
+    /// Stream `segments` of `source`, encoded as `coding`, charging each chunk's
+    /// admission and work to `ledger`.
     pub(crate) fn new(
         source: Arc<dyn Source>,
         segments: Vec<Segment>,
         coding: ContentCoding,
         slot: DownloadSlot,
+        ledger: Option<Arc<Ledger>>,
     ) -> io::Result<Self> {
         let total: u64 = segments.iter().map(Segment::len).sum();
         let encoder = Encoder::new(coding, total)?;
@@ -116,9 +129,39 @@ impl Download {
                 segments: segments.into(),
                 encoder,
                 slot,
+                ledger: ledger.clone(),
             })),
             remaining,
+            sent: 0,
+            end: None,
+            ledger,
         })
+    }
+
+    /// End the body with `error`, which hyper turns into an aborted connection:
+    /// the client sees a short transfer it can resume, never wrong bytes.
+    fn fail(&mut self, error: io::Error) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        self.end = Some(TransferEnd::Failed);
+        Poll::Ready(Some(Err(error)))
+    }
+}
+
+impl Drop for Download {
+    fn drop(&mut self) {
+        let Some(ledger) = &self.ledger else {
+            return;
+        };
+        // Every declared byte handed over is a complete transfer, whether or not
+        // hyper asked for the end of the body before letting it go.
+        let end = self.end.unwrap_or(if self.remaining == Some(0) {
+            TransferEnd::Complete
+        } else {
+            TransferEnd::Interrupted
+        });
+        ledger.transferred(Transfer {
+            bytes: self.sent,
+            end,
+        });
     }
 }
 
@@ -136,28 +179,38 @@ impl Body for Download {
                 State::Done => return Poll::Ready(None),
                 State::Ready(producer) => {
                     let admission = Box::pin(producer.slot.chunk());
-                    this.state = State::Admitting(producer, admission);
+                    let waiting = producer
+                        .ledger
+                        .as_ref()
+                        .map(|ledger| ledger.wait(WorkClass::Ordinary));
+                    this.state = State::Admitting(producer, admission, waiting);
                 }
-                State::Admitting(producer, mut admission) => match admission.as_mut().poll(cx) {
-                    Poll::Pending => {
-                        this.state = State::Admitting(producer, admission);
-                        return Poll::Pending;
+                State::Admitting(producer, mut admission, waiting) => {
+                    match admission.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            this.state = State::Admitting(producer, admission, waiting);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(admitted)) => {
+                            drop(waiting);
+                            let ledger = producer.ledger.clone();
+                            this.state = State::Producing(tokio::task::spawn_blocking(move || {
+                                // Held for the chunk's work and no longer, inside
+                                // the task for the reason the slot is: the work
+                                // outlives a body dropped while it runs.
+                                let _admitted = admitted;
+                                Ledger::charge(ledger, move || {
+                                    let mut producer = producer;
+                                    let chunk = producer.next_chunk();
+                                    (producer, chunk)
+                                })
+                            }));
+                        }
+                        Poll::Ready(Err(problem)) => {
+                            return this.fail(io::Error::other(problem.to_string()));
+                        }
                     }
-                    Poll::Ready(Ok(admitted)) => {
-                        this.state = State::Producing(tokio::task::spawn_blocking(move || {
-                            // Held for the chunk's work and no longer, inside
-                            // the task for the reason the slot is: the work
-                            // outlives a body dropped while it runs.
-                            let _admitted = admitted;
-                            let mut producer = producer;
-                            let chunk = producer.next_chunk();
-                            (producer, chunk)
-                        }));
-                    }
-                    Poll::Ready(Err(problem)) => {
-                        return Poll::Ready(Some(Err(io::Error::other(problem.to_string()))));
-                    }
-                },
+                }
                 State::Producing(mut task) => match Pin::new(&mut task).poll(cx) {
                     Poll::Pending => {
                         this.state = State::Producing(task);
@@ -165,28 +218,28 @@ impl Body for Download {
                     }
                     Poll::Ready(Ok((producer, Ok(Some(chunk))))) => {
                         this.state = State::Ready(producer);
+                        let length = chunk.len() as u64;
                         if let Some(remaining) = &mut this.remaining {
-                            *remaining = remaining.saturating_sub(chunk.len() as u64);
+                            *remaining = remaining.saturating_sub(length);
                         }
+                        this.sent = this.sent.saturating_add(length);
                         return Poll::Ready(Some(Ok(Frame::data(chunk))));
                     }
-                    Poll::Ready(Ok((_, Ok(None)))) => return Poll::Ready(None),
-                    // Either failure ends the body with an error, which hyper
-                    // turns into an aborted connection: the client sees a
-                    // short transfer it can resume, never wrong bytes.
+                    Poll::Ready(Ok((_, Ok(None)))) => {
+                        this.end = Some(TransferEnd::Complete);
+                        return Poll::Ready(None);
+                    }
                     Poll::Ready(Ok((producer, Err(error)))) => {
                         tracing::error!(
                             artifact = producer.source.name(),
                             %error,
                             "a download failed while producing its body",
                         );
-                        return Poll::Ready(Some(Err(error)));
+                        return this.fail(error);
                     }
                     Poll::Ready(Err(error)) => {
                         tracing::error!(%error, "a download's producer panicked");
-                        return Poll::Ready(Some(Err(io::Error::other(
-                            "the download's producer failed",
-                        ))));
+                        return this.fail(io::Error::other("the download's producer failed"));
                     }
                 },
             }
@@ -236,6 +289,9 @@ struct Producer {
     /// This download's claim on the download gate, held wherever the work is,
     /// and through which each chunk is admitted to the work gate.
     slot: DownloadSlot,
+    /// The request's record, held open until the last chunk's work has been
+    /// charged to it, wherever the producer is when the body ends.
+    ledger: Option<Arc<Ledger>>,
 }
 
 impl Producer {
@@ -420,7 +476,8 @@ mod tests {
             let source: Arc<dyn Source> = Arc::new(vec![7u8; 3 * CHUNK]);
             let segments = vec![Segment::Artifact(0..3 * CHUNK as u64)];
             let slot = admission.download(None).unwrap();
-            let mut body = Download::new(source, segments, ContentCoding::Identity, slot).unwrap();
+            let mut body =
+                Download::new(source, segments, ContentCoding::Identity, slot, None).unwrap();
             let mut context = Context::from_waker(std::task::Waker::noop());
             assert!(Pin::new(&mut body).poll_frame(&mut context).is_pending());
             drop(body);
@@ -461,7 +518,8 @@ mod tests {
             let source: Arc<dyn Source> = Arc::new(vec![7u8; 2 * CHUNK]);
             let segments = vec![Segment::Artifact(0..2 * CHUNK as u64)];
             let slot = admission.download(None).unwrap();
-            let mut body = Download::new(source, segments, ContentCoding::Identity, slot).unwrap();
+            let mut body =
+                Download::new(source, segments, ContentCoding::Identity, slot, None).unwrap();
 
             // Every unit of work is taken, so nothing is read...
             let mut context = Context::from_waker(std::task::Waker::noop());

@@ -1585,6 +1585,31 @@ The default `TraceLayer` and tower-http's `trace` feature are gone: enabling deb
 diagnostics can no longer disclose raw URIs as a second accidental access log.
 `notes/request-logging.md` is the detailed design record for this unit.
 
+**Work measured per thread, charged to a per-request ledger (2026-10-01).** The public
+deployment refused bursts with 429 while its CPU sat mostly idle, and `work_ms` could
+not say whether its work was computing or waiting. The record now carries `cpu_ms`,
+`major_faults`, and `minor_faults`, the blocking worker thread's own counters across
+the work (`getrusage(RUSAGE_THREAD)` through `nix`, read on Linux only, `null`
+elsewhere). `usage::measure` is the only way to take a reading and takes both on the
+thread that runs the closure. `work_ms − cpu_ms` is waiting of any kind; a major fault
+is a fault that waited for storage, counted as faults rather than pages because of
+readahead. Timings no longer pass through the handler's `Observation`: the middleware
+runs the handler in a task-local scope holding a `Ledger`, `blocking` and a download's
+chunks charge their waits and work to it, and the record is written from the ledger's
+`Drop`, when the last holder lets go. That replaces the drop guard and fixes two gaps
+the first version had. Work a disconnected client left running is now recorded when it
+ends, rather than lost. A download's record now counts every chunk it read through the
+work gate, not just the open, and is written when the transfer ends.
+
+A review of the ledger (2026-10-02) made waits for admission a guard charged however
+they end, so a client giving up in the waiting room still leaves `queue_ms`; routed all
+charged work through `Ledger::charge`, which keeps a sink from running while a thread
+unwinds; had a download report `bytes_out` as sent and a `transfer` outcome
+(`complete`, `interrupted`, `failed`); and bounded shutdown with `--shutdown-timeout-ms`
+(20 s), after which open connections are closed so their records are written before the
+process exits rather than lost when it is killed. `notes/request-logging.md` §3.3 has
+the detail.
+
 ### 23. `--public-base` — serving under a path prefix ✅
 
 FRINK mounts every service under a path on one shared hostname, with the gateway
@@ -2509,9 +2534,11 @@ fixed, two recorded below as open.
   sooner; it needs a listener wrapping the socket, and `axum` implements its
   client-address extractor only for its own listener types, so the access log would need
   a connect-info type of its own.
-- *Whether a transfer finished.* The access record is emitted when the response's
-  headers are produced, so for a download it cannot say whether the transfer finished
-  or how much of it was sent.
+- *Whether a transfer finished.* Resolved by unit 22's ledger: a download's record is
+  written when its body drops, with `bytes_out` as sent and `transfer` saying whether
+  it was `complete`, `interrupted`, or `failed`. What it still cannot say is how much
+  the client *received*: bytes handed to the connection may sit in socket buffers when
+  it closes.
 - *Trusting `X-Forwarded-For` by position.* With `--trusted-proxies` set, the client is
   read from the chain whatever the peer, so a caller that reaches the pod without the
   gateway — which, behind a ClusterIP Service, means from inside the cluster — can be

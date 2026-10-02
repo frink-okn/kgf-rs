@@ -66,6 +66,24 @@ spec:
             # per-client download limit becomes the whole deployment's, so
             # confirm it against a known request once traffic flows.
             - --trusted-proxies=2
+            # Admission, sized for this pod rather than the server's defaults (32
+            # work units, a heavy request costing 4, 128 waiting). On 2026-09-30
+            # the gate, not the pod, was the limit: requests carrying bindings took
+            # about 1 ms of work, CPU stayed at 5-18% of its limit, and a full
+            # 128-request waiting room refused bursts with 429 that would have
+            # cleared in tens of milliseconds. A day later a bindings-heavy
+            # benchmark took no major faults, so that work was not waiting on the
+            # disk either. 64 units let 16 heavy requests run at once instead of 8,
+            # and 1,024 places absorb a burst; the 500 ms wait still bounds how
+            # long any request stays. A waiting bindings request holds its parsed
+            # bindings, which grow with its body (1 MiB at the cap, tens of KB in
+            # practice), so a full room holds on the order of 1 GiB at worst, and
+            # takes it from the page cache. After a change, compare `work_ms` with
+            # `cpu_ms` and `major_faults` in the access log: work time that climbs
+            # with concurrency while `cpu_ms` stays flat is waiting, on the disk if
+            # `major_faults` climbs too, and the step was too far.
+            - --max-concurrent-work=64
+            - --max-queued-requests=1024
           ports:
             - name: http
               containerPort: 8080
@@ -103,7 +121,12 @@ spec:
           # Autopilot enforces that anyway; raise both together, keeping memory
           # within 6.5 GiB per vCPU or Autopilot bumps the CPU to match. That
           # ratio is a whole-pod rule, so it is the sum of both containers that
-          # has to stay inside it: 2.25 vCPU to 8.25 GiB here.
+          # has to stay inside it: 2.25 vCPU to 8.25 GiB here. A full page cache is
+          # not by itself a reason to raise memory: on 2026-10-01 the cache sat at
+          # its 7 GiB ceiling, yet a 13-query bindings-heavy benchmark took no major
+          # faults at 8 GiB, and 14 GiB changed nothing. Raise it when
+          # kubernetes.io/container/memory/page_fault_count (fault_type major) shows
+          # this container waiting on the disk under real traffic.
           resources:
             requests:
               cpu: "2"
