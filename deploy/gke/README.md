@@ -198,9 +198,15 @@ is still missing and does not restart.
   rest one each, as does every chunk a download reads, so at the defaults (32
   units, weight 4) as few as 8 run at once across all clients; the rest wait, and
   a full waiting room or an expired wait answers 429. Size them by the access
-  log's `queue_ms`, `work_ms`, `cpu_ms`, and `major_faults`: refusals while work
-  stays short mean the gate, not the pod, is the limit, and `work_ms` well above
-  `cpu_ms` means the work is waiting rather than computing.
+  log's `queue_ms`, `work_ms`, `cpu_ms`, and `major_faults` on records other than
+  `operation = "export"`: refusals while work stays short mean the gate, not the
+  pod, is the limit, and `work_ms` well above `cpu_ms` means the work is waiting
+  rather than computing. A download's `queue_ms` sums its chunks' waits, which
+  take no waiting-room place and never time out, so it is not a query's wait.
+- Shutdown: `--shutdown-timeout-ms` (20 s by default) is how long a rollout lets
+  open connections finish before the server closes them and exits. A download's
+  access record is written when its transfer ends, so keep this under the pod's
+  30 s termination grace period: a server killed first loses those records.
 - Sync cadence: `SYNC_INTERVAL` on the sidecar, seconds between passes.
 - Sync transfer shape: `NUMWORKERS`, `CONCURRENCY`, `PART_SIZE_MIB`. Their
   product is the sidecar's buffer high-water mark, so raise them and its memory

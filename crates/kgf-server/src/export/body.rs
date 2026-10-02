@@ -18,14 +18,13 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
 
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use tokio::task::JoinHandle;
 
 use super::coding::ContentCoding;
-use crate::access::Ledger;
+use crate::access::{Ledger, Transfer, TransferEnd, Wait};
 use crate::admission::{AdmissionGuard, DownloadSlot, WorkClass};
 use crate::envelope::Problem;
 
@@ -85,16 +84,26 @@ impl Segment {
 /// cancelling and retrying could put more reads and compressions in flight
 /// than the gate admits. Travelling with the producer, the slot is released
 /// with the body when no chunk is in progress, and with the task otherwise.
+///
+/// The request's access record waits for the body: dropping it reports how the
+/// transfer ended and how many bytes were handed to the connection.
 pub(crate) struct Download {
     state: State,
     /// Bytes still to send, when the response declared a length.
     remaining: Option<u64>,
+    /// Bytes handed to the connection so far.
+    sent: u64,
+    /// How the body ended, once it has. A body dropped without one was cut short.
+    end: Option<TransferEnd>,
+    /// The request's record, told how the transfer ended when the body drops.
+    ledger: Option<Arc<Ledger>>,
 }
 
 enum State {
     Ready(Box<Producer>),
-    /// Waiting, since the instant given, for the work gate to admit the next chunk.
-    Admitting(Box<Producer>, Admission, Instant),
+    /// Waiting for the work gate to admit the next chunk; the wait is charged to
+    /// the request when it ends, however it ends.
+    Admitting(Box<Producer>, Admission, Option<Wait>),
     Producing(JoinHandle<(Box<Producer>, io::Result<Option<Bytes>>)>),
     Done,
 }
@@ -120,10 +129,39 @@ impl Download {
                 segments: segments.into(),
                 encoder,
                 slot,
-                ledger,
+                ledger: ledger.clone(),
             })),
             remaining,
+            sent: 0,
+            end: None,
+            ledger,
         })
+    }
+
+    /// End the body with `error`, which hyper turns into an aborted connection:
+    /// the client sees a short transfer it can resume, never wrong bytes.
+    fn fail(&mut self, error: io::Error) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        self.end = Some(TransferEnd::Failed);
+        Poll::Ready(Some(Err(error)))
+    }
+}
+
+impl Drop for Download {
+    fn drop(&mut self) {
+        let Some(ledger) = &self.ledger else {
+            return;
+        };
+        // Every declared byte handed over is a complete transfer, whether or not
+        // hyper asked for the end of the body before letting it go.
+        let end = self.end.unwrap_or(if self.remaining == Some(0) {
+            TransferEnd::Complete
+        } else {
+            TransferEnd::Interrupted
+        });
+        ledger.transferred(Transfer {
+            bytes: self.sent,
+            end,
+        });
     }
 }
 
@@ -141,7 +179,11 @@ impl Body for Download {
                 State::Done => return Poll::Ready(None),
                 State::Ready(producer) => {
                     let admission = Box::pin(producer.slot.chunk());
-                    this.state = State::Admitting(producer, admission, Instant::now());
+                    let waiting = producer
+                        .ledger
+                        .as_ref()
+                        .map(|ledger| ledger.wait(WorkClass::Ordinary));
+                    this.state = State::Admitting(producer, admission, waiting);
                 }
                 State::Admitting(producer, mut admission, waiting) => {
                     match admission.as_mut().poll(cx) {
@@ -150,24 +192,22 @@ impl Body for Download {
                             return Poll::Pending;
                         }
                         Poll::Ready(Ok(admitted)) => {
-                            if let Some(ledger) = &producer.ledger {
-                                ledger.queued(WorkClass::Ordinary, waiting.elapsed());
-                            }
+                            drop(waiting);
+                            let ledger = producer.ledger.clone();
                             this.state = State::Producing(tokio::task::spawn_blocking(move || {
                                 // Held for the chunk's work and no longer, inside
                                 // the task for the reason the slot is: the work
                                 // outlives a body dropped while it runs.
                                 let _admitted = admitted;
-                                let mut producer = producer;
-                                let chunk = match producer.ledger.clone() {
-                                    Some(ledger) => ledger.run(|| producer.next_chunk()),
-                                    None => producer.next_chunk(),
-                                };
-                                (producer, chunk)
+                                Ledger::charge(ledger, move || {
+                                    let mut producer = producer;
+                                    let chunk = producer.next_chunk();
+                                    (producer, chunk)
+                                })
                             }));
                         }
                         Poll::Ready(Err(problem)) => {
-                            return Poll::Ready(Some(Err(io::Error::other(problem.to_string()))));
+                            return this.fail(io::Error::other(problem.to_string()));
                         }
                     }
                 }
@@ -178,28 +218,28 @@ impl Body for Download {
                     }
                     Poll::Ready(Ok((producer, Ok(Some(chunk))))) => {
                         this.state = State::Ready(producer);
+                        let length = chunk.len() as u64;
                         if let Some(remaining) = &mut this.remaining {
-                            *remaining = remaining.saturating_sub(chunk.len() as u64);
+                            *remaining = remaining.saturating_sub(length);
                         }
+                        this.sent = this.sent.saturating_add(length);
                         return Poll::Ready(Some(Ok(Frame::data(chunk))));
                     }
-                    Poll::Ready(Ok((_, Ok(None)))) => return Poll::Ready(None),
-                    // Either failure ends the body with an error, which hyper
-                    // turns into an aborted connection: the client sees a
-                    // short transfer it can resume, never wrong bytes.
+                    Poll::Ready(Ok((_, Ok(None)))) => {
+                        this.end = Some(TransferEnd::Complete);
+                        return Poll::Ready(None);
+                    }
                     Poll::Ready(Ok((producer, Err(error)))) => {
                         tracing::error!(
                             artifact = producer.source.name(),
                             %error,
                             "a download failed while producing its body",
                         );
-                        return Poll::Ready(Some(Err(error)));
+                        return this.fail(error);
                     }
                     Poll::Ready(Err(error)) => {
                         tracing::error!(%error, "a download's producer panicked");
-                        return Poll::Ready(Some(Err(io::Error::other(
-                            "the download's producer failed",
-                        ))));
+                        return this.fail(io::Error::other("the download's producer failed"));
                     }
                 },
             }

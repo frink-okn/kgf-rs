@@ -2071,23 +2071,21 @@ fn a_download_is_recorded_by_its_shape() {
     deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
     let log = RecordingAccessLog::default();
     let server = deployment.serve_with_access(Arc::new(log.clone()), false);
-    server
-        .request(
-            "GET",
-            "/tox/v/v1/export/data.hdt",
-            &[
-                ("range", "bytes=0-9, 20-29"),
-                ("accept-encoding", "zstd, identity;q=0.5"),
-            ],
-        )
-        .assert_status(206);
-    server
-        .request(
-            "GET",
-            "/tox/v/v1/export/data.hdt",
-            &[("accept-encoding", "zstd, identity;q=0.5")],
-        )
-        .assert_status(200);
+    let ranges = server.request(
+        "GET",
+        "/tox/v/v1/export/data.hdt",
+        &[
+            ("range", "bytes=0-9, 20-29"),
+            ("accept-encoding", "zstd, identity;q=0.5"),
+        ],
+    );
+    ranges.assert_status(206);
+    let coded = server.request(
+        "GET",
+        "/tox/v/v1/export/data.hdt",
+        &[("accept-encoding", "zstd, identity;q=0.5")],
+    );
+    coded.assert_status(200);
 
     // A download's record is written when its body is done with, which can be
     // just after the client has read the last byte.
@@ -2100,11 +2098,14 @@ fn a_download_is_recorded_by_its_shape() {
         .map(|record| serde_json::to_value(record).unwrap())
         .collect();
     assert_eq!(exports.len(), 2, "{records:?}");
-    // The open and every chunk read, each through the work gate.
-    for export in &exports {
+    // The open and every chunk read, each through the work gate; and the bytes
+    // the body handed over, which for a compressed body no header declared.
+    for (export, response) in exports.iter().zip([&ranges, &coded]) {
         assert!(export["queue_ms"].is_u64(), "{export}");
         assert!(export["work_ms"].is_u64(), "{export}");
         assert_eq!(export["cpu_ms"].is_u64(), cfg!(target_os = "linux"));
+        assert_eq!(export["transfer"], "complete", "{export}");
+        assert_eq!(export["bytes_out"], response.content().len(), "{export}");
     }
     assert_eq!(exports[0]["operation"], "export");
     assert_eq!(exports[0]["status"], 206);
@@ -2247,6 +2248,62 @@ fn download_slots_are_counted_per_client_and_given_back_when_a_client_leaves() {
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+/// A download's record is written when its transfer ends, so a client that leaves
+/// partway is recorded with the bytes the server handed over rather than the length
+/// its headers declared, and with the chunk reads it caused.
+#[test]
+fn a_download_left_partway_is_recorded_with_what_was_sent() {
+    // Larger than every buffer between the two ends of a loopback connection, as
+    // for the slot test above, so a client that never reads leaves most unsent.
+    let deployment = Deployment::new();
+    deployment.publish(
+        "big",
+        "v1",
+        &incompressible_nt(32 << 20),
+        "2026-01-09T09:00:00Z",
+    );
+    let log = RecordingAccessLog::default();
+    let server = deployment.serve_with_access(Arc::new(log.clone()), false);
+    let target = "/big/v/v1/export/data.hdt";
+    let export_route = Some("/{dataset}/v/{version}/export/{artifact}");
+    let length: u64 = server
+        .request("HEAD", target, &[])
+        .header("content-length")
+        .expect("an identity download declares its length")
+        .parse()
+        .unwrap();
+
+    let stalled = server.stall("GET", target, &[]);
+    assert!(
+        stalled.status_line.contains(" 200 "),
+        "{}",
+        stalled.status_line
+    );
+    // Its headers have gone, but the transfer has not ended, so neither has the
+    // request.
+    assert!(
+        !log.records()
+            .iter()
+            .any(|record| record.method == "GET" && record.route.as_deref() == export_route)
+    );
+
+    drop(stalled);
+    let records = log.wait_for(2);
+    let record = records
+        .iter()
+        .find(|record| record.method == "GET" && record.route.as_deref() == export_route)
+        .unwrap_or_else(|| panic!("no record for the download: {records:?}"));
+    assert_eq!(record.status, Some(200));
+    assert_eq!(
+        record.transfer,
+        Some(kgf_server::access::TransferEnd::Interrupted)
+    );
+    let sent = record.bytes_out.expect("a download counts what it sent");
+    assert!(0 < sent && sent < length, "{sent} of {length}");
+    assert!(record.queue_ms.is_some());
+    assert!(record.work_ms.is_some());
 }
 
 /// N-Triples of about `bytes` whose literals share no prefixes, so the HDT
@@ -3234,6 +3291,151 @@ fn the_serving_line_is_plain_text_when_stderr_is_not_a_terminal() {
         runtime: None,
     };
     server.get("/").assert_status(200);
+}
+
+/// A download still open at shutdown is closed once the shutdown timeout runs
+/// out, so the process exits on its own rather than waiting to be killed, and the
+/// download's record, written only when its transfer ends, is in the log it
+/// leaves behind.
+#[cfg(unix)]
+#[test]
+fn shutdown_closes_an_open_download_and_writes_its_record() {
+    let deployment = Deployment::new();
+    deployment.publish(
+        "big",
+        "v1",
+        &incompressible_nt(32 << 20),
+        "2026-01-09T09:00:00Z",
+    );
+    let mut serve = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_kgf"))
+            .args(["serve", "--bundle-root"])
+            .arg(deployment.root_path())
+            .args(["--bind", "127.0.0.1:0", "--shutdown-timeout-ms", "200"])
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn kgf serve"),
+    );
+    let mut stderr = BufReader::new(serve.0.stderr.take().expect("piped stderr")).lines();
+    let serving = stderr
+        .by_ref()
+        .map(|line| line.expect("read kgf serve's stderr"))
+        .find(|line| line.contains("serving"))
+        .expect("kgf serve exited before serving");
+    // Drained beside the test, so what the shutdown says can be shown if it fails.
+    let diagnostics =
+        std::thread::spawn(move || stderr.map_while(Result::ok).collect::<Vec<_>>().join("\n"));
+    let address: SocketAddr = serving
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("address="))
+        .expect("an address field")
+        .parse()
+        .expect("a socket address");
+    let server = Server {
+        address,
+        stop: None,
+        runtime: None,
+    };
+
+    // A client that never reads, held open through the shutdown.
+    let stalled = server.stall("GET", "/big/v/v1/export/data.hdt", &[]);
+    let terminated = Command::new("kill")
+        .args(["-TERM", &serve.0.id().to_string()])
+        .status()
+        .expect("run kill");
+    assert!(terminated.success());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let exited = loop {
+        if let Some(status) = serve.0.try_wait().expect("poll kgf serve") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = serve.0.kill();
+            panic!(
+                "kgf serve was still waiting on the open download:\n{}",
+                diagnostics.join().unwrap_or_default()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(exited.success(), "{exited}");
+    drop(stalled);
+
+    let mut stdout = String::new();
+    serve
+        .0
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut stdout)
+        .expect("read the access log");
+    let download = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a JSON record"))
+        .find(|record| record["operation"] == "export")
+        .unwrap_or_else(|| panic!("no record for the download:\n{stdout}"));
+    assert_eq!(download["status"], 200);
+    assert_eq!(download["transfer"], "interrupted");
+}
+
+/// Shutdown begins when its trigger ends, whether the trigger fires or dies. axum
+/// treats a trigger that panics as the signal and stops accepting; the shutdown
+/// timeout has to agree, or a request left open holds the server up for good.
+#[test]
+fn a_shutdown_trigger_that_panics_still_starts_the_shutdown_timeout() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    let mut config = kgf_server::Config::new(
+        kgf::serve::published_root(deployment.root_path()).expect("a published root"),
+        "127.0.0.1:0".parse().unwrap(),
+    );
+    config.shutdown_timeout = std::time::Duration::from_millis(100);
+    let service = Arc::new(Service::build(config).expect("a servable deployment"));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .expect("bind");
+    let address = listener.local_addr().expect("local address");
+    let (fire, fired) = tokio::sync::oneshot::channel::<()>();
+    let serving = runtime.spawn(kgf_server::serve_on(listener, service, async move {
+        let _ = fired.await;
+        panic!("the shutdown trigger failed");
+    }));
+
+    // A request left open: its body promised and never sent in full. A request
+    // answered first on the same connection proves the server is serving it.
+    let mut open = TcpStream::connect(address).expect("connect");
+    write!(open, "GET /healthz HTTP/1.1\r\nHost: {address}\r\n\r\n").expect("write");
+    let mut answered = Vec::new();
+    let mut byte = [0u8];
+    while !answered.ends_with(b"ok\n") {
+        open.read_exact(&mut byte).expect("the probe's answer");
+        answered.push(byte[0]);
+    }
+    write!(
+        open,
+        "POST /tox/v/v1/fragment HTTP/1.1\r\nHost: {address}\r\n\
+         Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{{"
+    )
+    .expect("write");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    fire.send(()).expect("the server is waiting on its trigger");
+    let stopped = runtime
+        .block_on(async { tokio::time::timeout(std::time::Duration::from_secs(5), serving).await });
+    assert!(
+        stopped.is_ok(),
+        "the open request held the server after its shutdown trigger failed"
+    );
+    drop(open);
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
 }
 
 #[test]

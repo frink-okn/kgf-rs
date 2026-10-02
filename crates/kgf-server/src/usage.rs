@@ -92,26 +92,77 @@ impl Reading {
 
 #[cfg(target_os = "linux")]
 mod platform {
+    use std::fmt;
+    use std::sync::Once;
     use std::time::Duration;
 
+    use nix::errno::Errno;
     use nix::sys::resource::{UsageWho, getrusage};
     use nix::sys::time::TimeVal;
 
     use super::Reading;
 
-    /// The calling thread's counters, or `None` if the reading failed.
+    /// The calling thread's counters, or `None` if they cannot be read.
+    ///
+    /// A failure here is not per request: a sandbox that refuses the call refuses
+    /// it every time, and every record loses its usage. So it is reported, once,
+    /// rather than leaving `null` fields indistinguishable from an unsupported
+    /// platform.
     pub(super) fn read() -> Option<Reading> {
-        let usage = getrusage(UsageWho::RUSAGE_THREAD).ok()?;
-        Some(Reading {
-            major_faults: u64::try_from(usage.major_page_faults()).ok()?,
-            minor_faults: u64::try_from(usage.minor_page_faults()).ok()?,
-            cpu: duration(usage.user_time())?.checked_add(duration(usage.system_time())?)?,
+        static REPORTED: Once = Once::new();
+        reading()
+            .inspect_err(|error| {
+                REPORTED.call_once(|| {
+                    tracing::warn!(
+                        %error,
+                        "per-thread resource usage cannot be read; access records will carry \
+                         no cpu_ms or page-fault counts",
+                    );
+                });
+            })
+            .ok()
+    }
+
+    fn reading() -> Result<Reading, Unreadable> {
+        let usage = getrusage(UsageWho::RUSAGE_THREAD).map_err(Unreadable::Refused)?;
+        let count = |value| u64::try_from(value).map_err(|_| Unreadable::OutOfRange);
+        Ok(Reading {
+            major_faults: count(usage.major_page_faults())?,
+            minor_faults: count(usage.minor_page_faults())?,
+            cpu: duration(usage.user_time())?
+                .checked_add(duration(usage.system_time())?)
+                .ok_or(Unreadable::OutOfRange)?,
         })
     }
 
-    fn duration(time: TimeVal) -> Option<Duration> {
-        let seconds = Duration::from_secs(u64::try_from(time.tv_sec()).ok()?);
-        seconds.checked_add(Duration::from_micros(u64::try_from(time.tv_usec()).ok()?))
+    fn duration(time: TimeVal) -> Result<Duration, Unreadable> {
+        let seconds = u64::try_from(time.tv_sec()).map_err(|_| Unreadable::OutOfRange)?;
+        let micros = u64::try_from(time.tv_usec()).map_err(|_| Unreadable::OutOfRange)?;
+        Duration::from_secs(seconds)
+            .checked_add(Duration::from_micros(micros))
+            .ok_or(Unreadable::OutOfRange)
+    }
+
+    /// Why the counters could not be read.
+    #[derive(Debug)]
+    enum Unreadable {
+        /// The kernel refused `getrusage`.
+        Refused(Errno),
+        /// The kernel reported a negative or unrepresentable value.
+        OutOfRange,
+    }
+
+    impl fmt::Display for Unreadable {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Refused(errno) => {
+                    write!(formatter, "getrusage(RUSAGE_THREAD) failed: {errno}")
+                }
+                Self::OutOfRange => {
+                    formatter.write_str("getrusage(RUSAGE_THREAD) reported a value out of range")
+                }
+            }
+        }
     }
 }
 

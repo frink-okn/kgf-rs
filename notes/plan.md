@@ -1601,6 +1601,15 @@ the first version had. Work a disconnected client left running is now recorded w
 ends, rather than lost. A download's record now counts every chunk it read through the
 work gate, not just the open, and is written when the transfer ends.
 
+A review of the ledger (2026-10-02) made waits for admission a guard charged however
+they end, so a client giving up in the waiting room still leaves `queue_ms`; routed all
+charged work through `Ledger::charge`, which keeps a sink from running while a thread
+unwinds; had a download report `bytes_out` as sent and a `transfer` outcome
+(`complete`, `interrupted`, `failed`); and bounded shutdown with `--shutdown-timeout-ms`
+(20 s), after which open connections are closed so their records are written before the
+process exits rather than lost when it is killed. `notes/request-logging.md` §3.3 has
+the detail.
+
 ### 23. `--public-base` — serving under a path prefix ✅
 
 FRINK mounts every service under a path on one shared hostname, with the gateway
@@ -2525,11 +2534,11 @@ fixed, two recorded below as open.
   sooner; it needs a listener wrapping the socket, and `axum` implements its
   client-address extractor only for its own listener types, so the access log would need
   a connect-info type of its own.
-- *Whether a transfer finished.* A download's access record is now written when its
-  body is done with (unit 22's ledger), and counts every chunk's work, but `bytes_out`
-  is still the declared length, so it cannot say whether the transfer finished or how
-  much of it was sent. The body knows both when it drops, so reporting them is now a
-  small change.
+- *Whether a transfer finished.* Resolved by unit 22's ledger: a download's record is
+  written when its body drops, with `bytes_out` as sent and `transfer` saying whether
+  it was `complete`, `interrupted`, or `failed`. What it still cannot say is how much
+  the client *received*: bytes handed to the connection may sit in socket buffers when
+  it closes.
 - *Trusting `X-Forwarded-For` by position.* With `--trusted-proxies` set, the client is
   read from the chain whatever the peer, so a caller that reaches the pod without the
   gateway — which, behind a ClusterIP Service, means from inside the cluster — can be

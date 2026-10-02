@@ -79,10 +79,11 @@ the line is also readable by eye.
 | `status` | u16, or `null` when the client went away before a response existed | response, §3.1 | shape |
 | `code` | `ErrorCode::as_str()` or `null` | §3.2 | shape |
 | `work_class` | `ordinary` / `heavy` / `null` (no store work) | `GetRequest::work_class` | shape |
-| `queue_ms`, `work_ms`, `total_ms` | integers; the first two `null` without admission or work | summed over every admission and run charged to the request's ledger — a download's open and each chunk — §3.3 | shape |
+| `queue_ms`, `work_ms`, `total_ms` | integers; the first two `null` without admission or work | summed over every admission and run charged to the request's ledger — a download's open and each chunk — §3.3. A wait counts however it ended, including a client giving up in it; a chunk's wait holds no waiting-room place and has no deadline, so filter out `export` to read query queueing | shape |
 | `cpu_ms`, `major_faults`, `minor_faults` | integers or `null` | the worker threads' CPU time and fault counters across the same work, §3.3; `null` without work, and off Linux | shape |
 | `waiting` | requests in the admission waiting room at entry | §9 | shape |
-| `bytes_in`, `bytes_out` | integers or `null` | `bytes_in` is what a body handler read, never a declared `Content-Length`; `bytes_out` is the response body's exact size hint | shape |
+| `bytes_in`, `bytes_out` | integers or `null` | `bytes_in` is what a body handler read, never a declared `Content-Length`; `bytes_out` is, for a download, the bytes its body handed to the connection, and otherwise the response body's exact size hint | shape |
+| `transfer` | `complete` / `interrupted` / `failed` or `null` | how a download's streamed body ended; `null` for a body sent whole. `failed` makes the record's `severity` `ERROR` whatever the status | shape |
 | `complete`, `truncation_reason` | bool, token or `null` | `Rendered.completeness` | shape |
 | `rows` | integer or `null` | `Rendered.rows` (new, §3.4) | shape |
 | `cardinality`, `exact` | integer or `null`, bool | the answer's `Cardinality` | shape |
@@ -228,6 +229,32 @@ Two plumbing changes make that possible:
   cover the transfer. The middleware runs the handler inside a `tokio::task_local!`
   scope holding the ledger, which is how `blocking` and the export handler find it
   without every handler passing it along.
+
+  A review of that first ledger (2026-10-02) tightened four edges:
+  - *Waits are charged however they end.* A wait for admission is a guard,
+    `Ledger::wait`, charged when it drops. A client that gives up in the waiting room
+    is cancelled inside the wait, and only a drop sees that; those waits are the
+    queue pressure a burst is made of, so its record has `queue_ms` and a
+    `work_class` rather than neither. A download's chunk waits use the same guard.
+  - *The sink never runs while a thread unwinds.* `Ledger::charge` is the one way
+    work is run against a ledger. It catches a panic in the work, lets the ledger go,
+    and resumes the panic, so a record written because the client had already left is
+    written outside the unwind, where a sink that panicked would abort the process.
+  - *A download says how it ended.* Its body reports `bytes_out`, what it handed to
+    the connection, and `transfer`: `complete`, `interrupted` when it was let go of
+    first, or `failed` when the server could not produce the rest, which makes the
+    record an `ERROR`. A record written after the transfer can say this; one written
+    with the headers could not.
+  - *Shutdown is bounded.* A download's record is written when its transfer ends, so
+    a process killed with transfers open loses them. `serve_on` gives open
+    connections `Config::shutdown_timeout` (`--shutdown-timeout-ms`, 20 s by default,
+    inside Kubernetes' 30 s grace period) from the end of the shutdown trigger, then
+    returns, and dropping the runtime closes what is left: their transfers end
+    `interrupted` and their records are written before the process exits. Before, a stalled download
+    held the process until it was killed. The timeout counts from the trigger's end
+    however it ends: axum takes a trigger that panics as the signal too, so a timeout
+    that waited only for one that fired left an open connection holding the server
+    for good.
 
   Only Linux is read, the platform the server is deployed and tested on; FreeBSD and
   OpenBSD count per thread too but are untested. Elsewhere the usage fields are `null`
