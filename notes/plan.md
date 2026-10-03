@@ -1645,7 +1645,7 @@ representation, loses `BoundTerm::parse_fragment`, GET `?name` variables and GET
 `values=`, and its RDF representations carry data only.
 
 Why, in one paragraph: the public deployment's Comunica evaluation
-(`../kgf-sparql/docs/public-deployment-comunica-evaluation.md`) found that the
+(`notes/public-deployment-comunica-evaluation.md`) found that the
 representation-selected fallback of question 44 accepts bare IRIs but not the bare
 datatype IRI inside a typed literal that the TPF specification prescribes and Comunica
 sends, which 400s and kills the client process on three corpus tasks; that a `values=`
@@ -1661,7 +1661,7 @@ exactly three mappings, `hydra:variableRepresentation`, `hydra:itemsPerPage`, an
 `void:inDataset` link; the route, `Operation::Tpf`, `AccessOperation::Tpf`, descriptor
 links; stripping `/fragment`; the Comunica conformance harness retargeted to `/tpf`
 with typed-literal, skolem-subject, and no-control-leak assertions; the
-`../kgf-sparql` corpus rerun as the external gate; and the documents. Outbound spec
+`../kgf-sparql-bench` corpus rerun as the external gate; and the documents. Outbound spec
 edits are question 66.
 
 **What landed.** `/tpf` is a GET-only operation with its own request and cursor
@@ -1693,7 +1693,7 @@ consults them.
 *Verified by* the parser's specification-example tests, `oxrdfio` round trips of every
 format including JSON-LD's named graph, real-listener tests of the document, route
 separation, cursor separation, and `/fragment` refusals, plus the pinned Comunica suite
-against `/tpf`. The `../kgf-sparql` corpus rerun remains the external deployment gate;
+against `/tpf`. The `../kgf-sparql-bench` corpus rerun remains the external deployment gate;
 it is not part of this repository's local test suite.
 
 ### What the implementation still is not
@@ -3479,7 +3479,7 @@ following the code.
     `rdfs:label` are valid absolute IRIs by syntax and are taken literally: without a
     prefix map, `ExplicitRepresentation` cannot distinguish them from custom URI
     schemes, and `/tpf` deliberately performs no prefix expansion. Found by the
-    public-deployment evaluation in `../kgf-sparql` and implementation review.
+    public-deployment evaluation (`notes/public-deployment-comunica-evaluation.md`) and implementation review.
 67. **§3.4.8's `terms` capability covers two operations, and only one of them can be
     declared from a bundle's bytes.** The prefix scan and its count need nothing beyond
     the sorted dictionary every bundle carries. Key resolution needs the derived
