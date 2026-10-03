@@ -27,6 +27,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use kgf_server::{AccessLog, Admission, Config, PublicBase, StdoutAccessLog};
@@ -83,6 +84,15 @@ pub struct Args {
     /// Reverse proxies in front of this server that append to X-Forwarded-For; 0 ignores the header.
     #[arg(long, default_value_t = 0)]
     pub trusted_proxies: u8,
+
+    /// Milliseconds after SIGTERM that open connections may finish before they are closed. Keep
+    /// it below the orchestrator's grace period, so open downloads' access records are written.
+    #[arg(long, default_value_t = default_shutdown_timeout_ms())]
+    pub shutdown_timeout_ms: u64,
+}
+
+fn default_shutdown_timeout_ms() -> u64 {
+    u64::try_from(kgf_server::DEFAULT_SHUTDOWN_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Available destinations for structured access records.
@@ -121,6 +131,7 @@ pub fn run(args: Args) -> Result<()> {
     config.access_log = args.access_log.sink()?;
     config.log_raw = args.log_raw;
     config.trusted_proxies = args.trusted_proxies;
+    config.shutdown_timeout = Duration::from_millis(args.shutdown_timeout_ms);
 
     // A current-thread runtime would serialize every request behind the one
     // that is faulting a page. Store work uses this runtime's blocking pool.

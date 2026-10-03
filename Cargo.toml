@@ -39,6 +39,11 @@ oxrdf = "0.3"
 oxrdfio = "0.2"
 spargebra = "0.4"
 tempfile = "3"
+# Per-thread resource usage (CPU time and page faults) for the access log, read
+# through a safe wrapper because the server crates deny `unsafe`. Used on Linux
+# only, where the server is deployed and tested; FreeBSD and OpenBSD keep the same
+# per-thread counters but are untested, and macOS keeps no per-thread fault counts.
+nix = { version = "0.30", default-features = false, features = ["resource"] }
 
 # The HTTP stack supports QUERY: hyper parses the extension method and axum
 # routes it through
