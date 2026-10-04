@@ -180,12 +180,7 @@ impl SkolemScope {
         if self.suffix(term).is_some() {
             return term.strip_prefix(&self.iri_prefix);
         }
-        if let Some((prefix, _)) = &self.propositions
-            && let Some(local) = term.strip_prefix(prefix.as_str())
-            && split_suffix(local).is_some()
-        {
-            return Some(local);
-        }
+
         self.graph_id(term)?;
         term.strip_prefix(self.graph_prefix.as_deref()?)
     }

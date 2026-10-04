@@ -645,22 +645,6 @@ impl<'a> Term<'a> {
         }
     }
 
-    /// Read a term as this API publishes it: a dictionary spelling, except
-    /// that a triple term is published decoded, in request syntax with every
-    /// IRI bracketed — so a published term is one or the other by its first
-    /// three bytes, which no dictionary IRI can begin with.
-    ///
-    /// Infallible because the published form of a triple term is written by
-    /// this crate from terms the dictionary holds: IRIs bracketed, blank nodes
-    /// as their scoped IRIs, literals in their dictionary spelling.
-    pub fn from_published(text: &'a str) -> Self {
-        if text.starts_with("<<(") {
-            return Term::parse(text, &PrefixMap::default())
-                .expect("a published triple term is request syntax with full IRIs");
-        }
-        Term::from_dictionary(text)
-    }
-
     /// Spell this term the way the dictionary does, for [`Dictionary::locate`].
     ///
     /// Borrows for an IRI, which is the overwhelmingly common case on a lookup
@@ -923,10 +907,19 @@ fn parse_literal_syntax<'a>(
         }
         // RDF 1.2 writes a base direction after the tag, `@ar--rtl`, and the
         // dictionary stores it that way; the tag itself is validated alone.
-        let tag = language
-            .strip_suffix("--ltr")
-            .or_else(|| language.strip_suffix("--rtl"))
-            .unwrap_or(language);
+        // Case-insensitively, like the tag it follows.
+        let tag = match language.len().checked_sub(5) {
+            Some(cut)
+                if language.is_char_boundary(cut)
+                    && matches!(
+                        language[cut..].to_ascii_lowercase().as_str(),
+                        "--ltr" | "--rtl"
+                    ) =>
+            {
+                &language[..cut]
+            }
+            _ => language,
+        };
         RdfLiteral::new_language_tagged_literal("", tag).map_err(|error| {
             TermSyntaxError::InvalidLanguageTag {
                 token: text.to_owned(),
@@ -1008,6 +1001,14 @@ fn parse_triple_syntax<'a>(
     }
     if subject.starts_with('"') || subject.starts_with("<<") {
         return Err(malformed("its subject must be an IRI or a blank node"));
+    }
+    // An object that is not a literal or a triple term is one token, like
+    // the subject and predicate; anything after it is not part of the term.
+    if !object.starts_with('"')
+        && !object.starts_with("<<")
+        && split_token(object).is_some_and(|(_, rest)| !rest.trim().is_empty())
+    {
+        return Err(malformed("it has something after its object"));
     }
     let subject = Term::parse_nested(subject, prefixes, depth)?;
     let predicate = parse_iri_syntax(predicate, prefixes)?;
@@ -2074,7 +2075,6 @@ mod tests {
         assert_eq!(json["type"], "triple");
         assert_eq!(json["value"]["predicate"]["type"], "iri");
         assert_eq!(Term::from_json(&json).unwrap(), parsed[0]);
-        assert_eq!(Term::from_published(&request), parsed[0]);
 
         // Nested, with a directional literal inside.
         let nested = Term::parse(

@@ -194,6 +194,74 @@ fn triple_terms_are_published_decoded_and_found_by_their_content() {
     );
 }
 
+/// What a lenient ingest stores is published whatever it is: a language tag
+/// no validator passes, or a datatype IRI holding a quote. And a blank node inside a triple term is found
+/// again by the IRI it was published under, whichever role the data holds it
+/// in, or when only the propositions HDT holds it.
+#[test]
+fn triple_terms_survive_lenient_content_and_name_blank_nodes_in_any_role() {
+    let source = concat!(
+        "<http://example.org/e1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+        "<<( <http://example.org/s> <http://example.org/p> \"x\"@zh-classical )>> .\n",
+        "<http://example.org/e2> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+        "<<( <http://example.org/s> <http://example.org/p> \"y\"^^<http://example.org/d\\u0022t> )>> .\n",
+        // `_:k` is only an object in the data, and a subject in a triple term.
+        "<http://example.org/x> <http://example.org/p> _:k .\n",
+        "<http://example.org/e3> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+        "<<( _:k <http://example.org/q> <http://example.org/o> )>> .\n",
+        // `_:m` occurs only inside an unasserted triple term.
+        "<http://example.org/e4> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+        "<<( _:m <http://example.org/q> <http://example.org/o> )>> .\n",
+    );
+    let served = Served::from_fixture(Fixture::build(source));
+    let store = served.store();
+    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+
+    // Every row publishes, in every representation.
+    let answer = served.fragment(&store, &format!("p={reifies}&limit=100"));
+    assert_eq!(answer["rows"].as_array().unwrap().len(), 4, "{answer}");
+    let all = served.fragment(&store, "limit=100");
+    assert_eq!(all["rows"].as_array().unwrap().len(), 5, "{all}");
+    let page = served.render(&store, "fragment", "limit=100", Representation::Html);
+    assert!(page.contains("zh-classical"), "{page}");
+
+    // Blank nodes inside triple terms resolve by their published IRIs.
+    for reifier in ["e3", "e4"] {
+        let row = answer["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["s"]["value"] == format!("http://example.org/{reifier}"))
+            .unwrap();
+        let blank = row["o"]["value"]["subject"]["value"].as_str().unwrap();
+        assert!(blank.starts_with("urn:fdc:"), "{row}");
+        let found = served.fragment(
+            &store,
+            &format!("o={}", urlencode(&format!("<<( <{blank}> ex:q ex:o )>>"))),
+        );
+        let subjects: Vec<&str> = found["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["s"]["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            subjects,
+            vec![format!("http://example.org/{reifier}").as_str()],
+            "{blank}"
+        );
+    }
+
+    // A triple term names no graph.
+    let error = served
+        .try_fragment(
+            &store,
+            &format!("g={}", urlencode("<<( ex:s ex:p ex:o )>>")),
+        )
+        .unwrap_err();
+    assert_eq!(error.code().as_str(), "bad_term_syntax");
+}
+
 /// Percent-encode a query value: triple-term syntax carries spaces, quotes
 /// and `#`, which a URL must not carry raw.
 fn urlencode(value: &str) -> String {

@@ -229,13 +229,18 @@ impl BoundTerm {
         let kind = BoundKind::of(&term);
         let dictionary = term.to_dictionary().into_owned();
         let max = limits.budgets.max_term_bytes;
-        if dictionary.len() as u64 > max {
+        // A triple term's dictionary spelling is a fixed-length minted IRI, so
+        // it is weighed by its content instead.
+        let weighed = match &term {
+            Term::Triple(_) => term.to_request().len(),
+            _ => dictionary.len(),
+        };
+        if weighed as u64 > max {
             return Err(Problem::new(
                 ErrorCode::CapExceeded,
                 format!(
-                    "the term in `{parameter}` is {} bytes in canonical form, over this \
-                     server's max_term_bytes of {max}",
-                    dictionary.len()
+                    "the term in `{parameter}` is {weighed} bytes in canonical form, over this \
+                     server's max_term_bytes of {max}"
                 ),
             ));
         }
@@ -1031,13 +1036,18 @@ impl GraphScope {
             });
         }
         let term = parse(text)?;
-        if term.kind == BoundKind::Literal {
+        if matches!(term.kind, BoundKind::Literal | BoundKind::Triple) {
             return Err(Problem::new(
                 ErrorCode::BadTermSyntax,
                 format!(
-                    "`{}` names a graph by IRI, or `*` for every graph; {} is a literal",
+                    "`{}` names a graph by IRI, or `*` for every graph; {} is a {}",
                     parameter.as_str(),
-                    reflected(text)
+                    reflected(text),
+                    if term.kind == BoundKind::Literal {
+                        "literal"
+                    } else {
+                        "triple term"
+                    }
                 ),
             ));
         }

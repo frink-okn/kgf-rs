@@ -579,9 +579,43 @@ impl AbsentTerm {
 #[derive(Debug, Clone)]
 struct RowTerm {
     /// What a response carries, and what its byte accounting weighs.
-    published: Rc<str>,
+    published: Published,
     /// The dictionary spelling, which `locate` matches and labels key on.
     stored: Rc<str>,
+}
+
+/// A term as this API publishes it.
+///
+/// Typed rather than a string because a triple term is published decoded,
+/// as a structure. Reading one back out of a spelling would take a parser
+/// accepting everything a lenient ingest stores — unvalidated IRIs and
+/// language tags among it — which no request grammar is, and a dictionary
+/// string could be mistaken for such a spelling.
+#[derive(Debug, Clone)]
+enum Published {
+    /// A dictionary spelling, a blank node already replaced by its scoped IRI.
+    Text(Rc<str>),
+    /// A triple term, decoded, its blank nodes published.
+    Triple(Rc<Term<'static>>),
+}
+
+impl Published {
+    /// The spelling, unless this is a triple term.
+    fn text(&self) -> Option<&Rc<str>> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Triple(_) => None,
+        }
+    }
+}
+
+impl Serialize for Published {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Text(text) => Term::from_dictionary(text).serialize(serializer),
+            Self::Triple(term) => term.serialize(serializer),
+        }
+    }
 }
 
 /// Terms as this API publishes them, memoized for one request.
@@ -591,12 +625,12 @@ struct RowTerm {
 /// a blank node repeated down a page is formatted and weighed once rather than
 /// once per row — the same reason the cache underneath it exists. There are
 /// two: a blank node becomes its scoped IRI, and a triple-term IRI becomes the
-/// triple term it encodes ([`Term::from_published`]), decoded through the
-/// bundle's triple-term index, nested terms included.
+/// triple term it encodes, decoded through the bundle's triple-term index,
+/// nested terms included.
 struct PublishedTerms<'s> {
     blank_nodes: SkolemScope,
     triple_terms: Option<&'s TripleTerms>,
-    published: HashMap<(Role, u64), (Rc<str>, u64)>,
+    published: HashMap<(Role, u64), (Published, u64)>,
 }
 
 impl<'s> PublishedTerms<'s> {
@@ -620,7 +654,7 @@ impl<'s> PublishedTerms<'s> {
         if let Some((published, serialized)) = self.published.get(&(role, id.0)) {
             return Ok((
                 RowTerm {
-                    published: Rc::clone(published),
+                    published: published.clone(),
                     stored,
                 },
                 *serialized,
@@ -630,18 +664,22 @@ impl<'s> PublishedTerms<'s> {
             Some(terms) if role == Role::Object => terms.decode(id.0),
             _ => None,
         };
-        let published = match decoded {
+        let (published, serialized) = match decoded {
             Some(proposition) => {
-                let mut text = String::new();
-                self.publish_triple(dictionary, proposition, &mut text)?;
-                text
+                let term = Term::Triple(Box::new(self.publish_triple(dictionary, proposition)?));
+                let serialized = serialized_bytes(&term);
+                (Published::Triple(Rc::new(term)), serialized)
             }
             None => match self.blank_nodes.iri(role, id, &stored) {
-                Some(iri) => iri,
+                Some(iri) => {
+                    let iri: Rc<str> = Rc::from(iri.as_str());
+                    let serialized = serialized_bytes(&Term::Iri(Cow::Borrowed(&iri)));
+                    (Published::Text(iri), serialized)
+                }
                 None => {
                     return Ok((
                         RowTerm {
-                            published: Rc::clone(&stored),
+                            published: Published::Text(Rc::clone(&stored)),
                             stored,
                         },
                         serialized,
@@ -649,21 +687,20 @@ impl<'s> PublishedTerms<'s> {
                 }
             },
         };
-        let published: Rc<str> = Rc::from(published.as_str());
-        let serialized = serialized_bytes(&Term::from_published(&published));
         self.published
-            .insert((role, id.0), (Rc::clone(&published), serialized));
+            .insert((role, id.0), (published.clone(), serialized));
         Ok((RowTerm { published, stored }, serialized))
     }
 
-    /// Write a triple term's published spelling: request syntax, IRIs in
-    /// brackets, blank nodes as their scoped IRIs.
+    /// A triple term, built from its stored components: IRIs and literals as
+    /// the dictionary holds them — never re-validated, since lenient ingest
+    /// stores what no strict grammar would accept — and blank nodes as their
+    /// scoped IRIs.
     fn publish_triple(
         &self,
         data: &Dictionary<'_>,
         proposition: Proposition,
-        out: &mut String,
-    ) -> Result<(), DictionaryTermError> {
+    ) -> Result<TripleTerm<'static>, DictionaryTermError> {
         let terms = self
             .triple_terms
             .expect("a proposition was decoded through the index");
@@ -674,34 +711,29 @@ impl<'s> PublishedTerms<'s> {
                 .expect("an unasserted triple term has a propositions HDT"),
         };
         let triple = proposition.triple;
-        out.push_str("<<( ");
-        self.publish_component(
+        let subject = self.publish_component(
             data,
             &dictionary,
             proposition.source,
             Role::Subject,
             triple.subject,
-            out,
         )?;
-        out.push_str(" <");
-        out.push_str(&extract(&dictionary, Role::Predicate, triple.predicate)?);
-        out.push_str("> ");
-        match terms.decode_in(proposition.source, triple.object) {
-            Some(nested) => self.publish_triple(data, nested, out)?,
+        let predicate = extract(&dictionary, Role::Predicate, triple.predicate)?;
+        let object = match terms.decode_in(proposition.source, triple.object) {
+            Some(nested) => Term::Triple(Box::new(self.publish_triple(data, nested)?)),
             None => self.publish_component(
                 data,
                 &dictionary,
                 proposition.source,
                 Role::Object,
                 triple.object,
-                out,
             )?,
-        }
-        out.push_str(" )>>");
-        Ok(())
+        };
+        Ok(TripleTerm::new(subject, predicate, object)
+            .expect("a stored subject is an IRI or a blank node"))
     }
 
-    /// One non-triple component of a triple term, in its published spelling.
+    /// One non-triple component of a triple term, published.
     fn publish_component(
         &self,
         data: &Dictionary<'_>,
@@ -709,18 +741,10 @@ impl<'s> PublishedTerms<'s> {
         source: TripleTermSource,
         role: Role,
         id: u64,
-        out: &mut String,
-    ) -> Result<(), DictionaryTermError> {
+    ) -> Result<Term<'static>, DictionaryTermError> {
         let stored = extract(dictionary, role, id)?;
-        if stored.starts_with('"') {
-            out.push_str(&stored);
-            return Ok(());
-        }
         if !stored.starts_with("_:") {
-            out.push('<');
-            out.push_str(&stored);
-            out.push('>');
-            return Ok(());
+            return Ok(Term::from_dictionary(&stored).into_owned());
         }
         let iri = match source {
             TripleTermSource::Data => self.blank_nodes.iri(role, TermId(id), &stored),
@@ -728,22 +752,22 @@ impl<'s> PublishedTerms<'s> {
             // input's two HDTs alike. Only a node the data lacks is scoped by
             // the propositions HDT.
             TripleTermSource::Propositions => {
-                let in_data = [Role::Subject, Role::Object].into_iter().find_map(|role| {
-                    data.locate(role, stored.as_bytes())
-                        .ok()
-                        .flatten()
-                        .map(|found| (role, found))
-                });
+                let mut in_data = None;
+                for role in [Role::Subject, Role::Object] {
+                    if let Some(found) = data.locate(role, stored.as_bytes())? {
+                        in_data = Some((role, found));
+                        break;
+                    }
+                }
                 match in_data {
                     Some((role, found)) => self.blank_nodes.iri(role, found, &stored),
                     None => self.blank_nodes.propositions_iri(role, TermId(id), &stored),
                 }
             }
         };
-        out.push('<');
-        out.push_str(&iri.expect("a blank node of a dictionary role has a scoped IRI"));
-        out.push('>');
-        Ok(())
+        Ok(Term::Iri(Cow::Owned(iri.expect(
+            "a blank node of a dictionary role has a scoped IRI",
+        ))))
     }
 }
 
@@ -793,7 +817,7 @@ impl Serialize for Row {
             map.serialize_entry(BINDING, &binding)?;
         }
         for (position, term) in &self.cells {
-            map.serialize_entry(position.as_str(), &Term::from_published(&term.published))?;
+            map.serialize_entry(position.as_str(), &term.published)?;
         }
         if let Some(graph) = &self.graph {
             map.serialize_entry(GRAPH, &Term::from_dictionary(graph))?;
@@ -1444,10 +1468,10 @@ impl Answer {
             // these see a named node. That is what keeps the RDF and native
             // representations naming one node the same way.
             let triple = Triple::new(
-                rdf_subject(subject.as_bytes())?,
-                NamedNode::new(predicate.as_ref())
+                rdf_subject(subject.text().as_bytes())?,
+                NamedNode::new(predicate.text())
                     .map_err(|error| unreadable("parsing an RDF predicate IRI", &error))?,
-                rdf_published_object(&object)?,
+                object.object()?,
             );
             let graph_name = match &self.tagging {
                 GraphTagging::Untagged | GraphTagging::Fixed(_) => {
@@ -1729,19 +1753,45 @@ fn rdf_fragment_cell<'a>(
     bound: Option<&'a BoundTerm>,
     row: &'a Row,
     position: Position,
-) -> Option<Cow<'a, str>> {
-    bound
-        .map(|bound| match bound.triple() {
-            // A bound triple term's dictionary spelling is its minted IRI; RDF
-            // carries the triple term itself, spelled as rows publish one.
-            Some(triple) => Cow::Owned(Term::Triple(Box::new(triple.clone())).to_request()),
-            None => Cow::Borrowed(bound.dictionary()),
+) -> Option<FragmentCell<'a>> {
+    bound.map(FragmentCell::Bound).or_else(|| {
+        row.cells.iter().find_map(|(found, term)| {
+            (*found == position).then_some(FragmentCell::Row(&term.published))
         })
-        .or_else(|| {
-            row.cells.iter().find_map(|(found, term)| {
-                (*found == position).then_some(Cow::Borrowed(term.published.as_ref()))
-            })
-        })
+    })
+}
+
+/// Where an RDF fragment row's term comes from: the request, or the row.
+enum FragmentCell<'a> {
+    Bound(&'a BoundTerm),
+    Row(&'a Published),
+}
+
+impl FragmentCell<'_> {
+    /// The spelling of an IRI or blank-node position: the subject or the
+    /// predicate, which are never triple terms.
+    fn text(&self) -> &str {
+        match self {
+            Self::Bound(bound) => bound.dictionary(),
+            Self::Row(published) => published
+                .text()
+                .expect("a subject or predicate is never a triple term"),
+        }
+    }
+
+    /// The object as `oxrdf` holds it. A bound triple term's dictionary
+    /// spelling is its minted IRI, so it is converted from the request's term,
+    /// as a row's is from its decoded one.
+    fn object(&self) -> Result<RdfTerm, Problem> {
+        match self {
+            Self::Bound(bound) => match bound.triple() {
+                Some(triple) => rdf_term(&Term::Triple(Box::new(triple.clone()))),
+                None => rdf_object(bound.dictionary().as_bytes()),
+            },
+            Self::Row(Published::Text(text)) => rdf_object(text.as_bytes()),
+            Self::Row(Published::Triple(term)) => rdf_term(term),
+        }
+    }
 }
 
 fn id_pattern_matches(pattern: IdPattern, triple: IdTriple) -> bool {
@@ -2134,7 +2184,7 @@ impl Renders for SearchAnswer {
 /// come out of the same step that emitted it.
 #[derive(Debug)]
 struct TermRow {
-    published: Rc<str>,
+    published: Published,
     roles: Vec<&'static str>,
     /// Two optional layers, as in a search result: the outer says hydration was
     /// requested, the inner whether this bundle found a label.
@@ -2144,7 +2194,7 @@ struct TermRow {
 
 impl TermRow {
     fn new(
-        published: Rc<str>,
+        published: Published,
         term: u64,
         roles: Vec<&'static str>,
         label: Option<Option<String>>,
@@ -2175,7 +2225,7 @@ impl TermRow {
 impl Serialize for TermRow {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
-        map.serialize_entry("term", &Term::from_published(&self.published))?;
+        map.serialize_entry("term", &self.published)?;
         map.serialize_entry("roles", &self.roles)?;
         if let Some(label) = &self.label {
             map.serialize_entry("label", label)?;
@@ -3682,15 +3732,6 @@ fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
         .map_err(|error| unreadable("parsing a VoID object IRI", &error))
 }
 
-/// An object in its published spelling, which is a dictionary spelling but
-/// for a triple term, published decoded.
-fn rdf_published_object(text: &str) -> Result<RdfTerm, Problem> {
-    if !text.starts_with("<<(") {
-        return rdf_object(text.as_bytes());
-    }
-    rdf_term(&Term::from_published(text))
-}
-
 /// A term as `oxrdf` holds it, triple terms included.
 fn rdf_term(term: &Term<'_>) -> Result<RdfTerm, Problem> {
     match term {
@@ -4989,7 +5030,14 @@ fn push_search_result(
     // one that collides with every other graph's.
     let (subject, subject_serialized) = published
         .measured(cache, dictionary, Role::Subject, TermId(triple.subject))
-        .map(|(term, serialized)| (term.published, serialized))
+        .map(|(term, serialized)| {
+            let subject = term
+                .published
+                .text()
+                .cloned()
+                .expect("a subject is never a triple term");
+            (subject, serialized)
+        })
         .map_err(|error| unreadable("materializing a search subject", &error))?;
     let predicate = cache
         .resolve(dictionary, Role::Predicate, TermId(triple.predicate))
@@ -6317,24 +6365,10 @@ fn proposition_of(
     terms: &TripleTerms,
     triple: &TripleTerm<'_>,
 ) -> Result<Option<TripleTermProposition>, Problem> {
-    let Some(subject) = component_of(
-        dictionary,
-        blank_nodes,
-        terms,
-        Role::Subject,
-        triple.subject(),
-    )?
-    else {
+    let Some(subject) = component_of(dictionary, blank_nodes, terms, triple.subject())? else {
         return Ok(None);
     };
-    let Some(object) = component_of(
-        dictionary,
-        blank_nodes,
-        terms,
-        Role::Object,
-        triple.object(),
-    )?
-    else {
+    let Some(object) = component_of(dictionary, blank_nodes, terms, triple.object())? else {
         return Ok(None);
     };
     Ok(Some(TripleTermProposition {
@@ -6348,7 +6382,6 @@ fn component_of(
     dictionary: &Dictionary<'_>,
     blank_nodes: &SkolemScope,
     terms: &TripleTerms,
-    role: Role,
     term: &Term<'_>,
 ) -> Result<Option<TripleTermComponent>, Problem> {
     Ok(Some(match term {
@@ -6358,42 +6391,70 @@ fn component_of(
             Some(proposition) => TripleTermComponent::Triple(Box::new(proposition)),
             None => return Ok(None),
         },
-        Term::Iri(iri) => {
-            if let Some(id) = reverse_scoped(dictionary, blank_nodes, role, iri)? {
-                blank_label(dictionary, role, id)?
-            } else if let (Some(id), Some(props)) = (
-                blank_nodes.propositions_role_id(role, iri),
-                terms.propositions_dict(),
-            ) {
-                let label = blank_label(&props, role, id.0)?;
-                if !matches!(label, TripleTermComponent::Blank(_)) {
-                    return Ok(None);
-                }
-                label
-            } else {
-                TripleTermComponent::Iri(iri.clone().into_owned())
-            }
-        }
+        Term::Iri(iri) => match blank_label_of(dictionary, blank_nodes, terms, iri)? {
+            Some(label) => TripleTermComponent::Blank(label),
+            None => TripleTermComponent::Iri(iri.clone().into_owned()),
+        },
     }))
 }
 
-/// A stored blank node's label, as a minting component; an IRI component if
-/// the term there is not a blank node after all.
-fn blank_label(
+/// The stored label of the blank node a published IRI names, without `_:`,
+/// or `None` if it names none.
+///
+/// Role-independent: a node published in a triple term is named by the
+/// section its label is stored in, which need not be the role it fills there
+/// — a node the data holds only as an object can be a triple term's subject.
+/// A propositions-scoped IRI names a node only when the data lacks its label;
+/// otherwise the data's IRI is the node's one spelling, and this other one is
+/// refused rather than aliased.
+fn blank_label_of(
+    dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    terms: &TripleTerms,
+    iri: &str,
+) -> Result<Option<String>, Problem> {
+    for role in [Role::Subject, Role::Object] {
+        if let Some(id) = reverse_scoped(dictionary, blank_nodes, role, iri)? {
+            return stored_label(dictionary, role, id);
+        }
+    }
+    let Some(props) = terms.propositions_dict() else {
+        return Ok(None);
+    };
+    for role in [Role::Subject, Role::Object] {
+        let Some(id) = blank_nodes.propositions_role_id(role, iri) else {
+            continue;
+        };
+        let Some(label) = stored_label(&props, role, id.0)? else {
+            return Ok(None);
+        };
+        let spelled = format!("_:{label}");
+        for data_role in [Role::Subject, Role::Object] {
+            let held = dictionary
+                .locate(data_role, spelled.as_bytes())
+                .map_err(|error| unreadable("looking a blank node up", &error))?;
+            if held.is_some() {
+                return Ok(None);
+            }
+        }
+        return Ok(Some(label));
+    }
+    Ok(None)
+}
+
+/// The label of the blank node stored at `id`, or `None` if it is not one.
+fn stored_label(
     dictionary: &Dictionary<'_>,
     role: Role,
     id: u64,
-) -> Result<TripleTermComponent, Problem> {
+) -> Result<Option<String>, Problem> {
     let mut buffer = Vec::new();
     let stored = dictionary
         .extract(role, TermId(id), &mut buffer)
         .map_err(|error| unreadable("reversing a blank-node IRI", &error))?;
     let stored = std::str::from_utf8(stored)
         .map_err(|error| unreadable("reading a blank-node label", &error))?;
-    Ok(match stored.strip_prefix("_:") {
-        Some(label) => TripleTermComponent::Blank(label.to_owned()),
-        None => TripleTermComponent::Iri(stored.to_owned()),
-    })
+    Ok(stored.strip_prefix("_:").map(str::to_owned))
 }
 
 /// Dictionary probes shared by all rows of one binding table.
@@ -8066,20 +8127,15 @@ impl Answer {
                     // has one spelling — the request's, which for a blank node
                     // is already the scoped IRI, since nothing else resolves.
                     for position in Position::ALL {
-                        let found = pattern
-                            .bound(position)
-                            .map(|bound| (bound.dictionary(), bound.dictionary()))
-                            .or_else(|| {
-                                row.cells
-                                    .iter()
-                                    .find(|(row_position, _)| *row_position == position)
-                                    .map(|(_, term)| {
-                                        (term.published.as_ref(), term.stored.as_ref())
-                                    })
-                            });
-                        if let Some((published, stored)) = found {
-                            cells.push(self.cell(published, stored));
-                        }
+                        let cell = match pattern.bound(position) {
+                            Some(bound) => Some(self.bound_cell(bound)),
+                            None => row
+                                .cells
+                                .iter()
+                                .find(|(row_position, _)| *row_position == position)
+                                .map(|(_, term)| self.cell(&term.published, &term.stored)),
+                        };
+                        cells.extend(cell);
                     }
                 } else {
                     cells.extend(
@@ -8127,17 +8183,46 @@ impl Answer {
     /// literal to every triple carrying it.
     /// `published` is what the cell shows and links to; `stored` is the
     /// dictionary spelling the page's labels were resolved against.
-    fn cell<'a>(&'a self, published: &'a str, stored: &'a str) -> Cell<'a> {
-        let mut cell = term_cell(
+    fn cell<'a>(&'a self, published: &'a Published, stored: &'a str) -> Cell<'a> {
+        let mut cell = row_cell(
             &self.target,
             &self.blank_nodes,
             published,
             self.page_labels.get(stored).map(String::as_str),
         );
-        if self.described.as_deref() == Some(published) {
+        if published
+            .text()
+            .is_some_and(|text| self.described.as_deref() == Some(text.as_ref()))
+        {
             cell.href = None;
         }
         cell
+    }
+
+    /// A cell for a position the request bound.
+    fn bound_cell<'a>(&'a self, bound: &'a BoundTerm) -> Cell<'a> {
+        match bound.triple() {
+            Some(triple) => published_cell(
+                &self.target,
+                &self.blank_nodes,
+                Term::Triple(Box::new(triple.clone())),
+                "",
+                None,
+            ),
+            None => {
+                let text = bound.dictionary();
+                let mut cell = term_cell(
+                    &self.target,
+                    &self.blank_nodes,
+                    text,
+                    self.page_labels.get(text).map(String::as_str),
+                );
+                if self.described.as_deref() == Some(text) {
+                    cell.href = None;
+                }
+                cell
+            }
+        }
     }
 }
 
@@ -8422,7 +8507,7 @@ impl Resource for TermsPage {
                 // sections *this scan read*, so a `role=predicate` scan calls
                 // every row a predicate whether or not the term is described
                 // elsewhere in the graph.
-                term_cell(
+                row_cell(
                     &self.target,
                     &self.blank_nodes,
                     &row.published,
@@ -8771,7 +8856,39 @@ fn term_cell<'a>(
     text: &'a str,
     annotation: Option<&'a str>,
 ) -> Cell<'a> {
-    let term = Term::from_published(text);
+    published_cell(
+        target,
+        blank_nodes,
+        Term::from_dictionary(text),
+        text,
+        annotation,
+    )
+}
+
+/// A cell for a published term, triple terms included.
+fn row_cell<'a>(
+    target: &Target,
+    blank_nodes: &SkolemScope,
+    published: &'a Published,
+    annotation: Option<&'a str>,
+) -> Cell<'a> {
+    match published {
+        Published::Text(text) => term_cell(target, blank_nodes, text, annotation),
+        Published::Triple(term) => {
+            published_cell(target, blank_nodes, term.as_ref().clone(), "", annotation)
+        }
+    }
+}
+
+/// A cell for `term`, whose published spelling is `text` unless it is a
+/// triple term.
+fn published_cell<'a>(
+    target: &Target,
+    blank_nodes: &SkolemScope,
+    term: Term<'a>,
+    text: &'a str,
+    annotation: Option<&'a str>,
+) -> Cell<'a> {
     let request = term.to_request();
     let href = match &term {
         Term::Literal(_) | Term::Triple(_) => target.ask("fragment", "o", &request),
@@ -8947,7 +9064,7 @@ mod tests {
                                     (
                                         *position,
                                         RowTerm {
-                                            published: Rc::clone(&text),
+                                            published: Published::Text(Rc::clone(&text)),
                                             stored: text,
                                         },
                                     )
