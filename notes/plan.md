@@ -2700,6 +2700,53 @@ The steps, each a commit reviewed on its own:
    leaves the encoding namespace out of the namespace inventory.
 8. **Notes**: this unit's *What landed*, and the questions for `../kgf` it raises.
 
+**What landed (2026-10-04).** All eight steps, each reviewed on its own, against hdtc
+branch `triple-terms`. Two decisions moved from the plan, recorded as questions 85–86:
+inner variables are written in `o` with `?name` placeholders, and `reification` is a
+declaration, not a gate. Three findings from building it:
+
+**A triple term's name is a function of dictionary strings.** hdtc reads a
+component's kind from the string the dictionary stores — `_:` a blank node, `"` a
+literal, anything else an IRI — in its build, its validation and its search, and
+writes a string that is not a literal in its encoded form as an escaped IRI
+(`docs/triple-terms-format.md` §2.1). The request side mints through the same
+`TripleTermComponent::from_dictionary`, so a request IRI the dictionary would hold as
+a literal's string (`<"a"@en>`) names the triple term hdtc named. Every name minted
+from valid input is unchanged: re-minting all of ROBOKOP's reproduced each one.
+
+**Leaving the propositions' literals out of a text query is free.** hdtc's text index
+covers literals found only in unasserted triple terms; `o.text` and `/search` resolve
+hits through `data.hdt` and ask for `propositions: false`. A range on the document ID
+did that at a cost in proportion to the index on every query, since Tantivy decodes a
+fast column's block headers to open it — 100–200 µs per one-hit search over 2 M
+propositions literals. hdtc now publishes them as a segment of their own, skipped
+whole, and opens a segment's column only when it has a match: one-hit searches cost
+what they cost over an index without them (8–10 µs there).
+
+**Measured at scale.** ROBOKOP annotated — 1.40 B triples, 133 M triple terms, all
+asserted — built with hdtc and served by `kgf serve` from a bundle of `data.hdt`,
+`.perm` and `.tt` (Apple silicon, external SSD, warm page cache, one client):
+
+| Request | Median |
+|---|---|
+| `p=rdf:reifies&o=<<( s p o )>>` (ground) | 0.18 ms |
+| `s=<reifier>&o=<<( ?s ?p ?o )>>` (outer subject first) | 0.15 ms |
+| `o=<<( :TP53 ?p :x )>>` (inner `s ? o`, probed) | 0.16 ms |
+| `o=<<( :TP53 ?p ?o )>>`, 100 rows; its 28th page | 0.47 ms; 0.22 ms |
+| `o=<<( ?s :subclass_of ?o )>>`, 100 rows; its 301st page | 0.50 ms; 0.46 ms |
+| `/count o=<<( :TP53 ?p ?o )>>` (2,717, exact) | 2.9 ms |
+| `/count o=<<( ?s :treats ?o )>>` (9,388, exact) | 10.5 ms |
+| `/count o=<<( ?s ?p ?o )>>` (137,483,585, one OPS range) | 0.17 ms |
+| `/count o=<<( ?s :subclass_of ?o )>>` (past the 1 M budget) | 1.28 s, lower bound + cursor |
+
+Exhaustive paging reaches exactly the exact count. An exact inner count costs about 1 µs
+per match, and one past the candidate budget returns a resumable lower bound, as the
+plan said. Each triple term decoded into a response costs about 1.3 µs (1,000 rows of
+`p=rdf:reifies`: 2.6 ms, against 1.3 ms for the same rows as bare IRIs from main).
+Patterns without triple terms are unchanged: over the same files, main and this branch
+answer 1,000-row pages of `s=`, `o=` and `p=` in the same 0.67–0.73 ms with
+byte-identical bodies.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
