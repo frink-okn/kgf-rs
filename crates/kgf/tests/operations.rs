@@ -266,6 +266,60 @@ fn triple_terms_survive_lenient_content_and_name_blank_nodes_in_any_role() {
     assert_eq!(error.code().as_str(), "bad_term_syntax");
 }
 
+/// A triple term whose components lenient ingest stored spelled like literals
+/// it is not — an IRI `<"a"@EN>`, `<"x>`, `<"@en>` — is published so that,
+/// sent back, it names the term hdtc named: such an object as an IRI, an
+/// encoded literal as a literal, asserted or not.
+#[test]
+fn published_triple_terms_name_themselves_even_with_lenient_components() {
+    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+    let mut source = String::new();
+    for (i, object) in [
+        "<\\u0022a\\u0022@EN>",
+        "\"a\"@en",
+        "<\\u0022x>",
+        "<\\u0022@en>",
+        "<\\u0022q\\u0022>",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let triple = format!("<http://example.org/s> <http://example.org/p{i}> {object}");
+        source.push_str(&format!(
+            "<http://example.org/e{i}> {reifies} <<( {triple} )>> .\n"
+        ));
+        if i % 2 == 0 {
+            source.push_str(&format!("{triple} .\n"));
+        }
+    }
+    let served = Served::from_fixture(Fixture::build(&source));
+    let store = served.store();
+    let answer = served.fragment(&store, &format!("p={reifies}&limit=100"));
+    let rows = answer["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 5, "{answer}");
+    for row in rows {
+        let object = &row["o"]["value"]["object"];
+        // By predicate: p1 is the real literal, p4's `"q"` is spelled as one.
+        let expected = match row["o"]["value"]["predicate"]["value"].as_str().unwrap() {
+            "http://example.org/p1" | "http://example.org/p4" => "literal",
+            _ => "iri",
+        };
+        assert_eq!(object["type"], expected, "{row}");
+        let body = serde_json::json!({
+            "pattern": {"s": "?r", "p": reifies, "o": "?t"},
+            "bindings": {"vars": ["?t"], "rows": [[row["o"].clone()]]},
+        });
+        let found = served.binding_fragment(&store, &body);
+        let subjects: Vec<&serde_json::Value> = found["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|found| &found["s"])
+            .collect();
+        assert_eq!(subjects, vec![&row["s"]], "{row}: {found}");
+    }
+}
+
 /// Variables inside a triple term: every plan answers what a filter over all
 /// rows answers, pages to the same rows at every size and under a one-candidate
 /// budget, and counts them — exactly, or as a floor that resumes to the total.

@@ -87,7 +87,7 @@ use crate::term::{
     DictionaryTermError, LiteralKind, PrefixMap, Term, TermCache, TripleTerm, serialized_bytes,
 };
 use crate::url::{self, Mount, Params};
-use hdtc::format::{TripleTermComponent, TripleTermProposition};
+use hdtc::format::{TripleTermComponent, TripleTermProposition, is_encoded_literal};
 use kgf_store::graphs::{GraphId, Graphs};
 use kgf_store::scope::{QuadSelection, ScopedSelection};
 use kgf_store::triple_terms::{
@@ -749,8 +749,14 @@ impl<'s> PublishedTerms<'s> {
         if !stored.starts_with("_:") {
             // By role, not by spelling: lenient ingest can store a subject IRI
             // that begins with a quote, which only an object could read as a
-            // literal.
+            // literal. And an object is a literal only in hdtc's encoded form:
+            // hdtc names any other quoted string — an IRI spelled like a
+            // literal, `<"a"@EN>` — by its IRI form, so it is published as an
+            // IRI, and sent back it names the triple term hdtc named.
             return Ok(match role {
+                Role::Object if stored.starts_with('"') && !is_encoded_literal(&stored) => {
+                    Term::Iri(Cow::Owned(stored))
+                }
                 Role::Object => Term::from_dictionary(&stored).into_owned(),
                 Role::Subject | Role::Predicate => Term::Iri(Cow::Owned(stored)),
             });
@@ -6432,6 +6438,10 @@ fn component_of(
             Some(proposition) => TripleTermComponent::Triple(Box::new(proposition)),
             None => return Ok(None),
         },
+        // Blank-node syntax never resolves: a node is named by its published
+        // IRI alone. Every entry point refuses `_:` already; this keeps
+        // `from_dictionary` from reading one as a label if a new one does not.
+        Term::Iri(iri) if iri.starts_with("_:") => return Ok(None),
         Term::Iri(iri) => match blank_label_of(dictionary, blank_nodes, Some(terms), iri)? {
             Some(label) => TripleTermComponent::Blank(label),
             None => TripleTermComponent::from_dictionary(iri.clone().into_owned()),

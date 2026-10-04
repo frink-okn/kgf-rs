@@ -2713,6 +2713,9 @@ writes a string that is not a literal in its encoded form as an escaped IRI
 `TripleTermComponent::from_dictionary`, so a request IRI the dictionary would hold as
 a literal's string (`<"a"@en>`) names the triple term hdtc named. Every name minted
 from valid input is unchanged: re-minting all of ROBOKOP's reproduced each one.
+Publishing follows the same rule: inside a triple term, an object string that is not
+a literal in hdtc's encoded form (`hdtc::format::is_encoded_literal`) is published as
+an IRI, so that sent back it names the term hdtc named.
 
 **Leaving the propositions' literals out of a text query is free.** hdtc's text index
 covers literals found only in unasserted triple terms; `o.text` and `/search` resolve
@@ -2720,8 +2723,11 @@ hits through `data.hdt` and ask for `propositions: false`. A range on the docume
 did that at a cost in proportion to the index on every query, since Tantivy decodes a
 fast column's block headers to open it — 100–200 µs per one-hit search over 2 M
 propositions literals. hdtc now publishes them as a segment of their own, skipped
-whole, and opens a segment's column only when it has a match: one-hit searches cost
-what they cost over an index without them (8–10 µs there).
+whole, and opens every segment's object column once, when the index opens, rather
+than per query — which every text query had paid, triple terms or not (about 250 µs
+for a one-hit scan over 5 M literals, and once per hit in ranked search). One-hit
+counts, scans and budgeted searches now take 3–5 µs over 5 M literals, with or
+without the propositions.
 
 **Measured at scale.** ROBOKOP annotated — 1.40 B triples, 133 M triple terms, all
 asserted — built with hdtc and served by `kgf serve` from a bundle of `data.hdt`,
