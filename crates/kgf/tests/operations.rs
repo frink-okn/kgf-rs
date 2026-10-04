@@ -209,6 +209,10 @@ fn triple_terms_survive_lenient_content_and_name_blank_nodes_in_any_role() {
         "<http://example.org/x> <http://example.org/p> _:k .\n",
         "<http://example.org/e3> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
         "<<( _:k <http://example.org/q> <http://example.org/o> )>> .\n",
+        // A subject IRI that begins with a quote, inside a triple term.
+        "<\"x> <http://example.org/p> <http://example.org/o> .\n",
+        "<http://example.org/e5> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+        "<<( <\"x> <http://example.org/p> <http://example.org/o> )>> .\n",
         // `_:m` occurs only inside an unasserted triple term.
         "<http://example.org/e4> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
         "<<( _:m <http://example.org/q> <http://example.org/o> )>> .\n",
@@ -219,9 +223,9 @@ fn triple_terms_survive_lenient_content_and_name_blank_nodes_in_any_role() {
 
     // Every row publishes, in every representation.
     let answer = served.fragment(&store, &format!("p={reifies}&limit=100"));
-    assert_eq!(answer["rows"].as_array().unwrap().len(), 4, "{answer}");
+    assert_eq!(answer["rows"].as_array().unwrap().len(), 5, "{answer}");
     let all = served.fragment(&store, "limit=100");
-    assert_eq!(all["rows"].as_array().unwrap().len(), 5, "{all}");
+    assert_eq!(all["rows"].as_array().unwrap().len(), 7, "{all}");
     let page = served.render(&store, "fragment", "limit=100", Representation::Html);
     assert!(page.contains("zh-classical"), "{page}");
 
@@ -407,11 +411,18 @@ fn patterns_inside_triple_terms_answer_what_a_filter_over_every_row_answers() {
             .collect();
         expected.sort();
         nonempty += usize::from(!expected.is_empty());
-        for size in [1usize, 2, 3, 10_000] {
-            let mut paged = served.page_through(&store, &query, size);
-            paged.sort();
-            assert_eq!(paged, expected, "?{query} at limit={size}");
+        // One order, whatever the page size.
+        let in_order = served.page_through(&store, &query, 10_000);
+        for size in [1usize, 2, 3] {
+            assert_eq!(
+                served.page_through(&store, &query, size),
+                in_order,
+                "?{query} at limit={size}"
+            );
         }
+        let mut sorted = in_order.clone();
+        sorted.sort();
+        assert_eq!(sorted, expected, "?{query}");
         let counted = served.count(&store, &query);
         assert_eq!(
             counted["count"]["value"].as_u64().unwrap() as usize,
@@ -480,6 +491,33 @@ fn patterns_inside_triple_terms_answer_what_a_filter_over_every_row_answers() {
     // Not vacuous: all but the deliberately absent subject match something.
     assert_eq!(nonempty, total - 1);
 
+    // A page that ran out from the start is the whole answer, exactly; one
+    // that stopped claims nothing it could later contradict.
+    let pattern = format!("o={}", urlencode("<<( ?a ex:knows ?c )>>"));
+    let whole = served.fragment(&store, &format!("{pattern}&limit=100"));
+    assert_eq!(whole["cardinality"]["exact"], true, "{whole}");
+    let first = served.fragment(&store, &format!("{pattern}&limit=1"));
+    assert_eq!(first["cardinality"]["exact"], false, "{first}");
+    assert!(first["cardinality"].get("min").is_none(), "{first}");
+    // An inner term the bundle does not hold is reported, like a ground one.
+    let absent = served.fragment(
+        &store,
+        &format!("o={}", urlencode("<<( ex:nobody ?b ?c )>>")),
+    );
+    assert_eq!(absent["absent_terms"][0]["parameter"], "o", "{absent}");
+
+    // The page says what was asked, and RDF carries the triple terms.
+    let page = served.render(&store, "fragment", &pattern, Representation::Html);
+    assert!(page.contains("ex:knows ?c"), "the page echoes the pattern");
+    let counted = served.render(&store, "count", &pattern, Representation::Html);
+    assert!(counted.contains("candidate triple"), "{counted}");
+    let nquads = served.render(&store, "fragment", &pattern, Representation::NQuads);
+    assert!(
+        nquads.contains("<<( <http://example.org/alice>"),
+        "{nquads}"
+    );
+    assert!(!nquads.contains("urn:x-kgf:tt"), "{nquads}");
+
     // Repeated variables, variables nested deeper, and `o.text` beside a
     // pattern are refused rather than answered differently.
     for query in [
@@ -489,9 +527,19 @@ fn patterns_inside_triple_terms_answer_what_a_filter_over_every_row_answers() {
             urlencode("<<( ?a ex:says <<( ?b ex:knows ex:erin )>> )>>")
         ),
         format!("o={}&o.text=Alice", urlencode("<<( ?a ?b ?c )>>")),
+        format!("o={}&g=*", urlencode("<<( ?a ?b ?c )>>")),
     ] {
         assert!(served.try_fragment(&store, &query).is_err(), "{query}");
     }
+    let sample = request::Sample::parse(
+        &params(&format!("o={}", urlencode("<<( ?a ?b ?c )>>"))),
+        served.limits(),
+        served.release().prefixes(),
+    );
+    assert!(
+        sample.is_err(),
+        "a sample has no exact cardinality to draw from"
+    );
 }
 
 /// Percent-encode a query value: triple-term syntax carries spaces, quotes

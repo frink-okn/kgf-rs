@@ -474,7 +474,9 @@ pub enum ClientClass {
 pub enum RequestShape {
     /// Triple pattern or count request.
     Pattern {
-        /// `?`, `i`, `l`, or `b` for subject, predicate, and object.
+        /// `?`, `i`, `l`, `b`, or `t` (a triple term) for subject, predicate,
+        /// and object, and `T` for an object constrained by a pattern inside a
+        /// triple term.
         pattern: String,
         /// Whether `o.text` constrains the object.
         text: bool,

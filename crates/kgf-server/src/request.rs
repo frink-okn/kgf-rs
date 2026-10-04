@@ -525,12 +525,7 @@ impl TriplePattern {
         if !text.starts_with("<<(") {
             return Ok(None);
         }
-        let bad = |error: crate::term::TermSyntaxError| {
-            Problem::new(ErrorCode::BadTermSyntax, format!("parameter `o`: {error}"))
-        };
-        let Some(parts) = crate::term::parse_triple_pattern(text, prefixes).map_err(bad)? else {
-            return Ok(None);
-        };
+        // Before parsing, as for any term: the cap bounds the parse too.
         let max = limits.budgets.max_term_bytes;
         if text.len() as u64 > max {
             return Err(Problem::new(
@@ -541,6 +536,12 @@ impl TriplePattern {
                 ),
             ));
         }
+        let bad = |error: crate::term::TermSyntaxError| {
+            Problem::new(ErrorCode::BadTermSyntax, format!("parameter `o`: {error}"))
+        };
+        let Some(parts) = crate::term::parse_triple_pattern(text, prefixes).map_err(bad)? else {
+            return Ok(None);
+        };
         let mut names = BTreeSet::new();
         let mut slots = Vec::with_capacity(3);
         let mut canonical = String::from("<<(");
@@ -3772,7 +3773,9 @@ impl GetRequest for Fragment {
     /// Every representation of that page — JSON, RDF, HTML — costs within a
     /// small constant of the others, so none of them changes the class.
     fn work_class(&self) -> WorkClass {
-        if self.pattern.text().is_some() {
+        // Both examine up to the candidate budget, each candidate a few
+        // binary searches, where a plain pattern is one bounded descent.
+        if self.pattern.text().is_some() || self.pattern.triple().is_some() {
             WorkClass::Heavy
         } else {
             WorkClass::Ordinary
@@ -3808,7 +3811,9 @@ impl GetRequest for Count {
     }
 
     fn work_class(&self) -> WorkClass {
-        if self.pattern.text().is_some() {
+        // Both examine up to the candidate budget, each candidate a few
+        // binary searches, where a plain pattern is one bounded descent.
+        if self.pattern.text().is_some() || self.pattern.triple().is_some() {
             WorkClass::Heavy
         } else {
             WorkClass::Ordinary

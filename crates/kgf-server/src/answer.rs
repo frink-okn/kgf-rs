@@ -747,7 +747,13 @@ impl<'s> PublishedTerms<'s> {
     ) -> Result<Term<'static>, DictionaryTermError> {
         let stored = extract(dictionary, role, id)?;
         if !stored.starts_with("_:") {
-            return Ok(Term::from_dictionary(&stored).into_owned());
+            // By role, not by spelling: lenient ingest can store a subject IRI
+            // that begins with a quote, which only an object could read as a
+            // literal.
+            return Ok(match role {
+                Role::Object => Term::from_dictionary(&stored).into_owned(),
+                Role::Subject | Role::Predicate => Term::Iri(Cow::Owned(stored)),
+            });
         }
         let iri = match source {
             TripleTermSource::Data => self.blank_nodes.iri(role, TermId(id), &stored),
@@ -6502,11 +6508,10 @@ fn stored_label(
 /// moving it once costs less than an allocation would.
 #[allow(clippy::large_enum_variant)]
 enum TripleResolved<'s> {
-    /// A bound outer term this bundle does not hold.
+    /// A bound outer term this bundle does not hold, or an object constraint
+    /// nothing in it can meet: no triple terms at all, or a bound inner term
+    /// in neither HDT that holds propositions.
     Absent(Vec<AbsentTerm>),
-    /// Nothing can match: the bundle holds no triple terms, or a bound inner
-    /// term is in neither HDT that holds propositions.
-    Empty,
     /// The store's plan.
     Selected(TripleTermSelection<'s>),
 }
@@ -6544,8 +6549,24 @@ fn resolve_triple_pattern<'s>(
     if !absent.is_empty() {
         return Ok(TripleResolved::Absent(absent));
     }
+    // The object constraint matches nothing in this release: say so, as a
+    // ground object the bundle does not hold is said to be absent.
+    let absent_object = || {
+        let blank = Position::ALL
+            .into_iter()
+            .filter_map(|position| triple.bound(position))
+            .any(BoundTerm::denotes_blank_node);
+        TripleResolved::Absent(vec![AbsentTerm {
+            parameter: "o",
+            reason: if blank {
+                AbsentReason::BlankNode
+            } else {
+                AbsentReason::NotInBundle
+            },
+        }])
+    };
     let Some(terms) = store.triple_terms() else {
-        return Ok(TripleResolved::Empty);
+        return Ok(absent_object());
     };
     let data = inner_pattern(&dictionary, blank_nodes, terms, None, triple)?;
     let propositions = match terms.propositions_dict() {
@@ -6553,7 +6574,7 @@ fn resolve_triple_pattern<'s>(
         None => None,
     };
     if data.is_none() && propositions.is_none() {
-        return Ok(TripleResolved::Empty);
+        return Ok(absent_object());
     }
     let selection = store
         .resolve_triple_terms(TripleTermPattern {
@@ -6693,7 +6714,6 @@ fn triple_fragment(
                 paging,
             );
         }
-        TripleResolved::Empty => return paged(store, target, envelope, Vec::new(), paging),
         TripleResolved::Selected(TripleTermSelection::Range(selection)) => {
             return paged(
                 store,
@@ -6726,9 +6746,10 @@ fn triple_fragment(
             match exact {
                 Some(count) => Cardinality::exact(count),
                 None if completeness.is_complete() && from_start => Cardinality::exact(rows),
-                // What is known is what this page found: a floor, never a figure
-                // the next page could contradict.
-                None => Cardinality::estimated(rows).at_least(rows),
+                // Only the rows this page found, as an estimate. Not a floor:
+                // a floor that fell as a client paged would contradict
+                // itself, and `/count` gives one that holds.
+                None => Cardinality::estimated(rows),
             }
         },
     )
@@ -6749,11 +6770,15 @@ fn budgeted_steps(
     let mut steps = Vec::with_capacity(want.min(1024));
     let mut spent = None;
     for step in walk {
-        if steps.len() >= want {
-            break;
-        }
         match step {
-            TripleTermStep::Row { triple, at } => steps.push(triple_term_step(triple, at)),
+            TripleTermStep::Row { triple, at } => {
+                steps.push(triple_term_step(triple, at));
+                // Stop at once: pulling once more could spend the rest of the
+                // candidate budget looking for a row no page carries.
+                if steps.len() >= want {
+                    break;
+                }
+            }
             TripleTermStep::Spent(at) => {
                 spent = Some(Spent::Candidate(triple_term_step(
                     IdTriple {
@@ -6783,14 +6808,11 @@ fn triple_count(
     binding: &CursorBinding,
 ) -> Result<(Cardinality, Completeness, Vec<AbsentTerm>), Problem> {
     let selection = match resolve_triple_pattern(store, blank_nodes, pattern, triple)? {
-        TripleResolved::Absent(_) | TripleResolved::Empty if cursor.is_some() => {
+        TripleResolved::Absent(_) if cursor.is_some() => {
             return Err(Problem::from(StaleCursor));
         }
         TripleResolved::Absent(absent) => {
             return Ok((Cardinality::exact(0), Completeness::complete(), absent));
-        }
-        TripleResolved::Empty => {
-            return Ok((Cardinality::exact(0), Completeness::complete(), Vec::new()));
         }
         TripleResolved::Selected(TripleTermSelection::Range(selection)) => {
             if cursor.is_some() {
@@ -6829,9 +6851,10 @@ fn triple_count(
     let progress = selection
         .count(from, candidates.0)
         .map_err(|_| Problem::from(StaleCursor))?;
+    // Only an edited token's accumulator can overflow.
     let counted = accumulated
         .checked_add(progress.counted)
-        .ok_or_else(|| unreadable("counting triple-term matches", &"row count overflow"))?;
+        .ok_or_else(|| Problem::from(StaleCursor))?;
     match progress.next {
         None => Ok((
             Cardinality::exact(counted),
@@ -9103,7 +9126,12 @@ impl Resource for CountAnswer {
                         absent_terms_text(&self.absent_terms)
                     )))
                 }
-                @if self.pattern.text().is_none() {
+                @if self.pattern.triple().is_some() {
+                    (note(
+                        "A count inside triple terms examines a bounded number of candidate triple \
+                         terms. Continue from the cursor until the count is exact."
+                    ))
+                } @else if self.pattern.text().is_none() {
                     (note(
                         "A plain pattern's count is exact and costs a bounded descent rather than an \
                          enumeration, which is what makes it worth asking before /fragment."
@@ -9193,9 +9221,12 @@ fn pattern_fields(pattern: &Pattern, operation: AccessOperation) -> Vec<(&str, V
         .map(|position| {
             (
                 pattern_parameter(position, operation),
-                pattern
-                    .bound(position)
-                    .map_or(Value::Text("(any)"), |term| Value::Code(term.requested())),
+                match (position, pattern.triple()) {
+                    (Position::Object, Some(triple)) => Value::Code(triple.requested()),
+                    _ => pattern
+                        .bound(position)
+                        .map_or(Value::Text("(any)"), |term| Value::Code(term.requested())),
+                },
             )
         })
         .collect();
