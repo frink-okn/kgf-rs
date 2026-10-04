@@ -113,7 +113,13 @@ impl RunSpec {
 
 #[derive(Debug, Clone, Copy)]
 struct LayerSpec {
+    /// The bitmap the rank directory indexes: the layer itself, or a sparse
+    /// layer's Elias–Fano high bits (`triple-terms-format.md` §8.1).
     bitmap: RankedSpec,
+    /// A sparse layer's low bits.
+    low: Option<PackedSpec>,
+    /// Positions covered: the HDT's triples.
+    positions: u64,
     reverse: PackedSpec,
 }
 
@@ -136,27 +142,75 @@ pub struct TripleTerms {
 
 /// One layer, projected: which positions of one permutation of one HDT are
 /// propositions named in `data.hdt`, and the object identifier naming each.
+///
+/// Stored dense or sparse as its counts chose (`triple-terms-format.md`
+/// §8.1); every query answers the same either way. Sparse, the bitmap is the
+/// Elias–Fano high bits: a mark's place there is its bucket plus the marks
+/// before it, and each bucket is closed by a clear bit.
 #[derive(Debug, Clone, Copy)]
 pub struct Layer<'a> {
     bitmap: RankedBitmap<'a>,
+    low: Option<PackedArray<'a>>,
+    positions: u64,
     reverse: PackedArray<'a>,
 }
 
 impl Layer<'_> {
-    /// Marked positions strictly before `position`.
+    /// Marked positions strictly before `position`. Sparse, two selects in
+    /// the high bits bound `position`'s bucket, and a binary search of the
+    /// bucket's ascending low bits places it.
+    ///
+    /// Panics if `position` exceeds the positions covered.
     pub fn rank(&self, position: u64) -> u64 {
-        self.bitmap.rank1(position)
+        let Some(low) = &self.low else {
+            return self.bitmap.rank1(position);
+        };
+        assert!(
+            position <= self.positions,
+            "rank({position}) out of range for {} positions",
+            self.positions
+        );
+        if position == self.positions {
+            return self.reverse.len();
+        }
+        let bits = low.width();
+        let bucket = position >> bits;
+        let start = match bucket {
+            0 => 0,
+            _ => self.bitmap.select0(bucket - 1) - (bucket - 1),
+        };
+        let end = self.bitmap.select0(bucket) - bucket;
+        let target = position & ((1u64 << bits) - 1);
+        let (mut lo, mut hi) = (start, end);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if low.get(mid) < target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
     }
 
     /// Marked positions in `range`: the matching triple terms, without
     /// enumerating them.
     pub fn count_in(&self, range: &Range<u64>) -> u64 {
-        self.bitmap.rank1(range.end) - self.bitmap.rank1(range.start)
+        self.rank(range.end) - self.rank(range.start)
     }
 
     /// The position of the `rank`-th marked triple.
     pub fn select(&self, rank: u64) -> u64 {
-        self.bitmap.select1(rank)
+        let place = self.bitmap.select1(rank);
+        match &self.low {
+            Some(low) => (place - rank) << low.width() | low.get(rank),
+            None => place,
+        }
+    }
+
+    /// Whether the layer is stored as Elias–Fano high and low bits.
+    pub fn is_sparse(&self) -> bool {
+        self.low.is_some()
     }
 
     /// The `data.hdt` object identifier of the triple-term IRI naming the
@@ -167,7 +221,11 @@ impl Layer<'_> {
 
     /// Whether the triple at `position` is marked.
     pub fn contains(&self, position: u64) -> bool {
-        self.bitmap.bitmap().get(position)
+        if self.low.is_none() {
+            return self.bitmap.bitmap().get(position);
+        }
+        let rank = self.rank(position);
+        rank < self.reverse.len() && self.select(rank) == position
     }
 }
 
@@ -207,6 +265,7 @@ impl TripleTerms {
                 component::DATA_POS,
                 component::DATA_OPS,
             ],
+            header.data.triples,
         )?;
 
         let props_run = run_spec(&index, &sections, component::PROPS_RUN, &header.props)?;
@@ -223,6 +282,7 @@ impl TripleTerms {
                         component::PROPS_POS,
                         component::PROPS_OPS,
                     ],
+                    header.props.triples,
                 )?;
                 Some(Propositions { hdt, layers })
             }
@@ -324,6 +384,8 @@ impl TripleTerms {
         let spec = layers[permutation_index(permutation)];
         Some(Layer {
             bitmap: spec.bitmap.view(&self.index, &self.index),
+            low: spec.low.map(|low| low.view(&self.index)),
+            positions: spec.positions,
             reverse: spec.reverse.view(&self.index),
         })
     }
@@ -1279,13 +1341,32 @@ fn run_spec(
     })
 }
 
+/// The three layers of one HDT of `positions` triples, each in the encoding
+/// its counts chose. hdtc's directory check has already required that
+/// encoding and the sections' shapes (`triple-terms-format.md` §6, §8.1).
 fn layer_specs(
     index: &Mapping,
     sections: &[TripleTermSection],
     components: [u32; 3],
+    positions: u64,
 ) -> Result<[LayerSpec; 3]> {
     let spec = |component: u32| -> Result<LayerSpec> {
-        let layer = section(index, sections, component, kind::LAYER)?;
+        let present = |k: u32| {
+            sections
+                .iter()
+                .any(|s| s.section_type == section_type(component, k))
+        };
+        let (layer, low) = if present(kind::LAYER) {
+            (section(index, sections, component, kind::LAYER)?, None)
+        } else {
+            (
+                section(index, sections, component, kind::LAYER_HIGH)?,
+                Some(packed(
+                    index,
+                    section(index, sections, component, kind::LAYER_LOW)?,
+                )?),
+            )
+        };
         let bitmap = BitmapSpec::new(index, layer.offset, layer.entry_count).map_err(|error| {
             Error::Malformed {
                 artifact: index.path().to_path_buf(),
@@ -1307,6 +1388,8 @@ fn layer_specs(
         )?;
         Ok(LayerSpec {
             bitmap: ranked,
+            low,
+            positions,
             reverse: packed(index, section(index, sections, component, kind::REVERSE)?)?,
         })
     };
@@ -1387,6 +1470,101 @@ mod tests {
                 TripleTermStep::Spent(_) => panic!("an unlimited budget ran out"),
             })
             .collect()
+    }
+
+    /// A few triple terms among many triples, some clustered in one
+    /// predicate: the data layers are stored sparse and the propositions
+    /// HDT's dense, and in every order every position answers `rank`,
+    /// `select` and `contains` as the marks — the targets the run decodes to,
+    /// asserted for `data.hdt`, unasserted for the propositions HDT — do.
+    #[test]
+    fn layers_answer_as_their_marks_do_dense_or_sparse() {
+        let iri = |kind: &str, n: u64| format!("<http://ex/{kind}{n}>");
+        let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+        let mut source = String::new();
+        let mut triples = Vec::new();
+        for i in 0..3_000u64 {
+            let triple = (iri("s", i % 300), iri("p", i % 10), iri("o", (i * 7) % 200));
+            source.push_str(&format!("{} {} {} .\n", triple.0, triple.1, triple.2));
+            triples.push(triple);
+        }
+        let mut reified: Vec<_> = (0..40u64)
+            .map(|i| triples[(i * 73 % 3_000) as usize].clone())
+            .collect();
+        // Every triple of one predicate: a dense run in POS.
+        reified.extend(
+            triples
+                .iter()
+                .filter(|t| t.1 == iri("p", 3))
+                .take(60)
+                .cloned(),
+        );
+        reified.extend((0..15u64).map(|i| (iri("s", i), iri("p", i % 10), iri("u", i))));
+        for (i, (s, p, o)) in reified.iter().enumerate() {
+            source.push_str(&format!(
+                "{} {reifies} <<( {s} {p} {o} )>> .\n",
+                iri("r", i as u64)
+            ));
+        }
+        let fixture = Fixture::build(&source);
+        let store = open(&fixture);
+        let terms = store.triple_terms().expect("the fixture has triple terms");
+        let mut marks: [std::collections::HashSet<(u64, u64, u64)>; 2] = Default::default();
+        for object in terms.run(Source::Data) {
+            let proposition = terms.decode(object).unwrap();
+            let t = proposition.triple;
+            marks[usize::from(proposition.source == Source::Propositions)].insert((
+                t.subject,
+                t.predicate,
+                t.object,
+            ));
+        }
+        let props = terms.propositions.as_ref().expect("unasserted ones too");
+        for (source, perms, marked) in [
+            (Source::Data, store.perms(), &marks[0]),
+            (Source::Propositions, props.hdt.permutations(), &marks[1]),
+        ] {
+            for permutation in [Permutation::Spo, Permutation::Pos, Permutation::Ops] {
+                let layer = terms.layer(source, permutation).unwrap();
+                assert_eq!(
+                    layer.is_sparse(),
+                    source == Source::Data,
+                    "{source:?} {permutation:?}"
+                );
+                let order = match permutation {
+                    Permutation::Spo => perms.spo(),
+                    Permutation::Pos => perms.pos(),
+                    Permutation::Ops => perms.ops(),
+                };
+                let n = perms.triples();
+                let mut rank = 0;
+                for z in 0..n {
+                    let y = order.level2_of(z);
+                    let (a, b, c) = (order.level1_of(y), order.level2_at(y), order.level3_at(z));
+                    let triple = match permutation {
+                        Permutation::Spo => (a, b, c),
+                        Permutation::Pos => (c, a, b),
+                        Permutation::Ops => (c, b, a),
+                    };
+                    assert_eq!(layer.rank(z), rank, "{source:?} {permutation:?} rank({z})");
+                    let is_marked = marked.contains(&triple);
+                    assert_eq!(
+                        layer.contains(z),
+                        is_marked,
+                        "{source:?} {permutation:?} {z}"
+                    );
+                    if is_marked {
+                        assert_eq!(layer.select(rank), z);
+                        let named = terms.decode(layer.term(rank)).unwrap().triple;
+                        assert_eq!((named.subject, named.predicate, named.object), triple);
+                        rank += 1;
+                    }
+                }
+                assert_eq!(rank, marked.len() as u64, "{source:?} {permutation:?}");
+                assert_eq!(layer.rank(n), rank);
+                assert_eq!(layer.count_in(&(0..n)), rank);
+            }
+        }
     }
 
     #[test]
@@ -1825,23 +2003,6 @@ mod tests {
         assert!(matches!(&error, Error::Malformed { .. }), "{error}");
     }
 
-    /// CRC32C (Castagnoli), so a test can corrupt a field and keep the
-    /// checksums that would otherwise catch it first.
-    fn crc32c(bytes: &[u8]) -> u32 {
-        let mut crc = !0u32;
-        for byte in bytes {
-            crc ^= u32::from(*byte);
-            for _ in 0..8 {
-                crc = if crc & 1 == 1 {
-                    (crc >> 1) ^ 0x82F6_3B78
-                } else {
-                    crc >> 1
-                };
-            }
-        }
-        !crc
-    }
-
     #[test]
     fn a_layer_whose_reverse_array_disagrees_with_its_bitmap_is_refused_at_open() {
         let fixture = Fixture::build(TRIPLE_TERMS_NT);
@@ -1856,17 +2017,18 @@ mod tests {
         };
         let directory = get(&bytes, 56, 8) as usize;
         let sections = get(&bytes, 40, 4) as usize;
-        let wanted = u64::from(section_type(component::DATA_POS, kind::REVERSE));
+        let wanted = u64::from(section_type(component::DATA_POS, kind::LAYER_SUPERRANK));
         let entry = (0..sections)
             .map(|i| directory + i * 64)
             .find(|&at| get(&bytes, at, 4) == wanted)
-            .expect("the POS reverse section");
-        // Empty it: a legal shape for a section, and a lie about its layer.
-        bytes[entry + 8..entry + 32].fill(0);
-        bytes[entry + 36..entry + 40].fill(0);
-        let crc = crc32c(&bytes[directory..directory + sections * 64]);
-        bytes[directory + sections * 64..directory + sections * 64 + 4]
-            .copy_from_slice(&crc.to_le_bytes());
+            .expect("the POS rank directory");
+        // Raise the population the directory's sentinel records: the
+        // directory's shape, and every count hdtc checks from it, still hold,
+        // but the layer now claims one mark its reverse array lacks.
+        let (offset, entries) = (get(&bytes, entry + 8, 8), get(&bytes, entry + 24, 8));
+        let sentinel = (offset + (entries - 1) * 8) as usize;
+        let marks = get(&bytes, sentinel, 8);
+        bytes[sentinel..sentinel + 8].copy_from_slice(&(marks + 1).to_le_bytes());
         std::fs::write(&path, bytes).unwrap();
         let error = Store::open(
             &published_bundle(fixture.bundle_path()),

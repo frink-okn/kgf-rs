@@ -365,8 +365,36 @@ fn published_triple_terms_name_themselves_even_with_lenient_components() {
 /// budget, and counts them — exactly, or as a floor that resumes to the total.
 #[test]
 fn patterns_inside_triple_terms_answer_what_a_filter_over_every_row_answers() {
-    let served = Served::from_fixture(Fixture::build(TRIPLE_TERMS_NT));
+    inner_patterns_answer_what_a_filter_answers(TRIPLE_TERMS_NT, false);
+}
+
+/// The same among thousands of other triples, where the data layers are
+/// stored sparse (Elias–Fano) rather than as bitmaps: every plan, page size,
+/// budget and count answers the same.
+#[test]
+fn patterns_inside_triple_terms_answer_the_same_over_sparse_layers() {
+    let mut source = TRIPLE_TERMS_NT.to_owned();
+    for i in 0..3_000 {
+        source.push_str(&format!(
+            "<http://example.org/f{i}> <http://example.org/filler> <http://example.org/g{}> .\n",
+            i % 50
+        ));
+    }
+    inner_patterns_answer_what_a_filter_answers(&source, true);
+}
+
+fn inner_patterns_answer_what_a_filter_answers(source: &str, sparse: bool) {
+    let served = Served::from_fixture(Fixture::build(source));
     let store = served.store();
+    let layer = store
+        .triple_terms()
+        .unwrap()
+        .layer(
+            kgf_store::triple_terms::Source::Data,
+            kgf_store::pattern::Permutation::Spo,
+        )
+        .unwrap();
+    assert_eq!(layer.is_sparse(), sparse);
     let all = served.fragment(&store, "limit=10000");
     let every: Vec<serde_json::Value> = all["rows"].as_array().unwrap().clone();
     let ex = |local: &str| format!("http://example.org/{local}");
