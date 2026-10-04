@@ -816,6 +816,11 @@ impl TextFilter {
     pub fn to_query(&self) -> TextQuery {
         TextQuery {
             text: self.0.clone(),
+            // Every hit is resolved through `data.hdt`'s permutations, so the
+            // literals found only inside unasserted triple terms — objects of
+            // no triple here — stay out of the query, its budget and its
+            // counts.
+            propositions: false,
             ..TextQuery::default()
         }
     }

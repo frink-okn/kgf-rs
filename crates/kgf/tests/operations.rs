@@ -4125,3 +4125,31 @@ fn dictionary_spelling(term: &serde_json::Value) -> String {
         other => panic!("unknown term type {other}"),
     }
 }
+
+/// A text index over a bundle with unasserted triple terms also holds the
+/// literals found only inside them, numbered past `data.hdt`'s objects. They
+/// are not objects of any triple here, so text answers do not include them —
+/// and above all do not fail on them.
+#[test]
+fn text_over_triple_terms_answers_from_data_hdt_alone() {
+    let served = Served::from_fixture(Fixture::build(TRIPLE_TERMS_NT).with_text());
+    let store = served.store();
+    // "a literal" occurs only inside the unasserted `<<( _:m ex:knows "a literal" )>>`.
+    let answer = served
+        .try_fragment(&store, "o.text=literal")
+        .expect("an answer");
+    assert_eq!(answer["rows"].as_array().unwrap().len(), 0, "{answer}");
+    let counted = served.count(&store, "o.text=literal");
+    assert_eq!(counted["count"]["value"], 0, "{counted}");
+    let searched = served.search(&store, "q=literal");
+    assert_eq!(
+        searched["results"].as_array().map_or(0, Vec::len),
+        0,
+        "{searched}"
+    );
+    // A literal of data.hdt is still found.
+    let alice = served
+        .try_fragment(&store, "o.text=Alice")
+        .expect("an answer");
+    assert!(!alice["rows"].as_array().unwrap().is_empty(), "{alice}");
+}
