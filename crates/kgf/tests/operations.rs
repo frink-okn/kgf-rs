@@ -24,7 +24,7 @@ use kgf_server::{Budgets, Caps, Limits};
 use kgf_store::catalog::BundleId;
 use kgf_store::dict::Section;
 use kgf_store::pattern::IdPattern;
-use kgf_store::testing::{Fixture, WORKED_EXAMPLE_NQ};
+use kgf_store::testing::{Fixture, TRIPLE_TERMS_NT, WORKED_EXAMPLE_NQ};
 use kgf_store::{IdTriple, Role, Store, TermId};
 
 /// Small, and every term shape in it.
@@ -45,6 +45,168 @@ const GRAPH: &str = concat!(
     "\"31\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
     "_:b1 <http://example.org/note> \"a blank subject\" .\n",
 );
+
+/// RDF 1.2 triple terms, end to end: a row whose object is a triple term
+/// carries it as SPARQL 1.2's triple term object, decoded however it is
+/// stored — asserted, unasserted, nested, or holding a blank node — and a
+/// ground triple term in a request finds what the row says it is.
+#[test]
+fn triple_terms_are_published_decoded_and_found_by_their_content() {
+    let served = Served::from_fixture(Fixture::build(TRIPLE_TERMS_NT));
+    let store = served.store();
+    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+    let iri = |local: &str| serde_json::json!({"type": "iri", "value": format!("http://example.org/{local}")});
+    let triple = |s: serde_json::Value, p: &str, o: serde_json::Value| serde_json::json!({"type": "triple", "value": {"subject": s, "predicate": iri(p), "object": o}});
+
+    // Every object of `rdf:reifies` comes back as the triple term it encodes.
+    let answer = served.fragment(&store, &format!("p={reifies}&limit=100"));
+    let objects: Vec<serde_json::Value> = answer["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["o"].clone())
+        .collect();
+    assert_eq!(objects.len(), 6, "{answer}");
+    assert!(objects.iter().all(|o| o["type"] == "triple"), "{objects:?}");
+    let alice_knows_bob = triple(iri("alice"), "knows", iri("bob"));
+    assert_eq!(
+        objects.iter().filter(|o| **o == alice_knows_bob).count(),
+        2,
+        "reified twice"
+    );
+    assert!(objects.contains(&triple(iri("bob"), "knows", iri("carol"))));
+    assert!(objects.contains(&triple(
+        iri("alice"),
+        "name",
+        serde_json::json!({"type": "literal", "value": "Alice", "lang": "en--ltr"})
+    )));
+    // A blank node inside is published as the data's node with that label.
+    let data_blank = answer["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|row| {
+            let subject = &row["o"]["value"]["subject"];
+            (row["o"]["value"]["object"] == iri("carol")
+                && subject["value"].as_str().unwrap().starts_with("urn:fdc:"))
+            .then(|| subject["value"].as_str().unwrap().to_owned())
+        })
+        .expect("the triple term holding `_:n`");
+    let n = served.fragment(&store, &format!("s=<{data_blank}>&p=ex:knows"));
+    assert_eq!(n["rows"][0]["o"], iri("carol"), "the same node: {n}");
+    // Nested, and named only under `:claims`.
+    let claims = served.fragment(&store, "p=ex:claims&limit=100");
+    let nested = claims["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["o"].clone())
+        .find(|o| o["value"]["predicate"] == iri("says"))
+        .expect("the nested claim");
+    assert_eq!(
+        nested,
+        triple(iri("dan"), "says", triple(iri("bob"), "knows", iri("erin")))
+    );
+
+    // A ground triple term finds the rows whose object it is, under every
+    // spelling: CURIEs, brackets, and a published blank-node IRI inside.
+    for (term, reifiers) in [
+        ("<<( ex:alice ex:knows ex:bob )>>", vec!["e1", "e2"]),
+        (
+            "<<(<http://example.org/bob> <http://example.org/knows> <http://example.org/carol>)>>",
+            vec!["e3"],
+        ),
+        ("<<( ex:alice ex:name \"Alice\"@en--ltr )>>", vec!["e4"]),
+        (
+            &format!("<<( <{data_blank}> ex:knows ex:carol )>>"),
+            vec!["e5"],
+        ),
+        ("<<( ex:carol ex:knows ex:alice )>>", vec![]),
+    ] {
+        let query = format!("o={}", urlencode(term));
+        let found = served.fragment(&store, &query);
+        let subjects: Vec<String> = found["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                row["s"]["value"]
+                    .as_str()
+                    .unwrap()
+                    .replace("http://example.org/", "")
+            })
+            .collect();
+        assert_eq!(subjects, reifiers, "{term}: {found}");
+        let counted = served.count(&store, &query);
+        assert_eq!(counted["count"]["value"], reifiers.len(), "{term}");
+    }
+    // The nested term, by its content.
+    let found = served.fragment(
+        &store,
+        &format!(
+            "o={}",
+            urlencode("<<( ex:dan ex:says <<( ex:bob ex:knows ex:erin )>> )>>")
+        ),
+    );
+    assert_eq!(found["rows"][0]["s"], iri("x"), "{found}");
+
+    // A triple term is never a subject or a predicate, and the encoding
+    // namespace is not a vocabulary.
+    for query in [
+        format!("s={}", urlencode("<<( ex:alice ex:knows ex:bob )>>")),
+        "o=<urn:x-kgf:tt:g:0123456789abcdef0123456789abcdef>".to_owned(),
+        format!("o={}", urlencode("<< ex:alice ex:knows ex:bob >>")),
+    ] {
+        let error = served.try_fragment(&store, &query).unwrap_err();
+        assert_eq!(error.code().as_str(), "bad_term_syntax", "{query}");
+    }
+
+    // RDF carries the triple term itself.
+    let turtle = served.render(
+        &store,
+        "fragment",
+        &format!("o={}", urlencode("<<( ex:alice ex:knows ex:bob )>>")),
+        Representation::Turtle,
+    );
+    assert!(turtle.contains("<<("), "{turtle}");
+    assert!(!turtle.contains("urn:x-kgf:tt"), "{turtle}");
+    let unbound = served.render(
+        &store,
+        "fragment",
+        &format!("p={reifies}"),
+        Representation::NQuads,
+    );
+    assert!(
+        unbound.contains("<<( <http://example.org/bob>"),
+        "{unbound}"
+    );
+    assert!(!unbound.contains("urn:x-kgf:tt"), "{unbound}");
+    // And the page links a triple term to the rows that name it.
+    let page = served.render(
+        &store,
+        "fragment",
+        &format!("p={reifies}"),
+        Representation::Html,
+    );
+    assert!(
+        !page.contains("urn:x-kgf:tt"),
+        "a page shows triple terms, not their encoding"
+    );
+}
+
+/// Percent-encode a query value: triple-term syntax carries spaces, quotes
+/// and `#`, which a URL must not carry raw.
+fn urlencode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
 
 #[test]
 fn every_pattern_shape_answers_what_the_store_answers() {

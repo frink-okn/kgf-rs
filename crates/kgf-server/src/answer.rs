@@ -47,7 +47,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use maud::html;
 use oxrdf::{
-    BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term as RdfTerm, Triple,
+    BaseDirection, BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad,
+    Term as RdfTerm, Triple,
 };
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
@@ -82,10 +83,14 @@ use crate::request::{
 };
 use crate::request::{GraphScope, GraphSelector};
 use crate::skolem::SkolemScope;
-use crate::term::{DictionaryTermError, LiteralKind, PrefixMap, Term, TermCache, serialized_bytes};
+use crate::term::{
+    DictionaryTermError, LiteralKind, PrefixMap, Term, TermCache, TripleTerm, serialized_bytes,
+};
 use crate::url::{self, Mount, Params};
+use hdtc::format::{TripleTermComponent, TripleTermProposition};
 use kgf_store::graphs::{GraphId, Graphs};
 use kgf_store::scope::{QuadSelection, ScopedSelection};
+use kgf_store::triple_terms::{Proposition, Source as TripleTermSource, TripleTerms};
 
 // ---------------------------------------------------------------------------
 // Where a response came from
@@ -582,18 +587,23 @@ struct RowTerm {
 /// Terms as this API publishes them, memoized for one request.
 ///
 /// [`TermCache`] materializes and measures a term as the dictionary spells it.
-/// This adds the one substitution the wire makes, and memoizes that separately
-/// so a blank node repeated down a page is formatted and weighed once rather
-/// than once per row — the same reason the cache underneath it exists.
-struct PublishedTerms {
+/// This adds the substitutions the wire makes, and memoizes them separately so
+/// a blank node repeated down a page is formatted and weighed once rather than
+/// once per row — the same reason the cache underneath it exists. There are
+/// two: a blank node becomes its scoped IRI, and a triple-term IRI becomes the
+/// triple term it encodes ([`Term::from_published`]), decoded through the
+/// bundle's triple-term index, nested terms included.
+struct PublishedTerms<'s> {
     blank_nodes: SkolemScope,
+    triple_terms: Option<&'s TripleTerms>,
     published: HashMap<(Role, u64), (Rc<str>, u64)>,
 }
 
-impl PublishedTerms {
-    fn new(blank_nodes: SkolemScope) -> Self {
+impl<'s> PublishedTerms<'s> {
+    fn new(blank_nodes: SkolemScope, store: &'s Store) -> Self {
         Self {
             blank_nodes,
+            triple_terms: store.triple_terms(),
             published: HashMap::new(),
         }
     }
@@ -616,21 +626,136 @@ impl PublishedTerms {
                 *serialized,
             ));
         }
-        let Some(iri) = self.blank_nodes.iri(role, id, &stored) else {
-            return Ok((
-                RowTerm {
-                    published: Rc::clone(&stored),
-                    stored,
-                },
-                serialized,
-            ));
+        let decoded = match self.triple_terms {
+            Some(terms) if role == Role::Object => terms.decode(id.0),
+            _ => None,
         };
-        let published: Rc<str> = Rc::from(iri.as_str());
-        let serialized = serialized_bytes(&Term::Iri(Cow::Borrowed(published.as_ref())));
+        let published = match decoded {
+            Some(proposition) => {
+                let mut text = String::new();
+                self.publish_triple(dictionary, proposition, &mut text)?;
+                text
+            }
+            None => match self.blank_nodes.iri(role, id, &stored) {
+                Some(iri) => iri,
+                None => {
+                    return Ok((
+                        RowTerm {
+                            published: Rc::clone(&stored),
+                            stored,
+                        },
+                        serialized,
+                    ));
+                }
+            },
+        };
+        let published: Rc<str> = Rc::from(published.as_str());
+        let serialized = serialized_bytes(&Term::from_published(&published));
         self.published
             .insert((role, id.0), (Rc::clone(&published), serialized));
         Ok((RowTerm { published, stored }, serialized))
     }
+
+    /// Write a triple term's published spelling: request syntax, IRIs in
+    /// brackets, blank nodes as their scoped IRIs.
+    fn publish_triple(
+        &self,
+        data: &Dictionary<'_>,
+        proposition: Proposition,
+        out: &mut String,
+    ) -> Result<(), DictionaryTermError> {
+        let terms = self
+            .triple_terms
+            .expect("a proposition was decoded through the index");
+        let dictionary = match proposition.source {
+            TripleTermSource::Data => *data,
+            TripleTermSource::Propositions => terms
+                .propositions_dict()
+                .expect("an unasserted triple term has a propositions HDT"),
+        };
+        let triple = proposition.triple;
+        out.push_str("<<( ");
+        self.publish_component(
+            data,
+            &dictionary,
+            proposition.source,
+            Role::Subject,
+            triple.subject,
+            out,
+        )?;
+        out.push_str(" <");
+        out.push_str(&extract(&dictionary, Role::Predicate, triple.predicate)?);
+        out.push_str("> ");
+        match terms.decode_in(proposition.source, triple.object) {
+            Some(nested) => self.publish_triple(data, nested, out)?,
+            None => self.publish_component(
+                data,
+                &dictionary,
+                proposition.source,
+                Role::Object,
+                triple.object,
+                out,
+            )?,
+        }
+        out.push_str(" )>>");
+        Ok(())
+    }
+
+    /// One non-triple component of a triple term, in its published spelling.
+    fn publish_component(
+        &self,
+        data: &Dictionary<'_>,
+        dictionary: &Dictionary<'_>,
+        source: TripleTermSource,
+        role: Role,
+        id: u64,
+        out: &mut String,
+    ) -> Result<(), DictionaryTermError> {
+        let stored = extract(dictionary, role, id)?;
+        if stored.starts_with('"') {
+            out.push_str(&stored);
+            return Ok(());
+        }
+        if !stored.starts_with("_:") {
+            out.push('<');
+            out.push_str(&stored);
+            out.push('>');
+            return Ok(());
+        }
+        let iri = match source {
+            TripleTermSource::Data => self.blank_nodes.iri(role, TermId(id), &stored),
+            // The data's node with this label is this node: hdtc labels an
+            // input's two HDTs alike. Only a node the data lacks is scoped by
+            // the propositions HDT.
+            TripleTermSource::Propositions => {
+                let in_data = [Role::Subject, Role::Object].into_iter().find_map(|role| {
+                    data.locate(role, stored.as_bytes())
+                        .ok()
+                        .flatten()
+                        .map(|found| (role, found))
+                });
+                match in_data {
+                    Some((role, found)) => self.blank_nodes.iri(role, found, &stored),
+                    None => self.blank_nodes.propositions_iri(role, TermId(id), &stored),
+                }
+            }
+        };
+        out.push('<');
+        out.push_str(&iri.expect("a blank node of a dictionary role has a scoped IRI"));
+        out.push('>');
+        Ok(())
+    }
+}
+
+/// One stored term, as text.
+fn extract(
+    dictionary: &Dictionary<'_>,
+    role: Role,
+    id: u64,
+) -> Result<String, DictionaryTermError> {
+    let mut buffer = Vec::new();
+    let bytes = dictionary.extract(role, TermId(id), &mut buffer)?;
+    String::from_utf8(bytes.to_vec()).map_err(|_| DictionaryTermError::NotUtf8 { role, id })
 }
 
 /// One result row: a term per variable, and for `/describe` which side of the
@@ -668,7 +793,7 @@ impl Serialize for Row {
             map.serialize_entry(BINDING, &binding)?;
         }
         for (position, term) in &self.cells {
-            map.serialize_entry(position.as_str(), &Term::from_dictionary(&term.published))?;
+            map.serialize_entry(position.as_str(), &Term::from_published(&term.published))?;
         }
         if let Some(graph) = &self.graph {
             map.serialize_entry(GRAPH, &Term::from_dictionary(graph))?;
@@ -964,7 +1089,11 @@ impl Renders for Answer {
         }
         let mut wanted: Vec<&str> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
-        let named = |text: &str| !text.starts_with('"');
+        // Literals have no labels, and neither do triple terms: a triple
+        // term's IRI is an encoding, never the subject of a label.
+        let named = |text: &str| {
+            !text.starts_with('"') && !text.starts_with(kgf_store::triple_terms::NAMESPACE)
+        };
         if let Echo::Fragment { pattern, .. } | Echo::Sample { pattern, .. } = &self.echo {
             for position in Position::ALL {
                 if let Some(bound) = pattern.bound(position) {
@@ -1316,9 +1445,9 @@ impl Answer {
             // representations naming one node the same way.
             let triple = Triple::new(
                 rdf_subject(subject.as_bytes())?,
-                NamedNode::new(predicate)
+                NamedNode::new(predicate.as_ref())
                     .map_err(|error| unreadable("parsing an RDF predicate IRI", &error))?,
-                rdf_object(object.as_bytes())?,
+                rdf_published_object(&object)?,
             );
             let graph_name = match &self.tagging {
                 GraphTagging::Untagged | GraphTagging::Fixed(_) => {
@@ -1600,12 +1729,19 @@ fn rdf_fragment_cell<'a>(
     bound: Option<&'a BoundTerm>,
     row: &'a Row,
     position: Position,
-) -> Option<&'a str> {
-    bound.map(BoundTerm::dictionary).or_else(|| {
-        row.cells
-            .iter()
-            .find_map(|(found, term)| (*found == position).then_some(term.published.as_ref()))
-    })
+) -> Option<Cow<'a, str>> {
+    bound
+        .map(|bound| match bound.triple() {
+            // A bound triple term's dictionary spelling is its minted IRI; RDF
+            // carries the triple term itself, spelled as rows publish one.
+            Some(triple) => Cow::Owned(Term::Triple(Box::new(triple.clone())).to_request()),
+            None => Cow::Borrowed(bound.dictionary()),
+        })
+        .or_else(|| {
+            row.cells.iter().find_map(|(found, term)| {
+                (*found == position).then_some(Cow::Borrowed(term.published.as_ref()))
+            })
+        })
 }
 
 fn id_pattern_matches(pattern: IdPattern, triple: IdTriple) -> bool {
@@ -2039,7 +2175,7 @@ impl TermRow {
 impl Serialize for TermRow {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
-        map.serialize_entry("term", &Term::from_dictionary(&self.published))?;
+        map.serialize_entry("term", &Term::from_published(&self.published))?;
         map.serialize_entry("roles", &self.roles)?;
         if let Some(label) = &self.label {
             map.serialize_entry("label", label)?;
@@ -3510,9 +3646,23 @@ fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
     if let Some(literal) = parse_literal(term) {
         let value = rdf_text(literal.value)?.to_owned();
         if let Some(language) = literal.language {
-            return Literal::new_language_tagged_literal(value, rdf_text(language)?)
+            let language = rdf_text(language)?;
+            // RDF 1.2's base direction, which the dictionary writes after the
+            // tag as `--ltr` or `--rtl`.
+            let directed = [("--ltr", BaseDirection::Ltr), ("--rtl", BaseDirection::Rtl)]
+                .into_iter()
+                .find_map(|(suffix, direction)| {
+                    language.strip_suffix(suffix).map(|tag| (tag, direction))
+                });
+            let literal = match directed {
+                Some((tag, direction)) => {
+                    Literal::new_directional_language_tagged_literal(value, tag, direction)
+                }
+                None => Literal::new_language_tagged_literal(value, language),
+            };
+            return literal
                 .map(Into::into)
-                .map_err(|error| unreadable("parsing a VoID literal language", &error));
+                .map_err(|error| unreadable("parsing an RDF literal language", &error));
         }
         if let Some(datatype) = literal.datatype {
             let datatype = NamedNode::new(rdf_text(datatype)?)
@@ -3530,6 +3680,36 @@ fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
     NamedNode::new(text)
         .map(Into::into)
         .map_err(|error| unreadable("parsing a VoID object IRI", &error))
+}
+
+/// An object in its published spelling, which is a dictionary spelling but
+/// for a triple term, published decoded.
+fn rdf_published_object(text: &str) -> Result<RdfTerm, Problem> {
+    if !text.starts_with("<<(") {
+        return rdf_object(text.as_bytes());
+    }
+    rdf_term(&Term::from_published(text))
+}
+
+/// A term as `oxrdf` holds it, triple terms included.
+fn rdf_term(term: &Term<'_>) -> Result<RdfTerm, Problem> {
+    match term {
+        Term::Triple(triple) => {
+            let subject = match rdf_term(triple.subject())? {
+                RdfTerm::NamedNode(node) => NamedOrBlankNode::NamedNode(node),
+                RdfTerm::BlankNode(node) => NamedOrBlankNode::BlankNode(node),
+                _ => unreachable!("a triple term's subject is an IRI or a blank node"),
+            };
+            let predicate = NamedNode::new(triple.predicate())
+                .map_err(|error| unreadable("parsing a triple term's predicate", &error))?;
+            Ok(RdfTerm::Triple(Box::new(Triple::new(
+                subject,
+                predicate,
+                rdf_term(triple.object())?,
+            ))))
+        }
+        _ => rdf_object(term.to_dictionary().as_bytes()),
+    }
 }
 
 fn rdf_text(bytes: &[u8]) -> Result<&str, Problem> {
@@ -4258,7 +4438,12 @@ pub fn fragment(
     };
 
     match (
-        resolve(&dictionary, &envelope.blank_nodes, &request.pattern)?,
+        resolve(
+            &dictionary,
+            &envelope.blank_nodes,
+            store.triple_terms(),
+            &request.pattern,
+        )?,
         request.pattern.text(),
     ) {
         (Resolved::Absent(absent), _) => paged(
@@ -4343,7 +4528,12 @@ pub fn count(
         return Err(Problem::from(StaleCursor));
     }
     let (count, completeness, absent_terms) = match (
-        resolve(&dictionary, &blank_nodes, &request.pattern)?,
+        resolve(
+            &dictionary,
+            &blank_nodes,
+            store.triple_terms(),
+            &request.pattern,
+        )?,
         request.pattern.text(),
     ) {
         // Exact and free of the enumeration: a range width after bounded
@@ -4402,7 +4592,7 @@ pub fn binding_fragment(
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
     let blank_nodes = SkolemScope::of(store);
-    let mut cache = LookupCache::new(dictionary, blank_nodes.clone());
+    let mut cache = LookupCache::new(dictionary, blank_nodes.clone(), store.triple_terms());
     let mut restrictions = Vec::new();
     for row in request.rows() {
         let Some(ids) = resolve_binding(&mut cache, row)? else {
@@ -4479,7 +4669,7 @@ pub fn binding_count(
 ) -> Result<BindingCountAnswer, Problem> {
     let dictionary = store.dict();
     let blank_nodes = SkolemScope::of(store);
-    let mut cache = LookupCache::new(dictionary, blank_nodes.clone());
+    let mut cache = LookupCache::new(dictionary, blank_nodes.clone(), store.triple_terms());
     // A graph this bundle does not hold makes every row zero, and the answer
     // says so rather than letting a client read the zeros as data.
     let scope = Scope::resolve(store, &target, &blank_nodes, &request.graph)?;
@@ -4638,7 +4828,7 @@ pub fn search(
     let mut results = Vec::with_capacity(request.limit as usize);
     let mut seen = HashSet::with_capacity(request.limit as usize);
     let mut cache = TermCache::new();
-    let mut published = PublishedTerms::new(blank_nodes.clone());
+    let mut published = PublishedTerms::new(blank_nodes.clone(), store);
     let mut resolution_budget = request.candidates.0;
     let mut spent_bytes = 0u64;
     let mut resolution_exhausted = false;
@@ -4865,7 +5055,13 @@ pub fn labels(
         let label = if let Some(label) = resolved_labels.get(requested.dictionary()) {
             label.clone()
         } else {
-            let label = match locate_scoped(&dictionary, &blank_nodes, Role::Subject, requested)? {
+            let label = match locate_scoped(
+                &dictionary,
+                &blank_nodes,
+                store.triple_terms(),
+                Role::Subject,
+                requested,
+            )? {
                 Some(subject) => {
                     preferred_label(store, &dictionary, &mut cache, subject, &label_predicates)?
                 }
@@ -4964,7 +5160,7 @@ pub fn terms(
     let blank_nodes = SkolemScope::of(store);
     let label_predicates = resolve_predicate_ids(&dictionary, &request.label_predicates)?;
     let mut cache = TermCache::new();
-    let mut published = PublishedTerms::new(blank_nodes.clone());
+    let mut published = PublishedTerms::new(blank_nodes.clone(), store);
     let mut rows: Vec<TermRow> = Vec::with_capacity(request.limit as usize);
     let mut spent = 0u64;
     let mut spent_budget = false;
@@ -5226,8 +5422,13 @@ pub fn describe(
 
     let mut phases = Vec::new();
     if request.direction.walks_out()
-        && let Some(subject) =
-            locate_scoped(&dictionary, &blank_nodes, Role::Subject, &request.resource)?
+        && let Some(subject) = locate_scoped(
+            &dictionary,
+            &blank_nodes,
+            store.triple_terms(),
+            Role::Subject,
+            &request.resource,
+        )?
     {
         let selection = select(
             store,
@@ -5243,8 +5444,13 @@ pub fn describe(
         )?);
     }
     if request.direction.walks_in()
-        && let Some(object) =
-            locate_scoped(&dictionary, &blank_nodes, Role::Object, &request.resource)?
+        && let Some(object) = locate_scoped(
+            &dictionary,
+            &blank_nodes,
+            store.triple_terms(),
+            Role::Object,
+            &request.resource,
+        )?
     {
         let selection = select(
             store,
@@ -5303,8 +5509,12 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
     };
     let vars = Vars::new(request.pattern.vars(), false);
 
-    let (count, triples, absent_terms) = match resolve(&dictionary, &blank_nodes, &request.pattern)?
-    {
+    let (count, triples, absent_terms) = match resolve(
+        &dictionary,
+        &blank_nodes,
+        store.triple_terms(),
+        &request.pattern,
+    )? {
         Resolved::Absent(absent) => (0, Vec::new(), absent),
         Resolved::Ids(ids) => {
             let (count, drawn) = draw(&select(store, ids)?, u64::from(request.n), request.seed);
@@ -5328,6 +5538,7 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         .collect();
 
     let (rows, spent_at) = materialize(
+        store,
         &dictionary,
         &blank_nodes,
         None,
@@ -5955,6 +6166,7 @@ enum Resolved {
 fn resolve(
     dictionary: &Dictionary<'_>,
     blank_nodes: &SkolemScope,
+    triple_terms: Option<&TripleTerms>,
     pattern: &Pattern,
 ) -> Result<Resolved, Problem> {
     let mut ids = IdPattern {
@@ -5967,7 +6179,7 @@ fn resolve(
         let Some(term) = pattern.bound(position) else {
             continue;
         };
-        match locate_scoped(dictionary, blank_nodes, position.role(), term)? {
+        match locate_scoped(dictionary, blank_nodes, triple_terms, position.role(), term)? {
             Some(id) => match position {
                 Position::Subject => ids.subject = Some(id),
                 Position::Predicate => ids.predicate = Some(id),
@@ -6044,9 +6256,13 @@ fn reverse_scoped(
 fn locate_scoped(
     dictionary: &Dictionary<'_>,
     blank_nodes: &SkolemScope,
+    triple_terms: Option<&TripleTerms>,
     role: Role,
     term: &BoundTerm,
 ) -> Result<Option<u64>, Problem> {
+    if let Some(triple) = term.triple() {
+        return locate_triple(dictionary, blank_nodes, triple_terms, role, triple);
+    }
     if term.denotes_blank_node() {
         return Ok(None);
     }
@@ -6059,18 +6275,145 @@ fn locate_scoped(
         .map_err(|error| unreadable("looking a term up", &error))
 }
 
+/// Look a triple term up: mint the IRI hdtc gave it and find that object.
+///
+/// A published blank-node IRI inside is first reversed to the label it was
+/// minted under — the data's, or the propositions HDT's for a node only it
+/// holds — since minting reads labels. A blank node written as `_:label`
+/// addresses nothing here, as everywhere in a request, and so neither does a
+/// triple term containing one. Only an object can be a triple term.
+fn locate_triple(
+    dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    triple_terms: Option<&TripleTerms>,
+    role: Role,
+    triple: &TripleTerm<'_>,
+) -> Result<Option<u64>, Problem> {
+    let Some(terms) = triple_terms else {
+        // A bundle without the index holds no triple terms: `Store::open`
+        // refuses one whose dictionary holds their IRIs.
+        return Ok(None);
+    };
+    if role != Role::Object {
+        return Ok(None);
+    }
+    let Some(proposition) = proposition_of(dictionary, blank_nodes, terms, triple)? else {
+        return Ok(None);
+    };
+    dictionary
+        .locate(
+            Role::Object,
+            hdtc::format::triple_term_iri(&proposition).as_bytes(),
+        )
+        .map(|found| found.map(|id| id.0))
+        .map_err(|error| unreadable("looking a triple term up", &error))
+}
+
+/// The proposition hdtc minted a request's triple term from, or `None` if a
+/// component cannot be one the bundle holds.
+fn proposition_of(
+    dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    terms: &TripleTerms,
+    triple: &TripleTerm<'_>,
+) -> Result<Option<TripleTermProposition>, Problem> {
+    let Some(subject) = component_of(
+        dictionary,
+        blank_nodes,
+        terms,
+        Role::Subject,
+        triple.subject(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(object) = component_of(
+        dictionary,
+        blank_nodes,
+        terms,
+        Role::Object,
+        triple.object(),
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(TripleTermProposition {
+        subject,
+        predicate: triple.predicate().to_owned(),
+        object,
+    }))
+}
+
+fn component_of(
+    dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    terms: &TripleTerms,
+    role: Role,
+    term: &Term<'_>,
+) -> Result<Option<TripleTermComponent>, Problem> {
+    Ok(Some(match term {
+        Term::BlankNode(_) => return Ok(None),
+        Term::Literal(_) => TripleTermComponent::Literal(term.to_dictionary().into_owned()),
+        Term::Triple(inner) => match proposition_of(dictionary, blank_nodes, terms, inner)? {
+            Some(proposition) => TripleTermComponent::Triple(Box::new(proposition)),
+            None => return Ok(None),
+        },
+        Term::Iri(iri) => {
+            if let Some(id) = reverse_scoped(dictionary, blank_nodes, role, iri)? {
+                blank_label(dictionary, role, id)?
+            } else if let (Some(id), Some(props)) = (
+                blank_nodes.propositions_role_id(role, iri),
+                terms.propositions_dict(),
+            ) {
+                let label = blank_label(&props, role, id.0)?;
+                if !matches!(label, TripleTermComponent::Blank(_)) {
+                    return Ok(None);
+                }
+                label
+            } else {
+                TripleTermComponent::Iri(iri.clone().into_owned())
+            }
+        }
+    }))
+}
+
+/// A stored blank node's label, as a minting component; an IRI component if
+/// the term there is not a blank node after all.
+fn blank_label(
+    dictionary: &Dictionary<'_>,
+    role: Role,
+    id: u64,
+) -> Result<TripleTermComponent, Problem> {
+    let mut buffer = Vec::new();
+    let stored = dictionary
+        .extract(role, TermId(id), &mut buffer)
+        .map_err(|error| unreadable("reversing a blank-node IRI", &error))?;
+    let stored = std::str::from_utf8(stored)
+        .map_err(|error| unreadable("reading a blank-node label", &error))?;
+    Ok(match stored.strip_prefix("_:") {
+        Some(label) => TripleTermComponent::Blank(label.to_owned()),
+        None => TripleTermComponent::Iri(stored.to_owned()),
+    })
+}
+
 /// Dictionary probes shared by all rows of one binding table.
 struct LookupCache<'a> {
     dictionary: Dictionary<'a>,
     blank_nodes: SkolemScope,
+    triple_terms: Option<&'a TripleTerms>,
     found: [HashMap<String, Option<u64>>; 3],
 }
 
 impl<'a> LookupCache<'a> {
-    fn new(dictionary: Dictionary<'a>, blank_nodes: SkolemScope) -> Self {
+    fn new(
+        dictionary: Dictionary<'a>,
+        blank_nodes: SkolemScope,
+        triple_terms: Option<&'a TripleTerms>,
+    ) -> Self {
         Self {
             dictionary,
             blank_nodes,
+            triple_terms,
             found: std::array::from_fn(|_| HashMap::new()),
         }
     }
@@ -6080,7 +6423,13 @@ impl<'a> LookupCache<'a> {
         if let Some(found) = by_term.get(term.dictionary()) {
             return Ok(*found);
         }
-        let found = locate_scoped(&self.dictionary, &self.blank_nodes, role, term)?;
+        let found = locate_scoped(
+            &self.dictionary,
+            &self.blank_nodes,
+            self.triple_terms,
+            role,
+            term,
+        )?;
         by_term.insert(term.dictionary().to_owned(), found);
         Ok(found)
     }
@@ -6384,6 +6733,7 @@ fn finish(
     // applies — before the response exists rather than after, which also bounds
     // the memory a page can take.
     let (rows, spent_at) = materialize(
+        store,
         &dictionary,
         &blank_nodes,
         store.graphs(),
@@ -6727,6 +7077,7 @@ fn resume_position(
 /// bound applied. The two passes bound different resources; neither can be
 /// removed without replacing it with an equally explicit memory bound.
 fn materialize(
+    store: &Store,
     dictionary: &Dictionary<'_>,
     blank_nodes: &SkolemScope,
     graphs: Option<&Graphs>,
@@ -6735,7 +7086,7 @@ fn materialize(
     bytes: ResponseBytes,
 ) -> Result<(Vec<Row>, Option<usize>), Problem> {
     let mut cache = TermCache::new();
-    let mut published = PublishedTerms::new(blank_nodes.clone());
+    let mut published = PublishedTerms::new(blank_nodes.clone(), store);
     let mut graph_names = GraphNames::new(*dictionary, blank_nodes);
     let mut rows: Vec<Row> = Vec::with_capacity(steps.len());
     let mut spent = 0u64;
@@ -7485,7 +7836,7 @@ fn schema_cell<'a>(
         Term::Iri(iri) => labels
             .and_then(|labels| labels.get(iri.as_ref()))
             .and_then(Option::as_deref),
-        Term::BlankNode(_) | Term::Literal(_) => None,
+        Term::BlankNode(_) | Term::Literal(_) | Term::Triple(_) => None,
     };
     let (label, qualifier, full_iri) = Term::from_dictionary(&term.0)
         .into_display(&target.prefixes)
@@ -8420,10 +8771,10 @@ fn term_cell<'a>(
     text: &'a str,
     annotation: Option<&'a str>,
 ) -> Cell<'a> {
-    let term = Term::from_dictionary(text);
+    let term = Term::from_published(text);
     let request = term.to_request();
     let href = match &term {
-        Term::Literal(_) => target.ask("fragment", "o", &request),
+        Term::Literal(_) | Term::Triple(_) => target.ask("fragment", "o", &request),
         _ => target.ask("describe", "iri", &request),
     };
     let (label, qualifier, full_iri) = match blank_nodes.display_label(text) {

@@ -13,6 +13,12 @@
 //! id is a layer of the membership sidecar, and two sidecars over one HDT can
 //! give the same layer id to different graphs, so it is scoped by the
 //! sidecar's digest instead.
+//!
+//! A blank node inside an unasserted RDF 1.2 triple term lives in the
+//! propositions HDT. When the data has a node with the same label it *is* that
+//! node — hdtc labels an input's two HDTs alike — and is published under the
+//! data's IRI. One that occurs only there is scoped by the propositions HDT's
+//! digest, for the same reason a graph-only name is scoped by the sidecar's.
 
 use kgf_store::Store;
 use kgf_store::dict::{DictCounts, Section, SectionTermId};
@@ -29,6 +35,9 @@ pub(crate) struct SkolemScope {
     /// memberships, which has no such graph to name.
     graph_prefix: Option<String>,
     counts: DictCounts,
+    /// Where blank nodes found only in the propositions HDT are minted, with
+    /// that HDT's dictionary counts; `None` for a bundle without one.
+    propositions: Option<(String, DictCounts)>,
 }
 
 impl SkolemScope {
@@ -38,16 +47,58 @@ impl SkolemScope {
             iri_prefix: scoped_prefix(hdt_identity_digest),
             graph_prefix: None,
             counts,
+            propositions: None,
         }
     }
 
     /// The scope of every blank node one open bundle publishes.
     pub(crate) fn of(store: &Store) -> Self {
         let scope = Self::new(store.hdt_identity_digest(), *store.dict().counts());
-        match store.graphs() {
+        let scope = match store.graphs() {
             Some(graphs) => scope.with_graph_sidecar(graphs.sidecar_identity_digest()),
             None => scope,
+        };
+        let propositions = store.triple_terms().and_then(|terms| {
+            Some((
+                terms.propositions_identity_digest()?,
+                *terms.propositions_dict()?.counts(),
+            ))
+        });
+        match propositions {
+            Some((digest, counts)) => scope.with_propositions(digest, counts),
+            None => scope,
         }
+    }
+
+    /// Bind blank nodes found only in the propositions HDT to its digest.
+    pub(crate) fn with_propositions(self, digest: [u8; 32], counts: DictCounts) -> Self {
+        Self {
+            propositions: Some((scoped_prefix(digest), counts)),
+            ..self
+        }
+    }
+
+    /// Replace a propositions-HDT blank node, one the data does not hold, with
+    /// its stable RDF IRI. `None` in a scope without a propositions HDT.
+    pub(crate) fn propositions_iri(
+        &self,
+        role: Role,
+        id: TermId,
+        dictionary_term: &str,
+    ) -> Option<String> {
+        dictionary_term.strip_prefix("_:")?;
+        let (prefix, counts) = self.propositions.as_ref()?;
+        let section_id = counts.section_id(role, id).ok()?;
+        let section = section_name(section_id.section())?;
+        Some(format!("{prefix}{section}-{}", section_id.local_id()))
+    }
+
+    /// Recover the role-scoped propositions-HDT id one of its blank-node URNs
+    /// names. The caller still verifies the id names a blank node there.
+    pub(crate) fn propositions_role_id(&self, role: Role, term: &str) -> Option<TermId> {
+        let (prefix, counts) = self.propositions.as_ref()?;
+        let (section, local_id) = split_suffix(term.strip_prefix(prefix.as_str())?)?;
+        counts.role_id(role, SectionTermId::new(section, local_id)?)
     }
 
     /// Bind graph-only blank names to the membership sidecar's digest.
@@ -129,21 +180,41 @@ impl SkolemScope {
         if self.suffix(term).is_some() {
             return term.strip_prefix(&self.iri_prefix);
         }
+        if let Some((prefix, _)) = &self.propositions
+            && let Some(local) = term.strip_prefix(prefix.as_str())
+            && split_suffix(local).is_some()
+        {
+            return Some(local);
+        }
         self.graph_id(term)?;
         term.strip_prefix(self.graph_prefix.as_deref()?)
     }
 
     /// Split a URN of this scope into its section and canonical local id.
     fn suffix(&self, term: &str) -> Option<(Section, u64)> {
-        let local = term.strip_prefix(&self.iri_prefix)?;
-        let (section, id) = local.split_once('-')?;
-        let section = match section {
-            "sh" => Section::Shared,
-            "s" => Section::Subjects,
-            "o" => Section::Objects,
-            _ => return None,
-        };
-        Some((section, canonical_id(id)?))
+        split_suffix(term.strip_prefix(&self.iri_prefix)?)
+    }
+}
+
+/// The section and canonical local id a `{section}-{local-id}` tail names.
+fn split_suffix(local: &str) -> Option<(Section, u64)> {
+    let (section, id) = local.split_once('-')?;
+    let section = match section {
+        "sh" => Section::Shared,
+        "s" => Section::Subjects,
+        "o" => Section::Objects,
+        _ => return None,
+    };
+    Some((section, canonical_id(id)?))
+}
+
+/// How a URN tail names a dictionary section; predicates are never blank.
+fn section_name(section: Section) -> Option<&'static str> {
+    match section {
+        Section::Shared => Some("sh"),
+        Section::Subjects => Some("s"),
+        Section::Objects => Some("o"),
+        Section::Predicates => None,
     }
 }
 

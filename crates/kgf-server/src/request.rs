@@ -62,7 +62,7 @@ use crate::cursor::{
 use crate::envelope::{ErrorCode, Problem, reflected};
 use crate::representation::{RdfSyntax, Representation};
 use crate::service::PredicateRoles;
-use crate::term::{Literal as KgfLiteral, PrefixMap, Term};
+use crate::term::{Literal as KgfLiteral, PrefixMap, Term, TripleTerm};
 use crate::url::Params;
 
 // ---------------------------------------------------------------------------
@@ -156,6 +156,10 @@ pub struct BoundTerm {
     requested: String,
     dictionary: String,
     kind: BoundKind,
+    /// The parsed triple term, when this is one. Kept because its dictionary
+    /// spelling is a minted IRI, and a published blank-node IRI inside it has
+    /// to be reversed against the bundle before minting can find it.
+    triple: Option<Box<TripleTerm<'static>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +167,7 @@ enum BoundKind {
     Iri,
     Literal,
     BlankNode,
+    Triple,
 }
 
 impl BoundKind {
@@ -171,6 +176,7 @@ impl BoundKind {
             Term::Iri(_) => Self::Iri,
             Term::Literal(_) => Self::Literal,
             Term::BlankNode(_) => Self::BlankNode,
+            Term::Triple(_) => Self::Triple,
         }
     }
 
@@ -179,7 +185,37 @@ impl BoundKind {
             Self::Iri => 'i',
             Self::Literal => 'l',
             Self::BlankNode => 'b',
+            Self::Triple => 't',
         }
+    }
+}
+
+/// A SPARQL 1.2 ground triple term as this crate's triple term.
+fn ground_triple(triple: spargebra::term::GroundTriple) -> Result<TripleTerm<'static>, Problem> {
+    // A ground term has no blank nodes, so a ground triple's subject is an IRI.
+    let subject = Term::Iri(triple.subject.into_string().into());
+    let object = match triple.object {
+        GroundTerm::NamedNode(node) => Term::Iri(node.into_string().into()),
+        GroundTerm::Literal(literal) => {
+            let value = literal.value().to_owned();
+            Term::Literal(match (literal.language(), literal.direction()) {
+                (Some(language), Some(direction)) => {
+                    KgfLiteral::tagged(value, format!("{language}--{direction}"))
+                }
+                (Some(language), None) => KgfLiteral::tagged(value, language.to_owned()),
+                (None, _) => KgfLiteral::typed(value, literal.datatype().as_str().to_owned()),
+            })
+        }
+        GroundTerm::Triple(inner) => Term::Triple(Box::new(ground_triple(*inner)?)),
+    };
+    Ok(TripleTerm::new(subject, triple.predicate.into_string(), object).expect("an IRI subject"))
+}
+
+/// The parsed triple term of `term`, owned, if it is one.
+fn owned_triple(term: &Term<'_>) -> Option<Box<TripleTerm<'static>>> {
+    match term.clone().into_owned() {
+        Term::Triple(triple) => Some(triple),
+        _ => None,
     }
 }
 
@@ -203,11 +239,13 @@ impl BoundTerm {
                 ),
             ));
         }
-        Ok(Self {
+        Self {
             requested,
             dictionary,
             kind,
-        })
+            triple: owned_triple(&term),
+        }
+        .refuse_encoding(parameter)
     }
 
     /// Whether this term denotes a blank node, however it was written.
@@ -255,11 +293,13 @@ impl BoundTerm {
             )
         })?;
         let kind = BoundKind::of(&term);
-        Ok(Self {
+        Self {
             requested: text.to_owned(),
             dictionary: term.to_dictionary().into_owned(),
             kind,
-        })
+            triple: owned_triple(&term),
+        }
+        .refuse_encoding(parameter)
     }
 
     /// Parse either compact request syntax or the JSON term-object form.
@@ -316,14 +356,48 @@ impl BoundTerm {
                 };
                 Term::Literal(literal)
             }
-            GroundTerm::Triple(_) => {
-                return Err(Problem::new(
-                    ErrorCode::BadTermSyntax,
-                    format!("`{parameter}` holds a triple term, which `values=` does not take yet"),
-                ));
-            }
+            GroundTerm::Triple(triple) => Term::Triple(Box::new(ground_triple(*triple)?)),
         };
         Self::from_canonical_term(parameter, term.to_request(), term, limits)
+    }
+
+    /// Refuse an IRI under the triple-term namespace, wherever it appears in
+    /// the term: it is how a bundle encodes a triple term, not a name anyone
+    /// uses, and the triple term itself is the spelling that works.
+    fn refuse_encoding(self, parameter: &str) -> Result<Self, Problem> {
+        fn names_encoding(term: &Term<'_>) -> bool {
+            match term {
+                Term::Iri(iri) => iri.starts_with(kgf_store::triple_terms::NAMESPACE),
+                Term::Triple(triple) => {
+                    names_encoding(triple.subject())
+                        || triple
+                            .predicate()
+                            .starts_with(kgf_store::triple_terms::NAMESPACE)
+                        || names_encoding(triple.object())
+                }
+                Term::BlankNode(_) | Term::Literal(_) => false,
+            }
+        }
+        let encoded = match &self.triple {
+            Some(triple) => names_encoding(&Term::Triple(triple.clone())),
+            None => {
+                self.kind == BoundKind::Iri
+                    && self
+                        .dictionary
+                        .starts_with(kgf_store::triple_terms::NAMESPACE)
+            }
+        };
+        if encoded {
+            return Err(Problem::new(
+                ErrorCode::BadTermSyntax,
+                format!(
+                    "`{parameter}` names an IRI under `{}`, which is how a bundle encodes a \
+                     triple term; write the triple term itself, `<<( subject predicate object )>>`",
+                    kgf_store::triple_terms::NAMESPACE
+                ),
+            ));
+        }
+        Ok(self)
     }
 
     /// Parse Hydra `ExplicitRepresentation`, used only by `/tpf`.
@@ -378,7 +452,28 @@ impl BoundTerm {
             requested: format!("<{iri}>"),
             dictionary: iri.to_owned(),
             kind: BoundKind::Iri,
+            triple: None,
         }
+    }
+
+    /// The triple term this binds, if it binds one.
+    pub fn triple(&self) -> Option<&TripleTerm<'static>> {
+        self.triple.as_deref()
+    }
+
+    /// Refuse a triple term in a position RDF 1.2 gives none: the subject and
+    /// the predicate.
+    fn require_not_triple(self, position: Position, parameter: &str) -> Result<Self, Problem> {
+        if self.kind == BoundKind::Triple && position != Position::Object {
+            return Err(Problem::new(
+                ErrorCode::BadTermSyntax,
+                format!(
+                    "`{parameter}` is a triple term, but a triple term is only ever an object; \
+                     bind it as `o`"
+                ),
+            ));
+        }
+        Ok(self)
     }
 }
 
@@ -404,8 +499,10 @@ impl Pattern {
                 .get(position.as_str())
                 .filter(|text| !text.is_empty())
             {
-                *pattern.slot(position) =
-                    Some(BoundTerm::parse(position.as_str(), text, limits, prefixes)?);
+                *pattern.slot(position) = Some(
+                    BoundTerm::parse(position.as_str(), text, limits, prefixes)?
+                        .require_not_triple(position, position.as_str())?,
+                );
             }
         }
         // Part of the pattern rather than beside it: the constraint sits in
@@ -1221,9 +1318,10 @@ impl BindingPattern {
                 WireTerm::Text(text) if text.starts_with('?') => {
                     BindingCell::Variable(Variable::parse(&text, &parameter)?)
                 }
-                term => {
-                    BindingCell::Term(BoundTerm::parse_body(&parameter, term, limits, prefixes)?)
-                }
+                term => BindingCell::Term(
+                    BoundTerm::parse_body(&parameter, term, limits, prefixes)?
+                        .require_not_triple(position, &parameter)?,
+                ),
             };
             cells.push(cell);
         }
@@ -5034,6 +5132,7 @@ mod tests {
                 requested: "p=ex:knows".split_once('=').unwrap().1.to_owned(),
                 dictionary: "http://example.org/knows".to_owned(),
                 kind: BoundKind::Iri,
+                triple: None,
             })
         );
         assert_eq!(
