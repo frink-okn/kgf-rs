@@ -2428,3 +2428,84 @@ fn a_graph_index_from_another_sidecar_is_refused_even_when_the_counts_agree() {
         "{stderr}"
     );
 }
+
+/// RDF 1.2 triple terms, asserted and not, in both kinds of input.
+const TRIPLE_TERMS: &str = concat!(
+    "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .\n",
+    "<http://example.org/e1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+    "<<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>> .\n",
+    "<http://example.org/e2> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+    "<<( <http://example.org/bob> <http://example.org/knows> <http://example.org/carol> )>> .\n",
+);
+
+/// A bundle built from RDF with triple terms carries the index and the
+/// propositions HDT and declares `reification`; one built from that bundle's
+/// HDT brings them along, and `--adopt` releases them with the HDT.
+#[test]
+fn triple_terms_travel_with_rdf_and_hdt_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tt.nt");
+    std::fs::write(&source, TRIPLE_TERMS).unwrap();
+    let files = [
+        "data.hdt.tt",
+        "data.hdt.props.hdt",
+        "data.hdt.props.hdt.perm",
+    ];
+    let first = dir.path().join("staging/tinykg/v0");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&first),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    for file in files {
+        assert!(first.join(file).is_file(), "missing {file}");
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(first.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        manifest["capabilities"].get("reification").is_some(),
+        "{}",
+        manifest["capabilities"]
+    );
+    kgf(&["manifest", path(&first), "--check"], "").ok();
+
+    for (version, adopt) in [("2026-06-01", false), ("2026-06-02", true)] {
+        let out = dir.path().join(format!("root/tinykg/{version}"));
+        let hdt = first.join("data.hdt");
+        let hdtc = hdtc();
+        let mut args = vec![
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--hdt",
+            path(&hdt),
+            "--hdtc",
+            &hdtc,
+        ];
+        if adopt {
+            args.push("--adopt");
+        }
+        kgf(&args, CONFIG).ok();
+        for file in files {
+            assert!(out.join(file).is_file(), "{version}: missing {file}");
+            assert_eq!(
+                first.join(file).exists(),
+                !adopt,
+                "{version}: {file} beside the input"
+            );
+        }
+        kgf(&["manifest", path(&out), "--check"], "").ok();
+    }
+}

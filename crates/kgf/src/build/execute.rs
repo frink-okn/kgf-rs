@@ -533,6 +533,21 @@ struct Adopted {
     graphs: bool,
     /// The permutation index.
     permutation: bool,
+    /// The triple-term index and the propositions HDT, with its own
+    /// permutation index, as many of them as the input carried.
+    triple_terms: bool,
+}
+
+/// The files that carry an HDT's RDF 1.2 triple terms: the index, and the
+/// propositions HDT with its permutation index, which exist only when some
+/// triple term is unasserted.
+fn triple_term_files(hdt: &Path) -> [std::path::PathBuf; 3] {
+    let propositions = hdtc::format::propositions_hdt_path(hdt);
+    [
+        hdtc::format::triple_term_index_path(hdt),
+        hdtc::format::permutation_index_path(&propositions),
+        propositions,
+    ]
 }
 
 /// `data.hdt` and everything that came with it, and what was read to hash it.
@@ -581,6 +596,23 @@ fn materialize(
                     )
                 })?;
             }
+            // Triple terms travel too, and for the same reason: the index and
+            // the propositions HDT bind to these bytes, and the propositions
+            // are data no other file holds. Without them a `data.hdt` holding
+            // triple-term IRIs is refused when the bundle is described.
+            let triple_terms = hdtc::format::triple_term_index_path(path).is_file();
+            if triple_terms {
+                for (from, to) in triple_term_files(path)
+                    .into_iter()
+                    .zip(triple_term_files(data))
+                {
+                    if from.is_file() {
+                        place_unhashed(&from, &to, *adopt).with_context(|| {
+                            format!("copying {} beside the HDT", from.display())
+                        })?;
+                    }
+                }
+            }
             // The graph *index* beside an input is deliberately not taken. It
             // is derived from the sidecar in minutes, and this server requires
             // layer sets an arbitrary one need not carry.
@@ -593,6 +625,7 @@ fn materialize(
                 adopted: Adopted {
                     graphs,
                     permutation,
+                    triple_terms,
                 },
             })
         }
@@ -846,9 +879,16 @@ fn release_adopted_input(plan: &BundlePlan, adopted: Adopted) {
     let permutation = adopted
         .permutation
         .then(|| hdtc::format::permutation_index_path(path));
+    let triple_terms = adopted
+        .triple_terms
+        .then(|| triple_term_files(path))
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     let released = std::iter::once(path.as_path())
         .chain(sidecar.as_deref())
         .chain(permutation.as_deref())
+        .chain(triple_terms.iter().map(std::path::PathBuf::as_path))
         .filter(|file| file.is_file());
     for file in released {
         if let Err(error) = std::fs::remove_file(file) {
