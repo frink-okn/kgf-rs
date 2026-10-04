@@ -309,7 +309,7 @@ fn validate_id(counts: &DictCounts, role: Role, id: Option<u64>) -> Result<()> {
     }
 }
 
-fn contiguous<'a>(
+pub(crate) fn contiguous<'a>(
     permutation: Permutation,
     triples: BitmapTriples<'a>,
     z_range: Range<u64>,

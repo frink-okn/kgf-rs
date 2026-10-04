@@ -175,6 +175,15 @@ pub enum Capability {
     Filters,
     /// Exact role key sets under `keysets/`.
     Keysets,
+    /// RDF 1.2 triple terms: the bundle holds some, and carries the index that
+    /// renders them and matches inside them.
+    ///
+    /// **Not a gate.** A bundle whose data holds triple terms without the index
+    /// is refused at open, so one without the index provably holds none, and
+    /// answers every pattern naming a triple term — exactly, and with nothing.
+    /// The declaration is for a reader without the bundle: it says which
+    /// datasets are worth asking about statements.
+    Reification,
 }
 
 impl Capability {
@@ -192,6 +201,7 @@ impl Capability {
             Self::Closure => "closure",
             Self::Filters => "filters",
             Self::Keysets => "keysets",
+            Self::Reification => "reification",
         }
     }
 }
@@ -234,6 +244,7 @@ impl BundleFacts {
         let data = IndexedHdt::open(hdt, perm)?;
 
         let _graphs = artifacts.open_graphs(bundle)?;
+        let _triple_terms = artifacts.open_triple_terms(bundle, &data)?;
         let _description = artifacts.open_description(bundle)?;
         // A manifest must not describe an optional capability whose complete
         // artifact cannot be opened. Reading only hdtc-text.meta would accept
@@ -310,6 +321,9 @@ fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
     if artifacts.text.is_some() {
         capabilities.insert(Capability::Search);
     }
+    if artifacts.triple_terms.is_some() {
+        capabilities.insert(Capability::Reification);
+    }
     // Each sketch family is all-or-nothing: both filter roles or neither, both
     // sketch roles or neither. A bundle carrying one role of a
     // family is not a bundle with a partial capability — it is a bundle whose
@@ -329,7 +343,7 @@ fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
 /// The artifact file names present, in canonical bundle-layout order.
 ///
 /// **This list must grow with every sidecar.** Reserved future locations include `labels/`,
-/// `ranges/`, `closures/`, `reif/`, `geo/` and `vectors/`, none of which has a
+/// `ranges/`, `closures/`, `geo/` and `vectors/`, none of which has a
 /// producer yet; an artifact absent from here
 /// is absent from the manifest's checksums and therefore from
 /// `content_digest`. Adding a sidecar without adding it here silently narrows a
@@ -347,6 +361,15 @@ fn artifact_names_for(artifacts: &ArtifactSet) -> Vec<&'static str> {
     }
     if artifacts.graph_index.is_some() {
         names.push(artifact::GRAPHS_IDX);
+    }
+    if artifacts.triple_terms.is_some() {
+        names.push(artifact::TRIPLE_TERMS);
+    }
+    if artifacts.propositions.is_some() {
+        names.push(artifact::PROPOSITIONS);
+    }
+    if artifacts.propositions_perm.is_some() {
+        names.push(artifact::PROPOSITIONS_PERM);
     }
     if artifacts.text.is_some() {
         names.push(artifact::TEXT);

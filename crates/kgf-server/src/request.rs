@@ -305,11 +305,22 @@ impl BoundTerm {
             GroundTerm::NamedNode(node) => Term::Iri(node.into_string().into()),
             GroundTerm::Literal(literal) => {
                 let value = literal.value().to_owned();
-                let literal = match literal.language() {
-                    Some(language) => KgfLiteral::tagged(value, language.to_owned()),
-                    None => KgfLiteral::typed(value, literal.datatype().as_str().to_owned()),
+                let literal = match (literal.language(), literal.direction()) {
+                    // RDF 1.2's base direction, spelled as hdtc's dictionary
+                    // spells it: after the tag, `--ltr` or `--rtl`.
+                    (Some(language), Some(direction)) => {
+                        KgfLiteral::tagged(value, format!("{language}--{direction}"))
+                    }
+                    (Some(language), None) => KgfLiteral::tagged(value, language.to_owned()),
+                    (None, _) => KgfLiteral::typed(value, literal.datatype().as_str().to_owned()),
                 };
                 Term::Literal(literal)
+            }
+            GroundTerm::Triple(_) => {
+                return Err(Problem::new(
+                    ErrorCode::BadTermSyntax,
+                    format!("`{parameter}` holds a triple term, which `values=` does not take yet"),
+                ));
             }
         };
         Self::from_canonical_term(parameter, term.to_request(), term, limits)

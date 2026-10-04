@@ -783,7 +783,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hdtc"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
@@ -799,6 +799,7 @@ dependencies = [
  "md5",
  "oxrdf",
  "oxrdfio",
+ "oxrdfxml-hdtc",
  "oxttl-hdtc",
  "rayon",
  "same-file",
@@ -1469,6 +1470,17 @@ name = "oxrdfxml"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd5516ae083d09bc57ec65ed5ee97701481725de6ffaa83d968ab42a96157ba1"
+dependencies = [
+ "oxilangtag",
+ "oxiri",
+ "oxrdf",
+ "quick-xml",
+ "thiserror",
+]
+
+[[package]]
+name = "oxrdfxml-hdtc"
+version = "0.2.3"
 dependencies = [
  "oxilangtag",
  "oxiri",
