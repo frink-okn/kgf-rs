@@ -953,9 +953,9 @@ fn parse_explicit_iri(value: &str) -> Result<Cow<'_, str>, TermSyntaxError> {
 /// A triple-term component as hdtc's minting takes it. An IRI goes through
 /// `from_dictionary`, hdtc's one reading of a stored string's kind: the
 /// dictionary holds an IRI spelled like a literal as that literal's string,
-/// so a request must mint the name the build did. Compact syntax refuses such
-/// an IRI; it arrives as a JSON `iri` term, typically one this server
-/// published for a lenient component (`{"type": "iri", "value": "\"a\"@EN"}`).
+/// so a request must mint the name the build did — whether it arrives in
+/// compact syntax (`<"a"@EN>`) or, as this server publishes a lenient
+/// component, as a JSON `iri` term (`{"type": "iri", "value": "\"a\"@EN"}`).
 fn component(term: &Term<'_>) -> TripleTermComponent {
     match term {
         Term::Iri(iri) => TripleTermComponent::from_dictionary(iri.clone().into_owned()),

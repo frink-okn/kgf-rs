@@ -2715,7 +2715,14 @@ a literal's string (`<"a"@en>`) names the triple term hdtc named. Every name min
 from valid input is unchanged: re-minting all of ROBOKOP's reproduced each one.
 Publishing follows the same rule: inside a triple term, an object string that is not
 a literal in hdtc's encoded form (`hdtc::format::is_encoded_literal`) is published as
-an IRI, so that sent back it names the term hdtc named.
+an IRI, so that sent back it names the term hdtc named; RDF serializations convert
+each component by its kind, so a lenient IRI no RDF syntax can carry fails the page
+as any unreadable term does rather than turning back into a literal. Open: a plain
+row still publishes its terms by spelling, under the canonical-dictionary assumption
+`Term::from_dictionary` documents, so for such a lenient IRI an asserted row's object
+(`"a"@en`) and its triple term's (`<"a"@EN>`) differ. Publishing plain rows by the
+same rule would also publish a foreign HDT's non-canonical literals as IRIs, so it is
+a policy question, not a fix.
 
 **Leaving the propositions' literals out of a text query is free.** hdtc's text index
 covers literals found only in unasserted triple terms; `o.text` and `/search` resolve

@@ -74,7 +74,7 @@ use crate::html::{
     Crumb, Resource, TermText, Value, fields, group_digits, json_body, note, operation_page,
     operation_page_with_format, page, pager, results_table, stats, table,
 };
-use crate::rdf::{GraphFormat, serialize_dataset, serialize_graph};
+use crate::rdf::{DatasetFormat, GraphFormat, serialize_dataset, serialize_graph};
 use crate::representation::{RdfSyntax, Representation};
 use crate::request::{
     self, BindingPattern, BindingRow, BoundTerm, Candidates, Direction, Pattern, Position,
@@ -1503,6 +1503,18 @@ impl Answer {
             }
         }
 
+        // JSON-LD 1.1 has no RDF 1.2 triple terms, and oxrdf refuses to write
+        // one; that is the client's choice of syntax, not a broken bundle.
+        if matches!(syntax, RdfSyntax::Dataset(DatasetFormat::JsonLd))
+            && statements
+                .iter()
+                .any(|quad| matches!(quad.object, RdfTerm::Triple(_)))
+        {
+            return Err(Problem::new(
+                ErrorCode::NotAcceptable,
+                JSON_LD_HAS_NO_TRIPLE_TERMS,
+            ));
+        }
         let next = match (metadata, next_cursor) {
             (Some(metadata), Some(cursor)) => Some(self.tpf_next(metadata, cursor)?),
             _ => None,
@@ -3747,6 +3759,11 @@ fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
         .map_err(|error| unreadable("parsing a VoID object IRI", &error))
 }
 
+/// What a client is told when it asks for JSON-LD of statements whose object
+/// is a triple term.
+pub(crate) const JSON_LD_HAS_NO_TRIPLE_TERMS: &str = "JSON-LD 1.1 cannot represent RDF 1.2 \
+     triple terms, which this page holds; ask for JSON, Turtle, N-Triples, N-Quads or TriG";
+
 /// A term as `oxrdf` holds it, triple terms included.
 fn rdf_term(term: &Term<'_>) -> Result<RdfTerm, Problem> {
     match term {
@@ -3764,7 +3781,19 @@ fn rdf_term(term: &Term<'_>) -> Result<RdfTerm, Problem> {
                 rdf_term(triple.object())?,
             ))))
         }
-        _ => rdf_object(term.to_dictionary().as_bytes()),
+        // By kind, never by spelling: a triple term's component was published
+        // as the kind hdtc named it by, and an IRI that lenient ingest spelled
+        // like a literal (`"a"@EN`) must not turn back into one here. Such an
+        // IRI is no IRI RDF can carry, so it fails as any lenient IRI does.
+        Term::Iri(iri) => NamedNode::new(iri.as_ref())
+            .map(Into::into)
+            .map_err(|error| unreadable("parsing a triple term's IRI", &error)),
+        Term::BlankNode(label) => BlankNode::new(label.as_ref())
+            .map(Into::into)
+            .map_err(|error| unreadable("parsing a triple term's blank node", &error)),
+        // Every published literal is in hdtc's encoded form, so its spelling
+        // reads back as itself.
+        Term::Literal(_) => rdf_object(term.to_dictionary().as_bytes()),
     }
 }
 

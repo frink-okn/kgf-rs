@@ -161,6 +161,12 @@ fn triple_terms_are_published_decoded_and_found_by_their_content() {
         assert_eq!(error.code().as_str(), "bad_term_syntax", "{query}");
     }
 
+    // JSON-LD cannot carry it, and says so.
+    let error = served
+        .try_render_fragment(&store, &format!("p={reifies}"), Representation::JsonLd)
+        .unwrap_err();
+    assert_eq!(error.code().as_str(), "not_acceptable", "{error:?}");
+
     // RDF carries the triple term itself.
     let turtle = served.render(
         &store,
@@ -254,6 +260,20 @@ fn triple_terms_survive_lenient_content_and_name_blank_nodes_in_any_role() {
             vec![format!("http://example.org/{reifier}").as_str()],
             "{blank}"
         );
+    }
+
+    // In RDF, a lenient IRI that no IRI grammar accepts fails the page as an
+    // unreadable term would — never a panic, and never a different term:
+    // the `<"x>` subject is not read back as a literal.
+    for representation in [
+        Representation::Turtle,
+        Representation::NQuads,
+        Representation::TriG,
+        Representation::JsonLd,
+    ] {
+        let rendered =
+            served.try_render_fragment(&store, &format!("s=ex:e5&p={reifies}"), representation);
+        assert!(rendered.is_err(), "{representation:?}");
     }
 
     // A triple term names no graph.
@@ -2632,6 +2652,33 @@ impl Served {
         }
         .expect("render an operation answer");
         String::from_utf8(rendered.body.to_vec()).expect("a UTF-8 body")
+    }
+
+    /// A fragment rendered in `representation`, or the problem rendering it.
+    fn try_render_fragment(
+        &self,
+        store: &Store,
+        query: &str,
+        representation: Representation,
+    ) -> Result<String, kgf_server::envelope::Problem> {
+        use kgf_server::answer::Renders;
+
+        let target = Target::new(
+            self.id(),
+            access_operation("fragment"),
+            params(query),
+            self.release().prefixes().clone(),
+            kgf_server::url::Mount::default(),
+        );
+        let request = request::Fragment::parse(
+            &params(query),
+            self.limits(),
+            self.release().prefixes(),
+            &self.release().binding(),
+        )
+        .expect("a well-formed request");
+        let rendered = answer::fragment(store, target, &request)?.render(representation)?;
+        Ok(String::from_utf8(rendered.body.to_vec()).expect("a UTF-8 body"))
     }
 
     /// Every term of the bundle, per role, in request syntax.
