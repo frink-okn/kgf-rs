@@ -156,30 +156,62 @@ pub struct Layer<'a> {
 }
 
 impl Layer<'_> {
-    /// Marked positions strictly before `position`. Sparse, two selects in
-    /// the high bits bound `position`'s bucket, and a binary search of the
-    /// bucket's ascending low bits places it.
+    /// Marked positions strictly before `position`.
     ///
     /// Panics if `position` exceeds the positions covered.
     pub fn rank(&self, position: u64) -> u64 {
-        let Some(low) = &self.low else {
-            return self.bitmap.rank1(position);
-        };
+        match &self.low {
+            None => self.bitmap.rank1(position),
+            Some(low) => self.locate(low, position).0,
+        }
+    }
+
+    /// The rank of `position` if it is marked: [`contains`](Self::contains)
+    /// and [`rank`](Self::rank) at once, as a probe needs them.
+    pub fn rank_if_marked(&self, position: u64) -> Option<u64> {
+        match &self.low {
+            None => self
+                .bitmap
+                .bitmap()
+                .get(position)
+                .then(|| self.bitmap.rank1(position)),
+            Some(low) => {
+                let (rank, marked) = self.locate(low, position);
+                marked.then_some(rank)
+            }
+        }
+    }
+
+    /// For a sparse layer: the marks before `position`, and whether it is one.
+    ///
+    /// One select in the high bits finds where `position`'s bucket begins;
+    /// its marks are the set bits from there to the next clear bit, and a
+    /// binary search of their ascending low bits places `position` among
+    /// them.
+    fn locate(&self, low: &PackedArray<'_>, position: u64) -> (u64, bool) {
         assert!(
             position <= self.positions,
             "rank({position}) out of range for {} positions",
             self.positions
         );
         if position == self.positions {
-            return self.reverse.len();
+            return (self.reverse.len(), false);
         }
         let bits = low.width();
         let bucket = position >> bits;
-        let start = match bucket {
+        let first = match bucket {
             0 => 0,
-            _ => self.bitmap.select0(bucket - 1) - (bucket - 1),
+            _ => self.bitmap.select0(bucket - 1) + 1,
         };
-        let end = self.bitmap.select0(bucket) - bucket;
+        // Scans start on a byte: skip the clear bits of that byte before
+        // `first`.
+        let high = self.bitmap.bitmap();
+        let byte = first & !7;
+        let skipped = (first - byte) - high.count_ones_in(byte..first);
+        let close = high
+            .select_zero_from(byte, skipped)
+            .expect("every bucket of a sparse layer is closed by a clear bit");
+        let (start, end) = (first - bucket, close - bucket);
         let target = position & ((1u64 << bits) - 1);
         let (mut lo, mut hi) = (start, end);
         while lo < hi {
@@ -190,7 +222,7 @@ impl Layer<'_> {
                 hi = mid;
             }
         }
-        lo
+        (lo, lo < end && low.get(lo) == target)
     }
 
     /// Marked positions in `range`: the matching triple terms, without
@@ -221,11 +253,10 @@ impl Layer<'_> {
 
     /// Whether the triple at `position` is marked.
     pub fn contains(&self, position: u64) -> bool {
-        if self.low.is_none() {
-            return self.bitmap.bitmap().get(position);
+        match &self.low {
+            None => self.bitmap.bitmap().get(position),
+            Some(low) => self.locate(low, position).1,
         }
-        let rank = self.rank(position);
-        rank < self.reverse.len() && self.select(rank) == position
     }
 }
 
@@ -718,8 +749,8 @@ impl<'a> InnerSource<'a> {
             } => {
                 let z = spo.find_level3(spo.level3_range(groups.start + i), *object)?;
                 self.layer
-                    .contains(z)
-                    .then(|| self.layer.term(self.layer.rank(z)))
+                    .rank_if_marked(z)
+                    .map(|rank| self.layer.term(rank))
             }
         }
     }
@@ -1553,6 +1584,7 @@ mod tests {
                         is_marked,
                         "{source:?} {permutation:?} {z}"
                     );
+                    assert_eq!(layer.rank_if_marked(z), is_marked.then_some(rank));
                     if is_marked {
                         assert_eq!(layer.select(rank), z);
                         let named = terms.decode(layer.term(rank)).unwrap().triple;
