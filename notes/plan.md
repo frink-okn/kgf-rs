@@ -2745,6 +2745,20 @@ for a one-hit scan over 5 M literals, and once per hit in ranked search). One-hi
 counts, scans and budgeted searches now take 3–5 µs over 5 M literals, with or
 without the propositions.
 
+**A layer is a bitmap or a sparse set, whichever is smaller.** hdtc first kept each
+layer as a bitmap over every triple, three bits per triple of the dataset whatever
+share were reified — 183 MB per layer over ROBOKOP, and the same for a graph that
+annotates a hundredth as many edges. It now stores each in the smaller of that and
+the Elias–Fano encoding of the marked positions, chosen by the counts
+(`triple-terms-format.md` §8.1); `Layer` answers `rank`, `count_in`, `select`,
+`contains` and `rank_if_marked` either way, so nothing above it changed. A sparse
+rank is one select in the high bits, a scan to the bucket's closing bit, and a binary
+search of the bucket's low bits. ROBOKOP's layers are sparse at 10% marked: the index
+is 2.75 GB instead of 3.03 GB. At the sparse end — the 10 M sample with 1% of its
+edges annotated — it is 2.1 MB instead of 50 MB. Every plan answers the same rows in
+the same time either way (within ±6%, one client, warm cache); a bundle built before
+the change is refused, since its layers are not in the encoding its counts choose.
+
 **Measured at scale.** ROBOKOP annotated — 1.40 B triples, 133 M triple terms, all
 asserted — built with hdtc and served by `kgf serve` from a bundle of `data.hdt`,
 `.perm` and `.tt` (Apple silicon, external SSD, warm page cache, one client):
