@@ -1461,6 +1461,25 @@ impl Answer {
             }
             GraphTagging::Fixed(_) | GraphTagging::Untagged | GraphTagging::PerRow => None,
         };
+        // JSON-LD 1.1 has no RDF 1.2 triple terms, and oxrdf refuses to write
+        // one; that is the client's choice of syntax, not a broken bundle, so
+        // it is refused before any term of the page is converted.
+        if matches!(syntax, RdfSyntax::Dataset(DatasetFormat::JsonLd)) {
+            let bound = match &self.echo {
+                Echo::Fragment { pattern, .. } => pattern.bound(Position::Object),
+                Echo::BindingsFragment { pattern, .. } => pattern.bound(Position::Object),
+                Echo::Describe { .. } | Echo::Sample { .. } => None,
+            };
+            let holds_triple_terms = self.rows.iter().take(keep).any(|row| {
+                rdf_fragment_cell(bound, row, Position::Object).is_some_and(|cell| cell.is_triple())
+            });
+            if holds_triple_terms {
+                return Err(Problem::new(
+                    ErrorCode::NotAcceptable,
+                    JSON_LD_HAS_NO_TRIPLE_TERMS,
+                ));
+            }
+        }
         let mut statements = Vec::with_capacity(keep);
         let mut data = HashSet::with_capacity(keep);
         for row in self.rows.iter().take(keep) {
@@ -1503,18 +1522,6 @@ impl Answer {
             }
         }
 
-        // JSON-LD 1.1 has no RDF 1.2 triple terms, and oxrdf refuses to write
-        // one; that is the client's choice of syntax, not a broken bundle.
-        if matches!(syntax, RdfSyntax::Dataset(DatasetFormat::JsonLd))
-            && statements
-                .iter()
-                .any(|quad| matches!(quad.object, RdfTerm::Triple(_)))
-        {
-            return Err(Problem::new(
-                ErrorCode::NotAcceptable,
-                JSON_LD_HAS_NO_TRIPLE_TERMS,
-            ));
-        }
         let next = match (metadata, next_cursor) {
             (Some(metadata), Some(cursor)) => Some(self.tpf_next(metadata, cursor)?),
             _ => None,
@@ -1795,6 +1802,14 @@ enum FragmentCell<'a> {
 }
 
 impl FragmentCell<'_> {
+    /// Whether this is a triple term, bound by the request or published.
+    fn is_triple(&self) -> bool {
+        match self {
+            Self::Bound(bound) => bound.triple().is_some(),
+            Self::Row(published) => matches!(published, Published::Triple(_)),
+        }
+    }
+
     /// The spelling of an IRI or blank-node position: the subject or the
     /// predicate, which are never triple terms.
     fn text(&self) -> &str {
@@ -3762,16 +3777,21 @@ fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
 /// What a client is told when it asks for JSON-LD of statements whose object
 /// is a triple term.
 pub(crate) const JSON_LD_HAS_NO_TRIPLE_TERMS: &str = "JSON-LD 1.1 cannot represent RDF 1.2 \
-     triple terms, which this page holds; ask for JSON, Turtle, N-Triples, N-Quads or TriG";
+     triple terms, which this page holds; ask for N-Quads or TriG";
 
 /// A term as `oxrdf` holds it, triple terms included.
 fn rdf_term(term: &Term<'_>) -> Result<RdfTerm, Problem> {
     match term {
         Term::Triple(triple) => {
-            let subject = match rdf_term(triple.subject())? {
-                RdfTerm::NamedNode(node) => NamedOrBlankNode::NamedNode(node),
-                RdfTerm::BlankNode(node) => NamedOrBlankNode::BlankNode(node),
-                _ => unreachable!("a triple term's subject is an IRI or a blank node"),
+            // A subject is an IRI or a blank node in RDF whatever it spells,
+            // so one spelled like a literal fails as an unreadable IRI.
+            let subject: NamedOrBlankNode = match triple.subject() {
+                Term::BlankNode(label) => BlankNode::new(label.as_ref())
+                    .map(Into::into)
+                    .map_err(|error| unreadable("parsing a triple term's blank node", &error))?,
+                subject => NamedNode::new(subject.to_dictionary())
+                    .map(Into::into)
+                    .map_err(|error| unreadable("parsing a triple term's subject", &error))?,
             };
             let predicate = NamedNode::new(triple.predicate())
                 .map_err(|error| unreadable("parsing a triple term's predicate", &error))?;
@@ -3781,10 +3801,15 @@ fn rdf_term(term: &Term<'_>) -> Result<RdfTerm, Problem> {
                 rdf_term(triple.object())?,
             ))))
         }
-        // By kind, never by spelling: a triple term's component was published
-        // as the kind hdtc named it by, and an IRI that lenient ingest spelled
-        // like a literal (`"a"@EN`) must not turn back into one here. Such an
-        // IRI is no IRI RDF can carry, so it fails as any lenient IRI does.
+        // As hdtc named the component: an IRI that spells an encoded literal
+        // is that literal — a request may write `<"a"@en>`, and minted the
+        // name of the triple term holding "a"@en — while one that spells no
+        // encoded literal (`"a"@EN`, published so) must not turn back into a
+        // literal here. That one is no IRI RDF can carry, so it fails as any
+        // lenient IRI does.
+        Term::Iri(iri) if iri.starts_with('"') && is_encoded_literal(iri) => {
+            rdf_object(iri.as_bytes())
+        }
         Term::Iri(iri) => NamedNode::new(iri.as_ref())
             .map(Into::into)
             .map_err(|error| unreadable("parsing a triple term's IRI", &error)),

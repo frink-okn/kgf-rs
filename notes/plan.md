@@ -2724,6 +2724,15 @@ row still publishes its terms by spelling, under the canonical-dictionary assump
 same rule would also publish a foreign HDT's non-canonical literals as IRIs, so it is
 a policy question, not a fix.
 
+JSON-LD 1.1 has no triple terms, so a page holding one is 406 `not_acceptable`,
+naming N-Quads and TriG. The refusal depends on the page, as the quad view's does on
+the request: a client paging an unbound-object fragment in JSON-LD can be answered on
+one page and refused on the next, and negotiation has already chosen JSON-LD by then,
+so `Accept: application/ld+json, text/turtle;q=0.5` is refused rather than served
+Turtle. Settling that means refusing JSON-LD for any request that *could* return a
+triple term on a bundle with `reification`, which would refuse every unbound pattern
+there; left as is until a JSON-LD client asks.
+
 **Leaving the propositions' literals out of a text query is free.** hdtc's text index
 covers literals found only in unasserted triple terms; `o.text` and `/search` resolve
 hits through `data.hdt` and ask for `propositions: false`. A range on the document ID

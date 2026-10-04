@@ -161,11 +161,16 @@ fn triple_terms_are_published_decoded_and_found_by_their_content() {
         assert_eq!(error.code().as_str(), "bad_term_syntax", "{query}");
     }
 
-    // JSON-LD cannot carry it, and says so.
+    // JSON-LD cannot carry it, and says so; a page of the same bundle that
+    // holds no triple term is still JSON-LD.
     let error = served
         .try_render_fragment(&store, &format!("p={reifies}"), Representation::JsonLd)
         .unwrap_err();
     assert_eq!(error.code().as_str(), "not_acceptable", "{error:?}");
+    let plain = served
+        .try_render_fragment(&store, "p=ex:knows", Representation::JsonLd)
+        .expect("JSON-LD of a page without triple terms");
+    assert!(plain.contains("http://example.org/bob"), "{plain}");
 
     // RDF carries the triple term itself.
     let turtle = served.render(
@@ -264,16 +269,18 @@ fn triple_terms_survive_lenient_content_and_name_blank_nodes_in_any_role() {
 
     // In RDF, a lenient IRI that no IRI grammar accepts fails the page as an
     // unreadable term would — never a panic, and never a different term:
-    // the `<"x>` subject is not read back as a literal.
-    for representation in [
-        Representation::Turtle,
-        Representation::NQuads,
-        Representation::TriG,
-        Representation::JsonLd,
+    // the `<"x>` subject is not read back as a literal. JSON-LD is refused
+    // first, as the client's syntax rather than the bundle.
+    for (representation, code) in [
+        (Representation::Turtle, "internal_error"),
+        (Representation::NQuads, "internal_error"),
+        (Representation::TriG, "internal_error"),
+        (Representation::JsonLd, "not_acceptable"),
     ] {
-        let rendered =
-            served.try_render_fragment(&store, &format!("s=ex:e5&p={reifies}"), representation);
-        assert!(rendered.is_err(), "{representation:?}");
+        let error = served
+            .try_render_fragment(&store, &format!("s=ex:e5&p={reifies}"), representation)
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), code, "{representation:?}");
     }
 
     // A triple term names no graph.
@@ -338,6 +345,19 @@ fn published_triple_terms_name_themselves_even_with_lenient_components() {
             .collect();
         assert_eq!(subjects, vec![&row["s"]], "{row}: {found}");
     }
+    // A request may spell the literal as an IRI, as hdtc reads it; RDF then
+    // writes the triple term it named, holding the literal.
+    let turtle = served.render(
+        &store,
+        "fragment",
+        &format!(
+            "o={}",
+            urlencode("<<( <http://example.org/s> <http://example.org/p1> <\"a\"@en> )>>")
+        ),
+        Representation::Turtle,
+    );
+    assert!(turtle.contains("example.org/e1"), "{turtle}");
+    assert!(turtle.contains("\"a\"@en"), "{turtle}");
 }
 
 /// Variables inside a triple term: every plan answers what a filter over all
@@ -2596,16 +2616,9 @@ impl Served {
         );
         let rendered = match operation {
             "fragment" => {
-                let request = request::Fragment::parse(
-                    &params(query),
-                    self.limits(),
-                    self.release().prefixes(),
-                    &self.release().binding(),
-                )
-                .expect("a well-formed request");
-                answer::fragment(store, target, &request)
-                    .expect("an answer")
-                    .render(representation)
+                return self
+                    .try_render_fragment(store, query, representation)
+                    .expect("render a fragment");
             }
             "describe" => {
                 let request = request::Describe::parse(
