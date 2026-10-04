@@ -950,10 +950,14 @@ fn parse_explicit_iri(value: &str) -> Result<Cow<'_, str>, TermSyntaxError> {
     Ok(Cow::Borrowed(value))
 }
 
-/// A triple-term component as hdtc's minting takes it.
+/// A triple-term component as hdtc's minting takes it. An IRI goes through
+/// `from_dictionary`, hdtc's one reading of a stored string's kind: the
+/// dictionary holds an IRI spelled like a literal (`<"a"@en>`) as that
+/// literal's string, so the two name the same triple term, and a request
+/// must mint the name the build did.
 fn component(term: &Term<'_>) -> TripleTermComponent {
     match term {
-        Term::Iri(iri) => TripleTermComponent::Iri(iri.clone().into_owned()),
+        Term::Iri(iri) => TripleTermComponent::from_dictionary(iri.clone().into_owned()),
         Term::BlankNode(label) => TripleTermComponent::Blank(label.clone().into_owned()),
         Term::Literal(_) => TripleTermComponent::Literal(term.to_dictionary().into_owned()),
         Term::Triple(triple) => TripleTermComponent::Triple(Box::new(triple.proposition())),

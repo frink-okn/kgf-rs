@@ -6434,7 +6434,7 @@ fn component_of(
         },
         Term::Iri(iri) => match blank_label_of(dictionary, blank_nodes, Some(terms), iri)? {
             Some(label) => TripleTermComponent::Blank(label),
-            None => TripleTermComponent::Iri(iri.clone().into_owned()),
+            None => TripleTermComponent::from_dictionary(iri.clone().into_owned()),
         },
     }))
 }
