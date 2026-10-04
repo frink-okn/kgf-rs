@@ -2678,8 +2678,9 @@ The steps, each a commit reviewed on its own:
 5. **Ground triple terms in patterns.** `o=<<( … )>>` on `/fragment`, `/count`,
    `/describe`, bindings, and `/tpf`, through minting and an ordinary lookup.
    A triple term in the subject or predicate position is refused: RDF 1.2 has none.
-6. **Variables inside a triple term** (`?e rdf:reifies <<( :s ?p ?o )>>`), body form
-   only, depth 1. The store answers them with one of three plans, chosen on cost from
+6. **Variables inside a triple term** (`?e rdf:reifies <<( :s ?p ?o )>>`), depth 1.
+   *As built:* in `o` on `/fragment` and `/count`, in request syntax with `?name`
+   placeholders, rather than in the bindings body form — see question 85. The store answers them with one of three plans, chosen on cost from
    the bundle alone, so a cursor resumes on the plan that issued it:
    - **no inner constraint** — every triple whose object is a triple term is one
      contiguous range of OPS, or of POS under a bound outer predicate: an ordinary
@@ -2691,7 +2692,9 @@ The steps, each a commit reviewed on its own:
      than the inner matches — each is decoded and tested.
    Inner-first and outer-first enumerations are candidate-budgeted like `o.text`:
    a page may end early with a cursor, and a count is exact when its scan completes
-   and a lower bound with a cursor otherwise. Inner variables are output columns.
+   and a lower bound with a cursor otherwise. The row's object is the whole triple
+   term, which carries the values the inner variables took; separate columns for
+   them wait for the tabular formats (question 85).
 7. **`kgf build`**: RDF input with triple terms produces the three artifacts, an
    HDT input brings them along (or is refused without them), and the stats layer
    leaves the encoding namespace out of the namespace inventory.
@@ -3739,6 +3742,37 @@ following the code.
 84. **`range_not_satisfiable` (416) joins the error table.** A download needs it, with
     `Content-Range: bytes */{len}`, for unsatisfiable and for refused multi-range
     requests alike.
+
+85. **Variables inside a triple term live in `o`, not in the bindings body.** Doc 09
+    §9.2 names inner variables through the JSON body form so that they surface as output
+    columns. This implementation takes them in `o` on `/fragment` and `/count`, in
+    request syntax — `o=<<( ex:s ?p ?o )>>` — for three reasons. The body form here *is*
+    the bindings form, whose per-row phases are counted exactly up front, while a
+    pattern inside triple terms is candidate-budgeted like `o.text`; joining the two
+    is a design of its own. GET is what an agent tries first. And the row already
+    carries what the variables took: its object is the whole triple term, decoded,
+    so JSON loses nothing. Columns per inner variable matter for CSV/Parquet/Arrow,
+    which this implementation does not yet serve, and are doc 07 §7.5 item 33's
+    question. The names are placeholders: a repeated name is refused rather than
+    read as a join. Proposed: doc 03 §3.7 admits `?name` inside the `o` triple term
+    on GET, keeps the body form for bindings, and leaves columns to item 33.
+86. **`reification` should not be a gate.** A bundle whose dictionary holds
+    triple-term IRIs without `data.hdt.tt` is refused at open, so a bundle without
+    the index provably holds no triple terms and answers every pattern naming one —
+    exactly, with nothing. Doc 03 §3.7 has such patterns return
+    `capability_not_available` without the capability; that would make a federated
+    client special-case bundles that can answer. The capability remains, as the
+    statement a router reads without the bundle.
+87. **A directional literal's JSON term object.** RDF 1.2's base direction is kept in
+    `lang` as N-Triples 1.2 writes it, `"lang": "ar--rtl"`, which round-trips through
+    request syntax and the dictionary. SPARQL 1.2 results JSON instead splits it,
+    `"xml:lang": "ar", "its:dir": "rtl"`. Doc 03's term object should choose before a
+    bundle with directional literals is served.
+88. **Blank nodes found only in the propositions HDT.** They need a published name and
+    have no dictionary id in `data.hdt`; this implementation scopes them by the
+    propositions HDT's digest, the graph-only blank name's precedent (question 80). A
+    node the data also holds is published under the data's IRI, and the propositions
+    spelling of it is refused, so each node has one name.
 
 ## Not in this plan
 

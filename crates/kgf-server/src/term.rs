@@ -973,6 +973,29 @@ fn parse_triple_syntax<'a>(
     prefixes: &PrefixMap,
     depth: usize,
 ) -> Result<TripleTerm<'a>, TermSyntaxError> {
+    let (subject, predicate, object) = triple_parts(text, depth)?;
+    if subject.starts_with('?') || predicate.starts_with('?') || object.starts_with('?') {
+        return Err(TermSyntaxError::MalformedTripleTerm {
+            token: text.to_owned(),
+            detail: "a variable inside a triple term makes it a pattern, which `/fragment` \
+                     and `/count` take as `o`, at the outermost triple term only"
+                .to_owned(),
+        });
+    }
+    let subject = Term::parse_nested(subject, prefixes, depth)?;
+    let predicate = parse_iri_syntax(predicate, prefixes)?;
+    let object = Term::parse_nested(object, prefixes, depth)?;
+    Ok(TripleTerm::new(subject, predicate, object).expect("the subject was checked"))
+}
+
+/// The subject, predicate and object texts of `<<( s p o )>>`.
+///
+/// The subject and predicate are single tokens — a bracketed IRI, a CURIE, a
+/// blank node, or a variable — and the object is everything up to the closing
+/// `)>>`, to be parsed as a term in its own right. That is what lets a literal
+/// object keep the request syntax's rule that its closing quote is the last
+/// one, quotes and parentheses inside included, and lets a triple term nest.
+fn triple_parts(text: &str, depth: usize) -> Result<(&str, &str, &str), TermSyntaxError> {
     let malformed = |detail: &str| TermSyntaxError::MalformedTripleTerm {
         token: text.to_owned(),
         detail: detail.to_owned(),
@@ -1010,10 +1033,55 @@ fn parse_triple_syntax<'a>(
     {
         return Err(malformed("it has something after its object"));
     }
-    let subject = Term::parse_nested(subject, prefixes, depth)?;
-    let predicate = parse_iri_syntax(predicate, prefixes)?;
-    let object = Term::parse_nested(object, prefixes, depth)?;
-    Ok(TripleTerm::new(subject, predicate, object).expect("the subject was checked above"))
+    Ok((subject, predicate, object))
+}
+
+/// One position of a pattern inside a triple term.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatternTerm<'a> {
+    /// A variable, by its name without the `?`.
+    Variable(&'a str),
+    /// A term.
+    Term(Term<'a>),
+}
+
+/// Parse `<<( s p o )>>` whose own positions may be variables, `?name`.
+///
+/// Depth 1 only: a nested triple term in the object position must be ground,
+/// because a variable there has no bounded evaluation. `Ok(None)` when no
+/// position is a variable, which is a ground triple term and parses as one.
+pub fn parse_triple_pattern<'a>(
+    text: &'a str,
+    prefixes: &PrefixMap,
+) -> Result<Option<[PatternTerm<'a>; 3]>, TermSyntaxError> {
+    let (subject, predicate, object) = triple_parts(text, 1)?;
+    if ![subject, predicate, object]
+        .iter()
+        .any(|part| part.starts_with('?'))
+    {
+        return Ok(None);
+    }
+    let variable = |part: &'a str| -> Result<Option<&'a str>, TermSyntaxError> {
+        let Some(name) = part.strip_prefix('?') else {
+            return Ok(None);
+        };
+        oxrdf::VariableRef::new(name).map_err(|_| TermSyntaxError::MalformedTripleTerm {
+            token: text.to_owned(),
+            detail: format!("`{part}` is not a SPARQL variable name"),
+        })?;
+        Ok(Some(name))
+    };
+    let position = |part: &'a str| -> Result<PatternTerm<'a>, TermSyntaxError> {
+        Ok(match variable(part)? {
+            Some(name) => PatternTerm::Variable(name),
+            None => PatternTerm::Term(Term::parse_nested(part, prefixes, 1)?),
+        })
+    };
+    let predicate = match variable(predicate)? {
+        Some(name) => PatternTerm::Variable(name),
+        None => PatternTerm::Term(Term::Iri(parse_iri_syntax(predicate, prefixes)?)),
+    };
+    Ok(Some([position(subject)?, predicate, position(object)?]))
 }
 
 /// The first token of `text` and what follows it: a bracketed IRI up to its

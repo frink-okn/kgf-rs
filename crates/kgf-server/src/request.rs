@@ -494,6 +494,104 @@ pub struct Pattern {
     predicate: Option<BoundTerm>,
     object: Option<BoundTerm>,
     text: Option<TextFilter>,
+    triple: Option<TriplePattern>,
+}
+
+/// A pattern inside the object's triple term, `<<( s ?p ?o )>>`: the object is
+/// unbound, and constrained to triple terms whose positions match.
+///
+/// Like `o.text`, it constrains the object position rather than binding it,
+/// so a row still reports its object — the whole triple term, whose
+/// components are the values the variables took. The variables are
+/// placeholders: a name may not repeat, since equating two positions is a
+/// join this operation does not evaluate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriplePattern {
+    requested: String,
+    canonical: String,
+    subject: Option<BoundTerm>,
+    predicate: Option<BoundTerm>,
+    object: Option<BoundTerm>,
+}
+
+impl TriplePattern {
+    /// Parse `o` when it is a triple term with variables in it; `None` when
+    /// it is not one.
+    fn parse(
+        text: &str,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+    ) -> Result<Option<Self>, Problem> {
+        if !text.starts_with("<<(") {
+            return Ok(None);
+        }
+        let bad = |error: crate::term::TermSyntaxError| {
+            Problem::new(ErrorCode::BadTermSyntax, format!("parameter `o`: {error}"))
+        };
+        let Some(parts) = crate::term::parse_triple_pattern(text, prefixes).map_err(bad)? else {
+            return Ok(None);
+        };
+        let max = limits.budgets.max_term_bytes;
+        if text.len() as u64 > max {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "the term in `o` is {} bytes, over this server's max_term_bytes of {max}",
+                    text.len()
+                ),
+            ));
+        }
+        let mut names = BTreeSet::new();
+        let mut slots = Vec::with_capacity(3);
+        let mut canonical = String::from("<<(");
+        for part in parts {
+            canonical.push(' ');
+            match part {
+                crate::term::PatternTerm::Variable(name) => {
+                    if !names.insert(name) {
+                        return Err(Problem::new(
+                            ErrorCode::MalformedRequest,
+                            format!(
+                                "`?{name}` appears twice in the triple term in `o`; equating two \
+                                 of its positions is a join this operation does not evaluate"
+                            ),
+                        ));
+                    }
+                    canonical.push('?');
+                    slots.push(None);
+                }
+                crate::term::PatternTerm::Term(term) => {
+                    let bound =
+                        BoundTerm::from_canonical_term("o", term.to_request(), term, limits)?;
+                    canonical.push_str(&bound.dictionary);
+                    slots.push(Some(bound));
+                }
+            }
+        }
+        canonical.push_str(" )>>");
+        let mut slots = slots.into_iter();
+        Ok(Some(Self {
+            requested: text.to_owned(),
+            canonical,
+            subject: slots.next().expect("three positions"),
+            predicate: slots.next().expect("three positions"),
+            object: slots.next().expect("three positions"),
+        }))
+    }
+
+    /// The pattern as the client wrote it.
+    pub fn requested(&self) -> &str {
+        &self.requested
+    }
+
+    /// The term bound at an inner position, or `None` for a variable.
+    pub fn bound(&self, position: Position) -> Option<&BoundTerm> {
+        match position {
+            Position::Subject => self.subject.as_ref(),
+            Position::Predicate => self.predicate.as_ref(),
+            Position::Object => self.object.as_ref(),
+        }
+    }
 }
 
 impl Pattern {
@@ -504,6 +602,12 @@ impl Pattern {
                 .get(position.as_str())
                 .filter(|text| !text.is_empty())
             {
+                if position == Position::Object
+                    && let Some(triple) = TriplePattern::parse(text, limits, prefixes)?
+                {
+                    pattern.triple = Some(triple);
+                    continue;
+                }
                 *pattern.slot(position) = Some(
                     BoundTerm::parse(position.as_str(), text, limits, prefixes)?
                         .require_not_triple(position, position.as_str())?,
@@ -521,6 +625,12 @@ impl Pattern {
     /// The ranked text constraint on the object, if the request carried one.
     pub fn text(&self) -> Option<&TextFilter> {
         self.text.as_ref()
+    }
+
+    /// The pattern inside the object's triple term, if the request carried
+    /// one.
+    pub fn triple(&self) -> Option<&TriplePattern> {
+        self.triple.as_ref()
     }
 
     fn slot(&mut self, position: Position) -> &mut Option<BoundTerm> {
@@ -555,7 +665,10 @@ impl Pattern {
     fn shape(&self) -> String {
         Position::ALL
             .into_iter()
-            .map(|position| self.bound(position).map_or('?', BoundTerm::shape))
+            .map(|position| match (position, &self.triple) {
+                (Position::Object, Some(_)) => 'T',
+                _ => self.bound(position).map_or('?', BoundTerm::shape),
+            })
             .collect()
     }
 
@@ -567,7 +680,12 @@ impl Pattern {
                 self.bound(position).map(BoundTerm::dictionary),
             );
         }
-        request.with_opt("o.text", self.text.as_ref().map(TextFilter::query))
+        request
+            .with_opt("o.text", self.text.as_ref().map(TextFilter::query))
+            .with_opt(
+                "o.triple",
+                self.triple.as_ref().map(|t| t.canonical.as_str()),
+            )
     }
 }
 
@@ -581,6 +699,13 @@ impl Serialize for Pattern {
             // position it constrains, where a bound one echoes as its term.
             match (position, &self.text) {
                 (Position::Object, Some(text)) => map.serialize_entry("o", text)?,
+                (Position::Object, None) if self.triple.is_some() => map.serialize_entry(
+                    "o",
+                    self.triple
+                        .as_ref()
+                        .map(TriplePattern::requested)
+                        .unwrap_or_default(),
+                )?,
                 _ => map.serialize_entry(
                     position.as_str(),
                     &self.bound(position).map(BoundTerm::requested),
@@ -618,6 +743,13 @@ impl TextFilter {
                      or search for it, not both",
                     reflected(bound.requested())
                 ),
+            ));
+        }
+        if pattern.triple().is_some() {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "`o` is a pattern inside a triple term and `o.text` searches literals; \
+                 an object cannot be both",
             ));
         }
         if text.is_empty() {
@@ -1146,6 +1278,13 @@ pub(crate) const QUAD_VIEW_NEEDS_A_DATASET: &str = "the quad view puts each stat
 /// and this build does not scope those. Refused rather than answered from the
 /// union, for the reason every ignored filter is refused.
 fn refuse_scoped_text(pattern: &Pattern, graph: &GraphScope) -> Result<(), Problem> {
+    if pattern.triple().is_some() && graph.canonical().is_some() {
+        return Err(Problem::new(
+            ErrorCode::MalformedRequest,
+            "`g` and a pattern inside a triple term cannot be combined in this build; \
+             scope the pattern or match inside the triple term, not both",
+        ));
+    }
     if pattern.text().is_some() && graph.canonical().is_some() {
         return Err(Problem::new(
             ErrorCode::MalformedRequest,
@@ -2322,7 +2461,7 @@ impl Count {
                 .with_opt("g", graph.canonical()),
         );
         let cursor = resume(params, &binding)?;
-        if cursor.is_some() && pattern.text().is_none() {
+        if cursor.is_some() && pattern.text().is_none() && pattern.triple().is_none() {
             // Ordinary counts finish in one bounded descent and never issue a
             // continuation. Accepting one would mean silently ignoring it.
             return Err(Problem::from(StaleCursor));
@@ -3284,6 +3423,13 @@ impl Sample {
     ) -> Result<Self, Problem> {
         accept_only(params, SAMPLE, Self::PARAMETERS)?;
         let pattern = Pattern::parse(params, limits, prefixes)?;
+        if pattern.triple().is_some() {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "`/sample` draws from a pattern's exact cardinality, which a pattern inside a \
+                 triple term does not have; use `/fragment`",
+            ));
+        }
         let n = page_size(
             params,
             "n",

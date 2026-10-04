@@ -262,6 +262,238 @@ fn triple_terms_survive_lenient_content_and_name_blank_nodes_in_any_role() {
     assert_eq!(error.code().as_str(), "bad_term_syntax");
 }
 
+/// Variables inside a triple term: every plan answers what a filter over all
+/// rows answers, pages to the same rows at every size and under a one-candidate
+/// budget, and counts them — exactly, or as a floor that resumes to the total.
+#[test]
+fn patterns_inside_triple_terms_answer_what_a_filter_over_every_row_answers() {
+    let served = Served::from_fixture(Fixture::build(TRIPLE_TERMS_NT));
+    let store = served.store();
+    let all = served.fragment(&store, "limit=10000");
+    let every: Vec<serde_json::Value> = all["rows"].as_array().unwrap().clone();
+    let ex = |local: &str| format!("http://example.org/{local}");
+    let reifies = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
+
+    // (query, outer s, outer p, inner s, inner p, inner o): `None` is a variable.
+    type Case = (String, Option<String>, Option<String>, [Option<String>; 3]);
+    let cases: Vec<Case> = vec![
+        ("<<( ?a ?b ?c )>>".into(), None, None, [None, None, None]),
+        (
+            "<<( ?a ex:knows ?c )>>".into(),
+            None,
+            None,
+            [None, Some(ex("knows")), None],
+        ),
+        (
+            "<<( ex:alice ?b ?c )>>".into(),
+            None,
+            None,
+            [Some(ex("alice")), None, None],
+        ),
+        (
+            "<<( ?a ?b ex:carol )>>".into(),
+            None,
+            None,
+            [None, None, Some(ex("carol"))],
+        ),
+        (
+            "<<( ex:alice ?b ex:bob )>>".into(),
+            None,
+            None,
+            [Some(ex("alice")), None, Some(ex("bob"))],
+        ),
+        (
+            "<<( ?a ex:knows ex:carol )>>".into(),
+            None,
+            None,
+            [None, Some(ex("knows")), Some(ex("carol"))],
+        ),
+        (
+            "<<( ?a ?b \"Alice\"@en--ltr )>>".into(),
+            None,
+            None,
+            [None, None, Some("\"Alice\"@en--ltr".into())],
+        ),
+        (
+            "<<( ?a ex:says <<( ex:bob ex:knows ex:erin )>> )>>".into(),
+            None,
+            None,
+            [
+                None,
+                Some(ex("says")),
+                Some(format!(
+                    "<<( {} {} {} )>>",
+                    ex("bob"),
+                    ex("knows"),
+                    ex("erin")
+                )),
+            ],
+        ),
+        (
+            "<<( ?a ex:knows ?c )>>".into(),
+            None,
+            Some(reifies.into()),
+            [None, Some(ex("knows")), None],
+        ),
+        (
+            "<<( ?a ?b ?c )>>".into(),
+            None,
+            Some(ex("claims")),
+            [None, None, None],
+        ),
+        (
+            "<<( ?a ?b ?c )>>".into(),
+            Some(ex("x")),
+            None,
+            [None, None, None],
+        ),
+        (
+            "<<( ?a ex:likes ?c )>>".into(),
+            Some(ex("x")),
+            Some(ex("claims")),
+            [None, Some(ex("likes")), None],
+        ),
+        (
+            "<<( ex:bob ?b ?c )>>".into(),
+            Some(ex("e3")),
+            None,
+            [Some(ex("bob")), None, None],
+        ),
+        (
+            "<<( ex:nobody ?b ?c )>>".into(),
+            None,
+            None,
+            [Some(ex("nobody")), None, None],
+        ),
+    ];
+    let total = cases.len();
+    let mut nonempty = 0;
+    for (inner, s, p, [is, ip, io]) in cases {
+        let mut query = format!("o={}", urlencode(&inner));
+        if let Some(s) = &s {
+            query.push_str(&format!("&s={}", urlencode(&format!("<{s}>"))));
+        }
+        if let Some(p) = &p {
+            query.push_str(&format!("&p={}", urlencode(&format!("<{p}>"))));
+        }
+        let mut expected: Vec<Vec<String>> = every
+            .iter()
+            .filter(|row| {
+                let o = &row["o"];
+                o["type"] == "triple"
+                    && s.as_deref().is_none_or(|s| row["s"]["value"] == s)
+                    && p.as_deref().is_none_or(|p| row["p"]["value"] == p)
+                    && is
+                        .as_deref()
+                        .is_none_or(|v| dictionary_spelling(&o["value"]["subject"]) == v)
+                    && ip
+                        .as_deref()
+                        .is_none_or(|v| dictionary_spelling(&o["value"]["predicate"]) == v)
+                    && io
+                        .as_deref()
+                        .is_none_or(|v| dictionary_spelling(&o["value"]["object"]) == v)
+            })
+            .map(|row| {
+                ["s", "p", "o"]
+                    .into_iter()
+                    .filter(|position| match *position {
+                        "s" => s.is_none(),
+                        "p" => p.is_none(),
+                        _ => true,
+                    })
+                    .map(|position| dictionary_spelling(&row[position]))
+                    .collect()
+            })
+            .collect();
+        expected.sort();
+        nonempty += usize::from(!expected.is_empty());
+        for size in [1usize, 2, 3, 10_000] {
+            let mut paged = served.page_through(&store, &query, size);
+            paged.sort();
+            assert_eq!(paged, expected, "?{query} at limit={size}");
+        }
+        let counted = served.count(&store, &query);
+        assert_eq!(
+            counted["count"]["value"].as_u64().unwrap() as usize,
+            expected.len(),
+            "/count?{query}: {counted}"
+        );
+
+        // Under a one-candidate budget, pages end early and resume; counts
+        // are floors that resume to the total.
+        let budgets = Budgets {
+            candidate_budget: 1,
+            ..Budgets::new()
+        };
+        let mut found = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..1_000 {
+            let paged = match &cursor {
+                Some(token) => format!("{query}&limit=10&cursor={token}"),
+                None => format!("{query}&limit=10"),
+            };
+            let page = served.fragment_within(&store, &paged, &budgets);
+            found.extend(rows(&page));
+            match page["next"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => break,
+            }
+        }
+        found.sort();
+        assert_eq!(found, expected, "?{query} under a one-candidate budget");
+        let mut counted = None;
+        let mut cursor: Option<String> = None;
+        for _ in 0..1_000 {
+            let paged = match &cursor {
+                Some(token) => format!("{query}&cursor={token}"),
+                None => query.clone(),
+            };
+            let request = request::Count::parse(
+                &params(&paged),
+                served.within(&budgets),
+                served.release().prefixes(),
+                &served.release().binding(),
+            )
+            .unwrap();
+            let answer = json(
+                answer::count(&store, served.target("count", &paged), &request).unwrap(),
+                Representation::Json,
+            );
+            match answer["next"].as_str() {
+                Some(next) => {
+                    assert_eq!(answer["count"]["exact"], false, "{answer}");
+                    cursor = Some(next.to_owned());
+                }
+                None => {
+                    counted = answer["count"]["value"].as_u64();
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            counted,
+            Some(expected.len() as u64),
+            "/count?{query} under a budget"
+        );
+    }
+
+    // Not vacuous: all but the deliberately absent subject match something.
+    assert_eq!(nonempty, total - 1);
+
+    // Repeated variables, variables nested deeper, and `o.text` beside a
+    // pattern are refused rather than answered differently.
+    for query in [
+        format!("o={}", urlencode("<<( ?a ex:knows ?a )>>")),
+        format!(
+            "o={}",
+            urlencode("<<( ?a ex:says <<( ?b ex:knows ex:erin )>> )>>")
+        ),
+        format!("o={}&o.text=Alice", urlencode("<<( ?a ?b ?c )>>")),
+    ] {
+        assert!(served.try_fragment(&store, &query).is_err(), "{query}");
+    }
+}
+
 /// Percent-encode a query value: triple-term syntax carries spaces, quotes
 /// and `#`, which a URL must not carry raw.
 fn urlencode(value: &str) -> String {
@@ -3822,6 +4054,15 @@ fn published_spelling(store: &Store, role: Role, id: u64, stored: &str) -> Strin
 /// response shape and hdtc's dictionary encoding rather than calling the code
 /// under test.
 fn dictionary_spelling(term: &serde_json::Value) -> String {
+    if term["type"] == "triple" {
+        let value = &term["value"];
+        return format!(
+            "<<( {} {} {} )>>",
+            dictionary_spelling(&value["subject"]),
+            dictionary_spelling(&value["predicate"]),
+            dictionary_spelling(&value["object"])
+        );
+    }
     let value = term["value"].as_str().expect("a term value");
     match term["type"].as_str().expect("a term type") {
         "iri" => value.to_owned(),

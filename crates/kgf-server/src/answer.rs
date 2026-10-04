@@ -78,8 +78,8 @@ use crate::rdf::{GraphFormat, serialize_dataset, serialize_graph};
 use crate::representation::{RdfSyntax, Representation};
 use crate::request::{
     self, BindingPattern, BindingRow, BoundTerm, Candidates, Direction, Pattern, Position,
-    ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter, role_name,
-    term_role_name,
+    ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter, TriplePattern,
+    role_name, term_role_name,
 };
 use crate::request::{GraphScope, GraphSelector};
 use crate::skolem::SkolemScope;
@@ -90,7 +90,10 @@ use crate::url::{self, Mount, Params};
 use hdtc::format::{TripleTermComponent, TripleTermProposition};
 use kgf_store::graphs::{GraphId, Graphs};
 use kgf_store::scope::{QuadSelection, ScopedSelection};
-use kgf_store::triple_terms::{Proposition, Source as TripleTermSource, TripleTerms};
+use kgf_store::triple_terms::{
+    BudgetedSelection, InnerPattern, Proposition, Source as TripleTermSource, TripleTermPattern,
+    TripleTermPosition, TripleTermSelection, TripleTermStep, TripleTerms,
+};
 
 // ---------------------------------------------------------------------------
 // Where a response came from
@@ -4478,6 +4481,17 @@ pub fn fragment(
         tagging: GraphTagging::for_scope(&request.graph),
     };
 
+    if let Some(triple) = request.pattern.triple() {
+        return triple_fragment(
+            store,
+            target,
+            envelope,
+            &request.pattern,
+            triple,
+            paging,
+            request.candidates,
+        );
+    }
     match (
         resolve(
             &dictionary,
@@ -4563,6 +4577,27 @@ pub fn count(
 ) -> Result<CountAnswer, Problem> {
     let dictionary = store.dict();
     let blank_nodes = SkolemScope::of(store);
+    if let Some(triple) = request.pattern.triple() {
+        let (count, completeness, absent_terms) = triple_count(
+            store,
+            &blank_nodes,
+            &request.pattern,
+            triple,
+            request.candidates,
+            request.cursor.as_ref(),
+            &request.binding,
+        )?;
+        return Ok(CountAnswer {
+            dataset: target.id.dataset.clone(),
+            version: target.id.version.clone(),
+            pattern: request.pattern.clone(),
+            g: request.graph.requested().map(str::to_owned),
+            count,
+            absent_terms,
+            completeness,
+            target,
+        });
+    }
     if request.cursor.is_some() && request.pattern.text().is_none() {
         // Parsing enforces this too; keep the operation correct for callers
         // constructing the public request type directly.
@@ -6455,6 +6490,364 @@ fn stored_label(
     let stored = std::str::from_utf8(stored)
         .map_err(|error| unreadable("reading a blank-node label", &error))?;
     Ok(stored.strip_prefix("_:").map(str::to_owned))
+}
+
+// ---------------------------------------------------------------------------
+// Patterns inside triple terms
+// ---------------------------------------------------------------------------
+
+/// What a pattern inside triple terms resolves to.
+///
+/// Unboxed although the variants differ in size: one exists per request, and
+/// moving it once costs less than an allocation would.
+#[allow(clippy::large_enum_variant)]
+enum TripleResolved<'s> {
+    /// A bound outer term this bundle does not hold.
+    Absent(Vec<AbsentTerm>),
+    /// Nothing can match: the bundle holds no triple terms, or a bound inner
+    /// term is in neither HDT that holds propositions.
+    Empty,
+    /// The store's plan.
+    Selected(TripleTermSelection<'s>),
+}
+
+/// Resolve `S P <<( inner )>>`: the outer terms in `data.hdt`, and the inner
+/// pattern separately in each HDT that holds propositions, since a term has
+/// different identifiers in each.
+fn resolve_triple_pattern<'s>(
+    store: &'s Store,
+    blank_nodes: &SkolemScope,
+    pattern: &Pattern,
+    triple: &TriplePattern,
+) -> Result<TripleResolved<'s>, Problem> {
+    let dictionary = store.dict();
+    let mut outer = [None, None];
+    let mut absent = Vec::new();
+    for (slot, position) in outer
+        .iter_mut()
+        .zip([Position::Subject, Position::Predicate])
+    {
+        let Some(term) = pattern.bound(position) else {
+            continue;
+        };
+        match locate_scoped(
+            &dictionary,
+            blank_nodes,
+            store.triple_terms(),
+            position.role(),
+            term,
+        )? {
+            Some(id) => *slot = Some(id),
+            None => absent.push(AbsentTerm::new(position.as_str(), term)),
+        }
+    }
+    if !absent.is_empty() {
+        return Ok(TripleResolved::Absent(absent));
+    }
+    let Some(terms) = store.triple_terms() else {
+        return Ok(TripleResolved::Empty);
+    };
+    let data = inner_pattern(&dictionary, blank_nodes, terms, None, triple)?;
+    let propositions = match terms.propositions_dict() {
+        Some(props) => inner_pattern(&dictionary, blank_nodes, terms, Some(&props), triple)?,
+        None => None,
+    };
+    if data.is_none() && propositions.is_none() {
+        return Ok(TripleResolved::Empty);
+    }
+    let selection = store
+        .resolve_triple_terms(TripleTermPattern {
+            subject: outer[0],
+            predicate: outer[1],
+            data,
+            propositions,
+        })
+        .map_err(|error| unreadable("resolving a pattern inside triple terms", &error))?
+        .expect("a bundle with triple terms resolves patterns inside them");
+    Ok(TripleResolved::Selected(selection))
+}
+
+/// The inner pattern in one HDT's identifiers: `data.hdt`'s when `props` is
+/// `None`, else the propositions HDT's. `None` when a bound inner term is not
+/// in that HDT, so nothing there matches.
+fn inner_pattern(
+    data: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    terms: &TripleTerms,
+    props: Option<&Dictionary<'_>>,
+    triple: &TriplePattern,
+) -> Result<Option<InnerPattern>, Problem> {
+    let dictionary = props.unwrap_or(data);
+    let mut ids = [None; 3];
+    for (slot, position) in ids.iter_mut().zip(Position::ALL) {
+        let Some(term) = triple.bound(position) else {
+            continue;
+        };
+        let role = position.role();
+        let found = if let Some(nested) = term.triple() {
+            // A ground triple term nested inside: minted from its stored
+            // labels, and looked for among this HDT's objects.
+            match proposition_of(data, blank_nodes, terms, nested)? {
+                Some(proposition) => dictionary
+                    .locate(
+                        Role::Object,
+                        hdtc::format::triple_term_iri(&proposition).as_bytes(),
+                    )
+                    .map_err(|error| unreadable("looking a triple term up", &error))?
+                    .map(|id| id.0),
+                None => None,
+            }
+        } else if term.denotes_blank_node() {
+            None
+        } else {
+            // A published blank-node IRI names its node by the label both
+            // HDTs store it under.
+            let label = match role {
+                Role::Subject | Role::Object => {
+                    blank_label_of(data, blank_nodes, terms, term.dictionary())?
+                }
+                Role::Predicate => None,
+            };
+            let spelled = match &label {
+                Some(label) => Cow::Owned(format!("_:{label}")),
+                None => Cow::Borrowed(term.dictionary()),
+            };
+            dictionary
+                .locate(role, spelled.as_bytes())
+                .map_err(|error| unreadable("looking a term up", &error))?
+                .map(|id| id.0)
+        };
+        match found {
+            Some(id) => *slot = Some(id),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(InnerPattern {
+        subject: ids[0],
+        predicate: ids[1],
+        object: ids[2],
+    }))
+}
+
+/// Where a request resumes a budgeted triple-term enumeration.
+fn triple_term_resume(
+    cursor: Option<&Cursor>,
+    space: PositionSpace,
+) -> Result<Option<TripleTermPosition>, Problem> {
+    match cursor {
+        None => Ok(None),
+        Some(cursor)
+            if cursor.space == space
+                && cursor.binding_index.is_none()
+                && cursor.scan_position.is_some() =>
+        {
+            Ok(Some(TripleTermPosition {
+                term: cursor.position,
+                row: cursor.scan_position.expect("checked above"),
+            }))
+        }
+        Some(_) => Err(Problem::from(StaleCursor)),
+    }
+}
+
+/// A step that resumes at `at`, for a cursor.
+fn triple_term_step(triple: IdTriple, at: TripleTermPosition) -> Step {
+    Step {
+        triple,
+        graph: None,
+        space: PositionSpace::TripleTerm,
+        resume: at.term,
+        scan: Some(at.row),
+        binding_index: None,
+        direction: None,
+        ranking: None,
+    }
+}
+
+/// `/fragment` with a pattern inside the object's triple term.
+///
+/// A plan whose candidates all match is an ordinary selection and pages like
+/// one. The others are budgeted on candidates, as `o.text` is: a candidate
+/// triple term need not contribute a row — one named only under another
+/// predicate contributes nothing to `? rdf:reifies <<( … )>>` — so a page may
+/// end with a cursor before it fills, and say so.
+fn triple_fragment(
+    store: &Store,
+    target: Target,
+    envelope: Envelope,
+    pattern: &Pattern,
+    triple: &TriplePattern,
+    paging: Paging<'_>,
+    candidates: Candidates,
+) -> Result<Answer, Problem> {
+    let selection = match resolve_triple_pattern(store, &envelope.blank_nodes, pattern, triple)? {
+        TripleResolved::Absent(absent) => {
+            return paged(
+                store,
+                target,
+                Envelope {
+                    absent_terms: absent,
+                    ..envelope
+                },
+                Vec::new(),
+                paging,
+            );
+        }
+        TripleResolved::Empty => return paged(store, target, envelope, Vec::new(), paging),
+        TripleResolved::Selected(TripleTermSelection::Range(selection)) => {
+            return paged(
+                store,
+                target,
+                envelope,
+                vec![phase(Enumeration::Triples(selection), None)?],
+                paging,
+            );
+        }
+        TripleResolved::Selected(TripleTermSelection::Budgeted(selection)) => selection,
+    };
+    let from = triple_term_resume(paging.cursor, PositionSpace::TripleTerm)?;
+    let from_start = from.is_none();
+    let (steps, spent) = budgeted_steps(
+        &selection,
+        from.unwrap_or_default(),
+        paging.want(),
+        candidates,
+    )?;
+    let exact = selection.exact_count();
+    finish(
+        store,
+        target,
+        envelope,
+        steps,
+        paging,
+        spent,
+        |completeness, rows| {
+            let rows = rows.len() as u64;
+            match exact {
+                Some(count) => Cardinality::exact(count),
+                None if completeness.is_complete() && from_start => Cardinality::exact(rows),
+                // What is known is what this page found: a floor, never a figure
+                // the next page could contradict.
+                None => Cardinality::estimated(rows).at_least(rows),
+            }
+        },
+    )
+}
+
+/// Up to `want` steps of a budgeted triple-term enumeration from `from`.
+fn budgeted_steps(
+    selection: &BudgetedSelection<'_>,
+    from: TripleTermPosition,
+    want: usize,
+    candidates: Candidates,
+) -> Result<(Vec<Step>, Option<Spent>), Problem> {
+    // A position the store does not recognize names no candidate of this
+    // enumeration: an edited token, or one issued by another request.
+    let walk = selection
+        .steps(from, candidates.0)
+        .map_err(|_| Problem::from(StaleCursor))?;
+    let mut steps = Vec::with_capacity(want.min(1024));
+    let mut spent = None;
+    for step in walk {
+        if steps.len() >= want {
+            break;
+        }
+        match step {
+            TripleTermStep::Row { triple, at } => steps.push(triple_term_step(triple, at)),
+            TripleTermStep::Spent(at) => {
+                spent = Some(Spent::Candidate(triple_term_step(
+                    IdTriple {
+                        subject: 0,
+                        predicate: 0,
+                        object: 0,
+                    },
+                    at,
+                )));
+            }
+        }
+    }
+    Ok((steps, spent))
+}
+
+/// `/count` with a pattern inside the object's triple term: exact when the
+/// plan's count is arithmetic or its scan completes within the candidate
+/// budget, and otherwise the rows counted so far as a lower bound, with a
+/// cursor that continues the scan.
+fn triple_count(
+    store: &Store,
+    blank_nodes: &SkolemScope,
+    pattern: &Pattern,
+    triple: &TriplePattern,
+    candidates: Candidates,
+    cursor: Option<&Cursor>,
+    binding: &CursorBinding,
+) -> Result<(Cardinality, Completeness, Vec<AbsentTerm>), Problem> {
+    let selection = match resolve_triple_pattern(store, blank_nodes, pattern, triple)? {
+        TripleResolved::Absent(_) | TripleResolved::Empty if cursor.is_some() => {
+            return Err(Problem::from(StaleCursor));
+        }
+        TripleResolved::Absent(absent) => {
+            return Ok((Cardinality::exact(0), Completeness::complete(), absent));
+        }
+        TripleResolved::Empty => {
+            return Ok((Cardinality::exact(0), Completeness::complete(), Vec::new()));
+        }
+        TripleResolved::Selected(TripleTermSelection::Range(selection)) => {
+            if cursor.is_some() {
+                return Err(Problem::from(StaleCursor));
+            }
+            return Ok((
+                Cardinality::exact(selection.count().value),
+                Completeness::complete(),
+                Vec::new(),
+            ));
+        }
+        TripleResolved::Selected(TripleTermSelection::Budgeted(selection)) => selection,
+    };
+    if let Some(count) = selection.exact_count() {
+        if cursor.is_some() {
+            return Err(Problem::from(StaleCursor));
+        }
+        return Ok((
+            Cardinality::exact(count),
+            Completeness::complete(),
+            Vec::new(),
+        ));
+    }
+    // The cursor carries the candidate to resume at and the rows counted
+    // before it.
+    let (from, accumulated) = match triple_term_resume(cursor, PositionSpace::TripleTermScan)? {
+        None => (TripleTermPosition::default(), 0),
+        Some(position) => (
+            TripleTermPosition {
+                term: position.term,
+                row: 0,
+            },
+            position.row,
+        ),
+    };
+    let progress = selection
+        .count(from, candidates.0)
+        .map_err(|_| Problem::from(StaleCursor))?;
+    let counted = accumulated
+        .checked_add(progress.counted)
+        .ok_or_else(|| unreadable("counting triple-term matches", &"row count overflow"))?;
+    match progress.next {
+        None => Ok((
+            Cardinality::exact(counted),
+            Completeness::complete(),
+            Vec::new(),
+        )),
+        Some(next) => {
+            let mut cursor = Cursor::at(binding, PositionSpace::TripleTermScan, next.term);
+            cursor.scan_position = Some(counted);
+            Ok((
+                Cardinality::estimated(counted).at_least(counted),
+                Completeness::budget_exhausted(BudgetReason::Candidate, cursor.encode()),
+                Vec::new(),
+            ))
+        }
+    }
 }
 
 /// Dictionary probes shared by all rows of one binding table.

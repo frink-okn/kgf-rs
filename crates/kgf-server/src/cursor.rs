@@ -191,6 +191,17 @@ pub enum PositionSpace {
     /// the named graphs follow in the sidecar's dictionary order, so the id
     /// is the page's own offset into that order.
     Graph = 11,
+    /// A candidate of a pattern inside triple terms, with the rows of that
+    /// candidate already delivered in [`Cursor::scan_position`].
+    ///
+    /// The candidate is the store's: a matching triple term's index, or a
+    /// position of the outer subject's group, depending on the plan — and the
+    /// plan is fixed by the bundle and the request, which the token is bound
+    /// to, so a resumed page reads the number the way the first page did.
+    TripleTerm = 12,
+    /// A candidate of a budgeted triple-term count, with the rows counted
+    /// before it in [`Cursor::scan_position`].
+    TripleTermScan = 13,
 }
 
 impl PositionSpace {
@@ -243,6 +254,8 @@ impl PositionSpace {
             9 => Some(Self::ClassProperty),
             10 => Some(Self::DictionaryPrefix),
             11 => Some(Self::Graph),
+            12 => Some(Self::TripleTerm),
+            13 => Some(Self::TripleTermScan),
             _ => None,
         }
     }
@@ -592,9 +605,10 @@ impl Cursor {
         // the request hash, and the operation checks the trailer's presence
         // against that.
         let shape_is_valid = match space {
-            PositionSpace::TextRank | PositionSpace::TextScan => {
-                binding_index.is_none() && scan_position.is_some()
-            }
+            PositionSpace::TextRank
+            | PositionSpace::TextScan
+            | PositionSpace::TripleTerm
+            | PositionSpace::TripleTermScan => binding_index.is_none() && scan_position.is_some(),
             PositionSpace::SchemaChild
             | PositionSpace::ClassRelation
             | PositionSpace::ClassProperty
