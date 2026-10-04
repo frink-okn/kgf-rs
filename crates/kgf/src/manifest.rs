@@ -393,6 +393,22 @@ fn inspect_bundle(dir: &Path) -> Result<BundleInspection> {
     Ok(BundleInspection { bundle, facts })
 }
 
+/// Open a staged bundle's triple terms, as a server opening it would: the
+/// index bound to `data.hdt` and to the propositions HDT, each run checked
+/// against its dictionary, the layers against their reverse arrays.
+pub(crate) fn check_staged_triple_terms(dir: &Path) -> Result<()> {
+    let inspection = inspect_bundle(dir)?;
+    ensure!(
+        inspection
+            .facts
+            .capabilities()
+            .any(|capability| capability == Capability::Reification),
+        "a triple-term index is staged but the bundle does not declare `reification`; \
+         this is a bug in `kgf build` rather than in the input"
+    );
+    Ok(())
+}
+
 /// Open a staged bundle's memberships, as a server opening it would.
 ///
 /// `Store::open` refuses a sidecar naming one of the reserved graph IRIs, and

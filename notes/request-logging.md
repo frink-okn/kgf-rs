@@ -106,7 +106,7 @@ and a well-formed one has exactly the shape the server acted on.
 
 | operation | fields |
 |---|---|
-| `fragment`, `count` (GET) | `pattern`: three characters, one per position, `?` unbound or the bound term's kind — `i` IRI, `l` literal, `b` blank node (e.g. `"?il"`); `text`: bool (`o.text` present); `limit` |
+| `fragment`, `count` (GET) | `pattern`: three characters, one per position, `?` unbound or the bound term's kind — `i` IRI, `l` literal, `b` blank node, `t` triple term — or `T` for an object constrained by a pattern inside a triple term (e.g. `"?il"`, `"?iT"`); `text`: bool (`o.text` present); `limit` |
 | `fragment`, `count` (bindings) | as above for the body pattern, plus `k` rows submitted and `columns` |
 | `describe` | `term`: `i`/`b`; `direction`; `limit` |
 | `sample` | `pattern`; `n` |

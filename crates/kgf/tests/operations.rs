@@ -499,12 +499,33 @@ fn patterns_inside_triple_terms_answer_what_a_filter_over_every_row_answers() {
     let first = served.fragment(&store, &format!("{pattern}&limit=1"));
     assert_eq!(first["cardinality"]["exact"], false, "{first}");
     assert!(first["cardinality"].get("min").is_none(), "{first}");
-    // An inner term the bundle does not hold is reported, like a ground one.
-    let absent = served.fragment(
-        &store,
-        &format!("o={}", urlencode("<<( ex:nobody ?b ?c )>>")),
+    // An inner term the bundle does not hold is reported, like a ground one,
+    // on both operations, beside an absent outer term.
+    let query = format!("o={}", urlencode("<<( ex:nobody ?b ?c )>>"));
+    for answer in [
+        served.fragment(&store, &query),
+        served.count(&store, &query),
+    ] {
+        assert_eq!(
+            answer["absent_terms"],
+            serde_json::json!([{"parameter": "o", "reason": "not_in_bundle"}]),
+            "{answer}"
+        );
+    }
+    let both = served.fragment(&store, &format!("{query}&s=ex:zzz"));
+    assert_eq!(
+        both["absent_terms"].as_array().unwrap().len(),
+        2,
+        "every absent term is named: {both}"
     );
-    assert_eq!(absent["absent_terms"][0]["parameter"], "o", "{absent}");
+    // A held inner term in no matching triple term is an empty answer, not
+    // an absent one: `ex:x` is a subject, but of no proposition.
+    let held = served.fragment(&store, &format!("o={}", urlencode("<<( ex:x ?b ?c )>>")));
+    assert!(
+        held.get("absent_terms")
+            .is_none_or(|a| a.as_array().unwrap().is_empty()),
+        "{held}"
+    );
 
     // The page says what was asked, and RDF carries the triple terms.
     let page = served.render(&store, "fragment", &pattern, Representation::Html);
@@ -540,6 +561,36 @@ fn patterns_inside_triple_terms_answer_what_a_filter_over_every_row_answers() {
         sample.is_err(),
         "a sample has no exact cardinality to draw from"
     );
+}
+
+/// A bundle without triple terms answers a pattern inside one with nothing,
+/// naming as absent only a bound inner term it does not hold.
+#[test]
+fn a_bundle_without_triple_terms_answers_patterns_inside_them_with_nothing() {
+    let served = Served::new();
+    let store = served.store();
+    for (inner, absent) in [
+        ("<<( ?a ?b ?c )>>", false),
+        ("<<( ex:alice ?b ?c )>>", false),
+        ("<<( ex:nobody ?b ?c )>>", true),
+    ] {
+        let query = format!("o={}", urlencode(inner));
+        for answer in [
+            served.fragment(&store, &query),
+            served.count(&store, &query),
+        ] {
+            let reported = answer
+                .get("absent_terms")
+                .and_then(|terms| terms.as_array())
+                .is_some_and(|terms| !terms.is_empty());
+            assert_eq!(reported, absent, "{inner}: {answer}");
+        }
+        let counted = served.count(&store, &query);
+        assert_eq!(
+            counted["count"],
+            serde_json::json!({"value": 0, "exact": true})
+        );
+    }
 }
 
 /// Percent-encode a query value: triple-term syntax carries spaces, quotes

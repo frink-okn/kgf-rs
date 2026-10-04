@@ -2509,3 +2509,148 @@ fn triple_terms_travel_with_rdf_and_hdt_inputs() {
         kgf(&["manifest", path(&out), "--check"], "").ok();
     }
 }
+
+/// A partial set of triple-term files beside an HDT input is refused before
+/// any work, naming the caller's files and leaving them where they were; an
+/// index-only input and one without a permutation index build; a dry run
+/// names the files it would take.
+#[test]
+fn a_partial_triple_term_set_is_refused_before_any_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tt.nt");
+    std::fs::write(&source, TRIPLE_TERMS).unwrap();
+    let hdtc = hdtc();
+    let built = dir.path().join("staging/tinykg/v0");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&built),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc,
+        ],
+        CONFIG,
+    )
+    .ok();
+
+    // A copy of the input with one file of the set removed at a time.
+    for missing in [
+        "data.hdt.tt",
+        "data.hdt.props.hdt",
+        "data.hdt.props.hdt.perm",
+    ] {
+        let input = dir.path().join(format!("partial-{missing}"));
+        std::fs::create_dir_all(&input).unwrap();
+        for file in [
+            "data.hdt",
+            "data.hdt.perm",
+            "data.hdt.tt",
+            "data.hdt.props.hdt",
+            "data.hdt.props.hdt.perm",
+        ] {
+            if file != missing {
+                std::fs::copy(built.join(file), input.join(file)).unwrap();
+            }
+        }
+        let out = dir.path().join(format!("root/tinykg/{missing}"));
+        let run = kgf(
+            &[
+                "build",
+                "--config",
+                "-",
+                "--out",
+                path(&out),
+                "--hdt",
+                path(&input.join("data.hdt")),
+                "--adopt",
+                "--hdtc",
+                &hdtc,
+            ],
+            CONFIG,
+        );
+        assert!(!run.status.success(), "{missing}: built from a partial set");
+        assert!(
+            run.stderr.contains(input.to_str().unwrap()),
+            "{missing}: the refusal names the caller's files:\n{}",
+            run.stderr
+        );
+        assert!(
+            input.join("data.hdt").exists(),
+            "{missing}: --adopt lost the input"
+        );
+        assert!(!out.exists(), "{missing}: something was published");
+    }
+
+    // Every triple term asserted, and no permutation index beside the HDT.
+    let asserted = dir.path().join("asserted.nt");
+    std::fs::write(
+        &asserted,
+        concat!(
+            "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .\n",
+            "<http://example.org/e1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+            "<<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>> .\n",
+        ),
+    )
+    .unwrap();
+    let staged = dir.path().join("staging/tinykg/v1");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&staged),
+            "--input",
+            path(&asserted),
+            "--hdtc",
+            &hdtc,
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(!staged.join("data.hdt.props.hdt").exists());
+    let input = dir.path().join("index-only");
+    std::fs::create_dir_all(&input).unwrap();
+    for file in ["data.hdt", "data.hdt.tt"] {
+        std::fs::copy(staged.join(file), input.join(file)).unwrap();
+    }
+    let rehearsed = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&dir.path().join("root/tinykg/dry")),
+            "--hdt",
+            path(&input.join("data.hdt")),
+            "--hdtc",
+            &hdtc,
+            "--dry-run",
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(rehearsed.contains("data.hdt.tt beside it"), "{rehearsed}");
+    let out = dir.path().join("root/tinykg/index-only");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--hdt",
+            path(&input.join("data.hdt")),
+            "--hdtc",
+            &hdtc,
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(out.join("data.hdt.tt").is_file() && out.join("data.hdt.perm").is_file());
+    kgf(&["manifest", path(&out), "--check"], "").ok();
+}

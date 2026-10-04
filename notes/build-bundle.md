@@ -213,6 +213,15 @@ the two ways out. The graph *index* is deliberately not taken: it is derived
 from the sidecar in minutes, and a server requires layer sets an arbitrary one
 need not carry. `--adopt` releases exactly what was taken.
 
+RDF 1.2 triple terms travel the same way: `data.hdt.tt`, and with it
+`data.hdt.props.hdt` and its `.perm` when the index's header says the HDT has
+unasserted triple terms. The propositions HDT is data no other file holds, so it
+is never rebuilt, only taken. A partial set — propositions without the index,
+or the index without the files its header names — is refused before anything
+moves, naming the caller's files; an index belonging to another HDT is refused as
+soon as the permutation index exists, by opening the staged bundle as a server
+would. An RDF input needs nothing: `hdtc create` writes the three files itself.
+
 Two limits worth stating. Every `--input` is a file: each one's digest goes into
 the manifest's provenance, a directory has no digest, and a directory name says
 nothing about the syntax inside it either, so a directory is refused with that

@@ -6432,7 +6432,7 @@ fn component_of(
             Some(proposition) => TripleTermComponent::Triple(Box::new(proposition)),
             None => return Ok(None),
         },
-        Term::Iri(iri) => match blank_label_of(dictionary, blank_nodes, terms, iri)? {
+        Term::Iri(iri) => match blank_label_of(dictionary, blank_nodes, Some(terms), iri)? {
             Some(label) => TripleTermComponent::Blank(label),
             None => TripleTermComponent::Iri(iri.clone().into_owned()),
         },
@@ -6451,7 +6451,7 @@ fn component_of(
 fn blank_label_of(
     dictionary: &Dictionary<'_>,
     blank_nodes: &SkolemScope,
-    terms: &TripleTerms,
+    terms: Option<&TripleTerms>,
     iri: &str,
 ) -> Result<Option<String>, Problem> {
     for role in [Role::Subject, Role::Object] {
@@ -6459,7 +6459,7 @@ fn blank_label_of(
             return stored_label(dictionary, role, id);
         }
     }
-    let Some(props) = terms.propositions_dict() else {
+    let Some(props) = terms.and_then(TripleTerms::propositions_dict) else {
         return Ok(None);
     };
     for role in [Role::Subject, Role::Object] {
@@ -6508,10 +6508,12 @@ fn stored_label(
 /// moving it once costs less than an allocation would.
 #[allow(clippy::large_enum_variant)]
 enum TripleResolved<'s> {
-    /// A bound outer term this bundle does not hold, or an object constraint
-    /// nothing in it can meet: no triple terms at all, or a bound inner term
-    /// in neither HDT that holds propositions.
+    /// A bound term this bundle does not hold: outer, or inner and in
+    /// neither HDT that holds propositions.
     Absent(Vec<AbsentTerm>),
+    /// Every bound term is held, but nothing can match: the bundle has no
+    /// triple terms, or none in either HDT with these inner terms.
+    Empty,
     /// The store's plan.
     Selected(TripleTermSelection<'s>),
 }
@@ -6526,6 +6528,7 @@ fn resolve_triple_pattern<'s>(
     triple: &TriplePattern,
 ) -> Result<TripleResolved<'s>, Problem> {
     let dictionary = store.dict();
+    let terms = store.triple_terms();
     let mut outer = [None, None];
     let mut absent = Vec::new();
     for (slot, position) in outer
@@ -6535,46 +6538,50 @@ fn resolve_triple_pattern<'s>(
         let Some(term) = pattern.bound(position) else {
             continue;
         };
-        match locate_scoped(
-            &dictionary,
-            blank_nodes,
-            store.triple_terms(),
-            position.role(),
-            term,
-        )? {
+        match locate_scoped(&dictionary, blank_nodes, terms, position.role(), term)? {
             Some(id) => *slot = Some(id),
             None => absent.push(AbsentTerm::new(position.as_str(), term)),
         }
     }
+    // The inner terms, in each HDT that holds propositions. A bound one that
+    // neither holds is a term this release does not hold, and is reported as
+    // a ground object would be; one that is held but in no matching triple
+    // term makes an answer that is simply empty.
+    let props = terms.and_then(TripleTerms::propositions_dict);
+    let data_ids = inner_ids(&dictionary, blank_nodes, terms, None, triple)?;
+    let props_ids = match &props {
+        Some(props) => Some(inner_ids(
+            &dictionary,
+            blank_nodes,
+            terms,
+            Some(props),
+            triple,
+        )?),
+        None => None,
+    };
+    let missing = Position::ALL
+        .into_iter()
+        .enumerate()
+        .find_map(|(i, position)| {
+            let held_in_data = !matches!(data_ids[i], Some(None));
+            let held_in_props = props_ids.is_some_and(|ids| !matches!(ids[i], Some(None)));
+            (!held_in_data && !held_in_props)
+                .then(|| triple.bound(position))
+                .flatten()
+        });
+    if let Some(term) = missing {
+        absent.push(AbsentTerm::new("o", term));
+    }
     if !absent.is_empty() {
         return Ok(TripleResolved::Absent(absent));
     }
-    // The object constraint matches nothing in this release: say so, as a
-    // ground object the bundle does not hold is said to be absent.
-    let absent_object = || {
-        let blank = Position::ALL
-            .into_iter()
-            .filter_map(|position| triple.bound(position))
-            .any(BoundTerm::denotes_blank_node);
-        TripleResolved::Absent(vec![AbsentTerm {
-            parameter: "o",
-            reason: if blank {
-                AbsentReason::BlankNode
-            } else {
-                AbsentReason::NotInBundle
-            },
-        }])
+    let Some(terms) = terms else {
+        return Ok(TripleResolved::Empty);
     };
-    let Some(terms) = store.triple_terms() else {
-        return Ok(absent_object());
-    };
-    let data = inner_pattern(&dictionary, blank_nodes, terms, None, triple)?;
-    let propositions = match terms.propositions_dict() {
-        Some(props) => inner_pattern(&dictionary, blank_nodes, terms, Some(&props), triple)?,
-        None => None,
-    };
+    let data = inner_pattern(data_ids);
+    let propositions = props_ids.and_then(inner_pattern);
     if data.is_none() && propositions.is_none() {
-        return Ok(absent_object());
+        return Ok(TripleResolved::Empty);
     }
     let selection = store
         .resolve_triple_terms(TripleTermPattern {
@@ -6583,21 +6590,38 @@ fn resolve_triple_pattern<'s>(
             data,
             propositions,
         })
-        .map_err(|error| unreadable("resolving a pattern inside triple terms", &error))?
-        .expect("a bundle with triple terms resolves patterns inside them");
-    Ok(TripleResolved::Selected(selection))
+        .map_err(|error| unreadable("resolving a pattern inside triple terms", &error))?;
+    debug_assert!(terms.propositions_dict().is_some() || propositions.is_none());
+    Ok(TripleResolved::Selected(selection.expect(
+        "a bundle with triple terms resolves patterns inside them",
+    )))
 }
 
-/// The inner pattern in one HDT's identifiers: `data.hdt`'s when `props` is
-/// `None`, else the propositions HDT's. `None` when a bound inner term is not
-/// in that HDT, so nothing there matches.
-fn inner_pattern(
+/// The inner pattern in one HDT, if every bound position was found there.
+fn inner_pattern(ids: [Option<Option<u64>>; 3]) -> Option<InnerPattern> {
+    let id = |slot: Option<Option<u64>>| -> Option<Option<u64>> {
+        match slot {
+            None => Some(None),
+            Some(found) => found.map(Some),
+        }
+    };
+    Some(InnerPattern {
+        subject: id(ids[0])?,
+        predicate: id(ids[1])?,
+        object: id(ids[2])?,
+    })
+}
+
+/// Each inner position's identifier in one HDT — `data.hdt` when `props` is
+/// `None`, else the propositions HDT: `None` for a variable, `Some(None)` for
+/// a bound term that HDT does not hold.
+fn inner_ids(
     data: &Dictionary<'_>,
     blank_nodes: &SkolemScope,
-    terms: &TripleTerms,
+    terms: Option<&TripleTerms>,
     props: Option<&Dictionary<'_>>,
     triple: &TriplePattern,
-) -> Result<Option<InnerPattern>, Problem> {
+) -> Result<[Option<Option<u64>>; 3], Problem> {
     let dictionary = props.unwrap_or(data);
     let mut ids = [None; 3];
     for (slot, position) in ids.iter_mut().zip(Position::ALL) {
@@ -6608,7 +6632,11 @@ fn inner_pattern(
         let found = if let Some(nested) = term.triple() {
             // A ground triple term nested inside: minted from its stored
             // labels, and looked for among this HDT's objects.
-            match proposition_of(data, blank_nodes, terms, nested)? {
+            let proposition = match terms {
+                Some(terms) => proposition_of(data, blank_nodes, terms, nested)?,
+                None => None,
+            };
+            match proposition {
                 Some(proposition) => dictionary
                     .locate(
                         Role::Object,
@@ -6638,16 +6666,9 @@ fn inner_pattern(
                 .map_err(|error| unreadable("looking a term up", &error))?
                 .map(|id| id.0)
         };
-        match found {
-            Some(id) => *slot = Some(id),
-            None => return Ok(None),
-        }
+        *slot = Some(found);
     }
-    Ok(Some(InnerPattern {
-        subject: ids[0],
-        predicate: ids[1],
-        object: ids[2],
-    }))
+    Ok(ids)
 }
 
 /// Where a request resumes a budgeted triple-term enumeration.
@@ -6714,6 +6735,7 @@ fn triple_fragment(
                 paging,
             );
         }
+        TripleResolved::Empty => return paged(store, target, envelope, Vec::new(), paging),
         TripleResolved::Selected(TripleTermSelection::Range(selection)) => {
             return paged(
                 store,
@@ -6808,11 +6830,14 @@ fn triple_count(
     binding: &CursorBinding,
 ) -> Result<(Cardinality, Completeness, Vec<AbsentTerm>), Problem> {
     let selection = match resolve_triple_pattern(store, blank_nodes, pattern, triple)? {
-        TripleResolved::Absent(_) if cursor.is_some() => {
+        TripleResolved::Absent(_) | TripleResolved::Empty if cursor.is_some() => {
             return Err(Problem::from(StaleCursor));
         }
         TripleResolved::Absent(absent) => {
             return Ok((Cardinality::exact(0), Completeness::complete(), absent));
+        }
+        TripleResolved::Empty => {
+            return Ok((Cardinality::exact(0), Completeness::complete(), Vec::new()));
         }
         TripleResolved::Selected(TripleTermSelection::Range(selection)) => {
             if cursor.is_some() {
@@ -9126,10 +9151,15 @@ impl Resource for CountAnswer {
                         absent_terms_text(&self.absent_terms)
                     )))
                 }
-                @if self.pattern.triple().is_some() {
+                @if self.pattern.triple().is_some() && !self.completeness.is_complete() {
                     (note(
                         "A count inside triple terms examines a bounded number of candidate triple \
                          terms. Continue from the cursor until the count is exact."
+                    ))
+                } @else if self.pattern.triple().is_some() {
+                    (note(
+                        "A count inside triple terms examines a bounded number of candidate triple \
+                         terms; this one finished within it, so it is exact."
                     ))
                 } @else if self.pattern.text().is_none() {
                     (note(
