@@ -36,7 +36,9 @@
 //!   HDT that holds propositions, and the layer's set bits in that range are
 //!   exactly the matching triple terms named in `data.hdt`. Each is then one
 //!   OPS group of `data.hdt`. Work is proportional to the matching terms, not
-//!   to the range.
+//!   to the range — except for an inner `s ? o`, which no permutation makes
+//!   contiguous: there each predicate group of `s` is probed for `o`, so the
+//!   candidates are at most the subject's predicates.
 //! - **Outer subject first**, when the outer subject's triple-term objects are
 //!   fewer than the inner matches: each is decoded and tested.
 //!
@@ -242,6 +244,17 @@ impl TripleTerms {
                 });
             }
         };
+        check_layers(
+            &index,
+            &data_run,
+            &data_layers,
+            propositions.as_ref().map(|p| &p.layers),
+        )?;
+        check_run_widths(
+            &index,
+            [&data_run, &props_run],
+            [Some(data), propositions.as_ref().map(|p| &p.hdt)],
+        )?;
         Ok(Self {
             index,
             data_run,
@@ -335,19 +348,14 @@ impl TripleTerms {
     /// Resolve a pattern inside triple terms against the HDTs that hold
     /// propositions. `data` must be the HDT this index was opened against.
     ///
-    /// `O(log N)` per source and enumerates nothing; the plan it picks is a
-    /// function of the bundle and the pattern alone.
+    /// Enumerates nothing. Costs `O(log N)` per HDT, plus one binary search per
+    /// predicate group of the outer subject when one is bound; the plan it
+    /// picks is a function of the bundle and the pattern alone.
     pub(crate) fn select<'a>(
         &'a self,
         data: &'a IndexedHdt,
         pattern: TripleTermPattern,
     ) -> Result<TripleTermSelection<'a>> {
-        let outer = IdPattern {
-            subject: pattern.subject,
-            predicate: pattern.predicate,
-            object: None,
-        };
-        data.resolve(outer)?; // validates the outer ids
         let unconstrained = pattern.data.is_some_and(|inner| inner.is_unconstrained())
             && (self.propositions.is_none()
                 || pattern
@@ -357,40 +365,38 @@ impl TripleTerms {
         let perms = data.permutations();
 
         if unconstrained && pattern.subject.is_none() {
-            let selection = match pattern.predicate {
+            let range = match pattern.predicate {
+                // The triple-term IRIs are one run of the object identifiers,
+                // so their OPS groups are one range.
+                None if run.is_empty() => 0..0,
                 None => {
                     let ops = perms.ops();
-                    let range = if run.is_empty() {
-                        0..0
-                    } else {
-                        z_span(
-                            ops,
-                            ops.level2_range(run.start).start..ops.level2_range(run.end - 1).end,
-                        )
-                    };
-                    crate::pattern::contiguous(Permutation::Ops, ops, range)
+                    ops.z_span(ops.level2_range(run.start).start..ops.level2_range(run.end - 1).end)
                 }
+                // And within a predicate's POS group, objects are sorted.
                 Some(predicate) => {
                     let pos = perms.pos();
                     let y = pos.level2_range(predicate);
-                    let first = lower_bound_level2(pos, y.clone(), run.start);
-                    let last = lower_bound_level2(pos, y, run.end);
-                    let range = if first == last {
-                        0..0
-                    } else {
-                        z_span(pos, first..last)
-                    };
-                    crate::pattern::contiguous(Permutation::Pos, pos, range)
+                    pos.z_span(
+                        pos.level2_lower_bound(y.clone(), run.start)
+                            ..pos.level2_lower_bound(y, run.end),
+                    )
                 }
             };
-            return Ok(TripleTermSelection {
-                plan: Plan::Range(selection),
-            });
+            let (permutation, triples) = match pattern.predicate {
+                None => (Permutation::Ops, perms.ops()),
+                Some(_) => (Permutation::Pos, perms.pos()),
+            };
+            return Ok(TripleTermSelection::Range(crate::pattern::contiguous(
+                permutation,
+                triples,
+                range,
+            )));
         }
 
-        // Each HDT that holds propositions, with the inner pattern's range.
+        // Each HDT that holds propositions, with its candidates.
         let mut sources = Vec::with_capacity(2);
-        let mut inner_matches = 0u64;
+        let mut inner_candidates = 0u64;
         for (source, inner) in [
             (Source::Data, pattern.data),
             (Source::Propositions, pattern.propositions),
@@ -398,30 +404,19 @@ impl TripleTerms {
             let (Some(inner), Some(hdt)) = (inner, self.hdt(data, source)) else {
                 continue;
             };
-            let layer_permutation = inner.permutation();
-            let Some(layer) = self.layer(source, layer_permutation) else {
+            let Some(source) = InnerSource::new(self, source, hdt, inner)? else {
                 continue;
             };
-            let range = inner.range(hdt)?;
-            let matches = layer.count_in(&range);
-            inner_matches += matches;
-            sources.push(InnerSource {
-                source,
-                inner,
-                permutation: layer_permutation,
-                range,
-                matches,
-                hdt,
-                layer,
-            });
+            inner_candidates += source.count;
+            sources.push(source);
         }
 
         if let Some(subject) = pattern.subject {
             let groups = subject_groups(perms.spo(), subject, pattern.predicate, &run);
             let candidates: u64 = groups.iter().map(range_len).sum();
-            if unconstrained || candidates <= inner_matches {
-                return Ok(TripleTermSelection {
-                    plan: Plan::OuterFirst(OuterFirst {
+            if unconstrained || candidates <= inner_candidates {
+                return Ok(TripleTermSelection::Budgeted(BudgetedSelection {
+                    plan: Budgeted::OuterFirst(OuterFirst {
                         terms: self,
                         spo: perms.spo(),
                         groups,
@@ -432,19 +427,19 @@ impl TripleTerms {
                             Some([pattern.data, pattern.propositions])
                         },
                     }),
-                });
+                }));
             }
         }
 
-        Ok(TripleTermSelection {
-            plan: Plan::InnerFirst(InnerFirst {
+        Ok(TripleTermSelection::Budgeted(BudgetedSelection {
+            plan: Budgeted::InnerFirst(InnerFirst {
                 ops: perms.ops(),
                 subject: pattern.subject,
                 predicate: pattern.predicate,
                 sources,
-                matches: inner_matches,
+                candidates: inner_candidates,
             }),
-        })
+        }))
     }
 
     fn hdt<'a>(&'a self, data: &'a IndexedHdt, source: Source) -> Option<&'a IndexedHdt> {
@@ -493,60 +488,16 @@ impl InnerPattern {
             && self.predicate.is_none_or(|p| p == triple.predicate)
             && self.object.is_none_or(|o| o == triple.object)
     }
-
-    /// The permutation whose layer serves this pattern: the one in which its
-    /// bound positions form a contiguous range, with `s ? o` reading the
-    /// subject's group and probing each marked position's object.
-    fn permutation(&self) -> Permutation {
-        match (self.subject, self.predicate, self.object) {
-            (Some(_), _, _) | (None, None, None) => Permutation::Spo,
-            (None, Some(_), _) => Permutation::Pos,
-            (None, None, Some(_)) => Permutation::Ops,
-        }
-    }
-
-    /// The pattern's range in [`permutation`](Self::permutation).
-    fn range(&self, hdt: &IndexedHdt) -> Result<Range<u64>> {
-        let probe_free = IdPattern {
-            subject: self.subject,
-            predicate: self.predicate,
-            // `s ? o` has no contiguous range; its subject's group stands in,
-            // and each marked position's object is probed.
-            object: if self.subject.is_some() && self.predicate.is_none() {
-                None
-            } else {
-                self.object
-            },
-        };
-        if probe_free.subject.is_none()
-            && probe_free.predicate.is_none()
-            && probe_free.object.is_none()
-        {
-            return Ok(0..hdt.triples());
-        }
-        Ok(hdt
-            .resolve(probe_free)?
-            .contiguous_range()
-            .expect("an `s ? o`-free pattern is contiguous"))
-    }
-
-    /// Whether a marked position of the range still needs its object probed.
-    fn probes_object(&self) -> Option<u64> {
-        match (self.subject, self.predicate, self.object) {
-            (Some(_), None, Some(object)) => Some(object),
-            _ => None,
-        }
-    }
 }
 
 /// Where a triple-term enumeration stands: the position of a candidate, and
 /// how many of that candidate's rows a page already delivered.
 ///
 /// What `term` counts depends on the plan, which the bundle fixes: the index
-/// of a matching triple term among all of them (inner first), or an SPO
+/// of a candidate triple term among all of them (inner first), or an SPO
 /// position (outer subject first). The plan an enumeration resumes on is the
 /// plan that issued its position, because both are functions of the same
-/// immutable bundle and the same request.
+/// immutable bundle and the same request. The default is the start.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TripleTermPosition {
     /// The candidate.
@@ -560,7 +511,7 @@ pub struct TripleTermPosition {
 pub enum TripleTermPlan {
     /// One contiguous range of a permutation: an ordinary [`Selection`].
     Range,
-    /// Matching triple terms from each layer, then their OPS groups.
+    /// Candidate triple terms from each layer, then their OPS groups.
     InnerFirst,
     /// The outer subject's triple-term objects, each decoded and tested.
     OuterFirst,
@@ -568,13 +519,35 @@ pub enum TripleTermPlan {
 
 /// A resolved pattern inside triple terms.
 #[derive(Debug)]
-pub struct TripleTermSelection<'a> {
-    plan: Plan<'a>,
+pub enum TripleTermSelection<'a> {
+    /// Any triple term, without an outer subject: an ordinary selection, paged
+    /// and counted like any other.
+    Range(Selection<'a>),
+    /// A plan whose work is budgeted on candidates examined.
+    Budgeted(BudgetedSelection<'a>),
+}
+
+impl TripleTermSelection<'_> {
+    /// The plan.
+    pub fn plan(&self) -> TripleTermPlan {
+        match self {
+            Self::Range(_) => TripleTermPlan::Range,
+            Self::Budgeted(budgeted) => budgeted.plan(),
+        }
+    }
+}
+
+/// A pattern inside triple terms whose enumeration examines candidates: the
+/// inner pattern's matching triple terms, or the outer subject's triple-term
+/// objects. A candidate need not contribute a row, so the work of a page is
+/// bounded by a candidate budget rather than by its rows.
+#[derive(Debug)]
+pub struct BudgetedSelection<'a> {
+    plan: Budgeted<'a>,
 }
 
 #[derive(Debug)]
-enum Plan<'a> {
-    Range(Selection<'a>),
+enum Budgeted<'a> {
     InnerFirst(InnerFirst<'a>),
     OuterFirst(OuterFirst<'a>),
 }
@@ -585,19 +558,109 @@ struct InnerFirst<'a> {
     subject: Option<u64>,
     predicate: Option<u64>,
     sources: Vec<InnerSource<'a>>,
-    matches: u64,
+    candidates: u64,
 }
 
+/// One HDT's candidate triple terms for an inner pattern.
 #[derive(Debug)]
 struct InnerSource<'a> {
-    #[allow(dead_code)]
-    source: Source,
-    inner: InnerPattern,
-    permutation: Permutation,
-    range: Range<u64>,
-    matches: u64,
-    hdt: &'a IndexedHdt,
+    candidates: Candidates<'a>,
+    count: u64,
     layer: Layer<'a>,
+}
+
+// Unboxed although the variants differ in size: a selection holds at most two
+// of these, one per HDT, so the padding is a few hundred bytes per request.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum Candidates<'a> {
+    /// The marked positions of the pattern's range in its permutation:
+    /// candidate `i` is the layer's `first + i`-th marked position. Every
+    /// candidate matches.
+    Marked { first: u64 },
+    /// `s ? o`, which no permutation makes contiguous: candidate `i` probes
+    /// the subject's `i`-th predicate group for the object, and matches when
+    /// the triple found there is marked. At most one candidate per
+    /// predicate of the subject.
+    Probed {
+        spo: BitmapTriples<'a>,
+        groups: Range<u64>,
+        object: u64,
+    },
+}
+
+impl<'a> InnerSource<'a> {
+    fn new(
+        terms: &'a TripleTerms,
+        source: Source,
+        hdt: &'a IndexedHdt,
+        inner: InnerPattern,
+    ) -> Result<Option<Self>> {
+        let spo = hdt.permutations().spo();
+        if let (Some(subject), None, Some(object)) = (inner.subject, inner.predicate, inner.object)
+        {
+            let Some(layer) = terms.layer(source, Permutation::Spo) else {
+                return Ok(None);
+            };
+            hdt.resolve(IdPattern {
+                subject: Some(subject),
+                predicate: None,
+                object: Some(object),
+            })?; // validates both ids
+            let groups = spo.level2_range(subject);
+            return Ok(Some(Self {
+                count: range_len(&groups),
+                candidates: Candidates::Probed {
+                    spo,
+                    groups,
+                    object,
+                },
+                layer,
+            }));
+        }
+        let ids = IdPattern {
+            subject: inner.subject,
+            predicate: inner.predicate,
+            object: inner.object,
+        };
+        let (permutation, range) = if inner.is_unconstrained() {
+            (Permutation::Spo, 0..hdt.triples())
+        } else {
+            let selection = hdt.resolve(ids)?;
+            let range = selection
+                .contiguous_range()
+                .expect("every pattern but `s ? o` is contiguous");
+            (selection.permutation(), range)
+        };
+        let Some(layer) = terms.layer(source, permutation) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            count: layer.count_in(&range),
+            candidates: Candidates::Marked {
+                first: layer.rank(range.start),
+            },
+            layer,
+        }))
+    }
+
+    /// The `data.hdt` object identifier of candidate `i`, or `None` if it
+    /// does not match. `O(log N)`.
+    fn term(&self, i: u64) -> Option<u64> {
+        match &self.candidates {
+            Candidates::Marked { first } => Some(self.layer.term(first + i)),
+            Candidates::Probed {
+                spo,
+                groups,
+                object,
+            } => {
+                let z = spo.find_level3(spo.level3_range(groups.start + i), *object)?;
+                self.layer
+                    .contains(z)
+                    .then(|| self.layer.term(self.layer.rank(z)))
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -636,42 +699,28 @@ pub struct TripleTermCount {
     pub next: Option<TripleTermPosition>,
 }
 
-impl<'a> TripleTermSelection<'a> {
+impl BudgetedSelection<'_> {
     /// The plan.
     pub fn plan(&self) -> TripleTermPlan {
         match self.plan {
-            Plan::Range(_) => TripleTermPlan::Range,
-            Plan::InnerFirst(_) => TripleTermPlan::InnerFirst,
-            Plan::OuterFirst(_) => TripleTermPlan::OuterFirst,
+            Budgeted::InnerFirst(_) => TripleTermPlan::InnerFirst,
+            Budgeted::OuterFirst(_) => TripleTermPlan::OuterFirst,
         }
     }
 
-    /// The ordinary selection a [`TripleTermPlan::Range`] plan is.
-    pub fn as_selection(&self) -> Option<&Selection<'a>> {
-        match &self.plan {
-            Plan::Range(selection) => Some(selection),
-            _ => None,
-        }
-    }
-
-    /// Candidates the whole enumeration examines: matching triple terms (inner
-    /// first) or the outer subject's triple-term objects (outer first). A
-    /// [`Range`](TripleTermPlan::Range) plan examines none.
+    /// Candidates the whole enumeration examines.
     pub fn candidates(&self) -> u64 {
         match &self.plan {
-            Plan::Range(_) => 0,
-            Plan::InnerFirst(plan) => plan.matches,
-            Plan::OuterFirst(plan) => plan.candidates,
+            Budgeted::InnerFirst(plan) => plan.candidates,
+            Budgeted::OuterFirst(plan) => plan.candidates,
         }
     }
 
-    /// The exact row count when it is arithmetic: a range width, or the outer
-    /// subject's triple-term objects when nothing constrains the inner
-    /// pattern.
+    /// The exact row count when it is arithmetic: the outer subject's
+    /// triple-term objects, when nothing constrains the inner pattern.
     pub fn exact_count(&self) -> Option<u64> {
         match &self.plan {
-            Plan::Range(selection) => Some(selection.count().value),
-            Plan::OuterFirst(plan) if plan.inner.is_none() => Some(plan.candidates),
+            Budgeted::OuterFirst(plan) if plan.inner.is_none() => Some(plan.candidates),
             _ => None,
         }
     }
@@ -679,8 +728,8 @@ impl<'a> TripleTermSelection<'a> {
     /// Enumerate from `from`, examining at most `budget` candidates.
     ///
     /// Yields rows in the plan's order and, if the budget runs out first, one
-    /// final [`TripleTermStep::Spent`]. A [`Range`](TripleTermPlan::Range)
-    /// plan is not enumerated here; page its [`Selection`].
+    /// final [`TripleTermStep::Spent`] naming the first unexamined candidate —
+    /// `from` itself, rows included, when the budget is zero.
     ///
     /// Fails with [`Error::ResumePositionOutOfRange`] when `from` names no
     /// candidate of this enumeration, or no row of the candidate it names.
@@ -689,24 +738,32 @@ impl<'a> TripleTermSelection<'a> {
         from: TripleTermPosition,
         budget: u64,
     ) -> Result<Box<dyn Iterator<Item = TripleTermStep> + '_>> {
-        match &self.plan {
-            Plan::Range(_) => panic!("a range plan is paged as a selection"),
-            Plan::InnerFirst(plan) => plan.steps(from, budget),
-            Plan::OuterFirst(plan) => plan.steps(from, budget),
+        let steps = match &self.plan {
+            Budgeted::InnerFirst(plan) => plan.steps(from, budget)?,
+            Budgeted::OuterFirst(plan) => plan.steps(from, budget)?,
+        };
+        if budget == 0 {
+            return Ok(Box::new(std::iter::once(TripleTermStep::Spent(from))));
         }
+        Ok(steps)
     }
 
     /// Count rows from `from`, examining at most `budget` candidates.
     pub fn count(&self, from: TripleTermPosition, budget: u64) -> Result<TripleTermCount> {
         match &self.plan {
-            Plan::Range(selection) => Ok(TripleTermCount {
-                counted: selection.count().value,
-                next: None,
-            }),
-            Plan::InnerFirst(plan) => plan.count(from, budget),
-            Plan::OuterFirst(plan) => {
+            Budgeted::InnerFirst(plan) => {
+                plan.check(from)?;
+                if budget == 0 {
+                    return Ok(TripleTermCount {
+                        counted: 0,
+                        next: Some(from),
+                    });
+                }
+                plan.count(from, budget)
+            }
+            Budgeted::OuterFirst(_) => {
                 let mut counted = 0;
-                for step in plan.steps(from, budget)? {
+                for step in self.steps(from, budget)? {
                     match step {
                         TripleTermStep::Row { .. } => counted += 1,
                         TripleTermStep::Spent(next) => {
@@ -726,28 +783,18 @@ impl<'a> TripleTermSelection<'a> {
     }
 }
 
-impl<'a> InnerFirst<'a> {
-    /// The matching triple term at enumeration index `index`: its source's
-    /// position in the list and its `data.hdt` object identifier, or `None`
-    /// when that marked position fails the object probe.
-    fn term(&self, index: u64) -> (usize, Option<u64>) {
+impl InnerFirst<'_> {
+    /// Candidate `index`'s `data.hdt` object identifier, or `None` when it
+    /// does not match.
+    fn term(&self, index: u64) -> Option<u64> {
         let mut index = index;
-        for (i, source) in self.sources.iter().enumerate() {
-            if index < source.matches {
-                let rank = source.layer.rank(source.range.start) + index;
-                if let Some(object) = source.inner.probes_object() {
-                    let position = source.layer.select(rank);
-                    let spo = source.hdt.permutations().spo();
-                    debug_assert_eq!(source.permutation, Permutation::Spo);
-                    if spo.level3_at(position) != object {
-                        return (i, None);
-                    }
-                }
-                return (i, Some(source.layer.term(rank)));
+        for source in &self.sources {
+            if index < source.count {
+                return source.term(index);
             }
-            index -= source.matches;
+            index -= source.count;
         }
-        unreachable!("index within the matches")
+        unreachable!("a candidate index within the candidates")
     }
 
     /// The rows of triple term `term` in `data.hdt` under the outer pattern:
@@ -788,7 +835,7 @@ impl<'a> InnerFirst<'a> {
                 .ops
                 .find_level2(y, predicate)
                 .map_or(0, |y| range_len(&self.ops.level3_range(y))),
-            None => range_len(&z_span(self.ops, y)),
+            None => range_len(&self.ops.z_span(y)),
         }
     }
 
@@ -796,16 +843,13 @@ impl<'a> InnerFirst<'a> {
         if from == TripleTermPosition::default() {
             return Ok(());
         }
-        if from.term >= self.matches {
+        if from.term >= self.candidates {
             return Err(Error::ResumePositionOutOfRange {
                 position: from.term,
-                length: self.matches,
+                length: self.candidates,
             });
         }
-        let rows = match self.term(from.term).1 {
-            Some(term) => self.row_count(term),
-            None => 0,
-        };
+        let rows = self.term(from.term).map_or(0, |term| self.row_count(term));
         if from.row > 0 && from.row >= rows {
             return Err(Error::ResumePositionOutOfRange {
                 position: from.row,
@@ -825,7 +869,7 @@ impl<'a> InnerFirst<'a> {
         let mut skip = from.row;
         let mut examined = 0u64;
         // The current term's remaining OPS positions, its identifier, its
-        // enumeration index, and the row number of the next one.
+        // candidate index, and the row number of the next one.
         let mut pending: Box<dyn Iterator<Item = u64>> = Box::new(std::iter::empty());
         let (mut term_id, mut term_index, mut row) = (0u64, 0u64, 0u64);
         let mut done = false;
@@ -849,7 +893,7 @@ impl<'a> InnerFirst<'a> {
                         at,
                     });
                 }
-                if index >= self.matches {
+                if index >= self.candidates {
                     done = true;
                     return None;
                 }
@@ -864,7 +908,7 @@ impl<'a> InnerFirst<'a> {
                 term_index = index;
                 row = std::mem::take(&mut skip);
                 index += 1;
-                if let (_, Some(term)) = self.term(term_index) {
+                if let Some(term) = self.term(term_index) {
                     term_id = term;
                     pending = Box::new(skip_rows(self.rows(term), row));
                 }
@@ -873,10 +917,9 @@ impl<'a> InnerFirst<'a> {
     }
 
     fn count(&self, from: TripleTermPosition, budget: u64) -> Result<TripleTermCount> {
-        self.check(from)?;
         let mut counted = 0;
         let mut skip = from.row;
-        for (examined, index) in (from.term..self.matches).enumerate() {
+        for (examined, index) in (from.term..self.candidates).enumerate() {
             if examined as u64 >= budget {
                 return Ok(TripleTermCount {
                     counted,
@@ -886,7 +929,7 @@ impl<'a> InnerFirst<'a> {
                     }),
                 });
             }
-            if let (_, Some(term)) = self.term(index) {
+            if let Some(term) = self.term(index) {
                 counted += self
                     .row_count(term)
                     .saturating_sub(std::mem::take(&mut skip));
@@ -908,7 +951,7 @@ impl OuterFirst<'_> {
         if from.row != 0 || !self.groups.iter().any(|group| group.contains(&from.term)) {
             return Err(Error::ResumePositionOutOfRange {
                 position: from.term,
-                length: self.candidates,
+                length: self.groups.last().map_or(0, |group| group.end),
             });
         }
         Ok(())
@@ -934,13 +977,15 @@ impl OuterFirst<'_> {
         budget: u64,
     ) -> Result<Box<dyn Iterator<Item = TripleTermStep> + '_>> {
         self.check(from)?;
+        // Straight to the group holding `from`: resuming costs a pass over the
+        // groups, never over the positions before it.
         let start = from.term;
-        let mut examined = 0u64;
         let mut positions = self
             .groups
             .iter()
-            .flat_map(|group| group.clone())
-            .skip_while(move |&z| from != TripleTermPosition::default() && z < start);
+            .filter(move |group| group.end > start)
+            .flat_map(move |group| group.start.max(start)..group.end);
+        let mut examined = 0u64;
         let mut done = false;
         Ok(Box::new(std::iter::from_fn(move || {
             loop {
@@ -1002,42 +1047,11 @@ fn subject_groups(
     ys.into_iter()
         .filter_map(|y| {
             let z = spo.level3_range(y);
-            let first = lower_bound_level3(spo, z.clone(), run.start);
-            let last = lower_bound_level3(spo, z, run.end);
+            let first = spo.level3_lower_bound(z.clone(), run.start);
+            let last = spo.level3_lower_bound(z, run.end);
             (first < last).then_some(first..last)
         })
         .collect()
-}
-
-/// The first position in a sorted level-2 range whose value is at least
-/// `value`.
-fn lower_bound_level2(triples: BitmapTriples<'_>, range: Range<u64>, value: u64) -> u64 {
-    match value.checked_sub(1) {
-        Some(below) => triples.level2_upper_bound(range, below),
-        None => range.start,
-    }
-}
-
-/// The first position in a sorted level-3 range whose value is at least
-/// `value`.
-fn lower_bound_level3(triples: BitmapTriples<'_>, range: Range<u64>, value: u64) -> u64 {
-    let (mut low, mut high) = (range.start, range.end);
-    while low < high {
-        let middle = low + (high - low) / 2;
-        if triples.level3_at(middle) < value {
-            low = middle + 1;
-        } else {
-            high = middle;
-        }
-    }
-    low
-}
-
-fn z_span(triples: BitmapTriples<'_>, y: Range<u64>) -> Range<u64> {
-    if y.is_empty() {
-        return 0..0;
-    }
-    triples.level3_range(y.start).start..triples.level3_range(y.end - 1).end
 }
 
 fn range_len(range: &Range<u64>) -> u64 {
@@ -1128,6 +1142,90 @@ fn check_run(index: &Mapping, hdt: &IndexedHdt, run: &RunSpec) -> Result<()> {
     Ok(())
 }
 
+/// Check what the layers' payloads promise without reading them: each
+/// reverse array has one entry per marked position, the three orders of an
+/// HDT mark the same triples, and every triple-term IRI of `data.hdt` names
+/// exactly one marked triple, in one HDT or the other
+/// (`triple-terms-format.md` §8). Sentinel loads only.
+fn check_layers(
+    index: &Mapping,
+    data_run: &RunSpec,
+    data: &[LayerSpec; 3],
+    props: Option<&[LayerSpec; 3]>,
+) -> Result<()> {
+    let malformed = |detail: String| Error::Malformed {
+        artifact: index.path().to_path_buf(),
+        detail,
+    };
+    let mut marked = 0;
+    for (which, layers) in [("data", Some(data)), ("propositions", props)] {
+        let Some(layers) = layers else {
+            continue;
+        };
+        let counts: Vec<u64> = layers
+            .iter()
+            .map(|layer| {
+                let count = layer.bitmap.view(index, index).count();
+                (layer.reverse.len() == count).then_some(count).ok_or(count)
+            })
+            .collect::<std::result::Result<_, u64>>()
+            .map_err(|count| {
+                malformed(format!(
+                    "a {which} layer marks {count} triples but its reverse array has a \
+                     different number of entries"
+                ))
+            })?;
+        if counts.windows(2).any(|pair| pair[0] != pair[1]) {
+            return Err(malformed(format!(
+                "the {which} layers mark different numbers of triples in different orders"
+            )));
+        }
+        marked += counts[0];
+    }
+    if marked != data_run.len {
+        return Err(malformed(format!(
+            "the layers mark {marked} triples for {} triple-term IRIs",
+            data_run.len
+        )));
+    }
+    Ok(())
+}
+
+/// Check the run arrays' widths, which the bound HDTs' identifier spaces fix
+/// (`triple-terms-format.md` §7). A wrong width decodes every proposition
+/// wrongly without failing.
+fn check_run_widths(
+    index: &Mapping,
+    runs: [&RunSpec; 2],
+    hdts: [Option<&IndexedHdt>; 2],
+) -> Result<()> {
+    let width = |maximum: u64| (u64::BITS - maximum.leading_zeros()) as u8;
+    let largest = |role: Role| {
+        hdts.iter()
+            .flatten()
+            .map(|hdt| hdt.dict_counts().len(role))
+            .max()
+            .unwrap_or(0)
+    };
+    let (subject, predicate, object) = (
+        width(largest(Role::Subject)) + 1,
+        width(largest(Role::Predicate)),
+        width(largest(Role::Object)),
+    );
+    for run in runs {
+        if run.subject.width() != subject
+            || run.predicate.width() != predicate
+            || run.object.width() != object
+        {
+            return Err(Error::Malformed {
+                artifact: index.path().to_path_buf(),
+                detail: "the run arrays' widths do not fit the HDTs they describe".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn section<'s>(
     index: &Mapping,
     sections: &'s [TripleTermSection],
@@ -1163,6 +1261,12 @@ fn run_spec(
     run: u32,
     facts: &hdtc::format::TripleTermSourceFacts,
 ) -> Result<RunSpec> {
+    if facts.run_start.checked_add(facts.run_length).is_none() {
+        return Err(Error::Malformed {
+            artifact: index.path().to_path_buf(),
+            detail: "a run of triple-term IRIs ends past the identifier space".to_owned(),
+        });
+    }
     Ok(RunSpec {
         start: facts.run_start,
         len: facts.run_length,
@@ -1269,9 +1373,12 @@ mod tests {
     }
 
     fn all_rows(selection: &TripleTermSelection<'_>) -> Vec<IdTriple> {
-        if let Some(selection) = selection.as_selection() {
-            return selection.page(0, usize::MAX).collect();
-        }
+        let selection = match selection {
+            TripleTermSelection::Range(selection) => {
+                return selection.page(0, usize::MAX).collect();
+            }
+            TripleTermSelection::Budgeted(selection) => selection,
+        };
         selection
             .steps(TripleTermPosition::default(), u64::MAX)
             .unwrap()
@@ -1430,13 +1537,21 @@ mod tests {
                 found.sort();
                 expected.sort();
                 assert_eq!(found, expected, "{inner:?} under {subject:?} {predicate:?}");
-                let count = selection
-                    .count(TripleTermPosition::default(), u64::MAX)
-                    .unwrap();
-                assert_eq!(count.counted, expected.len() as u64);
-                assert_eq!(count.next, None);
-                if let Some(exact) = selection.exact_count() {
-                    assert_eq!(exact, expected.len() as u64);
+                match &selection {
+                    TripleTermSelection::Range(range) => {
+                        assert_eq!(range.count().value, expected.len() as u64);
+                    }
+                    TripleTermSelection::Budgeted(budgeted) => {
+                        let count = budgeted
+                            .count(TripleTermPosition::default(), u64::MAX)
+                            .unwrap();
+                        assert_eq!(count.counted, expected.len() as u64);
+                        assert_eq!(count.next, None);
+                        if let Some(exact) = budgeted.exact_count() {
+                            assert_eq!(exact, expected.len() as u64);
+                        }
+                        check_resumes(budgeted, &expected);
+                    }
                 }
             }
         }
@@ -1445,38 +1560,9 @@ mod tests {
     }
 
     /// Resuming at any row, or after any budget, continues the enumeration
-    /// exactly.
-    #[test]
-    fn budgeted_enumeration_resumes_without_loss_or_duplication() {
-        let fixture = Fixture::build(TRIPLE_TERMS_NT);
-        let store = open(&fixture);
-        let terms = store.triple_terms().unwrap();
-        let knows = store
-            .dict()
-            .locate(Role::Predicate, b"http://example.org/knows")
-            .unwrap()
-            .unwrap()
-            .0;
-        let props_knows = terms
-            .propositions_dict()
-            .unwrap()
-            .locate(Role::Predicate, b"http://example.org/knows")
-            .unwrap()
-            .map(|id| id.0);
-        let pattern = TripleTermPattern {
-            subject: None,
-            predicate: None,
-            data: Some(InnerPattern {
-                predicate: Some(knows),
-                ..InnerPattern::default()
-            }),
-            propositions: props_knows.map(|p| InnerPattern {
-                predicate: Some(p),
-                ..InnerPattern::default()
-            }),
-        };
-        let selection = store.resolve_triple_terms(pattern).unwrap().unwrap();
-        assert_eq!(selection.plan(), TripleTermPlan::InnerFirst);
+    /// exactly; a budget of zero spends nothing and loses nothing; and a
+    /// position past the end names nothing.
+    fn check_resumes(selection: &BudgetedSelection<'_>, expected: &[IdTriple]) {
         let full: Vec<(IdTriple, TripleTermPosition)> = selection
             .steps(TripleTermPosition::default(), u64::MAX)
             .unwrap()
@@ -1485,7 +1571,9 @@ mod tests {
                 TripleTermStep::Spent(_) => unreachable!(),
             })
             .collect();
-        assert!(full.len() >= 3, "{full:?}");
+        let mut sorted: Vec<IdTriple> = full.iter().map(|(t, _)| *t).collect();
+        sorted.sort();
+        assert_eq!(sorted, expected);
         for (i, (_, at)) in full.iter().enumerate() {
             let rest: Vec<IdTriple> = selection
                 .steps(*at, u64::MAX)
@@ -1495,10 +1583,15 @@ mod tests {
                     TripleTermStep::Spent(_) => None,
                 })
                 .collect();
-            let expected: Vec<IdTriple> = full[i..].iter().map(|(t, _)| *t).collect();
-            assert_eq!(rest, expected, "resumed at {at:?}");
+            let suffix: Vec<IdTriple> = full[i..].iter().map(|(t, _)| *t).collect();
+            assert_eq!(rest, suffix, "resumed at {at:?}");
+            // Nothing is examined under a zero budget, and the position,
+            // row included, comes back as it went in.
+            let zero: Vec<TripleTermStep> = selection.steps(*at, 0).unwrap().collect();
+            assert_eq!(zero, vec![TripleTermStep::Spent(*at)]);
+            assert_eq!(selection.count(*at, 0).unwrap().next, Some(*at));
         }
-        for budget in 1..=4 {
+        for budget in 1..=3 {
             let mut collected = Vec::new();
             let mut from = TripleTermPosition::default();
             loop {
@@ -1514,9 +1607,8 @@ mod tests {
                     None => break,
                 }
             }
-            let expected: Vec<IdTriple> = full.iter().map(|(t, _)| *t).collect();
-            assert_eq!(collected, expected, "budget {budget}");
-            // Counting resumes the same way.
+            let in_order: Vec<IdTriple> = full.iter().map(|(t, _)| *t).collect();
+            assert_eq!(collected, in_order, "budget {budget}");
             let mut counted = 0;
             let mut from = TripleTermPosition::default();
             loop {
@@ -1529,17 +1621,28 @@ mod tests {
             }
             assert_eq!(counted, expected.len() as u64, "budget {budget}");
         }
-        // A position past the end names nothing.
+        let past = match selection.plan() {
+            TripleTermPlan::InnerFirst => TripleTermPosition {
+                term: selection.candidates(),
+                row: 0,
+            },
+            _ => TripleTermPosition {
+                term: u64::MAX,
+                row: 0,
+            },
+        };
         assert!(matches!(
-            selection.steps(
-                TripleTermPosition {
-                    term: selection.candidates(),
-                    row: 0
-                },
-                1
-            ),
+            selection.steps(past, 1),
             Err(Error::ResumePositionOutOfRange { .. })
         ));
+        // A row past the end of the candidate it names.
+        if let Some((_, at)) = full.last() {
+            let forged = TripleTermPosition {
+                term: at.term,
+                row: at.row + 1_000,
+            };
+            assert!(selection.steps(forged, 1).is_err(), "{forged:?}");
+        }
     }
 
     #[test]
@@ -1645,6 +1748,134 @@ mod tests {
         assert!(
             matches!(&error, Error::ArtifactBindingMismatch { .. }),
             "{error}"
+        );
+    }
+
+    /// Every triple term asserted: the index names no propositions HDT, and
+    /// every plan still answers.
+    #[test]
+    fn a_bundle_whose_triple_terms_are_all_asserted_needs_no_propositions_hdt() {
+        let source = concat!(
+            "<http://example.org/a> <http://example.org/p> <http://example.org/b> .\n",
+            "<http://example.org/e> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+            "<<( <http://example.org/a> <http://example.org/p> <http://example.org/b> )>> .\n",
+        );
+        let fixture = Fixture::build(source);
+        assert!(
+            !fixture
+                .bundle_path()
+                .join(crate::store::artifact::PROPOSITIONS)
+                .exists()
+        );
+        let store = open(&fixture);
+        let terms = store.triple_terms().unwrap();
+        assert!(terms.propositions_dict().is_none());
+        assert!(
+            terms
+                .layer(Source::Propositions, Permutation::Spo)
+                .is_none()
+        );
+        let rows = reifying(&store);
+        assert_eq!(rows.len(), 1);
+        let any = store
+            .resolve_triple_terms(TripleTermPattern {
+                data: Some(InnerPattern::default()),
+                ..TripleTermPattern::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(any.plan(), TripleTermPlan::Range);
+        assert_eq!(all_rows(&any), rows);
+        let p = store
+            .dict()
+            .locate(Role::Predicate, b"http://example.org/p")
+            .unwrap()
+            .unwrap()
+            .0;
+        let inner = store
+            .resolve_triple_terms(TripleTermPattern {
+                data: Some(InnerPattern {
+                    predicate: Some(p),
+                    ..InnerPattern::default()
+                }),
+                ..TripleTermPattern::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(inner.plan(), TripleTermPlan::InnerFirst);
+        assert_eq!(all_rows(&inner), rows);
+
+        // A propositions HDT the index does not name is refused.
+        let other = Fixture::build(TRIPLE_TERMS_NT);
+        for name in [
+            crate::store::artifact::PROPOSITIONS,
+            crate::store::artifact::PROPOSITIONS_PERM,
+        ] {
+            std::fs::copy(
+                other.bundle_path().join(name),
+                fixture.bundle_path().join(name),
+            )
+            .unwrap();
+        }
+        let error = Store::open(
+            &published_bundle(fixture.bundle_path()),
+            OpenOptions::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(&error, Error::Malformed { .. }), "{error}");
+    }
+
+    /// CRC32C (Castagnoli), so a test can corrupt a field and keep the
+    /// checksums that would otherwise catch it first.
+    fn crc32c(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0x82F6_3B78
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn a_layer_whose_reverse_array_disagrees_with_its_bitmap_is_refused_at_open() {
+        let fixture = Fixture::build(TRIPLE_TERMS_NT);
+        let path = fixture
+            .bundle_path()
+            .join(crate::store::artifact::TRIPLE_TERMS);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let get = |bytes: &[u8], at: usize, n: usize| {
+            let mut value = [0u8; 8];
+            value[..n].copy_from_slice(&bytes[at..at + n]);
+            u64::from_le_bytes(value)
+        };
+        let directory = get(&bytes, 56, 8) as usize;
+        let sections = get(&bytes, 40, 4) as usize;
+        let wanted = u64::from(section_type(component::DATA_POS, kind::REVERSE));
+        let entry = (0..sections)
+            .map(|i| directory + i * 64)
+            .find(|&at| get(&bytes, at, 4) == wanted)
+            .expect("the POS reverse section");
+        // Empty it: a legal shape for a section, and a lie about its layer.
+        bytes[entry + 8..entry + 32].fill(0);
+        bytes[entry + 36..entry + 40].fill(0);
+        let crc = crc32c(&bytes[directory..directory + sections * 64]);
+        bytes[directory + sections * 64..directory + sections * 64 + 4]
+            .copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let error = Store::open(
+            &published_bundle(fixture.bundle_path()),
+            OpenOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("reverse array"),
+            "refused for the reason: {error}"
         );
     }
 }
