@@ -4904,3 +4904,29 @@ fn verbalize_refuses_what_it_cannot_answer_by_name() {
     let not_json = server.request_with_body("QUERY", "/tox/v/2026-06-01/verbalize", &[], b"{}");
     not_json.assert_status(415);
 }
+
+#[test]
+fn verbalize_survives_a_profile_template_over_a_cycle() {
+    // A profile that names a person by whom they know, over two people who
+    // know each other: the descent must stop, not overflow the worker's stack
+    // and take the process with it.
+    const CYCLE_NT: &str = concat!(
+        "<http://example.org/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person> .\n",
+        "<http://example.org/b> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person> .\n",
+        "<http://example.org/a> <http://example.org/knows> <http://example.org/b> .\n",
+        "<http://example.org/b> <http://example.org/knows> <http://example.org/a> .\n",
+    );
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", CYCLE_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let answer = server.get(&verbalize_url(&[(
+        "config",
+        r#"{"profiles": {"p": {"type": "http://example.org/Person", "template": "{k}",
+                             "fields": {"k": "http://example.org/knows"}}},
+            "targets": {"t": {"type": "http://example.org/Person"}}}"#,
+    )]));
+    answer.assert_status(200);
+    let body = answer.json();
+    assert_eq!(body["complete"], true);
+    assert_eq!(body["records"].as_array().unwrap().len(), 2);
+}

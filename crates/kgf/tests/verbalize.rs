@@ -11,7 +11,7 @@ use kgf_store::catalog::{BundleId, Catalog};
 use kgf_store::manifest::default_predicate_roles;
 use kgf_store::testing::Fixture;
 use kgf_store::{OpenOptions, Store};
-use kgf_verbalize::{Bound, Config, Grouper, Record, Rendered, Verbalizer};
+use kgf_verbalize::{Bound, Config, Grouper, MAX_TEMPLATE_DEPTH, Record, Rendered, Verbalizer};
 
 const DATASET: &str = "fx";
 const VERSION: &str = "2026-09-04";
@@ -424,4 +424,79 @@ fn iris_the_bundle_lacks_are_reported_and_bind_to_nothing() {
     let verbalizer = Verbalizer::new(&published.store, &bound);
     assert!(verbalizer.roots(0).unwrap().is_empty());
     assert_eq!(verbalizer.roots(1).unwrap().len(), 1);
+}
+
+#[test]
+fn a_template_over_a_cycle_names_the_node_it_came_back_to_by_its_fragment() {
+    // Two people whose profile names each by whom they know, and who know
+    // each other; and one who knows only themself. Either would descend
+    // forever if a template were followed back into a node being named.
+    let published = Published::build(&graph(&[
+        ("a", RDF_TYPE, "Person"),
+        ("b", RDF_TYPE, "Person"),
+        ("a", "knows", "b"),
+        ("b", "knows", "a"),
+        ("c", RDF_TYPE, "Person"),
+        ("c", "knows", "c"),
+    ]));
+    let config = parse_config(
+        r#"{
+          "profiles": {
+            "person": {"type": "http://example.com/Person", "template": "{k}",
+                       "fields": {"k": "http://example.com/knows"}}
+          },
+          "targets": {"person": {"type": "http://example.com/Person"}}
+        }"#,
+    );
+    // Each root's own template comes back to the root, which is then named
+    // by its fragment; the mention of the other person goes one hop further
+    // before it comes back, and lands on the same answer for the same reason.
+    // No label from a cut descent is cached, so a and b read symmetrically
+    // whichever is rendered first.
+    let a = one(&published.store, &config, &format!("{EX}a"));
+    assert_eq!(a.text, "label: a\nknows: b\ntype: Person");
+    let b = one(&published.store, &config, &format!("{EX}b"));
+    assert_eq!(b.text, "label: b\nknows: a\ntype: Person");
+    let c = one(&published.store, &config, &format!("{EX}c"));
+    assert_eq!(c.text, "label: c\nknows: c\ntype: Person");
+
+    let records = all_records(&published.store, &config);
+    assert_eq!(records.len(), 3);
+}
+
+#[test]
+fn a_template_descends_a_bounded_number_of_hops() {
+    // A chain of people, each named by the next, ending in a labelled one.
+    let names: Vec<String> = (0..=MAX_TEMPLATE_DEPTH + 1)
+        .map(|i| format!("p{i}"))
+        .collect();
+    let last = names.last().unwrap();
+    let mut triples: Vec<(&str, &str, &str)> = Vec::new();
+    for pair in names.windows(2) {
+        triples.push((&pair[0], RDF_TYPE, "Person"));
+        triples.push((&pair[0], "next", &pair[1]));
+    }
+    triples.push((last, RDF_TYPE, "Person"));
+    triples.push((last, RDFS_LABEL, "\"the end\""));
+    let published = Published::build(&graph(&triples));
+    let config = parse_config(
+        r#"{
+          "profiles": {
+            "person": {"type": "http://example.com/Person", "template": "{n}",
+                       "fields": {"n": "http://example.com/next"}}
+          },
+          "targets": {"person": {"type": "http://example.com/Person"}}
+        }"#,
+    );
+    // The descent from the head stops one template short of the end, and
+    // the node there is named by its fragment rather than by the end's label.
+    let head = one(&published.store, &config, &format!("{EX}{}", names[0]));
+    assert_eq!(head.label, names[MAX_TEMPLATE_DEPTH]);
+    // Close enough to the end, the template reaches it.
+    let near = one(
+        &published.store,
+        &config,
+        &format!("{EX}{}", names[names.len() - 2]),
+    );
+    assert_eq!(near.label, "the end");
 }

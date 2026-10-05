@@ -50,6 +50,19 @@
 //! build never links the server to run it, and it is testable headless
 //! against fixture bundles.
 //!
+//! # A template stops at a cycle
+//!
+//! A template names a node by the labels of its neighbours, and a neighbour
+//! of a profiled class is named by a template in turn, so resolving one label
+//! can descend through several. Graphs have cycles — `owl:sameAs`, inverse
+//! pairs, a class that is an instance of itself — and a template over such an
+//! edge would descend forever. So a node whose template is already being
+//! rendered, or one more than [`MAX_TEMPLATE_DEPTH`] templates down, is named
+//! without its templates: by the cascade, else by its IRI's fragment. The
+//! text is still deterministic, but a label that took that cut depends on
+//! which node the descent started from, so it is not cached; the next root
+//! that mentions the node computes its own.
+//!
 //! # Caches, and why they are here
 //!
 //! A predicate's display name and a mentioned node's label are recomputed for
@@ -96,6 +109,12 @@ pub enum Error {
         id: u64,
     },
 }
+
+/// The most templates one label resolution descends through before the
+/// node at the bottom is named without its templates. A label that needs
+/// more than this many hops of templates is not a label; the bound keeps a
+/// long profiled chain from costing a deep recursion.
+pub const MAX_TEMPLATE_DEPTH: usize = 8;
 
 /// Materialized terms, memoized for the life of a run.
 ///
@@ -422,6 +441,12 @@ pub struct Verbalizer<'a> {
     /// A predicate IRI's subject id, when it has one, for labelling the
     /// predicate itself.
     predicate_subjects: HashMap<u64, Option<u64>>,
+    /// Subjects whose templates are being rendered right now, innermost
+    /// last: the descent one label resolution is in the middle of.
+    resolving: Vec<u64>,
+    /// How many times a template was skipped for a cycle or for depth. A
+    /// label computed while this moved took such a cut and is not cached.
+    cuts: u64,
 }
 
 impl<'a> Verbalizer<'a> {
@@ -436,6 +461,8 @@ impl<'a> Verbalizer<'a> {
             predicate_names: HashMap::new(),
             object_labels: HashMap::new(),
             predicate_subjects: HashMap::new(),
+            resolving: Vec::new(),
+            cuts: 0,
         }
     }
 
@@ -685,8 +712,11 @@ impl<'a> Verbalizer<'a> {
         {
             return Ok(label.to_string());
         }
+        let cuts = self.cuts;
         let label = self.compute_display_label(node, target, as_root)?;
-        if let Node::Object(id) = node {
+        if let Node::Object(id) = node
+            && self.cuts == cuts
+        {
             self.object_labels
                 .insert((id, target), Rc::from(label.as_str()));
         }
@@ -712,29 +742,64 @@ impl<'a> Verbalizer<'a> {
         };
 
         if let Some(subject) = self.subject_of(node)? {
-            if !self.bound.profiles.is_empty()
-                && let Some(rdf_type) = self.bound.rdf_type
-            {
-                for class in self.objects(subject, rdf_type)? {
-                    let Some(template) = self.bound.profiles.get(&class) else {
-                        continue;
-                    };
-                    if let Some(label) = self.render(template, subject, target)? {
+            let templates = self.templates(subject, target, as_root)?;
+            if !templates.is_empty() {
+                if self.resolving.len() < MAX_TEMPLATE_DEPTH && !self.resolving.contains(&subject) {
+                    self.resolving.push(subject);
+                    let rendered = self.render_first(&templates, subject, target);
+                    self.resolving.pop();
+                    if let Some(label) = rendered? {
                         return Ok(label);
                     }
+                } else {
+                    self.cuts += 1;
                 }
-            }
-            if as_root
-                && let Some(template) = &self.bound.targets[target].template
-                && let Some(label) = self.render(template, subject, target)?
-            {
-                return Ok(label);
             }
             if let Some(label) = self.first_literal(subject, target)? {
                 return Ok(normalize_label(&label));
             }
         }
         Ok(fallback_label(&iri))
+    }
+
+    /// The templates that may name `subject`, in the order tried: the profile
+    /// of each of its classes, then its target's `label_template` as a root.
+    fn templates(
+        &mut self,
+        subject: u64,
+        target: usize,
+        as_root: bool,
+    ) -> Result<Vec<&'a BoundTemplate>, Error> {
+        let bound = self.bound;
+        let mut templates = Vec::new();
+        if !bound.profiles.is_empty()
+            && let Some(rdf_type) = bound.rdf_type
+        {
+            for class in self.objects(subject, rdf_type)? {
+                if let Some(template) = bound.profiles.get(&class) {
+                    templates.push(template);
+                }
+            }
+        }
+        if as_root && let Some(template) = &bound.targets[target].template {
+            templates.push(template);
+        }
+        Ok(templates)
+    }
+
+    /// The first of `templates` that renders to something for `subject`.
+    fn render_first(
+        &mut self,
+        templates: &[&BoundTemplate],
+        subject: u64,
+        target: usize,
+    ) -> Result<Option<String>, Error> {
+        for template in templates {
+            if let Some(label) = self.render(template, subject, target)? {
+                return Ok(Some(label));
+            }
+        }
+        Ok(None)
     }
 
     /// A template filled from `subject`'s direct values, or `None` when it
