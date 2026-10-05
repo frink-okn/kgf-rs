@@ -24,11 +24,12 @@
 //! code, so none of them can be the one that forgets `Vary` or answers a
 //! browser with raw JSON.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, OriginalUri, Request, State};
 use axum::http::header::{
     ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_TYPE, ETAG, LOCATION, RETRY_AFTER, VARY,
 };
@@ -36,7 +37,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, any, get};
-use axum::{Router, middleware};
+use axum::{Extension, Router, middleware};
 use headers::{ETag, HeaderMapExt, Host, IfNoneMatch};
 use kgf_store::Capability;
 use kgf_store::catalog::BundleId;
@@ -48,10 +49,11 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::access::{AccessOperation, Observation, OpenTiming, Timed, Transport, millis};
-use crate::admission::WorkClass;
+use crate::admission::{DownloadClient, WorkClass};
 use crate::answer::{self, Rendered, Renders, Target};
 use crate::descriptor::{BundleManifest, DatasetDescriptor, ServiceDescriptor};
 use crate::envelope::{ErrorCode, PROBLEM_MEDIA_TYPE, Problem, reflected};
+use crate::export::{Conditions, Decision, Delivery, ExportArtifact};
 use crate::html::Resource;
 use crate::representation::{CachePolicy, Representation, etag, etag_for_body, negotiate};
 use crate::request;
@@ -79,11 +81,18 @@ pub const HEALTH_PATH: &str = "/healthz";
 pub const RESERVED_DATASET_IDS: &[&str] = &["healthz"];
 
 /// The KGF routes over a built service.
+///
+/// Two stacks, merged. Every resource but the downloads sits behind transfer
+/// compression and the middleware that gives compressed and identity bodies a
+/// shared weak validator. The downloads do not: they negotiate their own
+/// coding, because it decides their validator and length headers, and a range
+/// or `If-Range` is only safe against the strong tag of identity bytes, which
+/// either of those layers would take away. Mounting them outside the two layers
+/// is what keeps each layer free of a special case, and a layer added to one
+/// stack is a decision about that stack alone. Everything else — body limits,
+/// problem rendering, CORS, access records — is the shared stack both carry.
 pub fn router(service: Arc<Service>) -> Router {
-    let body_limit =
-        usize::try_from(service.config().budgets.max_request_bytes).unwrap_or(usize::MAX);
-
-    Router::new()
+    let api = Router::new()
         .route("/", read(get(service_descriptor)))
         // Before the dataset wildcard in reading order, though not in
         // matching order: the router prefers a static segment to a
@@ -118,6 +127,7 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/{dataset}/v/{version}/sample", read(get(sample)))
         .route("/{dataset}/v/{version}/search", read(get(search)))
         .route("/{dataset}/v/{version}/terms", read(get(terms)))
+        .route("/{dataset}/v/{version}/graphs", read(get(graphs)))
         .route("/{dataset}/v/{version}/schema", read(get(schema)))
         .route("/{dataset}/v/{version}/void", read(get(void)))
         .route("/{dataset}/v/{version}/summary", read(get(summary)))
@@ -136,43 +146,8 @@ pub fn router(service: Arc<Service>) -> Router {
                 .post(verbalize_post)
                 .fallback(verbalize_fallback),
         )
-        .fallback(no_such_route)
-        // Order matters more than usual here, and reads innermost first.
-        //
-        // `render_problems` must sit *outside* the body limit, or the 413 that
-        // limit produces never reaches the code that gives it a `code` — which
-        // is the whole reason the backstop exists. It must sit *inside* CORS,
-        // because it sets `Vary: Accept` with `insert` and CORS appends its own
-        // afterwards; the other way round would wipe them.
-        //
-        // Two body limits, because they catch different things.
-        // `RequestBodyLimitLayer` enforces the published figure on the wire
-        // whether or not anything reads the body. `DefaultBodyLimit` is what
-        // the bindings body extractors consult. brTPF's query-carried
-        // `values=` applies the same figure before its SPARQL parser runs.
-        .layer(RequestBodyLimitLayer::new(body_limit))
-        .layer(DefaultBodyLimit::max(body_limit))
-        .layer(middleware::from_fn_with_state(
-            Arc::clone(&service),
-            render_problems,
-        ))
-        // Permissive CORS, because the data is public and browser and WASM
-        // clients are a target. `QUERY` is listed explicitly — a preflight that
-        // omitted it would leave the canonical method unusable from a browser.
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_headers(Any)
-                .allow_methods([Method::GET, Method::HEAD, Method::POST, query_method()])
-                .expose_headers(Any),
-        )
-        // Axum applies the last layer outermost. Access logging therefore sees
-        // CORS preflights and responses produced by the body limit as well as
-        // ordinary handler responses.
-        .layer(middleware::from_fn_with_state(
-            Arc::clone(&service),
-            crate::access::record_request,
-        ))
+        .fallback(no_such_route);
+    let api = shared_layers(api, &service)
         // Compression sits *outside* access logging on purpose, so `bytes_out`
         // keeps meaning the entity's size rather than the wire's. That is the
         // number the published response caps bound and the one earlier records
@@ -195,8 +170,60 @@ pub fn router(service: Arc<Service>) -> Router {
         // Outermost, because it must observe the `Content-Encoding` the layer
         // below may have added — and must also reach the responses that layer
         // never handles, a `304` in particular.
-        .layer(middleware::from_fn(mark_encoding_negotiated))
-        .with_state(service)
+        .layer(middleware::from_fn(mark_encoding_negotiated));
+
+    let downloads = shared_layers(
+        Router::new().route(
+            "/{dataset}/v/{version}/export/{artifact}",
+            read(get(export)),
+        ),
+        &service,
+    );
+
+    api.merge(downloads).with_state(service)
+}
+
+/// The layers every resource carries, downloads included.
+fn shared_layers(router: Router<Arc<Service>>, service: &Arc<Service>) -> Router<Arc<Service>> {
+    let body_limit =
+        usize::try_from(service.config().budgets.max_request_bytes).unwrap_or(usize::MAX);
+    router
+        // Order matters more than usual here, and reads innermost first.
+        //
+        // `render_problems` must sit *outside* the body limit, or the 413 that
+        // limit produces never reaches the code that gives it a `code` — which
+        // is the whole reason the backstop exists. It must sit *inside* CORS,
+        // because it sets `Vary: Accept` with `insert` and CORS appends its own
+        // afterwards; the other way round would wipe them.
+        //
+        // Two body limits, because they catch different things.
+        // `RequestBodyLimitLayer` enforces the published figure on the wire
+        // whether or not anything reads the body. `DefaultBodyLimit` is what
+        // the bindings body extractors consult. brTPF's query-carried
+        // `values=` applies the same figure before its SPARQL parser runs.
+        .layer(RequestBodyLimitLayer::new(body_limit))
+        .layer(DefaultBodyLimit::max(body_limit))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(service),
+            render_problems,
+        ))
+        // Permissive CORS, because the data is public and browser and WASM
+        // clients are a target. `QUERY` is listed explicitly — a preflight that
+        // omitted it would leave the canonical method unusable from a browser.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_headers(Any)
+                .allow_methods([Method::GET, Method::HEAD, Method::POST, query_method()])
+                .expose_headers(Any),
+        )
+        // Applied last, so outermost of these. Access logging therefore sees
+        // CORS preflights and responses produced by the body limit as well as
+        // ordinary handler responses.
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(service),
+            crate::access::record_request,
+        ))
 }
 
 /// RFC 10008's method. Not a constant in `http`, which is the whole reason this
@@ -227,6 +254,25 @@ fn method_not_allowed_problem(method: Method) -> Problem {
         ),
     )
 }
+
+/// Every resource under a version, as a 404 lists them for a client to
+/// correct against.
+const VERSION_RESOURCES: &[&str] = &[
+    "manifest",
+    "fragment",
+    "tpf",
+    "count",
+    "describe",
+    "sample",
+    "search",
+    "terms",
+    "labels",
+    "graphs",
+    "schema",
+    "void",
+    "summary",
+    "export/data.hdt",
+];
 
 /// The fallback, in the client's own spelling: behind a prefix-stripping
 /// gateway the path this server saw is not the one the client sent, so both
@@ -261,10 +307,10 @@ async fn no_such_route(
         ErrorCode::NotFound,
         format!(
             "no resource at {}; this server serves {prefix}/ (service descriptor), \
-             {prefix}/{{dataset}}, and {prefix}/{{dataset}}/v/{{version}}/{{manifest,fragment,tpf,\
-             count,describe,sample,search,labels,schema,void,summary}}; version resources \
-             are also available under {prefix}/{{dataset}}/latest/{hint}",
-            reflected(&mount.public_path(path))
+             {prefix}/{{dataset}}, and {prefix}/{{dataset}}/v/{{version}}/{{{}}}; version \
+             resources are also available under {prefix}/{{dataset}}/latest/{hint}",
+            reflected(&mount.public_path(path)),
+            VERSION_RESOURCES.join(","),
         ),
     )
 }
@@ -408,6 +454,10 @@ async fn bundle_manifest(
         &version,
         release.manifest().bytes(),
         release.manifest().parsed(),
+        ExportArtifact::ALL
+            .iter()
+            .map(|&artifact| (artifact, release.export(artifact).clone()))
+            .collect(),
     );
 
     // The manifest itself is already in memory, but a bundle that cannot be
@@ -469,6 +519,7 @@ async fn fragment(
                     &release.binding(),
                 )?;
                 declares_search(release, request.pattern.text().is_some())?;
+                declares_graphs(release, &request.graph)?;
                 Ok(request)
             },
             answer::fragment,
@@ -488,7 +539,16 @@ async fn tpf(
         AccessOperation::Tpf,
         wants,
         Representation::TPF,
-        |params, limits, release| request::Tpf::parse(params, limits, &release.binding()),
+        |params, limits, release| {
+            let memberships = release.declares(Capability::Graphs);
+            let request = request::Tpf::parse(params, limits, &release.binding(), memberships)?;
+            let graph = match &request {
+                request::Tpf::Plain(request) => &request.graph,
+                request::Tpf::Values(request) => &request.graph,
+            };
+            declares_graphs(release, graph)?;
+            Ok(request)
+        },
         answer::tpf,
     )
     .await
@@ -509,6 +569,7 @@ async fn count(
                 let request =
                     request::Count::parse(params, limits, release.prefixes(), &release.binding())?;
                 declares_search(release, request.pattern.text().is_some())?;
+                declares_graphs(release, &request.graph)?;
                 Ok(request)
             },
             answer::count,
@@ -576,13 +637,15 @@ async fn binding_fragment(
                 method,
             },
             |params, body, limits, release| {
-                request::BindingFragment::parse(
+                let request = request::BindingFragment::parse(
                     params,
                     body,
                     limits,
                     release.prefixes(),
                     &release.binding(),
-                )
+                )?;
+                declares_graphs(release, &request.graph)?;
+                Ok(request)
             },
             answer::binding_fragment,
         )
@@ -649,7 +712,10 @@ async fn binding_count(
                 method,
             },
             |params, body, limits, release| {
-                request::BindingCount::parse(params, body, limits, release.prefixes())
+                let request =
+                    request::BindingCount::parse(params, body, limits, release.prefixes())?;
+                declares_graphs(release, &request.graph)?;
+                Ok(request)
             },
             answer::binding_count,
         )
@@ -809,6 +875,27 @@ async fn terms(
     .await
 }
 
+async fn graphs(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate(
+        service,
+        BundleId { dataset, version },
+        AccessOperation::Graphs,
+        wants,
+        // Gated: the listing reads the membership sidecar, which a bundle
+        // may not carry. See `capability_gate`.
+        |params, limits, release| {
+            capability_gate(release, Capability::Graphs)?;
+            request::GraphList::parse(params, limits, &release.binding())
+        },
+        answer::graphs_list,
+    )
+    .await
+}
+
 async fn schema(
     State(service): State<Arc<Service>>,
     Path((dataset, version)): Path<(String, String)>,
@@ -863,6 +950,124 @@ async fn summary(
         answer::summary,
     )
     .await
+}
+
+/// `GET|HEAD /{dataset}/v/{version}/export/{artifact}`: an artifact, whole or
+/// by range. See [`crate::export`] for the response's semantics.
+///
+/// Everything but the body is decided from the manifest before the bundle is
+/// opened, so a revalidation, a failed precondition, and an unsatisfiable range
+/// all answer without touching a mapping — and without a download slot, which
+/// only a response that streams takes.
+async fn export(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version, artifact)): Path<(String, String, String)>,
+    method: Method,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+) -> Result<Response, Problem> {
+    let release = service.datasets().release(&dataset, &version)?;
+    let artifact = ExportArtifact::from_name(&artifact).ok_or_else(|| {
+        Problem::new(
+            ErrorCode::NotFound,
+            format!(
+                "{} is not an artifact this server exports; \
+                 the release's links in the dataset descriptor name the ones it does",
+                reflected(&artifact)
+            ),
+        )
+    })?;
+    let mut observation = Observation::new(service.access(), AccessOperation::Export)
+        .resolved(&dataset, Some(&version));
+    observation.transport = Some(Transport::Get);
+    // Before any precondition: a `304` or a `206` answering a query this
+    // operation cannot honour would be the union passed off as what was asked.
+    let parsed = Params::parse(uri.query()).and_then(|params| {
+        request::Export::parse(
+            &params,
+            service.config().limits(),
+            release.prefixes(),
+            release.declares(Capability::Graphs),
+        )
+    });
+    if let Err(problem) = parsed {
+        return observed_result(Err(problem), observation);
+    }
+
+    let delivery = Delivery::new(
+        &dataset,
+        &version,
+        artifact,
+        release.export(artifact),
+        release.last_modified(),
+    );
+    let conditions = Conditions::read(&headers, &method);
+    let decision = conditions.decide(delivery.identity, delivery.last_modified);
+    observation.shaped(conditions.shape(artifact, &decision));
+    let (coding, extent) = match decision {
+        Decision::NotModified { coding } => {
+            return observed_result(Ok(delivery.not_modified(coding)), observation);
+        }
+        Decision::PreconditionFailed => {
+            let problem = Problem::new(
+                ErrorCode::PreconditionFailed,
+                format!(
+                    "If-Match or If-Unmodified-Since does not hold for this {}; \
+                     its current validator is in the ETag of a HEAD",
+                    artifact.name()
+                ),
+            );
+            return observed_result(Err(problem), observation);
+        }
+        Decision::RangeNotSatisfiable { excessive } => {
+            return observed_result(Ok(delivery.not_satisfiable(excessive)), observation);
+        }
+        Decision::Send { coding, extent } => (coding, extent),
+    };
+
+    // Before the open: a full gate costs the refused client nothing, and a
+    // `HEAD` streams nothing, so it takes no slot at all. The client is the
+    // one the access log attributes the request to.
+    let slot = if method == Method::HEAD {
+        None
+    } else {
+        let client = crate::access::client_address(
+            &headers,
+            peer.map(|Extension(ConnectInfo(address))| address.ip()),
+            service.config().trusted_proxies,
+        )
+        .map(DownloadClient::of);
+        match service.admission().download(client) {
+            Ok(slot) => Some(slot),
+            Err(problem) => return observed_result(Err(problem), observation),
+        }
+    };
+
+    // Opened for a `HEAD` as well: a bundle that cannot be opened must not be
+    // described as downloadable, and the `HEAD` must answer as its `GET` would.
+    let id = BundleId { dataset, version };
+    let opened = Arc::clone(&service);
+    observation.work_class = Some(WorkClass::Ordinary);
+    let timed = blocking(&service, WorkClass::Ordinary, move || {
+        opened.open_observed(&id)
+    })
+    .await;
+    observation.queue_ms = Some(timed.queue_ms);
+    observation.work_ms = timed.work_ms;
+    let store = match timed.result {
+        Ok((store, open)) => {
+            observation.open_ms = Some(open.open_ms);
+            observation.first_open = Some(open.first_open);
+            store
+        }
+        Err(problem) => return observed_result(Err(problem), observation),
+    };
+    let response = match slot {
+        None => delivery.head(&store, coding),
+        Some(slot) => delivery.send(store, coding, &extent, slot),
+    };
+    observed_result(response, observation)
 }
 
 async fn labels_post(
@@ -1098,6 +1303,30 @@ fn declares_search(release: &Release, wanted: bool) -> Result<(), Problem> {
     Ok(())
 }
 
+/// Refuse a graph scope the bundle has no memberships for.
+///
+/// Only the forms that read the sidecar are gated: a named graph and the quad
+/// view. The union and the unnamed graph are answerable on every release —
+/// the union is `data.hdt` itself, and a bundle without memberships is one
+/// whose triples are all unnamed — so they pass whether or not the release
+/// declares `graphs`.
+fn declares_graphs(release: &Release, graph: &request::GraphScope) -> Result<(), Problem> {
+    if graph.needs_sidecar() && !release.declares(Capability::Graphs) {
+        let parameter = graph.parameter();
+        return Err(Problem::new(
+            ErrorCode::CapabilityNotAvailable,
+            format!(
+                "this form of `{}` needs the `graphs` capability, which this bundle does not \
+                 declare; its manifest lists the ones it does. {} are answerable on every \
+                 release",
+                parameter.as_str(),
+                parameter.reserved_forms(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// The shape every operation has.
 ///
 /// Read in order, because the order is the decision: negotiate, resolve the
@@ -1168,6 +1397,9 @@ where
     // failed to parse selected none and stays plain GET.
     observation.transport = Some(request.transport());
     observation.request(&request, work_class);
+    if let Err(problem) = request.representable(representation) {
+        return observed_result(Err(problem), observation);
+    }
 
     // A versioned operation is a deterministic function of immutable bytes,
     // so the URL and the representation fix the response
@@ -1195,10 +1427,14 @@ where
         params,
         release.prefixes().clone(),
         service.mount().clone(),
-        release.declares(Capability::Search),
+        answer::Offers {
+            search: release.declares(Capability::Search),
+            graphs: release.declares(Capability::Graphs),
+        },
         wants.request_url.clone(),
     )
-    .with_dataset_metadata(release.dataset_iri(), release.carries_description());
+    .with_dataset_metadata(release.dataset_iri(), release.carries_description())
+    .with_declarations(release.declarations());
     let labels = PageLabelProfile::for_request(
         &service,
         release,
@@ -1268,6 +1504,9 @@ where
     };
     let work_class = request.work_class();
     observation.request(&request, work_class);
+    if let Err(problem) = request.representable(representation) {
+        return observed_result(Err(problem), observation);
+    }
     let validator = etag(
         release.digest(),
         service.descriptor_digest(),
@@ -1290,10 +1529,14 @@ where
         params,
         release.prefixes().clone(),
         service.mount().clone(),
-        release.declares(Capability::Search),
+        answer::Offers {
+            search: release.declares(Capability::Search),
+            graphs: release.declares(Capability::Graphs),
+        },
         wants.request_url.clone(),
     )
-    .with_dataset_metadata(release.dataset_iri(), release.carries_description());
+    .with_dataset_metadata(release.dataset_iri(), release.carries_description())
+    .with_declarations(release.declarations());
     let opened = Arc::clone(&service);
     let timed = blocking(&service, work_class, move || {
         let (store, open) = opened.open_observed(target.id())?;
@@ -1440,6 +1683,9 @@ where
         Err(problem) => return observed_result(Err(problem), observation),
     };
     observation.request(&request, WorkClass::Heavy);
+    if let Err(problem) = request.representable(representation) {
+        return observed_result(Err(problem), observation);
+    }
     let validator = etag_for_body(
         release.digest(),
         service.descriptor_digest(),
@@ -1994,13 +2240,13 @@ impl IntoResponse for Problem {
 /// the exact disagreement this exists to prevent, reachable by nothing worse
 /// than an unusual spelling. An unconditional rule cannot drift.
 ///
-/// It costs a strong validator on identity responses, and that is free here.
-/// Strong validators are only required for `Range` and `If-Match`, and this
-/// server implements neither; `If-None-Match` compares weakly (RFC 9110
+/// It costs a strong validator on identity responses, and that is free for
+/// every resource this rule covers. Strong validators are only required for
+/// `Range` and `If-Match`, which only downloads implement, and downloads are
+/// mounted outside this layer; `If-None-Match` compares weakly (RFC 9110
 /// §13.1.2), so revalidation is unaffected. A weak tag also states the truth
 /// that a shared one asserts: the encoded and identity bodies are semantically
-/// equivalent, not byte-identical. Adding `Range` support later would mean
-/// revisiting this.
+/// equivalent, not byte-identical.
 async fn mark_encoding_negotiated(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     declare_encoding_vary(response.headers_mut());
@@ -2252,6 +2498,25 @@ mod tests {
         );
         // A cached probe reports on the cache, not the process.
         assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+    }
+
+    #[test]
+    fn a_404_lists_every_resource_under_a_version() {
+        // The list is what an agent corrects a mistyped path against, so a
+        // route missing from it is one no correction ever reaches.
+        for operation in AccessOperation::VERSIONED {
+            let segment = operation.path_segment();
+            assert!(
+                VERSION_RESOURCES
+                    .iter()
+                    .any(|resource| resource.split('/').next() == Some(segment)),
+                "{segment} is routed but not listed"
+            );
+        }
+        for &artifact in ExportArtifact::ALL {
+            let resource = format!("export/{}", artifact.name());
+            assert!(VERSION_RESOURCES.contains(&resource.as_str()), "{resource}");
+        }
     }
 
     #[test]

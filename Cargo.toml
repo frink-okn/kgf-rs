@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -69,6 +69,14 @@ percent-encoding = "2"
 # zone database, because the only thing kgf does with a date is sort by it.
 jiff = { version = "0.2", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# A download body is polled by hyper one frame at a time, so it implements
+# `http_body::Body` itself rather than adapting a stream. Already under axum.
+http-body = "1"
+# Transfer compression for whole-artifact downloads. Both are already in the
+# tree under tantivy; named directly because an export encodes on the blocking
+# pool, one chunk at a time, rather than in the async compression layer.
+flate2 = "1"
+zstd = "0.13"
 
 [profile.release]
 lto = true

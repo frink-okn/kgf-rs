@@ -41,6 +41,9 @@ percent-encoding.workspace = true
 oxrdf.workspace = true
 oxrdfio.workspace = true
 spargebra.workspace = true
+http-body.workspace = true
+flate2.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 # An independent implementation of RFC 9110 §12.5.1, as the oracle for

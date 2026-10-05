@@ -170,6 +170,13 @@ compact names such as `kgfbn:sh-7`; expanded JSON-LD continues to emit full IRIs
 Hydra's structural blank nodes remain local metadata nodes. Identical HDT content
 intentionally produces identical skolem identities across endpoints and mirrors.
 
+A graph named by a blank node takes the same form. When the node also fills a
+triple position it *is* that node, and is published under its data IRI above. When
+it occurs only as a graph name it has no dictionary id, and is published as
+`…:sha256:{sidecar-digest}:g-{layer-id}`, scoped by the digest of the whole
+membership sidecar rather than the HDT's: two sidecars over one HDT can give one
+layer id to different graphs, and the sidecar digest is what tells them apart.
+
 **Every representation carries this identity, not only the RDF ones.** Native KGF
 JSON emits `{"type": "iri", "value": "urn:fdc:…"}`, and a browser page displays
 `_:{section}-{local-id}` while linking the full IRI. An earlier revision exempted

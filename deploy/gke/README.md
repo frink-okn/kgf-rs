@@ -18,6 +18,7 @@ already running.
 | `service.yaml` | Service `frink-kgf-service` | Port 80 to the pod's 8080. |
 | `httproute.yaml` | HTTPRoute `frink-kgf-route` | `apps.okn.us/kgf` with the prefix stripped. |
 | `healthcheckpolicy.yaml` | HealthCheckPolicy `frink-kgf-health-check` | The gateway probes `/healthz` on 8080. |
+| `backendpolicy.yaml` | GCPBackendPolicy `frink-kgf-backend-policy` | The gateway lets one response run for an hour, not 30 s, so `/export` downloads finish. |
 
 Outside this directory and created once by hand: the bucket
 `gs://frink-kgf-bundles` (us-east4, uniform access, no lifecycle rule), the
@@ -147,7 +148,7 @@ adopt a hand-built bundle later instead of rebuilding it.
 ```sh
 ./tools/okn-build-config.py dreamkg --build --lakefs \
     --hdt-root /Volumes/ssd/kgf/hdt --out-root /Volumes/ssd/kgf/bundles \
-    --registry-prefixes --builder-image ghcr.io/frink-okn/kgf:v0.2.0 \
+    --registry-prefixes --builder-image ghcr.io/frink-okn/kgf:v0.3.0 \
     --kgf target/release/kgf --hdtc ../hdtc/target/release/hdtc
 ```
 

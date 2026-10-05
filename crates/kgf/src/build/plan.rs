@@ -49,6 +49,44 @@ pub const SKETCH_ROLES: &str = "subjects,objects";
 /// of knowledge graphs "overlap" through `rdfs:label`.
 pub const KEYSET_ROLES: &str = "subjects-only,objects-only,shared";
 
+/// The position-keyed layer sets a bundle with memberships publishes.
+///
+/// Both, always. A scoped pattern enumerates in its own permutation's order,
+/// so a POS or OPS pattern reads the layers keyed by that permutation's
+/// positions, and a bundle carrying only one of the two is refused at open
+/// rather than answered from the other.
+pub const GRAPH_POSITIONS: &str = "pos,ops";
+
+/// Graphs above which each one stops getting a description of its own.
+///
+/// Not a bound on the analysis, which costs about one pass over the
+/// memberships however they are divided up: the graphs of a dataset partition
+/// its statements, so describing all of them is describing each statement
+/// once. What grows with the *number* of graphs is the published description —
+/// three view ranges per graph in the manifest, which is served whole, and a
+/// class-and-property projection per graph in each of the three artifacts.
+///
+/// So the line is drawn where a manifest stops being a document: a few hundred
+/// graphs is a KG partitioned by source, by release or by inference layer,
+/// which is the case the per-graph view exists for and which `/manifest`
+/// carries without complaint. A KG partitioned per entity is orders of
+/// magnitude past it, and a schema projection per graph there would describe
+/// nothing a reader wanted. `contents.graphs.describe` states it outright when
+/// a bundle knows better, and `/graphs` pages every graph either way.
+pub const GRAPH_DESCRIPTION_THRESHOLD: u64 = 256;
+
+/// Graphs above which the membership index carries the transpose.
+///
+/// The quad view reads the graphs of one statement per row. From the transpose
+/// that is one lookup; without it, it is one probe per graph — so the per-row
+/// cost of the `g` column grows with the number of graphs, while the
+/// transpose's size grows with the number of memberships. A handful of graphs
+/// is cheap to probe and not worth a second copy of every membership; a graph
+/// partitioned into thousands of named graphs is the other way round. The line
+/// is drawn here rather than left to whichever side a bundle happens to fall
+/// on, and `contents.graphs.transpose` states it outright when it matters.
+pub const GRAPH_TRANSPOSE_THRESHOLD: u64 = 32;
+
 /// A host-local dataset slug.
 ///
 /// It is simultaneously a directory name under the bundle root and the first
@@ -427,6 +465,8 @@ pub struct Contents {
     /// one case where someone deliberately turned it off.
     #[serde(serialize_with = "serialize_text")]
     pub text: Option<Text>,
+    /// `data.hdt.graphs` and `data.hdt.graphs.idx`, or what decides them.
+    pub graphs: Graphs,
     /// Membership filters and overlap sketches.
     pub filters: Filters,
     /// Exact role key sets.
@@ -448,6 +488,26 @@ fn serialize_text<S: serde::Serializer>(
             disabled.end()
         }
     }
+}
+
+/// `data.hdt.graphs` and `data.hdt.graphs.idx`.
+///
+/// Both fields stay three-valued in the resolved plan, because neither can be
+/// settled from the config alone: whether a bundle carries memberships depends
+/// on the input, and whether the index carries the transpose depends on how
+/// many graphs the sidecar turns out to hold. A plan is a decision about the
+/// bundle, and these two are decisions about how to read what the build finds.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct Graphs {
+    /// Carry memberships, never carry them, or follow the input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Carry the transpose, never carry it, or follow the graph count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transpose: Option<bool>,
+    /// Describe each graph, describe none, or follow the graph count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub describe: Option<bool>,
 }
 
 /// `data.hdt.perm`.
@@ -522,6 +582,97 @@ pub struct ConfigPlan {
     pub contents: Contents,
     /// Limits for the external builders.
     pub resources: Resources,
+    /// The parts of this dataset the publisher declared, ordered by id.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<kgf_store::manifest::Component>,
+    /// The component the design view describes, when one is nominated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub design: Option<String>,
+}
+
+/// Resolve the declared components, refusing what this build cannot honour.
+///
+/// Declaration only. A recipe — `files`, or a `tool` and its `inputs` — is the
+/// component DAG, which this build does not run, so an entry carrying one is
+/// refused with that reason rather than half-obeyed. What survives is the
+/// statement: an id, what kind of part it is, and the graph holding it.
+fn resolve_components(
+    components: BTreeMap<String, config::Component>,
+    design: Option<&str>,
+) -> Result<Vec<kgf_store::manifest::Component>> {
+    use kgf_store::manifest::{Component, ComponentRole};
+
+    let mut resolved = Vec::with_capacity(components.len());
+    for (id, component) in components {
+        for (field, value) in [("files", &component.files), ("tool", &component.tool)] {
+            ensure!(
+                value.is_none(),
+                "component {id:?} declares `{field}`, which is a recipe for the component \
+                 DAG this build does not run. Drop it and declare what the component is: \
+                 its `role`, and the `graph` holding it"
+            );
+        }
+        let role = match component.role.as_str() {
+            "source" => ComponentRole::Source,
+            "derived" => ComponentRole::Derived,
+            "entailment" => ComponentRole::Entailment,
+            other => bail!(
+                "component {id:?} has role {other:?}; use `source` for the contributor's \
+                 own data, `derived` for triples some tool computed, or `entailment` for \
+                 triples a reasoner inferred"
+            ),
+        };
+        ensure!(
+            kgf_store::StatsView::component(id.clone()).is_some(),
+            "component id {id:?} cannot name a description view"
+        );
+        if let Some(graph) = &component.graph {
+            oxrdf::NamedNode::new(graph).with_context(|| {
+                format!("component {id:?} names graph {graph:?}, which is not an absolute IRI")
+            })?;
+        }
+        resolved.push(Component {
+            id,
+            role,
+            graph: component.graph,
+            inputs: component.inputs,
+            generator: component.generator,
+            regime: component.regime,
+        });
+    }
+
+    // Several `role: source` components and no nomination is a dataset
+    // assembled from several contributed parts, none of them canonical. The
+    // design view is then the dataset itself, exactly as when no component is
+    // declared: every source is the contributor's own modeling, so describing
+    // the whole is not a choice made on the publisher's behalf, where picking
+    // one of them would be.
+    if let Some(design) = design {
+        let component = resolved
+            .iter()
+            .find(|component| component.id == design)
+            .with_context(|| format!("`design: {design}` names no declared component"))?;
+        ensure!(
+            component.graph.is_some(),
+            "`design: {design}` names a component with no graph, which has no triples \
+             to describe. Give it the graph holding it, or nominate one that has it"
+        );
+    }
+
+    let declared: std::collections::BTreeSet<&str> = resolved
+        .iter()
+        .map(|component| component.id.as_str())
+        .collect();
+    for component in &resolved {
+        for input in &component.inputs {
+            ensure!(
+                declared.contains(input.as_str()),
+                "component {:?} names input {input:?}, which no component declares",
+                component.id
+            );
+        }
+    }
+    Ok(resolved)
 }
 
 /// hdtc's own defaults, restated here so a resolved plan is complete rather than
@@ -548,36 +699,74 @@ impl ConfigPlan {
             config::SCHEMA_VERSION
         );
 
-        // Refused rather than ignored. A bundle whose config declares components
-        // and whose artifacts contain none would be described as a plain bundle
-        // — its statistics, graph identities, and entailment flags would all
-        // be silently absent.
-        for (field, value) in [
-            ("components", &config.components),
-            ("publish", &config.publish),
-        ] {
-            ensure!(
-                value.is_none(),
-                "build config declares `{field}`, but this build has no component \
-                 DAG: it merges no derived components, binds no per-component graph \
-                 identity, and produces no per-component statistics. \
-                 Remove it, or build the components with their own tools and pass \
-                 the merged result as `--input`"
-            );
-        }
+        // Refused rather than ignored. `publish` selects which components a DAG
+        // merges into `data.hdt`, and this build runs no DAG: a config naming it
+        // would describe a merge that never happened.
+        ensure!(
+            config.publish.is_none(),
+            "build config declares `publish`, which selects what a component DAG \
+             merges into data.hdt. This build runs no DAG: declare the components \
+             already present in the input under `components`, or build them with \
+             their own tools and pass the merged result as `--input`"
+        );
 
         let dataset = resolve_dataset(config.dataset)?;
         let semantics = resolve_semantics(config.semantics)?;
         let contents = resolve_contents(config.contents)?;
         let resources = resolve_resources(config.resources)?;
+        let components = resolve_components(config.components, config.design.as_deref())?;
 
-        Ok(Self {
+        let plan = Self {
             schema: config.schema,
             dataset,
             semantics,
             contents,
             resources,
-        })
+            components,
+            design: config.design,
+        };
+        // Settled by the config alone, so refused before any step runs. The
+        // graph count can refuse the same thing, but only once the sidecar
+        // says how many graphs there are.
+        if plan.contents.graphs.describe == Some(false) {
+            plan.refuse_design(
+                "contents.graphs.describe: false describes no graph on its own",
+                "Remove that key so each graph is described",
+            )?;
+        }
+        Ok(plan)
+    }
+
+    /// The component the design view describes and the graph holding it, when
+    /// the design view is a component's own subset rather than the dataset.
+    pub fn design_graph(&self) -> Option<(&kgf_store::manifest::Component, &str)> {
+        let component =
+            kgf_store::manifest::design_component(&self.components, self.design.as_deref())?;
+        Some((component, component.graph.as_deref()?))
+    }
+
+    /// Refuse a design view this build cannot describe, if there is one.
+    ///
+    /// The design view is its component's own subset, and that exists only
+    /// where the analysis describes the component's graph. Describing the
+    /// union in its place would publish the whole dataset under the
+    /// component's name, so a caller that knows the graph will not be
+    /// described stops the build here: `obstacle` says why not, and `remedy`
+    /// the way out that fits it.
+    pub fn refuse_design(&self, obstacle: &str, remedy: &str) -> Result<()> {
+        let Some((component, graph)) = self.design_graph() else {
+            return Ok(());
+        };
+        let why = match &self.design {
+            Some(_) => format!("`design: {}` nominates it", component.id),
+            None => "it is the canonical component, the one `role: source` marks".to_owned(),
+        };
+        bail!(
+            "the design view describes component {:?}, held in graph {graph}, because {why}; \
+             but {obstacle}, so there is nothing to describe it from. {remedy}, or make no \
+             component with a graph the design view",
+            component.id
+        )
     }
 }
 
@@ -783,6 +972,11 @@ fn resolve_contents(contents: config::Contents) -> Result<Contents> {
     Ok(Contents {
         perm: Perm { position_maps },
         text,
+        graphs: Graphs {
+            enabled: contents.graphs.enabled,
+            transpose: contents.graphs.transpose,
+            describe: contents.graphs.describe,
+        },
         filters,
         keysets,
         stats: Stats {},
@@ -850,6 +1044,51 @@ pub enum Input {
     },
 }
 
+impl Input {
+    /// Whether this input carries graph memberships to keep.
+    ///
+    /// An HDT carries them in the sidecar beside it or not at all. RDF carries
+    /// them when it is written in a syntax that has a fourth position, which
+    /// the builder's own classification answers from the file name — the
+    /// alternative is parsing every input before deciding how to build it, and
+    /// a file named `.nt` that holds quads is not a file this can guess about.
+    ///
+    /// Every RDF input is a named file, which argument resolution ensures, so
+    /// there is no directory here whose name could say nothing.
+    /// Whether a permutation index beside the input is taken rather than built.
+    ///
+    /// Decided from the path alone, so `--dry-run` prints the steps the build
+    /// will really run. Whether the index is *usable* is settled when it is
+    /// taken, where a refusal can name it.
+    pub fn adopts_permutation(&self) -> bool {
+        match self {
+            Self::Hdt { path, .. } => hdtc::format::permutation_index_path(path).is_file(),
+            Self::Rdf { .. } => false,
+        }
+    }
+
+    /// The input as an operator would name it, for a message about what to fix.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Hdt { path, .. } => path.display().to_string(),
+            Self::Rdf { paths } => paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+
+    fn carries_graphs(&self) -> bool {
+        match self {
+            Self::Hdt { path, .. } => hdtc::format::graph_sidecar_path(path).is_file(),
+            Self::Rdf { paths } => paths
+                .iter()
+                .any(|path| hdtc::format::rdf_input_carries_graphs(path)),
+        }
+    }
+}
+
 /// Recorded in the manifest, never acted on. This is provenance, not identity:
 /// `content_digest` covers published bytes rather than build inputs.
 #[derive(Debug, Clone, Serialize)]
@@ -866,6 +1105,34 @@ pub struct Provenance {
 }
 
 impl BundlePlan {
+    /// Whether this build carries the input's graph memberships.
+    ///
+    /// An unset `contents.graphs.enabled` follows the input, which is the only
+    /// reading that neither drops a quad source's graphs on the floor nor
+    /// gives every triples bundle a sidecar holding one layer. Set, it is
+    /// obeyed — except that memberships cannot be conjured from an HDT that
+    /// arrives without a sidecar, and a config asking for them there is a
+    /// mistake about the input rather than an instruction.
+    pub fn builds_graphs(&self) -> Result<bool> {
+        match self.config.contents.graphs.enabled {
+            Some(false) => Ok(false),
+            Some(true) => {
+                if let Input::Hdt { path, .. } = &self.input {
+                    ensure!(
+                        self.input.carries_graphs(),
+                        "contents.graphs.enabled asks for memberships, but {} has no {} \
+                         beside it and an HDT does not record which graph a triple came \
+                         from. Build the bundle from the RDF, or drop the key",
+                        path.display(),
+                        hdtc::format::graph_sidecar_path(Path::new("data.hdt")).display(),
+                    );
+                }
+                Ok(true)
+            }
+            None => Ok(self.input.carries_graphs()),
+        }
+    }
+
     /// The version directory this build publishes into.
     pub fn output(&self) -> &Path {
         &self.output
@@ -954,6 +1221,12 @@ mod tests {
         for source in [
             MINIMAL,
             "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\ncontents: {text: {enabled: false}}\n",
+            // Both graph keys are three-valued, and all three values have to
+            // survive the round trip: an omitted one coming back stated, or a
+            // stated one coming back omitted, changes what the build does.
+            "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\ncontents: {graphs: {enabled: false}}\n",
+            "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\ncontents: {graphs: {enabled: true}}\n",
+            "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\ncontents: {graphs: {transpose: false}}\n",
             "schema: 1\ndataset: {id: a, iri: 'https://e.org/a'}\nresources: {memory_limit: 8G}\n",
             // The two fields validated against the prefix map. Both once
             // resolved to a plan that would not re-parse, because the

@@ -11,16 +11,16 @@
 //! socket leaves nothing between the test and hyper's parser.
 
 use std::collections::{BTreeMap, HashSet};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use kgf_server::service::Service;
 use kgf_server::{AccessLog, AccessRecord};
-use kgf_store::testing::{Fixture, TINY_NT};
+use kgf_store::testing::{Fixture, TINY_NT, WORKED_EXAMPLE_NQ};
 use sha2::{Digest, Sha256};
 
 /// A second fixture graph, so two versions of one dataset differ in content and
@@ -1258,6 +1258,10 @@ fn stock_comunica_5_3_queries_the_tpf_endpoint() {
     remote.publish("remote", "v1", REMOTE_NT, "2026-06-01T14:03:22Z");
     let remote_server = remote.serve_with(caps);
     let remote_endpoint = format!("http://{}/remote/v/v1/tpf", remote_server.address);
+    let quads = Deployment::new();
+    quads.publish_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-06-01T14:03:22Z");
+    let quads_server = quads.serve_with(caps);
+    let quads_endpoint = format!("http://{}/quads/v/v1/tpf", quads_server.address);
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("interop/comunica/test.mjs");
@@ -1265,6 +1269,7 @@ fn stock_comunica_5_3_queries_the_tpf_endpoint() {
         .arg(script)
         .arg(endpoint)
         .arg(remote_endpoint)
+        .arg(quads_endpoint)
         .status()
         .expect("run Node.js; install it and run npm ci --prefix interop/comunica first");
     assert!(
@@ -1362,6 +1367,400 @@ fn void_and_summary_serve_the_published_description_in_every_format() {
     }
 }
 
+/// The graph scope over the wire: gated on the capability before any bundle
+/// opens, answerable in its reserved forms on every release, and paged
+/// through the quad view with the cursor the envelope carries.
+#[test]
+fn graph_scope_is_gated_on_the_capability_and_pages_over_the_wire() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    deployment.publish_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-01-09T09:00:00Z");
+    let server = deployment.serve();
+    let g1 = kgf_server::url::encode_value("<http://example.org/g1>");
+    let unnamed = kgf_server::url::encode_value("<urn:x-kgf:unnamed>");
+
+    // No memberships: a named graph and the quad view are 501 before the
+    // open; the two reserved names answer.
+    for target in [
+        format!("/tox/v/v1/fragment?g={g1}"),
+        format!("/tox/v/v1/count?g={g1}"),
+        "/tox/v/v1/fragment?g=*".to_owned(),
+    ] {
+        let refused = server.request("GET", &target, &[]);
+        refused.assert_status(501);
+        assert_eq!(
+            refused.json()["code"],
+            "capability_not_available",
+            "{target}"
+        );
+    }
+    let whole = server.request("GET", "/tox/v/v1/count", &[]).json()["count"]["value"]
+        .as_u64()
+        .unwrap();
+    let unnamed_count = server.request("GET", &format!("/tox/v/v1/count?g={unnamed}"), &[]);
+    unnamed_count.assert_status(200);
+    assert_eq!(unnamed_count.json()["count"]["value"], whole);
+
+    // The capability is declared for the quad bundle, and every form answers.
+    let manifest = server.request("GET", "/quads/v/v1/manifest", &[]).json();
+    assert!(
+        manifest["capabilities"]
+            .as_object()
+            .unwrap()
+            .contains_key("graphs"),
+        "{manifest}"
+    );
+    let count = server.request("GET", &format!("/quads/v/v1/count?g={g1}"), &[]);
+    count.assert_status(200);
+    assert_eq!(count.json()["count"]["value"], 2);
+    let quads = server.request("GET", "/quads/v/v1/count?g=*", &[]);
+    assert_eq!(quads.json()["count"]["value"], 5);
+
+    // Paged at one row: five pages, each resumed from the previous cursor,
+    // including the boundaries inside a triple's run.
+    let mut target = "/quads/v/v1/fragment?g=*&limit=1".to_owned();
+    let mut graphs = Vec::new();
+    loop {
+        let page = server.request("GET", &target, &[]);
+        page.assert_status(200);
+        let body = page.json();
+        assert_eq!(body["vars"], serde_json::json!(["s", "p", "o", "g"]));
+        graphs.push(body["rows"][0]["g"]["value"].as_str().unwrap().to_owned());
+        match body["next"].as_str() {
+            Some(next) => target = format!("/quads/v/v1/fragment?g=*&limit=1&cursor={next}"),
+            None => break,
+        }
+    }
+    assert_eq!(
+        graphs,
+        [
+            "urn:x-kgf:unnamed",
+            "http://example.org/g1",
+            "urn:x-kgf:unnamed",
+            "http://example.org/g1",
+            "http://example.org/g2",
+        ]
+    );
+
+    // The browser form offers the control only where it can be answered.
+    let form = server
+        .request("GET", "/quads/v/v1/fragment", &[("accept", "text/html")])
+        .text();
+    assert!(
+        form.contains("name=\"g\""),
+        "the quad bundle offers a graph control"
+    );
+    let form = server
+        .request("GET", "/tox/v/v1/fragment", &[("accept", "text/html")])
+        .text();
+    assert!(
+        !form.contains("name=\"g\""),
+        "a bundle without memberships does not"
+    );
+
+    // The listing is routed and linked only where the capability is declared.
+    let refused = server.request("GET", "/tox/v/v1/graphs", &[]);
+    refused.assert_status(501);
+    assert_eq!(refused.json()["code"], "capability_not_available");
+    let listing = server.request("GET", "/quads/v/v1/graphs", &[]);
+    listing.assert_status(200);
+    assert_eq!(listing.json()["graphs"].as_array().unwrap().len(), 3);
+    let page = server.request("GET", "/quads/v/v1/graphs", &[("accept", "text/html")]);
+    page.assert_status(200);
+    assert!(page.text().contains("urn:x-kgf:unnamed"));
+    let links = |dataset: &str| {
+        server.request("GET", &format!("/{dataset}"), &[]).json()["releases"][0]["links"].clone()
+    };
+    assert_eq!(links("quads")["graphs"], "/quads/v/v1/graphs");
+    assert!(links("tox").get("graphs").is_none());
+}
+
+/// The TPF route over a bundle with memberships: the four-position Hydra
+/// form with the union declared as the default graph, and the serving rule
+/// for every form of `graph` — the quad view with unnamed statements
+/// untagged, the union constant untagged like an absent `graph` but one row
+/// per distinct triple, and a named graph or the unnamed constant tagging
+/// with itself — with `hydra:totalItems` the count of the view requested.
+#[test]
+fn tpf_serves_the_quad_view_and_scoped_views_by_the_serving_table() {
+    const HYDRA: &str = "http://www.w3.org/ns/hydra/core#";
+    const SD: &str = "http://www.w3.org/ns/sparql-service-description#";
+    const UNION: &str = "urn:x-kgf:union";
+    const UNNAMED: &str = "urn:x-kgf:unnamed";
+
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    deployment.publish_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let nquads = |target: &str| -> Vec<oxrdf::Quad> {
+        let response = server.request("GET", target, &[("Accept", "application/n-quads")]);
+        response.assert_status(200);
+        oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NQuads)
+            .for_slice(&response.body)
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|error| panic!("{target} did not parse: {error}"))
+    };
+    // Data statements: everything outside the page's metadata graph.
+    let data = |quads: &[oxrdf::Quad]| -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = quads
+            .iter()
+            .filter(|quad| {
+                !matches!(&quad.graph_name, oxrdf::GraphName::NamedNode(node)
+                    if node.as_str().ends_with("#metadata"))
+            })
+            .map(|quad| {
+                let graph = match &quad.graph_name {
+                    oxrdf::GraphName::DefaultGraph => String::new(),
+                    oxrdf::GraphName::NamedNode(node) => node.as_str().to_owned(),
+                    other => panic!("unexpected graph name {other}"),
+                };
+                (quad.object.to_string(), graph)
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let total_items = |quads: &[oxrdf::Quad]| -> u64 {
+        quads
+            .iter()
+            .find(|quad| quad.predicate.as_str() == format!("{HYDRA}totalItems"))
+            .and_then(|quad| match &quad.object {
+                oxrdf::Term::Literal(literal) => literal.value().parse().ok(),
+                _ => None,
+            })
+            .expect("hydra:totalItems")
+    };
+    let mappings = |quads: &[oxrdf::Quad]| -> Vec<String> {
+        let mut properties: Vec<String> = quads
+            .iter()
+            .filter(|quad| quad.predicate.as_str() == format!("{HYDRA}property"))
+            .map(|quad| quad.object.to_string())
+            .collect();
+        properties.sort();
+        properties
+    };
+    let default_graph = |quads: &[oxrdf::Quad]| -> Option<(bool, String)> {
+        quads
+            .iter()
+            .find(|quad| quad.predicate.as_str() == format!("{SD}defaultGraph"))
+            .map(|quad| {
+                (
+                    matches!(quad.subject, oxrdf::NamedOrBlankNode::BlankNode(_)),
+                    quad.object.to_string(),
+                )
+            })
+    };
+
+    // The graph-unbound quad view: five memberships, layer 0 untagged.
+    let unbound = nquads("/quads/v/v1/tpf?limit=10");
+    assert_eq!(total_items(&unbound), 5);
+    assert_eq!(
+        data(&unbound),
+        vec![
+            ("<http://example.org/c>".to_owned(), String::new()),
+            (
+                "<http://example.org/c>".to_owned(),
+                "http://example.org/g1".to_owned()
+            ),
+            ("<http://example.org/d>".to_owned(), String::new()),
+            (
+                "<http://example.org/z>".to_owned(),
+                "http://example.org/g1".to_owned()
+            ),
+            (
+                "<http://example.org/z>".to_owned(),
+                "http://example.org/g2".to_owned()
+            ),
+        ]
+    );
+    assert_eq!(
+        mappings(&unbound),
+        vec![
+            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#object>",
+            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#predicate>",
+            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#subject>",
+            "<http://www.w3.org/ns/sparql-service-description#graph>",
+        ],
+        "a bundle with memberships publishes the four-position form"
+    );
+    assert_eq!(
+        default_graph(&unbound),
+        Some((true, format!("<{UNION}>"))),
+        "the union is declared as the default graph under a blank-node subject"
+    );
+    assert!(unbound.iter().any(|quad| {
+        quad.predicate.as_str() == format!("{HYDRA}template")
+            && quad
+                .object
+                .to_string()
+                .contains("{?subject,predicate,object,graph}")
+    }));
+    // A variable, as a bindings-restricted client sends it, is the same view.
+    assert_eq!(
+        data(&nquads("/quads/v/v1/tpf?graph=%3Fg&limit=10")),
+        data(&unbound)
+    );
+
+    // The union constant: each triple once, in the document's default graph
+    // like the rows a bare pattern reads, never tagged with the constant.
+    let union = nquads(&format!("/quads/v/v1/tpf?graph={UNION}&limit=10"));
+    assert_eq!(total_items(&union), 3);
+    assert!(
+        data(&union).iter().all(|(_, graph)| graph.is_empty()) && data(&union).len() == 3,
+        "{:?}",
+        data(&union)
+    );
+
+    // A named graph and the unnamed graph, tagged with themselves.
+    let g1 = nquads("/quads/v/v1/tpf?graph=http%3A%2F%2Fexample.org%2Fg1&limit=10");
+    assert_eq!(total_items(&g1), 2);
+    assert_eq!(
+        data(&g1),
+        vec![
+            (
+                "<http://example.org/c>".to_owned(),
+                "http://example.org/g1".to_owned()
+            ),
+            (
+                "<http://example.org/z>".to_owned(),
+                "http://example.org/g1".to_owned()
+            ),
+        ]
+    );
+    let unnamed = nquads(&format!("/quads/v/v1/tpf?graph={UNNAMED}&limit=10"));
+    assert_eq!(total_items(&unnamed), 2);
+    assert!(data(&unnamed).iter().all(|(_, graph)| graph == UNNAMED));
+
+    // TriG names graphs too, so the quad view serializes in it unchanged.
+    let trig = server.request(
+        "GET",
+        "/quads/v/v1/tpf?limit=10",
+        &[("Accept", "application/trig")],
+    );
+    trig.assert_status(200);
+    let parsed: Vec<oxrdf::Quad> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::TriG)
+        .for_slice(&trig.body)
+        .collect::<Result<_, _>>()
+        .expect("TriG parses");
+    assert_eq!(data(&parsed), data(&unbound));
+
+    // Every form pages to the same rows one row at a time, following the
+    // `hydra:next` link of each page — which carries the scope it was issued
+    // under, and for the quad view a run trailer that resumes inside one
+    // triple's memberships.
+    let origin = format!("http://{}", server.address);
+    let next_link = |quads: &[oxrdf::Quad]| -> Option<String> {
+        quads
+            .iter()
+            .find(|quad| quad.predicate.as_str() == format!("{HYDRA}next"))
+            .and_then(|quad| match &quad.object {
+                oxrdf::Term::NamedNode(node) => Some(node.as_str().to_owned()),
+                _ => None,
+            })
+    };
+    let walk = |target: &str| -> Vec<(String, String)> {
+        let mut collected = Vec::new();
+        let mut next = Some(target.to_owned());
+        let mut pages = 0;
+        while let Some(target) = next {
+            pages += 1;
+            assert!(pages < 20, "{target} did not terminate");
+            let page = nquads(&target);
+            collected.extend(data(&page));
+            next = next_link(&page).map(|link| {
+                let path = link
+                    .strip_prefix(&origin)
+                    .unwrap_or_else(|| panic!("a page link addresses this server: {link}"));
+                path.to_owned()
+            });
+        }
+        collected.sort();
+        collected
+    };
+    for scope in [
+        String::new(),
+        format!("graph={UNION}&"),
+        "graph=http%3A%2F%2Fexample.org%2Fg1&".to_owned(),
+        format!("graph={UNNAMED}&"),
+    ] {
+        assert_eq!(
+            walk(&format!("/quads/v/v1/tpf?{scope}limit=1")),
+            data(&nquads(&format!("/quads/v/v1/tpf?{scope}limit=10"))),
+            "paging {scope:?} one row at a time"
+        );
+    }
+
+    // Turtle can carry one graph: the union and scoped views, not the quad view.
+    let refused = server.request(
+        "GET",
+        "/quads/v/v1/tpf?limit=10",
+        &[("Accept", "text/turtle")],
+    );
+    refused.assert_status(406);
+    assert_eq!(refused.json()["code"], "not_acceptable");
+    let turtle = server.request(
+        "GET",
+        &format!("/quads/v/v1/tpf?graph={UNION}&limit=10"),
+        &[("Accept", "text/turtle")],
+    );
+    turtle.assert_status(200);
+    let triples: Vec<_> = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::Turtle)
+        .for_slice(&turtle.body)
+        .collect::<Result<_, _>>()
+        .expect("Turtle parses");
+    assert_eq!(
+        triples
+            .iter()
+            .filter(|quad| quad.predicate.as_str() == "http://example.org/b"
+                || quad.predicate.as_str() == "http://example.org/y")
+            .count(),
+        3
+    );
+
+    // A bindings-restricted request keeps the same rule.
+    let values = kgf_server::url::encode_value("(?s) { (<http://example.org/x>) }");
+    let restricted = nquads(&format!(
+        "/quads/v/v1/tpf?subject=%3Fs&graph=%3Fg&values={values}&limit=10"
+    ));
+    assert_eq!(
+        data(&restricted),
+        vec![
+            (
+                "<http://example.org/z>".to_owned(),
+                "http://example.org/g1".to_owned()
+            ),
+            (
+                "<http://example.org/z>".to_owned(),
+                "http://example.org/g2".to_owned()
+            ),
+        ]
+    );
+    let bound_graph = server.request(
+        "GET",
+        &format!(
+            "/quads/v/v1/tpf?subject=%3Fs&graph=%3Fg&values={}&limit=10",
+            kgf_server::url::encode_value(
+                "(?s ?g) { (<http://example.org/x> <http://example.org/g1>) }"
+            )
+        ),
+        &[("Accept", "application/n-quads")],
+    );
+    bound_graph.assert_status(400);
+
+    // Without memberships: the three-position form, no default-graph
+    // declaration, and every statement untagged.
+    let plain = nquads("/tox/v/v1/tpf?limit=10");
+    assert_eq!(mappings(&plain).len(), 3);
+    assert_eq!(default_graph(&plain), None);
+    assert!(data(&plain).iter().all(|(_, graph)| graph.is_empty()));
+    let refused = server.request(
+        "GET",
+        "/tox/v/v1/tpf?graph=http%3A%2F%2Fexample.org%2Fg1&limit=10",
+        &[("Accept", "application/n-quads")],
+    );
+    refused.assert_status(501);
+}
+
 #[test]
 fn a_versioned_manifest_is_immutable_cacheable_and_conditional() {
     let deployment = Deployment::new();
@@ -1416,6 +1815,483 @@ fn a_versioned_manifest_is_immutable_cacheable_and_conditional() {
     );
     page.assert_status(200);
     assert_ne!(page.header("etag"), Some(etag));
+}
+
+/// The published `data.hdt`, as a download: whole, by range, conditionally,
+/// and with the validators that make a resume safe.
+#[test]
+fn a_download_is_the_published_hdt_resumable_and_verifiable() {
+    use base64::Engine as _;
+
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    let file = std::fs::read(deployment.bundle("tox", "v1").join("data.hdt")).expect("the HDT");
+    let len = file.len();
+    let digest = Sha256::digest(&file);
+    let strong = format!("\"sha256:{digest:x}\"");
+    let repr_digest = format!(
+        "sha-256=:{}:",
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    );
+    let server = deployment.serve();
+    let target = "/tox/v/v1/export/data.hdt";
+
+    // The whole artifact, byte for byte, under its own digest.
+    let whole = server.get(target);
+    whole.assert_status(200);
+    assert_eq!(whole.body, file);
+    whole.assert_header("content-type", "application/vnd.hdt");
+    whole.assert_header("content-length", &len.to_string());
+    whole.assert_header("accept-ranges", "bytes");
+    whole.assert_header("etag", &strong);
+    whole.assert_header("repr-digest", &repr_digest);
+    whole.assert_header("last-modified", "Fri, 09 Jan 2026 09:00:00 GMT");
+    whole.assert_header("content-disposition", "attachment; filename=\"tox-v1.hdt\"");
+    whole.assert_cache_control(&["public", "max-age=31536000", "immutable", "no-transform"]);
+    assert_encoding_vary(&whole, "identity download");
+    assert_eq!(whole.header("content-encoding"), None);
+
+    // HEAD describes that GET exactly.
+    let head = server.request("HEAD", target, &[]);
+    head.assert_status(200);
+    for name in [
+        "content-length",
+        "etag",
+        "repr-digest",
+        "accept-ranges",
+        "content-type",
+    ] {
+        assert_eq!(head.header(name), whole.header(name), "{name}");
+    }
+
+    // Every range form, each carrying the whole representation's digest.
+    let ranges = [
+        ("bytes=10-19".to_owned(), 10..20),
+        ("bytes=-7".to_owned(), len - 7..len),
+        (format!("bytes={}-", len - 5), len - 5..len),
+        (format!("bytes=3-{}", len * 2), 3..len),
+    ];
+    for (header, span) in ranges {
+        let part = server.request("GET", target, &[("range", &header)]);
+        part.assert_status(206);
+        assert_eq!(part.body, file[span.clone()], "{header}");
+        part.assert_header(
+            "content-range",
+            &format!("bytes {}-{}/{len}", span.start, span.end - 1),
+        );
+        part.assert_header("content-length", &span.len().to_string());
+        part.assert_header("etag", &strong);
+        part.assert_header("repr-digest", &repr_digest);
+    }
+
+    // A resume that names this artifact is honoured; one naming anything else
+    // gets the whole file rather than a splice.
+    let resumed = server.request(
+        "GET",
+        target,
+        &[("range", "bytes=10-"), ("if-range", &strong)],
+    );
+    resumed.assert_status(206);
+    assert_eq!(resumed.body, file[10..]);
+    let stale = server.request(
+        "GET",
+        target,
+        &[("range", "bytes=10-"), ("if-range", "\"sha256:00\"")],
+    );
+    stale.assert_status(200);
+    assert_eq!(stale.body, file);
+
+    // A range is identity even to a client that accepts compression, which
+    // is what makes a decoding client's file length a valid resume offset.
+    let identity = server.request(
+        "GET",
+        target,
+        &[("range", "bytes=10-19"), ("accept-encoding", "zstd, gzip")],
+    );
+    identity.assert_status(206);
+    assert_eq!(identity.header("content-encoding"), None);
+    assert_eq!(identity.body, file[10..20]);
+
+    // Several distant ranges are one multipart response, its parts in the
+    // order they were asked for.
+    let tail = len - 4;
+    let multi = server.request("GET", target, &[("range", &format!("bytes={tail}-,0-3"))]);
+    multi.assert_status(206);
+    let content_type = multi.header("content-type").unwrap();
+    let boundary = content_type
+        .strip_prefix("multipart/byteranges; boundary=")
+        .unwrap_or_else(|| panic!("a multipart type, got {content_type}"));
+    multi.assert_header("content-length", &multi.body.len().to_string());
+    let parts = multipart_parts(&multi.body, boundary);
+    assert_eq!(
+        parts,
+        vec![
+            (
+                format!("bytes {tail}-{}/{len}", len - 1),
+                file[tail..].to_vec()
+            ),
+            (format!("bytes 0-3/{len}"), file[..4].to_vec()),
+        ]
+    );
+
+    // Nothing inside the artifact: 416, saying how long it is.
+    let beyond = server.request("GET", target, &[("range", &format!("bytes={len}-"))]);
+    beyond.assert_status(416);
+    beyond.assert_header("content-range", &format!("bytes */{len}"));
+    assert_eq!(beyond.json()["code"], "range_not_satisfiable");
+    // An invalid Range is ignored rather than refused.
+    let invalid = server.request("GET", target, &[("range", "bytes=9-3")]);
+    invalid.assert_status(200);
+    assert_eq!(invalid.body, file);
+
+    // Preconditions.
+    let unchanged = server.request("GET", target, &[("if-none-match", &strong)]);
+    unchanged.assert_status(304);
+    assert!(unchanged.body.is_empty());
+    unchanged.assert_header("etag", &strong);
+    unchanged.assert_cache_control(&["public", "max-age=31536000", "immutable", "no-transform"]);
+    let refused = server.request("GET", target, &[("if-match", "\"sha256:00\"")]);
+    refused.assert_status(412);
+    assert_eq!(refused.json()["code"], "precondition_failed");
+    server
+        .request("GET", target, &[("if-match", &strong)])
+        .assert_status(200);
+
+    // Only the artifacts this server exports are routes.
+    for other in ["data.hdt.perm", "manifest.json", "nonsense"] {
+        let missing = server.get(&format!("/tox/v/v1/export/{other}"));
+        missing.assert_status(404);
+        assert_eq!(missing.json()["code"], "not_found");
+    }
+    let posted = server.request("POST", target, &[]);
+    posted.assert_status(405);
+
+    // Clients find it from the descriptor and the manifest page.
+    let descriptor = server.get("/").json();
+    assert_eq!(descriptor["datasets"][0]["links"]["hdt"], target);
+    let page = server.request("GET", "/tox/v/v1/manifest", &[("accept", "text/html")]);
+    assert!(
+        links(&page.text()).iter().any(|(href, _)| href == target),
+        "the manifest page links the download"
+    );
+}
+
+/// A full-body download is sent uncompressed to every client that has not
+/// said it prefers otherwise — which is every client's default — and
+/// compressed for one that has, decoding to the artifact exactly.
+#[test]
+fn a_download_is_compressed_when_asked_and_decodes_to_the_artifact() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    let file = std::fs::read(deployment.bundle("tox", "v1").join("data.hdt")).expect("the HDT");
+    let digest = Sha256::digest(&file);
+    let weak = format!("W/\"sha256:{digest:x}\"");
+    let server = deployment.serve();
+    let target = "/tox/v/v1/export/data.hdt";
+
+    // What browsers, `requests`, Go and `curl --compressed` send by default:
+    // each gets a download it can size and resume.
+    for accept in ["gzip, deflate, br, zstd", "gzip, deflate", "gzip", "zstd"] {
+        let default = server.request("GET", target, &[("accept-encoding", accept)]);
+        default.assert_status(200);
+        assert_eq!(default.header("content-encoding"), None, "{accept}");
+        default.assert_header("content-length", &file.len().to_string());
+        default.assert_header("accept-ranges", "bytes");
+        default.assert_header("etag", &format!("\"sha256:{digest:x}\""));
+        assert_eq!(default.body, file, "{accept}");
+    }
+
+    for (accept, coding) in [
+        ("zstd, identity;q=0.5", "zstd"),
+        ("gzip, deflate, br, zstd, identity;q=0.1", "zstd"),
+        ("gzip, identity;q=0.5", "gzip"),
+        ("x-gzip, identity;q=0", "gzip"),
+    ] {
+        let compressed = server.request("GET", target, &[("accept-encoding", accept)]);
+        compressed.assert_status(200);
+        compressed.assert_header("content-encoding", coding);
+        compressed.assert_header("etag", &weak);
+        assert_encoding_vary(&compressed, accept);
+        // None of these can be known before the body has been produced.
+        for absent in [
+            "content-length",
+            "accept-ranges",
+            "repr-digest",
+            "last-modified",
+        ] {
+            assert_eq!(compressed.header(absent), None, "{accept}: {absent}");
+        }
+        let decoded = match coding {
+            "zstd" => zstd::stream::decode_all(compressed.content().as_slice()).unwrap(),
+            _ => {
+                let mut decoded = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut flate2::read::GzDecoder::new(compressed.content().as_slice()),
+                    &mut decoded,
+                )
+                .unwrap();
+                decoded
+            }
+        };
+        assert_eq!(decoded, file, "{accept}");
+
+        // Its HEAD makes no claim about a length it does not know.
+        let head = server.request("HEAD", target, &[("accept-encoding", accept)]);
+        head.assert_status(200);
+        head.assert_header("content-encoding", coding);
+        assert_eq!(head.header("content-length"), None, "{accept}");
+
+        // And it revalidates under its own validator.
+        let unchanged = server.request(
+            "GET",
+            target,
+            &[("accept-encoding", accept), ("if-none-match", &weak)],
+        );
+        unchanged.assert_status(304);
+        unchanged.assert_header("etag", &weak);
+    }
+
+    // A client weighting identity above the codings gets identity, with the
+    // strong validator intact: the compression layer every other route passes
+    // through would have gzipped this, and must leave a download alone.
+    let identity = server.request(
+        "GET",
+        target,
+        &[("accept-encoding", "gzip;q=0.5, identity")],
+    );
+    identity.assert_status(200);
+    assert_eq!(identity.header("content-encoding"), None);
+    identity.assert_header("etag", &format!("\"sha256:{digest:x}\""));
+    assert_eq!(identity.body, file);
+}
+
+#[test]
+fn a_download_is_recorded_by_its_shape() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    let log = RecordingAccessLog::default();
+    let server = deployment.serve_with_access(Arc::new(log.clone()), false);
+    server
+        .request(
+            "GET",
+            "/tox/v/v1/export/data.hdt",
+            &[
+                ("range", "bytes=0-9, 20-29"),
+                ("accept-encoding", "zstd, identity;q=0.5"),
+            ],
+        )
+        .assert_status(206);
+    server
+        .request(
+            "GET",
+            "/tox/v/v1/export/data.hdt",
+            &[("accept-encoding", "zstd, identity;q=0.5")],
+        )
+        .assert_status(200);
+
+    let records = log.records();
+    let exports: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record.route.as_deref() == Some("/{dataset}/v/{version}/export/{artifact}")
+        })
+        .map(|record| serde_json::to_value(record).unwrap())
+        .collect();
+    assert_eq!(exports.len(), 2, "{records:?}");
+    assert_eq!(exports[0]["operation"], "export");
+    assert_eq!(exports[0]["status"], 206);
+    assert_eq!(
+        exports[0]["shape"],
+        serde_json::json!({"artifact": "data.hdt", "coding": "identity", "ranges": 2})
+    );
+    assert_eq!(
+        exports[1]["shape"],
+        serde_json::json!({"artifact": "data.hdt", "coding": "zstd", "ranges": 0})
+    );
+}
+
+/// A download takes a graph scope only where the artifact is that scope, and
+/// refuses everything else before a precondition or a byte is considered:
+/// answering `g=<G>` with the union would be a larger file carrying no sign of
+/// being the wrong one.
+#[test]
+fn a_download_refuses_a_query_it_cannot_honour() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    deployment.publish_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-01-09T09:00:00Z");
+    let server = deployment.serve();
+    let scoped = |dataset: &str, g: &str| {
+        format!(
+            "/{dataset}/v/v1/export/data.hdt?g={}",
+            kgf_server::url::encode_value(g)
+        )
+    };
+    let refused = |target: &str, headers: &[(&str, &str)], status: u16, code: &str| {
+        let response = server.request("GET", target, headers);
+        response.assert_status(status);
+        assert_eq!(response.json()["code"], code, "{target}");
+    };
+
+    for dataset in ["tox", "quads"] {
+        // The union is the artifact, spelled either way.
+        let union = server.get(&scoped(dataset, "<urn:x-kgf:union>"));
+        union.assert_status(200);
+        assert_eq!(
+            union.body,
+            server.get(&format!("/{dataset}/v/v1/export/data.hdt")).body
+        );
+
+        for g in ["*", "<http://example.org/g1>"] {
+            refused(&scoped(dataset, g), &[], 501, "capability_not_available");
+            // Refused ahead of the preconditions and the range, which would
+            // otherwise have answered 304 or 206 with the union's bytes.
+            let etag = union.header("etag").unwrap();
+            refused(
+                &scoped(dataset, g),
+                &[("if-none-match", &etag), ("range", "bytes=0-9")],
+                501,
+                "capability_not_available",
+            );
+        }
+        refused(
+            &format!("/{dataset}/v/v1/export/data.hdt?format=json"),
+            &[],
+            400,
+            "malformed_request",
+        );
+        refused(&scoped(dataset, "<not an iri"), &[], 400, "bad_term_syntax");
+    }
+
+    // The unnamed graph is the whole artifact only where every triple is
+    // unnamed, which is a release without memberships.
+    server
+        .get(&scoped("tox", "<urn:x-kgf:unnamed>"))
+        .assert_status(200);
+    refused(
+        &scoped("quads", "<urn:x-kgf:unnamed>"),
+        &[],
+        501,
+        "capability_not_available",
+    );
+}
+
+/// A client that stops reading keeps its download slot, and only its own:
+/// another client still downloads, the same client is told it is at its
+/// limit, and the slot comes back as soon as the stalled client goes away.
+#[test]
+fn download_slots_are_counted_per_client_and_given_back_when_a_client_leaves() {
+    // Large and incompressible, so a client that never reads leaves the server
+    // with most of the body unsent: more than every buffer between the two
+    // ends of a loopback connection can hold.
+    let deployment = Deployment::new();
+    deployment.publish(
+        "big",
+        "v1",
+        &incompressible_nt(32 << 20),
+        "2026-01-09T09:00:00Z",
+    );
+    let server = deployment.serve_configured(|config| {
+        config.trusted_proxies = 1;
+        config.admission.max_downloads_per_client = 1;
+    });
+    let target = "/big/v/v1/export/data.hdt";
+    let from = |client: &'static str| [("x-forwarded-for", client), ("range", "bytes=0-9")];
+
+    let stalled = server.stall("GET", target, &[("x-forwarded-for", "192.0.2.1")]);
+    assert!(
+        stalled.status_line.contains(" 200 "),
+        "{}",
+        stalled.status_line
+    );
+
+    let refused = server.request("GET", target, &from("192.0.2.1"));
+    refused.assert_status(429);
+    assert_eq!(refused.json()["code"], "rate_limited");
+    assert!(
+        refused.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("this client"),
+        "{}",
+        refused.text()
+    );
+    refused.assert_header("retry-after", "30");
+    // A HEAD streams nothing and is never refused for want of a slot.
+    server
+        .request("HEAD", target, &[("x-forwarded-for", "192.0.2.1")])
+        .assert_status(200);
+
+    server
+        .request("GET", target, &from("192.0.2.2"))
+        .assert_status(206);
+
+    drop(stalled);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let retried = server.request("GET", target, &from("192.0.2.1"));
+        if retried.status == 206 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slot was not given back: {}",
+            retried.status
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// N-Triples of about `bytes` whose literals share no prefixes, so the HDT
+/// built from it is about as large as the text.
+fn incompressible_nt(bytes: usize) -> String {
+    let mut source = String::with_capacity(bytes + 1024);
+    let mut index = 0u64;
+    while source.len() < bytes {
+        let mut literal = String::with_capacity(512);
+        for part in 0..8u64 {
+            literal.push_str(&format!(
+                "{:x}",
+                Sha256::digest([index.to_be_bytes(), part.to_be_bytes()].concat())
+            ));
+        }
+        source.push_str(&format!(
+            "<http://example.org/s{index}> <http://example.org/p> \"{literal}\" .\n"
+        ));
+        index += 1;
+    }
+    source
+}
+
+/// The parts of a `multipart/byteranges` body: each part's `Content-Range`
+/// and its bytes.
+fn multipart_parts(body: &[u8], boundary: &str) -> Vec<(String, Vec<u8>)> {
+    let delimiter = format!("--{boundary}");
+    let mut parts = Vec::new();
+    let mut rest = body;
+    loop {
+        let start = find(rest, delimiter.as_bytes()).expect("a delimiter") + delimiter.len();
+        rest = &rest[start..];
+        if rest.starts_with(b"--") {
+            return parts;
+        }
+        let headers_end = find(rest, b"\r\n\r\n").expect("part headers end");
+        let headers = std::str::from_utf8(&rest[2..headers_end]).unwrap();
+        let range = headers
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix("Content-Range: "))
+            .expect("a part's Content-Range")
+            .to_owned();
+        rest = &rest[headers_end + 4..];
+        let end = find(rest, format!("\r\n{delimiter}").as_bytes()).expect("the next delimiter");
+        parts.push((range, rest[..end].to_vec()));
+        rest = &rest[end..];
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 #[test]
@@ -1980,6 +2856,7 @@ fn a_page_is_admitted_the_same_way_in_every_representation_it_offers() {
 fn access_logging_emits_one_correlated_record_for_every_response() {
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    deployment.publish_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-06-01T14:03:22Z");
     let records = RecordingAccessLog::default();
     let server = deployment.serve_with_access(Arc::new(records.clone()), false);
     let fragment_path = "/tox/v/v1/fragment?limit=2";
@@ -2014,6 +2891,8 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
     malformed_rdf.assert_header("content-type", "application/problem+json");
     let latest_query = server.request("QUERY", "/tox/latest/fragment", &[]);
     latest_query.assert_status(307);
+    let graphs = server.request("GET", "/quads/v/v1/graphs?limit=1", &[]);
+    graphs.assert_status(200);
 
     let responses = [
         &page,
@@ -2024,6 +2903,7 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
         &latest,
         &malformed_rdf,
         &latest_query,
+        &graphs,
     ];
     let records = records.records();
     assert_eq!(records.len(), responses.len());
@@ -2109,6 +2989,23 @@ fn access_logging_emits_one_correlated_record_for_every_response() {
     assert_eq!(
         records[7].transport,
         Some(kgf_server::access::Transport::Query)
+    );
+
+    // A listing records the shape of what it was asked for and how much of the
+    // answer it delivered, exactly as a pattern page does.
+    let listing = &records[8];
+    assert_eq!(
+        listing.operation,
+        Some(kgf_server::access::AccessOperation::Graphs)
+    );
+    assert_eq!(listing.dataset.as_deref(), Some("quads"));
+    assert_eq!(listing.rows, Some(1));
+    assert_eq!(listing.cardinality, Some(3));
+    assert_eq!(listing.complete, Some(false));
+    assert_eq!(listing.truncation_reason, Some("page_limit"));
+    assert_eq!(
+        serde_json::to_value(listing).unwrap()["shape"],
+        serde_json::json!({"limit": 1})
     );
 }
 
@@ -2239,6 +3136,60 @@ fn request_ids_are_minted_without_an_access_log() {
         .expect("a minted request id");
     assert_ne!(first_id, second_id);
     assert_eq!(first_id.len(), "0123456789abcdef-00000000".len());
+}
+
+#[test]
+fn the_serving_line_is_plain_text_when_stderr_is_not_a_terminal() {
+    // A harness binds an ephemeral port and reads it back from the startup
+    // line, so a redirected line must parse exactly as written. `NO_COLOR` is
+    // removed so plain text is the binary's own decision rather than the test
+    // environment's, and `RUST_LOG` so the `info` line is not filtered out.
+    let deployment = Deployment::new();
+    let mut serve = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_kgf"))
+            .args(["serve", "--bundle-root"])
+            .arg(deployment.root_path())
+            .args(["--bind", "127.0.0.1:0", "--access-log", "off"])
+            .env_remove("NO_COLOR")
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn kgf serve"),
+    );
+    let stderr = BufReader::new(serve.0.stderr.take().expect("piped stderr"));
+
+    let mut seen = String::new();
+    let mut serving = None;
+    for line in stderr.lines() {
+        let line = line.expect("read kgf serve's stderr");
+        seen.push_str(&line);
+        seen.push('\n');
+        if line.contains("serving") {
+            serving = Some(line);
+            break;
+        }
+    }
+    let serving = serving.unwrap_or_else(|| panic!("kgf serve exited before serving:\n{seen}"));
+    assert!(
+        !serving.contains('\x1b'),
+        "a redirected log line carries escape codes: {serving:?}"
+    );
+
+    let address: SocketAddr = serving
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("address="))
+        .unwrap_or_else(|| panic!("no address field: {serving:?}"))
+        .parse()
+        .expect("the address field is a socket address");
+    assert_ne!(address.port(), 0, "the line reports the port bound");
+    let server = Server {
+        address,
+        stop: None,
+        runtime: None,
+    };
+    server.get("/").assert_status(200);
 }
 
 #[test]
@@ -2947,6 +3898,63 @@ impl Deployment {
         self.publish_bundle(dataset, version, source, created, true);
     }
 
+    /// Build a quad bundle — sidecar and index beside the HDT — and describe it.
+    fn publish_quads(&self, dataset: &str, version: &str, source: &str, created: &str) {
+        self.publish_fixture(dataset, version, Fixture::build_quads(source), created);
+    }
+
+    /// Assemble a quad bundle with `kgf build`, the way a deployment does.
+    ///
+    /// The whole pipeline rather than a fixture: the description of each graph
+    /// is produced by the build and read back by the server, so this is the
+    /// only kind of test that can catch the two disagreeing about what a view
+    /// is called or where its rows are.
+    fn publish_built_quads(&self, dataset: &str, version: &str, source: &str, created: &str) {
+        self.publish_built(dataset, version, source, created, "");
+    }
+
+    /// The same, with extra build config appended — components, say.
+    fn publish_built(
+        &self,
+        dataset: &str,
+        version: &str,
+        source: &str,
+        created: &str,
+        extra: &str,
+    ) {
+        let workspace = tempfile::tempdir().expect("build scratch");
+        let input = workspace.path().join("source.nq");
+        std::fs::write(&input, source).expect("write the build's input");
+        let config = workspace.path().join("build.yaml");
+        std::fs::write(
+            &config,
+            format!(
+                "schema: 1\ndataset: {{id: {dataset}, iri: 'https://example.org/{dataset}'}}\n\
+                 semantics: {{prefixes: {{ex: 'http://example.org/'}}}}\n{extra}"
+            ),
+        )
+        .expect("write the build config");
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: kgf::build::Args,
+        }
+        let cli = Cli::parse_from([
+            "kgf-build",
+            "--config",
+            config.to_str().unwrap(),
+            "--out",
+            self.bundle(dataset, version).to_str().unwrap(),
+            "--input",
+            input.to_str().unwrap(),
+            "--hdtc",
+            kgf_store::testing::hdtc_binary().to_str().unwrap(),
+        ]);
+        kgf::build::run(cli.args).expect("build a quad bundle");
+        self.set_created(&self.bundle(dataset, version), created);
+    }
+
     fn publish_description(&self, dataset: &str, version: &str, created: &str) {
         self.publish_description_with_labels(dataset, version, created, true);
     }
@@ -3010,9 +4018,13 @@ impl Deployment {
         created: &str,
         text: bool,
     ) {
-        let bundle = self.bundle(dataset, version);
         let fixture = Fixture::build(source);
         let fixture = if text { fixture.with_text() } else { fixture };
+        self.publish_fixture(dataset, version, fixture, created);
+    }
+
+    fn publish_fixture(&self, dataset: &str, version: &str, fixture: Fixture, created: &str) {
+        let bundle = self.bundle(dataset, version);
         fixture.copy_bundle_to(&bundle);
 
         #[derive(Parser)]
@@ -3144,6 +4156,16 @@ impl AccessLog for RecordingAccessLog {
     }
 }
 
+/// A spawned `kgf serve`, stopped when the test ends however it ends.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 struct Server {
     address: SocketAddr,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -3195,6 +4217,29 @@ impl Server {
         self.exchange(method, &request, body)
     }
 
+    /// Send a request and read only its status and headers, leaving the body
+    /// unread for as long as the returned connection is held.
+    fn stall(&self, method: &str, target: &str, headers: &[(&str, &str)]) -> Stalled {
+        let mut request = format!("{method} {target} HTTP/1.1\r\nHost: {}\r\n", self.address);
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        let mut stream = TcpStream::connect(self.address).expect("connect");
+        stream.write_all(request.as_bytes()).expect("write");
+        let mut head = Vec::new();
+        let mut byte = [0u8];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).expect("a response head");
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).expect("headers are ASCII");
+        Stalled {
+            status_line: head.lines().next().unwrap_or_default().to_owned(),
+            _stream: stream,
+        }
+    }
+
     fn request_without_host(&self, target: &str, headers: &[(&str, &str)]) -> Response {
         let mut request = format!("GET {target} HTTP/1.0\r\nConnection: close\r\n");
         for (name, value) in headers {
@@ -3243,6 +4288,12 @@ fn links(html: &str) -> Vec<(String, bool)> {
         found.push((href.to_owned(), tag.contains("rel=\"nofollow\"")));
     }
     found
+}
+
+/// A connection whose response body is not being read.
+struct Stalled {
+    status_line: String,
+    _stream: TcpStream,
 }
 
 struct Response {
@@ -3307,6 +4358,27 @@ impl Response {
         String::from_utf8(self.body.clone()).expect("a UTF-8 body")
     }
 
+    /// The body with any chunked transfer framing removed.
+    fn content(&self) -> Vec<u8> {
+        if self.header("transfer-encoding").as_deref() != Some("chunked") {
+            return self.body.clone();
+        }
+        let mut content = Vec::new();
+        let mut rest = self.body.as_slice();
+        loop {
+            let line_end = find(rest, b"\r\n").expect("a chunk-size line");
+            let size = std::str::from_utf8(&rest[..line_end]).unwrap();
+            let size = usize::from_str_radix(size.split(';').next().unwrap().trim(), 16)
+                .expect("a hexadecimal chunk size");
+            rest = &rest[line_end + 2..];
+            if size == 0 {
+                return content;
+            }
+            content.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
+    }
+
     fn json(&self) -> serde_json::Value {
         serde_json::from_slice(&self.body)
             .unwrap_or_else(|error| panic!("expected JSON, got {:?}: {error}", self.text()))
@@ -3355,6 +4427,220 @@ impl Response {
             "header {name}; all headers were {:?}",
             self.headers
         );
+    }
+}
+
+/// A bundle the build assembled from quads describes every graph it holds, and
+/// the server reads those descriptions back under the names `/graphs` lists.
+///
+/// The whole pipeline in one test, because the two halves are only correct
+/// together: the build names a view after the graph, lays the rows out in the
+/// order a mapped bundle walks them, and records the ranges; the server parses
+/// the name a request sends with the same grammar and reads those ranges.
+#[test]
+fn a_built_quad_bundle_describes_each_of_its_graphs() {
+    const G1: &str = "http://example.org/g1";
+    const UNNAMED: &str = "urn:x-kgf:unnamed";
+
+    let deployment = Deployment::new();
+    deployment.publish_built_quads("quads", "v1", WORKED_EXAMPLE_NQ, "2026-09-17T09:00:00Z");
+    let server = deployment.serve();
+
+    // The graphs the bundle holds, and the counts of the worked example.
+    let graphs = server.get("/quads/v/v1/graphs");
+    graphs.assert_status(200);
+    let listed: Vec<(String, u64)> = graphs.json()["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["g"]["value"].as_str().unwrap().to_owned(),
+                entry["count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            (UNNAMED.to_owned(), 2),
+            (G1.to_owned(), 2),
+            ("http://example.org/g2".to_owned(), 1),
+        ]
+    );
+
+    // Each graph has a description of its own, under the name it is listed by,
+    // and its counts are the graph's rather than the dataset's.
+    for (graph, triples) in [(UNNAMED, 2), (G1, 2), ("http://example.org/g2", 1)] {
+        let view = kgf_server::url::encode_value(&format!("graph:{graph}"));
+        let schema = server.get(&format!("/quads/v/v1/schema?view={view}"));
+        schema.assert_status(200);
+        let body = schema.json();
+        assert_eq!(body["view"], format!("graph:{graph}"), "{graph}");
+        assert_eq!(body["node"]["counts"]["triples"], triples, "{graph}");
+    }
+    // The union is what the dataset's own views describe, and it counts each
+    // distinct triple once rather than once per graph.
+    let whole = server.get("/quads/v/v1/schema?view=queryable");
+    assert_eq!(whole.json()["node"]["counts"]["triples"], 3);
+
+    // The persisted summary names the same graphs, and its links work.
+    let summary = server.get("/quads/v/v1/summary?format=json");
+    summary.assert_status(200);
+    let summary = summary.json();
+    let named: Vec<String> = summary["graphs"]
+        .as_array()
+        .expect("a quad bundle's summary names its graphs")
+        .iter()
+        .map(|entry| entry["graph"].as_str().unwrap().to_owned())
+        .collect();
+    // The card ranks by size; `/graphs` above lists by layer id.
+    assert_eq!(named, vec![G1, UNNAMED, "http://example.org/g2"]);
+    assert_eq!(summary["graphs_total"], 3);
+    for entry in summary["graphs"].as_array().unwrap() {
+        for link in ["schema", "fragment"] {
+            let followed = server.get(&format!(
+                "/quads/v/v1/{}",
+                entry["links"][link].as_str().unwrap()
+            ));
+            followed.assert_status(200);
+        }
+    }
+
+    // The browser page shows them too, with the way into each graph's triples.
+    let page = server.request("GET", "/quads/v/v1/summary", &[("Accept", "text/html")]);
+    page.assert_status(200);
+    let page = String::from_utf8(page.body.to_vec()).unwrap();
+    assert!(page.contains("Named graphs"), "{page}");
+    assert!(
+        page.contains("g=%3Chttp%3A%2F%2Fexample.org%2Fg1%3E"),
+        "{page}"
+    );
+
+    // A graph this bundle does not hold is a 404 that says where to look, and
+    // a view name of no known kind is refused before anything opens.
+    let missing = server.get("/quads/v/v1/schema?view=graph%3Ahttp%3A%2F%2Fexample.org%2Fnope");
+    missing.assert_status(404);
+    assert!(
+        missing.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("/graphs"),
+        "{missing:?}",
+        missing = missing.json()
+    );
+    let malformed = server.get("/quads/v/v1/schema?view=nonsense");
+    malformed.assert_status(400);
+    assert!(
+        malformed.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("graph:<IRI>"),
+        "{malformed:?}",
+        malformed = malformed.json()
+    );
+}
+
+/// A declared component is a graph with a name of its own: `/graphs` says which
+/// graph holds it, `/schema` describes it under that name, and the design view
+/// follows the canonical one rather than the merged whole.
+#[test]
+fn a_bundle_serves_the_components_it_declares() {
+    const G1: &str = "http://example.org/g1";
+
+    let deployment = Deployment::new();
+    deployment.publish_built(
+        "quads",
+        "v1",
+        WORKED_EXAMPLE_NQ,
+        "2026-09-17T09:00:00Z",
+        concat!(
+            "components:\n",
+            "  asserted: {role: source, graph: 'http://example.org/g1'}\n",
+            "  closure: {role: entailment, graph: 'http://example.org/g2', ",
+            "inputs: [asserted]}\n",
+        ),
+    );
+    let server = deployment.serve();
+
+    // The listing says which graphs are components, and which are not.
+    let graphs = server.get("/quads/v/v1/graphs");
+    graphs.assert_status(200);
+    let claimed: Vec<(String, Option<String>)> = graphs.json()["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["g"]["value"].as_str().unwrap().to_owned(),
+                entry["component"].as_str().map(str::to_owned),
+            )
+        })
+        .collect();
+    assert_eq!(
+        claimed,
+        vec![
+            ("urn:x-kgf:unnamed".to_owned(), None),
+            (G1.to_owned(), Some("asserted".to_owned())),
+            (
+                "http://example.org/g2".to_owned(),
+                Some("closure".to_owned())
+            ),
+        ]
+    );
+
+    // Its description is under the component's id, and asking for the graph's
+    // own name says where to look instead.
+    let component = server.get("/quads/v/v1/schema?view=component%3Aasserted");
+    component.assert_status(200);
+    assert_eq!(component.json()["node"]["counts"]["triples"], 2);
+    let by_graph = server.get("/quads/v/v1/schema?view=graph%3Ahttp%3A%2F%2Fexample.org%2Fg1");
+    by_graph.assert_status(404);
+    assert!(
+        by_graph.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("view=component:asserted"),
+        "{:?}",
+        by_graph.json()
+    );
+
+    // The design view is the canonical component, not the merged graph: two of
+    // the three distinct triples.
+    let design = server.get("/quads/v/v1/schema?view=design");
+    design.assert_status(200);
+    assert_eq!(design.json()["node"]["counts"]["triples"], 2);
+    let queryable = server.get("/quads/v/v1/schema?view=queryable");
+    assert_eq!(queryable.json()["node"]["counts"]["triples"], 3);
+
+    // And the manifest publishes what was declared.
+    let manifest = server.get("/quads/v/v1/manifest").json();
+    assert_eq!(manifest["components"][0]["id"], "asserted");
+    assert_eq!(manifest["components"][1]["role"], "entailment");
+    assert_eq!(manifest["components"][1]["inputs"][0], "asserted");
+
+    // A reader can get from the listing to each part's description, and from
+    // one description to another: which view answers a question depends on
+    // what the reader came to find out, so no page is a dead end.
+    let listing = server.request("GET", "/quads/v/v1/graphs", &[("Accept", "text/html")]);
+    listing.assert_status(200);
+    let listing = String::from_utf8(listing.body.to_vec()).unwrap();
+    for view in ["component%3Aasserted", "component%3Aclosure"] {
+        assert!(
+            listing.contains(&format!("schema?view={view}")),
+            "{listing}"
+        );
+    }
+    let page = server.request(
+        "GET",
+        "/quads/v/v1/schema?view=component%3Aasserted",
+        &[("Accept", "text/html")],
+    );
+    page.assert_status(200);
+    let page = String::from_utf8(page.body.to_vec()).unwrap();
+    assert!(page.contains("schema-views"), "{page}");
+    for view in ["design", "queryable", "component%3Aclosure"] {
+        assert!(page.contains(&format!("view={view}")), "missing {view}");
     }
 }
 

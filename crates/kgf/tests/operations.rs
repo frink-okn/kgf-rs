@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use kgf_server::access::AccessOperation;
-use kgf_server::answer::{self, Target};
+use kgf_server::answer::{self, Renders as _, Target};
 use kgf_server::representation::Representation;
 use kgf_server::request;
 use kgf_server::service::{Release, Service};
@@ -24,7 +24,7 @@ use kgf_server::{Budgets, Caps, Limits};
 use kgf_store::catalog::BundleId;
 use kgf_store::dict::Section;
 use kgf_store::pattern::IdPattern;
-use kgf_store::testing::Fixture;
+use kgf_store::testing::{Fixture, WORKED_EXAMPLE_NQ};
 use kgf_store::{IdTriple, Role, Store, TermId};
 
 /// Small, and every term shape in it.
@@ -1478,11 +1478,21 @@ impl Served {
         Self::build(true)
     }
 
+    /// The worked example of the graph read contract: three distinct triples
+    /// over the unnamed graph, `g1`, and `g2`, with five memberships.
+    fn quads() -> Self {
+        Self::from_fixture(Fixture::build_quads(WORKED_EXAMPLE_NQ))
+    }
+
     fn build(text: bool) -> Self {
-        let root = tempfile::tempdir().expect("temp dir");
-        let bundle = root.path().join(DATASET).join(VERSION);
         let fixture = Fixture::build(GRAPH);
         let fixture = if text { fixture.with_text() } else { fixture };
+        Self::from_fixture(fixture)
+    }
+
+    fn from_fixture(fixture: Fixture) -> Self {
+        let root = tempfile::tempdir().expect("temp dir");
+        let bundle = root.path().join(DATASET).join(VERSION);
         fixture.copy_bundle_to(&bundle);
 
         #[derive(Parser)]
@@ -1649,6 +1659,47 @@ impl Served {
     fn binding_fragment_html(&self, store: &Store, body: &serde_json::Value) -> String {
         let rendered = self.render_binding_fragment(store, body, Representation::Html);
         String::from_utf8(rendered.body.to_vec()).expect("a bindings fragment page is UTF-8")
+    }
+
+    /// A bindings fragment request, for a test that needs its cursor binding.
+    fn parse_binding_fragment(&self, body: &serde_json::Value) -> request::BindingFragment {
+        let encoded = serde_json::to_vec(body).expect("a JSON body");
+        request::BindingFragment::parse(
+            &params(""),
+            &encoded,
+            self.limits(),
+            self.release().prefixes(),
+            &self.release().binding(),
+        )
+        .expect("a bindings fragment request")
+    }
+
+    /// A bindings fragment that may be refused, for the tokens that must be.
+    fn try_binding_fragment(
+        &self,
+        store: &Store,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, kgf_server::envelope::Problem> {
+        let encoded = serde_json::to_vec(body).expect("a JSON body");
+        let request = request::BindingFragment::parse(
+            &params(""),
+            &encoded,
+            self.limits(),
+            self.release().prefixes(),
+            &self.release().binding(),
+        )?;
+        let answer = answer::binding_fragment(
+            store,
+            Target::body(
+                self.id(),
+                AccessOperation::Fragment,
+                params(""),
+                self.release().prefixes().clone(),
+                kgf_server::url::Mount::default(),
+            ),
+            &request,
+        )?;
+        Ok(json(answer, Representation::Json))
     }
 
     fn render_binding_fragment(
@@ -2545,6 +2596,863 @@ fn a_scan_page_links_every_term_to_its_own_neighborhood() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Graph scope
+// ---------------------------------------------------------------------------
+
+/// `g=<IRI>` in request syntax, percent-encoded as a client would send it.
+fn g(iri: &str) -> String {
+    format!("g={}", kgf_server::url::encode_value(&format!("<{iri}>")))
+}
+
+const G1: &str = "http://example.org/g1";
+const G2: &str = "http://example.org/g2";
+const UNNAMED: &str = "urn:x-kgf:unnamed";
+const UNION: &str = "urn:x-kgf:union";
+
+/// The two tables of the read contract, over the worked example: every form
+/// of `g` on `/count` and on `/fragment`, in JSON.
+#[test]
+fn every_form_of_g_counts_what_the_contract_states() {
+    let served = Served::quads();
+    let store = served.store();
+
+    for (scope, expected) in [
+        (String::new(), 3),
+        (g(UNION), 3),
+        (g(G1), 2),
+        (g(G2), 1),
+        (g(UNNAMED), 2),
+        ("g=*".to_owned(), 5),
+    ] {
+        let query = if scope.is_empty() {
+            "limit=100".to_owned()
+        } else {
+            format!("{scope}&limit=100")
+        };
+        let count = served.count(&store, &scope);
+        assert_eq!(
+            count["count"],
+            serde_json::json!({"value": expected, "exact": true}),
+            "count {scope}"
+        );
+        let page = served.fragment(&store, &query);
+        assert_eq!(page["cardinality"]["value"], expected, "fragment {scope}");
+        assert_eq!(
+            page["rows"].as_array().unwrap().len(),
+            expected,
+            "fragment {scope}"
+        );
+        assert_eq!(page["complete"], true, "{scope}");
+        // The echo carries the client's own spelling, and nothing when `g` was absent.
+        match scope.as_str() {
+            "" => assert!(page.get("g").is_none() && count.get("g").is_none()),
+            "g=*" => assert_eq!(page["g"], "*"),
+            _ => assert!(
+                page["g"].as_str().unwrap().starts_with('<'),
+                "{}",
+                page["g"]
+            ),
+        }
+    }
+
+    // The quad view is one row per membership, with the graph beside the
+    // triple: the unnamed graph under its constant, and the union never.
+    let quads = served.fragment(&store, "g=*&limit=100");
+    assert_eq!(quads["vars"], serde_json::json!(["s", "p", "o", "g"]));
+    let expected = [
+        (
+            "http://example.org/a",
+            "http://example.org/b",
+            "http://example.org/c",
+            UNNAMED,
+        ),
+        (
+            "http://example.org/a",
+            "http://example.org/b",
+            "http://example.org/c",
+            G1,
+        ),
+        (
+            "http://example.org/a",
+            "http://example.org/b",
+            "http://example.org/d",
+            UNNAMED,
+        ),
+        (
+            "http://example.org/x",
+            "http://example.org/y",
+            "http://example.org/z",
+            G1,
+        ),
+        (
+            "http://example.org/x",
+            "http://example.org/y",
+            "http://example.org/z",
+            G2,
+        ),
+    ];
+    assert_eq!(
+        rows(&quads),
+        expected
+            .iter()
+            .map(|(s, p, o, g)| vec![
+                (*s).to_owned(),
+                (*p).to_owned(),
+                (*o).to_owned(),
+                (*g).to_owned()
+            ])
+            .collect::<Vec<_>>()
+    );
+
+    // Scoped rows are the union's rows filtered, in the union's order, and a
+    // scoped page reports no graph column.
+    let scoped = served.fragment(&store, &format!("{}&limit=100", g(G1)));
+    assert_eq!(scoped["vars"], serde_json::json!(["s", "p", "o"]));
+    assert_eq!(
+        rows(&scoped),
+        vec![
+            vec![
+                "http://example.org/a",
+                "http://example.org/b",
+                "http://example.org/c"
+            ],
+            vec![
+                "http://example.org/x",
+                "http://example.org/y",
+                "http://example.org/z"
+            ],
+        ]
+    );
+
+    // A bound pattern scopes the same way, in every position space: `? p ?`
+    // reads POS, `? ? o` reads OPS, `s ? o` probes.
+    let p_y = format!("p={}", kgf_server::url::encode_value("ex:y"));
+    assert_eq!(
+        served.count(&store, &format!("{p_y}&{}", g(G1)))["count"]["value"],
+        1
+    );
+    assert_eq!(
+        served.count(&store, &format!("{p_y}&{}", g(UNNAMED)))["count"]["value"],
+        0
+    );
+    assert_eq!(
+        served.count(&store, &format!("{p_y}&g=*"))["count"]["value"],
+        2
+    );
+    let o_c = format!("o={}", kgf_server::url::encode_value("ex:c"));
+    assert_eq!(
+        served.count(&store, &format!("{o_c}&{}", g(G1)))["count"]["value"],
+        1
+    );
+    assert_eq!(
+        served.count(&store, &format!("{o_c}&{}", g(UNNAMED)))["count"]["value"],
+        1
+    );
+    assert_eq!(
+        served.count(&store, &format!("{o_c}&g=*"))["count"]["value"],
+        2
+    );
+    let s_a_o_c = format!(
+        "s={}&o={}",
+        kgf_server::url::encode_value("ex:a"),
+        kgf_server::url::encode_value("ex:c")
+    );
+    assert_eq!(
+        served.count(&store, &format!("{s_a_o_c}&{}", g(G2)))["count"]["value"],
+        0
+    );
+    assert_eq!(
+        served.count(&store, &format!("{s_a_o_c}&g=*"))["count"]["value"],
+        2
+    );
+    let probe = served.fragment(&store, &format!("{s_a_o_c}&g=*&limit=100"));
+    assert_eq!(
+        rows(&probe),
+        vec![
+            vec!["http://example.org/b".to_owned(), UNNAMED.to_owned()],
+            vec!["http://example.org/b".to_owned(), G1.to_owned()],
+        ],
+        "the probe's quad view reports the predicate and the graph"
+    );
+}
+
+/// A page may end inside one triple's memberships; the cursor says so, and
+/// the next page starts with the rest of them, in every position space.
+#[test]
+fn the_quad_view_pages_and_resumes_inside_a_run() {
+    let served = Served::quads();
+    let store = served.store();
+
+    for (pattern, expected_rows) in [
+        ("", 5usize),
+        (&format!("p={}", kgf_server::url::encode_value("ex:b")), 3),
+        (&format!("o={}", kgf_server::url::encode_value("ex:z")), 2),
+        (
+            &format!(
+                "s={}&o={}",
+                kgf_server::url::encode_value("ex:a"),
+                kgf_server::url::encode_value("ex:c")
+            ),
+            2,
+        ),
+    ] {
+        let whole = served.fragment(&store, &format!("{pattern}&g=*&limit=100"));
+        let all_rows = rows(&whole);
+        assert_eq!(all_rows.len(), expected_rows, "{pattern}");
+        for page_size in [1, 2, 3] {
+            let mut collected = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let query = match &cursor {
+                    Some(token) => format!("{pattern}&g=*&limit={page_size}&cursor={token}"),
+                    None => format!("{pattern}&g=*&limit={page_size}"),
+                };
+                let page = served.fragment(&store, &query);
+                assert_eq!(page["cardinality"]["value"], expected_rows as u64);
+                collected.extend(rows(&page));
+                match page["next"].as_str() {
+                    Some(next) => cursor = Some(next.to_owned()),
+                    None => break,
+                }
+            }
+            assert_eq!(collected, all_rows, "{pattern} at page size {page_size}");
+        }
+    }
+}
+
+/// A cursor binds to the scope it was issued under.
+#[test]
+fn a_graph_scope_is_bound_into_the_cursor() {
+    let served = Served::quads();
+    let store = served.store();
+
+    let first = served.fragment(&store, &format!("{}&limit=1", g(G1)));
+    let token = first["next"].as_str().expect("g1 has a second row");
+    // The same scope resumes; another scope, or the quad view, is stale — and
+    // the union constant is the same request as no `g` at all.
+    served.fragment(&store, &format!("{}&limit=1&cursor={token}", g(G1)));
+    for other in [g(G2), g(UNNAMED), "g=*".to_owned(), String::new()] {
+        let query = format!("{other}&limit=1&cursor={token}");
+        let problem = served
+            .try_fragment(&store, &query)
+            .expect_err("a cursor from another scope must be stale");
+        assert_eq!(problem.code().as_str(), "stale_cursor", "{other}");
+    }
+    let union = served.fragment(&store, "limit=1");
+    let token = union["next"].as_str().unwrap();
+    let resumed = served.fragment(&store, &format!("{}&limit=1&cursor={token}", g(UNION)));
+    assert_eq!(resumed["rows"].as_array().unwrap().len(), 1);
+}
+
+/// A graph this bundle does not hold is a well-formed request with an empty
+/// answer that says which parameter, as an absent term is.
+#[test]
+fn an_absent_graph_is_an_empty_answer_that_names_g() {
+    let served = Served::quads();
+    let store = served.store();
+    let scope = g("http://example.org/nowhere");
+
+    let page = served.fragment(&store, &format!("{scope}&limit=100"));
+    assert_eq!(page["rows"], serde_json::json!([]));
+    assert_eq!(page["cardinality"]["value"], 0);
+    assert_eq!(
+        page["absent_terms"],
+        serde_json::json!([{"parameter": "g", "reason": "not_in_bundle"}])
+    );
+    let count = served.count(&store, &scope);
+    assert_eq!(count["count"]["value"], 0);
+    assert_eq!(count["absent_terms"][0]["parameter"], "g");
+
+    // A bindings count says it too, rather than leaving a client to read a
+    // column of zeros as data.
+    let body = serde_json::json!({
+        "pattern": {"s": "?s", "p": "ex:b", "o": "?o"},
+        "bindings": {"vars": ["?s"], "rows": [["ex:a"], ["ex:x"]]},
+        "g": "<http://example.org/nowhere>",
+    });
+    let counts = served.binding_count(&store, &body);
+    assert_eq!(counts["absent_terms"][0]["parameter"], "g");
+    assert!(
+        counts["counts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["count"]["value"] == 0),
+        "{counts}"
+    );
+    let page = served.binding_fragment(&store, &body);
+    assert_eq!(page["absent_terms"][0]["parameter"], "g");
+
+    // A literal is not a graph name, and says so before any bundle opens.
+    let problem = request::Fragment::parse(
+        &params("g=%22text%22"),
+        served.limits(),
+        served.release().prefixes(),
+        &served.release().binding(),
+    )
+    .expect_err("a literal is refused");
+    assert_eq!(problem.code().as_str(), "bad_term_syntax");
+}
+
+/// A `/graphs` cursor names a graph of this listing and nothing else, and a
+/// page that runs out of bytes says so and resumes where it stopped.
+#[test]
+fn a_graph_listing_refuses_a_forged_cursor_and_reports_its_byte_budget() {
+    use kgf_server::cursor::{Cursor, PositionSpace};
+
+    let served = Served::quads();
+    let store = served.store();
+    let binding =
+        request::GraphList::parse(&params(""), served.limits(), &served.release().binding())
+            .expect("a listing with no parameters")
+            .binding;
+
+    // Two named graphs, so ids 1 and 2 are the listing; zero is the unnamed
+    // graph, which is never a resume point, and another space is another
+    // operation's token.
+    for token in [
+        Cursor::at_graph(&binding, 0).encode(),
+        Cursor::at_graph(&binding, 3).encode(),
+        Cursor::at(&binding, PositionSpace::Spo, 1).encode(),
+    ] {
+        let query = format!("cursor={token}");
+        let problem = request::GraphList::parse(
+            &params(&query),
+            served.limits(),
+            &served.release().binding(),
+        )
+        .and_then(|request| {
+            answer::graphs_list(&store, served.target("graphs", &query), &request).map(|_| ())
+        })
+        .expect_err("a forged graph cursor must be refused");
+        assert_eq!(problem.code().as_str(), "stale_cursor", "{token}");
+    }
+
+    // One row always goes out, however small the budget, and the rest of the
+    // listing is behind the cursor it hands back.
+    let bytes = Budgets {
+        max_response_bytes: 1,
+        ..Budgets::new()
+    };
+    let list = |query: &str| -> serde_json::Value {
+        let request = request::GraphList::parse(
+            &params(query),
+            served.within(&bytes),
+            &served.release().binding(),
+        )
+        .expect("a well-formed listing");
+        json(
+            answer::graphs_list(&store, served.target("graphs", query), &request)
+                .expect("a listing"),
+            Representation::Json,
+        )
+    };
+    let mut collected = Vec::new();
+    let mut query = String::new();
+    loop {
+        let page = list(&query);
+        let rows = page["graphs"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "one row fits a one-byte budget: {page}");
+        collected.push(dictionary_spelling(&rows[0]["g"]));
+        match page["next"].as_str() {
+            Some(next) => {
+                assert_eq!(page["truncation_reason"], "response_bytes");
+                query = format!("cursor={next}");
+            }
+            None => break,
+        }
+    }
+    assert_eq!(collected, vec![UNNAMED, G1, G2]);
+}
+
+/// A graph named by a blank node is published under an IRI this bundle mints
+/// for it, and that IRI scopes a request back to the same layer. The spelling
+/// is not a second name for an ordinary graph: an id out of range, and an id
+/// whose layer carries a real IRI, name nothing.
+#[test]
+fn a_blank_node_graph_name_is_published_under_a_bundle_scoped_iri() {
+    let served = Served::from_fixture(Fixture::build_quads(concat!(
+        "<http://example.org/a> <http://example.org/b> <http://example.org/c> _:g .\n",
+        "<http://example.org/a> <http://example.org/b> <http://example.org/d> .\n",
+        "<http://example.org/x> <http://example.org/y> <http://example.org/z> <http://example.org/g1> .\n",
+    )));
+    let store = served.store();
+    let request =
+        request::GraphList::parse(&params(""), served.limits(), &served.release().binding())
+            .expect("a listing");
+    let listing = json(
+        answer::graphs_list(&store, served.target("graphs", ""), &request).expect("a listing"),
+        Representation::Json,
+    );
+    let named: Vec<String> = listing["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| dictionary_spelling(&entry["g"]))
+        .filter(|name| name != UNNAMED && name != G1)
+        .collect();
+    let [minted] = named.as_slice() else {
+        panic!("one blank graph name is published: {listing}");
+    };
+    assert!(
+        !minted.starts_with("_:") && minted.contains("g-"),
+        "a blank graph name is published as an IRI: {minted}"
+    );
+
+    // It scopes a request back to the layer it names.
+    let page = served.fragment(&store, &format!("{}&limit=10", g(minted)));
+    assert_eq!(
+        rows(&page),
+        vec![vec![
+            "http://example.org/a",
+            "http://example.org/b",
+            "http://example.org/c"
+        ]]
+    );
+
+    // Blank-node syntax addresses nothing here, as in every other position:
+    // the stored label means nothing outside the document it was parsed from.
+    let blank = served.fragment(
+        &store,
+        &format!("g={}&limit=10", kgf_server::url::encode_value("_:g")),
+    );
+    assert_eq!(blank["cardinality"]["value"], 0);
+    assert_eq!(blank["absent_terms"][0]["reason"], "blank_node");
+
+    // The id is checked against the sidecar rather than trusted: the layer
+    // holding `g1` carries an IRI and is reachable only by it, and an id past
+    // the last layer names no graph at all.
+    let id: u64 = minted
+        .rsplit("g-")
+        .next()
+        .and_then(|tail| tail.parse().ok())
+        .unwrap_or_else(|| panic!("a minted name ends in its layer id: {minted}"));
+    let prefix = minted
+        .strip_suffix(&format!("g-{id}"))
+        .expect("the id is the suffix");
+    for other in [3 - id, 99] {
+        let alias = format!("{prefix}g-{other}");
+        let refused = served.fragment(&store, &format!("{}&limit=10", g(&alias)));
+        assert_eq!(refused["cardinality"]["value"], 0, "{alias}");
+        assert_eq!(
+            refused["absent_terms"],
+            serde_json::json!([{"parameter": "g", "reason": "not_in_bundle"}]),
+            "{alias}"
+        );
+    }
+}
+
+/// A blank node is one node however many positions it fills. One that names a
+/// graph and is also a triple's subject is published under a single IRI in
+/// both places, so a statement about the graph joins with the graph it
+/// describes — and that IRI is its only spelling: the graph-only form of the
+/// same layer names nothing.
+#[test]
+fn a_blank_node_naming_a_graph_and_a_subject_is_one_node() {
+    let served = Served::from_fixture(Fixture::build_quads(concat!(
+        "_:g <http://example.org/p> <http://example.org/o> _:g .\n",
+        "<http://example.org/a> <http://example.org/b> <http://example.org/c> .\n",
+    )));
+    let store = served.store();
+    let about = format!(
+        "p={}&limit=10",
+        kgf_server::url::encode_value("<http://example.org/p>")
+    );
+    let page = served.fragment(&store, &about);
+    let subject = dictionary_spelling(&page["rows"][0]["s"]);
+    assert!(
+        !subject.starts_with("_:") && subject.contains(":s-"),
+        "the subject is published under its data IRI: {subject}"
+    );
+
+    // The listing names the graph by that IRI, and the quad view tags the
+    // statement with its own subject.
+    let names = blank_graph_names(&served, &store);
+    assert_eq!(names, vec![subject.clone()]);
+    let quads = served.fragment(&store, &format!("g=*&{about}"));
+    assert_eq!(dictionary_spelling(&quads["rows"][0]["g"]), subject);
+
+    // The IRI scopes a request to the graph it names.
+    let scoped = served.fragment(&store, &format!("{}&limit=10", g(&subject)));
+    assert_eq!(
+        rows(&scoped),
+        vec![vec![
+            subject.clone(),
+            "http://example.org/p".to_owned(),
+            "http://example.org/o".to_owned()
+        ]]
+    );
+
+    // The graph-only spelling of the same layer is not a second name for it.
+    let digest: String = store
+        .graphs()
+        .expect("a quad bundle carries memberships")
+        .sidecar_identity_digest()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let graph_only =
+        format!("urn:fdc:frink-okn.github.io:20260818:kgf:bnode:v1:sha256:{digest}:g-1");
+    let refused = served.fragment(&store, &format!("{}&limit=10", g(&graph_only)));
+    assert_eq!(refused["cardinality"]["value"], 0);
+    assert_eq!(
+        refused["absent_terms"],
+        serde_json::json!([{"parameter": "g", "reason": "not_in_bundle"}])
+    );
+}
+
+/// Two bundles can hold the same triples grouped into different graphs. A
+/// graph-only blank name is scoped by the memberships it was minted from, so
+/// one bundle's name for a graph never selects another graph in the other —
+/// though a layer id alone would, since both put the blank graph first.
+#[test]
+fn a_graph_only_blank_name_is_scoped_by_the_memberships_it_came_from() {
+    let first = Served::from_fixture(Fixture::build_quads(concat!(
+        "<http://example.org/a> <http://example.org/b> <http://example.org/c> _:g .\n",
+        "<http://example.org/x> <http://example.org/y> <http://example.org/z> <http://example.org/g1> .\n",
+    )));
+    let second = Served::from_fixture(Fixture::build_quads(concat!(
+        "<http://example.org/a> <http://example.org/b> <http://example.org/c> <http://example.org/g1> .\n",
+        "<http://example.org/x> <http://example.org/y> <http://example.org/z> _:g .\n",
+    )));
+    let (first_store, second_store) = (first.store(), second.store());
+    assert_eq!(
+        first_store.hdt_identity_digest(),
+        second_store.hdt_identity_digest(),
+        "the two bundles publish the same triples"
+    );
+
+    let [minted] = blank_graph_names(&first, &first_store)
+        .try_into()
+        .expect("one blank graph name");
+    let [other] = blank_graph_names(&second, &second_store)
+        .try_into()
+        .expect("one blank graph name");
+    assert_ne!(minted, other, "one IRI for two different graphs");
+
+    let page = first.fragment(&first_store, &format!("{}&limit=10", g(&minted)));
+    assert_eq!(
+        rows(&page),
+        vec![vec![
+            "http://example.org/a",
+            "http://example.org/b",
+            "http://example.org/c"
+        ]]
+    );
+    let foreign = second.fragment(&second_store, &format!("{}&limit=10", g(&minted)));
+    assert_eq!(foreign["cardinality"]["value"], 0, "{foreign}");
+    assert_eq!(
+        foreign["absent_terms"],
+        serde_json::json!([{"parameter": "g", "reason": "not_in_bundle"}])
+    );
+}
+
+/// `g=_:g` is well-formed and names nothing, so it answers empty in every
+/// representation and not only in JSON: a scope that selected no graph has no
+/// statement to tag, and so no graph name to spell as RDF.
+#[test]
+fn a_blank_node_graph_selector_answers_empty_in_rdf() {
+    let served = Served::quads();
+    let store = served.store();
+    let query = format!("g={}&limit=10", kgf_server::url::encode_value("_:g"));
+    for representation in [
+        Representation::Turtle,
+        Representation::NQuads,
+        Representation::TriG,
+        Representation::JsonLd,
+    ] {
+        let body = served.render(&store, "fragment", &query, representation);
+        assert!(
+            !body.contains("http://example.org/a"),
+            "{representation:?} carries no statement: {body}"
+        );
+    }
+}
+
+/// The published names of a bundle's graphs, less the fixtures' ordinary ones.
+fn blank_graph_names(served: &Served, store: &Store) -> Vec<String> {
+    let request =
+        request::GraphList::parse(&params(""), served.limits(), &served.release().binding())
+            .expect("a listing");
+    let listing = json(
+        answer::graphs_list(store, served.target("graphs", ""), &request).expect("a listing"),
+        Representation::Json,
+    );
+    listing["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| dictionary_spelling(&entry["g"]))
+        .filter(|name| name != UNNAMED && name != G1)
+        .collect()
+}
+
+/// The quad view's cursor carries how many of a triple's memberships the last
+/// page delivered. A trailer past the end of that run would silently drop the
+/// rest of the triple, so it is refused rather than clamped.
+#[test]
+fn a_forged_membership_trailer_is_stale() {
+    use kgf_server::cursor::{Cursor, PositionSpace};
+
+    let served = Served::quads();
+    let store = served.store();
+    let request = served.parse_fragment("g=*&limit=1");
+    // Three triples, so position 2 is the last one: a trailer past its
+    // memberships leaves the enumeration with no row to check at all, which is
+    // the case that pages an empty answer and calls it complete.
+    for position in [0, 1, 2] {
+        let mut cursor = Cursor::at(&request.binding, PositionSpace::Spo, position);
+        cursor.scan_position = Some(5);
+        let problem = served
+            .try_fragment(&store, &format!("g=*&limit=1&cursor={}", cursor.encode()))
+            .expect_err("a trailer past this triple's memberships must be stale");
+        assert_eq!(
+            problem.code().as_str(),
+            "stale_cursor",
+            "position {position}"
+        );
+    }
+
+    // The same in a bindings walk, where a phase that ends early would
+    // otherwise carry on into the next input row's phase.
+    let body = serde_json::json!({
+        "pattern": {"s": "?s", "p": "?p", "o": "?o"},
+        "bindings": {"vars": ["?s"], "rows": [["ex:a"], ["ex:x"]]},
+        "g": "*",
+        "limit": 1,
+    });
+    let parsed = served.parse_binding_fragment(&body);
+    let mut cursor = Cursor::at(&parsed.binding, PositionSpace::Spo, 1);
+    cursor.binding_index = Some(0);
+    cursor.scan_position = Some(4);
+    let mut forged = body.clone();
+    forged["cursor"] = serde_json::json!(cursor.encode().as_str());
+    let problem = served
+        .try_binding_fragment(&store, &forged)
+        .expect_err("a forged trailer in a bindings phase must be stale");
+    assert_eq!(problem.code().as_str(), "stale_cursor");
+
+    // A trailer that names a run this triple really has still resumes it.
+    let mut cursor = Cursor::at(&request.binding, PositionSpace::Spo, 2);
+    cursor.scan_position = Some(1);
+    let page = served.fragment(&store, &format!("g=*&limit=5&cursor={}", cursor.encode()));
+    assert_eq!(rows(&page).len(), 1, "{page}");
+}
+
+/// The bindings operations scope every input row the same way.
+#[test]
+fn bindings_scope_every_row() {
+    let served = Served::quads();
+    let store = served.store();
+    let body = serde_json::json!({
+        "pattern": {"s": "?s", "p": "ex:b", "o": "?o"},
+        "bindings": {"vars": ["?s"], "rows": [["ex:a"], ["ex:x"]]},
+        "g": format!("<{G1}>"),
+        "limit": 100,
+    });
+    let counts = served.binding_count(&store, &body);
+    assert_eq!(counts["g"], format!("<{G1}>"));
+    assert_eq!(counts["counts"][0]["count"]["value"], 1);
+    assert_eq!(counts["counts"][1]["count"]["value"], 0);
+
+    let page = served.binding_fragment(&store, &body);
+    assert_eq!(page["cardinality"]["value"], 1);
+    assert_eq!(
+        rows(&page),
+        vec![vec!["http://example.org/a", "http://example.org/c"]]
+    );
+
+    // An empty `g` in a body selects this operation's default, as an empty
+    // query parameter does: a form sends the field it has, blank or not.
+    let mut blank = body.clone();
+    blank["g"] = serde_json::json!("");
+    let page = served.binding_fragment(&store, &blank);
+    assert!(page["g"].is_null(), "{page}");
+    assert_eq!(
+        page["cardinality"]["value"], 2,
+        "the union of both rows, not a refusal"
+    );
+
+    let mut quads = body.clone();
+    quads["g"] = serde_json::json!("*");
+    let page = served.binding_fragment(&store, &quads);
+    assert_eq!(page["vars"], serde_json::json!(["s", "o", "g"]));
+    assert_eq!(page["cardinality"]["value"], 3);
+    assert_eq!(
+        rows(&page),
+        vec![
+            vec!["http://example.org/a", "http://example.org/c", UNNAMED],
+            vec!["http://example.org/a", "http://example.org/c", G1],
+            vec!["http://example.org/a", "http://example.org/d", UNNAMED],
+        ]
+    );
+}
+
+/// The two reserved names are answerable on a bundle with no memberships at
+/// all: such a bundle's triples are all unnamed, so both select everything.
+#[test]
+fn the_reserved_names_are_answerable_without_memberships() {
+    let served = Served::new();
+    let store = served.store();
+    let total = served.count(&store, "")["count"]["value"].as_u64().unwrap();
+    assert!(total > 0);
+    for scope in [g(UNION), g(UNNAMED)] {
+        assert_eq!(
+            served.count(&store, &scope)["count"]["value"],
+            total,
+            "{scope}"
+        );
+        let page = served.fragment(&store, &format!("{scope}&limit=100"));
+        assert_eq!(page["cardinality"]["value"], total, "{scope}");
+        assert_eq!(page["vars"], serde_json::json!(["s", "p", "o"]));
+    }
+}
+
+/// `g` and `o.text` do not combine in this build, and the request says so
+/// rather than answering from the union.
+#[test]
+fn a_graph_scope_beside_a_text_constraint_is_refused() {
+    let served = Served::with_text();
+    let problem = request::Fragment::parse(
+        &params(&format!("o.text=alice&{}", g(UNNAMED))),
+        served.limits(),
+        served.release().prefixes(),
+        &served.release().binding(),
+    )
+    .expect_err("the combination is refused");
+    assert_eq!(problem.code().as_str(), "malformed_request");
+    // The union, however spelled, is no scope at all.
+    request::Count::parse(
+        &params(&format!("o.text=alice&{}", g(UNION))),
+        served.limits(),
+        served.release().prefixes(),
+        &served.release().binding(),
+    )
+    .expect("the union constant is no scope");
+}
+
+/// The page representation shows the graph column and links each graph to
+/// the same pattern scoped to it.
+#[test]
+fn a_quad_view_page_shows_its_graph_column() {
+    let served = Served::quads();
+    let store = served.store();
+    let request = served.parse_fragment("g=*&limit=100");
+    let rendered = answer::fragment(&store, served.target("fragment", "g=*&limit=100"), &request)
+        .expect("an answer")
+        .render(Representation::Html)
+        .expect("render a page");
+    let page = String::from_utf8(rendered.body.to_vec()).unwrap();
+    assert!(page.contains("<th>g</th>"), "the table has a graph column");
+    assert!(page.contains(UNNAMED), "unnamed rows carry the constant");
+    assert!(
+        page.contains(&format!(
+            "g={}",
+            kgf_server::url::encode_value(&format!("<{G1}>"))
+        )),
+        "a graph links to the pattern scoped to it"
+    );
+}
+
+/// `/graphs` lists the unnamed graph under its constant and every named graph
+/// with its count, pages by graph id, and is absent where there is nothing
+/// to list.
+#[test]
+fn the_graph_listing_pages_every_graph_with_its_count() {
+    let served = Served::quads();
+    let store = served.store();
+    let list = |query: &str| -> serde_json::Value {
+        let request =
+            request::GraphList::parse(&params(query), served.limits(), &served.release().binding())
+                .unwrap_or_else(|error| panic!("GET /graphs?{query}: {error}"));
+        json(
+            answer::graphs_list(&store, served.target("graphs", query), &request)
+                .unwrap_or_else(|error| panic!("GET /graphs?{query}: {error}")),
+            Representation::Json,
+        )
+    };
+
+    let whole = list("");
+    assert_eq!(whole["triples"], 3);
+    assert_eq!(whole["memberships"], 5);
+    assert_eq!(
+        whole["cardinality"],
+        serde_json::json!({"value": 3, "exact": true})
+    );
+    assert_eq!(whole["complete"], true);
+    let listed: Vec<(String, u64)> = whole["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                dictionary_spelling(&entry["g"]),
+                entry["count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            (UNNAMED.to_owned(), 2),
+            (G1.to_owned(), 2),
+            (G2.to_owned(), 1),
+        ]
+    );
+
+    // One per page, resumed from each cursor, reproduces the listing.
+    let mut collected = Vec::new();
+    let mut query = "limit=1".to_owned();
+    loop {
+        let page = list(&query);
+        assert_eq!(page["cardinality"]["value"], 3);
+        for entry in page["graphs"].as_array().unwrap() {
+            collected.push(dictionary_spelling(&entry["g"]));
+        }
+        match page["next"].as_str() {
+            Some(next) => query = format!("limit=1&cursor={next}"),
+            None => break,
+        }
+    }
+    assert_eq!(collected, vec![UNNAMED, G1, G2]);
+
+    // The page: every graph links to its own triples.
+    let request =
+        request::GraphList::parse(&params(""), served.limits(), &served.release().binding())
+            .unwrap();
+    let page = answer::graphs_list(&store, served.target("graphs", ""), &request)
+        .unwrap()
+        .render(Representation::Html)
+        .unwrap();
+    let page = String::from_utf8(page.body.to_vec()).unwrap();
+    assert!(page.contains(&g(G1)), "{page}");
+    assert!(page.contains(&g(UNNAMED)), "{page}");
+
+    // A bundle whose every statement is named lists no unnamed graph.
+    let named_only = Served::from_fixture(Fixture::build_quads(kgf_store::testing::TINY_NQ));
+    let store = named_only.store();
+    let request = request::GraphList::parse(
+        &params(""),
+        named_only.limits(),
+        &named_only.release().binding(),
+    )
+    .unwrap();
+    let listing = json(
+        answer::graphs_list(&store, named_only.target("graphs", ""), &request).unwrap(),
+        Representation::Json,
+    );
+    assert_eq!(listing["cardinality"]["value"], 2);
+    assert!(
+        listing["graphs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["g"]["value"] != UNNAMED),
+        "{listing}"
+    );
+}
+
 /// Every term of a role, plus the variable.
 fn options(terms: &Terms, role: Role) -> Vec<Option<usize>> {
     std::iter::once(None)
@@ -2593,6 +3501,7 @@ fn access_operation(operation: &str) -> AccessOperation {
         "sample" => AccessOperation::Sample,
         "search" => AccessOperation::Search,
         "terms" => AccessOperation::Terms,
+        "graphs" => AccessOperation::Graphs,
         "schema" => AccessOperation::Schema,
         "void" => AccessOperation::Void,
         "summary" => AccessOperation::Summary,

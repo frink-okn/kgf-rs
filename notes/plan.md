@@ -2090,6 +2090,461 @@ request-layer test that the largest permitted prefix is accepted and one byte mo
 `cap_exceeded`, the capability-gate pair rewritten around a `terms` that is no longer
 declared, and the two stress bundles above driven through a real listener.
 
+### 30. Named graphs — the `graphs` capability
+
+**Planned 2026-09-16.** [`graphs.md`](graphs.md) is the read contract this unit meets;
+what follows is the order the work lands in, and the decisions each step had to make
+that the contract left to the implementation. hdtc already builds everything: `hdtc
+create --mode quads --graphs-index` writes `data.hdt.graphs` and `data.hdt.graphs.idx`,
+and `hdtc void --graph-view dataset` describes every graph as a `void:subset`. What was
+missing was on this side: the store never read the two artifacts it binding-checked,
+`g=` answered 501 from `NOT_OFFERED`, and `kgf build` could only make a triples bundle.
+
+The steps, each a commit reviewed on its own:
+
+1. **hdtc façade** (`../hdtc`, branch `graphs-facade`). A mapped reader needs the
+   sidecar's header and the index's typed section directory the way it already gets the
+   permutation index's, plus parsers for the three fixed-size records it must address
+   lazily — the 96-byte layer entry, the 48-byte chunk entry, and the 160-byte
+   Elias–Fano header — because a bundle may carry thousands of graphs and reading every
+   layer entry at open would make opening proportional to `G`. Nothing else is shared:
+   hdtc's seek-based `GraphSidecarReader` is its CLI's, as `PermutationIndex::triples`
+   is.
+2. **`rank::select0`.** Elias–Fano rank needs the position of the `h`-th zero of the
+   upper bitmap, over the same two-level directory `select1` walks.
+3. **`kgf-store::graphs`.** The mapped sidecar and index: header facts, the graph
+   dictionary as one more PFC section, one layer-set reader parameterised by which file
+   and which position space, and the three layer encodings behind one `Layer` API —
+   `count`, `rank`, `select`, `access`, `next_member` — each returning `Result` because
+   the chunk directories and Elias–Fano headers are validated on first touch rather than
+   at open. `graphs_of` and `memberships` read the transpose when the index carries it
+   and probe or sum the layers otherwise; that is one algorithm choosing on cost between
+   two structures the format defines as equivalent, not a fallback for a missing
+   artifact. `Store::open` requires the index to carry **both** POS and OPS layer sets,
+   naming `hdtc graphs-index` otherwise, and refuses a sidecar whose dictionary holds
+   either reserved IRI. Differential tests against `hdtc search`'s four-position
+   patterns and a naive oracle over every layer of a synthetic bundle wide enough to
+   produce all three encodings.
+4. **Scoped and quad-view selections.** `Selection::in_graph` and
+   `Selection::memberships` over all eight patterns in each pattern's native position
+   space: scoped counts are two ranks, scoped pages are `select`-driven, `s ? o` filters
+   its bounded probe by `access`; the quad view yields one row per membership in
+   position order then ascending graph id, counting by rank differences summed over the
+   layers or by the transpose. Cursors keep their existing spaces — the request binding
+   already carries `g` — and the quad view reuses the token's trailer for "memberships
+   of this triple already delivered", so a page may end inside one triple's graphs in
+   any space, the predicate space included.
+5. **`g=` on `/fragment` and `/count`**, GET and bindings bodies alike: the four forms,
+   the two constants accepted on every release, `g=<G>` and `g=*` gated on the
+   capability before the open, the `g` column and `vars` entry in the quad view, the
+   forms and answer pages, the access-log shape. The worked example of `graphs.md` as a
+   fixture, every count in both of its tables.
+6. **`GET /graphs`**: every named graph with its layer count, the unnamed graph under
+   its constant when non-empty, paged by graph id; the descriptor link and the manifest
+   page row.
+7. **`/tpf`**: the `graph` parameter in `ExplicitRepresentation`, the four-mapping Hydra
+   form with `sd:graph`, the blank-node `sd:defaultDataset [ sd:defaultGraph
+   <urn:x-kgf:union> ]` declaration, the per-row tagging rule of the serving table, and
+   the refusal of the quad view in Turtle. The Comunica harness gains the `GRAPH` cases.
+8. **`kgf build`**: `contents.graphs.enabled` selects `--mode quads --graphs-index` for
+   RDF input and, for an HDT input, requires and adopts the sidecar beside it and builds
+   the index; the reserved IRIs are refused before anything is published.
+9. **Per-graph statistics**: `hdtc void --graph-view dataset` on a graphs bundle, each
+   subset projected into `graph:<name>` views of the three TSVs beside `design` and
+   `queryable`, a `graphs` section in the summary, `StatsView::Graph` in the store, and
+   `g=` on `/schema` to select one.
+10. **Notes**: this unit's *What landed*, `graphs.md`'s status, and the questions for
+    `../kgf` the work raised.
+
+**What landed (2026-09-17).** All ten steps, in that order, each reviewed on its own.
+The contract in [`graphs.md`](graphs.md) held, with four amendments the code forced.
+
+**The union is untagged, always.** The contract had `g=<urn:x-kgf:union>` tag every
+statement with the constant, measured on an implementation whose fixture fit one page.
+It does not survive paging. Comunica 5.3.0 hands only a fragment's *first* page to its
+QPF source, whose filter honours the page's `sd:defaultGraph` declaration; every later
+page is identified as a plain RDF document and matched against the pattern's literal
+graph term, which knows nothing of the declaration. Tagged union rows therefore vanish
+from the second page on: a bare `?s ?p ?o` over one-row pages read one triple of three.
+Untagged rows page to the end, so the union is the document's default graph whether the
+request named the constant or left `graph` out. The cost is that stock Comunica reads
+nothing through an explicit `GRAPH <urn:x-kgf:union>`; that idiom belongs to this API
+and to a KGF-aware source, where the union is the default graph. The bare pattern is
+the query every client sends, and it is the one that must work.
+
+**A graph is a description view, not a second kind of description.** The plan said
+`g=` on `/schema`; what landed is `view=graph:<IRI>`, beside `design`, `queryable` and
+`component:<id>`. A graph and a component are on the same axis — both name a subset of
+the published triples, and the analysis expresses both as a `void:subset` — so the
+parameter that already chooses a subset is the one to extend. It also keeps `/schema`
+from having to explain what `g=*` would mean there. The grammar for these names now
+lives in `StatsView` alone: the manifest validates a name by parsing it, a mapped
+bundle parses it the same way, and a request is checked against it, so the three cannot
+drift. The build parses every name it emits for the same reason, and lays the views out
+in the order a mapped bundle walks them, which a reader requires.
+
+**`contents.graphs` is tri-state.** Whether a bundle carries memberships depends on the
+input, which neither `true` nor `false` can express. Omitted follows the input; `false`
+drops a quad source's graphs into the union deliberately; `true` refuses an HDT that
+arrives without a sidecar. `transpose` is the same shape: the quad view's `g` column
+costs one lookup per row with the transpose and one probe per graph without, while the
+transpose's size grows with the memberships it copies, so an unset value reads the
+graph count out of the sidecar the build just wrote and takes it above 32.
+
+**The reserved names are refused by running the runtime check.** `graphs.md` said no
+runtime check would be needed because the build refuses them. The build refuses them
+*with* that check: it opens the staged bundle as a server would, as soon as the two
+artifacts exist and before the text index, the sketches, the key sets and the
+description set. Refusing at parse time would be cheaper and needs hdtc to know these
+names, which is question 78 below rather than a table to duplicate here.
+
+Two bugs worth recording because both are the same shape — a check that cannot fire.
+The quad view's cursor carries how many of a triple's memberships the last page
+delivered, and comparing that against the first row the enumeration produced misses the
+forged trailer that produces *no* first row, which is what a trailer past the last
+triple's run does: the page came back empty and called itself complete. And `--adopt`
+released the caller's sidecar whether or not the bundle had taken it, so a build that
+deliberately dropped the graphs deleted the only copy of them. Neither was reachable
+from a passing test until one was written for it.
+
+*Verified by* the worked example of `graphs.md` as a fixture — every count in both of
+its tables, on every representation — differential tests against `hdtc search`'s
+four-position patterns and a naive oracle over a synthetic bundle wide enough to
+produce all three layer encodings, exhaustive paging of every form of `g` and `graph`
+at adversarial page sizes, forged cursors at every position and inside a bindings
+phase, a blank-node graph fixture, stock Comunica 5.3.0 as both a `qpf` and a `brtpf`
+source against one-row pages, and a bundle assembled by `kgf build` and served, which
+is the only test that can catch the build and the server disagreeing about what a view
+is called.
+
+**After review (2026-09-18): one IRI per node, and a design view that means what it
+says.** A blank graph name that is also a subject is now published under the
+subject's IRI, and a graph-only blank name is scoped by the membership sidecar's
+digest, which the graph index records and `kgf manifest` now checks against the
+sidecar it hashes anyway (question 77). The design view is its component's own subset,
+and publication verifies that rather than the proxy it checked before — that a bundle
+with component views never aliased `design` to `queryable` — which refused a bundle
+declaring only a derived component, where the dataset itself is the only design view
+there is. The converse was silent: a design component whose graph went undescribed,
+by `contents.graphs.describe: false` or by the graph-count threshold, got the union
+under its name. It is now refused, at `--check-config` when the config says so and
+as soon as the sidecar is read otherwise. Per-graph statistics declare
+`data.hdt.graphs` as a parent of `stats/void.hdt`, so regenerating a manifest over a
+replaced sidecar is refused. And `g=_:g` in an RDF syntax answers its empty page
+rather than a 500: the graph tag is built only when a statement needs it.
+
+**Several sources (2026-09-22): the design view is the dataset.** The build refused a
+config declaring more than one `role: source` component without `design:`, because
+the design doc had no rule for it. KnowWhereGraph is that shape: each of its bundles
+clumps several KWG source subgraphs, one component each, and none of them is the
+dataset. The rule is now the one a derived-only declaration already had: no component
+is canonical, so `design` aliases `queryable` at the dataset root. The store's
+`design_component` already answered `None` there, and the description set and
+publication check already handled it, so only the build's refusal went. Nominating one
+source stays available for a publisher who wants that part on the card. Doc 04 now
+states the rule.
+
+### 31. Whole-dataset downloads — `/export`
+
+**Planned 2026-09-28.** Doc 03 §3.4.11 reserves `GET /export/data.hdt` "(Range requests
+supported)" and says nothing more about the response. The aim here is a download surface
+as dependable as a well-configured static file server: resumable after any
+interruption, verifiable end to end after a resume, cacheable by anything between the
+server and the client, and identical on every mirror serving the same bundle. Then
+N-Triples generated from the HDT, with the same properties. Three steps:
+
+1. **`/export/data.hdt`.** Static-file semantics over the mapped, publication-verified
+   HDT:
+   - *Validators.* A strong `ETag` that is the artifact's own SHA-256 from the manifest,
+     `"sha256:{hex}"`. Unlike every other validator here it does not mix in the
+     deployment digest: the bytes do not depend on the deployment, so two servers — or a
+     server and a mirror — publishing one bundle agree on the tag, and a client may
+     resume from either. `Last-Modified` is the manifest's `created`.
+   - *Ranges.* `Accept-Ranges: bytes`. One satisfiable range is a `206` with
+     `Content-Range`; several are coalesced and served as `multipart/byteranges` up to a
+     part cap, beyond which the request is refused with `416`, as RFC 9110 §14.2 allows
+     for many small ranges. None satisfiable is `416` carrying `Content-Range: bytes
+     */{len}`. A syntactically invalid `Range` is ignored, as the RFC requires; `HEAD`
+     never ranges.
+   - *Preconditions,* in RFC 9110 §13.2.2's order: `If-Match` then
+     `If-Unmodified-Since` can answer `412`; `If-None-Match` then `If-Modified-Since`
+     can answer `304`; `If-Range` — strong comparison, or an exact date — decides
+     whether a range is honoured or the full `200` is sent.
+   - *Integrity.* `Repr-Digest: sha-256=:{base64}:` (RFC 9530) on every identity
+     response, `206` included: it digests the whole representation, so it is exactly
+     what a client that assembled a file from several transfers checks it against.
+   - *Caching and naming.* `Cache-Control: public, max-age=31536000, immutable,
+     no-transform` — `no-transform` because an intermediary that re-encodes the bytes
+     invalidates both the ranges and the digest. `Content-Disposition: attachment;
+     filename="{dataset}-{version}.hdt"`, so a saved file names the version it holds.
+   - *Transfer compression* (revised after the second review, below). A full-body
+     response negotiates `zstd` or `gzip` from `Accept-Encoding`, but identity wins a
+     tie, so only a client weighting a coding above identity gets one; a honoured range,
+     and a request asserting `If-Match` or `If-Unmodified-Since`, are always identity.
+     Measured on the demo corpus, gzip takes an HDT to 20–59% of its size. A compressed
+     response carries a weak `ETag`, and no `Content-Length`, `Accept-Ranges`, or
+     `Repr-Digest`, because its bytes are not known before they are produced. A client
+     that decodes as it stores holds identity bytes, so its file length is an identity
+     offset and a `curl -C` resume works; a browser does not resume a coded download at
+     all, which is why identity is the default. The export negotiates and encodes for
+     itself, sets its own `Vary: Accept-Encoding`, and is mounted outside the global
+     compression layer and the middleware that weakens every other `ETag`: that
+     middleware's rule is right for resources nothing ranges over, and would make
+     `If-Range` unusable here.
+   - *Capacity.* A download is long-lived, so it must not hold the query admission gate
+     for its duration. It takes a slot from a separate, smaller gate
+     (`--max-concurrent-downloads`) for the life of its body, and a full gate answers
+     `429` with `Retry-After`. `HEAD`, `304`, `412`, and `416` take no slot. The body
+     reads, and compresses, one chunk at a time on the blocking pool, so a client that
+     stops reading holds its slot but no thread.
+2. **A block index, and `/export/data.nt` — `data.nq` for a bundle with graphs.** A
+   byte offset into generated N-Triples can be mapped back to a triple only by an index
+   built ahead of time. `kgf build` writes one (a new hdtc-owned format): per block of
+   about 1 MiB, cut at a triple boundary, the block's first triple and its byte offset,
+   plus the stream's total length and SHA-256. A request then costs `O(log B)` to find
+   its block and at most one block's serialization to reach its offset — a cost-table
+   row. Build and server must produce identical bytes, so hdtc's N-Triples writer is
+   exported through the façade and used by both: `hdtc dump data.hdt | sha256sum` then
+   equals `/export/data.nt`'s `Repr-Digest`, and anyone can check the dump against the
+   HDT alone. The server verifies each block it renders against the index and drops
+   the connection rather than send bytes that disagree. Blank nodes are the stored
+   labels, as `hdtc dump` writes them, so the HDT and N-Triples downloads carry one
+   graph. `data.nq` enumerates in SPO order, then graph id, through the transpose. The
+   same compression negotiation applies.
+3. **Discovery.** An `/export` listing with JSON and HTML: sizes, digests, and prefilled
+   commands, including the resumable compress-as-you-store recipe below. `void:dataDump`
+   and a DCAT distribution in `/void`, so standard linked-data tooling finds the
+   downloads.
+
+**No pre-compressed `.nt.gz`.** One was designed — a gzip member per index block, which
+is a valid gzip file, decodable in parallel, and range-addressable by block. Its length
+and offsets would have to be fixed at build time, which makes serving depend on the
+compressor producing the identical bytes it produced for the build: pinned versions,
+per-member verification, and a rebuild whenever a dependency moves. Transfer compression
+gives most of the benefit with no persisted state. What it loses is compressed resumes
+and a `Content-Length` on compressed responses, and a curl user who wants a compressed
+file on disk can get one resumably from the client side:
+
+```bash
+curl --compressed -fSL "$url" | (trap '' INT; exec gzip) > "$file"
+curl --compressed -fSL -C $(gzip -dc "$file" | wc -c) "$url" | (trap '' INT; exec gzip) >> "$file"
+```
+
+A dropped connection ends curl cleanly, so gzip writes its trailer and the file is
+valid; the resume appends a second gzip member, which every gzip reader concatenates;
+`-f` keeps an error body out of the data; and `trap '' INT` keeps Ctrl-C from
+truncating the last member. Tested against a range server that drops the connection
+mid-body, and with SIGINT delivered to the pipeline's process group.
+
+**`Transfer-Encoding: gzip` is not used.** It is the textbook fit — the wire compressed
+while ranges and validators stay on identity bytes — but HTTP/2 and HTTP/3 forbid
+transfer codings, browsers never request one, and the gateway in front of this service
+would not carry one through.
+
+**A file resource has one representation.** Every other route answers HTML to a
+browser. A browser navigating to `data.hdt` must get the file, so the export routes are
+the stated exception; their page is the listing (step 3), and the manifest page links
+the download meanwhile.
+
+**The manifest's `export` capability stays undeclared.** `data.hdt` is required, so the
+route is never gated (rule 8), and the release links advertise it unconditionally. Doc
+03 defines `export` as a list of artifacts this build does not all serve, and declaring
+a capability commits to its whole contract (question 81).
+
+**Operational.** The GKE gateway's backend timeout bounds a whole response, 30 s by
+default, so a large download needs a `GCPBackendPolicy` raising it. `latest` redirects
+make a resume across a release dangerous for clients that resume without `If-Range` —
+`curl -C -` and `wget -c` among them — so documentation and links name versioned URLs,
+and the version in the saved filename and the digest catch a splice after the fact.
+
+**What landed — step 1 (2026-09-28).** `GET|HEAD /{dataset}/v/{version}/export/data.hdt`,
+in `kgf-server::export`, with the decisions the plan left open:
+
+- *The manifest must identify `data.hdt`.* Its size and SHA-256 are read into the
+  release at startup, and a manifest without them — or with a checksum that is not 64
+  lowercase hex digits — stops the server, naming `kgf manifest`. Every validator,
+  length, and digest a download sends is then fixed before any request, and no request
+  hashes a file. Before streaming, the mapping's length is checked against the
+  manifest's, which is the one disagreement detectable without reading the file.
+- *Ranges.* Parsing and resolving are separate, because an unparseable header is
+  ignored while a parseable one naming nothing is a `416`. Spans are sorted and merged
+  when they overlap or sit within 128 bytes — about a part's framing — so a multipart
+  response lists parts ascending rather than in request order; more than 32 parts after
+  merging, or more than 256 specs, is `416`. The multipart boundary is derived from the
+  artifact's digest.
+- *`If-Range` by date accepts a date at or after `Last-Modified`,* which is `headers`'
+  reading rather than RFC 9110's exact match. At a versioned URL any such date names the
+  same bytes, so the leniency cannot splice.
+- *A compressed response states no date.* `Last-Modified` is the identity bytes', so a
+  coded response omits it and the date preconditions do not bind it — the strong and
+  weak tags carry revalidation. A compressed `HEAD` has no `Content-Length`, which took
+  an empty body with an unknown size: an empty body of exact size zero has the router
+  write `Content-Length: 0` into the `HEAD`.
+- *Levels.* zstd 3, its library default, and gzip 6 at first — gzip is now 1 (below). On
+  `climatemodelskg` the HDT goes from 26.4 MB to 12.2 MB with zstd and 12.9 MB with
+  gzip; zstd's frame records the content size and an XXH64 checksum. Neither level has
+  been measured under concurrent load in a release build, which is where to revisit
+  them.
+- *The gate.* `--max-concurrent-downloads`, default 16, refusing at once with
+  `Retry-After: 30` rather than queueing; per client, see below. A `HEAD`, a `304`, a
+  `412`, and a `416` take no slot, and neither does anything decided before the open.
+- *Discovery.* The release links carry `hdt` unconditionally, and the manifest page has
+  a download panel with the resumable `curl` command and the digest to check.
+- *`range_not_satisfiable` (416)* joins the error codes, beside `precondition_failed`
+  (question 84).
+
+*Verified by* unit tests of the range grammar — including an exhaustive check that
+the served spans cover every requested byte and nothing outside the artifact — of the
+`Accept-Encoding` weights against what real clients send, of every precondition in
+RFC 9110's order, and of encoder draining; and end to end over a socket: whole, `HEAD`,
+every range form, `If-Range` both ways, multipart parsed back into its parts, `416`,
+`304`, `412`, both codings decoded back to the file, a compressed `HEAD`, and a
+download the compression layer would otherwise have gzipped. Against the demo corpus
+with stock `curl`: a download verified by `shasum`, a truncated file resumed with `-C -`,
+and a `--compressed` download truncated and resumed to the identical file.
+
+**Per-client download limit (2026-09-28).** The deployment-wide gate alone is first come,
+first served: a parallel downloader asking for sixteen ranges at once, or a handful of
+clients that stop reading, holds every slot there is. `--max-downloads-per-client`,
+default 4, bounds what one client holds, which does more against both than a stall
+timeout would — a client reading a trickle makes progress and would keep its slot
+under any timeout. Decisions:
+
+- *A client is the access log's client.* The address the trusted forwarding chain
+  reports, else the peer — the same reading of `X-Forwarded-For` as the record's
+  `forwarded_hash`, now shared as `access::client_address`. An entry that is not an
+  address falls back to the peer rather than keying on a string a caller chose. The
+  cost is that the limit is only as right as `--trusted-proxies`: counted from the wrong
+  hop, every client is the gateway and the per-client limit becomes the deployment's.
+  The GKE deployment's setting of 2 has not yet been confirmed against real traffic.
+- *An IPv6 client is its /64.* Temporary addressing gives one host many addresses in
+  its /64, and keyed on the full address a client could open a download per address.
+  An IPv4 address can be a whole NAT, which is the price of counting by address.
+- *The client's own limit is checked first,* so a client at its limit is told so rather
+  than that the server is busy. A request with no peer address — only possible for an
+  embedder serving without connection info — counts against the deployment's limit only;
+  one shared bucket for all of them would make the per-client limit global.
+- *A lock, off every read path.* The per-client counts are a mutex-guarded map, taken
+  when a download is admitted and when its body is dropped, never per chunk; it holds
+  only clients with a download in progress, so it never outgrows the slot count.
+
+*Verified by* a stalled download over a real socket: 32 MB of incompressible literals,
+more than the loopback buffers hold, read to the end of its headers and then left. The
+same client is refused with the per-client message, another client downloads, a `HEAD`
+from the stalled client is still answered, and the slot comes back once the stalled
+connection closes.
+
+**After review (2026-09-28): two findings, both fixed.**
+
+- *The route ignored its query.* `?g=<G>` and `?g=*` were answered with the union —
+  a `206` of union bytes where `/count` answers 501 — which is the silently dropped
+  filter every other operation refuses. Doc 03 §3.7 lists `g` on `export`, so it is
+  now parsed like `/fragment`'s and refused, as `capability_not_available`, unless the
+  scope is what the artifact holds: absent or the union's name, or the unnamed graph's
+  name on a release without memberships, whose triples are all unnamed. Every other
+  parameter is `malformed_request`. Both are decided before any precondition, since a
+  `304` or a `206` for such a query would pass the union off as what was asked.
+- *A cancelled download released its slot early.* The body held the slot while the
+  blocking task held the producer, so a client that went away mid-chunk freed its slot
+  while that chunk's read and compression carried on — cancelling and retrying could
+  put more work in flight than either limit admits. `blocking()` already keeps its
+  capacity inside the task for exactly this reason; the slot now travels with the
+  producer the same way. The body reads through a small `Source` trait rather than a
+  `Store`, which is what lets the unit test queue a chunk behind an occupied blocking
+  thread, drop the body, and see the slot still held — and it fails against the old
+  ownership.
+
+**After a second review (2026-09-29).** Fourteen findings over both commits; twelve
+fixed, two recorded below as open.
+
+- *A compressed download could not be resumed, and every client got one.* Browsers,
+  `requests`, Go, and `curl --compressed` all send `Accept-Encoding` by default at equal
+  weight, and the server preferred compression on a tie, so the ordinary download of the
+  manifest page's link had no size, no progress, and no resume — a restart from zero
+  after any interruption, against a gateway that cut responses at 30 s. Identity now
+  wins a tie: a coding is chosen only when the client weights it above identity
+  (`zstd, identity;q=0.5`). HDT compresses by about half, so the default gives up little
+  to be resumable; N-Triples, at about a tenth, may want the other rule, and that is a
+  decision for step 2.
+- *`If-Match` failed on an unchanged artifact when compression was negotiated,* because
+  it compares strongly and a coded body's tag is weak; `If-Unmodified-Since` was not
+  evaluated at all against a coded body, which states no date. A request carrying
+  either is now answered from the identity bytes, as a range is — which keeps RFC 9110's
+  comparison against the selected representation and chooses the one the client's
+  assertion is about.
+- *The gateway cut every response at 30 s.* `deploy/gke/backendpolicy.yaml` raises the
+  backend-service timeout to an hour; Google documents it as bounding the whole
+  response, first request byte to last response byte, with an effective maximum of a
+  day. A download longer than that resumes by range, and the bound also caps how long a
+  stalled client holds a slot.
+- *Coded chunks burned CPU outside the work gate.* Each chunk, identity or coded, now
+  takes one ordinary unit of the query work gate for the few milliseconds it runs,
+  waiting without a deadline — refusing the next chunk of an admitted transfer would
+  only cut it. That bounds a transfer's page faults and compression by the same
+  published figure as a query's, and gzip drops to level 1 for the reason the API's own
+  compression does; a coded chunk is encoded straight from the mapping, without the
+  copy the identity path needs to hand hyper a buffer it owns.
+- *The download special-cased two global layers.* The export route is now its own
+  router carrying the shared layers — body limits, problem rendering, CORS, access
+  records — merged beside the API's, whose stack adds compression and the
+  ETag-weakening middleware. Neither layer knows downloads exist, and the marker both
+  checked is gone.
+- *The manifest page's commands doubled the mount prefix,* in the new download panel
+  and the older operations panel alike: `$KGF` is the base URL with its prefix, as the
+  service page defines it, and the paths after it were mounted. The download table now
+  reads the release's parsed identity — the digest the `ETag` carries — rather than
+  re-reading the manifest's text.
+- *Multipart parts go out in request order,* as RFC 9110 §15.3.7.2 asks, a merged part
+  taking the place of the earliest spec it absorbed.
+- *Smaller.* Validators and `Repr-Digest` are built once at startup rather than per
+  request; one lowercase-hex helper replaces three; and a 404's list of resources under
+  a version gained `terms`, `graphs`, and `export/data.hdt`, with a test that every
+  versioned operation appears in it.
+
+**Still open from step 1.**
+
+- *Stalled clients.* A client that stops reading still holds its slot — one of its own
+  few rather than one of everyone's — until TCP gives up on it or the gateway's backend
+  timeout ends the response. A write-progress timeout on the connection would release it
+  sooner; it needs a listener wrapping the socket, and `axum` implements its
+  client-address extractor only for its own listener types, so the access log would need
+  a connect-info type of its own.
+- *Whether a transfer finished.* The access record is emitted when the response's
+  headers are produced, so for a download it cannot say whether the transfer finished
+  or how much of it was sent.
+- *Trusting `X-Forwarded-For` by position.* With `--trusted-proxies` set, the client is
+  read from the chain whatever the peer, so a caller that reaches the pod without the
+  gateway — which, behind a ClusterIP Service, means from inside the cluster — can be
+  counted as another client, exhausting its download slots or evading its own. Trusting
+  the header only when the peer is in a configured proxy network (the gateway's
+  proxy-only subnet) closes it; that is a new setting, and it matters equally to the
+  access log's pseudonyms.
+- *Page-cache pressure.* A download reads the artifact through the mapping queries use,
+  so a multi-gigabyte transfer faults every page of it into the pod's page cache and can
+  push other bundles' hot index pages out. Reading downloads with `pread` and dropping
+  the pages behind (`posix_fadvise(DONTNEED)`) would avoid it, at the cost of a second
+  read path. Worth measuring on the largest bundles before building.
+
+### 32. The human view, revisited — an idea
+
+**Noted 2026-09-29; not yet planned.** Unit 18 made the HTML a browser workbench, and
+every route since has added its page to that frame one at a time. The idea is to
+reconsider the human view as a whole — what a visitor arriving at the catalog, a
+dataset, or a release is there to do, and whether the pages lead them to it —
+rather than patch each page as a feature lands.
+
+The first concrete gap is the one that prompted the note: unit 31's download is
+advertised in HTML only by a "Download" section near the bottom of a release's manifest
+page, below its configuration tables. The service page's dataset cards and the dataset
+page's row of links (understand, schema, browse, TPF, manifest) do not mention it, though
+the dataset descriptor's JSON carries the link, and sizes appear only as exact byte
+counts. So a visitor wanting the data goes catalog → dataset → "Latest manifest" →
+scroll. Candidates, to fold into the revamp rather than land piecemeal: a "Download HDT
+(26.4 MB)" link on the dataset page pointing at the current release's versioned URL;
+the manifest page's download panel beside its operations rather than after its
+configuration; human-readable sizes beside exact ones; possibly a download link on each
+catalog card; and step 3's `/export` listing as the download's own page.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
@@ -3043,12 +3498,102 @@ following the code.
     should say which cap governs it rather than leaving the answer to whatever an HTTP
     stack happens to allow.
 
+73. **`/search`'s `complete: true` says a top-k finished, not that the matches are
+    exhausted, and §3.6 has no word for the difference.** Unit 17 reads `limit` as a
+    requested top-k rather than a page size, so the entity loop stops the moment it has
+    kept `limit` subjects and the completeness decision weighs only the response-byte,
+    RDF-resolution, and text-candidate budgets. The two requests recorded in
+    `notes/search-completeness.md` are the symptom: over Ubergraph, `q=buffalo` at
+    `limit=100` answers 100 entities `complete: true, next: null`, and the same query at
+    `limit=1000` answers 742 the same way. Every other paged operation asks for
+    `limit + 1` and keeps `limit` precisely so a full page cannot claim completeness,
+    and §3.6 forbids silent truncation. So one of three has to be written down: §3.6
+    gains a term for a bounded ranking that exhausted no budget; or `/search` owes a
+    `page_limit` truncation with no cursor behind it, which the envelope contract must
+    then permit; or ranked entity paging gets specified along with the state it costs.
+    The note argues the third is the expensive one — ranking is over literals and the
+    response unit is entities, so deduplication happens after ranking and a cursor
+    naming a literal rank cannot keep a subject from reappearing. Found serving
+    Ubergraph.
+74. **The union must be untagged in every RDF representation, and the design should say
+    why.** [`graphs.md`](graphs.md) now carries the corrected serving table, but the
+    reasoning belongs to anyone implementing doc 03 over a quads bundle: a paging client
+    matches pages after the first against the pattern's literal graph term, so a union
+    row tagged with the reserved constant is dropped from the second page on. The
+    consequence is that `GRAPH <urn:x-kgf:union>` is not an idiom stock Comunica can
+    page, and the union is reached by a bare pattern plus the `sd:defaultGraph`
+    declaration. Measured against Comunica 5.3.0 at one row per page.
+75. **`g` beside `o.text` is refused, and §3.4 should say which error it is.** A ranked
+    text page is assembled from one selection per matching literal and this build scopes
+    none of them, so the request is well-formed and unanswerable: 400, not the 501 an
+    undeclared capability earns. If a later milestone scopes ranked pages the refusal
+    goes away, but until then the distinction is a client's only way to tell "not here"
+    from "not ever".
+76. **`/graphs` needs its response shape and its enumeration order in the spec.** What
+    landed lists the unnamed graph first when it holds a triple, then the named graphs
+    in the sidecar's dictionary order, with the cursor naming the next layer id. That
+    order is a cursor contract like every other enumeration order here, so it belongs in
+    doc 03 rather than only in this implementation.
+77. **A graph named by a blank node needs a stated spelling.** The sidecar stores such a
+    name as `_:label`, which means nothing outside the document it was parsed from. This
+    implementation publishes a node that also fills a triple position under its data
+    IRI, since the graph and the subject of `_:g :p :o _:g` are one resource, and one
+    found only as a graph name as `…:sha256:{sidecar-digest}:g-{layer}` — scoped by the
+    membership sidecar's digest rather than the HDT's, because a layer id means nothing
+    across two sidecars over one HDT. Every graph then has exactly one IRI, checked
+    against the sidecar when it comes back. A first cut keyed every blank graph by
+    layer id under the HDT's digest, which split the shared node in two and gave two
+    bundles with the same triples grouped differently one IRI for different graphs.
+    Whether this is the federation's answer, and whether a graph so named should be
+    listed at all, is a doc 03 question.
+78. **hdtc could refuse the two reserved graph IRIs at build time.** `kgf build` refuses
+    them by opening the finished sidecar the way a server does, which is after the whole
+    HDT has been built. hdtc knows a quad's graph as it reads it and could refuse there,
+    in seconds rather than hours — but the names are KGF's, not hdtc's, so this is a
+    question about where the federation's reserved vocabulary lives rather than a patch.
+79. **hdtc's dataset VoID view cannot say which subset is a blank-named graph.**
+    `--graph-view dataset` links a graph with an IRI for a name through
+    `sd:namedGraph`/`sd:name`, and emits a graph named by a blank node as a bare
+    `void:subset` with no link at all — which is exactly the shape the unnamed graph's
+    own subset has. A consumer cannot tell the two apart, so `kgf build` describes
+    neither rather than describing one under the other's name, and a bundle can list
+    more graphs through `/graphs` than its summary describes. A `sd:namedGraph` whose
+    `sd:name` is the blank node, or any other discriminator, would close it.
+80. **hdtc's sidecar format should say a blank graph name is scoped as the data is.**
+    Publishing a blank graph name under its data IRI when the node is in the data
+    rests on the sidecar and `data.hdt` spelling one node alike. hdtc does — its parser
+    applies one blank prefix to the subject, object and graph of a quad, and its design
+    notes say so — but `docs/graphs-sidecar-format.md` §5 says only "after input
+    blank-node scoping", which a conforming writer could read as a scoping of its own.
+    The normative text should say it is the scoping applied to `data.hdt`'s terms.
+81. **§3.4.11's `export` is one capability over artifacts of different kinds.** Its list
+    mixes the required `data.hdt`, which every bundle can serve, with optional
+    artifacts and a later-phase Parquet partition, so no bundle can declare the
+    capability without committing to routes a deployment may not have. Generated
+    serializations (unit 31's N-Triples) are not artifacts at all and need their own
+    cost row: `O(log B)` plus one index block to start, then `O(bytes)`. Downloads also
+    sit outside §3.5's composite budgets — `max_response_bytes` and the time budget
+    cannot apply to a whole-dataset transfer — and are bounded by a download gate
+    instead, which §3.5 should say.
+82. **An export's validator is its content hash, not a deployment-scoped tag.** §3.6
+    says `ETag` = artifact checksum; for downloads that should be normative and exactly
+    the checksum, so every server and mirror publishing a bundle agrees and a client
+    can resume from any of them. It should also require `Repr-Digest` (RFC 9530) and
+    say that a range is always served from identity bytes while a full body may be
+    content-coded.
+83. **"Every URL has an HTML page" needs its exception.** §3.2's one-URL-two-readers
+    rule would put a page where a browser expects a file. The download resources should
+    be single-representation, with the listing as their page.
+84. **`range_not_satisfiable` (416) joins the error table.** A download needs it, with
+    `Content-Range: bytes */{len}`, for unsatisfiable and for refused multi-range
+    requests alike.
+
 ## Not in this plan
 
-Remaining composed operations (ranges, star, key resolution), graph scoping, and
-everything requiring a sidecar beyond `.perm` and the existing exhaustive text index.
-Those are doc 20 §20.8's later milestones and compose through the `Store`, envelope,
-cursor, term, and live-profile layers this plan builds.
+Remaining composed operations (ranges, star, key resolution) and everything requiring a
+sidecar beyond `.perm`, the exhaustive text index, and the graph memberships unit 30
+added. Those are doc 20 §20.8's later milestones and compose through the `Store`,
+envelope, cursor, term, and live-profile layers this plan builds.
 
 `kgf build` was deliberately absent from units 1–18 and landed as unit 21, once unit
 19 had settled enough of the consumer contract to say what a description set must

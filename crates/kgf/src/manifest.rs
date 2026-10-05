@@ -132,6 +132,11 @@ pub(crate) struct Requested {
     pub(crate) roles: BTreeMap<String, Vec<String>>,
     /// Provenance for re-derivation. `None` keeps what the manifest has.
     pub(crate) source: Option<Source>,
+    /// The parts of the dataset the config declared. Empty keeps what the
+    /// manifest has, so re-describing a bundle by hand does not drop them.
+    pub(crate) components: Vec<kgf_store::manifest::Component>,
+    /// Which of them the design view describes, carried the same way.
+    pub(crate) design: Option<String>,
 }
 
 impl Requested {
@@ -169,6 +174,11 @@ impl Requested {
         }
 
         Ok(Self {
+            // `kgf manifest` describes a bundle that already exists and reads no
+            // build config, so it never declares components; the writer carries
+            // forward whatever the manifest already had.
+            components: Vec::new(),
+            design: None,
             id: args.id.clone(),
             version: args.version.clone(),
             dataset_iri: args.dataset_iri.clone(),
@@ -206,6 +216,20 @@ pub(crate) struct DescriptionArtifactMetadata {
     pub(crate) class_relations: RowArtifactMetadata,
     /// Bounds for `stats/class-properties.tsv`.
     pub(crate) class_properties: RowArtifactMetadata,
+    /// Whether the analysis read the memberships to describe each graph, which
+    /// makes the sidecar a parent of `stats/void.hdt` beside the HDT.
+    pub(crate) per_graph: bool,
+}
+
+impl DescriptionArtifactMetadata {
+    /// What `stats/void.hdt` was computed from.
+    fn void_parents(&self) -> Vec<String> {
+        let mut parents = vec![artifact::HDT.to_owned()];
+        if self.per_graph {
+            parents.push(artifact::GRAPHS.to_owned());
+        }
+        parents
+    }
 }
 
 /// Run `kgf manifest`.
@@ -344,17 +368,103 @@ struct BundleInspection {
 /// # Safety obligation
 ///
 /// [`PublishedBundle::new`](kgf_store::PublishedBundle::new) requires that the
-/// artifacts not be modified or truncated while mapped. This is a one-shot
-/// command over a directory the operator named, holding the mappings only for
-/// the duration of this call and writing nothing but `manifest.json`, which is
-/// not among the mapped artifacts. Establishing that obligation explicitly is
-/// what the capability exists for; the rest of this crate keeps
-/// `unsafe` denied.
+/// artifacts not be modified or truncated while mapped. The mappings live only
+/// inside this call, which is single-threaded and writes nothing at all, so
+/// what has to hold is that nothing *else* writes those bytes while it runs.
+/// Both callers establish that, differently:
+///
+/// - `kgf manifest` is a one-shot command over a directory the operator named,
+///   and the only file it writes afterwards is `manifest.json`, which is not
+///   among the mapped artifacts.
+/// - A build calls it over its own staging directory, between the step that
+///   wrote the artifacts and the next step that runs. The directory is this
+///   process's private temporary one, invisible to a catalog scan, and no
+///   builder is running against it at the time. Under `--adopt` the staged
+///   `data.hdt` is a hard link to the caller's file, so this inherits the
+///   promise `--adopt` already makes: the input is not being rewritten while
+///   the build reads it.
+///
+/// Establishing that obligation explicitly is what the capability exists for;
+/// the rest of this crate keeps `unsafe` denied.
 #[allow(unsafe_code)]
 fn inspect_bundle(dir: &Path) -> Result<BundleInspection> {
     let bundle = unsafe { kgf_store::PublishedBundle::new(dir) };
     let facts = BundleFacts::read(&bundle)?;
     Ok(BundleInspection { bundle, facts })
+}
+
+/// Open a staged bundle's memberships, as a server opening it would.
+///
+/// `Store::open` refuses a sidecar naming one of the reserved graph IRIs, and
+/// an index carrying only one of the two position-keyed layer sets. The
+/// manifest written last would surface either — but only after the text index,
+/// the sketches, the key sets and the description set had been built over
+/// bytes that will never be published. This is the same check, run as soon as
+/// the two artifacts exist, and it also catches the build that asked for
+/// memberships and produced none.
+pub(crate) fn check_staged_graphs(
+    dir: &Path,
+    components: &[kgf_store::manifest::Component],
+) -> Result<()> {
+    let inspection = inspect_bundle(dir)?;
+    ensure!(
+        inspection
+            .facts
+            .capabilities()
+            .any(|capability| capability == Capability::Graphs),
+        "the build asked for named graphs and produced no membership artifacts; \
+         this is a bug in `kgf build` rather than in the input"
+    );
+    check_component_graphs(dir, components)
+}
+
+/// Check that every component's graph is one this bundle holds.
+///
+/// A declared component is trusted about *what* its graph contains — nothing
+/// can check that `#asserted` holds the asserted axioms — but not about
+/// whether the graph is there at all. Checked where the declaration is made,
+/// so a config naming a graph the data does not carry fails before anything is
+/// published rather than serving a component nothing can scope to.
+///
+/// # Safety obligation
+///
+/// The same as [`inspect_bundle`]'s, and for the same reason: the mappings
+/// live only inside this call, which writes nothing, over a staging directory
+/// no other writer is touching.
+#[allow(unsafe_code)]
+pub(crate) fn check_component_graphs(
+    dir: &Path,
+    components: &[kgf_store::manifest::Component],
+) -> Result<()> {
+    let wanted: Vec<&str> = components
+        .iter()
+        .filter_map(|component| component.graph.as_deref())
+        .collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let bundle = unsafe { kgf_store::PublishedBundle::new(dir) };
+    // The memberships alone: this runs before the manifest exists, which is
+    // what `Store::open` would need.
+    let graphs = kgf_store::Graphs::open_bundle(&bundle)
+        .context("opening the staged memberships to check the declared components")?;
+    let graphs = graphs.context(
+        "components declare graphs, but this bundle carries no memberships. Set \
+         contents.graphs.enabled, or drop the `graph` from each component and declare \
+         them as provenance alone",
+    )?;
+    for graph in wanted {
+        let found = graphs
+            .resolve(graph.as_bytes())
+            .with_context(|| format!("looking up the component graph {graph}"))?;
+        ensure!(
+            found.is_some(),
+            "component graph {graph} is not one this bundle holds; `kgf build` refuses \
+             a declaration the data cannot back. `GET /graphs` on a built bundle lists \
+             the names it carries"
+        );
+    }
+    Ok(())
 }
 
 /// Check that the manifest describes the artifacts *byte for byte*, not merely
@@ -539,6 +649,18 @@ fn build(
             .clone()
             .or_else(|| previous.and_then(|m| m.homepage.clone())),
         publisher: publisher(requested, previous),
+        // Declared in the build config, which `kgf manifest` does not read, so
+        // regenerating a manifest by hand carries them forward like every other
+        // statement about the dataset rather than dropping them.
+        components: if requested.components.is_empty() {
+            previous.map(|m| m.components.clone()).unwrap_or_default()
+        } else {
+            requested.components.clone()
+        },
+        design: requested
+            .design
+            .clone()
+            .or_else(|| previous.and_then(|m| m.design.clone())),
         counts: facts.counts(),
         capabilities: facts
             .capabilities()
@@ -727,7 +849,48 @@ fn checksum_artifacts(dir: &Path, facts: &BundleFacts) -> Result<Vec<(String, Ar
         entries.push((name.to_owned(), entry));
     }
     verify_key_decomposition(dir, &entries)?;
+    verify_graph_index_binding(dir, &entries)?;
     Ok(entries)
+}
+
+/// Check that the graph index records the digest of the sidecar beside it.
+///
+/// The index binds itself to its sidecar by that digest, and a server takes it
+/// as the sidecar's identity: it scopes the IRI of every graph named by a blank
+/// node that no triple mentions, so a layer id reverses only against the
+/// memberships it was minted from. Opening compares the cheap fields alone,
+/// which a sidecar re-encoded with the same counts would pass. The whole-file
+/// checksum computed above is exactly the digest the index should carry, so
+/// the comparison costs one header read.
+fn verify_graph_index_binding(dir: &Path, entries: &[(String, ArtifactEntry)]) -> Result<()> {
+    let checksum = |name: &str| {
+        entries
+            .iter()
+            .find(|(entry_name, _)| entry_name == name)
+            .map(|(_, entry)| entry.sha256.as_str())
+    };
+    let (Some(sidecar), Some(_)) = (checksum(artifact::GRAPHS), checksum(artifact::GRAPHS_IDX))
+    else {
+        return Ok(());
+    };
+    let index = dir.join(artifact::GRAPHS_IDX);
+    let directory = hdtc::format::GraphIndex::directory(&index, &dir.join(artifact::HDT))
+        .with_context(|| format!("reading the graph index {}", index.display()))?;
+    let recorded: String = directory
+        .header()
+        .sidecar_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    ensure!(
+        recorded == sidecar,
+        "{} was built from a graph sidecar with sha256 {recorded}, but {} is sha256 \
+         {sidecar}; rebuild the index with `hdtc graphs-index {} --positions pos,ops`",
+        index.display(),
+        dir.join(artifact::GRAPHS).display(),
+        dir.join(artifact::HDT).display(),
+    );
+    Ok(())
 }
 
 /// Read a `filters/` or `keysets/` artifact's own header, if this is one.
@@ -987,16 +1150,16 @@ fn carry_artifact_metadata(
         .collect();
 
     for (name, current) in artifacts {
-        if generated_description.is_some()
-            && let Some(parent) = match name.as_str() {
-                artifact::VOID_HDT => Some(artifact::HDT),
-                artifact::VOID_PERM => Some(artifact::VOID_HDT),
+        if let Some(description) = generated_description
+            && let Some(parents) = match name.as_str() {
+                artifact::VOID_HDT => Some(description.void_parents()),
+                artifact::VOID_PERM => Some(vec![artifact::VOID_HDT.to_owned()]),
                 _ => None,
             }
         {
             // This producer owns the binding. Do not let identical bytes carry
             // a legacy manifest's absent or stale parent back over it.
-            current.parents = vec![parent.to_owned()];
+            current.parents = parents;
             continue;
         }
         let generated = generated_description.and_then(|description| match name.as_str() {
@@ -1355,6 +1518,8 @@ mod tests {
             id: "d".to_owned(),
             dataset_iri: None,
             version: "v".to_owned(),
+            components: Vec::new(),
+            design: None,
             content_digest: "sha256:0".to_owned(),
             created: None,
             formats: Formats::default(),

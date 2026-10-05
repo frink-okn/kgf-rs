@@ -398,7 +398,9 @@ fn split_ranges(header: &str) -> Vec<&str> {
 
 /// `q=0.812` as 812. Rejects anything outside RFC 9110 §12.4.2's grammar rather
 /// than clamping, so `q=9` is an ignored parameter rather than a huge weight.
-fn quality_thousandths(value: &str) -> Option<u32> {
+///
+/// Shared with `Accept-Encoding`, whose weights are the same grammar.
+pub(crate) fn quality_thousandths(value: &str) -> Option<u32> {
     let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
     if fraction.len() > 3 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;

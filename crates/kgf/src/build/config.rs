@@ -43,19 +43,29 @@ pub struct Config {
     #[serde(default)]
     pub resources: Resources,
 
-    /// Derived-triple components. Recognized, not yet supported.
+    /// The parts of this dataset, by id.
     ///
-    /// Named rather than left to `deny_unknown_fields` so that a config written
-    /// against the planned component DAG fails with an explanation instead of
-    /// "unknown field `components`". Claiming the key now stays additive: when
-    /// the DAG lands, the refusal becomes an implementation and no config that
-    /// works today breaks.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub components: Option<serde_norway::Value>,
+    /// Declaration, not derivation. An entry says what a part of the dataset
+    /// *is* — the canonical release, an entailment, a derived overlay — and
+    /// binds it to the graph holding it. Building a component from a recipe is
+    /// the component DAG, which this build does not run: an entry carrying
+    /// `files` or `tool` is refused with that reason rather than ignored.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub components: BTreeMap<String, Component>,
 
     /// Which components merge into `data.hdt`. As above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish: Option<serde_norway::Value>,
+
+    /// The component the design view describes, by id.
+    ///
+    /// Omitted, the canonical component is it: the single `role: source` one.
+    /// Where several components claim that role, none is canonical and the
+    /// design view describes the whole dataset. A KG whose native encoding is
+    /// the one its readers want needs nothing here; one that publishes a
+    /// projection worth reading instead of its own encoding says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design: Option<String>,
 }
 
 /// Identity and description.
@@ -156,6 +166,9 @@ pub struct Contents {
     /// The full-text index over literals.
     #[serde(default)]
     pub text: Text,
+    /// The named-graph membership sidecar and its index.
+    #[serde(default)]
+    pub graphs: Graphs,
     /// Membership filters and overlap sketches.
     #[serde(default)]
     pub filters: Filters,
@@ -207,6 +220,76 @@ impl Default for Text {
             untagged_language: None,
         }
     }
+}
+
+/// One declared part of the dataset.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Component {
+    /// `source`, `derived`, or `entailment`.
+    pub role: String,
+    /// The graph holding this component's triples.
+    ///
+    /// Omitted, the component is provenance and nothing more: it records what
+    /// went in and by what, and nothing can say which triples are its, so it
+    /// gets no description view and no `g=` scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<String>,
+    /// The components this one was computed over, by id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<String>,
+    /// What produced it, as the publisher names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator: Option<String>,
+    /// The entailment regime a `role: entailment` component was closed under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime: Option<String>,
+
+    /// A recipe this build cannot run. Recognized so it fails with a reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<serde_norway::Value>,
+    /// The same, for the external tool the component DAG would invoke.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<serde_norway::Value>,
+}
+
+/// `data.hdt.graphs` and `data.hdt.graphs.idx`. Built together or not at all.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Graphs {
+    /// Carry memberships, so the bundle declares `graphs` and answers `g`.
+    ///
+    /// Three values, not two. Omitted follows the input: RDF written in a quad
+    /// syntax, and an HDT with a sidecar beside it, carry graphs and keep
+    /// them; everything else has none to keep. `true` builds them from any
+    /// input, and refuses an HDT that arrives without a sidecar rather than
+    /// publishing a bundle whose graphs went missing on the way in. `false`
+    /// drops a quad source's graphs into the union deliberately, which is a
+    /// thing to be able to say and not a thing to do by accident.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+
+    /// Carry the membership transpose: the graph of every statement, by
+    /// position, rather than one layer to probe per graph.
+    ///
+    /// Omitted follows the number of graphs, which the build learns from the
+    /// sidecar it just wrote. `true` and `false` state it outright.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transpose: Option<bool>,
+
+    /// Describe each graph on its own, as a `graph:<IRI>` view of the tier-1
+    /// description set.
+    ///
+    /// Omitted follows the number of graphs, for the same reason `transpose`
+    /// does and with the opposite sign: one view per graph is a whole
+    /// class-and-property projection per graph, in each of the three
+    /// artifacts and in the manifest that declares their ranges, so the
+    /// description grows with the graphs times the schema. A KG split by
+    /// source or by release has few enough graphs for that to be the most
+    /// useful thing in the bundle; one split per entity has too many for it to
+    /// be a description at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub describe: Option<bool>,
 }
 
 /// `filters/`. Always built as complete role families.

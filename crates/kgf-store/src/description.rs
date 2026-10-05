@@ -6,6 +6,7 @@
 //! description size. Schema lookup binary-searches one declared view block;
 //! count-ranked projections page rows from resumable byte boundaries.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -100,7 +101,7 @@ impl ComponentId {
     /// Parse a non-empty component identifier.
     pub fn new(id: impl Into<String>) -> Option<Self> {
         let id = id.into();
-        (!id.is_empty()).then_some(Self(id))
+        usable_view_name(&id).then_some(Self(id))
     }
 
     /// The component identifier without the manifest's `component:` prefix.
@@ -109,7 +110,47 @@ impl ComponentId {
     }
 }
 
+/// A named graph a description view describes.
+///
+/// The graph's own IRI, which is the identity `g=` and `GET /graphs` use, so a
+/// client that has a graph's name has its description without a second
+/// vocabulary to map between. The unnamed graph is described under its
+/// reserved constant; the union is the dataset itself, which `queryable`
+/// already describes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GraphName(String);
+
+impl GraphName {
+    /// Parse a non-empty graph name.
+    pub fn new(name: impl Into<String>) -> Option<Self> {
+        let name = name.into();
+        usable_view_name(&name).then_some(Self(name))
+    }
+
+    /// The graph IRI, without the manifest's `graph:` prefix.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Whether a string can name a description view.
+///
+/// A view name is the first column of every row of a tab-separated
+/// projection, so a name carrying a tab or a newline would split a row
+/// somewhere else than where it was written. Refused where the name is parsed
+/// rather than where a row is read, so a manifest that declares one is refused
+/// at open instead of mis-splitting rows afterwards.
+fn usable_view_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(|byte: char| byte.is_control())
+}
+
 /// One description layer published by the bundle.
+///
+/// **The variant order is an on-disk contract.** A published projection lays
+/// its views out in this order and declares a byte range for each, and a
+/// verifier walks those ranges requiring them to tile the file with no gap and
+/// no overlap. Reordering the variants therefore invalidates every bundle
+/// already published; adding one at the end does not.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StatsView {
     /// The canonical component's designed schema.
@@ -118,6 +159,12 @@ pub enum StatsView {
     Queryable,
     /// One published component.
     Component(ComponentId),
+    /// One named graph of the dataset.
+    ///
+    /// The same axis as a component and not a second one: both describe a
+    /// subset of the published triples, and the analysis names both the same
+    /// way, as a `void:subset` of the dataset.
+    Graph(GraphName),
 }
 
 impl StatsView {
@@ -126,14 +173,38 @@ impl StatsView {
         ComponentId::new(id).map(Self::Component)
     }
 
-    fn from_manifest_key(key: &str) -> Option<Self> {
+    /// Construct a graph view, refusing an empty graph name.
+    pub fn graph(name: impl Into<String>) -> Option<Self> {
+        GraphName::new(name).map(Self::Graph)
+    }
+
+    /// The manifest key for this view, which is also its `view=` spelling.
+    pub fn manifest_key(&self) -> Cow<'static, str> {
+        match self {
+            Self::Design => Cow::Borrowed("design"),
+            Self::Queryable => Cow::Borrowed("queryable"),
+            Self::Component(component) => Cow::Owned(format!("component:{}", component.as_str())),
+            Self::Graph(graph) => Cow::Owned(format!("graph:{}", graph.as_str())),
+        }
+    }
+
+    /// Parse a manifest key, which is the same grammar a request sends.
+    ///
+    /// The one place the view grammar is written down: the manifest validates
+    /// names with it, a mapped bundle parses them with it, and a request is
+    /// checked against it, so none of the three can drift from the others.
+    pub fn from_manifest_key(key: &str) -> Option<Self> {
         match key {
             "design" => Some(Self::Design),
             "queryable" => Some(Self::Queryable),
-            _ => key
-                .strip_prefix("component:")
-                .and_then(ComponentId::new)
-                .map(Self::Component),
+            _ => {
+                if let Some(component) = key.strip_prefix("component:") {
+                    return ComponentId::new(component).map(Self::Component);
+                }
+                key.strip_prefix("graph:")
+                    .and_then(GraphName::new)
+                    .map(Self::Graph)
+            }
         }
     }
 }
@@ -734,6 +805,15 @@ impl DescriptionStore {
     /// Published `stats/summary.md` as UTF-8 text.
     pub fn summary_markdown(&self) -> Result<&str> {
         documents::summary_markdown(self.summary_md.as_bytes(), self.summary_md.path())
+    }
+
+    /// Every view this bundle published, in the order a reader walks them.
+    ///
+    /// For a page that offers them: which parts of a dataset are described is
+    /// a property of the artifacts, not of the manifest's declarations, and a
+    /// bundle may describe fewer parts than it declares.
+    pub fn views(&self) -> impl Iterator<Item = &StatsView> {
+        self.schema_nodes.views.keys()
     }
 
     /// Select one published description view.
@@ -1813,6 +1893,15 @@ mod tests {
             id: "example".to_owned(),
             dataset_iri: None,
             version: "v1".to_owned(),
+            components: vec![crate::manifest::Component {
+                id: "canonical".to_owned(),
+                role: crate::manifest::ComponentRole::Source,
+                graph: None,
+                inputs: Vec::new(),
+                generator: None,
+                regime: None,
+            }],
+            design: None,
             content_digest: "sha256:00".to_owned(),
             created: None,
             formats: Formats::default(),
@@ -2058,6 +2147,15 @@ mod tests {
             id: "verified".to_owned(),
             dataset_iri: None,
             version: "v1".to_owned(),
+            components: vec![crate::manifest::Component {
+                id: "canonical".to_owned(),
+                role: crate::manifest::ComponentRole::Source,
+                graph: None,
+                inputs: Vec::new(),
+                generator: None,
+                regime: None,
+            }],
+            design: None,
             content_digest: "sha256:00".to_owned(),
             created: None,
             formats: Formats::default(),
@@ -2106,6 +2204,81 @@ mod tests {
         )
         .unwrap();
         manifest
+    }
+
+    /// The four kinds of view coexist in one projection, and the order the
+    /// file is laid out in is the enum's rather than the names'.
+    ///
+    /// A component sorts before `design` as a string and after `queryable` as
+    /// a view, so a bundle carrying both kinds is the case where the two
+    /// orders disagree in both directions at once.
+    #[test]
+    fn every_kind_of_view_is_selectable_from_one_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("schema-nodes.tsv");
+        let mut bytes = b"view\tkind\tclass\tpredicate\tdatatype\tsubject_id\n".to_vec();
+        let header = bytes.len() as u64;
+        let mut views = BTreeMap::new();
+        // Written in `StatsView` order, which is what a reader walks.
+        for name in [
+            "design",
+            "queryable",
+            "component:canonical",
+            "graph:http://example.org/g1",
+            "graph:urn:x-kgf:unnamed",
+        ] {
+            let offset = bytes.len() as u64;
+            bytes.extend_from_slice(format!("{name}\tdataset\t\t\t\t1\n").as_bytes());
+            views.insert(
+                name.to_owned(),
+                ArtifactView {
+                    offset,
+                    bytes: bytes.len() as u64 - offset,
+                    rows: 1,
+                },
+            );
+        }
+        assert_eq!(views.len(), 5);
+        assert!(header < views["design"].offset + 1);
+
+        let max_row_bytes = max_complete_row(&bytes);
+        std::fs::write(&path, &bytes).unwrap();
+        let mapping = crate::testing::map_fixture(&path);
+        let table = MappedTsv::open(
+            mapping,
+            &tsv_entry(bytes.len() as u64, max_row_bytes, views),
+        )
+        .unwrap();
+
+        for view in [
+            StatsView::Design,
+            StatsView::Queryable,
+            StatsView::component("canonical").unwrap(),
+            StatsView::graph("http://example.org/g1").unwrap(),
+            StatsView::graph(crate::graphs::UNNAMED_GRAPH_IRI).unwrap(),
+        ] {
+            let spec = table
+                .views
+                .get(&view)
+                .unwrap_or_else(|| panic!("{:?} is selectable", view.manifest_key()));
+            assert_eq!(spec.rows, 1, "{:?}", view.manifest_key());
+        }
+
+        // The ranges tile the file in the order the enum fixes, which is what
+        // the verifier walks: each view starts where the previous one ended.
+        let mut cursor = header;
+        for spec in table.views.values() {
+            assert_eq!(spec.offset, cursor);
+            cursor = spec.end();
+        }
+        assert_eq!(cursor, bytes.len() as u64);
+
+        // A name a projection could not carry is not a view name at all.
+        assert!(StatsView::graph("with\ttab").is_none());
+        assert!(StatsView::graph("with\nnewline").is_none());
+        assert!(StatsView::component("").is_none());
+        assert!(StatsView::from_manifest_key("graph:").is_none());
+        assert!(StatsView::from_manifest_key("nonsense").is_none());
     }
 
     #[test]
@@ -2175,7 +2348,7 @@ mod tests {
             store
                 .description()
                 .expect("description")
-                .verify_artifacts()
+                .verify_artifacts(candidate.design_component())
                 .expect("valid description indexes");
         }
 
@@ -2199,7 +2372,7 @@ mod tests {
         let error = store
             .description()
             .expect("description still opens with bounded checks")
-            .verify_artifacts()
+            .verify_artifacts(manifest.design_component())
             .expect_err("offline proof must reject the shifted range");
         assert!(
             error.to_string().contains("expected contiguous offset"),

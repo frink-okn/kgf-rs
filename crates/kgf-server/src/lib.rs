@@ -24,7 +24,8 @@
 //! alone — a page in a browser, data from `curl`, at the same URL. Most use
 //! JSON; RDF `/void` uses Turtle/JSON-LD and static `/summary` uses
 //! Markdown/JSON. See [`representation`] for why the tie-break falls the way it
-//! does, and [`html`] for the rendering.
+//! does, and [`html`] for the rendering. A download ([`export`]) is the
+//! exception: a browser following its link must get the file.
 //!
 //! # Status
 //!
@@ -32,8 +33,9 @@
 //! [`envelope`], the URL space with `latest`, caching and content negotiation,
 //! and the read operations `/fragment`, `/tpf`, `/count`, `/describe`, `/sample`
 //! and `/schema`, the `/void` and `/summary` description resources, plus bindings
-//! QUERY/POST for fragment and count in [`request`] and [`answer`]. The service
-//! emits typed, content-free access records through [`access`] when configured.
+//! QUERY/POST for fragment and count in [`request`] and [`answer`], and
+//! whole-dataset downloads in [`export`]. The service emits typed, content-free
+//! access records through [`access`] when configured.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -44,7 +46,9 @@ pub mod answer;
 pub mod cursor;
 pub mod descriptor;
 pub mod envelope;
+pub mod export;
 mod forms;
+mod hex;
 pub mod html;
 mod rdf;
 pub mod representation;
@@ -493,6 +497,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         heavy_request_weight = service.config().admission.heavy_request_weight,
         max_queued_requests = service.config().admission.max_queued_requests,
         queue_timeout_ms = service.config().admission.queue_timeout_ms,
+        max_concurrent_downloads = service.config().admission.max_concurrent_downloads,
+        max_downloads_per_client = service.config().admission.max_downloads_per_client,
         "serving",
     );
     serve_on(listener, service, shutdown_signal()).await

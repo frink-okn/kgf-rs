@@ -34,3 +34,7 @@ triple-pattern shapes, exact counts, describe, sample, search, labels, dictionar
 scans and their exact counts, the description surface, and bindings-restricted
 QUERY/POST fragment and count requests with bounded paging and stable cursors. A dedicated `/tpf` route provides TPF/brTPF with Hydra
 `ExplicitRepresentation`; N-Quads, TriG, and JSON-LD keep its controls in a named graph.
+`/export/data.hdt` downloads the whole dataset as HDT, resumable by byte range
+(`curl -C -`) and verifiable by its SHA-256 `ETag` and `Repr-Digest`. It is sent
+uncompressed, so every client can size and resume it; a client that weights zstd or
+gzip above identity (`Accept-Encoding: zstd, identity;q=0.5`) gets a compressed body.

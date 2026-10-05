@@ -297,8 +297,8 @@ suite gate every step, as for unit 20.
 
 ## Not in this plan
 
-- The four-position QPF form (graphs) — waits for doc 03 §3.7, on this route when it
-  comes.
+- The four-position QPF form (graphs) — now specified in [`graphs.md`](graphs.md);
+  on this route when the graphs capability lands.
 - `page=`, `hydra:previous`, `hydra:first` — Comunica does not use them and the TPF spec
   does not require them.
 - `BasicRepresentation` — a client that sends unquoted literals gets a 400; declaring

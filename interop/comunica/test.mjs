@@ -3,6 +3,7 @@ import { QueryEngine } from '@comunica/query-sparql';
 
 const endpoint = process.argv[2];
 const remoteEndpoint = process.argv[3];
+const quadsEndpoint = process.argv[4];
 assert(endpoint, 'usage: node test.mjs http://host/dataset/v/version/tpf');
 assert(remoteEndpoint, 'a second KGF TPF endpoint is required for federation');
 
@@ -116,4 +117,54 @@ assert.deepEqual(
   'stock Comunica must join bindings across two KGF brTPF endpoints',
 );
 
-console.log('Comunica 5.3.0 TPF grammar, paging, graph split, bind joins, and federation passed');
+// Named graphs, against a bundle carrying memberships: the worked example of
+// notes/graphs.md, with three distinct triples and five memberships. Stock
+// Comunica, with no unionDefaultGraph flag, must read the union for a bare
+// pattern from the page's sd:defaultGraph declaration alone and page it to the
+// end, reach a named graph and the unnamed graph through GRAPH <…>, and see
+// only named graphs through GRAPH ?g. The union constant is not a Comunica
+// idiom: union rows are served untagged, because Comunica matches every page
+// after the first against the pattern's literal graph term, so a bare pattern
+// is the only way stock Comunica reads the union.
+if (quadsEndpoint) {
+  for (const type of ['qpf', 'brtpf']) {
+    const quads = { sources: [{ type, value: quadsEndpoint }] };
+    const count = async (query) => {
+      const stream = await engine.queryBindings(query, quads);
+      return (await stream.toArray()).length;
+    };
+    assert.equal(
+      await count('SELECT * WHERE { ?s ?p ?o }'),
+      3,
+      `${type}: a bare pattern reads the union, one row per distinct triple`,
+    );
+    assert.equal(
+      await count('SELECT * WHERE { GRAPH ?g { ?s ?p ?o } }'),
+      3,
+      `${type}: GRAPH ?g ranges over named-graph memberships only`,
+    );
+    assert.equal(
+      await count('SELECT * WHERE { GRAPH <urn:x-kgf:unnamed> { ?s ?p ?o } }'),
+      2,
+      `${type}: the unnamed graph is reachable under its constant`,
+    );
+    assert.equal(
+      await count('SELECT * WHERE { GRAPH <http://example.org/g1> { ?s ?p ?o } }'),
+      2,
+      `${type}: a named graph scopes to its own triples`,
+    );
+    assert.equal(
+      await count(`
+        SELECT * WHERE {
+          <http://example.org/a> <http://example.org/b> ?o .
+          ?x <http://example.org/y> ?z .
+        }
+      `),
+      2,
+      `${type}: a two-pattern join over the union`,
+    );
+  }
+}
+
+console.log('Comunica 5.3.0 TPF grammar, paging, graph split, bind joins, federation'
+  + (quadsEndpoint ? ', and named graphs' : '') + ' passed');

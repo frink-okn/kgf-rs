@@ -708,6 +708,40 @@ impl<'a> BitmapView<'a> {
         None
     }
 
+    /// Position of the `k`-th clear bit at or after `start`, zero-based.
+    ///
+    /// [`select_from`](Self::select_from) over the complement. The bits a
+    /// final byte carries past the bitmap's end are masked *set* here, for the
+    /// same reason that method masks them clear: they are not part of the
+    /// bitmap and must never be selected.
+    pub fn select_zero_from(&self, start: u64, k: u64) -> Option<u64> {
+        assert_eq!(start % 8, 0, "scans start on a byte boundary");
+        let mut remaining = k;
+        let mut position = start;
+
+        while position < self.bits {
+            let mut byte = !self.bytes[(position / 8) as usize];
+            let left = self.bits - position;
+            if left < 8 {
+                byte &= (1u8 << left) - 1;
+            }
+            let zeros = u64::from(byte.count_ones());
+            if remaining < zeros {
+                for bit in 0..8 {
+                    if byte >> bit & 1 == 1 {
+                        if remaining == 0 {
+                            return Some(position + bit);
+                        }
+                        remaining -= 1;
+                    }
+                }
+            }
+            remaining -= zeros;
+            position += 8;
+        }
+        None
+    }
+
     /// Set bits in `range`, clamped to the bitmap's length.
     ///
     /// Used by [`crate::rank`] for the partial subblock a `rank1` ends in, which
@@ -962,6 +996,15 @@ mod tests {
         let view = BitmapView::new(&bytes, 16).unwrap();
         let found: Vec<u64> = (0..5).filter_map(|k| view.select_from(0, k)).collect();
         assert_eq!(found, vec![0, 3, 6, 8, 9]);
+        let clear: Vec<u64> = (0..11)
+            .filter_map(|k| view.select_zero_from(0, k))
+            .collect();
+        assert_eq!(clear, vec![1, 2, 4, 5, 7, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(view.select_zero_from(8, 0), Some(10));
+        assert_eq!(view.select_zero_from(0, 11), None);
+        // Bits past a short bitmap's end are neither set nor clear.
+        let short = BitmapView::new(&bytes, 10).unwrap();
+        assert_eq!(short.select_zero_from(8, 0), None);
         assert_eq!(view.select_from(8, 0), Some(8));
         assert_eq!(view.select_from(0, 5), None);
     }

@@ -5,10 +5,13 @@
 # behaves as it does on a workstation. The price is that one pod at a time can
 # mount it, which is why the Deployment uses the Recreate strategy.
 #
-# 500Gi holds one version of every knowledge graph with room to spare: the
-# latest-tag HDTs total about 88 GB and a bundle is roughly three times its HDT.
-# Grow it in place by raising `storage`; pd-ssd read IOPS scale with size, so a
-# larger disk is also a faster one.
+# The latest-tag HDTs total about 88 GB and a bundle is roughly three times its
+# HDT, but that is one version of each graph and the root holds more: the sync
+# never deletes a version it has fetched, so the root grows with every release,
+# not only with the number of graphs. 1Ti leaves room for that. Grow it in place
+# by raising `storage`; pd-ssd read IOPS scale with size, so a larger disk is
+# also a faster one. It cannot shrink: a smaller disk is a new PVC and a full
+# resync.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -22,4 +25,4 @@ spec:
   storageClassName: premium-rwo
   resources:
     requests:
-      storage: 500Gi
+      storage: 1Ti

@@ -23,6 +23,16 @@ const CONFIG: &str = concat!(
     "  roles: {label: ['http://www.w3.org/2000/01/rdf-schema#label']}\n",
 );
 
+/// The worked example of `notes/graphs.md`: three distinct triples, five
+/// memberships, two named graphs and two statements that carried no graph.
+const QUADS: &str = concat!(
+    "<http://example.org/a> <http://example.org/b> <http://example.org/c> .\n",
+    "<http://example.org/a> <http://example.org/b> <http://example.org/c> <http://example.org/g1> .\n",
+    "<http://example.org/a> <http://example.org/b> <http://example.org/d> .\n",
+    "<http://example.org/x> <http://example.org/y> <http://example.org/z> <http://example.org/g1> .\n",
+    "<http://example.org/x> <http://example.org/y> <http://example.org/z> <http://example.org/g2> .\n",
+);
+
 const SOURCE: &str = concat!(
     "<http://example.org/alice> <http://www.w3.org/2000/01/rdf-schema#label> \"Alice\" .\n",
     "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .\n",
@@ -921,21 +931,85 @@ fn the_documented_config_sample_parses() {
     );
 }
 
-/// The component DAG is not built here, and a config that declares one is
-/// refused with that reason rather than with "unknown field". The
-/// failure mode this prevents is quiet: a bundle whose config named components
-/// and whose artifacts contain none would be described as an ordinary bundle,
-/// with every per-component statistic and graph identity silently absent.
+/// Declaring a component is supported; building one from a recipe is the
+/// component DAG, which this build does not run. A config carrying a recipe is
+/// refused with that reason rather than half-obeyed, and so is `publish`, which
+/// selects what such a DAG would merge.
 #[test]
-fn a_config_declaring_components_is_refused_with_a_reason() {
-    for field in ["components", "publish"] {
+fn a_component_recipe_is_refused_and_a_declaration_is_not() {
+    let declared = concat!(
+        "components:\n",
+        "  asserted: {role: source, graph: 'http://example.org/g1'}\n",
+        "  closure: {role: entailment, graph: 'http://example.org/g2', inputs: [asserted]}\n",
+    );
+    let plan = kgf(
+        &["build", "--config", "-", "--check-config"],
+        &format!("{MINIMAL}{declared}"),
+    )
+    .ok();
+    let plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
+    assert_eq!(plan["components"][0]["id"], "asserted");
+    assert_eq!(plan["components"][0]["role"], "source");
+    assert_eq!(plan["components"][1]["inputs"][0], "asserted");
+
+    // Several sources and no nomination is a dataset of several parts, none
+    // canonical, so nothing is nominated on the publisher's behalf.
+    let plan = kgf(
+        &["build", "--config", "-", "--check-config"],
+        &format!(
+            "{MINIMAL}{}",
+            concat!(
+                "components:\n",
+                "  a: {role: source, graph: 'http://example.org/g1'}\n",
+                "  b: {role: source, graph: 'http://example.org/g2'}\n",
+            )
+        ),
+    )
+    .ok();
+    let plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
+    assert_eq!(plan["components"].as_array().unwrap().len(), 2);
+    assert!(plan.get("design").is_none(), "{plan}");
+
+    // A recipe names the DAG this build has no orchestrator for.
+    for recipe in ["files: [kg.nt.gz]", "tool: {argv: [owl-rl]}"] {
         let stderr = kgf(
             &["build", "--config", "-", "--check-config"],
-            &format!("{MINIMAL}{field}: []\n"),
+            &format!("{MINIMAL}components:\n  canonical: {{role: source, {recipe}}}\n"),
         )
         .err();
-        assert!(stderr.contains("no component DAG"), "{field}: {stderr}");
-        assert!(stderr.contains("--input"), "{field}: {stderr}");
+        assert!(
+            stderr.contains("component DAG this build does not run"),
+            "{stderr}"
+        );
+    }
+    let stderr = kgf(
+        &["build", "--config", "-", "--check-config"],
+        &format!("{MINIMAL}publish: [canonical]\n"),
+    )
+    .err();
+    assert!(stderr.contains("runs no DAG"), "{stderr}");
+
+    // What a declaration must be internally consistent about.
+    for (config, expected) in [
+        (
+            "components:\n  a: {role: nonsense, graph: 'http://example.org/g1'}\n",
+            "use `source`",
+        ),
+        (
+            "components:\n  a: {role: source, inputs: [missing]}\n",
+            "which no component declares",
+        ),
+        (
+            "components:\n  a: {role: source, graph: 'not an iri'}\n",
+            "not an absolute IRI",
+        ),
+    ] {
+        let stderr = kgf(
+            &["build", "--config", "-", "--check-config"],
+            &format!("{MINIMAL}{config}"),
+        )
+        .err();
+        assert!(stderr.contains(expected), "{config}: {stderr}");
     }
 }
 
@@ -1022,4 +1096,1335 @@ fn kgf(args: &[&str], stdin: &str) -> Run {
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         status: output.status,
     }
+}
+
+/// RDF written in a quad syntax keeps its graphs, and RDF that is not does not
+/// acquire a sidecar holding one layer. Neither needs a config key: the input
+/// says which it is.
+#[test]
+fn a_quad_source_keeps_its_graphs_and_a_triple_source_carries_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let quads = dir.path().join("tiny.nq");
+    std::fs::write(&quads, QUADS).unwrap();
+    let triples = dir.path().join("tiny.nt");
+    std::fs::write(&triples, SOURCE).unwrap();
+
+    let with_graphs = dir.path().join("root/tinykg/quads");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&with_graphs),
+            "--input",
+            path(&quads),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    for entry in ["data.hdt.graphs", "data.hdt.graphs.idx"] {
+        assert!(with_graphs.join(entry).exists(), "missing {entry}");
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(with_graphs.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        manifest["capabilities"]
+            .as_object()
+            .unwrap()
+            .contains_key("graphs"),
+        "{manifest}"
+    );
+    // Described like every other artifact, so `content_digest` covers both.
+    for artifact in ["data.hdt.graphs", "data.hdt.graphs.idx"] {
+        assert!(
+            manifest["artifacts"][artifact]["sha256"].is_string(),
+            "{artifact} is not described"
+        );
+    }
+    kgf(&["manifest", path(&with_graphs), "--check"], "").ok();
+
+    let without = dir.path().join("root/tinykg/triples");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&without),
+            "--input",
+            path(&triples),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(!without.join("data.hdt.graphs").exists());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(without.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        !manifest["capabilities"]
+            .as_object()
+            .unwrap()
+            .contains_key("graphs"),
+        "{manifest}"
+    );
+}
+
+/// Dropping a quad source's graphs into the union is a thing to be able to
+/// say, and `contents.graphs.enabled: false` is how it is said.
+#[test]
+fn a_quad_source_built_as_triples_drops_its_graphs_deliberately() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!("{CONFIG}contents:\n  graphs: {{enabled: false}}\n"),
+    )
+    .ok();
+    assert!(!out.join("data.hdt.graphs").exists());
+    // The union is still every distinct triple of the quad source.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["counts"]["triples"], 3);
+}
+
+/// An HDT carries its memberships in the sidecar beside it or not at all, so a
+/// config that asks for them where there are none is refused rather than
+/// publishing a bundle whose graphs went missing on the way in.
+#[test]
+fn memberships_from_an_hdt_come_from_the_sidecar_beside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let quads = dir.path().join("tiny.nq");
+    std::fs::write(&quads, QUADS).unwrap();
+    let triples = dir.path().join("tiny.nt");
+    std::fs::write(&triples, SOURCE).unwrap();
+
+    // Two bundles to take HDTs from: one with memberships, one without.
+    let staged_quads = dir.path().join("staging/tinykg/quads");
+    let staged_triples = dir.path().join("staging/tinykg/triples");
+    for (out, input) in [(&staged_quads, &quads), (&staged_triples, &triples)] {
+        kgf(
+            &[
+                "build",
+                "--config",
+                "-",
+                "--out",
+                path(out),
+                "--input",
+                path(input),
+                "--hdtc",
+                &hdtc(),
+            ],
+            CONFIG,
+        )
+        .ok();
+    }
+
+    // The sidecar beside the HDT is found without being asked for, copied, and
+    // indexed for this server's position spaces.
+    let adopted = dir.path().join("root/tinykg/adopted");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&adopted),
+            "--hdt",
+            path(&staged_quads.join("data.hdt")),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(adopted.join("data.hdt.graphs").exists());
+    assert!(adopted.join("data.hdt.graphs.idx").exists());
+    kgf(&["manifest", path(&adopted), "--check"], "").ok();
+
+    // Asking for them where the input has none names the file it looked for.
+    let refused = dir.path().join("root/tinykg/refused");
+    let stderr = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&refused),
+            "--hdt",
+            path(&staged_triples.join("data.hdt")),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!("{CONFIG}contents:\n  graphs: {{enabled: true}}\n"),
+    )
+    .err();
+    assert!(stderr.contains("data.hdt.graphs"), "{stderr}");
+    assert!(!refused.exists(), "nothing is published on a refusal");
+}
+
+/// The two reserved names have fixed meanings across the federation, so a
+/// source that uses one as a graph name is refused — and refused as soon as
+/// the sidecar exists, before the expensive steps run.
+#[test]
+fn a_source_naming_a_reserved_graph_is_refused_before_the_bundle_is_built() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("reserved.nq");
+    std::fs::write(
+        &source,
+        "<http://example.org/a> <http://example.org/b> <http://example.org/c> \
+         <urn:x-kgf:union> .\n",
+    )
+    .unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+
+    let stderr = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .err();
+    assert!(stderr.contains("urn:x-kgf:union"), "{stderr}");
+    assert!(!out.exists(), "nothing is published on a refusal");
+    let siblings: Vec<_> = std::fs::read_dir(out.parent().unwrap())
+        .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    assert!(siblings.is_empty(), "staging was left behind: {siblings:?}");
+}
+
+/// The transpose follows the number of graphs when the config does not state
+/// it: the `g` column costs one lookup per row with it and one probe per graph
+/// without, and its own size grows with the memberships it copies.
+#[test]
+fn the_membership_transpose_follows_the_number_of_graphs() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("many.nq");
+    let mut quads = String::new();
+    for graph in 0..40 {
+        quads.push_str(&format!(
+            "<http://example.org/s{graph}> <http://example.org/p> \
+             <http://example.org/o> <http://example.org/g{graph}> .\n"
+        ));
+    }
+    std::fs::write(&source, &quads).unwrap();
+
+    let index_bytes = |out: &Path, config: &str| -> u64 {
+        kgf(
+            &[
+                "build",
+                "--config",
+                "-",
+                "--out",
+                path(out),
+                "--input",
+                path(&source),
+                "--hdtc",
+                &hdtc(),
+            ],
+            config,
+        )
+        .ok();
+        std::fs::metadata(out.join("data.hdt.graphs.idx"))
+            .expect("an indexed bundle")
+            .len()
+    };
+
+    let follows = index_bytes(&dir.path().join("root/tinykg/follows"), CONFIG);
+    let stated = index_bytes(
+        &dir.path().join("root/tinykg/stated"),
+        &format!("{CONFIG}contents:\n  graphs: {{transpose: false}}\n"),
+    );
+    assert!(
+        follows > stated,
+        "40 graphs is over the threshold, so the index carries the \
+         transpose: {follows} bytes against {stated}"
+    );
+
+    // And below it the other way round: the worked example's two graphs are
+    // cheap to probe, so an unset key builds no transpose and asking for one
+    // builds it.
+    let small = dir.path().join("small.nq");
+    std::fs::write(&small, QUADS).unwrap();
+    let index_of = |out: &Path, config: &str| -> u64 {
+        kgf(
+            &[
+                "build",
+                "--config",
+                "-",
+                "--out",
+                path(out),
+                "--input",
+                path(&small),
+                "--hdtc",
+                &hdtc(),
+            ],
+            config,
+        )
+        .ok();
+        std::fs::metadata(out.join("data.hdt.graphs.idx"))
+            .expect("an indexed bundle")
+            .len()
+    };
+    let bare = index_of(&dir.path().join("root/tinykg/bare"), CONFIG);
+    let asked = index_of(
+        &dir.path().join("root/tinykg/asked"),
+        &format!("{CONFIG}contents:\n  graphs: {{transpose: true}}\n"),
+    );
+    assert!(
+        asked > bare,
+        "two graphs are under the threshold, so the transpose is built only \
+         when asked for: {asked} bytes against {bare}"
+    );
+}
+
+/// A bundle with memberships is described one graph at a time as well as
+/// whole: one view per graph in each of the three projections, named after the
+/// graph, and one entry per graph in the persisted summary.
+#[test]
+fn a_quad_bundle_is_described_one_graph_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+
+    // Every projection declares the same views, because a view a bundle
+    // cannot answer in all three is one no request can select — even where the
+    // projection has no rows to put in it, as the typed ones do not here.
+    let expected = [
+        "design",
+        "queryable",
+        "graph:http://example.org/g1",
+        "graph:http://example.org/g2",
+        "graph:urn:x-kgf:unnamed",
+    ];
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    for artifact in [
+        "stats/schema-nodes.tsv",
+        "stats/class-relations.tsv",
+        "stats/class-properties.tsv",
+    ] {
+        let declared = manifest["artifacts"][artifact]["views"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{artifact} declares no views"));
+        for view in expected {
+            assert!(
+                declared.contains_key(view),
+                "{artifact} has no range for {view}"
+            );
+        }
+    }
+    // The rows are laid out in the order a mapped bundle walks the views, and
+    // `--check` walks them: rows that are not where the manifest says fail.
+    assert_eq!(views_of(&out, "stats/schema-nodes.tsv"), expected);
+    kgf(&["manifest", path(&out), "--check"], "").ok();
+
+    // The summary names each graph with its own counts, which sum to more than
+    // the dataset's three triples because one triple is in two graphs.
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("stats/summary.json")).unwrap()).unwrap();
+    let graphs: Vec<(String, u64)> = summary["graphs"]
+        .as_array()
+        .expect("a quad bundle's summary names its graphs")
+        .iter()
+        .map(|entry| {
+            (
+                entry["graph"].as_str().unwrap().to_owned(),
+                entry["counts"]["triples"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    // Ranked by size like every other list on the card, which is a different
+    // order from `/graphs`'s complete listing by layer id.
+    assert_eq!(
+        graphs,
+        vec![
+            ("http://example.org/g1".to_owned(), 2),
+            ("urn:x-kgf:unnamed".to_owned(), 2),
+            ("http://example.org/g2".to_owned(), 1),
+        ]
+    );
+    assert_eq!(summary["graphs_total"], 3);
+    assert_eq!(summary["counts"]["triples"], 3);
+
+    // A bundle without memberships has nothing to say there and says nothing.
+    let triples = dir.path().join("tiny.nt");
+    std::fs::write(&triples, SOURCE).unwrap();
+    let plain = dir.path().join("root/tinykg/plain");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&plain),
+            "--input",
+            path(&triples),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(plain.join("stats/summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["graphs"], serde_json::json!([]));
+    assert_eq!(
+        views_of(&plain, "stats/schema-nodes.tsv"),
+        ["design", "queryable"]
+    );
+}
+
+/// The distinct view names of one projection, in file order.
+fn views_of(bundle: &Path, artifact: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(bundle.join(artifact)).expect(artifact);
+    let mut names: Vec<String> = text
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').next().unwrap().to_owned())
+        .collect();
+    names.dedup();
+    names
+}
+
+/// `--adopt` releases the memberships it took and leaves alone the ones it
+/// did not: a build that deliberately dropped a quad source's graphs must not
+/// delete the only copy of them on its way out.
+#[test]
+fn adopt_releases_the_sidecar_only_when_the_bundle_took_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+
+    let staged = |name: &str| -> std::path::PathBuf {
+        let out = dir.path().join(format!("staging/tinykg/{name}"));
+        kgf(
+            &[
+                "build",
+                "--config",
+                "-",
+                "--out",
+                path(&out),
+                "--input",
+                path(&source),
+                "--hdtc",
+                &hdtc(),
+            ],
+            CONFIG,
+        )
+        .ok();
+        out
+    };
+
+    // Dropped deliberately: the bundle has no memberships, and the input keeps
+    // the only copy of the ones it arrived with.
+    let kept = staged("kept");
+    let out = dir.path().join("root/tinykg/dropped");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--hdt",
+            path(&kept.join("data.hdt")),
+            "--adopt",
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!("{CONFIG}contents:\n  graphs: {{enabled: false}}\n"),
+    )
+    .ok();
+    assert!(!out.join("data.hdt.graphs").exists());
+    assert!(!kept.join("data.hdt").exists(), "--adopt keeps its promise");
+    assert!(
+        kept.join("data.hdt.graphs").exists(),
+        "a build that dropped the graphs must not delete them"
+    );
+
+    // Taken: both files move, and neither is left binding to nothing.
+    let taken = staged("taken");
+    let out = dir.path().join("root/tinykg/taken");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--hdt",
+            path(&taken.join("data.hdt")),
+            "--adopt",
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(out.join("data.hdt.graphs").exists());
+    assert!(!taken.join("data.hdt").exists());
+    assert!(!taken.join("data.hdt.graphs").exists());
+}
+
+/// What a file name says about its syntax is the builder's own classification,
+/// and a directory's name says nothing at all.
+#[test]
+fn the_input_decides_memberships_unless_it_cannot_say() {
+    let dir = tempfile::tempdir().unwrap();
+    // JSON-LD names graphs with `@graph`, so a bundle built from one keeps
+    // them without being asked to.
+    let jsonld = dir.path().join("tiny.jsonld");
+    std::fs::write(
+        &jsonld,
+        "{\"@graph\": [{\"@id\": \"http://example.org/g1\", \"@graph\": \
+         [{\"@id\": \"http://example.org/a\", \"http://example.org/b\": \
+         {\"@id\": \"http://example.org/c\"}}]}]}",
+    )
+    .unwrap();
+    let out = dir.path().join("root/tinykg/jsonld");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&jsonld),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(
+        out.join("data.hdt.graphs").exists(),
+        "JSON-LD carries graphs"
+    );
+
+    // A directory is not an input at all: it has no digest for the manifest
+    // and no syntax to read graphs from, and the refusal says so before
+    // anything is built.
+    let inputs = dir.path().join("inputs");
+    std::fs::create_dir(&inputs).unwrap();
+    std::fs::copy(&jsonld, inputs.join("tiny.jsonld")).unwrap();
+    let stderr = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&dir.path().join("root/tinykg/dir")),
+            "--input",
+            path(&inputs),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .err();
+    assert!(stderr.contains("is a directory"), "{stderr}");
+
+    // `enabled: true` over triples RDF builds the sidecar the config asked
+    // for, holding one layer: every statement carried no graph.
+    let triples = dir.path().join("tiny.nt");
+    std::fs::write(&triples, SOURCE).unwrap();
+    let out = dir.path().join("root/tinykg/asked");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&triples),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!("{CONFIG}contents:\n  graphs: {{enabled: true}}\n"),
+    )
+    .ok();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        manifest["capabilities"]
+            .as_object()
+            .unwrap()
+            .contains_key("graphs"),
+        "{manifest}"
+    );
+    let graphs: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("stats/summary.json")).unwrap()).unwrap();
+    assert_eq!(
+        graphs["graphs"][0]["graph"], "urn:x-kgf:unnamed",
+        "one layer, and it is the unnamed graph"
+    );
+}
+
+/// A graph named by a blank node has no IRI to name a description view after,
+/// and the analysis cannot say which bare subset is which. The bundle builds,
+/// carries every graph, and describes the ones that can be told apart.
+#[test]
+fn a_blank_named_graph_is_carried_without_being_described() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("blank.nq");
+    std::fs::write(
+        &source,
+        concat!(
+            "<http://example.org/a> <http://example.org/b> <http://example.org/c> _:g .\n",
+            "<http://example.org/a> <http://example.org/b> <http://example.org/d> .\n",
+            "<http://example.org/x> <http://example.org/y> <http://example.org/z> \
+             <http://example.org/g1> .\n",
+        ),
+    )
+    .unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+
+    // Every graph is carried: the memberships are complete, whatever the
+    // description can name.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        manifest["capabilities"]
+            .as_object()
+            .unwrap()
+            .contains_key("graphs"),
+        "{manifest}"
+    );
+
+    // Described: the graph with an IRI, and neither of the two subsets that
+    // cannot be told apart — the unnamed graph's and the blank one's.
+    assert_eq!(
+        views_of(&out, "stats/schema-nodes.tsv"),
+        ["design", "queryable", "graph:http://example.org/g1"]
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("stats/summary.json")).unwrap()).unwrap();
+    let graphs: Vec<String> = summary["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["graph"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(graphs, ["http://example.org/g1"]);
+    kgf(&["manifest", path(&out), "--check"], "").ok();
+}
+
+/// One view per graph is a whole schema projection per graph, in each of the
+/// three artifacts and in the manifest range that declares it, so a bundle
+/// split into many graphs stops describing them one by one.
+#[test]
+fn per_graph_description_follows_the_number_of_graphs() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("many.nq");
+    let graphs = 300;
+    let mut quads = String::new();
+    for graph in 0..graphs {
+        quads.push_str(&format!(
+            "<http://example.org/s{graph}> <http://example.org/p> \
+             <http://example.org/o> <http://example.org/g{graph:04}> .\n"
+        ));
+    }
+    std::fs::write(&source, &quads).unwrap();
+    let build = |out: &Path, config: &str, input: &Path| {
+        kgf(
+            &[
+                "build",
+                "--config",
+                "-",
+                "--out",
+                path(out),
+                "--input",
+                path(input),
+                "--hdtc",
+                &hdtc(),
+            ],
+            config,
+        )
+        .ok();
+    };
+
+    // Three hundred graphs is over the line: the memberships are all there and
+    // the per-graph views are not.
+    let many = dir.path().join("root/tinykg/many");
+    build(&many, CONFIG, &source);
+    assert!(many.join("data.hdt.graphs").exists());
+    assert_eq!(
+        views_of(&many, "stats/schema-nodes.tsv"),
+        ["design", "queryable"]
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(many.join("stats/summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["graphs"], serde_json::json!([]));
+    kgf(&["manifest", path(&many), "--check"], "").ok();
+
+    // A bundle that knows better says so, and gets a view for every graph.
+    let asked = dir.path().join("root/tinykg/asked");
+    build(
+        &asked,
+        &format!("{CONFIG}contents:\n  graphs: {{describe: true}}\n"),
+        &source,
+    );
+    assert_eq!(views_of(&asked, "stats/schema-nodes.tsv").len(), graphs + 2);
+    // The card stays a card: the largest few, and the total beside them.
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(asked.join("stats/summary.json")).unwrap()).unwrap();
+    assert_eq!(summary["graphs"].as_array().unwrap().len(), 10);
+    assert_eq!(summary["graphs_total"], graphs);
+    kgf(&["manifest", path(&asked), "--check"], "").ok();
+
+    // And the other way: a small bundle that does not want them.
+    let small = dir.path().join("small.nq");
+    std::fs::write(&small, QUADS).unwrap();
+    let declined = dir.path().join("root/tinykg/declined");
+    build(
+        &declined,
+        &format!("{CONFIG}contents:\n  graphs: {{describe: false}}\n"),
+        &small,
+    );
+    assert!(declined.join("data.hdt.graphs").exists());
+    assert_eq!(
+        views_of(&declined, "stats/schema-nodes.tsv"),
+        ["design", "queryable"]
+    );
+}
+
+/// A permutation index beside an HDT input is taken rather than rebuilt, which
+/// is what makes a second opinion about the rest of the bundle affordable:
+/// building one over a large graph is the hours in a build.
+#[test]
+fn a_permutation_index_beside_the_input_is_taken_rather_than_rebuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+
+    // A first bundle, to take an HDT and its two companions from.
+    let staged = dir.path().join("staging/tinykg/v0");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&staged),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    let hdt = staged.join("data.hdt");
+    assert!(staged.join("data.hdt.perm").exists());
+
+    // The rehearsal says what the build will really do: no permutation step.
+    let rehearsal = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&dir.path().join("root/tinykg/rehearsed")),
+            "--hdt",
+            path(&hdt),
+            "--hdtc",
+            &hdtc(),
+            "--dry-run",
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(
+        !rehearsal.contains("hdtc perm"),
+        "an index beside the input is not rebuilt:\n{rehearsal}"
+    );
+    assert!(
+        rehearsal.contains("data.hdt.perm beside it"),
+        "the rehearsal says it is taken:\n{rehearsal}"
+    );
+
+    // And the build produces a bundle that checks, with the permutation and
+    // the memberships both taken from beside the input.
+    let out = dir.path().join("root/tinykg/taken");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--hdt",
+            path(&hdt),
+            "--adopt",
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    for artifact in ["data.hdt", "data.hdt.perm", "data.hdt.graphs"] {
+        assert!(out.join(artifact).exists(), "missing {artifact}");
+    }
+    kgf(&["manifest", path(&out), "--check"], "").ok();
+    // `--adopt` released everything it took, and nothing it did not: the graph
+    // index was rebuilt here, so the input's own copy stays where it was.
+    assert!(!hdt.exists());
+    assert!(!staged.join("data.hdt.perm").exists());
+    assert!(!staged.join("data.hdt.graphs").exists());
+    assert!(staged.join("data.hdt.graphs.idx").exists());
+
+    // An index that lacks a map the config asks for cannot serve as this
+    // bundle's, and the refusal names the two ways out.
+    let plain = dir.path().join("staging/tinykg/v1");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&plain),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    let stderr = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&dir.path().join("root/tinykg/mapped")),
+            "--hdt",
+            path(&plain.join("data.hdt")),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!("{CONFIG}contents:\n  perm: {{position_maps: [pos]}}\n"),
+    )
+    .err();
+    assert!(stderr.contains("position_maps"), "{stderr}");
+    assert!(stderr.contains("Remove that index"), "{stderr}");
+}
+
+/// A declared component is described under its own id, and the canonical one
+/// becomes the design view — which is the whole point on a bundle whose merged
+/// graph is mostly derived triples.
+#[test]
+fn a_declared_component_is_described_under_its_id_and_becomes_the_design_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+    let config = concat!(
+        "components:\n",
+        "  asserted: {role: source, graph: 'http://example.org/g1'}\n",
+        "  closure: {role: entailment, graph: 'http://example.org/g2', inputs: [asserted]}\n",
+    );
+
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!("{CONFIG}{config}"),
+    )
+    .ok();
+
+    // A graph a component claims is described under the component's id; the
+    // graph nothing claims keeps its own IRI.
+    assert_eq!(
+        views_of(&out, "stats/schema-nodes.tsv"),
+        [
+            "design",
+            "queryable",
+            "component:asserted",
+            "component:closure",
+            "graph:urn:x-kgf:unnamed",
+        ]
+    );
+
+    // The design view is the canonical component's, not a copy of queryable:
+    // `g1` holds two of the three distinct triples.
+    let rows = |view: &str| -> Vec<String> {
+        std::fs::read_to_string(out.join("stats/schema-nodes.tsv"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix(&format!("{view}\t")).map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(rows("design"), rows("component:asserted"));
+    assert_ne!(rows("design"), rows("queryable"));
+
+    // The manifest records what was declared, and the summary names each
+    // graph's component.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["components"][0]["id"], "asserted");
+    assert_eq!(manifest["components"][0]["graph"], "http://example.org/g1");
+    assert_eq!(manifest["components"][1]["role"], "entailment");
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("stats/summary.json")).unwrap()).unwrap();
+    let claimed: Vec<(String, Option<String>)> = summary["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["graph"].as_str().unwrap().to_owned(),
+                entry["component"].as_str().map(str::to_owned),
+            )
+        })
+        .collect();
+    assert_eq!(
+        claimed,
+        vec![
+            (
+                "http://example.org/g1".to_owned(),
+                Some("asserted".to_owned())
+            ),
+            ("urn:x-kgf:unnamed".to_owned(), None),
+            (
+                "http://example.org/g2".to_owned(),
+                Some("closure".to_owned())
+            ),
+        ]
+    );
+    kgf(&["manifest", path(&out), "--check"], "").ok();
+
+    // The design view follows a nomination where there is one. `g2` holds one
+    // of the three distinct triples, and nominating it moves design there.
+    let nominated = dir.path().join("root/tinykg/nominated");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&nominated),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!("{CONFIG}{config}design: closure\n"),
+    )
+    .ok();
+    let rows = |bundle: &Path, view: &str| -> Vec<String> {
+        std::fs::read_to_string(bundle.join("stats/schema-nodes.tsv"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix(&format!("{view}\t")).map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(
+        rows(&nominated, "design"),
+        rows(&nominated, "component:closure"),
+        "the nominated component is the design view"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(nominated.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["design"], "closure");
+    kgf(&["manifest", path(&nominated), "--check"], "").ok();
+
+    // A nomination has to name a component that has triples to describe.
+    for (extra, expected) in [
+        ("design: nobody\n", "names no declared component"),
+        (
+            "components:\n  loose: {role: derived}\ndesign: loose\n",
+            "no graph",
+        ),
+    ] {
+        let stderr = kgf(
+            &["build", "--config", "-", "--check-config"],
+            &format!("{MINIMAL}{extra}"),
+        )
+        .err();
+        assert!(stderr.contains(expected), "{extra}: {stderr}");
+    }
+
+    // A component naming a graph the data does not carry is refused, and
+    // nothing is published.
+    let refused = dir.path().join("root/tinykg/refused");
+    let stderr = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&refused),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        &format!(
+            "{CONFIG}components:\n  ghost: {{role: source, graph: 'http://example.org/nope'}}\n"
+        ),
+    )
+    .err();
+    assert!(stderr.contains("is not one this bundle holds"), "{stderr}");
+    assert!(!refused.exists());
+}
+
+/// Build `source` into `out` under `config`, as the tests below all do.
+fn build_quads(out: &Path, config: &str, source: &Path) -> Run {
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(out),
+            "--input",
+            path(source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        config,
+    )
+}
+
+/// The design view is its component's own subset. A build that will not
+/// describe that component's graph has nothing to project it from, and
+/// publishing the union there instead would describe the whole dataset under
+/// the component's name — so it is refused, and says which of the two to drop.
+#[test]
+fn a_design_component_the_build_would_not_describe_is_refused() {
+    let components = concat!(
+        "components:\n",
+        "  asserted: {role: source, graph: 'http://example.org/g1'}\n",
+        "  closure: {role: entailment, graph: 'http://example.org/g2', inputs: [asserted]}\n",
+    );
+    let declined = "contents:\n  graphs: {describe: false}\n";
+
+    // Stated in the config, so refused before anything is built — for the
+    // canonical component the design view defaults to, and for a nominated one.
+    let stderr = kgf(
+        &["build", "--config", "-", "--check-config"],
+        &format!("{MINIMAL}{components}{declined}"),
+    )
+    .err();
+    assert!(
+        stderr.contains("component \"asserted\"")
+            && stderr.contains("canonical component")
+            && stderr.contains("contents.graphs.describe: false"),
+        "{stderr}"
+    );
+    let stderr = kgf(
+        &["build", "--config", "-", "--check-config"],
+        &format!("{MINIMAL}{components}design: closure\n{declined}"),
+    )
+    .err();
+    assert!(
+        stderr.contains("component \"closure\"") && stderr.contains("`design: closure`"),
+        "{stderr}"
+    );
+
+    // A component with no graph is not a subset anything could describe, so
+    // declining the per-graph views costs it nothing.
+    kgf(
+        &["build", "--config", "-", "--check-config"],
+        &format!("{MINIMAL}components:\n  asserted: {{role: source}}\n{declined}"),
+    )
+    .ok();
+
+    // Past the threshold the sidecar decides, so the refusal comes once it has
+    // said how many graphs there are — and still before anything is published.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("many.nq");
+    let mut quads = String::new();
+    for graph in 0..300 {
+        quads.push_str(&format!(
+            "<http://example.org/s{graph}> <http://example.org/p> \
+             <http://example.org/o> <http://example.org/g{graph:04}> .\n"
+        ));
+    }
+    std::fs::write(&source, &quads).unwrap();
+    let out = dir.path().join("root/tinykg/many");
+    let stderr = build_quads(
+        &out,
+        &format!(
+            "{CONFIG}components:\n  first: {{role: source, graph: 'http://example.org/g0000'}}\n"
+        ),
+        &source,
+    )
+    .err();
+    assert!(
+        stderr.contains("holds 300 graphs") && stderr.contains("contents.graphs.describe: true"),
+        "{stderr}"
+    );
+    assert!(!out.exists());
+
+    // Saying so outright describes every graph, the design component's too.
+    let asked = dir.path().join("root/tinykg/asked");
+    build_quads(
+        &asked,
+        &format!(
+            "{CONFIG}components:\n  first: {{role: source, graph: 'http://example.org/g0000'}}\n\
+             contents:\n  graphs: {{describe: true}}\n"
+        ),
+        &source,
+    )
+    .ok();
+    kgf(&["manifest", path(&asked), "--check"], "").ok();
+}
+
+/// Declaring only a derived part of a dataset leaves no component to be the
+/// design view. The design view then describes the dataset itself, as it does
+/// for a bundle declaring no components at all, and the derived part is
+/// described under its own id beside it.
+#[test]
+fn a_derived_component_alone_leaves_the_design_view_the_dataset() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+    build_quads(
+        &out,
+        &format!(
+            "{CONFIG}components:\n  closure: {{role: entailment, graph: 'http://example.org/g2'}}\n"
+        ),
+        &source,
+    )
+    .ok();
+
+    assert_eq!(
+        views_of(&out, "stats/schema-nodes.tsv"),
+        [
+            "design",
+            "queryable",
+            "component:closure",
+            "graph:http://example.org/g1",
+            "graph:urn:x-kgf:unnamed",
+        ]
+    );
+    let rows = |view: &str| -> Vec<String> {
+        std::fs::read_to_string(out.join("stats/schema-nodes.tsv"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix(&format!("{view}\t")).map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(rows("design"), rows("queryable"));
+    assert_ne!(rows("design"), rows("component:closure"));
+    kgf(&["manifest", path(&out), "--check"], "").ok();
+}
+
+/// A dataset assembled from several contributed parts declares each as a
+/// source, and with none nominated none is canonical. The design view is the
+/// dataset itself, and each part is described under its own id.
+#[test]
+fn several_source_components_leave_the_design_view_the_dataset() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+    build_quads(
+        &out,
+        &format!(
+            "{CONFIG}components:\n  \
+             first: {{role: source, graph: 'http://example.org/g1'}}\n  \
+             second: {{role: source, graph: 'http://example.org/g2'}}\n"
+        ),
+        &source,
+    )
+    .ok();
+
+    assert_eq!(
+        views_of(&out, "stats/schema-nodes.tsv"),
+        [
+            "design",
+            "queryable",
+            "component:first",
+            "component:second",
+            "graph:urn:x-kgf:unnamed",
+        ]
+    );
+    let rows = |view: &str| -> Vec<String> {
+        std::fs::read_to_string(out.join("stats/schema-nodes.tsv"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix(&format!("{view}\t")).map(str::to_owned))
+            .collect()
+    };
+    assert_eq!(rows("design"), rows("queryable"));
+    assert_ne!(rows("design"), rows("component:first"));
+    assert_ne!(rows("design"), rows("component:second"));
+    kgf(&["manifest", path(&out), "--check"], "").ok();
+}
+
+/// Statistics computed one graph at a time read the memberships as well as
+/// the HDT, so the sidecar is a parent of `stats/void.hdt`. That is what makes
+/// regenerating the manifest notice a sidecar replaced under the statistics:
+/// the union can be byte for byte the same while every graph holds something
+/// else.
+#[test]
+fn per_graph_statistics_name_the_memberships_they_were_computed_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+    build_quads(&out, CONFIG, &source).ok();
+
+    let parents = |bundle: &Path| -> serde_json::Value {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+        manifest["artifacts"]["stats/void.hdt"]["parents"].clone()
+    };
+    assert_eq!(
+        parents(&out),
+        serde_json::json!(["data.hdt", "data.hdt.graphs"])
+    );
+
+    // Statistics that describe no graph on their own read no memberships.
+    let declined = dir.path().join("root/tinykg/declined");
+    build_quads(
+        &declined,
+        &format!("{CONFIG}contents:\n  graphs: {{describe: false}}\n"),
+        &source,
+    )
+    .ok();
+    assert_eq!(parents(&declined), serde_json::json!(["data.hdt"]));
+
+    // The same three triples, grouped differently: `g1` and `g2` trade the
+    // triple they do not share.
+    let regrouped_source = dir.path().join("regrouped.nq");
+    std::fs::write(
+        &regrouped_source,
+        QUADS.replace(
+            "<http://example.org/c> <http://example.org/g1>",
+            "<http://example.org/c> <http://example.org/g2>",
+        ),
+    )
+    .unwrap();
+    let regrouped = dir.path().join("root/tinykg/regrouped");
+    build_quads(&regrouped, CONFIG, &regrouped_source).ok();
+    assert_ne!(
+        sha256(&out.join("data.hdt.graphs")),
+        sha256(&regrouped.join("data.hdt.graphs")),
+        "the two builds must disagree about the memberships"
+    );
+
+    // Swapped under statistics that still describe the first grouping, the
+    // new pair binds to the unchanged union and opens — and regeneration
+    // refuses to carry the old statistics over it.
+    for artifact in ["data.hdt.graphs", "data.hdt.graphs.idx"] {
+        std::fs::copy(regrouped.join(artifact), out.join(artifact)).unwrap();
+    }
+    let stderr = kgf(&["manifest", path(&out)], "").err();
+    assert!(
+        stderr.contains("its parent data.hdt.graphs changed"),
+        "{stderr}"
+    );
+}
+
+/// A graph index names the sidecar it was built from by digest, and a server
+/// takes that digest as the sidecar's identity — it scopes the IRIs of graphs
+/// named by blank nodes. An index built from another sidecar with the same
+/// counts passes every check an open can afford, so the manifest, which hashes
+/// the sidecar anyway, compares the two.
+#[test]
+fn a_graph_index_from_another_sidecar_is_refused_even_when_the_counts_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tiny.nq");
+    std::fs::write(&source, QUADS).unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+    build_quads(&out, CONFIG, &source).ok();
+
+    // Two graphs, five memberships and three triples, like the original.
+    let regrouped_source = dir.path().join("regrouped.nq");
+    std::fs::write(
+        &regrouped_source,
+        QUADS.replace(
+            "<http://example.org/c> <http://example.org/g1>",
+            "<http://example.org/c> <http://example.org/g2>",
+        ),
+    )
+    .unwrap();
+    let regrouped = dir.path().join("root/tinykg/regrouped");
+    build_quads(&regrouped, CONFIG, &regrouped_source).ok();
+
+    std::fs::copy(
+        regrouped.join("data.hdt.graphs.idx"),
+        out.join("data.hdt.graphs.idx"),
+    )
+    .unwrap();
+    let stderr = kgf(&["manifest", path(&out)], "").err();
+    assert!(
+        stderr.contains("was built from a graph sidecar with sha256")
+            && stderr.contains("hdtc graphs-index"),
+        "{stderr}"
+    );
 }
