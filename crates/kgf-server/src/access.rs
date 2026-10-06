@@ -450,10 +450,14 @@ impl From<WorkClass> for AccessWorkClass {
 
 /// Coarse client family inferred from User-Agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum ClientClass {
     /// Comunica.
     Comunica,
+    /// The kgf-sparql SPARQL engine. Built on Comunica but its own family,
+    /// because it reads the native KGF source rather than TPF and its
+    /// per-query request volume is a different workload from an agent client's.
+    KgfSparql,
     /// A conventional browser User-Agent.
     Browser,
     /// curl.
@@ -1287,9 +1291,12 @@ fn classify(user_agent: Option<&str>) -> ClientClass {
     };
     let lower = user_agent.to_ascii_lowercase();
     // Most specific family first: a KGF client may name the runtime it runs
-    // on, and the runtime's name must not claim the request.
+    // on, and the runtime's name must not claim the request. kgfq runs SPARQL
+    // through kgf-sparql, which runs on Comunica, so the three go in that order.
     if lower.contains("kgf-client") || lower.contains("kgfq") {
         ClientClass::Kgf
+    } else if lower.contains("kgf-sparql") {
+        ClientClass::KgfSparql
     } else if lower.contains("comunica") {
         ClientClass::Comunica
     } else if lower.starts_with("mozilla/") {
@@ -1472,7 +1479,30 @@ mod tests {
         assert_eq!(classify(Some("undici")), ClientClass::Node);
         assert_eq!(classify(Some("kgf-client/0.1")), ClientClass::Kgf);
         assert_eq!(classify(Some("kgf-client/0.3 (node 22)")), ClientClass::Kgf);
+        assert_eq!(
+            classify(Some(
+                "kgf-sparql/0.1.1 (+https://github.com/frink-okn/kgf-sparql)"
+            )),
+            ClientClass::KgfSparql
+        );
+        assert_eq!(
+            classify(Some("kgf-sparql/0.2.0 (Comunica/5.3.0; node 25)")),
+            ClientClass::KgfSparql
+        );
+        assert_eq!(
+            classify(Some("kgfq/0.1 (kgf-sparql/0.1.1)")),
+            ClientClass::Kgf
+        );
         assert_eq!(classify(None), ClientClass::Unknown);
+    }
+
+    #[test]
+    fn client_classes_serialize_as_kebab_case_tokens() {
+        let token = |class| serde_json::to_value(class).unwrap();
+        assert_eq!(token(ClientClass::KgfSparql), "kgf-sparql");
+        assert_eq!(token(ClientClass::Comunica), "comunica");
+        assert_eq!(token(ClientClass::Kgf), "kgf");
+        assert_eq!(token(ClientClass::Unknown), "unknown");
     }
 
     #[test]
