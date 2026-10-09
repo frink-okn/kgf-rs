@@ -58,8 +58,10 @@ pub mod service;
 mod skolem;
 pub mod term;
 pub mod url;
+mod usage;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use kgf_store::map::PublishedRoot;
 use serde::Serialize;
@@ -125,6 +127,15 @@ pub struct Config {
     /// one gateway, set one; a record's `forwarded_hash` then names the
     /// address that gateway received the request from.
     pub trusted_proxies: u8,
+    /// How long shutdown waits for open connections to finish before closing them.
+    ///
+    /// A download can outlast any orchestrator's patience, and a process killed
+    /// with transfers open loses their access records, which are written only
+    /// when a transfer ends. Closing the stragglers first ends their transfers as
+    /// `interrupted` and lets the records out before the process exits. Keep it
+    /// below the grace period between the orchestrator's `SIGTERM` and its
+    /// `SIGKILL`.
+    pub shutdown_timeout: Duration,
 }
 
 impl Config {
@@ -141,6 +152,7 @@ impl Config {
             access_log: None,
             log_raw: false,
             trusted_proxies: 0,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
         }
     }
 
@@ -485,6 +497,11 @@ impl Default for Budgets {
     }
 }
 
+/// Two thirds of Kubernetes' default 30-second termination grace period, so a
+/// default deployment closes its last connections, and writes their records, with
+/// time to spare before it would be killed.
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Build the service and serve it until shutdown.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let bind = config.bind;
@@ -499,6 +516,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         queue_timeout_ms = service.config().admission.queue_timeout_ms,
         max_concurrent_downloads = service.config().admission.max_concurrent_downloads,
         max_downloads_per_client = service.config().admission.max_downloads_per_client,
+        shutdown_timeout_ms = service.config().shutdown_timeout.as_millis(),
         "serving",
     );
     serve_on(listener, service, shutdown_signal()).await
@@ -514,18 +532,46 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 /// handlers, and a library entry point must not do that on an embedder's
 /// behalf. It would compete with whatever the host process already has, and it
 /// would leave a caller with no way to stop the server at all.
+///
+/// Once `shutdown` resolves, open connections get the configured
+/// [`shutdown_timeout`](Config::shutdown_timeout) to finish. Any still open then
+/// are left to the caller's runtime: dropping it closes them, which ends their
+/// requests and writes their access records.
 pub async fn serve_on(
     listener: tokio::net::TcpListener,
     service: Arc<Service>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    axum::serve(
+    let timeout = service.config().shutdown_timeout;
+    let (stopping, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(
         listener,
         routes::router(service).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown)
-    .await?;
+    .with_graceful_shutdown(async move {
+        shutdown.await;
+        let _ = stopping.send(());
+    });
+    tokio::select! {
+        served = server.into_future() => served?,
+        () = drained(stopped, timeout) => tracing::warn!(
+            ?timeout,
+            "connections still open at the shutdown timeout; closing them",
+        ),
+    }
     Ok(())
+}
+
+/// Resolve `timeout` after shutdown begins.
+///
+/// Shutdown begins when the trigger ends, however it ends. axum runs the trigger
+/// in a task of its own and takes that task's end as the signal, so a trigger that
+/// panics stops the server accepting just as one that fires does; its sender is
+/// then dropped rather than used, and the timeout must start either way, or a
+/// connection left open would hold the server up for good.
+async fn drained(stopped: tokio::sync::oneshot::Receiver<()>, timeout: Duration) {
+    let _ = stopped.await;
+    tokio::time::sleep(timeout).await;
 }
 
 /// Resolve on Ctrl-C or `SIGTERM`.

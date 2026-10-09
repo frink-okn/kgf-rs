@@ -3,14 +3,15 @@
 //! The default record deliberately contains no request terms, search text,
 //! path captures, bodies, response bodies, or problem details. Handlers add
 //! only metadata derived from typed requests; the outer middleware owns the
-//! raw HTTP facts and emits exactly one record per request — when the response
-//! has been produced, or when the request was abandoned before that.
+//! raw HTTP facts and emits exactly one record per request, once the request
+//! has been answered or abandoned and the work it admitted has ended.
 
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,7 @@ use crate::envelope::ErrorCode;
 use crate::representation::Representation;
 use crate::request::ObservedRequest;
 use crate::service::Service;
+use crate::usage::{self, Spent, Usage};
 
 const REQUEST_ID: HeaderName = HeaderName::from_static("kgf-request-id");
 const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
@@ -83,10 +85,30 @@ pub struct AccessRecord {
     pub code: Option<&'static str>,
     /// Admission class for bundle work.
     pub work_class: Option<AccessWorkClass>,
-    /// Time spent waiting for admission.
+    /// Time spent waiting for admission, summed over every admission the request
+    /// asked for: one for an operation, and for a download its open and each chunk.
+    /// A chunk's wait takes no waiting-room place and never times out, so a
+    /// download's figure is not comparable with a query's. Counted however the
+    /// wait ended, including a client giving up partway through it.
     pub queue_ms: Option<u64>,
-    /// Time spent on the blocking worker, excluding its scheduling delay.
+    /// Time spent on the blocking worker, excluding its scheduling delay, summed
+    /// over the same pieces of work as `queue_ms`. Still counted when the client went
+    /// away while the work ran.
     pub work_ms: Option<u64>,
+    /// CPU time the work's threads ran, user and kernel, summed like `work_ms`. What
+    /// `work_ms` has beyond it was waiting: on storage, on another request's open of
+    /// the same bundle, or for a core. `null` without bundle work, and on platforms
+    /// that do not keep per-thread counters.
+    pub cpu_ms: Option<u64>,
+    /// Page faults during the work that waited for storage. A count of faults, not of
+    /// pages: a fault on a mapped file reads ahead, so one can bring in many pages. A
+    /// fault that waited on another request's read of the same page counts as well,
+    /// so concurrent records can each count one read. `null` as for `cpu_ms`.
+    pub major_faults: Option<u64>,
+    /// Page faults during the work resolved without storage: a mapped page already
+    /// cached, or the first touch of freshly allocated memory such as a growing
+    /// response buffer. `null` as for `cpu_ms`.
+    pub minor_faults: Option<u64>,
     /// Time from the middleware seeing the request to emitting this record.
     pub total_ms: u64,
     /// Requests in the admission waiting room when this one arrived.
@@ -94,8 +116,14 @@ pub struct AccessRecord {
     /// Request-body bytes a handler read; `null` when no body was consumed.
     /// Never the declared `Content-Length`, which the client chooses.
     pub bytes_in: Option<u64>,
-    /// Exact response-body size when the HTTP stack knows it.
+    /// Response-body bytes. For a streamed download, what its body handed to the
+    /// connection before it ended; otherwise the exact size when the HTTP stack
+    /// knows it.
     pub bytes_out: Option<u64>,
+    /// How a streamed download's body ended: `complete`, `interrupted` (the client
+    /// went away, or shutdown closed the connection), or `failed`. `null` for a
+    /// response sent whole.
+    pub transfer: Option<TransferEnd>,
     /// Whether an operation response is complete.
     pub complete: Option<bool>,
     /// Why an operation response is incomplete.
@@ -156,6 +184,15 @@ pub enum Severity {
 }
 
 impl Severity {
+    /// From the status, except that a body the server failed to finish is an
+    /// error whatever status its headers carried.
+    fn of(status: Option<u16>, transfer: Option<TransferEnd>) -> Self {
+        match transfer {
+            Some(TransferEnd::Failed) => Self::Error,
+            _ => Self::for_status(status),
+        }
+    }
+
     fn for_status(status: Option<u16>) -> Self {
         match status {
             Some(500..=599) => Self::Error,
@@ -167,7 +204,9 @@ impl Severity {
 
 /// A destination for access records.
 ///
-/// `record` runs on the request's async task, so an implementation must not
+/// `record` runs wherever the request's last piece of work let go of it: usually
+/// the request's async task, but also a blocking-pool worker whose client left, or
+/// the task dropping a download's body. An implementation must therefore not
 /// block: hand the record to a queue, a channel, or memory, never to a
 /// synchronous write that can stall.
 pub trait AccessLog: Send + Sync + std::fmt::Debug {
@@ -414,10 +453,14 @@ impl From<WorkClass> for AccessWorkClass {
 
 /// Coarse client family inferred from User-Agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum ClientClass {
     /// Comunica.
     Comunica,
+    /// The kgf-sparql SPARQL engine. Built on Comunica but its own family,
+    /// because it reads the native KGF source rather than TPF and its
+    /// per-query request volume is a different workload from an agent client's.
+    KgfSparql,
     /// A conventional browser User-Agent.
     Browser,
     /// curl.
@@ -579,8 +622,6 @@ pub(crate) struct Observation {
     pub(crate) version: Option<String>,
     pub(crate) representation: Option<Representation>,
     pub(crate) work_class: Option<WorkClass>,
-    pub(crate) queue_ms: Option<u64>,
-    pub(crate) work_ms: Option<u64>,
     pub(crate) bytes_in: Option<u64>,
     pub(crate) complete: Option<bool>,
     pub(crate) truncation_reason: Option<&'static str>,
@@ -680,14 +721,6 @@ impl Observation {
     }
 }
 
-/// Admission and worker timing returned even when work fails.
-#[derive(Debug)]
-pub(crate) struct Timed<T> {
-    pub(crate) result: Result<T, crate::envelope::Problem>,
-    pub(crate) queue_ms: u64,
-    pub(crate) work_ms: Option<u64>,
-}
-
 /// Bundle-open timing attached to a successful lookup.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OpenTiming {
@@ -767,26 +800,222 @@ impl AccessState {
 }
 
 /// Record one request outside every response-producing router layer.
+///
+/// The handler runs inside the request's [`Ledger`] scope, so the work it admits
+/// is charged to this request wherever that work ends up running.
 pub(crate) async fn record_request(
     State(service): State<Arc<Service>>,
     request: Request,
     next: Next,
 ) -> Response {
     let in_flight = InFlight::begin(service.access(), service.admission().waiting(), &request);
-    let response = next.run(request).await;
+    let response = match &in_flight {
+        InFlight::Recording(ledger) => LEDGER.scope(Arc::clone(ledger), next.run(request)).await,
+        InFlight::Unrecorded(_) => next.run(request).await,
+    };
     in_flight.finish(response)
 }
 
-/// One request the middleware has seen and not yet recorded.
+tokio::task_local! {
+    /// The ledger of the request whose handler this task is running.
+    static LEDGER: Arc<Ledger>;
+}
+
+/// One request the middleware has seen and not yet answered.
 ///
-/// Emits exactly once: from [`finish`](Self::finish) with the response, or
-/// from `Drop` when the request future is cancelled before that — the client
-/// disconnected while the server was still working — so an abandoned request
-/// appears in the census with no status rather than not at all. The work it
-/// admitted still runs to completion, which is why it must be counted.
-struct InFlight {
+/// [`finish`](Self::finish) gives a recording request's ledger the response. A
+/// request future cancelled before that, because the client disconnected while the
+/// server was still working, lets go of the ledger with no response, so an
+/// abandoned request appears in the census with no status rather than not at all.
+enum InFlight {
+    /// No sink is configured: the request id is minted for the response header
+    /// and nothing else is kept.
+    Unrecorded(String),
+    Recording(Arc<Ledger>),
+}
+
+/// One request's record, kept open until the request and all the work it admitted
+/// have ended.
+///
+/// The record is written when the last holder lets go: the middleware once the
+/// response is produced, a blocking task once its work is done, a wait for
+/// admission once it ends, a download's body once its transfer ends. Usually the
+/// middleware is last, and the record is written as the response leaves. Two cases
+/// outlive it:
+///
+/// - A client that disconnects while its work runs. A blocking task cannot be
+///   cancelled, so the work runs to the end and costs what it costs; the record
+///   carries that cost rather than nothing.
+/// - A download. Its chunks are read on the blocking pool after its headers have
+///   gone, each admitted through the same work gate as a query. The record counts
+///   them with its open, and says how the transfer ended and how much was sent.
+///
+/// Either way there is exactly one record, because `Drop` runs once.
+pub(crate) struct Ledger {
+    sink: Arc<dyn AccessLog>,
+    /// Minted with the request and returned in its `KGF-Request-Id`.
     request_id: String,
-    recording: Option<(Arc<dyn AccessLog>, Pending)>,
+    entry: Mutex<Entry>,
+}
+
+/// What a [`Ledger`] gathers until it is written.
+struct Entry {
+    /// `None` once the record is known not to be wanted.
+    pending: Option<Pending>,
+    /// `None` until the middleware has a response, and for good if it never does.
+    outcome: Option<Outcome>,
+    work: Work,
+    /// How a streamed body ended; `None` for a response sent whole.
+    transfer: Option<Transfer>,
+}
+
+/// The work charged to one request, summed over each admission and each run.
+#[derive(Debug, Default)]
+struct Work {
+    /// The class of the first admission, for a record whose handler never said.
+    class: Option<WorkClass>,
+    queued: Option<Duration>,
+    ran: Option<Duration>,
+    /// `None` if any piece of the work went unmeasured: a partial sum is no total.
+    usage: Option<Usage>,
+}
+
+impl Work {
+    fn queued(&mut self, class: WorkClass, waited: Duration) {
+        self.class.get_or_insert(class);
+        self.queued = Some(self.queued.unwrap_or_default().saturating_add(waited));
+    }
+
+    fn ran(&mut self, spent: Spent) {
+        self.usage = match self.ran {
+            None => spent.usage,
+            Some(_) => self.usage.zip(spent.usage).map(|(sum, usage)| sum + usage),
+        };
+        self.ran = Some(self.ran.unwrap_or_default().saturating_add(spent.wall));
+    }
+}
+
+/// How a streamed response body ended, and what it handed to the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Transfer {
+    /// Body bytes handed to the connection before the end.
+    pub(crate) bytes: u64,
+    pub(crate) end: TransferEnd,
+}
+
+/// How a streamed response body ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferEnd {
+    /// Every byte of the body was handed to the connection.
+    Complete,
+    /// The body was let go of first: the client went away, or the server shut down
+    /// and closed the connection.
+    Interrupted,
+    /// The server could not produce the rest, and the connection was aborted.
+    Failed,
+}
+
+impl Ledger {
+    /// The ledger of the request this task is handling, when a sink is recording.
+    pub(crate) fn current() -> Option<Arc<Self>> {
+        LEDGER.try_with(Arc::clone).ok()
+    }
+
+    /// Start a wait for admission in `class`. The wait is charged when the guard
+    /// drops, however it ends: admitted, refused, or given up because the request
+    /// went away while it waited.
+    pub(crate) fn wait(self: &Arc<Self>, class: WorkClass) -> Wait {
+        Wait {
+            ledger: Arc::clone(self),
+            class,
+            started: Instant::now(),
+        }
+    }
+
+    /// Run `work` on this thread, charged to `ledger` when there is one.
+    ///
+    /// The ledger is let go of here, after the work and outside any unwinding. If
+    /// `ledger` is the last holder, because the client left while the work ran,
+    /// letting go writes the record; a sink must never run while the thread is
+    /// unwinding, where a panic of its own would abort the process. So a panic in
+    /// the work is caught, the ledger released, and the panic resumed, which still
+    /// reaches the blocking pool's `JoinHandle` as before.
+    pub(crate) fn charge<T>(ledger: Option<Arc<Self>>, work: impl FnOnce() -> T) -> T {
+        let Some(ledger) = ledger else {
+            return work();
+        };
+        let output = panic::catch_unwind(AssertUnwindSafe(|| ledger.run(work)));
+        drop(ledger);
+        output.unwrap_or_else(|payload| panic::resume_unwind(payload))
+    }
+
+    /// Record how a streamed body ended.
+    pub(crate) fn transferred(&self, transfer: Transfer) {
+        self.entry().transfer = Some(transfer);
+    }
+
+    fn queued(&self, class: WorkClass, waited: Duration) {
+        self.entry().work.queued(class, waited);
+    }
+
+    fn run<T>(&self, work: impl FnOnce() -> T) -> T {
+        let (output, spent) = usage::measure(work);
+        self.entry().work.ran(spent);
+        output
+    }
+
+    /// Take the response, unless it is a probe not worth a record.
+    fn answer(&self, outcome: Outcome) {
+        let mut entry = self.entry();
+        if entry
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.is_uneventful_probe(&outcome))
+        {
+            entry.pending = None;
+        } else {
+            entry.outcome = Some(outcome);
+        }
+    }
+
+    fn entry(&self) -> MutexGuard<'_, Entry> {
+        // Work runs outside the lock, so nothing should poison it; if something
+        // did, the entry is still this request's record.
+        self.entry.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Drop for Ledger {
+    fn drop(&mut self) {
+        let entry = self.entry.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if let Some(pending) = entry.pending.take() {
+            let record = pending.record(
+                std::mem::take(&mut self.request_id),
+                entry.outcome.take(),
+                std::mem::take(&mut entry.work),
+                entry.transfer.take(),
+            );
+            self.sink.record(&record);
+        }
+    }
+}
+
+/// A request's wait for admission, charged to its ledger when the wait ends.
+///
+/// A guard rather than a measurement taken after the wait, because a request whose
+/// client leaves while it waits is cancelled inside the wait: only a drop sees that
+/// end, and those waits are the queue pressure a burst is made of.
+pub(crate) struct Wait {
+    ledger: Arc<Ledger>,
+    class: WorkClass,
+    started: Instant,
+}
+
+impl Drop for Wait {
+    fn drop(&mut self) {
+        self.ledger.queued(self.class, self.started.elapsed());
+    }
 }
 
 /// The facts a record needs that are known before the handler runs.
@@ -816,10 +1045,7 @@ impl InFlight {
     fn begin(access: &AccessState, waiting: usize, request: &Request) -> Self {
         let request_id = access.request_id();
         let Some(sink) = access.sink.clone() else {
-            return Self {
-                request_id,
-                recording: None,
-            };
+            return Self::Unrecorded(request_id);
         };
         let raw = access.tier == Tier::Raw;
         let headers = request.headers();
@@ -851,35 +1077,35 @@ impl InFlight {
                 .map(|client| access.pseudonym(client)),
             waiting,
         };
-        Self {
+        Self::Recording(Arc::new(Ledger {
+            sink,
             request_id,
-            recording: Some((sink, pending)),
+            entry: Mutex::new(Entry {
+                pending: Some(pending),
+                outcome: None,
+                work: Work::default(),
+                transfer: None,
+            }),
+        }))
+    }
+
+    fn request_id(&self) -> &str {
+        match self {
+            Self::Unrecorded(request_id) => request_id,
+            Self::Recording(ledger) => &ledger.request_id,
         }
     }
 
-    fn finish(mut self, mut response: Response) -> Response {
+    fn finish(self, mut response: Response) -> Response {
         response.headers_mut().insert(
             REQUEST_ID,
-            HeaderValue::from_str(&self.request_id)
+            HeaderValue::from_str(self.request_id())
                 .expect("server request ids are valid header values"),
         );
-        if let Some((sink, pending)) = self.recording.take() {
-            let outcome = Outcome::of(&mut response);
-            if !pending.is_uneventful_probe(&outcome) {
-                let request_id = std::mem::take(&mut self.request_id);
-                sink.record(&pending.record(request_id, Some(outcome)));
-            }
+        if let Self::Recording(ledger) = self {
+            ledger.answer(Outcome::of(&mut response));
         }
         response
-    }
-}
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        if let Some((sink, pending)) = self.recording.take() {
-            let request_id = std::mem::take(&mut self.request_id);
-            sink.record(&pending.record(request_id, None));
-        }
     }
 }
 
@@ -928,8 +1154,15 @@ impl Pending {
             && self.started.elapsed() < PROBE_QUIET
     }
 
-    /// The record for a response, or for a request abandoned without one.
-    fn record(self, request_id: String, outcome: Option<Outcome>) -> AccessRecord {
+    /// The record for a response, or for a request abandoned without one, with
+    /// the work charged to it.
+    fn record(
+        self,
+        request_id: String,
+        outcome: Option<Outcome>,
+        work: Work,
+        transfer: Option<Transfer>,
+    ) -> AccessRecord {
         let (status, code, problem_representation, bytes_out, observation) = match outcome {
             Some(outcome) => (
                 Some(outcome.status),
@@ -950,7 +1183,7 @@ impl Pending {
             .map(|value| value.token().to_owned());
         AccessRecord {
             time: Timestamp::now().to_string(),
-            severity: Severity::for_status(status),
+            severity: Severity::of(status, transfer.map(|transfer| transfer.end)),
             request_id,
             method: self.method,
             route: self.route,
@@ -961,13 +1194,20 @@ impl Pending {
             representation,
             status,
             code,
-            work_class: observation.work_class.map(AccessWorkClass::from),
-            queue_ms: observation.queue_ms,
-            work_ms: observation.work_ms,
+            work_class: observation
+                .work_class
+                .or(work.class)
+                .map(AccessWorkClass::from),
+            queue_ms: work.queued.map(millis),
+            work_ms: work.ran.map(millis),
+            cpu_ms: work.usage.map(|usage| millis(usage.cpu)),
+            major_faults: work.usage.map(|usage| usage.major_faults),
+            minor_faults: work.usage.map(|usage| usage.minor_faults),
             total_ms: millis(self.started.elapsed()),
             waiting: self.waiting,
             bytes_in: observation.bytes_in,
-            bytes_out,
+            bytes_out: transfer.map(|transfer| transfer.bytes).or(bytes_out),
+            transfer: transfer.map(|transfer| transfer.end),
             complete: observation.complete,
             truncation_reason: observation.truncation_reason,
             rows: observation.rows,
@@ -1063,9 +1303,12 @@ fn classify(user_agent: Option<&str>) -> ClientClass {
     };
     let lower = user_agent.to_ascii_lowercase();
     // Most specific family first: a KGF client may name the runtime it runs
-    // on, and the runtime's name must not claim the request.
+    // on, and the runtime's name must not claim the request. kgfq runs SPARQL
+    // through kgf-sparql, which runs on Comunica, so the three go in that order.
     if lower.contains("kgf-client") || lower.contains("kgfq") {
         ClientClass::Kgf
+    } else if lower.contains("kgf-sparql") {
+        ClientClass::KgfSparql
     } else if lower.contains("comunica") {
         ClientClass::Comunica
     } else if lower.starts_with("mozilla/") {
@@ -1113,6 +1356,76 @@ fn operation_for_route(route: &str) -> Option<AccessOperation> {
         "/{dataset}/v/{version}/verbalize" => Some(AccessOperation::Verbalize),
         "/{dataset}/v/{version}/export/{artifact}" => Some(AccessOperation::Export),
         _ => None,
+    }
+}
+
+/// What tests elsewhere in the crate need to drive work through a request's
+/// ledger as the middleware would.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::future::Future;
+    use std::sync::atomic::AtomicBool;
+
+    use super::*;
+
+    /// The ledger the middleware would hold for a request to `uri`. The returned
+    /// handle stands in for the middleware's own: dropping it is the request
+    /// going away.
+    pub(crate) fn recording(sink: Arc<dyn AccessLog>, uri: &str) -> Arc<Ledger> {
+        let access = AccessState::new(Some(sink), false, 0).expect("a salt");
+        let request = Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .expect("a request");
+        match InFlight::begin(&access, 0, &request) {
+            InFlight::Recording(ledger) => ledger,
+            InFlight::Unrecorded(_) => unreachable!("a sink is configured"),
+        }
+    }
+
+    /// Run `future` as a handler of `ledger`'s request.
+    pub(crate) async fn scoped<F: Future>(ledger: Arc<Ledger>, future: F) -> F::Output {
+        LEDGER.scope(ledger, future).await
+    }
+
+    /// A sink that keeps its records, and notices being called while unwinding.
+    #[derive(Debug, Default)]
+    pub(crate) struct Sink {
+        records: Mutex<Vec<AccessRecord>>,
+        unwinding: AtomicBool,
+    }
+
+    impl Sink {
+        pub(crate) fn records(&self) -> Vec<AccessRecord> {
+            self.records.lock().unwrap().clone()
+        }
+
+        /// Whether any record was written by a thread that was unwinding.
+        pub(crate) fn written_while_unwinding(&self) -> bool {
+            self.unwinding.load(Ordering::SeqCst)
+        }
+
+        /// The records once there are at least `count`, for one written by work
+        /// that is still finishing.
+        pub(crate) async fn wait_for(&self, count: usize) -> Vec<AccessRecord> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let records = self.records();
+                if records.len() >= count || Instant::now() >= deadline {
+                    return records;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    impl AccessLog for Sink {
+        fn record(&self, record: &AccessRecord) {
+            if std::thread::panicking() {
+                self.unwinding.store(true, Ordering::SeqCst);
+            }
+            self.records.lock().unwrap().push(record.clone());
+        }
     }
 }
 
@@ -1179,7 +1492,30 @@ mod tests {
         assert_eq!(classify(Some("undici")), ClientClass::Node);
         assert_eq!(classify(Some("kgf-client/0.1")), ClientClass::Kgf);
         assert_eq!(classify(Some("kgf-client/0.3 (node 22)")), ClientClass::Kgf);
+        assert_eq!(
+            classify(Some(
+                "kgf-sparql/0.1.1 (+https://github.com/frink-okn/kgf-sparql)"
+            )),
+            ClientClass::KgfSparql
+        );
+        assert_eq!(
+            classify(Some("kgf-sparql/0.2.0 (Comunica/5.3.0; node 25)")),
+            ClientClass::KgfSparql
+        );
+        assert_eq!(
+            classify(Some("kgfq/0.1 (kgf-sparql/0.1.1)")),
+            ClientClass::Kgf
+        );
         assert_eq!(classify(None), ClientClass::Unknown);
+    }
+
+    #[test]
+    fn client_classes_serialize_as_kebab_case_tokens() {
+        let token = |class| serde_json::to_value(class).unwrap();
+        assert_eq!(token(ClientClass::KgfSparql), "kgf-sparql");
+        assert_eq!(token(ClientClass::Comunica), "comunica");
+        assert_eq!(token(ClientClass::Kgf), "kgf");
+        assert_eq!(token(ClientClass::Unknown), "unknown");
     }
 
     #[test]
@@ -1347,6 +1683,178 @@ mod tests {
     }
 
     #[test]
+    fn work_outliving_an_abandoned_request_is_recorded_when_it_ends() {
+        let sink = Arc::new(Recording::default());
+        let access = AccessState::new(Some(sink.clone()), false, 0).unwrap();
+        let request = Request::builder()
+            .uri("/tox/v/v1/fragment")
+            .body(Body::empty())
+            .unwrap();
+
+        let in_flight = InFlight::begin(&access, 0, &request);
+        // What a blocking task holds while its work runs.
+        let task = ledger_of(&in_flight);
+        task.queued(WorkClass::Heavy, Duration::from_millis(3));
+        drop(in_flight);
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "written before the work it admitted ended"
+        );
+
+        task.run(|| std::thread::sleep(Duration::from_millis(2)));
+        drop(task);
+
+        let records = sink.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.status, None);
+        assert_eq!(record.work_class, Some(AccessWorkClass::Heavy));
+        assert_eq!(record.queue_ms, Some(3));
+        assert!(record.work_ms >= Some(2), "{record:?}");
+        assert_eq!(record.cpu_ms.is_some(), cfg!(target_os = "linux"));
+        assert_eq!(record.major_faults.is_some(), cfg!(target_os = "linux"));
+    }
+
+    #[test]
+    fn a_record_sums_every_piece_of_work_and_waits_for_the_last() {
+        let sink = Arc::new(Recording::default());
+        let access = AccessState::new(Some(sink.clone()), false, 0).unwrap();
+        let request = Request::builder()
+            .uri("/tox/v/v1/export/data.hdt")
+            .body(Body::empty())
+            .unwrap();
+
+        // A download: its open before the response, its chunks after.
+        let in_flight = InFlight::begin(&access, 0, &request);
+        let body = ledger_of(&in_flight);
+        body.queued(WorkClass::Ordinary, Duration::from_millis(1));
+        body.run(|| std::thread::sleep(Duration::from_millis(1)));
+        let response = in_flight.finish(Response::new(Body::from("{}")));
+        assert!(response.headers().contains_key(&REQUEST_ID));
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "written while the body still had work to do"
+        );
+
+        body.queued(WorkClass::Ordinary, Duration::from_millis(2));
+        body.run(|| std::thread::sleep(Duration::from_millis(1)));
+        drop(body);
+
+        let records = sink.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, Some(200));
+        assert_eq!(records[0].queue_ms, Some(3));
+        assert!(records[0].work_ms >= Some(2), "{:?}", records[0]);
+    }
+
+    fn ledger_of(in_flight: &InFlight) -> Arc<Ledger> {
+        match in_flight {
+            InFlight::Recording(ledger) => Arc::clone(ledger),
+            InFlight::Unrecorded(_) => panic!("a sink is configured"),
+        }
+    }
+
+    #[test]
+    fn a_request_given_up_while_it_waits_is_charged_its_wait() {
+        let sink = Arc::new(Recording::default());
+        let access = AccessState::new(Some(sink.clone()), false, 0).unwrap();
+        let request = Request::builder()
+            .uri("/tox/v/v1/fragment")
+            .body(Body::empty())
+            .unwrap();
+
+        let in_flight = InFlight::begin(&access, 0, &request);
+        let waiting = ledger_of(&in_flight).wait(WorkClass::Heavy);
+        std::thread::sleep(Duration::from_millis(2));
+        // The client leaves: the middleware's guard goes, and the wait with it.
+        drop(in_flight);
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "written before the wait ended"
+        );
+        drop(waiting);
+
+        let records = sink.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, None);
+        assert_eq!(records[0].work_class, Some(AccessWorkClass::Heavy));
+        assert!(records[0].queue_ms >= Some(2), "{:?}", records[0]);
+        assert_eq!(records[0].work_ms, None);
+    }
+
+    #[test]
+    fn a_transfer_records_how_it_ended_and_what_it_sent() {
+        for (end, severity) in [
+            (TransferEnd::Complete, Severity::Info),
+            (TransferEnd::Interrupted, Severity::Info),
+            (TransferEnd::Failed, Severity::Error),
+        ] {
+            let sink = Arc::new(Recording::default());
+            let access = AccessState::new(Some(sink.clone()), false, 0).unwrap();
+            let request = Request::builder()
+                .uri("/tox/v/v1/export/data.hdt")
+                .body(Body::empty())
+                .unwrap();
+
+            let in_flight = InFlight::begin(&access, 0, &request);
+            let body = ledger_of(&in_flight);
+            // The headers declare ten bytes; the body then hands over four.
+            in_flight.finish(Response::new(Body::from("0123456789")));
+            body.transferred(Transfer { bytes: 4, end });
+            drop(body);
+
+            let records = sink.0.lock().unwrap();
+            assert_eq!(records[0].status, Some(200));
+            assert_eq!(records[0].bytes_out, Some(4), "{end:?}");
+            assert_eq!(records[0].transfer, Some(end));
+            assert_eq!(records[0].severity, severity, "{end:?}");
+        }
+    }
+
+    #[test]
+    fn a_panic_after_the_client_left_writes_the_record_outside_the_unwind() {
+        let sink = Arc::new(testing::Sink::default());
+        // The client has gone, so the work holds the request's only handle.
+        let ledger = testing::recording(sink.clone(), "/tox/v/v1/fragment");
+
+        let panicked = panic::catch_unwind(AssertUnwindSafe(|| {
+            Ledger::charge(Some(ledger), || panic!("the work failed"))
+        }));
+
+        assert!(panicked.is_err());
+        assert_eq!(sink.records().len(), 1);
+        assert!(!sink.written_while_unwinding());
+    }
+
+    #[test]
+    fn usage_is_recorded_only_when_every_piece_of_work_was_measured() {
+        let usage = Usage {
+            major_faults: 1,
+            minor_faults: 2,
+            cpu: Duration::from_millis(1),
+        };
+        let measured = Spent {
+            wall: Duration::from_millis(1),
+            usage: Some(usage),
+        };
+        let unmeasured = Spent {
+            wall: Duration::from_millis(1),
+            usage: None,
+        };
+
+        let mut work = Work::default();
+        work.ran(measured);
+        work.ran(measured);
+        assert_eq!(work.usage, Some(usage + usage));
+        // A partial sum would read as a total, so one gap loses the figure.
+        work.ran(unmeasured);
+        assert_eq!(work.usage, None);
+        work.ran(measured);
+        assert_eq!(work.usage, None);
+        assert_eq!(work.ran, Some(Duration::from_millis(4)));
+    }
+
+    #[test]
     fn a_finished_request_is_recorded_once() {
         let sink = Arc::new(Recording::default());
         let access = AccessState::new(Some(sink.clone()), false, 0).unwrap();
@@ -1371,7 +1879,7 @@ mod tests {
         let access = AccessState::new(None, true, 2).unwrap();
         let request = Request::builder().uri("/").body(Body::empty()).unwrap();
         let in_flight = InFlight::begin(&access, 0, &request);
-        assert!(in_flight.recording.is_none());
+        assert!(matches!(in_flight, InFlight::Unrecorded(_)));
         let response = in_flight.finish(Response::new(Body::empty()));
         assert!(response.headers().contains_key(&REQUEST_ID));
     }

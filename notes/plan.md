@@ -1585,6 +1585,31 @@ The default `TraceLayer` and tower-http's `trace` feature are gone: enabling deb
 diagnostics can no longer disclose raw URIs as a second accidental access log.
 `notes/request-logging.md` is the detailed design record for this unit.
 
+**Work measured per thread, charged to a per-request ledger (2026-10-01).** The public
+deployment refused bursts with 429 while its CPU sat mostly idle, and `work_ms` could
+not say whether its work was computing or waiting. The record now carries `cpu_ms`,
+`major_faults`, and `minor_faults`, the blocking worker thread's own counters across
+the work (`getrusage(RUSAGE_THREAD)` through `nix`, read on Linux only, `null`
+elsewhere). `usage::measure` is the only way to take a reading and takes both on the
+thread that runs the closure. `work_ms − cpu_ms` is waiting of any kind; a major fault
+is a fault that waited for storage, counted as faults rather than pages because of
+readahead. Timings no longer pass through the handler's `Observation`: the middleware
+runs the handler in a task-local scope holding a `Ledger`, `blocking` and a download's
+chunks charge their waits and work to it, and the record is written from the ledger's
+`Drop`, when the last holder lets go. That replaces the drop guard and fixes two gaps
+the first version had. Work a disconnected client left running is now recorded when it
+ends, rather than lost. A download's record now counts every chunk it read through the
+work gate, not just the open, and is written when the transfer ends.
+
+A review of the ledger (2026-10-02) made waits for admission a guard charged however
+they end, so a client giving up in the waiting room still leaves `queue_ms`; routed all
+charged work through `Ledger::charge`, which keeps a sink from running while a thread
+unwinds; had a download report `bytes_out` as sent and a `transfer` outcome
+(`complete`, `interrupted`, `failed`); and bounded shutdown with `--shutdown-timeout-ms`
+(20 s), after which open connections are closed so their records are written before the
+process exits rather than lost when it is killed. `notes/request-logging.md` §3.3 has
+the detail.
+
 ### 23. `--public-base` — serving under a path prefix ✅
 
 FRINK mounts every service under a path on one shared hostname, with the gateway
@@ -1645,7 +1670,7 @@ representation, loses `BoundTerm::parse_fragment`, GET `?name` variables and GET
 `values=`, and its RDF representations carry data only.
 
 Why, in one paragraph: the public deployment's Comunica evaluation
-(`../kgf-sparql/docs/public-deployment-comunica-evaluation.md`) found that the
+(`notes/public-deployment-comunica-evaluation.md`) found that the
 representation-selected fallback of question 44 accepts bare IRIs but not the bare
 datatype IRI inside a typed literal that the TPF specification prescribes and Comunica
 sends, which 400s and kills the client process on three corpus tasks; that a `values=`
@@ -1661,7 +1686,7 @@ exactly three mappings, `hydra:variableRepresentation`, `hydra:itemsPerPage`, an
 `void:inDataset` link; the route, `Operation::Tpf`, `AccessOperation::Tpf`, descriptor
 links; stripping `/fragment`; the Comunica conformance harness retargeted to `/tpf`
 with typed-literal, skolem-subject, and no-control-leak assertions; the
-`../kgf-sparql` corpus rerun as the external gate; and the documents. Outbound spec
+`../kgf-sparql-bench` corpus rerun as the external gate; and the documents. Outbound spec
 edits are question 66.
 
 **What landed.** `/tpf` is a GET-only operation with its own request and cursor
@@ -1693,7 +1718,7 @@ consults them.
 *Verified by* the parser's specification-example tests, `oxrdfio` round trips of every
 format including JSON-LD's named graph, real-listener tests of the document, route
 separation, cursor separation, and `/fragment` refusals, plus the pinned Comunica suite
-against `/tpf`. The `../kgf-sparql` corpus rerun remains the external deployment gate;
+against `/tpf`. The `../kgf-sparql-bench` corpus rerun remains the external deployment gate;
 it is not part of this repository's local test suite.
 
 ### What the implementation still is not
@@ -2509,9 +2534,11 @@ fixed, two recorded below as open.
   sooner; it needs a listener wrapping the socket, and `axum` implements its
   client-address extractor only for its own listener types, so the access log would need
   a connect-info type of its own.
-- *Whether a transfer finished.* The access record is emitted when the response's
-  headers are produced, so for a download it cannot say whether the transfer finished
-  or how much of it was sent.
+- *Whether a transfer finished.* Resolved by unit 22's ledger: a download's record is
+  written when its body drops, with `bytes_out` as sent and `transfer` saying whether
+  it was `complete`, `interrupted`, or `failed`. What it still cannot say is how much
+  the client *received*: bytes handed to the connection may sit in socket buffers when
+  it closes.
 - *Trusting `X-Forwarded-For` by position.* With `--trusted-proxies` set, the client is
   read from the chain whatever the peer, so a caller that reaches the pod without the
   gateway — which, behind a ClusterIP Service, means from inside the cluster — can be
@@ -2544,6 +2571,59 @@ scroll. Candidates, to fold into the revamp rather than land piecemeal: a "Downl
 the manifest page's download panel beside its operations rather than after its
 configuration; human-readable sizes beside exact ones; possibly a download link on each
 catalog card; and step 3's `/export` listing as the download's own page.
+
+The second, noted 2026-09-30 from an attempt at issue 7 that was set aside, is **which
+page says what about a dataset**. Issue 7 asks for the summary page to show the
+description its Markdown and JSON forms carry. Adding it was easy; deciding it belonged
+there was not, because the description is already the lede of `/{dataset}`, one
+breadcrumb up, and of the release's manifest page. The distinction the attempt turned up:
+
+- **The machine formats of one document are alternative spellings of it.** The summary
+  card's Markdown and JSON are standalone documents handed to an agent, which reads
+  nothing else first, so each carries the description and should carry whatever the
+  other does unless a reason is written down.
+- **An HTML page is one page of a site.** What it repeats from its neighbours is a
+  question about the site as a whole, and repeating the description on the summary page
+  duplicates the dataset page. Issue 7 should be answered from this review rather than
+  by adding the field.
+
+Where each authored field reaches a reader today:
+
+- `/{dataset}`, page and JSON: title, description, IRI, publisher. No homepage and no
+  license.
+- The manifest page: the description as its lede, IRI, license (as plain text),
+  publisher. The manifest JSON also has the homepage; the page omits it.
+- The summary card's JSON: id, version, IRI, title, description, license, homepage. Its
+  Markdown: title, id, version, license, description — no IRI and no homepage, for no
+  recorded reason. Its page: title, id, version.
+
+So the homepage is on no page at all. A candidate split: `/{dataset}` says what the
+dataset is and who stands behind it (IRI, title, description, publisher, homepage,
+releases, predicate roles); the card says what a release contains and how to start
+querying it (title, description, id, version, license, counts, the ranked lists,
+links), and drops the IRI and homepage from its JSON, which also closes that gap with
+its Markdown. License stays on the card because a release is what is licensed, and an
+agent needs the terms beside the content. A license is as often an identifier such as
+`CC-BY-4.0` as a URL, so a page should link it, and the homepage, only when the value
+is an `http` or `https` address.
+
+The card's Markdown and JSON also differ on content:
+
+- the namespace inventory is in the JSON only, and uncapped, where every other list on
+  the card is the leading ten;
+- `graphs_total`, each graph's component, and each graph's subject, predicate and
+  object counts are in the JSON only (the page shows the counts too);
+- the top properties' distinct subject and object counts are in the JSON only;
+- the version-relative links, and the view the ranked lists come from, are in the JSON
+  only.
+
+Two smaller findings. The dataset and manifest pages set the description in a single
+paragraph, so a description written in several paragraphs runs together once HTML folds
+its blank lines. And whatever the revamp changes will not reach a browser that has
+already cached a page: every versioned response, pages included, is sent `immutable`
+with a year's `max-age`, so a browser never revalidates, and the deployment digest in
+the `ETag` that would have caught a rendering change is never consulted. The caching
+policy for pages needs settling before or with the revamp.
 
 ### 33. Verbalization — a root as the text it is embedded from ✅
 
@@ -3542,7 +3622,7 @@ following the code.
     `rdfs:label` are valid absolute IRIs by syntax and are taken literally: without a
     prefix map, `ExplicitRepresentation` cannot distinguish them from custom URI
     schemes, and `/tpf` deliberately performs no prefix expansion. Found by the
-    public-deployment evaluation in `../kgf-sparql` and implementation review.
+    public-deployment evaluation (`notes/public-deployment-comunica-evaluation.md`) and implementation review.
 67. **§3.4.8's `terms` capability covers two operations, and only one of them can be
     declared from a bundle's bytes.** The prefix scan and its count need nothing beyond
     the sorted dictionary every bundle carries. Key resolution needs the derived

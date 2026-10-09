@@ -26,7 +26,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, OriginalUri, Request, State};
@@ -48,8 +47,8 @@ use tower_http::compression::predicate::SizeAbove;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::access::{AccessOperation, Observation, OpenTiming, Timed, Transport, millis};
-use crate::admission::{DownloadClient, WorkClass};
+use crate::access::{AccessOperation, Ledger, Observation, OpenTiming, Transport};
+use crate::admission::{AdmissionController, DownloadClient, WorkClass};
 use crate::answer::{self, Rendered, Renders, Target};
 use crate::descriptor::{BundleManifest, DatasetDescriptor, ServiceDescriptor};
 use crate::envelope::{ErrorCode, PROBLEM_MEDIA_TYPE, Problem, reflected};
@@ -469,13 +468,11 @@ async fn bundle_manifest(
     let id = BundleId { dataset, version };
     let opened = Arc::clone(&service);
     observation.work_class = Some(WorkClass::Ordinary);
-    let timed = blocking(&service, WorkClass::Ordinary, move || {
+    let open = blocking(service.admission(), WorkClass::Ordinary, move || {
         opened.open_observed(&id).map(|(_, timing)| timing)
     })
     .await;
-    observation.queue_ms = Some(timed.queue_ms);
-    observation.work_ms = timed.work_ms;
-    match timed.result {
+    match open {
         Ok(open) => {
             observation.open_ms = Some(open.open_ms);
             observation.first_open = Some(open.first_open);
@@ -1049,13 +1046,11 @@ async fn export(
     let id = BundleId { dataset, version };
     let opened = Arc::clone(&service);
     observation.work_class = Some(WorkClass::Ordinary);
-    let timed = blocking(&service, WorkClass::Ordinary, move || {
+    let open = blocking(service.admission(), WorkClass::Ordinary, move || {
         opened.open_observed(&id)
     })
     .await;
-    observation.queue_ms = Some(timed.queue_ms);
-    observation.work_ms = timed.work_ms;
-    let store = match timed.result {
+    let store = match open {
         Ok((store, open)) => {
             observation.open_ms = Some(open.open_ms);
             observation.first_open = Some(open.first_open);
@@ -1065,7 +1060,7 @@ async fn export(
     };
     let response = match slot {
         None => delivery.head(&store, coding),
-        Some(slot) => delivery.send(store, coding, &extent, slot),
+        Some(slot) => delivery.send(store, coding, &extent, slot, Ledger::current()),
     };
     observed_result(response, observation)
 }
@@ -1442,7 +1437,7 @@ where
         request.labels_requested(),
     );
     let opened = Arc::clone(&service);
-    let timed = blocking(&service, work_class, move || {
+    let result = blocking(service.admission(), work_class, move || {
         let (store, open) = opened.open_observed(target.id())?;
         Ok(Opened::run(open, || {
             // Serialized in here, not outside: strings are materialized only
@@ -1454,9 +1449,7 @@ where
         }))
     })
     .await;
-    observation.queue_ms = Some(timed.queue_ms);
-    observation.work_ms = timed.work_ms;
-    let rendered = match record_open(&mut observation, timed.result) {
+    let rendered = match record_open(&mut observation, result) {
         Ok(rendered) => rendered,
         Err(problem) => return observed_result(Err(problem), observation),
     };
@@ -1538,16 +1531,14 @@ where
     .with_dataset_metadata(release.dataset_iri(), release.carries_description())
     .with_declarations(release.declarations());
     let opened = Arc::clone(&service);
-    let timed = blocking(&service, work_class, move || {
+    let result = blocking(service.admission(), work_class, move || {
         let (store, open) = opened.open_observed(target.id())?;
         Ok(Opened::run(open, || {
             execute(&store, target, &request, representation)
         }))
     })
     .await;
-    observation.queue_ms = Some(timed.queue_ms);
-    observation.work_ms = timed.work_ms;
-    let rendered = match record_open(&mut observation, timed.result) {
+    let rendered = match record_open(&mut observation, result) {
         Ok(rendered) => rendered,
         Err(problem) => return observed_result(Err(problem), observation),
     };
@@ -1710,6 +1701,9 @@ where
             ),
         };
     }
+    // Parsed and hashed, the body is not read again. Released before admission, so
+    // a request in the waiting room holds its parsed form and not the bytes too.
+    drop(body);
 
     let target = Target::body(
         id,
@@ -1720,7 +1714,7 @@ where
     );
     let labels = PageLabelProfile::for_request(&service, release, representation, false);
     let opened = Arc::clone(&service);
-    let timed = blocking(&service, WorkClass::Heavy, move || {
+    let result = blocking(service.admission(), WorkClass::Heavy, move || {
         let (store, open) = opened.open_observed(target.id())?;
         Ok(Opened::run(open, || {
             let mut answer = execute(&store, target, &request)?;
@@ -1729,9 +1723,7 @@ where
         }))
     })
     .await;
-    observation.queue_ms = Some(timed.queue_ms);
-    observation.work_ms = timed.work_ms;
-    let rendered = match record_open(&mut observation, timed.result) {
+    let rendered = match record_open(&mut observation, result) {
         Ok(rendered) => rendered,
         Err(problem) => return observed_result(Err(problem), observation),
     };
@@ -2433,57 +2425,134 @@ fn record_open<T>(
 /// convention for a path that is not built, so an unimplemented operation
 /// reached by a client should answer `internal_error` and log, not look like a
 /// network failure.
-async fn blocking<T, F>(service: &Service, class: WorkClass, work: F) -> Timed<T>
+///
+/// The wait for admission and the work itself are charged to the request's
+/// [`Ledger`] when a sink is recording: the wait however it ends, including a
+/// client giving up in the waiting room, and the work wherever it runs, including
+/// after a client that disconnected mid-work has gone.
+async fn blocking<T, F>(
+    admission: &AdmissionController,
+    class: WorkClass,
+    work: F,
+) -> Result<T, Problem>
 where
     F: FnOnce() -> Result<T, Problem> + Send + 'static,
     T: Send + 'static,
 {
-    let queue_started = Instant::now();
-    let admitted = match service.admission().enter(class).await {
-        Ok(admitted) => admitted,
-        Err(problem) => {
-            return Timed {
-                result: Err(problem),
-                queue_ms: millis(queue_started.elapsed()),
-                work_ms: None,
-            };
-        }
-    };
-    let queue_ms = millis(queue_started.elapsed());
-    match tokio::task::spawn_blocking(move || {
+    let ledger = Ledger::current();
+    let waiting = ledger.as_ref().map(|ledger| ledger.wait(class));
+    let admitted = admission.enter(class).await;
+    drop(waiting);
+    let admitted = admitted?;
+    tokio::task::spawn_blocking(move || {
         // A blocking task cannot be cancelled after it starts. Keep its
         // capacity in the task itself, so a disconnected client dropping the
         // awaiting handler does not admit replacement work while this work is
         // still faulting pages or building a response.
         let _admitted = admitted;
-        let work_started = Instant::now();
-        let result = work();
-        (result, millis(work_started.elapsed()))
+        Ledger::charge(ledger, work)
     })
     .await
-    {
-        Ok((result, work_ms)) => Timed {
-            result,
-            queue_ms,
-            work_ms: Some(work_ms),
-        },
-        Err(error) => {
-            tracing::error!(%error, "a request panicked on the blocking pool");
-            Timed {
-                result: Err(Problem::new(
-                    ErrorCode::InternalError,
-                    "the request failed while reading the bundle",
-                )),
-                queue_ms,
-                work_ms: None,
-            }
-        }
-    }
+    .unwrap_or_else(|error| {
+        tracing::error!(%error, "a request panicked on the blocking pool");
+        Err(Problem::new(
+            ErrorCode::InternalError,
+            "the request failed while reading the bundle",
+        ))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::time::Duration;
+
+    use crate::access::AccessWorkClass;
+    use crate::access::testing::{self, Sink};
+    use crate::admission::Admission;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_request_given_up_in_the_waiting_room_is_recorded_with_its_wait() {
+        runtime().block_on(async {
+            let admission = AdmissionController::new(Admission {
+                max_concurrent_work: 1,
+                heavy_request_weight: 1,
+                queue_timeout_ms: 60_000,
+                ..Admission::new()
+            });
+            let _occupied = admission.enter(WorkClass::Ordinary).await.unwrap();
+            let sink = Arc::new(Sink::default());
+            let ledger = testing::recording(sink.clone(), "/tox/v/v1/fragment");
+
+            let request = testing::scoped(
+                Arc::clone(&ledger),
+                blocking(&admission, WorkClass::Ordinary, || Ok(())),
+            );
+            // A client that gives up drops its request while it waits.
+            let gave_up = tokio::time::timeout(Duration::from_millis(20), request).await;
+            assert!(gave_up.is_err(), "admitted past an occupied gate");
+            drop(ledger);
+
+            let records = sink.records();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].status, None);
+            assert_eq!(records[0].work_class, Some(AccessWorkClass::Ordinary));
+            assert!(records[0].queue_ms >= Some(20), "{:?}", records[0]);
+            assert_eq!(records[0].work_ms, None);
+        });
+    }
+
+    #[test]
+    fn work_a_departed_client_left_running_is_recorded_when_it_ends() {
+        runtime().block_on(async {
+            let admission = AdmissionController::new(Admission::new());
+            let sink = Arc::new(Sink::default());
+            let ledger = testing::recording(sink.clone(), "/tox/v/v1/fragment");
+            let (started, has_started) = std::sync::mpsc::channel();
+            let (finish, may_finish) = std::sync::mpsc::channel::<()>();
+
+            let mut request = Box::pin(testing::scoped(
+                Arc::clone(&ledger),
+                blocking(&admission, WorkClass::Heavy, move || {
+                    started.send(()).unwrap();
+                    may_finish.recv().unwrap();
+                    Ok(())
+                }),
+            ));
+            // Run the request until its work is under way on the pool...
+            tokio::select! {
+                _ = &mut request => panic!("the work cannot have finished"),
+                started = tokio::task::spawn_blocking(move || has_started.recv()) => {
+                    started.unwrap().unwrap();
+                }
+            }
+            // ...then go away, as a disconnecting client does.
+            drop(request);
+            drop(ledger);
+            assert!(
+                sink.records().is_empty(),
+                "written while its work still ran"
+            );
+
+            finish.send(()).unwrap();
+            let records = sink.wait_for(1).await;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].status, None);
+            assert_eq!(records[0].work_class, Some(AccessWorkClass::Heavy));
+            assert!(records[0].queue_ms.is_some());
+            assert!(records[0].work_ms.is_some());
+            assert_eq!(records[0].cpu_ms.is_some(), cfg!(target_os = "linux"));
+            assert!(!sink.written_while_unwinding());
+        });
+    }
 
     #[test]
     fn a_health_probe_is_answered_without_touching_a_bundle() {

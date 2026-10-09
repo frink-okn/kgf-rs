@@ -10,7 +10,7 @@ window and no URL-compatibility shim: `/fragment` changes in place.
 ## Why
 
 The public deployment was measured with stock Comunica 5.3.0 over the 60-task mcp-okn
-corpus (`../kgf-sparql/docs/public-deployment-comunica-evaluation.md`). Two findings are
+corpus (`public-deployment-comunica-evaluation.md`, in these notes). Two findings are
 about the term grammar rather than about performance:
 
 1. **The native grammar and the TPF grammar contradict each other, and today one route
@@ -93,7 +93,7 @@ release answers it; there is no capability flag, as unit 20 already decided.
 | `subject`, `predicate`, `object` | the pattern, in `ExplicitRepresentation` (below); omitted or `?name` is a variable |
 | `values` | brTPF binding table, SPARQL `VALUES` syntax without the keyword; parsed by `spargebra` exactly as today |
 | `cursor` | KGF's opaque continuation, only ever obtained from `hydra:next` |
-| `limit` | page size, a KGF extension a client may add out of band (the `../kgf-sparql` harness ramps it); never part of the template |
+| `limit` | page size, a KGF extension a client may add out of band (the `../kgf-sparql-bench` harness ramps it); never part of the template |
 | `format` | `nq`, `trig`, `ttl`, `jsonld`, `html`, for browsers and debugging |
 
 Anything else is a 400 through the existing `accept_only` machinery, including `s`,
@@ -268,7 +268,7 @@ Each step is a mergeable unit with its own tests; none needs a fixture change.
    `Accept` (no control leak, which also proves the primary-topic split); and the
    negotiated content type observed to be N-Quads. The ignored Rust test that drives
    it passes both `/tpf` URLs.
-7. **External gate** — rerun the `../kgf-sparql` corpus harness with the endpoints
+7. **External gate** — rerun the `../kgf-sparql-bench` corpus harness with the endpoints
    swapped to `/tpf` (`TASK_WORKERS=3 python3 test/corpus-arms.py … brtpf all`), and
    compare with the recorded public-deployment numbers: 42 of 60 tasks under the
    combined profile, 0.43× requests at the median, the three sockg crashes gone, and
@@ -306,4 +306,4 @@ suite gate every step, as for unit 20.
 - Bindings over a body on `/tpf`, or TPF hypermedia on `/fragment`.
 - Comunica-side work that this route exposes but does not fix: 4xx surfacing as
   unhandled rejections, no retry on network-level failures, unbounded request
-  concurrency. Those are tracked in the `../kgf-sparql` report.
+  concurrency. Those are tracked in `public-deployment-comunica-evaluation.md`.
