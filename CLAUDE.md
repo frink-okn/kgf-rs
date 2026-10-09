@@ -43,7 +43,7 @@ Source/
 | `kgf-store` | The memory-mapped read layer (doc 20). No HTTP, no async, no locks on the read path. |
 | `kgf-verbalize` | A bundle's roots as embedding text, over `kgf-store`. Called by the build stage and by `/verbalize` alike; knows nothing of HTTP. |
 | `kgf-server` | The HTTP API (doc 03) over `kgf-store`: caps, budgets, cursors, formats. |
-| `kgf` | The binary: `kgf build`, `kgf serve`, `kgf manifest`. |
+| `kgf` | The binary: `kgf build`, `kgf serve`, `kgf manifest`, `kgf verbalize`. |
 
 **Status: M1 is built and answers.** `kgf-store` implements doc 20's read layer in
 full — mapped bundles, dictionary, all eight patterns with exact counts and positional
@@ -153,16 +153,19 @@ to write the `unsafe` that **maps**; every other crate and module carries
 obligation — the mapping surface stays small and audited, and everything above it is
 safe code over slices.
 
-**There is exactly one other `unsafe` in the workspace, and it maps nothing.**
-`PublishedBundle::new` and `PublishedRoot::new` are `pub unsafe` precisely so the
-immutability promise is made from *outside* `kgf-store`, by the layer that can know
-it: a library cannot establish that a directory will not be rewritten, and a
-deployment can. That layer is `kgf::serve::published_root`, which carries the
-workspace's second `#[allow(unsafe_code)]` and a SAFETY comment citing doc 04 §4.6.
-`kgf-server` stays `deny(unsafe_code)` and takes a `PublishedRoot` in its `Config`
-rather than a path, because it is a library that can be embedded and must not make the
-promise on an unknown caller's behalf. A third site is a design change to surface, not
-a convenience.
+**Every other `unsafe` in the workspace maps nothing: it makes the immutability
+promise.** `PublishedBundle::new` and `PublishedRoot::new` are `pub unsafe` precisely so
+that promise is made from *outside* `kgf-store`, by the layer that can know it: a
+library cannot establish that a directory will not be rewritten, and a deployment can.
+That layer is the `kgf` binary, and only it carries `#[allow(unsafe_code)]`: `serve`
+asserts it for the root a deployment serves, and the one-shot commands `manifest` and
+`verbalize` assert it for a directory the operator named (or a build's own staging
+directory), each under a SAFETY comment saying what the command writes and why that is
+not the mapped bytes. `kgf-server` stays `deny(unsafe_code)` and takes a `PublishedRoot`
+in its `Config` rather than a path, because it is a library that can be embedded and
+must not make the promise on an unknown caller's behalf. A site of a new kind — in a
+library, or over a directory nobody has promised anything about — is a design change to
+surface, not a convenience.
 
 The soundness argument is written down in that module and must stay true: mapping a
 file is unsound in general, because another process can truncate it under a live
