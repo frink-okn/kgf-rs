@@ -98,15 +98,15 @@ pub fn run(args: Args) -> Result<()> {
     if args.iri.is_empty() {
         for (index, name) in &targets {
             let roots = verbalizer.roots(*index)?;
-            let total = args
-                .limit
-                .map_or(roots.len(), |limit| limit.min(roots.len()));
+            let total = args.limit.map_or(roots.len(), |limit| {
+                u64::try_from(limit).unwrap_or(u64::MAX).min(roots.len())
+            });
             let target_started = Instant::now();
             // Roots with a predicate sampled down to the limit: the signal
             // for tuning the config, reported here rather than carried on
             // the records, which no later stage would read it from.
             let mut limited = 0u64;
-            for &root in roots.iter().take(total) {
+            for root in roots.take(usize::try_from(total).unwrap_or(usize::MAX)) {
                 if let Some(rendered) = verbalizer.verbalize(*index, root)? {
                     limited += u64::from(rendered.limited > 0);
                     out.write(&rendered, name)?;

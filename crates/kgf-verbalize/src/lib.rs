@@ -88,6 +88,13 @@
 //! and not in the store for the reason every other cache does: the store's
 //! read path holds no lock, and a verbalizer is one thread's work over one
 //! bundle.
+//!
+//! Each cache is bounded at [`MAX_CACHE_ENTRIES`] and simply emptied when it
+//! gets there. A build over millions of roots touches millions of distinct
+//! terms, and a cache that only grew would hold them all; emptying it costs a
+//! few recomputations after each clearing and nothing else, since no result
+//! depends on a cache hit. The class walk is bounded the same way: a build
+//! enumerates a class by position in pages, never as one list.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -128,11 +135,28 @@ pub enum Error {
     },
 }
 
+/// The most entries any one of a verbalizer's caches holds before it is
+/// emptied. Terms and labels average well under a hundred bytes, so a full
+/// cache is tens of megabytes; past this the run would rather recompute than
+/// grow with the graph.
+pub const MAX_CACHE_ENTRIES: usize = 1 << 18;
+
+/// Members of a class fetched per step of a [`Roots`] walk.
+const ROOTS_PAGE: usize = 1 << 12;
+
 /// The most templates one label resolution descends through before the
 /// node at the bottom is named without its templates. A label that needs
 /// more than this many hops of templates is not a label; the bound keeps a
 /// long profiled chain from costing a deep recursion.
 pub const MAX_TEMPLATE_DEPTH: usize = 8;
+
+/// Insert into a cache, emptying it first if it is full.
+fn bounded_insert<K: std::hash::Hash + Eq, V>(cache: &mut HashMap<K, V>, key: K, value: V) {
+    if cache.len() >= MAX_CACHE_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(key, value);
+}
 
 /// Materialized terms, memoized for the life of a run.
 ///
@@ -160,7 +184,7 @@ impl Terms {
         let text: Rc<str> = std::str::from_utf8(bytes)
             .map_err(|_| Error::NotUtf8 { role, id })?
             .into();
-        self.entries.insert((role, id), Rc::clone(&text));
+        bounded_insert(&mut self.entries, (role, id), Rc::clone(&text));
         Ok(text)
     }
 }
@@ -515,21 +539,26 @@ impl<'a> Verbalizer<'a> {
         self.exhausted
     }
 
-    /// The subject ids of every member of `target`'s class, ascending.
+    /// The subject ids of every member of `target`'s class, ascending, a
+    /// page at a time.
     ///
     /// Blank-node members are included; [`verbalize`](Self::verbalize) skips
-    /// them. An empty result for a class the bundle lacks is the correct
-    /// answer, and [`Bound::unknown`] is where that is reported. This
-    /// enumerates the whole class and is for a build; a server draws
-    /// positions through [`root_count`](Self::root_count) and
-    /// [`root_at`](Self::root_at) instead.
-    pub fn roots(&self, target: usize) -> Result<Vec<u64>, Error> {
-        Ok(match self.members(target)? {
-            Some(selection) => selection
-                .page(0, usize::MAX)
-                .map(|triple| triple.subject)
-                .collect(),
-            None => Vec::new(),
+    /// them. An empty walk for a class the bundle lacks is the correct
+    /// answer, and [`Bound::unknown`] is where that is reported. This walks
+    /// the whole class and is for a build; a server draws positions through
+    /// [`root_count`](Self::root_count) and [`root_at`](Self::root_at)
+    /// instead. The walk borrows the store, not the verbalizer, so each root
+    /// can be verbalized as it arrives.
+    pub fn roots(&self, target: usize) -> Result<Roots<'a>, Error> {
+        let selection = self.members(target)?;
+        let count = selection
+            .as_ref()
+            .map_or(0, |selection| selection.count().value);
+        Ok(Roots {
+            selection,
+            count,
+            next: 0,
+            page: Vec::new().into_iter(),
         })
     }
 
@@ -761,7 +790,7 @@ impl<'a> Verbalizer<'a> {
                     .dictionary
                     .locate(Role::Subject, iri.as_bytes())?
                     .map(|id| id.0);
-                self.predicate_subjects.insert(id, found);
+                bounded_insert(&mut self.predicate_subjects, id, found);
                 found
             }
         })
@@ -784,8 +813,11 @@ impl<'a> Verbalizer<'a> {
             && self.cuts == cuts
             && !self.exhausted
         {
-            self.object_labels
-                .insert((id, target), Rc::from(label.as_str()));
+            bounded_insert(
+                &mut self.object_labels,
+                (id, target),
+                Rc::from(label.as_str()),
+            );
         }
         Ok(label)
     }
@@ -952,9 +984,56 @@ impl<'a> Verbalizer<'a> {
             Some(label) => humanize(&label).to_lowercase().into(),
             None => fallback_label(&iri).to_lowercase().into(),
         };
-        self.predicate_names
-            .insert((predicate, target), Rc::clone(&name));
+        bounded_insert(
+            &mut self.predicate_names,
+            (predicate, target),
+            Rc::clone(&name),
+        );
         Ok(name)
+    }
+}
+
+/// A class's members by position, in pages: the walk [`Verbalizer::roots`]
+/// returns.
+pub struct Roots<'a> {
+    selection: Option<Selection<'a>>,
+    /// Members in all; the walk ends at this position.
+    count: u64,
+    /// The position the next page starts at.
+    next: u64,
+    page: std::vec::IntoIter<u64>,
+}
+
+impl Roots<'_> {
+    /// How many members the walk will yield in all.
+    pub fn len(&self) -> u64 {
+        self.count
+    }
+
+    /// Whether the class has no members.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+impl Iterator for Roots<'_> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<u64> {
+        if let Some(root) = self.page.next() {
+            return Some(root);
+        }
+        let selection = self.selection.as_ref()?;
+        if self.next >= self.count {
+            return None;
+        }
+        let page: Vec<u64> = selection
+            .page(self.next, ROOTS_PAGE)
+            .map(|triple| triple.subject)
+            .collect();
+        self.next += page.len() as u64;
+        self.page = page.into_iter();
+        self.page.next()
     }
 }
 
@@ -1062,6 +1141,17 @@ mod tests {
             RootRecord::new(&b, "t").digest
         );
         assert_eq!(TextRecord::new(&a).digest, RootRecord::new(&a, "t").digest);
+    }
+
+    #[test]
+    fn a_full_cache_is_emptied_rather_than_grown() {
+        let mut cache = HashMap::new();
+        for key in 0..MAX_CACHE_ENTRIES {
+            bounded_insert(&mut cache, key, ());
+        }
+        assert_eq!(cache.len(), MAX_CACHE_ENTRIES);
+        bounded_insert(&mut cache, MAX_CACHE_ENTRIES, ());
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

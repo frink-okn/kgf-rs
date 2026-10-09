@@ -681,3 +681,34 @@ fn the_command_refuses_to_write_into_the_bundle_or_run_a_target_twice() {
         "{texts:?}"
     );
 }
+
+#[test]
+fn a_class_is_walked_by_position_across_pages() {
+    // More members than one page of the walk fetches, so the walk has to
+    // turn the page at least once and must neither skip nor repeat a root.
+    const MEMBERS: usize = 5_000;
+    let mut graph = String::new();
+    for i in 0..MEMBERS {
+        graph.push_str(&nt(&format!("m{i:05}"), RDF_TYPE, "Thing"));
+    }
+    let published = Published::build(&graph);
+    let config = parse_config(r#"{"targets": {"thing": {"type": "http://example.com/Thing"}}}"#);
+    let resolved = config.resolve().unwrap();
+    let label_role = default_predicate_roles().remove("label").unwrap();
+    let bound = Bound::bind(&published.store, &resolved, &label_role).unwrap();
+    let mut verbalizer = Verbalizer::new(&published.store, &bound);
+
+    let roots = verbalizer.roots(0).unwrap();
+    assert_eq!(roots.len(), MEMBERS as u64);
+    let mut seen = Seen::new();
+    let mut walked = 0;
+    let mut previous = None;
+    for root in roots {
+        let rendered = verbalizer.verbalize(0, root).unwrap().unwrap();
+        assert!(seen.first(rendered.digest), "repeated {}", rendered.iri);
+        assert!(previous.is_none_or(|p| p < root), "out of order at {root}");
+        previous = Some(root);
+        walked += 1;
+    }
+    assert_eq!(walked, MEMBERS);
+}
