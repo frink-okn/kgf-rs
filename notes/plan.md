@@ -2545,6 +2545,118 @@ the manifest page's download panel beside its operations rather than after its
 configuration; human-readable sizes beside exact ones; possibly a download link on each
 catalog card; and step 3's `/export` listing as the download's own page.
 
+### 33. Verbalization — a root as the text it is embedded from ✅
+
+**Implemented 2026-09-04 to 2026-10-09, in a crate of its own.** Doc 13 §13.1's first
+pipeline stage: a config names classes whose members become roots, and each root
+becomes one text — a `label:` line, then one `predicate: value` line per selected
+outgoing edge, values named by their labels rather than expanded. The model that reads
+those texts stays outside this workspace. This unit is the read half: the crate, the
+command that writes records for a build, and the route that renders a few roots of a
+served bundle so that a config can be authored against the graph without a local copy.
+
+**Where it lives, and why not hdtc.** `kgf-verbalize` sits between `kgf-store` and
+`kgf-server`, because it has two callers that are peers — the build stage and
+`/verbalize` — and neither owns it, and because it reads through the mapped `Store`:
+a root's star, a mentioned node's types, a template field's values, the label cascade,
+all star lookups in id space over the permutations. hdtc's readers seek a file with
+bounded memory, the opposite model, and the preview is only worth having if it predicts
+the build's text byte for byte, which one implementation serving both callers is the
+only way to guarantee. The crate defines no byte format and knows nothing of HTTP.
+
+**What a text is.** Roots are the subjects of `? rdf:type <class>`, blank nodes
+skipped. The star `s ? ?` arrives grouped by predicate in id order, which is IRI order,
+so "predicates in IRI order" costs nothing. Per predicate, the `predicate_limit` values
+with the smallest `sha256(root \t predicate \t object)` over the *strings* are kept and
+emitted in score order: a uniform sample keyed on content, so an unchanged node samples
+the same values in every build whatever ids it was assigned, and the sample is neither
+"first n in dictionary order" (a lexical accident) nor "rarest values" (a ranking the
+text would then depend on globally). A value is named by its literal form; an IRI by the
+profile for its class, then the cascade, then its humanized IRI fragment; a blank node
+is skipped. The root is named the same way except that its target's `label_template`
+is tried first.
+
+**Two label mechanisms, by position.** A *profile* is keyed by class and names a node
+wherever it appears; a target's *`label_template`* names the node only as the root of
+its own document. The same class may carry both, and when it does the root takes the
+template — written for exactly that node in exactly that position — and a mention takes
+the profile, so a Location is `Location 123: Cover crops` as a headline and `Cover
+crops` inside a Site's text. A single mechanism would push one string into both slots.
+
+**The cascade is the config's, then the bundle's.** A target's `label_predicates` are
+tried in the order written, and the bundle's `label` role follows as what a config
+that says nothing gets. The config goes first because its author has seen the graph —
+a generic label predicate can carry boilerplate beside the domain predicate carrying
+the real name, and only the config can say which to prefer — and because a text is glad
+of description or identifier predicates that a label endpoint should never return. This
+is a deliberate divergence from doc 13 §13.1's wording; see question 85.
+
+**Templates stop at a cycle.** A template names a node by its neighbours' labels, and a
+neighbour of a profiled class is named by a template in turn, so one label resolution
+can descend through several. Graphs have cycles — `owl:sameAs`, inverse pairs, a class
+that is an instance of itself — and the first implementation descended until the worker
+thread's stack overflowed, which aborts the process: one GET took the server down. A
+node whose template is already mid-render, or one more than `MAX_TEMPLATE_DEPTH` (8)
+templates down, is now named without its templates. A label that took such a cut
+depends on where the descent started, so it is not cached; every other label is.
+
+**Cost.** The build reads without bound, because `predicate_limit` selects from all of a
+predicate's values. The route cannot: every row any walk consumes — a root's star, the
+probes naming what it mentions — is charged to one candidate budget for the request,
+through the one method that reads a row. When the budget runs out the root in hand is
+delivered marked `truncated`, no further root is rendered, and the answer reports the
+candidate budget exhausted, as `/search` does. Roots are bounded by a new cap,
+`max_verbalize_roots` (default 100): IRIs named are counted against it, a plan with more
+targets than the cap is refused (no `n` fits), and the default `n` shrinks to fit. The
+response stops at its byte budget. Drawing a member is one rank descent and a class's
+member count a range width, so a plan never enumerates a class. The route is therefore
+one row of the cost table: `max_verbalize_roots` rank descents plus `candidate_budget`
+rows plus the bytes.
+
+**The route's modes.** `iri` renders named roots under one target; `target` without
+IRIs draws `n` seeded-uniform members, the same draw `/sample` makes; a config alone is
+a *plan* — every target's member count and `n` sampled texts with length statistics,
+each text reporting `limited` (predicates sampled down to the limit: the tuning signal)
+and `truncated` (the server's bound, not a config problem). The config travels as YAML
+or JSON text in a GET parameter for a browser and as a JSON body on `QUERY` (canonical)
+and `POST` (fallback), with the same fields either way. The HTML representation carries
+the config in a form, so a config can be drafted in a browser against a served bundle.
+
+**Not a manifest capability.** The route needs no artifact, so declaring it would tell a
+reader of the manifest nothing about the bundle (unit 27's rule), and the manifest is a
+protocol-level document: a capability there says any server honouring doc 03 answers it
+for this bundle, which is not true of an operation doc 03 does not define. The service
+descriptor links the route on every release, as what this deployment routes.
+
+**The command.** `kgf verbalize <bundle> --config --output` writes one JSON line per
+distinct text — identical texts from several roots are one record naming them all,
+keeping its `max_iris_per_record` smallest IRIs and a count. It opens the bundle as
+`kgf manifest` does, asserting publication for an operator-named directory, and refuses
+an `--output` inside the bundle before mapping anything, since the one file it writes
+must not be a mapped one. Memory is unbounded across a run — the term and label caches
+never evict and the grouper holds every distinct text — which is fine at thousands of
+roots and not at doc 13's 10⁶–10⁸; streaming output and bounded caches are a later
+unit, together with the record shape the embedding stage will want (every root with its
+text digest, the distinct texts keyed by digest), once the vectors split is settled.
+
+**What the schema pages needed.** Authoring a config starts from two signals per
+(class, predicate): coverage — how many of a class's members carry the predicate — and
+fanout — triples per subject. The build now passes `--partition-distinct-counts all`
+so every VoID partition carries exact distinct-subject counts, the class-level ones
+included (hdtc keeps a scalar tracker per emitted partition, so this costs words, not
+sets), and `/schema`'s class-property pages show a per-subject column.
+
+*Verified by* the fixture tests in `crates/kgf/tests/verbalize.rs` — the text's shape,
+the config cascade over the bundle role, the stable sample across runs and across
+shifted ids, allow and deny lists, template and profile by position, grouping, unknown
+IRIs, the cycle and depth bounds, and the command's refusals — and over a listener by
+`verbalize_previews_a_config_in_three_modes_over_get_query_and_post`,
+`verbalize_refuses_what_it_cannot_answer_by_name`,
+`verbalize_survives_a_profile_template_over_a_cycle`, and
+`verbalize_charges_every_read_to_one_candidate_budget`. On the SOCKG release (27 M
+triples, 1,237 roots over eleven targets) the texts were byte-identical to the Python
+implementation this ports, in 0.28 s against 21.5 s.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
@@ -3587,6 +3699,42 @@ following the code.
 84. **`range_not_satisfiable` (416) joins the error table.** A download needs it, with
     `Content-Range: bytes */{len}`, for unsatisfiable and for refused multi-range
     requests alike.
+
+85. **Doc 13 §13.1's cascade should be the config's first, then the roles.** It says
+    verbalization "should draw on the declared predicate roles rather than its own
+    predicate lists, so a KG's label and description predicates are stated once". Unit
+    33 does the opposite on purpose: a target's `label_predicates` come first, in the
+    order written, and the bundle's `label` role follows as the fallback for whatever
+    the config did not name. The case that forced it: SOCKG's journal articles carry
+    `rdfs:label` and `dcterms:title`, and the label is boilerplate — "Journal article
+    about data" on many of them — while the title is the name. With the role first,
+    every text citing an article read `cites: Journal article about data`. The role
+    cannot say "prefer the title for this class": it is one list for the whole graph,
+    and for `/labels` that generic answer is correct, since the boilerplate *is* the
+    node's label. A label endpoint and a text ask different questions — "what is this
+    node called" against "what should a model read about it" — and the text also wants
+    description or identifier predicates a label endpoint must never return, because a
+    node named by its description still beats one named by its IRI fragment. Stating
+    the predicates once assumed one list serves both questions. Proposed wording: the
+    roles are the default a config inherits, not the list it must use; a config that
+    says nothing gets the bundle's behaviour, and one that names predicates gets them
+    first.
+
+86. **`/verbalize` and `max_verbalize_roots` are a route and a cap doc 03 does not
+    define.** The operation is an authoring tool over a served bundle, not a read
+    operation in §3.1's sense, and its cost is one row (question 85's unit records
+    it: cap many rank descents, a candidate budget of rows, the byte budget). Either
+    doc 03 gains the row and the cap, or doc 13 gains a section saying the preview
+    exists, what it costs, and that it is a deployment's to route rather than a
+    bundle's to declare.
+
+87. **Should an operation the protocol has not defined have a name in the capability
+    vocabulary at all?** Unit 33 first declared `verbalize` in every manifest, on the
+    `sample`/`labels` precedent, and withdrew it: unit 27 settled that a declaration
+    tells a reader nothing when no artifact can be absent, and the manifest's audience
+    reads it as a statement about the protocol, not about one implementation. The
+    precedent itself is the open question — `sample` and `labels` are declared because
+    doc 03 defines them, and if that is the rule it should be written down.
 
 ## Not in this plan
 
