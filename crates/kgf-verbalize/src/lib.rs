@@ -30,7 +30,10 @@
 //!    profile for its class, then the label cascade, then its humanized
 //!    fragment. Blank-node values are skipped.
 //! 5. Name the root the same way, except that its target's `label_template`
-//!    is tried after profiles and before the cascade.
+//!    is tried first: it was written for this node in this position, so it
+//!    beats the profile of the root's class, which was written for the node
+//!    as a mention. A class with both reads one way as a root and another
+//!    way as a mention, which is the point of having both.
 //!
 //! The cascade is the target's own `label_predicates`, in the order written,
 //! followed by the bundle's `label` role — the predicates `/labels` answers
@@ -807,8 +810,9 @@ impl<'a> Verbalizer<'a> {
         Ok(fallback_label(&iri))
     }
 
-    /// The templates that may name `subject`, in the order tried: the profile
-    /// of each of its classes, then its target's `label_template` as a root.
+    /// The templates that may name `subject`, in the order tried: its
+    /// target's `label_template` as a root, then the profile of each of its
+    /// classes.
     fn templates(
         &mut self,
         subject: u64,
@@ -817,6 +821,9 @@ impl<'a> Verbalizer<'a> {
     ) -> Result<Vec<&'a BoundTemplate>, Error> {
         let bound = self.bound;
         let mut templates = Vec::new();
+        if as_root && let Some(template) = &bound.targets[target].template {
+            templates.push(template);
+        }
         if !bound.profiles.is_empty()
             && let Some(rdf_type) = bound.rdf_type
         {
@@ -825,9 +832,6 @@ impl<'a> Verbalizer<'a> {
                     templates.push(template);
                 }
             }
-        }
-        if as_root && let Some(template) = &bound.targets[target].template {
-            templates.push(template);
         }
         Ok(templates)
     }

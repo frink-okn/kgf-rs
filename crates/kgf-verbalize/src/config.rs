@@ -20,11 +20,13 @@
 //!
 //! A **profile** is keyed by class and applies to a node wherever it appears:
 //! as a root, or mentioned in some other root's text. A target's
-//! **`label_template`** applies only when the node is the root. They differ by
-//! position, not by syntax: a Location describes *itself* as
-//! `Location 123: Program X`, while a Site that mentions it says
-//! `has location: Program X`. Collapsing the two would push the rich template
-//! into every document that references the class.
+//! **`label_template`** applies only when the node is the root, and when a
+//! class has both, the root takes the template: it was written for that node
+//! in that position. They differ by position, not by syntax: a Location
+//! describes *itself* as `Location 123: Program X`, while a Site that mentions
+//! it says `has location: Program X`. Collapsing the two would push the rich
+//! template into every document that references the class, or make every
+//! root's headline as terse as a mention.
 
 use std::collections::{BTreeMap, BTreeSet};
 

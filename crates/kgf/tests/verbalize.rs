@@ -500,3 +500,51 @@ fn a_template_descends_a_bounded_number_of_hops() {
     );
     assert_eq!(near.label, "the end");
 }
+
+#[test]
+fn a_root_with_both_takes_its_target_template_and_a_mention_its_profile() {
+    let published = Published::build(&graph(&[
+        ("loc1", RDF_TYPE, "Location"),
+        ("loc1", "locationId", "\"123\""),
+        ("loc1", "hasProgram", "prog"),
+        ("prog", RDFS_LABEL, "\"Cover crops\""),
+        ("site1", RDF_TYPE, "Site"),
+        ("site1", RDFS_LABEL, "\"Site one\""),
+        ("site1", "hasLocation", "loc1"),
+    ]));
+    // The same class, Location, has a profile for when it is mentioned and a
+    // target template for when it is the root. Both are written in the same
+    // field vocabulary; only the position decides which names the node.
+    let config = parse_config(
+        r#"{
+          "profiles": {
+            "location": {"type": "http://example.com/Location", "template": "{program}",
+                         "fields": {"program": "http://example.com/hasProgram"}}
+          },
+          "targets": {
+            "location": {"type": "http://example.com/Location",
+                         "label_template": "Location {id}: {program}",
+                         "label_fields": {"id": "http://example.com/locationId",
+                                          "program": "http://example.com/hasProgram"}},
+            "site": {"type": "http://example.com/Site"}
+          }
+        }"#,
+    );
+    let records = all_records(&published.store, &config);
+    let grouped = by_text(&records);
+    assert_eq!(records.len(), 2, "{records:#?}");
+    // As a root, the location's own headline is the template's.
+    assert!(
+        grouped.contains_key(
+            "label: Location 123: Cover crops\nhas program: Cover crops\nlocation id: 123\ntype: Location"
+        ),
+        "{records:#?}"
+    );
+    // Mentioned by the site, the same node reads by its profile.
+    assert!(
+        grouped.contains_key(
+            "label: Site one\nhas location: Cover crops\ntype: Site\nlabel: Site one"
+        ),
+        "{records:#?}"
+    );
+}
