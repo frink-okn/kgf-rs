@@ -85,7 +85,7 @@ use std::rc::Rc;
 use hdtc::format::parse_literal;
 use kgf_store::dict::Dictionary;
 use kgf_store::pattern::{IdPattern, Selection};
-use kgf_store::{Role, Store, TermId};
+use kgf_store::{IdTriple, Role, Store, TermId};
 use serde::Serialize;
 
 pub use config::{Config, ConfigError, Resolved};
@@ -397,8 +397,9 @@ pub struct Rendered {
     pub label: String,
     /// The text to embed.
     pub text: String,
-    /// Whether the root's star was cut at a [`star budget`](Verbalizer::with_star_budget)
-    /// before every edge was seen, so the text is a bounded approximation of
+    /// Whether the [read budget](Verbalizer::with_read_budget) ran out before
+    /// every edge of the root's star, and every probe naming what it
+    /// mentions, had been read — so the text is a bounded approximation of
     /// what an unbudgeted run would write.
     pub truncated: bool,
     /// How many of the root's walked predicates had more values than
@@ -411,7 +412,6 @@ pub struct Rendered {
 /// A root's text and what the walk left out of it.
 struct BuiltText {
     text: String,
-    truncated: bool,
     limited: u32,
 }
 
@@ -431,8 +431,12 @@ pub struct Verbalizer<'a> {
     store: &'a Store,
     dictionary: Dictionary<'a>,
     bound: &'a Bound,
-    /// The most edges of one root's star that are read; `None` reads them all.
-    star_budget: Option<usize>,
+    /// Triples this verbalizer may still read, across every root; `None`
+    /// reads without bound.
+    budget: Option<usize>,
+    /// Whether a read has been cut short by the budget. Once true, every
+    /// text rendered from here on is an approximation.
+    exhausted: bool,
     terms: Terms,
     /// A predicate's display name, per target (the cascade differs).
     predicate_names: HashMap<(u64, usize), Rc<str>>,
@@ -445,7 +449,8 @@ pub struct Verbalizer<'a> {
     /// last: the descent one label resolution is in the middle of.
     resolving: Vec<u64>,
     /// How many times a template was skipped for a cycle or for depth. A
-    /// label computed while this moved took such a cut and is not cached.
+    /// label computed while this moved took such a cut and is not cached;
+    /// nor is one computed after the budget ran out.
     cuts: u64,
 }
 
@@ -456,7 +461,8 @@ impl<'a> Verbalizer<'a> {
             store,
             dictionary: store.dict(),
             bound,
-            star_budget: None,
+            budget: None,
+            exhausted: false,
             terms: Terms::default(),
             predicate_names: HashMap::new(),
             object_labels: HashMap::new(),
@@ -466,16 +472,27 @@ impl<'a> Verbalizer<'a> {
         }
     }
 
-    /// Read at most `edges` of any one root's star.
+    /// Read at most `triples` over the life of this verbalizer: every root's
+    /// star, and every probe that names a node a text mentions — its types,
+    /// a template field's values, the cascade — all charged to the one
+    /// figure.
     ///
-    /// A build reads every edge, because `predicate_limit` selects from all
-    /// of a predicate's values. A bounded-cost server cannot: one root with a
-    /// million edges would be a million-row read behind a request that asked
-    /// for one text. Past the budget the star is cut and the text is marked
-    /// [`truncated`](Rendered::truncated).
-    pub fn with_star_budget(mut self, edges: usize) -> Self {
-        self.star_budget = Some(edges);
+    /// A build reads without bound, because `predicate_limit` selects from
+    /// all of a predicate's values. A bounded-cost server cannot: one root
+    /// with a million edges, or one mention of a node with a million values
+    /// under a profiled field, would be a million-row read behind a request
+    /// that asked for one text. Past the budget every read comes back short,
+    /// the texts are marked [`truncated`](Rendered::truncated), and
+    /// [`exhausted`](Self::exhausted) says so, which is a caller's cue to
+    /// stop rendering roots.
+    pub fn with_read_budget(mut self, triples: usize) -> Self {
+        self.budget = Some(triples);
         self
+    }
+
+    /// Whether the read budget has run out.
+    pub fn exhausted(&self) -> bool {
+        self.exhausted
     }
 
     /// The subject ids of every member of `target`'s class, ascending.
@@ -540,7 +557,7 @@ impl<'a> Verbalizer<'a> {
             iri: iri.to_string(),
             label,
             text: built.text,
-            truncated: built.truncated,
+            truncated: self.exhausted,
             limited: built.limited,
         }))
     }
@@ -568,7 +585,7 @@ impl<'a> Verbalizer<'a> {
         label: &str,
     ) -> Result<BuiltText, Error> {
         let mut lines = vec![format!("label: {label}")];
-        let (star, truncated) = self.star(root)?;
+        let star = self.star(root)?;
         let limit = self.bound.targets[target].predicate_limit;
         let mut limited = 0u32;
 
@@ -610,7 +627,6 @@ impl<'a> Verbalizer<'a> {
         }
         Ok(BuiltText {
             text: lines.join("\n"),
-            truncated,
             limited,
         })
     }
@@ -647,34 +663,62 @@ impl<'a> Verbalizer<'a> {
     }
 
     /// `s ? ?` as `(predicate, object)` pairs, grouped by predicate in id
-    /// order, and whether the star budget cut it short.
-    fn star(&self, subject: u64) -> Result<(Vec<(u64, u64)>, bool), Error> {
-        let selection = self.store.resolve(IdPattern {
-            subject: Some(subject),
-            predicate: None,
-            object: None,
-        })?;
-        let budget = self.star_budget.unwrap_or(usize::MAX);
-        let mut star: Vec<(u64, u64)> = selection
-            .page(0, budget.saturating_add(1))
-            .map(|triple| (triple.predicate, triple.object))
-            .collect();
-        let truncated = star.len() > budget;
-        star.truncate(budget);
-        Ok((star, truncated))
+    /// order.
+    fn star(&mut self, subject: u64) -> Result<Vec<(u64, u64)>, Error> {
+        self.read(
+            IdPattern {
+                subject: Some(subject),
+                predicate: None,
+                object: None,
+            },
+            |triple| (triple.predicate, triple.object),
+        )
     }
 
     /// The objects of `subject predicate ?`.
-    fn objects(&self, subject: u64, predicate: u64) -> Result<Vec<u64>, Error> {
-        let selection = self.store.resolve(IdPattern {
-            subject: Some(subject),
-            predicate: Some(predicate),
-            object: None,
-        })?;
-        Ok(selection
-            .page(0, usize::MAX)
-            .map(|triple| triple.object)
-            .collect())
+    fn objects(&mut self, subject: u64, predicate: u64) -> Result<Vec<u64>, Error> {
+        self.read(
+            IdPattern {
+                subject: Some(subject),
+                predicate: Some(predicate),
+                object: None,
+            },
+            |triple| triple.object,
+        )
+    }
+
+    /// Every row of `pattern`, or as many as the budget still allows.
+    fn read<T>(
+        &mut self,
+        pattern: IdPattern,
+        map: impl Fn(IdTriple) -> T,
+    ) -> Result<Vec<T>, Error> {
+        let selection = self.store.resolve(pattern)?;
+        let mut rows = Vec::new();
+        for triple in selection.page(0, usize::MAX) {
+            if !self.take() {
+                break;
+            }
+            rows.push(map(triple));
+        }
+        Ok(rows)
+    }
+
+    /// Charge one row to the budget: whether it may be read. Every row any
+    /// walk consumes passes through here, so whatever the budget bounds, it
+    /// bounds here; a row refused is what makes the run exhausted.
+    fn take(&mut self) -> bool {
+        match &mut self.budget {
+            Some(0) => {
+                self.exhausted = true;
+                false
+            }
+            Some(remaining) => {
+                *remaining -= 1;
+                true
+            }
+            None => true,
+        }
     }
 
     /// The subject id a node has when it appears as a subject, if it does.
@@ -716,6 +760,7 @@ impl<'a> Verbalizer<'a> {
         let label = self.compute_display_label(node, target, as_root)?;
         if let Node::Object(id) = node
             && self.cuts == cuts
+            && !self.exhausted
         {
             self.object_labels
                 .insert((id, target), Rc::from(label.as_str()));
@@ -846,12 +891,21 @@ impl<'a> Verbalizer<'a> {
         Ok(best)
     }
 
-    /// The first literal value along the target's cascade.
+    /// The first literal value along the target's cascade. Reads no further
+    /// than that value: a label predicate with many values costs one row.
     fn first_literal(&mut self, subject: u64, target: usize) -> Result<Option<Rc<str>>, Error> {
         for i in 0..self.bound.targets[target].cascade.len() {
             let predicate = self.bound.targets[target].cascade[i];
-            for object in self.objects(subject, predicate)? {
-                let text = self.resolve(Role::Object, object)?;
+            let selection = self.store.resolve(IdPattern {
+                subject: Some(subject),
+                predicate: Some(predicate),
+                object: None,
+            })?;
+            for triple in selection.page(0, usize::MAX) {
+                if !self.take() {
+                    return Ok(None);
+                }
+                let text = self.resolve(Role::Object, triple.object)?;
                 if let TermKind::Literal(value) = classify(&text) {
                     return Ok(Some(Rc::from(value)));
                 }

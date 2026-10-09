@@ -755,8 +755,9 @@ pub struct Verbalize {
     pub label_predicates: Vec<String>,
     /// Bytes the rendered texts may occupy.
     pub bytes: ResponseBytes,
-    /// Edges of one root's star the render may read.
-    pub star_budget: u64,
+    /// Triples the whole request may read: every root's star and every
+    /// probe naming what a text mentions, charged to one figure.
+    pub read_budget: u64,
 }
 
 /// Which roots `/verbalize` renders.
@@ -1020,7 +1021,7 @@ impl Verbalize {
                 .map(<[String]>::to_vec)
                 .unwrap_or_default(),
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
-            star_budget: limits.budgets.candidate_budget,
+            read_budget: limits.budgets.candidate_budget,
         })
     }
 

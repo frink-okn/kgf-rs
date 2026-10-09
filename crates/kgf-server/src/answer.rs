@@ -5147,11 +5147,14 @@ fn preferred_label(
 /// the sampled texts' lengths — the "what would this config produce" question,
 /// answered without a build.
 ///
-/// Every root costs one star read, bounded by the candidate budget, plus a
-/// bounded label probe per mentioned node; the roots themselves are bounded by
-/// `max_verbalize_roots`; and the response stops at its byte budget. A class's
-/// member count is a range width, and drawing a member is one rank descent,
-/// so a plan never enumerates a class.
+/// Every triple the render reads — a root's star, and the type, template and
+/// cascade probes that name each node a text mentions — is charged to one
+/// candidate budget for the request. When it runs out, the root in hand is
+/// delivered marked `truncated`, no further root is rendered, and the answer
+/// says the candidate budget was exhausted. The roots are bounded by
+/// `max_verbalize_roots`, and the response stops at its byte budget. A
+/// class's member count is a range width, and drawing a member is one rank
+/// descent, so a plan never enumerates a class.
 pub fn verbalize(
     store: &Store,
     target: Target,
@@ -5160,7 +5163,7 @@ pub fn verbalize(
     let bound = Bound::bind(store, &request.resolved, &request.label_predicates)
         .map_err(|error| unreadable("binding a verbalization config", &error))?;
     let mut verbalizer = Verbalizer::new(store, &bound)
-        .with_star_budget(usize::try_from(request.star_budget).unwrap_or(usize::MAX));
+        .with_read_budget(usize::try_from(request.read_budget).unwrap_or(usize::MAX));
     let names: Vec<&str> = bound.targets().collect();
 
     let mut records = Vec::new();
@@ -5194,7 +5197,7 @@ pub fn verbalize(
                     .map_err(|error| unreadable("verbalizing a root", &error))?;
                 match rendered {
                     Some(rendered) => {
-                        if !admit(rendered, index, &mut records) {
+                        if !admit(rendered, index, &mut records) || verbalizer.exhausted() {
                             break;
                         }
                     }
@@ -5223,7 +5226,7 @@ pub fn verbalize(
                         continue;
                     };
                     report.observe(&rendered);
-                    if !admit(rendered, index, &mut records) {
+                    if !admit(rendered, index, &mut records) || verbalizer.exhausted() {
                         reports.push(report);
                         break 'targets;
                     }
@@ -5272,10 +5275,10 @@ pub struct VerbalizeTargetReport {
     max_chars: u64,
     /// Mean lines per rendered text, the label line included.
     mean_lines: u64,
-    /// Rendered texts whose star was cut at the candidate budget before
-    /// every edge was read: a bounded server's approximation, not a config
-    /// problem.
-    star_cut: u64,
+    /// Rendered texts the candidate budget ran out in, so that not every
+    /// edge or label was read: a bounded server's approximation, not a
+    /// config problem.
+    truncated: u64,
     /// Predicates sampled down to `predicate_limit`, summed over the rendered
     /// texts: the signal for tuning the limit or the lists.
     limited: u64,
@@ -5295,7 +5298,7 @@ impl VerbalizeTargetReport {
             mean_chars: 0,
             max_chars: 0,
             mean_lines: 0,
-            star_cut: 0,
+            truncated: 0,
             limited: 0,
             chars: 0,
             lines: 0,
@@ -5309,7 +5312,7 @@ impl VerbalizeTargetReport {
         self.chars += chars;
         self.lines += lines;
         self.max_chars = self.max_chars.max(chars);
-        self.star_cut += u64::from(rendered.truncated);
+        self.truncated += u64::from(rendered.truncated);
         self.limited += u64::from(rendered.limited);
         self.mean_chars = self.chars / self.sampled;
         self.mean_lines = self.lines / self.sampled;
@@ -5440,7 +5443,7 @@ impl Resource for VerbalizeAnswer {
                     Value::Number(report.max_chars),
                     Value::Number(report.mean_lines),
                     Value::Number(report.limited),
-                    Value::Number(report.star_cut),
+                    Value::Number(report.truncated),
                 ]
             })
             .collect();
@@ -5478,7 +5481,7 @@ impl Resource for VerbalizeAnswer {
                              edges than one request may read."
                         ))
                         (results_table(
-                            &["target", "class", "members", "sampled", "mean chars", "max chars", "mean lines", "limited", "star cut"],
+                            &["target", "class", "members", "sampled", "mean chars", "max chars", "mean lines", "limited", "truncated"],
                             &target_rows,
                         ))
                     }
@@ -5501,7 +5504,7 @@ impl Resource for VerbalizeAnswer {
                                     @if record.limited > 1 { "s" }
                                     " sampled down"
                                 }
-                                @if record.truncated { " · star cut at the candidate budget" }
+                                @if record.truncated { " · cut at the candidate budget" }
                             }
                         }
                     }

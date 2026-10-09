@@ -4930,3 +4930,37 @@ fn verbalize_survives_a_profile_template_over_a_cycle() {
     assert_eq!(body["complete"], true);
     assert_eq!(body["records"].as_array().unwrap().len(), 2);
 }
+
+#[test]
+fn verbalize_charges_every_read_to_one_candidate_budget() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", TYPED_NT, "2026-06-01T14:03:22Z");
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.candidate_budget = 6;
+    let server = deployment.serve_with_limits(kgf_server::Caps::new(), budgets);
+
+    // Three roots want more than six triples between their stars and the
+    // probes naming what they mention. The budget is one figure for the
+    // request, not one per root: the root it ran out in is delivered as an
+    // approximation, and nothing after it is rendered.
+    let plan = server.get(&verbalize_url(&[("config", VERBALIZE_CONFIG)]));
+    plan.assert_status(200);
+    plan.assert_header("kgf-truncation-reason", "candidate_budget");
+    let body = plan.json();
+    assert_eq!(body["complete"], false);
+    let records = body["records"].as_array().unwrap();
+    assert!(records.len() < 3, "{body}");
+    assert_eq!(records.last().unwrap()["truncated"], true);
+    let truncated: u64 = body["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|report| report["truncated"].as_u64().unwrap())
+        .sum();
+    assert_eq!(truncated, 1);
+
+    // The same plan under the default budget reads everything.
+    let server = deployment.serve();
+    let plan = server.get(&verbalize_url(&[("config", VERBALIZE_CONFIG)]));
+    assert_eq!(plan.json()["complete"], true);
+}
