@@ -6,6 +6,19 @@
 //! half of the embedding pipeline; the model half stays outside this
 //! workspace and consumes the records this module writes.
 //!
+//! # Two record streams, joined by a digest
+//!
+//! A build writes two files as it walks, one line per root in
+//! [`RootRecord`] and one line per distinct text in [`TextRecord`], joined by
+//! the text's SHA-256. The model embeds the texts — each distinct text once,
+//! however many roots share it — and hands back vectors keyed by the same
+//! digest; the index stage joins the roots to those vectors through it. The
+//! digest is the key because it is what both sides can compute from the text
+//! alone, and because a root's line then carries 64 bytes rather than its
+//! text. Nothing is held until the end: a root is written when rendered and a
+//! text the first time its digest is seen, so a run's memory is the set of
+//! digests, not the texts.
+//!
 //! # It runs in id space
 //!
 //! A config names classes and predicates as IRIs. [`Bound::bind`] resolves
@@ -94,7 +107,9 @@ use serde::Serialize;
 pub use config::{Config, ConfigError, Resolved};
 
 use self::config::{Template, TemplatePart};
-use self::text::{RDF_TYPE, fallback_label, humanize, normalize_label, stable_score, text_digest};
+use self::text::{
+    RDF_TYPE, fallback_label, hex, humanize, normalize_label, stable_score, text_digest,
+};
 
 /// Why verbalization stopped.
 #[derive(Debug, thiserror::Error)]
@@ -400,6 +415,8 @@ pub struct Rendered {
     pub label: String,
     /// The text to embed.
     pub text: String,
+    /// SHA-256 of `text`: the key a text's vector is matched to its roots by.
+    pub digest: [u8; 32],
     /// Whether the [read budget](Verbalizer::with_read_budget) ran out before
     /// every edge of the root's star, and every probe naming what it
     /// mentions, had been read — so the text is a bounded approximation of
@@ -556,10 +573,12 @@ impl<'a> Verbalizer<'a> {
         }
         let label = self.display_label(Node::Subject(subject), target, true)?;
         let built = self.build_text(subject, &iri, target, &label)?;
+        let digest = text_digest(&built.text);
         Ok(Some(Rendered {
             iri: iri.to_string(),
             label,
             text: built.text,
+            digest,
             truncated: self.exhausted,
             limited: built.limited,
         }))
@@ -939,89 +958,79 @@ impl<'a> Verbalizer<'a> {
     }
 }
 
-/// One line of records output: a text and the roots that produced it.
+/// One root, as a line of the roots stream.
 ///
-/// The field order is part of the contract: the embedding stage that consumes
-/// these lines is a separate program, and a record must read the same from
-/// either side.
+/// The field order is part of the contract: the index stage that joins these
+/// lines to the model's vectors is a separate program, and a record must read
+/// the same from either side.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Record {
-    /// Up to `max_iris` of the roots that produced this text, ascending.
-    pub iris: Vec<String>,
-    /// The first root's label.
-    pub label: String,
-    /// The text.
-    pub embedding_text: String,
-    /// How many roots produced this text, counting past the `iris` cap.
-    pub iri_count: u64,
+pub struct RootRecord<'a> {
+    /// The root's IRI.
+    pub iri: &'a str,
+    /// The target it was rendered under, by config name.
+    pub target: &'a str,
+    /// The hex SHA-256 of its text: the key into the texts stream.
+    pub digest: String,
 }
 
-/// Groups verbalized roots by identical text into [`Record`]s.
-#[derive(Debug)]
-pub struct Grouper {
-    by_digest: HashMap<[u8; 32], Record>,
-    max_iris: usize,
-}
-
-impl Grouper {
-    /// A grouper keeping at most `max_iris` IRIs per record.
-    pub fn new(max_iris: usize) -> Self {
+impl<'a> RootRecord<'a> {
+    /// The line for `rendered` under `target`.
+    pub fn new(rendered: &'a Rendered, target: &'a str) -> Self {
         Self {
-            by_digest: HashMap::new(),
-            max_iris: max_iris.max(1),
+            iri: &rendered.iri,
+            target,
+            digest: hex(&rendered.digest),
         }
     }
+}
 
-    /// Add one root. A record keeps its `max_iris` smallest IRIs whatever
-    /// order roots arrive in, so the output does not depend on it.
-    pub fn add(&mut self, rendered: Rendered) {
-        let digest = text_digest(&rendered.text);
-        let Some(record) = self.by_digest.get_mut(&digest) else {
-            self.by_digest.insert(
-                digest,
-                Record {
-                    iris: vec![rendered.iri],
-                    label: rendered.label,
-                    embedding_text: rendered.text,
-                    iri_count: 1,
-                },
-            );
-            return;
-        };
-        if record.iris.contains(&rendered.iri) {
-            return;
+/// One distinct text, as a line of the texts stream: what the model embeds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TextRecord<'a> {
+    /// The hex SHA-256 of `text`.
+    pub digest: String,
+    /// The text.
+    pub text: &'a str,
+}
+
+impl<'a> TextRecord<'a> {
+    /// The line for `rendered`'s text.
+    pub fn new(rendered: &'a Rendered) -> Self {
+        Self {
+            digest: hex(&rendered.digest),
+            text: &rendered.text,
         }
-        record.iri_count += 1;
-        if record.iris.len() < self.max_iris {
-            record.iris.push(rendered.iri);
-            record.iris.sort_unstable();
-        } else if let Some(last) = record.iris.last_mut()
-            && rendered.iri < *last
-        {
-            *last = rendered.iri;
-            record.iris.sort_unstable();
-        }
+    }
+}
+
+/// The digests written so far: whether a text is new.
+///
+/// 32 bytes per distinct text, which is the whole of what a streaming run
+/// retains across roots.
+#[derive(Debug, Default)]
+pub struct Seen {
+    digests: HashSet<[u8; 32]>,
+}
+
+impl Seen {
+    /// An empty set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `digest`; `true` the first time it is seen.
+    pub fn first(&mut self, digest: [u8; 32]) -> bool {
+        self.digests.insert(digest)
     }
 
     /// How many distinct texts so far.
     pub fn len(&self) -> usize {
-        self.by_digest.len()
+        self.digests.len()
     }
 
-    /// Whether nothing has been added.
+    /// Whether no text has been seen.
     pub fn is_empty(&self) -> bool {
-        self.by_digest.is_empty()
-    }
-
-    /// The records, ordered by text and then by IRIs.
-    pub fn finish(self) -> Vec<Record> {
-        let mut records: Vec<Record> = self.by_digest.into_values().collect();
-        records.sort_unstable_by(|a, b| {
-            a.embedding_text
-                .cmp(&b.embedding_text)
-                .then_with(|| a.iris.cmp(&b.iris))
-        });
-        records
+        self.digests.is_empty()
     }
 }
 
@@ -1032,36 +1041,37 @@ mod tests {
     fn rendered(iri: &str, text: &str) -> Rendered {
         Rendered {
             iri: iri.to_owned(),
-            label: "l".to_owned(),
+            label: String::new(),
             text: text.to_owned(),
+            digest: text_digest(text),
             truncated: false,
             limited: 0,
         }
     }
 
     #[test]
-    fn identical_text_groups_and_keeps_the_smallest_iris() {
-        let mut grouper = Grouper::new(2);
-        grouper.add(rendered("http://x/c", "same"));
-        grouper.add(rendered("http://x/a", "same"));
-        grouper.add(rendered("http://x/b", "same"));
-        grouper.add(rendered("http://x/a", "same"));
-        grouper.add(rendered("http://x/z", "other"));
-        let records = grouper.finish();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].embedding_text, "other");
-        assert_eq!(records[1].iris, ["http://x/a", "http://x/b"]);
-        assert_eq!(records[1].iri_count, 3);
+    fn a_text_is_new_once_and_its_roots_share_its_digest() {
+        let a = rendered("http://example.com/a", "label: same");
+        let b = rendered("http://example.com/b", "label: same");
+        let mut seen = Seen::new();
+        assert!(seen.first(a.digest));
+        assert!(!seen.first(b.digest));
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            RootRecord::new(&a, "t").digest,
+            RootRecord::new(&b, "t").digest
+        );
+        assert_eq!(TextRecord::new(&a).digest, RootRecord::new(&a, "t").digest);
     }
 
     #[test]
     fn records_serialize_with_a_fixed_field_order() {
-        let mut grouper = Grouper::new(10);
-        grouper.add(rendered("http://x/a", "label: A"));
-        let json = serde_json::to_string(&grouper.finish()[0]).unwrap();
-        assert_eq!(
-            json,
-            r#"{"iris":["http://x/a"],"label":"l","embedding_text":"label: A","iri_count":1}"#
-        );
+        let a = rendered("http://example.com/a", "label: A");
+        let root = serde_json::to_string(&RootRecord::new(&a, "thing")).unwrap();
+        assert!(root.starts_with(r#"{"iri":"http://example.com/a","target":"thing","digest":""#));
+        assert!(root.ends_with(r#""}"#));
+        let text = serde_json::to_string(&TextRecord::new(&a)).unwrap();
+        assert!(text.starts_with(r#"{"digest":""#));
+        assert!(text.ends_with(r#"","text":"label: A"}"#));
     }
 }

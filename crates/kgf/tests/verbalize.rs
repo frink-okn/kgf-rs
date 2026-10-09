@@ -11,7 +11,7 @@ use kgf_store::catalog::{BundleId, Catalog};
 use kgf_store::manifest::default_predicate_roles;
 use kgf_store::testing::Fixture;
 use kgf_store::{OpenOptions, Store};
-use kgf_verbalize::{Bound, Config, Grouper, MAX_TEMPLATE_DEPTH, Record, Rendered, Verbalizer};
+use kgf_verbalize::{Bound, Config, MAX_TEMPLATE_DEPTH, Rendered, Seen, Verbalizer};
 
 const DATASET: &str = "fx";
 const VERSION: &str = "2026-09-04";
@@ -72,21 +72,49 @@ fn parse_config(json: &str) -> Config {
     serde_json::from_str(json).expect("a well-formed config")
 }
 
-/// Every root of every target, as records.
+/// A distinct text and the roots that produced it, as the two streams join
+/// up by digest.
+#[derive(Debug)]
+struct Record {
+    iris: Vec<String>,
+    label: String,
+    embedding_text: String,
+    iri_count: u64,
+}
+
+/// Every root of every target, grouped by text and ordered by it.
 fn all_records(store: &Store, config: &Config) -> Vec<Record> {
     let resolved = config.resolve().expect("a resolvable config");
     let label_role = default_predicate_roles().remove("label").unwrap();
     let bound = Bound::bind(store, &resolved, &label_role).expect("bind");
     let mut verbalizer = Verbalizer::new(store, &bound);
-    let mut grouper = Grouper::new(10);
+    let mut seen = Seen::new();
+    let mut by_digest: BTreeMap<[u8; 32], Record> = BTreeMap::new();
     for target in 0..bound.targets().len() {
         for root in verbalizer.roots(target).expect("roots") {
-            if let Some(rendered) = verbalizer.verbalize(target, root).expect("verbalize") {
-                grouper.add(rendered);
+            let Some(rendered) = verbalizer.verbalize(target, root).expect("verbalize") else {
+                continue;
+            };
+            if seen.first(rendered.digest) {
+                by_digest.insert(
+                    rendered.digest,
+                    Record {
+                        iris: Vec::new(),
+                        label: rendered.label.clone(),
+                        embedding_text: rendered.text.clone(),
+                        iri_count: 0,
+                    },
+                );
             }
+            let record = by_digest.get_mut(&rendered.digest).unwrap();
+            record.iris.push(rendered.iri);
+            record.iris.sort();
+            record.iri_count += 1;
         }
     }
-    grouper.finish()
+    let mut records: Vec<Record> = by_digest.into_values().collect();
+    records.sort_by(|a, b| a.embedding_text.cmp(&b.embedding_text));
+    records
 }
 
 /// One named root under the first target.
@@ -589,8 +617,15 @@ fn the_command_refuses_to_write_into_the_bundle_or_run_a_target_twice() {
     // The bundle is mapped on the promise that nothing writes into it, so
     // the one file this command writes may not land there — by a plain path
     // or by one that only gets there through `..`.
+    let out = published.beside("roots.jsonl");
+    let texts = published.beside("texts.jsonl");
     let inside = published.bundle().join("data.hdt");
-    let (ok, stderr) = kgf(&["--output", inside.to_str().unwrap()]);
+    let (ok, stderr) = kgf(&[
+        "--roots",
+        out.to_str().unwrap(),
+        "--texts",
+        inside.to_str().unwrap(),
+    ]);
     assert!(!ok);
     assert!(stderr.contains("inside the bundle"), "{stderr}");
     let dotted = published
@@ -600,7 +635,12 @@ fn the_command_refuses_to_write_into_the_bundle_or_run_a_target_twice() {
         .join(VERSION)
         .join("records.jsonl");
     std::fs::create_dir(published.beside("elsewhere")).unwrap();
-    let (ok, stderr) = kgf(&["--output", dotted.to_str().unwrap()]);
+    let (ok, stderr) = kgf(&[
+        "--roots",
+        dotted.to_str().unwrap(),
+        "--texts",
+        texts.to_str().unwrap(),
+    ]);
     assert!(!ok);
     assert!(stderr.contains("inside the bundle"), "{stderr}");
     assert!(
@@ -608,21 +648,36 @@ fn the_command_refuses_to_write_into_the_bundle_or_run_a_target_twice() {
         "the artifact was not truncated"
     );
 
-    let out = published.beside("records.jsonl");
-    let (ok, stderr) = kgf(&[
-        "--output",
+    let outputs = [
+        "--roots",
         out.to_str().unwrap(),
-        "--target",
-        "thing",
-        "--target",
-        "thing",
-    ]);
+        "--texts",
+        texts.to_str().unwrap(),
+    ];
+    let (ok, stderr) = kgf(&[&outputs[..], &["--target", "thing", "--target", "thing"]].concat());
     assert!(!ok);
     assert!(stderr.contains("given twice"), "{stderr}");
 
-    let (ok, stderr) = kgf(&["--output", out.to_str().unwrap(), "--target", "thing"]);
+    // The two streams join by digest: the root's line names the text's.
+    let (ok, stderr) = kgf(&[&outputs[..], &["--target", "thing"]].concat());
     assert!(ok, "{stderr}");
-    let written = std::fs::read_to_string(&out).unwrap();
-    assert_eq!(written.lines().count(), 1);
-    assert!(written.contains("\"label\":\"A\""), "{written}");
+    let lines = |path: &std::path::Path| -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let roots = lines(&out);
+    let texts = lines(&texts);
+    assert_eq!(roots.len(), 1, "{roots:?}");
+    assert_eq!(texts.len(), 1, "{texts:?}");
+    assert_eq!(roots[0]["iri"], format!("{EX}a"));
+    assert_eq!(roots[0]["target"], "thing");
+    assert_eq!(roots[0]["digest"], texts[0]["digest"]);
+    assert_eq!(roots[0]["digest"].as_str().unwrap().len(), 64);
+    assert!(
+        texts[0]["text"].as_str().unwrap().starts_with("label: A\n"),
+        "{texts:?}"
+    );
 }

@@ -5326,6 +5326,9 @@ pub struct VerbalizeRecord {
     iri: String,
     label: String,
     text: String,
+    /// Hex SHA-256 of the text: the key a build's roots and texts streams
+    /// join on, so a preview and a build agree on it.
+    digest: String,
     chars: u64,
     lines: u64,
     truncated: bool,
@@ -5343,6 +5346,7 @@ impl VerbalizeRecord {
             ("iri", serialized_json_string(&rendered.iri) + 24),
             ("label", serialized_json_string(&rendered.label)),
             ("text", serialized_json_string(&rendered.text)),
+            ("digest", 66),
             ("chars", 20),
             ("lines", 20),
             ("truncated", 5),
@@ -5353,6 +5357,7 @@ impl VerbalizeRecord {
             iri: rendered.iri,
             label: rendered.label,
             text: rendered.text,
+            digest: kgf_verbalize::text::hex(&rendered.digest),
             chars,
             lines,
             truncated: rendered.truncated,
@@ -5364,11 +5369,12 @@ impl VerbalizeRecord {
 
 impl Serialize for VerbalizeRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(8))?;
+        let mut map = serializer.serialize_map(Some(9))?;
         map.serialize_entry("target", &self.target)?;
         map.serialize_entry("iri", &Term::from_dictionary(&self.iri))?;
         map.serialize_entry("label", &self.label)?;
         map.serialize_entry("text", &self.text)?;
+        map.serialize_entry("digest", &self.digest)?;
         map.serialize_entry("chars", &self.chars)?;
         map.serialize_entry("lines", &self.lines)?;
         map.serialize_entry("truncated", &self.truncated)?;
