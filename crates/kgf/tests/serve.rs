@@ -4695,10 +4695,16 @@ fn verbalize_previews_a_config_in_three_modes_over_get_query_and_post() {
     deployment.publish("tox", "2026-06-01", TYPED_NT, "2026-06-01T14:03:22Z");
     let server = deployment.serve();
 
-    // The capability is declared by every bundle, like `labels`, because it
-    // needs nothing beyond the core artifacts.
+    // The route is this deployment's, not the bundle's: the service
+    // descriptor advertises it, and the manifest — a statement of what the
+    // bundle carries — does not.
     let manifest = server.get("/tox/v/2026-06-01/manifest").json();
-    assert!(manifest["capabilities"]["verbalize"].is_object());
+    assert!(manifest["capabilities"].get("verbalize").is_none());
+    let descriptor = server.get("/").json();
+    assert!(
+        descriptor["datasets"][0]["links"]["verbalize"].is_string(),
+        "{descriptor}"
+    );
 
     // A bare config is a plan: every target, its member count, sampled texts.
     let plan = server.get(&verbalize_url(&[("config", VERBALIZE_CONFIG)]));
