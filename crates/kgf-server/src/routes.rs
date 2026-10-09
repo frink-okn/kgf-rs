@@ -504,6 +504,7 @@ async fn fragment(
                     params,
                     limits,
                     release.prefixes(),
+                    release.predicate_roles(),
                     &release.binding(),
                 )?;
                 declares_search(release, request.pattern.text().is_some())?;
@@ -630,6 +631,7 @@ async fn binding_fragment(
                     body,
                     limits,
                     release.prefixes(),
+                    release.predicate_roles(),
                     &release.binding(),
                 )?;
                 declares_graphs(release, &request.graph)?;
@@ -786,7 +788,13 @@ async fn describe(
         AccessOperation::Describe,
         wants,
         |params, limits, release| {
-            request::Describe::parse(params, limits, release.prefixes(), &release.binding())
+            request::Describe::parse(
+                params,
+                limits,
+                release.prefixes(),
+                release.predicate_roles(),
+                &release.binding(),
+            )
         },
         answer::describe,
     )
@@ -807,7 +815,14 @@ async fn sample(
         // bundle is required to carry, so there is no version of this bundle
         // that cannot answer it. See `capability_gate` for why that is the whole
         // test.
-        |params, limits, release| request::Sample::parse(params, limits, release.prefixes()),
+        |params, limits, release| {
+            request::Sample::parse(
+                params,
+                limits,
+                release.prefixes(),
+                release.predicate_roles(),
+            )
+        },
         answer::sample,
     )
     .await
@@ -854,6 +869,7 @@ async fn terms(
             request::Terms::parse(
                 params,
                 limits,
+                release.prefixes(),
                 release.predicate_roles(),
                 &release.binding(),
             )
@@ -899,7 +915,13 @@ async fn schema(
             // gives: the cascade resolves through the core permutations. A
             // release that declares no `label` role still answers, with the
             // labels absent rather than the request refused.
-            request::Schema::parse(params, limits, release.prefixes(), &release.binding())
+            request::Schema::parse(
+                params,
+                limits,
+                release.prefixes(),
+                release.predicate_roles(),
+                &release.binding(),
+            )
         },
         answer::schema,
     )
@@ -1323,12 +1345,7 @@ where
     )
     .with_dataset_metadata(release.dataset_iri(), release.carries_description())
     .with_declarations(release.declarations());
-    let labels = PageLabelProfile::for_request(
-        &service,
-        release,
-        representation,
-        request.labels_requested(),
-    );
+    let labels = PageLabelProfile::for_request(&service, release, representation);
     let opened = Arc::clone(&service);
     let result = blocking(service.admission(), work_class, move || {
         let (store, open) = opened.open_observed(target.id())?;
@@ -1449,16 +1466,18 @@ where
     )
 }
 
-/// What an HTML render needs to annotate its IRIs with display labels: the
-/// release's frozen `label` cascade and the cap that bounds the work.
+/// What an HTML render needs to annotate its IRIs with display labels when
+/// the request did not ask for them: the release's frozen `label` cascade with
+/// no language preference, and the cap that bounds the work.
 ///
 /// Built only when the negotiated representation is a page. JSON does not pay
-/// for labels it does not carry — a JSON client hydrates through `/labels`,
-/// with the same cascade and the same cap.
+/// for labels it was not asked for. A request that does ask — `labels=true`,
+/// or an operation that labels by default — has its labels resolved by the
+/// operation itself, with its own `lang`, into the response both
+/// representations render, and the answer then has nothing for this to add.
 struct PageLabelProfile {
-    predicates: Vec<String>,
+    labeling: request::Labeling,
     cap: usize,
-    required: bool,
 }
 
 impl PageLabelProfile {
@@ -1466,16 +1485,13 @@ impl PageLabelProfile {
         service: &Service,
         release: &Release,
         representation: Representation,
-        requested: bool,
     ) -> Option<Self> {
-        (representation == Representation::Html || requested).then(|| Self {
-            predicates: release
-                .predicate_roles()
-                .get("label")
-                .map(<[String]>::to_vec)
-                .unwrap_or_default(),
+        (representation == Representation::Html).then(|| Self {
+            labeling: request::Labeling::release_default(
+                release.predicate_roles(),
+                service.config().limits(),
+            ),
             cap: usize::try_from(service.config().caps.max_label_iris).unwrap_or(usize::MAX),
-            required: requested,
         })
     }
 }
@@ -1489,9 +1505,7 @@ impl HydrateForPage for Option<PageLabelProfile> {
     fn hydrate(&self, store: &kgf_store::Store, answer: &mut impl Renders) -> Result<(), Problem> {
         match self {
             None => Ok(()),
-            Some(profile) => {
-                answer.hydrate_labels(store, &profile.predicates, profile.cap, profile.required)
-            }
+            Some(profile) => answer.hydrate_labels(store, &profile.labeling, profile.cap),
         }
     }
 }
@@ -1605,7 +1619,7 @@ where
         release.prefixes().clone(),
         service.mount().clone(),
     );
-    let labels = PageLabelProfile::for_request(&service, release, representation, false);
+    let labels = PageLabelProfile::for_request(&service, release, representation);
     let opened = Arc::clone(&service);
     let result = blocking(service.admission(), WorkClass::Heavy, move || {
         let (store, open) = opened.open_observed(target.id())?;

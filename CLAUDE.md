@@ -83,8 +83,12 @@ than a per-section offset.
 
 A bundle carrying `data.hdt.text` (built by `hdtc text`) declares `search` and answers
 `o.text` on `/fragment` and `/count`: a ranked constraint on the object position,
-resolved through the permutations. `/search` is entity-level and deduplicated, with
-the doc 19 §19.4 label cascade; `/labels` exposes the same frozen cascade directly.
+resolved through the permutations. `/search` is entity-level and deduplicated. Labels
+follow doc 19 §19.4's cascade, language first, over the release's frozen `label` role:
+`QUERY /labels` resolves a batch, and `labels=true` — or a list of predicates to use
+instead, with `lang` and `label_source` — adds a `labels` map to every operation that
+returns IRIs, and the label statements themselves to an RDF page over the union
+(unit 33).
 
 **Every route has machine and HTML representations at one URL**, chosen by `Accept` —
 a page in a browser, data from `curl` — so a new route implements `html::Resource` or

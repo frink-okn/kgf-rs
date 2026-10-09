@@ -11,6 +11,7 @@
 //! `kgf::serve::published_root` is the one sanctioned way in (see CLAUDE.md's
 //! note on the workspace's second `unsafe`).
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -44,6 +45,53 @@ const GRAPH: &str = concat!(
     "<http://example.org/carol> <http://example.org/age> ",
     "\"31\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
     "_:b1 <http://example.org/note> \"a blank subject\" .\n",
+);
+
+/// Labels in several languages under the two label predicates the served
+/// release declares, `ex:label` then `ex:name`, each subject arranged to pin one
+/// rule of the cascade.
+const MULTILINGUAL: &str = concat!(
+    // Language dominates predicate.
+    "<http://example.org/asthma> <http://example.org/label> \"Asthma\"@de .\n",
+    "<http://example.org/asthma> <http://example.org/name> \"asthma\"@en .\n",
+    // An untagged literal outranks a language nobody asked for.
+    "<http://example.org/atrazine> <http://example.org/label> \"Atrazin\"@de .\n",
+    "<http://example.org/atrazine> <http://example.org/label> \"atrazine\" .\n",
+    // A range matches every tag it is a subtag prefix of.
+    "<http://example.org/colour> <http://example.org/label> \"colour\"@en-gb .\n",
+    "<http://example.org/colour> <http://example.org/label> \"couleur\"@fr .\n",
+    // One language and one predicate: the lowest term id.
+    "<http://example.org/twin> <http://example.org/label> \"beta\"@en .\n",
+    "<http://example.org/twin> <http://example.org/label> \"Alpha\"@en .\n",
+    // One language rank: the declared predicate order.
+    "<http://example.org/both> <http://example.org/name> \"by name\" .\n",
+    "<http://example.org/both> <http://example.org/label> \"by label\" .\n",
+    // A value that is not a literal is not a label.
+    "<http://example.org/linked> <http://example.org/label> <http://example.org/asthma> .\n",
+    "<http://example.org/linked> <http://example.org/name> \"linked\" .\n",
+    "<http://example.org/german> <http://example.org/label> \"nur Deutsch\"@de .\n",
+    "_:anon <http://example.org/label> \"anonymous\" .\n",
+);
+
+/// One subject with many IRI-valued edges, each target named: a page whose RDF
+/// outweighs its JSON measure, so RDF byte fitting has to cut it.
+const LINKED: &str = concat!(
+    "<http://example.org/hub> <http://example.org/links> <http://example.org/a1> .\n",
+    "<http://example.org/hub> <http://example.org/links> <http://example.org/a2> .\n",
+    "<http://example.org/hub> <http://example.org/links> <http://example.org/a3> .\n",
+    "<http://example.org/hub> <http://example.org/links> <http://example.org/a4> .\n",
+    "<http://example.org/hub> <http://example.org/links> <http://example.org/a5> .\n",
+    "<http://example.org/hub> <http://example.org/links> <http://example.org/a6> .\n",
+    "<http://example.org/hub> <http://example.org/links> <http://example.org/a7> .\n",
+    "<http://example.org/hub> <http://example.org/links> <http://example.org/a8> .\n",
+    "<http://example.org/a1> <http://example.org/name> \"a1\" .\n",
+    "<http://example.org/a2> <http://example.org/name> \"a2\" .\n",
+    "<http://example.org/a3> <http://example.org/name> \"a3\" .\n",
+    "<http://example.org/a4> <http://example.org/name> \"a4\" .\n",
+    "<http://example.org/a5> <http://example.org/name> \"a5\" .\n",
+    "<http://example.org/a6> <http://example.org/name> \"a6\" .\n",
+    "<http://example.org/a7> <http://example.org/name> \"a7\" .\n",
+    "<http://example.org/a8> <http://example.org/name> \"a8\" .\n",
 );
 
 #[test]
@@ -350,6 +398,7 @@ fn schema_class_relations_obey_row_candidate_and_byte_budgets() {
         &params("projection=class-relations"),
         served.limits(),
         served.release().prefixes(),
+        served.release().predicate_roles(),
         &served.release().binding(),
     )
     .unwrap();
@@ -1372,6 +1421,371 @@ fn a_ranked_row_says_which_class_its_score_belongs_to() {
 }
 
 #[test]
+fn the_label_cascade_ranks_language_then_predicate_then_term_id() {
+    let served = Served::multilingual();
+    let store = served.store();
+    let resolve = |iri: &str, lang: Option<&[&str]>| {
+        let mut body = serde_json::json!({"iris": [iri], "label_source": true});
+        if let Some(lang) = lang {
+            body["lang"] = serde_json::json!(lang);
+        }
+        let answer = served.labels(&store, &body);
+        assert_eq!(answer["complete"], true);
+        answer["labels"][0].clone()
+    };
+    let label = |iri: &str, lang: Option<&[&str]>| resolve(iri, lang)["label"].clone();
+
+    // Language dominates predicate: English under the second predicate beats
+    // German under the first, and German wins when it is what was asked for.
+    assert_eq!(label("ex:asthma", Some(&["en"])), "asthma");
+    assert_eq!(label("ex:asthma", Some(&["de"])), "Asthma");
+    // With no preference both are "some other language", so predicate order
+    // decides between them.
+    assert_eq!(label("ex:asthma", None), "Asthma");
+    assert_eq!(label("ex:asthma", Some(&["fr"])), "Asthma");
+
+    // An untagged literal outranks a language nobody asked for, and is the
+    // best there is when nobody asked for any; it does not outrank one that
+    // was asked for, nor the wildcard, which matches every tag.
+    assert_eq!(label("ex:atrazine", Some(&["en"])), "atrazine");
+    assert_eq!(label("ex:atrazine", None), "atrazine");
+    assert_eq!(label("ex:atrazine", Some(&["de"])), "Atrazin");
+    assert_eq!(label("ex:atrazine", Some(&["*"])), "Atrazin");
+
+    // Basic filtering, whole subtags, without regard to case — and a
+    // preference that matches nothing falls through to term-id order.
+    assert_eq!(label("ex:colour", Some(&["en"])), "colour");
+    assert_eq!(label("ex:colour", Some(&["EN-GB"])), "colour");
+    assert_eq!(label("ex:colour", Some(&["fr", "en"])), "couleur");
+    assert_eq!(label("ex:colour", Some(&["fr-ca", "en-us"])), "colour");
+
+    // The lowest term id breaks a tie, so the label is the same string on
+    // every call; `"Alpha"` sorts before `"beta"` in the dictionary.
+    assert_eq!(label("ex:twin", Some(&["en"])), "Alpha");
+    assert_eq!(label("ex:twin", None), "Alpha");
+    // Within a language rank, the declared predicate order.
+    assert_eq!(label("ex:both", None), "by label");
+    // A label predicate's IRI value is not a candidate, so the next one is.
+    assert_eq!(label("ex:linked", None), "linked");
+    // A blank node is reached by the scoped IRI the API publishes it under.
+    let anon = served.fragment(&store, "o=%22anonymous%22")["rows"][0]["s"]["value"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(label(&format!("<{anon}>"), None), "anonymous");
+
+    // Named predicates replace the release's for the one request, in the order
+    // given, and language still dominates them.
+    let named = |iri: &str, labels: &[&str], lang: &[&str]| {
+        served.labels(
+            &store,
+            &serde_json::json!({"iris": [iri], "labels": labels, "lang": lang}),
+        )["labels"][0]["label"]
+            .clone()
+    };
+    assert_eq!(named("ex:both", &["ex:name", "ex:label"], &[]), "by name");
+    assert_eq!(
+        named("ex:asthma", &["ex:name", "ex:label"], &["fr"]),
+        "asthma"
+    );
+    assert_eq!(
+        named("ex:asthma", &["ex:name", "ex:label"], &["de"]),
+        "Asthma"
+    );
+    assert_eq!(
+        named("ex:german", &["ex:name"], &[]),
+        serde_json::Value::Null
+    );
+
+    // The source names the predicate and, for a tagged literal, its language.
+    assert_eq!(
+        resolve("ex:asthma", Some(&["en"]))["label_source"],
+        serde_json::json!({"predicate": "http://example.org/name", "lang": "en"})
+    );
+    assert_eq!(
+        resolve("ex:colour", Some(&["en"]))["label_source"],
+        serde_json::json!({"predicate": "http://example.org/label", "lang": "en-gb"})
+    );
+    assert_eq!(
+        resolve("ex:both", None)["label_source"],
+        serde_json::json!({"predicate": "http://example.org/label"})
+    );
+    assert_eq!(
+        resolve("ex:missing", None)["label_source"],
+        serde_json::Value::Null
+    );
+    assert!(
+        served.labels(&store, &serde_json::json!({"iris": ["ex:both"]}))["labels"][0]
+            .get("label_source")
+            .is_none(),
+        "off unless asked for"
+    );
+}
+
+#[test]
+fn a_labelled_page_maps_every_iri_it_carries_and_only_those() {
+    let served = Served::multilingual();
+    let store = served.store();
+
+    let page = served.fragment(&store, "s=ex:linked&labels=true&lang=en&label_source=true");
+    assert_eq!(page["complete"], true);
+    // The bound subject, every row predicate, the row's IRI object — but no
+    // literal, which is its own text.
+    assert_eq!(
+        page["labels"],
+        serde_json::json!({
+            "http://example.org/asthma": "asthma",
+            "http://example.org/label": null,
+            "http://example.org/linked": "linked",
+            "http://example.org/name": null,
+        })
+    );
+    assert_eq!(
+        page["label_sources"]["http://example.org/asthma"],
+        serde_json::json!({"predicate": "http://example.org/name", "lang": "en"})
+    );
+    assert_eq!(
+        page["label_sources"]["http://example.org/label"],
+        serde_json::Value::Null
+    );
+
+    // A blank node is keyed by the IRI its row publishes it under.
+    let anon = served.fragment(&store, "o=%22anonymous%22&labels=true");
+    let subject = anon["rows"][0]["s"]["value"].as_str().unwrap();
+    assert!(subject.starts_with("urn:fdc:"), "{subject}");
+    assert_eq!(anon["labels"][subject], "anonymous");
+
+    // `/describe` labels the resource it describes, and both directions.
+    let described = served.describe(&store, "iri=ex:asthma&labels=true&lang=de");
+    assert_eq!(described["labels"]["http://example.org/asthma"], "Asthma");
+    assert_eq!(described["labels"]["http://example.org/linked"], "linked");
+
+    // A sample labels what it drew.
+    let sample = served.sample(&store, "p=ex:name&n=10&labels=true&lang=en");
+    assert_eq!(sample["labels"]["http://example.org/asthma"], "asthma");
+    assert_eq!(
+        sample["labels"]["http://example.org/name"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn page_labels_are_weighed_with_the_row_that_brings_them() {
+    let served = Served::multilingual();
+    let store = served.store();
+    let query = "p=ex:label&labels=true&lang=en";
+    let whole = served.fragment(&store, query);
+    assert_eq!(whole["complete"], true);
+
+    // A byte budget too small for anything: each page keeps its first row,
+    // and with it every label that row brings and no other.
+    let tight = Budgets {
+        max_response_bytes: 1,
+        ..Budgets::new()
+    };
+    let (rows, labels) = page_through(
+        query,
+        |query| served.fragment_within(&store, query, &tight),
+        "response_bytes",
+    );
+    assert_eq!(rows, *whole["rows"].as_array().unwrap());
+    assert_eq!(labels, whole["labels"]);
+}
+
+#[test]
+fn a_spent_label_allowance_ends_the_page_where_it_resumes() {
+    let served = Served::multilingual();
+    let store = served.store();
+    let query = "p=ex:label&labels=true&lang=fr";
+    let whole = served.fragment(&store, query);
+    assert_eq!(whole["complete"], true);
+
+    // One candidate: the first row of a page is resolved whatever it costs,
+    // so every page moves, and the next term with two candidates ends it.
+    let starved = Budgets {
+        candidate_budget: 1,
+        ..Budgets::new()
+    };
+    let (rows, labels) = page_through(
+        query,
+        |query| served.fragment_within(&store, query, &starved),
+        "candidate_budget",
+    );
+    assert_eq!(rows, *whole["rows"].as_array().unwrap());
+    assert_eq!(labels, whole["labels"]);
+
+    // A batch has no cursor: it answers a prefix of what was sent and says
+    // which budget ended it.
+    let batch = served.labels_within(
+        &store,
+        &serde_json::json!({"iris": ["ex:asthma", "ex:atrazine", "ex:colour"]}),
+        &starved,
+    );
+    assert_eq!(batch["complete"], false);
+    assert_eq!(batch["truncation_reason"], "candidate_budget");
+    assert!(batch["next"].is_null());
+    assert_eq!(batch["labels"].as_array().unwrap().len(), 1);
+    assert_eq!(batch["labels"][0]["label"], "Asthma");
+
+    // A sample is drawn whole, so it says so without a cursor either.
+    let sample = served.sample_within(&store, "p=ex:label&n=20&labels=true", &starved);
+    assert_eq!(sample["complete"], false);
+    assert_eq!(sample["truncation_reason"], "candidate_budget");
+    assert!(sample["next"].is_null());
+}
+
+#[test]
+fn an_rdf_page_carries_each_label_as_the_statement_it_came_from() {
+    let served = Served::multilingual();
+    let store = served.store();
+    let statements = |query: &str| {
+        let rendered =
+            served.fragment_rendered_within(&store, query, Representation::NQuads, &BUDGETS);
+        String::from_utf8(rendered.body.to_vec())
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+    };
+    // The page's own triples, and beside them the statement each labelled IRI's
+    // label came from — the `name` triple is both, and appears once. The
+    // predicates have no labels, and a literal is not labelled.
+    let expected: BTreeSet<String> = [
+        "<http://example.org/linked> <http://example.org/label> <http://example.org/asthma> .",
+        "<http://example.org/linked> <http://example.org/name> \"linked\" .",
+        "<http://example.org/asthma> <http://example.org/name> \"asthma\"@en .",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    assert_eq!(statements("s=ex:linked&labels=true&lang=en"), expected);
+    // The statement is its own source, so asking for one adds nothing, and the
+    // language changes which statement is carried.
+    assert_eq!(
+        statements("s=ex:linked&labels=true&lang=en&label_source=true"),
+        expected
+    );
+    assert!(
+        statements("s=ex:linked&labels=true&lang=de")
+            .contains("<http://example.org/asthma> <http://example.org/label> \"Asthma\"@de .")
+    );
+    // Without labels, the page alone.
+    assert_eq!(statements("s=ex:linked").len(), 2);
+}
+
+#[test]
+fn rdf_byte_fitting_keeps_exactly_the_labels_of_the_rows_it_keeps() {
+    let served = Served::linked();
+    let store = served.store();
+    let query = "s=ex:hub&p=ex:links&labels=true";
+    let whole = served.fragment_rendered_within(&store, query, Representation::NQuads, &BUDGETS);
+    assert!(whole.completeness.is_complete());
+
+    // One byte under the whole document: the JSON measure keeps every row, so
+    // it is the RDF fit that cuts the page, and the label statements it keeps
+    // must be those of the rows it keeps.
+    let budget = whole.body.len() as u64 - 1;
+    let tight = Budgets {
+        max_response_bytes: budget,
+        ..Budgets::new()
+    };
+    assert!(
+        served
+            .fragment_rendered_within(&store, query, Representation::Json, &tight)
+            .completeness
+            .is_complete(),
+        "the JSON measure must keep every row, or this tests the wrong cut"
+    );
+    let mut seen_data = BTreeSet::new();
+    let mut seen_labels = BTreeSet::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let paged = match &cursor {
+            None => query.to_owned(),
+            Some(token) => format!("{query}&cursor={token}"),
+        };
+        let rendered =
+            served.fragment_rendered_within(&store, &paged, Representation::NQuads, &tight);
+        assert!(rendered.body.len() as u64 <= budget);
+        let body = String::from_utf8(rendered.body.to_vec()).unwrap();
+        let (data, labels): (Vec<&str>, Vec<&str>) = body
+            .lines()
+            .partition(|line| line.contains("<http://example.org/links>"));
+        let objects: BTreeSet<&str> = data
+            .iter()
+            .map(|line| line.split(' ').nth(2).unwrap())
+            .collect();
+        let labelled: BTreeSet<&str> = labels
+            .iter()
+            .map(|line| line.split(' ').next().unwrap())
+            .collect();
+        assert_eq!(labelled, objects, "{body}");
+        seen_data.extend(data.iter().map(|line| line.to_string()));
+        seen_labels.extend(labels.iter().map(|line| line.to_string()));
+        pages += 1;
+        match rendered.completeness.next_cursor() {
+            Some(next) => {
+                assert_eq!(
+                    rendered.completeness.truncation_reason(),
+                    Some(kgf_server::envelope::TruncationReason::ResponseBytes)
+                );
+                cursor = Some(next.to_owned());
+            }
+            None => break,
+        }
+    }
+    assert!(pages > 1, "the fit never cut the page");
+    let whole = String::from_utf8(whole.body.to_vec()).unwrap();
+    assert_eq!(
+        seen_data
+            .union(&seen_labels)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        whole.lines().map(str::to_owned).collect::<BTreeSet<_>>()
+    );
+}
+
+/// Page `query` to its end through `fetch`, checking that every page but the
+/// last stopped for `reason` with at least one row, and return the rows and
+/// the union of the pages' label maps.
+fn page_through(
+    query: &str,
+    fetch: impl Fn(&str) -> serde_json::Value,
+    reason: &str,
+) -> (Vec<serde_json::Value>, serde_json::Value) {
+    let mut rows = Vec::new();
+    let mut labels = serde_json::Map::new();
+    let mut stopped = 0;
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = fetch(&match &cursor {
+            None => query.to_owned(),
+            Some(token) => format!("{query}&cursor={token}"),
+        });
+        let page_rows = page["rows"].as_array().unwrap();
+        assert!(!page_rows.is_empty(), "every page moves: {page}");
+        rows.extend(page_rows.iter().cloned());
+        // A term a later page repeats is labelled again there, identically.
+        for (iri, label) in page["labels"].as_object().unwrap() {
+            if let Some(seen) = labels.insert(iri.clone(), label.clone()) {
+                assert_eq!(seen, *label, "{iri}");
+            }
+        }
+        match page["next"].as_str() {
+            Some(next) => {
+                assert_eq!(page["truncation_reason"], reason, "{page}");
+                stopped += 1;
+                cursor = Some(next.to_owned());
+            }
+            None => break,
+        }
+    }
+    assert!(stopped > 0, "the budget never ended a page");
+    (rows, serde_json::Value::Object(labels))
+}
+
+#[test]
 fn labels_preserve_input_order_and_search_returns_one_entity_with_evidence() {
     let served = Served::with_text();
     let store = served.store();
@@ -1484,6 +1898,16 @@ impl Served {
         Self::from_fixture(Fixture::build_quads(WORKED_EXAMPLE_NQ))
     }
 
+    /// [`MULTILINGUAL`], under the same two-predicate label role.
+    fn multilingual() -> Self {
+        Self::from_fixture(Fixture::build(MULTILINGUAL))
+    }
+
+    /// [`LINKED`], under the same label role.
+    fn linked() -> Self {
+        Self::from_fixture(Fixture::build(LINKED))
+    }
+
     fn build(text: bool) -> Self {
         let fixture = Fixture::build(GRAPH);
         let fixture = if text { fixture.with_text() } else { fixture };
@@ -1561,6 +1985,7 @@ impl Served {
             &params(query),
             self.within(budgets),
             self.release().prefixes(),
+            self.release().predicate_roles(),
             &self.release().binding(),
         )
         .expect("a well-formed request");
@@ -1570,11 +1995,34 @@ impl Served {
         )
     }
 
+    /// A `/fragment` page in `representation`, under budgets a test chose.
+    fn fragment_rendered_within(
+        &self,
+        store: &Store,
+        query: &str,
+        representation: Representation,
+        budgets: &Budgets,
+    ) -> answer::Rendered {
+        let request = request::Fragment::parse(
+            &params(query),
+            self.within(budgets),
+            self.release().prefixes(),
+            self.release().predicate_roles(),
+            &self.release().binding(),
+        )
+        .expect("a well-formed request");
+        answer::fragment(store, self.target("fragment", query), &request)
+            .expect("an answer")
+            .render(representation)
+            .expect("a rendered page")
+    }
+
     fn sample_within(&self, store: &Store, query: &str, budgets: &Budgets) -> serde_json::Value {
         let request = request::Sample::parse(
             &params(query),
             self.within(budgets),
             self.release().prefixes(),
+            self.release().predicate_roles(),
         )
         .expect("a well-formed request");
         json(
@@ -1598,6 +2046,7 @@ impl Served {
             &params(query),
             self.limits(),
             self.release().prefixes(),
+            self.release().predicate_roles(),
             &self.release().binding(),
         )
         .expect("a well-formed request")
@@ -1627,6 +2076,7 @@ impl Served {
             &params(query),
             limits,
             self.release().prefixes(),
+            self.release().predicate_roles(),
             &self.release().binding(),
         )?;
         let answer = answer::fragment(store, self.target("fragment", query), &request)?;
@@ -1669,6 +2119,7 @@ impl Served {
             &encoded,
             self.limits(),
             self.release().prefixes(),
+            self.release().predicate_roles(),
             &self.release().binding(),
         )
         .expect("a bindings fragment request")
@@ -1686,6 +2137,7 @@ impl Served {
             &encoded,
             self.limits(),
             self.release().prefixes(),
+            self.release().predicate_roles(),
             &self.release().binding(),
         )?;
         let answer = answer::binding_fragment(
@@ -1716,6 +2168,7 @@ impl Served {
             &encoded,
             self.limits(),
             self.release().prefixes(),
+            self.release().predicate_roles(),
             &self.release().binding(),
         )
         .expect("a bindings fragment request");
@@ -1769,6 +2222,7 @@ impl Served {
             &params(query),
             self.limits(),
             self.release().prefixes(),
+            self.release().predicate_roles(),
             &self.release().binding(),
         )
         .unwrap_or_else(|error| panic!("GET /describe?{query}: {error}"));
@@ -1778,9 +2232,13 @@ impl Served {
     }
 
     fn sample(&self, store: &Store, query: &str) -> serde_json::Value {
-        let request =
-            request::Sample::parse(&params(query), self.limits(), self.release().prefixes())
-                .unwrap_or_else(|error| panic!("GET /sample?{query}: {error}"));
+        let request = request::Sample::parse(
+            &params(query),
+            self.limits(),
+            self.release().prefixes(),
+            self.release().predicate_roles(),
+        )
+        .unwrap_or_else(|error| panic!("GET /sample?{query}: {error}"));
         let answer = answer::sample(store, self.target("sample", query), &request)
             .unwrap_or_else(|error| panic!("GET /sample?{query}: {error}"));
         json(answer, Representation::Json)
@@ -1801,6 +2259,7 @@ impl Served {
             &params(query),
             limits,
             self.release().prefixes(),
+            self.release().predicate_roles(),
             &self.release().binding(),
         )?;
         let answer = answer::schema(store, self.target("schema", query), &request)?;
@@ -1814,6 +2273,7 @@ impl Served {
             &params(query),
             self.limits(),
             self.release().prefixes(),
+            self.release().predicate_roles(),
             &self.release().binding(),
         )
         .expect("a schema request");
@@ -1838,18 +2298,20 @@ impl Served {
             &params(query),
             limits,
             self.release().prefixes(),
+            self.release().predicate_roles(),
             &self.release().binding(),
         )
         .expect("a schema request");
         let mut answer =
             answer::schema(store, self.target("schema", query), &request).expect("a schema answer");
+        // What the router adds for a page; a no-op when the request asked
+        // for labels itself, which the operation has then resolved.
         if hydrate_labels {
             answer
                 .hydrate_labels(
                     store,
-                    &["http://www.w3.org/2000/01/rdf-schema#label".to_owned()],
+                    &request::Labeling::release_default(self.release().predicate_roles(), limits),
                     1_000,
-                    true,
                 )
                 .expect("hydrate schema labels");
         }
@@ -1880,6 +2342,7 @@ impl Served {
         request::Terms::parse(
             &params(query),
             self.limits(),
+            self.release().prefixes(),
             self.release().predicate_roles(),
             &self.release().binding(),
         )
@@ -1906,6 +2369,7 @@ impl Served {
         let request = request::Terms::parse(
             &params(query),
             self.within(budgets),
+            self.release().prefixes(),
             self.release().predicate_roles(),
             &self.release().binding(),
         )
@@ -1917,11 +2381,20 @@ impl Served {
     }
 
     fn labels(&self, store: &Store, body: &serde_json::Value) -> serde_json::Value {
+        self.labels_within(store, body, &BUDGETS)
+    }
+
+    fn labels_within(
+        &self,
+        store: &Store,
+        body: &serde_json::Value,
+        budgets: &Budgets,
+    ) -> serde_json::Value {
         let encoded = serde_json::to_vec(body).expect("a JSON body");
         let request = request::Labels::parse(
             &params(""),
             &encoded,
-            self.limits(),
+            self.within(budgets),
             self.release().prefixes(),
             self.release().predicate_roles(),
         )
@@ -1965,6 +2438,7 @@ impl Served {
                     &params(query),
                     self.limits(),
                     self.release().prefixes(),
+                    self.release().predicate_roles(),
                     &self.release().binding(),
                 )
                 .expect("a well-formed request");
@@ -1977,6 +2451,7 @@ impl Served {
                     &params(query),
                     self.limits(),
                     self.release().prefixes(),
+                    self.release().predicate_roles(),
                     &self.release().binding(),
                 )
                 .expect("a well-formed request");
@@ -1989,6 +2464,7 @@ impl Served {
                     &params(query),
                     self.limits(),
                     self.release().prefixes(),
+                    self.release().predicate_roles(),
                 )
                 .expect("a well-formed request");
                 answer::sample(store, target, &request)
@@ -2889,6 +3365,7 @@ fn an_absent_graph_is_an_empty_answer_that_names_g() {
         &params("g=%22text%22"),
         served.limits(),
         served.release().prefixes(),
+        served.release().predicate_roles(),
         &served.release().binding(),
     )
     .expect_err("a literal is refused");
@@ -3318,6 +3795,7 @@ fn a_graph_scope_beside_a_text_constraint_is_refused() {
         &params(&format!("o.text=alice&{}", g(UNNAMED))),
         served.limits(),
         served.release().prefixes(),
+        served.release().predicate_roles(),
         &served.release().binding(),
     )
     .expect_err("the combination is refused");

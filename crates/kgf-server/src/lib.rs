@@ -50,6 +50,7 @@ pub mod export;
 mod forms;
 mod hex;
 pub mod html;
+pub mod label;
 mod rdf;
 pub mod representation;
 pub mod request;
@@ -315,6 +316,16 @@ pub struct Caps {
     pub max_search_results: u32,
     /// IRIs one `/labels` request may resolve.
     pub max_label_iris: u32,
+    /// Language ranges one request's `lang` preference may list.
+    ///
+    /// Each range is matched once per distinct language tag a request meets,
+    /// not once per value, so this bounds the matching rather than the scan;
+    /// without it the list is bounded only by the request size.
+    pub max_label_languages: u32,
+    /// Predicates one request's `labels` may name in place of the release's
+    /// `label` role. Each is a descent per labelled term, so the list
+    /// multiplies the cascade's cost.
+    pub max_label_predicates: u32,
     /// Child or class-relation rows in one `/schema` page.
     pub max_schema_items: u32,
 }
@@ -336,6 +347,8 @@ impl Caps {
             max_search_predicates: 128,
             max_search_results: 1_000,
             max_label_iris: 10_000,
+            max_label_languages: 16,
+            max_label_predicates: 16,
             max_schema_items: 1_000,
         }
     }
@@ -425,12 +438,15 @@ impl Limits<'_> {
             || self.caps.max_search_predicates == 0
             || self.caps.max_search_results == 0
             || self.caps.max_label_iris == 0
+            || self.caps.max_label_languages == 0
+            || self.caps.max_label_predicates == 0
             || self.caps.max_schema_items == 0
         {
             return Err(
                 "caps.max_limit, caps.default_limit, caps.max_sample, caps.max_bindings, \
-                 caps.max_search_predicates, caps.max_search_results, caps.max_label_iris and \
-                 caps.max_schema_items must be at least 1; \
+                 caps.max_search_predicates, caps.max_search_results, caps.max_label_iris, \
+                 caps.max_label_languages, caps.max_label_predicates and caps.max_schema_items \
+                 must be at least 1; \
                  a zero-width operation is not usable"
                     .to_owned(),
             );

@@ -2565,7 +2565,7 @@ fn bindings_query_and_post_answer_over_the_wire() {
 }
 
 #[test]
-fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
+fn search_and_labels_answer_over_the_wire() {
     let deployment = Deployment::new();
     deployment.publish_text("tox", "v1", GROWN_NT, "2026-06-01T14:03:22Z");
     let server = deployment.serve();
@@ -2620,11 +2620,21 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
     assert!(search_html.contains("<dt>predicates</dt>"), "{search_html}");
     assert!(!search_html.contains("all predicates"), "{search_html}");
 
-    // Locale is not part of the operation: labels are the release's stable
-    // display labels rather than a per-request localization service.
-    let with_lang = server.get("/tox/v/v1/search?q=Alice&lang=en");
-    with_lang.assert_status(400);
-    assert_eq!(with_lang.json()["code"], "malformed_request");
+    // A language preference shapes the label, not the result, and is taken
+    // wherever labels are. Untagged labels are what this release carries, and
+    // an untagged literal outranks every language the request did not name.
+    let with_lang =
+        server.get("/tox/v/v1/search?q=Alice&predicate=ex%3Aname&lang=en&label_source=true");
+    with_lang.assert_status(200);
+    assert_eq!(with_lang.json()["results"][0]["label"], "Alice");
+    assert_eq!(
+        with_lang.json()["results"][0]["label_source"],
+        serde_json::json!({"predicate": "http://example.org/name"})
+    );
+    // Shaping labels nobody asked for would change nothing, so it is refused.
+    let unlabelled = server.get("/tox/v/v1/search?q=Alice&labels=false&lang=en");
+    unlabelled.assert_status(400);
+    assert_eq!(unlabelled.json()["code"], "malformed_request");
 
     let body = serde_json::to_vec(&serde_json::json!({
         "iris": ["ex:bob", "ex:missing"]
@@ -2643,6 +2653,46 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
             {"iri": {"type": "iri", "value": "http://example.org/bob"}, "label": "Bob"},
             {"iri": {"type": "iri", "value": "http://example.org/missing"}, "label": null},
         ])
+    );
+
+    // The body takes the cascade's language preference and the switch for
+    // where each label came from — both refused before this release.
+    let shaped = serde_json::to_vec(&serde_json::json!({
+        "iris": ["ex:bob", "ex:missing"],
+        "lang": ["en", "fr"],
+        "label_source": true
+    }))
+    .unwrap();
+    let sourced = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/labels",
+        &[("Content-Type", "application/json")],
+        &shaped,
+    );
+    sourced.assert_status(200);
+    assert_eq!(
+        sourced.json()["labels"],
+        serde_json::json!([
+            {"iri": {"type": "iri", "value": "http://example.org/bob"}, "label": "Bob",
+             "label_source": {"predicate": "http://example.org/name"}},
+            {"iri": {"type": "iri", "value": "http://example.org/missing"}, "label": null,
+             "label_source": null},
+        ])
+    );
+    let unranged = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/labels",
+        &[("Content-Type", "application/json")],
+        br#"{"iris": ["ex:bob"], "lang": ["en_GB"]}"#,
+    );
+    unranged.assert_status(400);
+    assert!(
+        unranged.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("lang[0]"),
+        "{}",
+        unranged.text()
     );
     assert_eq!(
         labeled.header("accept-query").as_deref(),
@@ -2677,6 +2727,158 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
         "{empty_html}"
     );
     assert!(!empty_html.contains("response budget"), "{empty_html}");
+}
+
+#[test]
+fn row_operations_label_their_iris_when_asked() {
+    let deployment = Deployment::new();
+    // `ex:remoteName` is a label the release does not declare, for the
+    // override below.
+    deployment.publish(
+        "tox",
+        "v1",
+        &format!("{GROWN_NT}{REMOTE_NT}"),
+        "2026-06-01T14:03:22Z",
+    );
+    let server = deployment.serve();
+
+    // The modifier the issue asked for: one label per distinct IRI on the
+    // page, bound terms included, and an explicit null for one with none.
+    let page = server.get("/tox/v/v1/fragment?p=ex%3Aknows&labels=true");
+    page.assert_status(200);
+    let body = page.json();
+    assert_eq!(
+        body["labels"],
+        serde_json::json!({
+            "http://example.org/alice": "Alice",
+            "http://example.org/bob": "Bob",
+            "http://example.org/knows": null,
+        })
+    );
+    assert!(body.get("label_sources").is_none());
+    // Off unless asked for, so a page that did not ask is unchanged.
+    assert!(
+        server
+            .get("/tox/v/v1/fragment?p=ex%3Aknows")
+            .json()
+            .get("labels")
+            .is_none()
+    );
+
+    let sourced = server.get("/tox/v/v1/describe?iri=ex%3Abob&labels=true&label_source=true");
+    sourced.assert_status(200);
+    assert_eq!(
+        sourced.json()["label_sources"]["http://example.org/bob"],
+        serde_json::json!({"predicate": "http://example.org/name"})
+    );
+    assert_eq!(
+        sourced.json()["label_sources"]["http://example.org/knows"],
+        serde_json::Value::Null
+    );
+
+    let sample = server.get("/tox/v/v1/sample?p=ex%3Aknows&n=1&labels=true");
+    sample.assert_status(200);
+    assert_eq!(
+        sample.json()["labels"]["http://example.org/knows"],
+        serde_json::Value::Null
+    );
+
+    // The same field on the body form, bindings pages included.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "pattern": {"s": "?s", "p": "ex:knows", "o": "?o"},
+        "bindings": {"vars": ["?s"], "rows": [["ex:alice"]]},
+        "labels": true,
+        "lang": ["en"]
+    }))
+    .unwrap();
+    let bound = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/fragment",
+        &[("Content-Type", "application/json")],
+        &body,
+    );
+    bound.assert_status(200);
+    assert_eq!(bound.json()["labels"]["http://example.org/bob"], "Bob");
+
+    // RDF carries each label as the statement it came from, beside the page's
+    // own; an IRI with no label simply has no statement.
+    let quads = server.request(
+        "GET",
+        "/tox/v/v1/fragment?p=ex%3Aknows&labels=true",
+        &[("Accept", "application/n-quads")],
+    );
+    quads.assert_status(200);
+    let mut lines: Vec<String> = quads.text().lines().map(str::to_owned).collect();
+    lines.sort();
+    assert_eq!(
+        lines,
+        [
+            "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .",
+            "<http://example.org/alice> <http://example.org/name> \"Alice\" .",
+            "<http://example.org/bob> <http://example.org/name> \"Bob\" .",
+        ]
+    );
+    // But labels are read across every graph, so a page scoped to one cannot
+    // carry their statements without claiming they are in it.
+    let scoped = server.request(
+        "GET",
+        "/tox/v/v1/fragment?p=ex%3Aknows&g=%3Curn%3Ax-kgf%3Aunnamed%3E&labels=true",
+        &[("Accept", "application/n-quads")],
+    );
+    scoped.assert_status(406);
+    assert!(scoped.json()["detail"].as_str().unwrap().contains("union"));
+    server
+        .request(
+            "GET",
+            "/tox/v/v1/fragment?p=ex%3Aknows&g=%3Curn%3Ax-kgf%3Aunnamed%3E&labels=true",
+            &[("Accept", "application/json")],
+        )
+        .assert_status(200);
+
+    // The predicates to label with may be named for the one request, in
+    // place of the release's own and in the order given.
+    let named = server.get("/tox/v/v1/fragment?p=ex%3Aknows&labels=ex%3AremoteName");
+    named.assert_status(200);
+    assert_eq!(
+        named.json()["labels"],
+        serde_json::json!({
+            "http://example.org/alice": null,
+            "http://example.org/bob": "Bobby",
+            "http://example.org/knows": null,
+        })
+    );
+    let fallback = server.get("/tox/v/v1/fragment?p=ex%3Aknows&labels=ex%3AremoteName,ex%3Aname");
+    assert_eq!(
+        fallback.json()["labels"]["http://example.org/alice"],
+        "Alice"
+    );
+    assert_eq!(fallback.json()["labels"]["http://example.org/bob"], "Bobby");
+    let body = serde_json::to_vec(&serde_json::json!({
+        "iris": ["ex:bob"],
+        "labels": ["ex:name"]
+    }))
+    .unwrap();
+    let batch = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/labels",
+        &[("Content-Type", "application/json")],
+        &body,
+    );
+    batch.assert_status(200);
+    assert_eq!(batch.json()["labels"][0]["label"], "Bob");
+
+    // And the page is the same labels, set under each term.
+    let html = server
+        .request(
+            "GET",
+            "/tox/v/v1/fragment?p=ex%3Aknows&labels=true",
+            &[("Accept", "text/html")],
+        )
+        .text();
+    assert!(
+        html.contains("<span class=\"t-label\">Bob</span>"),
+        "{html}"
+    );
 }
 
 #[test]

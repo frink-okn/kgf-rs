@@ -34,6 +34,7 @@
 //! its cursor. It also means the binding needs no dictionary, so a cursor is
 //! validated before the bundle opens.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use oxrdf::VariableRef as SparqlVariableRef;
@@ -60,6 +61,7 @@ use crate::cursor::{
     BundleBinding, CanonicalRequest, Cursor, CursorBinding, Operation, PositionSpace, StaleCursor,
 };
 use crate::envelope::{ErrorCode, Problem, reflected};
+use crate::label::{LanguageRange, Languages};
 use crate::representation::{RdfSyntax, Representation};
 use crate::service::PredicateRoles;
 use crate::term::{Literal as KgfLiteral, PrefixMap, Term};
@@ -584,10 +586,9 @@ pub struct Search {
     pub roles: Vec<String>,
     /// Explicit and role-expanded predicate IRIs, deduplicated.
     pub predicates: Vec<BoundTerm>,
-    /// Ordered predicates used to hydrate the preferred label.
-    pub label_predicates: Vec<BoundTerm>,
-    /// Whether each entity receives its preferred display label.
-    pub labels: bool,
+    /// How each entity's preferred label is resolved; `None` for
+    /// `labels=false`.
+    pub labels: Option<Labeling>,
     /// Entity hits retained from the bounded ranking.
     pub limit: u32,
     /// Bytes the result rows may occupy.
@@ -597,8 +598,16 @@ pub struct Search {
 }
 
 impl Search {
-    const PARAMETERS: &'static [&'static str] =
-        &["q", "role", "predicate", "labels", "limit", "format"];
+    const PARAMETERS: &'static [&'static str] = &[
+        "q",
+        "role",
+        "predicate",
+        "labels",
+        "lang",
+        "label_source",
+        "limit",
+        "format",
+    ];
 
     /// Parse one search request against the release's frozen role profile.
     pub fn parse(
@@ -662,8 +671,7 @@ impl Search {
             query,
             roles,
             predicates: predicates.into_values().collect(),
-            labels: boolean(params, "labels", true)?,
-            label_predicates: profile_terms(profile, "label"),
+            labels: Labeling::from_params(params, true, profile, prefixes, limits)?,
             limit: page_size(
                 params,
                 "limit",
@@ -681,8 +689,8 @@ impl Search {
 #[derive(Debug)]
 pub struct Labels {
     iris: Vec<BoundTerm>,
-    /// Ordered predicates in the release's label cascade.
-    pub label_predicates: Vec<BoundTerm>,
+    /// How each label is resolved.
+    pub labeling: Labeling,
     /// Bytes the result rows may occupy.
     pub bytes: ResponseBytes,
 }
@@ -717,9 +725,26 @@ impl Labels {
                     .require_iri(&format!("iris[{index}]"))?,
             );
         }
+        if matches!(wire.labels, Some(WireLabelsControl::Switch(false))) {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "a labels request always resolves labels; `labels` may name the predicates \
+                 to resolve them with instead of the release's own",
+            ));
+        }
+        let labeling = Labeling::from_body(
+            wire.labels,
+            wire.lang,
+            wire.label_source,
+            true,
+            profile,
+            prefixes,
+            limits,
+        )?
+        .expect("a labels request always labels");
         Ok(Self {
             iris,
-            label_predicates: profile_terms(profile, "label"),
+            labeling,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
         })
     }
@@ -737,6 +762,296 @@ fn profile_terms(profile: &PredicateRoles, role: &str) -> Vec<BoundTerm> {
         .iter()
         .map(|iri| BoundTerm::from_profile_iri(iri))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Labels
+// ---------------------------------------------------------------------------
+
+/// How a request wants preferred labels resolved.
+///
+/// One type for every operation that labels — the `/labels` batch, and every
+/// operation that takes `labels` — so `labels`, `lang` and `label_source` mean
+/// the same thing wherever labels are offered, and a request that labels on
+/// one route can be moved to another without being rewritten.
+#[derive(Debug, Clone)]
+pub struct Labeling {
+    /// The predicates the cascade reads, in order: the release's frozen
+    /// `label` role, or the request's own list when `labels` named one.
+    pub predicates: Vec<BoundTerm>,
+    /// The request's language preference, strongest first.
+    pub languages: Languages,
+    /// Whether each label reports the predicate and language it came from.
+    pub source: bool,
+    /// Label values the cascade may examine.
+    pub candidates: Candidates,
+}
+
+/// What a request's `labels` asked for, before `lang` and `label_source` are
+/// read.
+enum LabelsControl {
+    /// No labels.
+    Off,
+    /// The release's declared `label` role.
+    Release,
+    /// These predicates, in this order, in place of the release's role for this
+    /// one request.
+    Predicates(Vec<BoundTerm>),
+}
+
+impl LabelsControl {
+    fn predicates(self, profile: &PredicateRoles) -> Option<Vec<BoundTerm>> {
+        match self {
+            Self::Off => None,
+            Self::Release => Some(profile_terms(profile, "label")),
+            Self::Predicates(predicates) => Some(predicates),
+        }
+    }
+}
+
+impl Labeling {
+    /// The parameters that shape labels without turning them on.
+    const SHAPING: [&'static str; 2] = ["lang", "label_source"];
+
+    fn new(
+        predicates: Vec<BoundTerm>,
+        languages: Languages,
+        source: bool,
+        limits: Limits<'_>,
+    ) -> Self {
+        Self {
+            predicates,
+            languages,
+            source,
+            candidates: Candidates(limits.budgets.candidate_budget),
+        }
+    }
+
+    /// The release's own cascade with no language preference and no sources:
+    /// what a page labels its terms with when the request did not ask.
+    pub fn release_default(profile: &PredicateRoles, limits: Limits<'_>) -> Self {
+        Self::new(
+            profile_terms(profile, "label"),
+            Languages::default(),
+            false,
+            limits,
+        )
+    }
+
+    /// The predicates' full IRIs, in cascade order.
+    pub fn predicate_iris(&self) -> impl Iterator<Item = &str> {
+        self.predicates.iter().map(BoundTerm::dictionary)
+    }
+
+    /// Read `labels`, `lang` and `label_source` from a query string.
+    ///
+    /// `labels` is `true`, `false`, or the predicates to label with, separated
+    /// by commas or whitespace as `predicate=` takes them on `/search`.
+    /// `default` is whether the operation labels when it is absent. `lang` and
+    /// `label_source` without labels are refused rather than ignored: they
+    /// would change nothing, and a client that sent them expected them to.
+    fn from_params(
+        params: &Params,
+        default: bool,
+        profile: &PredicateRoles,
+        prefixes: &PrefixMap,
+        limits: Limits<'_>,
+    ) -> Result<Option<Self>, Problem> {
+        let control = match params.get("labels") {
+            None if default => LabelsControl::Release,
+            None | Some("false") => LabelsControl::Off,
+            Some("true") => LabelsControl::Release,
+            Some(value) if names_predicates(value) => {
+                let terms = term_list("labels", value)?;
+                within_label_predicates(terms.len(), limits)?;
+                let mut predicates = Vec::with_capacity(terms.len());
+                for text in terms {
+                    predicates.push(
+                        BoundTerm::parse("labels", text, limits, prefixes)?
+                            .require_iri("labels")?,
+                    );
+                }
+                LabelsControl::Predicates(distinct_predicates(predicates))
+            }
+            Some(value) => {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    format!(
+                        "labels={} is not `true`, `false`, or a list of predicate IRIs such \
+                         as labels=rdfs:label,skos:prefLabel",
+                        reflected(value)
+                    ),
+                ));
+            }
+        };
+        let Some(predicates) = control.predicates(profile) else {
+            return match Self::SHAPING
+                .into_iter()
+                .find(|name| params.get(name).is_some())
+            {
+                Some(name) => Err(shaping_without_labels(name)),
+                None => Ok(None),
+            };
+        };
+        let languages = match params.get("lang") {
+            None => Languages::default(),
+            Some(list) => {
+                let ranges = comma_list("lang", list)?;
+                parse_languages(
+                    ranges
+                        .into_iter()
+                        .map(|range| (range, Cow::Borrowed("lang"))),
+                    limits,
+                )?
+            }
+        };
+        let source = boolean(params, "label_source", false)?;
+        Ok(Some(Self::new(predicates, languages, source, limits)))
+    }
+
+    /// The same three, read from a JSON body's `labels`, `lang` and
+    /// `label_source` fields, where `labels` is `true`, `false`, or an array of
+    /// predicate IRIs in either term syntax.
+    #[allow(clippy::too_many_arguments)]
+    fn from_body(
+        labels: Option<WireLabelsControl>,
+        lang: Option<Vec<String>>,
+        source: Option<bool>,
+        default: bool,
+        profile: &PredicateRoles,
+        prefixes: &PrefixMap,
+        limits: Limits<'_>,
+    ) -> Result<Option<Self>, Problem> {
+        let control = match labels {
+            None if default => LabelsControl::Release,
+            None | Some(WireLabelsControl::Switch(false)) => LabelsControl::Off,
+            Some(WireLabelsControl::Switch(true)) => LabelsControl::Release,
+            Some(WireLabelsControl::Predicates(terms)) => {
+                if terms.is_empty() {
+                    return Err(Problem::new(
+                        ErrorCode::MalformedRequest,
+                        "`labels` lists no predicates, which would label nothing; send \
+                         `true` for the release's own, or `false` for none",
+                    ));
+                }
+                within_label_predicates(terms.len(), limits)?;
+                let mut predicates = Vec::with_capacity(terms.len());
+                for (index, term) in terms.into_iter().enumerate() {
+                    let name = format!("labels[{index}]");
+                    predicates.push(
+                        BoundTerm::parse_body(&name, term, limits, prefixes)?.require_iri(&name)?,
+                    );
+                }
+                LabelsControl::Predicates(distinct_predicates(predicates))
+            }
+        };
+        let Some(predicates) = control.predicates(profile) else {
+            return match (&lang, source) {
+                (Some(_), _) => Err(shaping_without_labels("lang")),
+                (None, Some(_)) => Err(shaping_without_labels("label_source")),
+                (None, None) => Ok(None),
+            };
+        };
+        let languages = match &lang {
+            None => Languages::default(),
+            Some(ranges) => parse_languages(
+                ranges
+                    .iter()
+                    .enumerate()
+                    .map(|(index, range)| (range.as_str(), Cow::Owned(format!("lang[{index}]")))),
+                limits,
+            )?,
+        };
+        Ok(Some(Self::new(
+            predicates,
+            languages,
+            source.unwrap_or(false),
+            limits,
+        )))
+    }
+}
+
+/// Whether a `labels` value is a list of predicates rather than a boolean:
+/// every member bracketed or prefixed, as an IRI or a CURIE is. Anything else
+/// is refused as neither, with an error that names both forms.
+fn names_predicates(value: &str) -> bool {
+    term_list("labels", value).is_ok_and(|terms| {
+        terms
+            .iter()
+            .all(|term| term.starts_with('<') || term.contains(':'))
+    })
+}
+
+/// Refuse a predicate list over `max_label_predicates` before parsing it:
+/// each predicate is a descent per labelled term, so the list multiplies the
+/// cascade's cost.
+fn within_label_predicates(count: usize, limits: Limits<'_>) -> Result<(), Problem> {
+    let cap = limits.caps.max_label_predicates;
+    if count > cap as usize {
+        return Err(Problem::new(
+            ErrorCode::CapExceeded,
+            format!(
+                "`labels` lists {count} predicates, over this server's max_label_predicates of {cap}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Keep each predicate once, in its first place: a predicate already tried
+/// cannot rank anything new later in the list.
+fn distinct_predicates(predicates: Vec<BoundTerm>) -> Vec<BoundTerm> {
+    let mut kept: Vec<BoundTerm> = Vec::with_capacity(predicates.len());
+    for predicate in predicates {
+        if !kept
+            .iter()
+            .any(|seen| seen.dictionary() == predicate.dictionary())
+        {
+            kept.push(predicate);
+        }
+    }
+    kept
+}
+
+fn shaping_without_labels(name: &str) -> Problem {
+    Problem::new(
+        ErrorCode::MalformedRequest,
+        format!(
+            "`{name}` shapes preferred labels, and this request asks for none; add labels=true"
+        ),
+    )
+}
+
+/// Parse language ranges, each with the name it is reported under.
+fn parse_languages<'a>(
+    ranges: impl ExactSizeIterator<Item = (&'a str, Cow<'a, str>)>,
+    limits: Limits<'_>,
+) -> Result<Languages, Problem> {
+    let cap = limits.caps.max_label_languages;
+    if ranges.len() > cap as usize {
+        return Err(Problem::new(
+            ErrorCode::CapExceeded,
+            format!(
+                "`lang` lists {} language ranges, over this server's max_label_languages of {cap}",
+                ranges.len()
+            ),
+        ));
+    }
+    let mut parsed = Vec::with_capacity(ranges.len());
+    for (text, name) in ranges {
+        parsed.push(LanguageRange::parse(text).map_err(|_| {
+            Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "{name}={} is not a basic language range: write `*`, or a language \
+                     tag such as `en` or `en-GB` (RFC 4647), which matches itself and \
+                     every tag it is a prefix of",
+                    reflected(text)
+                ),
+            )
+        })?);
+    }
+    Ok(Languages::new(parsed))
 }
 
 /// Which memberships a fragment or count reads: the `g` parameter.
@@ -1027,6 +1342,37 @@ pub(crate) const QUAD_VIEW_NEEDS_A_DATASET: &str = "the quad view puts each stat
 /// A ranked text page is assembled from one selection per matching literal,
 /// and this build does not scope those. Refused rather than answered from the
 /// union, for the reason every ignored filter is refused.
+/// Whether the negotiated representation can carry the labels a request asked
+/// for.
+///
+/// An RDF document carries a label as the statement it came from, beside the
+/// page's own — a statement of the same dataset, so the document is still a
+/// set of the bundle's triples. But labels are resolved over the whole
+/// dataset, and an RDF document says which graph each statement is in: a
+/// label statement written into the graph a request selected, or into a row's
+/// graph in the quad view, would claim a membership nothing checked. So RDF
+/// labels a page over the union and refuses one over any narrower scope,
+/// rather than placing statements where they may not be.
+fn labels_carried(
+    labels: Option<&Labeling>,
+    graph: &GraphScope,
+    representation: Representation,
+) -> Result<(), Problem> {
+    if labels.is_some()
+        && representation.is_rdf()
+        && !matches!(graph.selector(), GraphSelector::Union)
+    {
+        return Err(Problem::new(
+            ErrorCode::NotAcceptable,
+            "labels are read across every graph, so an RDF page can carry their statements \
+             only when it reads the union: this one is scoped by `g`, and a label statement \
+             written into it would claim a graph it may not be in. Leave out `g`, or ask \
+             for JSON, whose `labels` map makes no claim about graphs",
+        ));
+    }
+    Ok(())
+}
+
 fn refuse_scoped_text(pattern: &Pattern, graph: &GraphScope) -> Result<(), Problem> {
     if pattern.text().is_some() && graph.canonical().is_some() {
         return Err(Problem::new(
@@ -1698,6 +2044,8 @@ pub struct BindingFragment {
     pub cursor: Option<Cursor>,
     /// What a cursor this request issues must match.
     pub binding: CursorBinding,
+    /// How the response labels its IRIs; `None` unless the body asked.
+    pub labels: Option<Labeling>,
     /// GET RDF is the distinct brTPF projection; native bodies preserve the
     /// complete compatibility relation and its binding indices.
     distinct_rdf: bool,
@@ -1710,10 +2058,20 @@ impl BindingFragment {
         body: &[u8],
         limits: Limits<'_>,
         prefixes: &PrefixMap,
+        profile: &PredicateRoles,
         bundle: &BundleBinding,
     ) -> Result<Self, Problem> {
         accept_only(params, FRAGMENT, &["format"])?;
         let wire: WireBindingFragment = parse_body(body)?;
+        let labels = Labeling::from_body(
+            wire.labels,
+            wire.lang,
+            wire.label_source,
+            false,
+            profile,
+            prefixes,
+            limits,
+        )?;
         let pattern = BindingPattern::parse(wire.pattern, limits, prefixes)?;
         let bindings = Bindings::parse(wire.bindings, &pattern, limits, prefixes)?;
         let graph = GraphScope::parse_body(wire.g.as_deref(), limits, prefixes)?;
@@ -1739,6 +2097,7 @@ impl BindingFragment {
             candidates: Candidates(limits.budgets.candidate_budget),
             cursor,
             binding,
+            labels,
             distinct_rdf: false,
         })
     }
@@ -1798,6 +2157,7 @@ impl BindingFragment {
             candidates: Candidates(limits.budgets.candidate_budget),
             cursor: resume(params, &binding)?,
             binding,
+            labels: None,
             distinct_rdf: true,
         })
     }
@@ -1902,6 +2262,9 @@ struct WireBindingFragment {
     g: Option<String>,
     limit: Option<u32>,
     cursor: Option<String>,
+    labels: Option<WireLabelsControl>,
+    lang: Option<Vec<String>>,
+    label_source: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1917,6 +2280,53 @@ struct WireBindingCount {
 #[serde(deny_unknown_fields)]
 struct WireLabels {
     iris: Vec<WireTerm>,
+    labels: Option<WireLabelsControl>,
+    lang: Option<Vec<String>>,
+    label_source: Option<bool>,
+}
+
+/// A body's `labels`: a switch, or the predicates to label with.
+///
+/// Its own type rather than an untagged enum so that a value that is neither
+/// gets an error naming both forms, not serde's "did not match any variant".
+#[derive(Debug)]
+enum WireLabelsControl {
+    Switch(bool),
+    Predicates(Vec<WireTerm>),
+}
+
+impl<'de> Deserialize<'de> for WireLabelsControl {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ControlVisitor;
+
+        impl<'de> Visitor<'de> for ControlVisitor {
+            type Value = WireLabelsControl;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("`true`, `false`, or an array of predicate IRIs")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(WireLabelsControl::Switch(value))
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut terms = Vec::new();
+                while let Some(term) = sequence.next_element::<WireTerm>()? {
+                    terms.push(term);
+                }
+                Ok(WireLabelsControl::Predicates(terms))
+            }
+        }
+
+        deserializer.deserialize_any(ControlVisitor)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2041,17 +2451,35 @@ pub struct Fragment {
     pub cursor: Option<Cursor>,
     /// What a cursor this request issues must match.
     pub binding: CursorBinding,
+    /// How the response labels its IRIs; `None` unless `labels=true`.
+    pub labels: Option<Labeling>,
 }
 
 impl Fragment {
-    const PARAMETERS: &'static [&'static str] =
-        &["s", "p", "o", "o.text", "g", "limit", "cursor", "format"];
+    const PARAMETERS: &'static [&'static str] = &[
+        "s",
+        "p",
+        "o",
+        "o.text",
+        "g",
+        "limit",
+        "cursor",
+        "labels",
+        "lang",
+        "label_source",
+        "format",
+    ];
 
     /// Read the parameters of a `/fragment` request.
+    ///
+    /// The cursor binding leaves the label parameters out: they change what
+    /// annotates a page, not which rows it holds, so a client may turn labels
+    /// on or change language part-way through paging.
     pub fn parse(
         params: &Params,
         limits: Limits<'_>,
         prefixes: &PrefixMap,
+        profile: &PredicateRoles,
         bundle: &BundleBinding,
     ) -> Result<Self, Problem> {
         accept_only(params, FRAGMENT, Self::PARAMETERS)?;
@@ -2079,6 +2507,7 @@ impl Fragment {
             candidates: Candidates(limits.budgets.candidate_budget),
             cursor: resume(params, &binding)?,
             binding,
+            labels: Labeling::from_params(params, false, profile, prefixes, limits)?,
         })
     }
 }
@@ -2162,6 +2591,8 @@ impl Tpf {
             candidates: Candidates(limits.budgets.candidate_budget),
             cursor: resume(params, &binding)?,
             binding,
+            // TPF's metadata is Hydra's, which has no place for them.
+            labels: None,
         }))
     }
 }
@@ -2306,15 +2737,14 @@ pub struct Terms {
     pub count: bool,
     /// Rows this page may carry.
     pub limit: u32,
-    /// Whether each term receives its preferred display label.
+    /// How each term's preferred display label is resolved; `None` for
+    /// `labels=false`, and for a count, which has no rows to label.
     ///
     /// Defaulted on, as `/search` defaults it: an IRI list is what this
     /// operation returns, and an unlabelled page of opaque identifiers answers
     /// "which terms" without answering "which things". The cost is one bounded
     /// lookup per row and `labels=false` declines it.
-    pub labels: bool,
-    /// Ordered predicates used to hydrate the preferred label.
-    pub label_predicates: Vec<BoundTerm>,
+    pub labels: Option<Labeling>,
     /// Bytes the result rows may occupy.
     pub bytes: ResponseBytes,
     /// Where to resume a page.
@@ -2325,7 +2755,15 @@ pub struct Terms {
 
 impl Terms {
     const PARAMETERS: &'static [&'static str] = &[
-        "prefix", "role", "count", "limit", "labels", "cursor", "format",
+        "prefix",
+        "role",
+        "count",
+        "limit",
+        "labels",
+        "lang",
+        "label_source",
+        "cursor",
+        "format",
     ];
 
     /// The parameters a count refuses, and what each of them would have meant.
@@ -2333,12 +2771,16 @@ impl Terms {
     /// Refused rather than ignored: each one describes a page, and a count has
     /// no page. Silently dropping `limit` would answer a different question from
     /// the one asked without saying so.
-    const PAGE_ONLY: [&'static str; 3] = ["limit", "labels", "cursor"];
+    const PAGE_ONLY: [&'static str; 5] = ["limit", "labels", "lang", "label_source", "cursor"];
 
     /// Read the parameters of a `/terms` request.
+    ///
+    /// `prefixes` is read only for `labels`, which may name predicates: the
+    /// scan's own `prefix` is stored bytes, never a CURIE.
     pub fn parse(
         params: &Params,
         limits: Limits<'_>,
+        prefixes: &PrefixMap,
         profile: &PredicateRoles,
         bundle: &BundleBinding,
     ) -> Result<Self, Problem> {
@@ -2427,8 +2869,11 @@ impl Terms {
                 limits.caps.max_limit,
                 "ask for count=true when only the number is wanted",
             )?,
-            labels: boolean(params, "labels", true)?,
-            label_predicates: profile_terms(profile, "label"),
+            labels: if count {
+                None
+            } else {
+                Labeling::from_params(params, true, profile, prefixes, limits)?
+            },
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
             cursor: resume(params, &binding)?,
             binding,
@@ -2475,16 +2920,28 @@ pub struct Describe {
     pub cursor: Option<Cursor>,
     /// What a cursor this request issues must match.
     pub binding: CursorBinding,
+    /// How the response labels its IRIs; `None` unless `labels=true`.
+    pub labels: Option<Labeling>,
 }
 
 impl Describe {
-    const PARAMETERS: &'static [&'static str] = &["iri", "direction", "limit", "cursor", "format"];
+    const PARAMETERS: &'static [&'static str] = &[
+        "iri",
+        "direction",
+        "limit",
+        "cursor",
+        "labels",
+        "lang",
+        "label_source",
+        "format",
+    ];
 
     /// Read the parameters of a `/describe` request.
     pub fn parse(
         params: &Params,
         limits: Limits<'_>,
         prefixes: &PrefixMap,
+        profile: &PredicateRoles,
         bundle: &BundleBinding,
     ) -> Result<Self, Problem> {
         accept_only(params, DESCRIBE, Self::PARAMETERS)?;
@@ -2521,6 +2978,7 @@ impl Describe {
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
             cursor: resume(params, &binding)?,
             binding,
+            labels: Labeling::from_params(params, false, profile, prefixes, limits)?,
         })
     }
 }
@@ -2805,9 +3263,9 @@ pub struct Schema {
     pub bytes: ResponseBytes,
     /// Rows a filtered class-relation page may examine.
     pub candidates: Candidates,
-    /// Whether the JSON response should carry the preferred label (or an
-    /// explicit null) for each distinct schema IRI on the page.
-    pub labels: bool,
+    /// How the response labels each distinct schema IRI on the page, with an
+    /// explicit null for one that has no label; `None` unless `labels=true`.
+    pub labels: Option<Labeling>,
     /// Where to resume, if the request carried a cursor.
     pub cursor: Option<Cursor>,
     /// What a cursor this request issues must match.
@@ -2894,6 +3352,8 @@ impl Schema {
         "limit",
         "cursor",
         "labels",
+        "lang",
+        "label_source",
         "format",
     ];
 
@@ -2902,12 +3362,13 @@ impl Schema {
         params: &Params,
         limits: Limits<'_>,
         prefixes: &PrefixMap,
+        profile: &PredicateRoles,
         bundle: &BundleBinding,
     ) -> Result<Self, Problem> {
         accept_only(params, SCHEMA, Self::PARAMETERS)?;
         let view = schema_view(params)?;
         let query = parse_schema_query(params, limits, prefixes)?;
-        let labels = boolean(params, "labels", false)?;
+        let labels = Labeling::from_params(params, false, profile, prefixes, limits)?;
         let limit = match &query {
             SchemaQuery::Node(_) => {
                 if params.get("limit").is_some() {
@@ -3150,18 +3611,31 @@ pub struct Sample {
     pub seed: u64,
     /// Bytes the drawn members may occupy.
     pub bytes: ResponseBytes,
+    /// How the response labels its IRIs; `None` unless `labels=true`.
+    pub labels: Option<Labeling>,
 }
 
 impl Sample {
     /// No `cursor`: a sample is drawn whole and has no position to resume from,
     /// which is why [`Operation`] has no variant for it.
-    const PARAMETERS: &'static [&'static str] = &["s", "p", "o", "n", "seed", "format"];
+    const PARAMETERS: &'static [&'static str] = &[
+        "s",
+        "p",
+        "o",
+        "n",
+        "seed",
+        "labels",
+        "lang",
+        "label_source",
+        "format",
+    ];
 
     /// Read the parameters of a `/sample` request.
     pub fn parse(
         params: &Params,
         limits: Limits<'_>,
         prefixes: &PrefixMap,
+        profile: &PredicateRoles,
     ) -> Result<Self, Problem> {
         accept_only(params, SAMPLE, Self::PARAMETERS)?;
         let pattern = Pattern::parse(params, limits, prefixes)?;
@@ -3177,6 +3651,7 @@ impl Sample {
             n,
             seed: seed(params)?,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            labels: Labeling::from_params(params, false, profile, prefixes, limits)?,
         })
     }
 }
@@ -3223,12 +3698,6 @@ pub(crate) trait GetRequest: ObservedRequest {
     /// Remove empty controls whose omission selects this request's default.
     fn normalize_params(params: &Params) -> Params;
 
-    /// Whether this request explicitly asks for preferred labels in its
-    /// machine representation.
-    fn labels_requested(&self) -> bool {
-        false
-    }
-
     /// Host admission class for the work this parsed request will perform.
     fn work_class(&self) -> WorkClass {
         WorkClass::Ordinary
@@ -3252,7 +3721,8 @@ impl ObservedRequest for Fragment {
     }
 
     fn representable(&self, representation: Representation) -> Result<(), Problem> {
-        one_graph_syntax_carries(&self.graph, representation)
+        one_graph_syntax_carries(&self.graph, representation)?;
+        labels_carried(self.labels.as_ref(), &self.graph, representation)
     }
 
     fn resumed(&self) -> bool {
@@ -3411,7 +3881,7 @@ impl ObservedRequest for Search {
             roles: self.roles.clone(),
             predicates: self.predicates.len() as u64,
             limit: self.limit,
-            labels: self.labels,
+            labels: self.labels.is_some(),
         }
     }
 
@@ -3426,7 +3896,7 @@ impl ObservedRequest for Terms {
             prefix_len: self.prefix.len() as u64,
             role: role_name(self.role),
             limit: (!self.count).then_some(self.limit),
-            labels: (!self.count).then_some(self.labels),
+            labels: (!self.count).then_some(self.labels.is_some()),
         }
     }
 
@@ -3452,7 +3922,8 @@ impl ObservedRequest for BindingFragment {
     }
 
     fn representable(&self, representation: Representation) -> Result<(), Problem> {
-        one_graph_syntax_carries(&self.graph, representation)
+        one_graph_syntax_carries(&self.graph, representation)?;
+        labels_carried(self.labels.as_ref(), &self.graph, representation)
     }
 
     fn resumed(&self) -> bool {
@@ -3498,7 +3969,10 @@ fn normalize_pattern_params(params: &Params, additional: &[&str]) -> Params {
 
 impl GetRequest for Fragment {
     fn normalize_params(params: &Params) -> Params {
-        normalize_pattern_params(params, &["o.text", "g", "limit"])
+        normalize_pattern_params(
+            params,
+            &["o.text", "g", "limit", "labels", "lang", "label_source"],
+        )
     }
 
     /// A text constraint is the only thing that takes this operation off its
@@ -3553,7 +4027,7 @@ impl GetRequest for Count {
 
 impl GetRequest for Describe {
     fn normalize_params(params: &Params) -> Params {
-        params.without_empty(&["limit"])
+        params.without_empty(&["limit", "labels", "lang", "label_source"])
     }
 }
 
@@ -3568,11 +4042,9 @@ impl GetRequest for Schema {
             "view",
             "limit",
             "labels",
+            "lang",
+            "label_source",
         ])
-    }
-
-    fn labels_requested(&self) -> bool {
-        self.labels
     }
 
     fn work_class(&self) -> WorkClass {
@@ -3611,7 +4083,7 @@ impl GetRequest for Summary {
 
 impl GetRequest for Sample {
     fn normalize_params(params: &Params) -> Params {
-        normalize_pattern_params(params, &["n", "seed"])
+        normalize_pattern_params(params, &["n", "seed", "labels", "lang", "label_source"])
     }
 
     fn work_class(&self) -> WorkClass {
@@ -3621,7 +4093,7 @@ impl GetRequest for Sample {
 
 impl GetRequest for Search {
     fn normalize_params(params: &Params) -> Params {
-        params.without_empty(&["role", "predicate", "limit"])
+        params.without_empty(&["role", "predicate", "limit", "lang", "label_source"])
     }
 
     fn work_class(&self) -> WorkClass {
@@ -3631,11 +4103,15 @@ impl GetRequest for Search {
 
 impl GetRequest for Terms {
     fn normalize_params(params: &Params) -> Params {
-        params.without_empty(&["prefix", "role", "count", "limit", "labels"])
-    }
-
-    fn labels_requested(&self) -> bool {
-        self.labels
+        params.without_empty(&[
+            "prefix",
+            "role",
+            "count",
+            "limit",
+            "labels",
+            "lang",
+            "label_source",
+        ])
     }
 
     // No `work_class`: every shape of this operation is ordinary. A page is
@@ -3665,8 +4141,9 @@ impl GetRequest for Terms {
 /// that 501 would send an agent to look for a bundle declaring the
 /// capability, where the identical request would fail again.
 ///
-/// The table gives `/fragment` and `/count` the same filters but no `labels` on
-/// a count, since it has no rows to label. `g` is not here any more: it is a
+/// The table gives `/fragment` and `/count` the same filters. `labels` is not
+/// here any more either: every operation that returns rows takes it, and on
+/// `/count`, which has none to label, it is not a parameter at all. `g` is a
 /// parameter of `/fragment` and `/count`, and whether *this release* can
 /// answer a given form of it is decided per bundle, by the routes.
 const NOT_OFFERED: &[(&str, Option<Capability>, &[&str])] = &[
@@ -3676,11 +4153,6 @@ const NOT_OFFERED: &[(&str, Option<Capability>, &[&str])] = &[
     ("o.gt", Some(Capability::Range), &[FRAGMENT, COUNT]),
     ("o.le", Some(Capability::Range), &[FRAGMENT, COUNT]),
     ("o.lt", Some(Capability::Range), &[FRAGMENT, COUNT]),
-    (
-        "labels",
-        Some(Capability::Labels),
-        &[FRAGMENT, DESCRIBE, SAMPLE],
-    ),
 ];
 
 const FRAGMENT: &str = "fragment";
@@ -3949,7 +4421,13 @@ mod tests {
     }
 
     fn fragment(query: &str) -> Result<Fragment, Problem> {
-        Fragment::parse(&params(query), limits(), &prefixes(), &bundle())
+        Fragment::parse(
+            &params(query),
+            limits(),
+            &prefixes(),
+            &PredicateRoles::default(),
+            &bundle(),
+        )
     }
 
     fn tpf(query: &str) -> Result<Tpf, Problem> {
@@ -3958,11 +4436,297 @@ mod tests {
 
     fn schema(query: &str) -> Result<Schema, Problem> {
         let params = Schema::normalize_params(&params(query));
-        Schema::parse(&params, limits(), &prefixes(), &bundle())
+        Schema::parse(
+            &params,
+            limits(),
+            &prefixes(),
+            &PredicateRoles::default(),
+            &bundle(),
+        )
     }
 
     fn binding_fragment(body: &[u8]) -> Result<BindingFragment, Problem> {
-        BindingFragment::parse(&params(""), body, limits(), &prefixes(), &bundle())
+        BindingFragment::parse(
+            &params(""),
+            body,
+            limits(),
+            &prefixes(),
+            &PredicateRoles::default(),
+            &bundle(),
+        )
+    }
+
+    fn problem_detail(problem: &Problem) -> String {
+        serde_json::to_value(problem).unwrap()["detail"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn ranges(labeling: &Labeling) -> Vec<&str> {
+        labeling
+            .languages
+            .ranges()
+            .iter()
+            .map(LanguageRange::as_str)
+            .collect()
+    }
+
+    #[test]
+    fn labels_take_a_language_preference_and_a_source_switch() {
+        let labels = fragment("labels=true&lang=fr,EN-gb,fr&label_source=true")
+            .unwrap()
+            .labels
+            .expect("labels were asked for");
+        assert_eq!(ranges(&labels), ["fr", "en-gb"], "folded, and kept once");
+        assert!(labels.source);
+
+        // Off unless asked for on a row operation, and with no preference
+        // and no sources unless those are asked for too.
+        assert!(fragment("").unwrap().labels.is_none());
+        let plain = fragment("labels=true").unwrap().labels.unwrap();
+        assert!(plain.languages.is_empty());
+        assert!(!plain.source);
+
+        // A parameter that shapes labels nobody asked for would change
+        // nothing, so it is refused rather than ignored.
+        for query in ["lang=en", "label_source=true", "labels=false&lang=en"] {
+            let refused = fragment(query).unwrap_err();
+            assert_eq!(refused.code(), ErrorCode::MalformedRequest, "{query}");
+            assert!(problem_detail(&refused).contains("labels=true"), "{query}");
+        }
+
+        for query in [
+            "labels=true&lang=en_GB",
+            "labels=true&lang=en,,fr",
+            "labels=true&lang=",
+            "labels=true&lang=en-",
+            "labels=true&label_source=yes",
+        ] {
+            assert_eq!(
+                fragment(query).unwrap_err().code(),
+                ErrorCode::MalformedRequest,
+                "{query}"
+            );
+        }
+        assert!(problem_detail(&fragment("labels=true&lang=en_GB").unwrap_err()).contains("en_GB"));
+
+        // `labels` may name the predicates to label with instead of the
+        // release's, in either term syntax, each kept once in its first place
+        // — and naming them turns labels on, so `lang` applies.
+        let named =
+            fragment("labels=ex:name,%3Chttp%3A%2F%2Fexample.org%2Flabel%3E%20ex:name&lang=en")
+                .unwrap()
+                .labels
+                .unwrap();
+        assert_eq!(
+            named.predicate_iris().collect::<Vec<_>>(),
+            ["http://example.org/name", "http://example.org/label"]
+        );
+        assert_eq!(ranges(&named), ["en"]);
+        // A predicate is an IRI, and a prefix must be declared.
+        for query in ["labels=_:b1", "labels=nope:name"] {
+            assert_eq!(
+                fragment(query).unwrap_err().code(),
+                ErrorCode::BadTermSyntax,
+                "{query}"
+            );
+        }
+        // A value that is neither form is malformed, and the error names both.
+        let neither = fragment("labels=yes").unwrap_err();
+        assert_eq!(neither.code(), ErrorCode::MalformedRequest);
+        assert!(problem_detail(&neither).contains("list of predicate IRIs"));
+        // The list is capped, as the cascade's cost is per predicate.
+        let over = (0..=CAPS.max_label_predicates)
+            .map(|index| format!("ex:p{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let refused = fragment(&format!("labels={over}")).unwrap_err();
+        assert_eq!(refused.code(), ErrorCode::CapExceeded);
+        assert!(problem_detail(&refused).contains("max_label_predicates"));
+
+        // The list is capped, and the cap is the published one.
+        let over = (0..=CAPS.max_label_languages)
+            .map(|index| format!("x{}", char::from(b'a' + (index % 26) as u8)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let refused = fragment(&format!("labels=true&lang={over}")).unwrap_err();
+        assert_eq!(refused.code(), ErrorCode::CapExceeded);
+        assert!(problem_detail(&refused).contains("max_label_languages"));
+
+        // Labels annotate a page without changing which rows it holds, so a
+        // cursor does not bind to them.
+        assert_eq!(
+            fragment("p=ex:knows&labels=true&lang=en&label_source=true")
+                .unwrap()
+                .binding,
+            fragment("p=ex:knows").unwrap().binding
+        );
+
+        // A count has no rows to label, and a dictionary count no page.
+        assert_eq!(
+            Count::parse(&params("lang=en"), limits(), &prefixes(), &bundle())
+                .unwrap_err()
+                .code(),
+            ErrorCode::MalformedRequest
+        );
+        for query in ["count=true&lang=en", "count=true&label_source=true"] {
+            let refused = Terms::parse(
+                &params(query),
+                limits(),
+                &prefixes(),
+                &PredicateRoles::default(),
+                &bundle(),
+            )
+            .unwrap_err();
+            assert!(
+                problem_detail(&refused).contains("describes a page"),
+                "{query}"
+            );
+        }
+
+        // `/search` and `/terms` label unless told not to, and take the same
+        // preference when they do.
+        let search = Search::parse(
+            &params("q=asthma&lang=en"),
+            limits(),
+            &prefixes(),
+            &PredicateRoles::default(),
+        )
+        .unwrap();
+        assert_eq!(ranges(&search.labels.unwrap()), ["en"]);
+        let terms = Terms::parse(
+            &params("lang=de&label_source=true"),
+            limits(),
+            &prefixes(),
+            &PredicateRoles::default(),
+            &bundle(),
+        )
+        .unwrap();
+        assert!(terms.labels.unwrap().source);
+        assert!(
+            Search::parse(
+                &params("q=asthma&labels=false&lang=en"),
+                limits(),
+                &prefixes(),
+                &PredicateRoles::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_body_takes_the_same_label_controls_as_a_query_string() {
+        let body = br#"{"pattern": {"s": "?s", "p": "ex:knows", "o": "?o"},
+            "bindings": {"vars": ["?s"], "rows": [["ex:alice"]]},
+            "labels": true, "lang": ["en-US", "*"], "label_source": true}"#;
+        let labels = binding_fragment(body).unwrap().labels.unwrap();
+        assert_eq!(ranges(&labels), ["en-us", "*"]);
+        assert!(labels.source);
+
+        let unlabelled = br#"{"pattern": {"s": "?s", "p": "ex:knows", "o": "?o"},
+            "bindings": {"vars": ["?s"], "rows": [["ex:alice"]]}}"#;
+        assert!(binding_fragment(unlabelled).unwrap().labels.is_none());
+
+        let shaped = br#"{"pattern": {"s": "?s", "p": "ex:knows", "o": "?o"},
+            "bindings": {"vars": ["?s"], "rows": [["ex:alice"]]}, "lang": ["en"]}"#;
+        assert!(problem_detail(&binding_fragment(shaped).unwrap_err()).contains("labels=true"));
+
+        let malformed = br#"{"pattern": {"s": "?s", "p": "ex:knows", "o": "?o"},
+            "bindings": {"vars": ["?s"], "rows": [["ex:alice"]]},
+            "labels": true, "lang": ["en", "not a range"]}"#;
+        assert!(problem_detail(&binding_fragment(malformed).unwrap_err()).contains("lang[1]"));
+
+        // A body's `labels` takes the same predicate list, as an array.
+        let named = br#"{"pattern": {"s": "?s", "p": "ex:knows", "o": "?o"},
+            "bindings": {"vars": ["?s"], "rows": [["ex:alice"]]},
+            "labels": ["ex:name", {"type": "iri", "value": "http://example.org/label"}]}"#;
+        assert_eq!(
+            binding_fragment(named)
+                .unwrap()
+                .labels
+                .unwrap()
+                .predicate_iris()
+                .collect::<Vec<_>>(),
+            ["http://example.org/name", "http://example.org/label"]
+        );
+        for (body, expected) in [
+            (
+                &br#"{"pattern": {"s": "?s", "p": "ex:knows", "o": "?o"},
+                    "bindings": {"vars": ["?s"], "rows": [["ex:alice"]]}, "labels": []}"#[..],
+                "lists no predicates",
+            ),
+            (
+                &br#"{"pattern": {"s": "?s", "p": "ex:knows", "o": "?o"},
+                    "bindings": {"vars": ["?s"], "rows": [["ex:alice"]]}, "labels": "yes"}"#[..],
+                "an array of predicate IRIs",
+            ),
+            (
+                &br#"{"pattern": {"s": "?s", "p": "ex:knows", "o": "?o"},
+                    "bindings": {"vars": ["?s"], "rows": [["ex:alice"]]}, "labels": ["\"x\""]}"#[..],
+                "labels[0]",
+            ),
+        ] {
+            let refused = binding_fragment(body).unwrap_err();
+            assert!(problem_detail(&refused).contains(expected), "{refused:?}");
+        }
+
+        let labels = |body: &[u8]| {
+            Labels::parse(
+                &params(""),
+                body,
+                limits(),
+                &prefixes(),
+                &PredicateRoles::default(),
+            )
+        };
+        let batch =
+            labels(br#"{"iris": ["ex:a"], "lang": ["fr", "en"], "label_source": true}"#).unwrap();
+        assert_eq!(ranges(&batch.labeling), ["fr", "en"]);
+        assert!(batch.labeling.source);
+        let bare = labels(br#"{"iris": ["ex:a"]}"#).unwrap();
+        assert!(bare.labeling.languages.is_empty());
+        assert!(!bare.labeling.source);
+        assert!(labels(br#"{"iris": ["ex:a"], "langs": ["fr"]}"#).is_err());
+        let named = labels(br#"{"iris": ["ex:a"], "labels": ["ex:name"]}"#).unwrap();
+        assert_eq!(
+            named.labeling.predicate_iris().collect::<Vec<_>>(),
+            ["http://example.org/name"]
+        );
+        assert!(labels(br#"{"iris": ["ex:a"], "labels": true}"#).is_ok());
+        assert!(
+            problem_detail(&labels(br#"{"iris": ["ex:a"], "labels": false}"#).unwrap_err())
+                .contains("always resolves labels")
+        );
+    }
+
+    #[test]
+    fn rdf_carries_labels_only_over_the_union() {
+        let union = fragment("labels=true").unwrap();
+        let named = fragment("labels=true&g=ex:g1").unwrap();
+        for representation in [Representation::Json, Representation::Html] {
+            assert!(union.representable(representation).is_ok());
+            assert!(named.representable(representation).is_ok());
+        }
+        for rdf in [
+            Representation::Turtle,
+            Representation::NQuads,
+            Representation::TriG,
+            Representation::JsonLd,
+        ] {
+            assert!(union.representable(rdf).is_ok(), "{rdf:?}");
+            assert_eq!(
+                named.representable(rdf).unwrap_err().code(),
+                ErrorCode::NotAcceptable,
+                "{rdf:?}"
+            );
+        }
+        assert!(
+            fragment("g=ex:g1")
+                .unwrap()
+                .representable(Representation::NQuads)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3980,9 +4744,14 @@ mod tests {
             WorkClass::Heavy
         );
         assert_eq!(
-            Sample::parse(&params("n=1000"), limits(), &prefixes())
-                .unwrap()
-                .work_class(),
+            Sample::parse(
+                &params("n=1000"),
+                limits(),
+                &prefixes(),
+                &PredicateRoles::default()
+            )
+            .unwrap()
+            .work_class(),
             WorkClass::Heavy
         );
         assert_eq!(
@@ -4010,6 +4779,7 @@ mod tests {
             let request = Terms::parse(
                 &Terms::normalize_params(&params(query)),
                 limits(),
+                &prefixes(),
                 &PredicateRoles::default(),
                 &bundle(),
             )
@@ -4360,16 +5130,13 @@ mod tests {
         // fine, the server is not. (`g=` used to be the sharpest case here;
         // it is now a parameter of these operations, and whether one release
         // can answer a given form of it is the route's decision.)
-        for (query, expected) in [("o.ge=%2242%22", "range"), ("labels=true", "labels")] {
-            let refused = fragment(query).unwrap_err();
-            assert_eq!(refused.code(), ErrorCode::CapabilityNotAvailable, "{query}");
-            assert_eq!(refused.status(), 501);
-            let detail = serde_json::to_value(&refused).unwrap();
-            assert!(
-                detail["detail"].as_str().unwrap().contains(expected),
-                "{query} must name the capability it needs: {detail}"
-            );
-        }
+        let refused = fragment("o.ge=%2242%22").unwrap_err();
+        assert_eq!(refused.code(), ErrorCode::CapabilityNotAvailable);
+        assert_eq!(refused.status(), 501);
+        assert!(
+            problem_detail(&refused).contains("range"),
+            "a filter must name the capability it needs: {refused:?}"
+        );
 
         // A filter with no capability behind it is still refused, and says so
         // without inventing one.
@@ -4419,24 +5186,31 @@ mod tests {
         assert_eq!(union.binding, fragment("").unwrap().binding);
         assert_ne!(parsed.binding, fragment("").unwrap().binding);
         assert_eq!(
-            Sample::parse(&params(scoped), limits(), &prefixes())
-                .unwrap_err()
-                .code(),
+            Sample::parse(
+                &params(scoped),
+                limits(),
+                &prefixes(),
+                &PredicateRoles::default()
+            )
+            .unwrap_err()
+            .code(),
             ErrorCode::MalformedRequest,
             "sample defines no graph scoping, so `g` is simply not its parameter"
         );
 
         // `labels` runs the other way: it applies to responses
         // that carry rows, so a count does not take one.
-        assert_eq!(
-            fragment("labels=true").unwrap_err().code(),
-            ErrorCode::CapabilityNotAvailable
-        );
-        assert_eq!(
-            Sample::parse(&params("labels=true"), limits(), &prefixes())
-                .unwrap_err()
-                .code(),
-            ErrorCode::CapabilityNotAvailable
+        assert!(fragment("labels=true").unwrap().labels.is_some());
+        assert!(
+            Sample::parse(
+                &params("labels=true"),
+                limits(),
+                &prefixes(),
+                &PredicateRoles::default()
+            )
+            .unwrap()
+            .labels
+            .is_some()
         );
         assert_eq!(
             Count::parse(&params("labels=true"), limits(), &prefixes(), &bundle())
@@ -4456,6 +5230,7 @@ mod tests {
                 &params("iri=ex:a&o.text=atrazine"),
                 limits(),
                 &prefixes(),
+                &PredicateRoles::default(),
                 &bundle()
             )
             .unwrap_err()
@@ -4937,8 +5712,14 @@ mod tests {
     #[test]
     fn a_term_over_the_published_budget_is_refused() {
         let huge = format!("o=%22{}%22", "x".repeat(70_000));
-        let refused =
-            Fragment::parse(&params(&huge), limits(), &prefixes(), &bundle()).unwrap_err();
+        let refused = Fragment::parse(
+            &params(&huge),
+            limits(),
+            &prefixes(),
+            &PredicateRoles::default(),
+            &bundle(),
+        )
+        .unwrap_err();
         assert_eq!(refused.code(), ErrorCode::CapExceeded);
         assert!(
             serde_json::to_value(&refused).unwrap()["detail"]
@@ -4950,7 +5731,15 @@ mod tests {
 
     #[test]
     fn describe_needs_a_resource_and_takes_three_directions() {
-        let parse = |query: &str| Describe::parse(&params(query), limits(), &prefixes(), &bundle());
+        let parse = |query: &str| {
+            Describe::parse(
+                &params(query),
+                limits(),
+                &prefixes(),
+                &PredicateRoles::default(),
+                &bundle(),
+            )
+        };
 
         assert_eq!(parse("iri=ex:a").unwrap().direction, Direction::Both);
         assert_eq!(
@@ -4986,7 +5775,14 @@ mod tests {
 
     #[test]
     fn a_sample_is_deterministic_by_default() {
-        let parse = |query: &str| Sample::parse(&params(query), limits(), &prefixes());
+        let parse = |query: &str| {
+            Sample::parse(
+                &params(query),
+                limits(),
+                &prefixes(),
+                &PredicateRoles::default(),
+            )
+        };
 
         let bare = parse("").unwrap();
         assert_eq!(bare.seed, 0, "an omitted seed is fixed, not random");
