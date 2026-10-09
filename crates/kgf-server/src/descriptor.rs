@@ -119,6 +119,8 @@ pub struct ReleaseLinks {
     #[serde(skip_serializing_if = "Option::is_none")]
     labels: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    verbalize: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     graphs: Option<String>,
     /// The whole dataset as standard HDT, resumable by byte range.
     hdt: String,
@@ -256,6 +258,7 @@ impl Resource for ServiceDescriptor<'_> {
                             ("max_search_predicates", Value::Number(u64::from(self.caps.max_search_predicates))),
                             ("max_search_results", Value::Number(u64::from(self.caps.max_search_results))),
                             ("max_label_iris", Value::Number(u64::from(self.caps.max_label_iris))),
+                            ("max_verbalize_roots", Value::Number(u64::from(self.caps.max_verbalize_roots))),
                             ("max_schema_items", Value::Number(u64::from(self.caps.max_schema_items))),
                         ]))
                         h2 { "Response budgets" }
@@ -494,6 +497,7 @@ fn release_links(
             .then(|| operation("search")),
         terms: Some(operation("terms")),
         labels: Some(operation("labels")),
+        verbalize: Some(operation("verbalize")),
         graphs: release
             .declares(Capability::Graphs)
             .then(|| operation("graphs")),
@@ -830,6 +834,7 @@ fn operations(
         operations.push(("graphs", "limit, cursor", true));
     }
     operations.push(("labels", "QUERY/POST JSON body: iris", false));
+    operations.push(("verbalize", "config, target, iri, n, seed, plan", true));
     operations
         .into_iter()
         .map(|(operation, parameters, browsable)| {

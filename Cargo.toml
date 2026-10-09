@@ -11,6 +11,7 @@ repository = "https://github.com/frink-okn/kgf-rs"
 
 [workspace.dependencies]
 kgf-store = { path = "crates/kgf-store" }
+kgf-verbalize = { path = "crates/kgf-verbalize" }
 kgf-server = { path = "crates/kgf-server" }
 
 # hdtc owns every byte format a bundle contains; `hdtc::format` is the curated

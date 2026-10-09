@@ -783,7 +783,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hdtc"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
@@ -1078,6 +1078,7 @@ dependencies = [
  "hdtc",
  "kgf-server",
  "kgf-store",
+ "kgf-verbalize",
  "oxiri",
  "oxrdf",
  "oxrdfio",
@@ -1109,6 +1110,7 @@ dependencies = [
  "http-body",
  "jiff",
  "kgf-store",
+ "kgf-verbalize",
  "maud",
  "mediatype 0.21.0",
  "mediatype 0.23.0",
@@ -1118,6 +1120,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
+ "serde_norway",
  "sha2",
  "spargebra",
  "thiserror",
@@ -1141,6 +1144,19 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "kgf-verbalize"
+version = "0.3.0"
+dependencies = [
+ "hdtc",
+ "kgf-store",
+ "oxiri",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
