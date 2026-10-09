@@ -2628,16 +2628,19 @@ protocol-level document: a capability there says any server honouring doc 03 ans
 for this bundle, which is not true of an operation doc 03 does not define. The service
 descriptor links the route on every release, as what this deployment routes.
 
-**The command.** `kgf verbalize <bundle> --config --output` writes one JSON line per
-distinct text — identical texts from several roots are one record naming them all,
-keeping its `max_iris_per_record` smallest IRIs and a count. It opens the bundle as
-`kgf manifest` does, asserting publication for an operator-named directory, and refuses
-an `--output` inside the bundle before mapping anything, since the one file it writes
-must not be a mapped one. Memory is unbounded across a run — the term and label caches
-never evict and the grouper holds every distinct text — which is fine at thousands of
-roots and not at doc 13's 10⁶–10⁸; streaming output and bounded caches are a later
-unit, together with the record shape the embedding stage will want (every root with its
-text digest, the distinct texts keyed by digest), once the vectors split is settled.
+**The command, and its two streams.** `kgf verbalize <bundle> --config --roots --texts`
+writes one JSON line per root — its IRI, its target, and the hex SHA-256 of its text —
+and one per distinct text under that digest, the first time the digest is seen. The
+digest is the key between the stages: the model embeds the texts, each distinct text
+once however many roots share it, and returns vectors keyed by digest; the index stage
+joins the roots to them through it. The first shape, one record per text keeping ten of
+its roots' IRIs and a count, was a search payload rather than a pipeline file — a root
+past the ten could never be given its vector, and there was no key to match vectors
+back by. Both streams are written as the walk goes, a class is walked by position a
+page at a time, and each cache is emptied when it reaches `MAX_CACHE_ENTRIES`, so a run
+retains the set of digests and nothing else that grows with the output. The command
+opens the bundle as `kgf manifest` does, asserting publication for an operator-named
+directory, and refuses an output inside the bundle before mapping anything.
 
 **What the schema pages needed.** Authoring a config starts from two signals per
 (class, predicate): coverage — how many of a class's members carry the predicate — and
@@ -2655,7 +2658,8 @@ IRIs, the cycle and depth bounds, and the command's refusals — and over a list
 `verbalize_survives_a_profile_template_over_a_cycle`, and
 `verbalize_charges_every_read_to_one_candidate_budget`. On the SOCKG release (27 M
 triples, 1,237 roots over eleven targets) the texts were byte-identical to the Python
-implementation this ports, in 0.28 s against 21.5 s.
+implementation this ports — 1,215 distinct texts, every root joined to the same text —
+in 0.3 s and 38 MB against 22 s and 1.1 GB.
 
 ## Testing spine
 
