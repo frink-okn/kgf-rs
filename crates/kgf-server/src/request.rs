@@ -862,7 +862,7 @@ impl Verbalize {
             params.get("target").map(str::to_owned),
             iris,
             n,
-            seed(params)?,
+            params.get("seed").map(|_| seed(params)).transpose()?,
             boolean(params, "plan", false)?,
             limits,
             profile,
@@ -908,7 +908,7 @@ impl Verbalize {
             wire.target,
             iris,
             wire.n,
-            wire.seed.unwrap_or(0),
+            wire.seed,
             wire.plan.unwrap_or(false),
             limits,
             profile,
@@ -923,7 +923,7 @@ impl Verbalize {
         target: Option<String>,
         iris: Vec<BoundTerm>,
         n: Option<u32>,
-        seed: u64,
+        seed: Option<u64>,
         plan: bool,
         limits: Limits<'_>,
         profile: &PredicateRoles,
@@ -958,7 +958,7 @@ impl Verbalize {
         let cap = limits.caps.max_verbalize_roots;
 
         let (mode, target, n) = if !iris.is_empty() {
-            if plan || n.is_some() {
+            if plan || n.is_some() || seed.is_some() {
                 return Err(Problem::new(
                     ErrorCode::MalformedRequest,
                     "iri names the roots to render, so n, seed and plan do not apply; send one or the other",
@@ -984,9 +984,21 @@ impl Verbalize {
             } else {
                 names.len() as u32
             };
-            // An explicit n is held to the cap; the default fits under it, so
-            // a bare config is always answerable, with fewer roots per target
-            // when the config declares many.
+            // A plan renders at least one root per target, so a config
+            // declaring more targets than the cap has no n that fits and is
+            // refused like any other request over a cap. Under that, an
+            // explicit n is held to the cap and the default shrinks to fit,
+            // so a bare config is answerable with fewer roots per target
+            // when it declares many.
+            if selected > cap {
+                return Err(Problem::new(
+                    ErrorCode::CapExceeded,
+                    format!(
+                        "a plan of {selected} targets would render at least {selected} roots, \
+                         over this server's max_verbalize_roots of {cap}; name one target"
+                    ),
+                ));
+            }
             let n = match n {
                 Some(n) if n.saturating_mul(selected) > cap => {
                     return Err(Problem::new(
@@ -999,7 +1011,7 @@ impl Verbalize {
                     ));
                 }
                 Some(n) => n,
-                None => VERBALIZE_DEFAULT_N.min(cap / selected.max(1)).max(1),
+                None => VERBALIZE_DEFAULT_N.min(cap / selected.max(1)),
             };
             (VerbalizeMode::Plan, target, n)
         } else {
@@ -1015,7 +1027,7 @@ impl Verbalize {
             mode,
             target,
             n,
-            seed,
+            seed: seed.unwrap_or(0),
             label_predicates: profile
                 .get("label")
                 .map(<[String]>::to_vec)

@@ -4887,6 +4887,31 @@ fn verbalize_refuses_what_it_cannot_answer_by_name() {
         ("target", "site"),
     ]));
     within.assert_status(200);
+    // More targets than the cap: no n fits, so a bare config is refused too,
+    // rather than rendering one root per target past the cap.
+    let many = server.get(&verbalize_url(&[(
+        "config",
+        r#"{"targets": {"a": {"type": "http://example.org/A"}, "b": {"type": "http://example.org/B"},
+                        "c": {"type": "http://example.org/C"}, "d": {"type": "http://example.org/D"}}}"#,
+    )]));
+    many.assert_status(400);
+    assert_eq!(many.json()["code"], "cap_exceeded");
+    assert!(
+        many.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("name one target")
+    );
+
+    // A seed alongside iri is refused rather than silently ignored.
+    let seeded = server.get(&verbalize_url(&[
+        ("config", VERBALIZE_CONFIG),
+        ("target", "site"),
+        ("iri", "ex:site1"),
+        ("seed", "7"),
+    ]));
+    seeded.assert_status(400);
+    assert!(seeded.json()["detail"].as_str().unwrap().contains("seed"));
 
     // A config naming what the bundle lacks is answered, and told.
     let unknown = server.get(&verbalize_url(&[(
