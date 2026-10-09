@@ -1,14 +1,14 @@
 //! `kgf verbalize`: write the texts a bundle's roots would be embedded from.
 //!
-//! The command form of the verbalizer in `kgf-server`: a bundle directory and
-//! a config in, one JSON line per distinct text out, ready for the embedding
-//! stage. It exists for two callers. The build pipeline will run it as a
+//! The command form of `kgf-verbalize`: a bundle directory and a config in,
+//! one JSON line per distinct text out, ready for the embedding stage. It exists for two callers. The build pipeline will run it as a
 //! stage; until then, and for anyone with a bundle on disk, it is the way to
 //! run a config end to end and read what it produces.
 //!
 //! The bundle is opened the way `kgf manifest` opens one: this crate asserts
 //! the publication invariant for a directory the operator named, holds the
-//! mappings for the run, and writes nothing into it.
+//! mappings for the run, and writes nothing into it — an `--output` inside
+//! the bundle is refused before anything is mapped.
 
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
@@ -63,6 +63,7 @@ pub fn run(args: Args) -> Result<()> {
         .resolve()
         .context("resolving the verbalization config")?;
 
+    refuse_output_inside(&args.bundle, &args.output)?;
     let opened = open_bundle(&args.bundle)?;
     let manifest = Manifest::read(&args.bundle)
         .with_context(|| format!("reading the manifest of {}", args.bundle.display()))?;
@@ -151,8 +152,11 @@ fn select_targets(bound: &Bound, names: &[String]) -> Result<Vec<(usize, String)
         .iter()
         .map(|(index, name)| (name.as_str(), *index))
         .collect();
-    let mut selected = Vec::with_capacity(names.len());
+    let mut selected: Vec<(usize, String)> = Vec::with_capacity(names.len());
     for name in names {
+        if selected.iter().any(|(_, chosen)| chosen == name) {
+            bail!("--target {name:?} is given twice");
+        }
         let Some(index) = by_name.get(name.as_str()) else {
             bail!(
                 "no target named {name:?}; the config declares {}",
@@ -195,6 +199,36 @@ struct Opened {
     store: Store,
 }
 
+/// Refuse an `--output` under the bundle directory.
+///
+/// The bundle is about to be mapped on the promise that nothing writes into
+/// it; the one file this command writes must therefore lie elsewhere. Both
+/// paths are canonicalized so that a symlink or a `..` cannot slip the output
+/// inside. The output's directory must already exist for its path to have a
+/// canonical form, which `File::create` would require anyway.
+fn refuse_output_inside(bundle: &Path, output: &Path) -> Result<()> {
+    let bundle = bundle
+        .canonicalize()
+        .with_context(|| format!("resolving the bundle {}", bundle.display()))?;
+    let parent = match output.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let parent = parent
+        .canonicalize()
+        .with_context(|| format!("resolving the output directory {}", parent.display()))?;
+    let Some(name) = output.file_name() else {
+        bail!("--output {} names no file", output.display());
+    };
+    ensure!(
+        !parent.join(name).starts_with(&bundle),
+        "--output {} is inside the bundle {}, whose files are published and never written",
+        output.display(),
+        bundle.display()
+    );
+    Ok(())
+}
+
 /// Open the bundle the operator named.
 ///
 /// # Safety obligation
@@ -202,7 +236,9 @@ struct Opened {
 /// [`PublishedBundle::new`](kgf_store::PublishedBundle::new) requires that the
 /// artifacts not be modified or truncated while mapped. This command holds the
 /// mappings for one run over a directory the operator named as published, and
-/// writes only to `--output`, which it refuses to place inside the bundle.
+/// the only file it writes is `--output`, which [`refuse_output_inside`] has
+/// already placed outside the bundle. What has to hold, as for `kgf manifest`,
+/// is that nothing *else* rewrites a published version while it runs.
 #[allow(unsafe_code)]
 fn open_bundle(dir: &Path) -> Result<Opened> {
     ensure!(dir.is_dir(), "{} is not a bundle directory", dir.display());

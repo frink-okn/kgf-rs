@@ -56,6 +56,16 @@ impl Published {
             .expect("open the bundle");
         Self { _root: root, store }
     }
+
+    /// The bundle version directory.
+    fn bundle(&self) -> std::path::PathBuf {
+        self._root.path().join(DATASET).join(VERSION)
+    }
+
+    /// A path beside the bundle, outside it.
+    fn beside(&self, name: &str) -> std::path::PathBuf {
+        self._root.path().join(name)
+    }
 }
 
 fn parse_config(json: &str) -> Config {
@@ -547,4 +557,72 @@ fn a_root_with_both_takes_its_target_template_and_a_mention_its_profile() {
         ),
         "{records:#?}"
     );
+}
+
+#[test]
+fn the_command_refuses_to_write_into_the_bundle_or_run_a_target_twice() {
+    let published = Published::build(&graph(&[
+        ("a", RDF_TYPE, "Thing"),
+        ("a", RDFS_LABEL, "\"A\""),
+    ]));
+    let config = published.beside("config.json");
+    std::fs::write(
+        &config,
+        r#"{"targets": {"thing": {"type": "http://example.com/Thing"}}}"#,
+    )
+    .unwrap();
+    let kgf = |args: &[&str]| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_kgf"))
+            .arg("verbalize")
+            .arg(published.bundle())
+            .arg("--config")
+            .arg(&config)
+            .args(args)
+            .output()
+            .expect("run kgf");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+
+    // The bundle is mapped on the promise that nothing writes into it, so
+    // the one file this command writes may not land there — by a plain path
+    // or by one that only gets there through `..`.
+    let inside = published.bundle().join("data.hdt");
+    let (ok, stderr) = kgf(&["--output", inside.to_str().unwrap()]);
+    assert!(!ok);
+    assert!(stderr.contains("inside the bundle"), "{stderr}");
+    let dotted = published
+        .beside("elsewhere")
+        .join("..")
+        .join(DATASET)
+        .join(VERSION)
+        .join("records.jsonl");
+    std::fs::create_dir(published.beside("elsewhere")).unwrap();
+    let (ok, stderr) = kgf(&["--output", dotted.to_str().unwrap()]);
+    assert!(!ok);
+    assert!(stderr.contains("inside the bundle"), "{stderr}");
+    assert!(
+        std::fs::read(&inside).is_ok(),
+        "the artifact was not truncated"
+    );
+
+    let out = published.beside("records.jsonl");
+    let (ok, stderr) = kgf(&[
+        "--output",
+        out.to_str().unwrap(),
+        "--target",
+        "thing",
+        "--target",
+        "thing",
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("given twice"), "{stderr}");
+
+    let (ok, stderr) = kgf(&["--output", out.to_str().unwrap(), "--target", "thing"]);
+    assert!(ok, "{stderr}");
+    let written = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(written.lines().count(), 1);
+    assert!(written.contains("\"label\":\"A\""), "{written}");
 }
