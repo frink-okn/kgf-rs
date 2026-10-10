@@ -56,21 +56,63 @@ pub const BUNDLE_FORMAT: &str = "1";
 /// The HDT format version bundles carry.
 pub const HDT_FORMAT: &str = "1.0";
 
-/// Federation fallback for the role used to name an entity.
+/// Federation fallbacks for the roles every consumer may assume the meaning
+/// of: `label`, the predicates that name an entity, strongest first, and
+/// `synonym`, the predicates that name it otherwise, which role-scoped search
+/// widens to.
+///
+/// A synonym of any kind is a search target and never a label: a related,
+/// narrower or broader synonym names a different thing, and even an exact one
+/// would compete with the label on language rather than stand behind it.
 ///
 /// Full IRIs rather than CURIEs: this is semantic configuration, while prefix
 /// names are presentation aliases that may differ between releases.
 pub fn default_predicate_roles() -> BTreeMap<String, Vec<String>> {
-    BTreeMap::from([(
-        "label".to_owned(),
-        vec![
-            "http://www.w3.org/2004/02/skos/core#prefLabel".to_owned(),
-            "http://www.w3.org/2000/01/rdf-schema#label".to_owned(),
-            "https://schema.org/name".to_owned(),
-            "http://purl.org/dc/terms/title".to_owned(),
-            "http://xmlns.com/foaf/0.1/name".to_owned(),
-        ],
-    )])
+    const OBO_IN_OWL: &str = "http://www.geneontology.org/formats/oboInOwl#";
+    BTreeMap::from([
+        (
+            "label".to_owned(),
+            vec![
+                "http://www.w3.org/2004/02/skos/core#prefLabel".to_owned(),
+                "http://www.w3.org/2000/01/rdf-schema#label".to_owned(),
+                "https://schema.org/name".to_owned(),
+                "http://purl.org/dc/terms/title".to_owned(),
+                "http://xmlns.com/foaf/0.1/name".to_owned(),
+            ],
+        ),
+        (
+            "synonym".to_owned(),
+            vec![
+                "http://www.w3.org/2004/02/skos/core#altLabel".to_owned(),
+                format!("{OBO_IN_OWL}hasExactSynonym"),
+                "https://schema.org/alternateName".to_owned(),
+                format!("{OBO_IN_OWL}hasRelatedSynonym"),
+                format!("{OBO_IN_OWL}hasNarrowSynonym"),
+                format!("{OBO_IN_OWL}hasBroadSynonym"),
+            ],
+        ),
+    ])
+}
+
+/// The roles a release resolves with: each role it declares, and the
+/// federation default for each one it does not.
+///
+/// A declared role replaces the default of the same name entirely rather than
+/// extending it, so a publisher can narrow a role as well as widen it; a role
+/// the publisher left out is never absent. Applying this to a profile that has
+/// already been through it changes nothing, so a manifest can record the
+/// result and a reader can apply it again to a manifest written before a
+/// default existed.
+pub fn effective_predicate_roles(
+    declared: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut roles = default_predicate_roles();
+    roles.extend(
+        declared
+            .iter()
+            .map(|(role, predicates)| (role.clone(), predicates.clone())),
+    );
+    roles
 }
 
 /// Validate one full IRI stored in a predicate-role profile.
@@ -1384,6 +1426,42 @@ mod tests {
         CLASS_PROPERTIES_HEADER, CLASS_RELATIONS_HEADER, Fixture, SCHEMA_NODES_HEADER, TINY_NQ,
         TINY_NT, published_bundle,
     };
+
+    #[test]
+    fn declared_roles_replace_their_defaults_and_the_rest_are_filled() {
+        let defaults = default_predicate_roles();
+        for (role, predicates) in &defaults {
+            for iri in predicates {
+                validate_predicate_role_iri(iri, &BTreeMap::new())
+                    .unwrap_or_else(|detail| panic!("default {role} {iri}: {detail}"));
+            }
+        }
+        // No synonym is a label fallback: the two roles share no predicate.
+        assert!(
+            defaults["synonym"]
+                .iter()
+                .all(|synonym| !defaults["label"].contains(synonym))
+        );
+
+        assert_eq!(effective_predicate_roles(&BTreeMap::new()), defaults);
+        let declared = BTreeMap::from([
+            (
+                "label".to_owned(),
+                vec!["http://example.org/name".to_owned()],
+            ),
+            (
+                "identifier".to_owned(),
+                vec!["http://example.org/id".to_owned()],
+            ),
+        ]);
+        let effective = effective_predicate_roles(&declared);
+        assert_eq!(effective["label"], ["http://example.org/name"]);
+        assert_eq!(effective["identifier"], ["http://example.org/id"]);
+        assert_eq!(effective["synonym"], defaults["synonym"]);
+        // Idempotent, so a manifest can record the result and a reader can
+        // apply it again.
+        assert_eq!(effective_predicate_roles(&effective), effective);
+    }
 
     #[test]
     fn predicate_role_iris_are_full_and_not_declared_curies() {

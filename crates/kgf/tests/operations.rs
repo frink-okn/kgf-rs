@@ -1817,6 +1817,23 @@ fn labels_preserve_input_order_and_search_returns_one_entity_with_evidence() {
     assert!(alice.get("label").is_none());
     assert_eq!(alice["match"]["predicate"], "http://example.org/name");
     assert_eq!(alice["match"]["literal"], "Alice");
+    // The hit says which of the release's roles its predicate plays, here the
+    // label role the fixture declares.
+    assert_eq!(alice["match"]["roles"], serde_json::json!(["label"]));
+
+    // `synonym` is a role every release has — this one declares only `label`,
+    // and the federation default fills it in — so scoping to it answers
+    // rather than refusing, with nothing here to find.
+    let synonyms = served.search(&store, "q=Alice&role=synonym&limit=20");
+    assert_eq!(synonyms["roles"], serde_json::json!(["synonym"]));
+    assert!(synonyms["results"].as_array().unwrap().is_empty());
+    // A literal no role covers says so with an empty list.
+    let note = served.search(&store, "q=blank+subject&limit=20");
+    assert_eq!(
+        note["results"][0]["match"]["predicate"],
+        "http://example.org/note"
+    );
+    assert_eq!(note["results"][0]["match"]["roles"], serde_json::json!([]));
 
     // A role is query-time sugar for its profile predicates. Label hydration
     // uses that same release profile but remains independently switchable.

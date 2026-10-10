@@ -17,8 +17,9 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–29 and 33 are complete: all of M1 plus `o.text`, bindings, entity search,
-live labels — language first, on every operation that returns IRIs — the browser workbench, the mandatory description surface, standard RDF
+Units 1–29, 33 and 34 are complete: all of M1 plus `o.text`, bindings, entity search,
+live labels — language first, on every operation that returns IRIs — role defaults
+filled one role at a time, the browser workbench, the mandatory description surface, standard RDF
 serialization, stock Comunica TPF/brTPF interoperability, the bundle builder,
 structured request logging, public-base mounting, the dedicated `/tpf` route, an
 admission policy measured against the work it classes, the sorted dictionary as an
@@ -1116,7 +1117,8 @@ older design: mutable authoring metadata may inform the next publication, but an
 immutable version URL cannot let `role=label` change meaning. Prefixes and roles
 therefore participate in the release binding used by ETags and cursors even though the
 artifact `content_digest` remains the release-history checksum. New manifests receive
-the federation label defaults unless the publisher supplies a profile.
+the federation label defaults unless the publisher supplies a profile. *(Unit 34: defaults
+now fill each role a publisher leaves undeclared, and `synonym` has one.)*
 
 No new sidecar was added. The live algorithms have explicit caps
 (`max_search_predicates`, `max_search_results`, `max_label_iris`) and budgets, so the
@@ -2657,7 +2659,8 @@ an array in a body — in place of the release's role for that one request, capp
 had — `labels: {IRI: string|null}` over every IRI the response carries: the pattern's
 bound positions or the described resource, and every IRI in a row, graph column included,
 a blank node under its scoped IRI and no literal — plus `label_sources` beside it when
-asked. The map is left out for a release with no `label` role (question 92). An RDF page
+asked. The map is left out for a release with no `label` role (question 92). *(Unit 34
+made that case impossible: every release now has one.)* An RDF page
 carries each label as the statement it came from, beside its own, deduplicated against
 them and computed per prefix so that RDF byte fitting keeps exactly the labels of the rows
 it keeps; a page scoped to a graph, or in the quad view, is refused in RDF (406), because
@@ -2707,6 +2710,48 @@ whole document whose every page labels exactly its own rows; and socket tests of
 modifier on every route and method, the predicate override in a query string and a
 body, RDF labels and the 406 for a scoped page, the HTML rendering, `QUERY /labels` with
 `lang` and `label_source`, and `/search?lang=`.
+
+### 34. Role defaults one role at a time, and a default `synonym` ✅
+
+Roles were already open-ended: `/search?role=synonym` expanded any role a release
+declared, and nothing else read one but `label`. What was missing was a default.
+Defaults were all-or-nothing — a manifest declaring any role got none of the federation
+defaults — so a release declaring only `synonym` silently had no labels, and a release
+declaring only `label` refused `role=synonym`. Ubergraph v0.0.2 is the second case, and
+put `oboInOwl:hasExactSynonym` in its `label` role to make entity search reach synonyms.
+
+That workaround is the reason for the change as much as the defaults are. Under unit 33's
+cascade a predicate's place in `label` breaks ties only within a language rank, so a
+synonym in the role competes with the primary label on language and wins whenever its
+tagging fits the request better. Sampling Ubergraph on 2026-10-09 found both directions:
+`WBPhenotype_0002623`'s label is tagged `@en` and an untagged exact synonym would replace
+it when no `lang` is sent, and `ENVO_00000484`'s untagged label "polynya" would lose to
+the exact synonym `"Polyn'ya"@en` under `lang=en`. Its next release should declare
+`label: [rdfs:label, skos:prefLabel]` and leave synonyms to `synonym`, which the default
+now covers; `role=label,synonym` is the entity search.
+
+**What landed.** `kgf_store::manifest::effective_predicate_roles` is the federation
+defaults overlaid by the declared roles, a declared role replacing its default whole. `kgf
+manifest` and `kgf build` record its result in every new manifest, so a consumer reading
+manifests without a server sees every role that applies; the server applies it again
+when reading, which changes nothing for a new manifest and fills a role a manifest
+written earlier lacks; the manifest page shows the effective profile. The `synonym`
+default is `skos:altLabel`, `oboInOwl:hasExactSynonym`, `schema:alternateName`, and
+`oboInOwl:hasRelatedSynonym`, `…Narrow…` and `…Broad…` — every kind, since a search
+wants them all and returns the predicate that matched — and it shares no predicate with
+the `label` default: a synonym of any kind is a search target, never a label. Every
+release now has a `label` role, so unit 33's branch for one without is gone (question
+92). A search hit's `match` carries `roles`, the release roles naming its predicate, for
+one lookup per hit (question 95).
+
+*Verified by* a store test that every default is a valid role IRI, that the two defaults
+are disjoint, and that the overlay replaces, fills and is idempotent; manifest tests that
+a synonym-only declaration keeps the default `label` and that a carried-forward profile
+gains a new default; a socket test that a synonym-only release serves the default label
+role in its descriptor, records it in its manifest, and labels `/schema`; and search
+tests of `match.roles` for a role-member predicate and for one in no role, and of
+`role=synonym` on a release that declares only `label`; the exact-size oracle covers
+`roles`.
 
 ## Testing spine
 
@@ -3809,14 +3854,26 @@ following the code.
     versioned answer's meaning. The spec gives it no body form; this implementation
     makes a body's `labels` `true`, `false`, or an array of predicates, on `QUERY
     /fragment` and on the `/labels` batch alike, so one key means one thing everywhere.
-92. **A release with no `label` role answers `labels=true` two ways.** A response-level
-    map is left out, as `/schema` already did: a null says the cascade looked and found
-    nothing, and there is no cascade to look with. A row-level `label` (`/labels`,
-    `/search`, `/terms`) has always been `null` in that case instead. The difference
-    predates unit 33, which kept it; the spec should pick one.
+92. **Resolved (unit 34): every release has a `label` role.** Unit 33 left a
+    response-level map out for a release declaring no `label` role, while a row-level
+    `label` was `null`. Defaults now fill role by role, so the case cannot arise and the
+    special case is gone.
 93. **§3.4.1 lists `labels` as requiring `search`, and §3.4.12's heading says the same.**
     Labels compose the core permutations every bundle carries, so this implementation
     never gates them (rule 8 in `CLAUDE.md`). Both should read `—`.
+94. **Role defaults should fill role by role, and `synonym` should have one.** Doc 19
+    §19.1 says a dataset that declares no roles gets the federation label cascade and no
+    field filtering for search. Unit 34 reads "declares none" per role: an undeclared
+    `label` is the default cascade even when `synonym` is declared, and an undeclared
+    `synonym` is a default list too, so `role=synonym` answers on every release — which
+    is what "the three every consumer may assume the meaning of" needs. A declared role
+    replaces its default whole. Doc 19 §19.1's example and §19.4.2's default list should
+    show both defaults, and doc 04 §4.3 should say the manifest records the filled
+    profile. `description` has no default yet; nothing here reads it.
+95. **A search hit should say which role its predicate plays.** Doc 03 §3.4.5's `match`
+    is `{predicate, literal, lang}`; unit 34 adds `roles`, the release roles whose lists
+    name the predicate, empty for one in none. A client merging hits can then rank a
+    label match above a synonym match without the release's profile in hand.
 
 ## Not in this plan
 

@@ -51,7 +51,7 @@ use sha2::{Digest, Sha256};
 use kgf_store::Capability;
 use kgf_store::catalog::{BundleId, Catalog};
 use kgf_store::manifest::{
-    Manifest, Publisher, default_predicate_roles, validate_predicate_role_iri,
+    Manifest, Publisher, effective_predicate_roles, validate_predicate_role_iri,
 };
 use kgf_store::store::{OpenOptions, Store, artifact};
 
@@ -666,12 +666,11 @@ impl Dataset {
 pub struct PredicateRoles(BTreeMap<String, Vec<String>>);
 
 impl PredicateRoles {
+    /// The manifest's roles over the federation defaults. A manifest written
+    /// now already records them all; one written before a default existed
+    /// gains that role and keeps every role it recorded.
     fn from_manifest(manifest: &Manifest) -> Result<Self, String> {
-        let roles = if manifest.predicate_roles.is_empty() {
-            default_predicate_roles()
-        } else {
-            manifest.predicate_roles.clone()
-        };
+        let roles = effective_predicate_roles(&manifest.predicate_roles);
         for (role, predicates) in &roles {
             if role.is_empty()
                 || !role

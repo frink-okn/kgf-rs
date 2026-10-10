@@ -23,7 +23,7 @@
 //! for the ETag, where a structured view is what is wanted.
 
 use kgf_store::Capability;
-use kgf_store::manifest::{Manifest, Publisher};
+use kgf_store::manifest::{Manifest, Publisher, effective_predicate_roles};
 use serde::Serialize;
 
 use crate::export::{ArtifactIdentity, ExportArtifact};
@@ -567,13 +567,14 @@ impl Resource for BundleManifest {
                 ]
             })
             .collect();
-        let role_members: Vec<String> = manifest
-            .predicate_roles
+        // The roles this server resolves with, which for a manifest written
+        // before a default existed are more than the manifest records.
+        let effective_roles = effective_predicate_roles(&manifest.predicate_roles);
+        let role_members: Vec<String> = effective_roles
             .values()
             .map(|predicates| predicates.join(", "))
             .collect();
-        let predicate_roles: Vec<_> = manifest
-            .predicate_roles
+        let predicate_roles: Vec<_> = effective_roles
             .keys()
             .zip(&role_members)
             .map(|(role, predicates)| vec![Value::Code(role), Value::Code(predicates)])
@@ -734,13 +735,10 @@ impl Resource for BundleManifest {
                         h2 { "Predicate roles" }
                         (note(
                             "The immutable semantic profile used by role-scoped search and preferred \
-                             label resolution for this version."
+                             label resolution for this version. A role the publisher did not declare \
+                             takes the federation default."
                         ))
-                        @if predicate_roles.is_empty() {
-                            (note("The federation label defaults apply."))
-                        } @else {
-                            (table(&["Role", "Predicates (strongest first)"], &predicate_roles))
-                        }
+                        (table(&["Role", "Predicates (strongest first)"], &predicate_roles))
                     }
                 }
 

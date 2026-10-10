@@ -276,17 +276,29 @@ fn schema_answers_json_html_latest_and_resumable_pages_over_http() {
 }
 
 #[test]
-fn schema_omits_requested_labels_when_the_release_has_no_label_cascade() {
+fn a_release_that_declares_only_synonyms_keeps_the_default_label_role() {
     let deployment = Deployment::new();
-    deployment.publish_description_without_labels("tox", "v1", "2026-08-08T12:00:00Z");
+    deployment.publish_description_declaring_only_synonyms("tox", "v1", "2026-08-08T12:00:00Z");
     let server = deployment.serve();
+
+    // Defaults fill role by role: the declared `synonym` replaces the default
+    // one, and the undeclared `label` is the federation's. The manifest records
+    // both, so a consumer reading it without this server sees what applies.
+    let roles = server.get("/tox").json()["predicate_roles"].clone();
+    assert_eq!(
+        roles["synonym"],
+        serde_json::json!(["https://example.org/synonym"])
+    );
+    assert_eq!(
+        roles["label"][0],
+        "http://www.w3.org/2004/02/skos/core#prefLabel"
+    );
+    let manifest = server.get("/tox/v/v1/manifest").json();
+    assert_eq!(manifest["predicate_roles"], roles);
 
     let response = server.get("/tox/v/v1/schema?children=classes&labels=true");
     response.assert_status(200);
-    assert!(
-        response.json().get("labels").is_none(),
-        "an absent cascade is distinct from configured predicates that found no labels"
-    );
+    assert!(response.json()["labels"].is_object(), "{}", response.text());
 }
 
 #[test]
@@ -4404,19 +4416,24 @@ impl Deployment {
     }
 
     fn publish_description(&self, dataset: &str, version: &str, created: &str) {
-        self.publish_description_with_labels(dataset, version, created, true);
+        self.publish_description_with_roles(dataset, version, created, true);
     }
 
-    fn publish_description_without_labels(&self, dataset: &str, version: &str, created: &str) {
-        self.publish_description_with_labels(dataset, version, created, false);
-    }
-
-    fn publish_description_with_labels(
+    fn publish_description_declaring_only_synonyms(
         &self,
         dataset: &str,
         version: &str,
         created: &str,
-        labels: bool,
+    ) {
+        self.publish_description_with_roles(dataset, version, created, false);
+    }
+
+    fn publish_description_with_roles(
+        &self,
+        dataset: &str,
+        version: &str,
+        created: &str,
+        declares_label: bool,
     ) {
         let bundle = self.bundle(dataset, version);
         Fixture::description().copy_bundle_to(&bundle);
@@ -4440,14 +4457,14 @@ impl Deployment {
             "--prefix".to_owned(),
             "ex=https://example.org/".to_owned(),
         ];
-        if labels {
+        if declares_label {
             arguments.extend([
                 "--role".to_owned(),
                 "label=https://example.org/label".to_owned(),
             ]);
         } else {
-            // Supplying a non-label role opts out of the federation defaults,
-            // whose profile deliberately includes a label cascade.
+            // A role other than `label`, which leaves `label` to the federation
+            // default.
             arguments.extend([
                 "--role".to_owned(),
                 "synonym=https://example.org/synonym".to_owned(),

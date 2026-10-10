@@ -83,7 +83,9 @@ than a per-section offset.
 
 A bundle carrying `data.hdt.text` (built by `hdtc text`) declares `search` and answers
 `o.text` on `/fragment` and `/count`: a ranked constraint on the object position,
-resolved through the permutations. `/search` is entity-level and deduplicated. Labels
+resolved through the permutations. `/search` is entity-level and deduplicated, and
+`role=label,synonym` scopes it to roles every release has — declared, or filled role by
+role from the federation defaults (unit 34). Labels
 follow doc 19 §19.4's cascade, language first, over the release's frozen `label` role:
 `QUERY /labels` resolves a batch, and `labels=true` — or a list of predicates to use
 instead, with `lang` and `label_source` — adds a `labels` map to every operation that

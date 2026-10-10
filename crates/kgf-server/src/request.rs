@@ -586,6 +586,10 @@ pub struct Search {
     pub roles: Vec<String>,
     /// Explicit and role-expanded predicate IRIs, deduplicated.
     pub predicates: Vec<BoundTerm>,
+    /// The release roles each role-member predicate belongs to, so a hit can
+    /// say it matched through a synonym rather than a label without the client
+    /// mapping predicates back to roles itself.
+    pub roles_by_predicate: BTreeMap<String, Vec<String>>,
     /// How each entity's preferred label is resolved; `None` for
     /// `labels=false`.
     pub labels: Option<Labeling>,
@@ -671,6 +675,7 @@ impl Search {
             query,
             roles,
             predicates: predicates.into_values().collect(),
+            roles_by_predicate: roles_by_predicate(profile),
             labels: Labeling::from_params(params, true, profile, prefixes, limits)?,
             limit: page_size(
                 params,
@@ -753,6 +758,21 @@ impl Labels {
     pub fn iris(&self) -> &[BoundTerm] {
         &self.iris
     }
+}
+
+/// Every predicate a role names, with the roles that name it, in role-name
+/// order.
+fn roles_by_predicate(profile: &PredicateRoles) -> BTreeMap<String, Vec<String>> {
+    let mut roles = BTreeMap::<String, Vec<String>>::new();
+    for (role, predicates) in profile.iter() {
+        for predicate in predicates {
+            roles
+                .entry(predicate.clone())
+                .or_default()
+                .push(role.to_owned());
+        }
+    }
+    roles
 }
 
 fn profile_terms(profile: &PredicateRoles, role: &str) -> Vec<BoundTerm> {

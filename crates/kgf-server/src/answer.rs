@@ -1982,11 +1982,9 @@ impl SearchResult {
         subject: Rc<str>,
         subject_serialized: u64,
         label: Option<RowLabel>,
-        predicate: Rc<str>,
-        literal: Rc<str>,
+        evidence: SearchEvidence,
         ranking: Ranking,
     ) -> Self {
-        let evidence = SearchEvidence { predicate, literal };
         let serialized = serialized_object([
             ("subject", subject_serialized),
             ("match", evidence.serialized()),
@@ -2021,11 +2019,25 @@ impl Serialize for SearchResult {
 #[derive(Debug)]
 struct SearchEvidence {
     predicate: Rc<str>,
+    /// The release roles that name `predicate`, empty when none does: a
+    /// search over every literal can match one no role covers.
+    roles: Vec<String>,
     literal: Rc<str>,
 }
 
 impl SearchEvidence {
     fn serialized(&self) -> u64 {
+        let roles = 2
+            + self
+                .roles
+                .iter()
+                .map(|role| serialized_json_string(role))
+                .sum::<u64>()
+            + self.roles.len().saturating_sub(1) as u64;
+        self.serialized_without_roles() + 1 + quoted_key("roles") + roles
+    }
+
+    fn serialized_without_roles(&self) -> u64 {
         let predicate = serialized_json_string(&self.predicate);
         match Term::from_dictionary(&self.literal) {
             Term::Literal(literal) => {
@@ -2058,6 +2070,7 @@ impl Serialize for SearchEvidence {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("predicate", self.predicate.as_ref())?;
+        map.serialize_entry("roles", &self.roles)?;
         match Term::from_dictionary(&self.literal) {
             Term::Literal(literal) => {
                 map.serialize_entry("literal", literal.value())?;
@@ -3822,11 +3835,7 @@ pub fn schema(
     request: &request::Schema,
 ) -> Result<SchemaAnswer, Problem> {
     let mut answer = schema_page(store, target, request)?;
-    // A release with no `label` role has no cascade, and the map is left out
-    // rather than filled with nulls, as on a page of rows.
-    if let Some(labeling) = &request.labels
-        && !labeling.predicates.is_empty()
-    {
+    if let Some(labeling) = &request.labels {
         answer.label(store, labeling)?;
     }
     Ok(answer)
@@ -5146,12 +5155,20 @@ fn push_search_result(
             }
         }
     };
+    let roles = request
+        .roles_by_predicate
+        .get(predicate.as_ref())
+        .cloned()
+        .unwrap_or_default();
     let result = SearchResult::new(
         subject,
         subject_serialized,
         label,
-        predicate,
-        literal,
+        SearchEvidence {
+            predicate,
+            roles,
+            literal,
+        },
         ranking,
     );
     let next = spent_bytes.saturating_add(result.serialized);
@@ -6516,15 +6533,11 @@ struct PageLabeling {
 }
 
 impl PageLabeling {
-    /// What to label, or nothing when the request did not ask — or asked of a
-    /// release that declares no `label` role, which has no cascade. The map is
-    /// then left out rather than filled with nulls: a null says the cascade
-    /// looked and found nothing, and here there was nothing to look with.
+    /// What to label, or nothing when the request did not ask.
     fn of<'a>(
         labeling: Option<&Labeling>,
         bound: impl IntoIterator<Item = &'a BoundTerm>,
     ) -> Option<Self> {
-        let labeling = labeling.filter(|labeling| !labeling.predicates.is_empty());
         labeling.map(|labeling| Self {
             labeling: labeling.clone(),
             bound: bound
@@ -9249,14 +9262,21 @@ mod tests {
             .collect();
 
         for literal in literals {
-            for label in &labels {
+            for (label, roles) in labels.iter().zip(
+                [vec![], vec!["label"], vec!["label", "syn\"onym"]]
+                    .into_iter()
+                    .cycle(),
+            ) {
                 for score in [0.0, 14.0, 1.0 / 3.0, f32::NAN, f32::INFINITY] {
                     let result = SearchResult::new(
                         Rc::clone(&subject),
                         subject_serialized,
                         label.clone(),
-                        Rc::from("http://example.org/predicate,one"),
-                        Rc::from(literal),
+                        SearchEvidence {
+                            predicate: Rc::from("http://example.org/predicate,one"),
+                            roles: roles.iter().map(|role| role.to_string()).collect(),
+                            literal: Rc::from(literal),
+                        },
                         Ranking {
                             score,
                             kind: "normalized",

@@ -912,9 +912,8 @@ async fn schema(
         wants,
         |params, limits, release| {
             // `labels=true` is ungated for the reason `capability_gate`
-            // gives: the cascade resolves through the core permutations. A
-            // release that declares no `label` role still answers, with the
-            // labels absent rather than the request refused.
+            // gives: the cascade resolves through the core permutations, and
+            // every release has a `label` role, its own or the federation's.
             request::Schema::parse(
                 params,
                 limits,
