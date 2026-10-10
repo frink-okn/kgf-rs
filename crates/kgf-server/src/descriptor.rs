@@ -23,7 +23,7 @@
 //! for the ETag, where a structured view is what is wanted.
 
 use kgf_store::Capability;
-use kgf_store::manifest::{Manifest, Publisher, effective_predicate_roles};
+use kgf_store::manifest::{Manifest, Publisher};
 use serde::Serialize;
 
 use crate::export::{ArtifactIdentity, ExportArtifact};
@@ -567,14 +567,13 @@ impl Resource for BundleManifest {
                 ]
             })
             .collect();
-        // The roles this server resolves with, which for a manifest written
-        // before a default existed are more than the manifest records.
-        let effective_roles = effective_predicate_roles(&manifest.predicate_roles);
-        let role_members: Vec<String> = effective_roles
+        let role_members: Vec<String> = manifest
+            .predicate_roles
             .values()
             .map(|predicates| predicates.join(", "))
             .collect();
-        let predicate_roles: Vec<_> = effective_roles
+        let predicate_roles: Vec<_> = manifest
+            .predicate_roles
             .keys()
             .zip(&role_members)
             .map(|(role, predicates)| vec![Value::Code(role), Value::Code(predicates)])
@@ -735,10 +734,13 @@ impl Resource for BundleManifest {
                         h2 { "Predicate roles" }
                         (note(
                             "The immutable semantic profile used by role-scoped search and preferred \
-                             label resolution for this version. A role the publisher did not declare \
-                             takes the federation default."
+                             label resolution for this version."
                         ))
-                        (table(&["Role", "Predicates (strongest first)"], &predicate_roles))
+                        @if predicate_roles.is_empty() {
+                            (note("This manifest records no roles; the federation defaults apply."))
+                        } @else {
+                            (table(&["Role", "Predicates (strongest first)"], &predicate_roles))
+                        }
                     }
                 }
 
@@ -848,7 +850,7 @@ fn operations(
     }
     operations.push((
         "labels",
-        "QUERY/POST JSON body: iris, lang, label_source",
+        "QUERY/POST JSON body: iris, labels, lang, label_source",
         false,
     ));
     operations

@@ -99,10 +99,11 @@ pub fn default_predicate_roles() -> BTreeMap<String, Vec<String>> {
 ///
 /// A declared role replaces the default of the same name entirely rather than
 /// extending it, so a publisher can narrow a role as well as widen it; a role
-/// the publisher left out is never absent. Applying this to a profile that has
-/// already been through it changes nothing, so a manifest can record the
-/// result and a reader can apply it again to a manifest written before a
-/// default existed.
+/// the publisher left out is never absent. Applied when a manifest is written,
+/// which records the result: a version means what its manifest says, so a
+/// later default reaches a lineage only when it is rebuilt, and then only for
+/// a role its manifest does not already record. Applying it to its own result
+/// changes nothing.
 pub fn effective_predicate_roles(
     declared: &BTreeMap<String, Vec<String>>,
 ) -> BTreeMap<String, Vec<String>> {
@@ -1458,8 +1459,8 @@ mod tests {
         assert_eq!(effective["label"], ["http://example.org/name"]);
         assert_eq!(effective["identifier"], ["http://example.org/id"]);
         assert_eq!(effective["synonym"], defaults["synonym"]);
-        // Idempotent, so a manifest can record the result and a reader can
-        // apply it again.
+        // Idempotent, so a rebuild that carries a recorded profile forward
+        // records the same one.
         assert_eq!(effective_predicate_roles(&effective), effective);
     }
 

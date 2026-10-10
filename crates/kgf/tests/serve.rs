@@ -302,6 +302,34 @@ fn a_release_that_declares_only_synonyms_keeps_the_default_label_role() {
 }
 
 #[test]
+fn a_release_resolves_with_the_roles_its_manifest_records() {
+    let deployment = Deployment::new();
+    deployment.publish_description_declaring_only_synonyms("tox", "v1", "2026-08-08T12:00:00Z");
+    // As a manifest written before defaults were filled role by role records
+    // it: `synonym` alone. A server must not fill the rest in when reading it,
+    // or the version would mean something different on every upgrade.
+    deployment.set_roles(
+        "tox",
+        "v1",
+        serde_json::json!({"synonym": ["https://example.org/synonym"]}),
+    );
+    let server = deployment.serve();
+
+    assert_eq!(
+        server.get("/tox").json()["predicate_roles"],
+        serde_json::json!({"synonym": ["https://example.org/synonym"]})
+    );
+    // With no `label` role there is no cascade, so the map is left out rather
+    // than filled with nulls that would claim the cascade looked.
+    let response = server.get("/tox/v/v1/schema?children=classes&labels=true");
+    response.assert_status(200);
+    assert!(
+        response.json().get("labels").is_none(),
+        "an absent cascade is distinct from configured predicates that found no labels"
+    );
+}
+
+#[test]
 fn tpf_quad_formats_keep_controls_out_of_the_default_graph() {
     const HYDRA: &str = "http://www.w3.org/ns/hydra/core#";
     const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
@@ -2600,9 +2628,11 @@ fn search_and_labels_answer_over_the_wire() {
     server
         .get("/tox/v/v1/search?q=&role=&predicate=&labels=true&limit=")
         .assert_status(400);
-    server
-        .get("/tox/v/v1/search?q=Alice&labels=&limit=")
-        .assert_status(400);
+    // An untouched form control is an absent one here as on every route that
+    // labels, so `labels` takes its default.
+    let blank = server.get("/tox/v/v1/search?q=Alice&labels=&lang=&limit=");
+    blank.assert_status(200);
+    assert_eq!(blank.json()["labels"], true);
     let search_page = server.request(
         "GET",
         "/tox/v/v1/search?q=Alice&predicate=ex%3Aname",
@@ -4513,6 +4543,15 @@ impl Deployment {
         // built inside one test share a second. The releases here need a
         // defined order, so the timestamps are written explicitly.
         self.set_created(&bundle, created);
+    }
+
+    /// Overwrite the roles a published manifest records.
+    fn set_roles(&self, dataset: &str, version: &str, roles: serde_json::Value) {
+        let path = self.bundle(dataset, version).join("manifest.json");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["predicate_roles"] = roles;
+        std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
     }
 
     fn set_created(&self, bundle: &Path, created: &str) {

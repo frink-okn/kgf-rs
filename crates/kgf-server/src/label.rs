@@ -27,13 +27,16 @@
 //! when it named none — that is one value, the same work as reading the first
 //! value of the first predicate.
 //!
-//! The rest is bounded by an allowance of values examined, taken from the
-//! request's candidate budget. A term is resolved only when every value its
-//! groups hold fits what is left, which is known exactly before any is read
-//! because each group is a contiguous permutation range. The one exception is
-//! the first item of a response, which is resolved whatever it costs so that a
-//! response always carries something and a cursor out of it always moves — the
-//! same allowance the byte budget makes for one oversized row.
+//! The rest is bounded by an allowance of values read: `candidate_budget`, as
+//! a window of the request's own beside whatever its enumeration spends,
+//! because a ranked page that legitimately spends its whole candidate budget
+//! would otherwise leave its labels nothing. Each value is charged as it is
+//! read, and none is read past the allowance, so a request never reads more
+//! label values than that, whoever chose its predicates. A term the allowance
+//! cannot settle ends a response before the item that carries it — unless that
+//! is the response's first item, which nothing can follow: then the request is
+//! refused, because a response that carried nothing would hand back a cursor
+//! that never moves.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -45,15 +48,15 @@ use kgf_store::pattern::IdPattern;
 use kgf_store::{Role, Store, TermId};
 
 use crate::answer::{select, unreadable};
-use crate::envelope::Problem;
+use crate::envelope::{ErrorCode, Problem};
 use crate::term::{LiteralKind, Term};
 
 /// One language range in RFC 4647 §2.1's basic syntax: `*`, or subtags of one
 /// to eight ASCII letters or digits joined by hyphens, the first all letters.
 ///
-/// Held lowercased. Language tags compare case-insensitively and the
-/// dictionary holds the folded form, so a range that kept its case would match
-/// nothing for a client that wrote `en-GB`.
+/// Held lowercased, the form it is echoed in. Matching ignores case on both
+/// sides, since language tags compare case-insensitively and a dictionary may
+/// hold `en-GB` as readily as `en-gb`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LanguageRange(Box<str>);
 
@@ -205,7 +208,8 @@ impl PreferredLabel {
         &self.predicate
     }
 
-    /// The literal's language tag, lowercased; `None` for an untagged one.
+    /// The literal's language tag, lowercased whatever case the dictionary
+    /// stores it in; `None` for an untagged one.
     pub fn language(&self) -> Option<&str> {
         self.language.as_deref()
     }
@@ -228,14 +232,28 @@ pub enum Resolution {
     Exhausted,
 }
 
-/// Whether a resolution may spend past what the allowance has left.
+/// What an allowance too small to settle a term means for the item that
+/// carries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Spend {
-    /// Only when every candidate the term has fits what is left.
+    /// A later item: the response ends before it, and says the candidate
+    /// budget ended it.
     WithinAllowance,
-    /// Whatever it costs: a response's first item, which must be answered for
-    /// the response to carry anything and for a cursor out of it to move.
+    /// A response's first item, or a term every response of the request
+    /// carries: nothing can come before it, so the request is refused.
     First,
+}
+
+impl Spend {
+    /// The spend for an item, which is the first exactly when nothing has
+    /// been kept before it.
+    pub fn first_if(first: bool) -> Self {
+        if first {
+            Self::First
+        } else {
+            Self::WithinAllowance
+        }
+    }
 }
 
 /// One request's label resolution: the cascade, and what it may still spend.
@@ -253,7 +271,9 @@ pub struct LabelCascade<'s> {
     /// matching every value against every range would be the cost of this
     /// cascade rather than a constant beside it.
     ranks: HashMap<Box<[u8]>, LanguageRank>,
-    /// Values this request may still examine.
+    /// Values this request may read in all, for the refusal that names it.
+    allowance: u64,
+    /// Values this request may still read.
     remaining: u64,
     /// Each subject resolved so far, so a term repeated down a page is
     /// resolved — and charged — once.
@@ -291,6 +311,7 @@ impl<'s> LabelCascade<'s> {
             predicates: held,
             languages,
             ranks: HashMap::new(),
+            allowance,
             remaining: allowance,
             resolved: HashMap::new(),
             scratch: Vec::new(),
@@ -298,65 +319,71 @@ impl<'s> LabelCascade<'s> {
     }
 
     /// Resolve the preferred label of the term with subject id `subject`.
+    ///
+    /// `Exhausted` only for [`Spend::WithinAllowance`]: a first item the
+    /// allowance cannot settle is a refusal instead.
     pub fn resolve(&mut self, subject: u64, spend: Spend) -> Result<Resolution, Problem> {
         if let Some(found) = self.resolved.get(&subject) {
             return Ok(Resolution::Resolved(found.clone()));
         }
 
-        // Every group is one contiguous SPO range, so its exact size is known
-        // after the descent that finds it — before any value is read.
-        let mut groups = Vec::with_capacity(self.predicates.len());
-        let mut candidates = 0u64;
-        for (index, (predicate, _)) in self.predicates.iter().enumerate() {
+        // Read in (predicate, term id) order, which is the cascade's order
+        // within one language rank, so a value replaces the one held only by
+        // ranking strictly better. A term is settled by a value at the best
+        // rank — nothing after it can win — or by reading all it has.
+        let mut best: Option<(LanguageRank, usize, u64)> = None;
+        'groups: for index in 0..self.predicates.len() {
+            if best.is_some_and(|(rank, _, _)| rank == LanguageRank::BEST) {
+                break;
+            }
             let selection = select(
                 self.store,
                 IdPattern {
                     subject: Some(subject),
-                    predicate: Some(*predicate),
+                    predicate: Some(self.predicates[index].0),
                     object: None,
                 },
             )?;
-            let count = selection.count().value;
-            if count > 0 {
-                candidates = candidates.saturating_add(count);
-                groups.push((index, selection, count));
-            }
-        }
-        if candidates > self.remaining && spend == Spend::WithinAllowance {
-            return Ok(Resolution::Exhausted);
-        }
-
-        // Read in (predicate, term id) order, which is the cascade's order
-        // within one language rank, so a value replaces the one held only by
-        // ranking strictly better.
-        let mut best: Option<(LanguageRank, usize, u64)> = None;
-        let mut examined = 0u64;
-        for (index, selection, count) in &groups {
-            if best.is_some_and(|(rank, _, _)| rank == LanguageRank::BEST) {
-                break;
-            }
-            let count = usize::try_from(*count).unwrap_or(usize::MAX);
+            let count = usize::try_from(selection.count().value).unwrap_or(usize::MAX);
             for triple in selection.page(0, count) {
-                examined += 1;
+                if self.remaining == 0 {
+                    return match spend {
+                        Spend::WithinAllowance => Ok(Resolution::Exhausted),
+                        Spend::First => Err(self.unsettled()),
+                    };
+                }
+                self.remaining -= 1;
                 // A value that is not a literal is not a label candidate.
                 let Some(rank) = self.rank_of(triple.object)? else {
                     continue;
                 };
                 if best.is_none_or(|(held, _, _)| rank < held) {
-                    best = Some((rank, *index, triple.object));
+                    best = Some((rank, index, triple.object));
                 }
                 if rank == LanguageRank::BEST {
-                    break;
+                    break 'groups;
                 }
             }
         }
-        self.remaining = self.remaining.saturating_sub(examined);
 
         let label = best
             .map(|(_, index, object)| self.chosen(index, object))
             .transpose()?;
         self.resolved.insert(subject, label.clone());
         Ok(Resolution::Resolved(label))
+    }
+
+    /// The refusal for a first item whose label the allowance cannot settle.
+    fn unsettled(&self) -> Problem {
+        Problem::new(
+            ErrorCode::CapExceeded,
+            format!(
+                "settling the first term's label would read more than this request's \
+                 candidate_budget of {} label values; name predicates with fewer values per \
+                 term in `labels`, or leave labels out",
+                self.allowance
+            ),
+        )
     }
 
     /// The language rank of object `id`, or `None` if it is not a literal.
@@ -395,6 +422,8 @@ impl<'s> LabelCascade<'s> {
                 &format_args!("object term {object} ranked as a literal and is not one"),
             ));
         };
+        // Folded here whatever the dictionary stores: `Term::from_dictionary`
+        // lowercases a tag, so a source reports one spelling on every bundle.
         let language = match literal.kind() {
             LiteralKind::Language(tag) => Some(Box::from(tag.as_ref())),
             LiteralKind::Plain | LiteralKind::Datatype(_) => None,

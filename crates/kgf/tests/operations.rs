@@ -1596,30 +1596,48 @@ fn page_labels_are_weighed_with_the_row_that_brings_them() {
 fn a_spent_label_allowance_ends_the_page_where_it_resumes() {
     let served = Served::multilingual();
     let store = served.store();
-    let query = "p=ex:label&labels=true&lang=fr";
+    // `fr` ranks nothing these subjects carry first, so each reads both of its
+    // values: two per row.
+    let query = "p=ex:name&labels=true&lang=fr";
     let whole = served.fragment(&store, query);
     assert_eq!(whole["complete"], true);
 
-    // One candidate: the first row of a page is resolved whatever it costs,
-    // so every page moves, and the next term with two candidates ends it.
-    let starved = Budgets {
-        candidate_budget: 1,
+    // Two values settle a page's first row and nothing after it, so every page
+    // carries one row and ends there, resumably.
+    let two = Budgets {
+        candidate_budget: 2,
         ..Budgets::new()
     };
     let (rows, labels) = page_through(
         query,
-        |query| served.fragment_within(&store, query, &starved),
+        |query| served.fragment_within(&store, query, &two),
         "candidate_budget",
     );
     assert_eq!(rows, *whole["rows"].as_array().unwrap());
     assert_eq!(labels, whole["labels"]);
+
+    // One cannot settle even the first row, and nothing can come before it, so
+    // the request is refused rather than allowed to read past its budget.
+    let one = Budgets {
+        candidate_budget: 1,
+        ..Budgets::new()
+    };
+    let refused = served
+        .try_fragment_within(&store, query, served.within(&one))
+        .unwrap_err();
+    assert_eq!(refused.code(), kgf_server::envelope::ErrorCode::CapExceeded);
+    assert!(
+        serde_json::to_string(&refused)
+            .unwrap()
+            .contains("candidate_budget of 1")
+    );
 
     // A batch has no cursor: it answers a prefix of what was sent and says
     // which budget ended it.
     let batch = served.labels_within(
         &store,
         &serde_json::json!({"iris": ["ex:asthma", "ex:atrazine", "ex:colour"]}),
-        &starved,
+        &two,
     );
     assert_eq!(batch["complete"], false);
     assert_eq!(batch["truncation_reason"], "candidate_budget");
@@ -1627,11 +1645,44 @@ fn a_spent_label_allowance_ends_the_page_where_it_resumes() {
     assert_eq!(batch["labels"].as_array().unwrap().len(), 1);
     assert_eq!(batch["labels"][0]["label"], "Asthma");
 
+    // Values are charged as they are read, not as a term holds them: each of
+    // these has two, and the first one read settles it.
+    let settled = served.labels_within(
+        &store,
+        &serde_json::json!({"iris": ["ex:twin", "ex:colour"], "lang": ["en"]}),
+        &two,
+    );
+    assert_eq!(settled["complete"], true);
+    assert_eq!(settled["labels"][1]["label"], "colour", "{settled}");
+
     // A sample is drawn whole, so it says so without a cursor either.
-    let sample = served.sample_within(&store, "p=ex:label&n=20&labels=true", &starved);
+    let sample = served.sample_within(&store, "p=ex:name&n=20&labels=true", &two);
     assert_eq!(sample["complete"], false);
     assert_eq!(sample["truncation_reason"], "candidate_budget");
     assert!(sample["next"].is_null());
+}
+
+#[test]
+fn a_labelled_blank_node_is_labelled_in_every_cell_that_draws_it() {
+    let served = Served::multilingual();
+    let store = served.store();
+    let anon = served.fragment(&store, "o=%22anonymous%22")["rows"][0]["s"]["value"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let encoded = anon.replace(':', "%3A");
+    // The request names the node by its scoped IRI and its row carries it under
+    // its dictionary label; the page finds the label by either.
+    let page = served.render(
+        &store,
+        "describe",
+        &format!("iri=%3C{encoded}%3E&labels=true"),
+        Representation::Html,
+    );
+    assert!(
+        page.contains("<span class=\"t-label\">anonymous</span>"),
+        "{page}"
+    );
 }
 
 #[test]
@@ -1671,6 +1722,22 @@ fn an_rdf_page_carries_each_label_as_the_statement_it_came_from() {
     );
     // Without labels, the page alone.
     assert_eq!(statements("s=ex:linked").len(), 2);
+
+    // A label statement that matches the page's own pattern is never added: it
+    // would be another page's row. `asthma`'s German label is an `ex:label`
+    // triple, and this one-row page of `ex:label` is a different one.
+    let page = statements("p=ex:label&labels=true&lang=de&limit=1");
+    assert_eq!(
+        page.iter()
+            .filter(|line| line.contains("<http://example.org/label>"))
+            .count(),
+        1,
+        "{page:?}"
+    );
+    assert!(
+        !page.iter().any(|line| line.contains("\"Asthma\"@de")),
+        "{page:?}"
+    );
 }
 
 #[test]

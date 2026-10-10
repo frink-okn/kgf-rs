@@ -2660,21 +2660,25 @@ had — `labels: {IRI: string|null}` over every IRI the response carries: the pa
 bound positions or the described resource, and every IRI in a row, graph column included,
 a blank node under its scoped IRI and no literal — plus `label_sources` beside it when
 asked. The map is left out for a release with no `label` role (question 92). *(Unit 34
-made that case impossible: every release now has one.)* An RDF page
+made that case impossible for a manifest written since.)* An RDF page
 carries each label as the statement it came from, beside its own, deduplicated against
 them and computed per prefix so that RDF byte fitting keeps exactly the labels of the rows
 it keeps; a page scoped to a graph, or in the quad view, is refused in RDF (406), because
 labels are read over the union and a statement written into a graph claims it is there
 (question 90).
 
-**Cost.** Per IRI, one descent per label predicate, each of which gives that group's
-exact size; then values in (predicate, term id) order until no later one can win —
-usually one. The values a request reads are charged to an allowance of
-`candidate_budget`, a window of its own as `/search`'s resolution window is. A term is
-resolved only if every value it has fits what is left, which the descents already
-established, so the allowance is never overrun mid-term; a response's first item is
-resolved whatever it costs, the allowance the byte budget makes for one oversized row, so
-every page moves. `max_label_iris` still bounds the `/labels` batch and the HTML
+**Cost.** Per IRI, one descent per label predicate; then values in (predicate, term id)
+order until no later one can win — usually one. Each value is charged as it is read to an
+allowance of `candidate_budget`, a window of its own as `/search`'s resolution window is
+— shared with the enumeration it would leave a ranked page's labels nothing, since
+ranking legitimately spends the whole budget — and none is read past it. A term the
+allowance cannot settle ends the response before the item that carries it, resumably
+where the operation pages; a response's *first* item, which nothing can precede, is
+refused instead (`cap_exceeded`, naming the budget), so no request reads more label
+values than the allowance whoever chose its predicates. *(As first landed, the first item
+was resolved whatever it cost and a term was admitted only if every value its groups held
+fit; a review found the first unbounded under a client's `labels=` predicates, and the
+second refusing terms that one value would settle. Both changed to the above.)* `max_label_iris` still bounds the `/labels` batch and the HTML
 affordance for a page that did not ask; a requested map is bounded by the page it labels,
 at most `max_limit` rows of a few terms each, which is §3.5's "bounded by
 `max_output_terms`" and why `/schema?labels=true` no longer refuses over the cap.
@@ -2733,16 +2737,21 @@ now covers; `role=label,synonym` is the entity search.
 **What landed.** `kgf_store::manifest::effective_predicate_roles` is the federation
 defaults overlaid by the declared roles, a declared role replacing its default whole. `kgf
 manifest` and `kgf build` record its result in every new manifest, so a consumer reading
-manifests without a server sees every role that applies; the server applies it again
-when reading, which changes nothing for a new manifest and fills a role a manifest
-written earlier lacks; the manifest page shows the effective profile. The `synonym`
+manifests without a server sees every role that applies. The server resolves each release
+with exactly what its manifest records — standard profile only for a manifest recording
+none, as before — because a version means what its manifest says and an upgrade must not
+change that; a manifest written earlier gains a default only when its lineage is rebuilt,
+and then only for a role it does not record. *(As first landed the server filled defaults
+on read too, which a review rightly found changed published versions' role semantics
+with no new version, and showed `/manifest` and its page disagreeing; reverted.)* The `synonym`
 default is `skos:altLabel`, `oboInOwl:hasExactSynonym`, `schema:alternateName`, and
 `oboInOwl:hasRelatedSynonym`, `…Narrow…` and `…Broad…` — every kind, since a search
 wants them all and returns the predicate that matched — and it shares no predicate with
 the `label` default: a synonym of any kind is a search target, never a label. Every
-release now has a `label` role, so unit 33's branch for one without is gone (question
-92). A search hit's `match` carries `roles`, the release roles naming its predicate, for
-one lookup per hit (question 95).
+manifest written now has a `label` role; one written before that records roles without
+one keeps unit 33's behaviour, its response-level map left out (question 92). A search
+hit's `match` carries `roles`, the release roles naming its predicate, from an inverse
+each release computes once (question 95).
 
 *Verified by* a store test that every default is a valid role IRI, that the two defaults
 are disjoint, and that the overlay replaces, fills and is idempotent; manifest tests that
@@ -2751,7 +2760,8 @@ gains a new default; a socket test that a synonym-only release serves the defaul
 role in its descriptor, records it in its manifest, and labels `/schema`; and search
 tests of `match.roles` for a role-member predicate and for one in no role, and of
 `role=synonym` on a release that declares only `label`; the exact-size oracle covers
-`roles`.
+`roles`; and a socket test that a manifest recording only `synonym` is served with exactly
+that, its `/schema` map left out.
 
 ## Testing spine
 
@@ -3809,11 +3819,13 @@ following the code.
     the values of one `(subject, predicate)` group are not grouped by language and the
     best one cannot be searched for: the language-first cascade reads values until no
     later one can win. Unit 33's row is `O(|label preds| · log N + V)` per IRI, `V` the
-    values read — one in the common case — with `V` summed over a request bounded by
-    `candidate_budget`, and a response's first item resolved whatever its `V`, so the
-    worst case is the budget plus one term's label values. Both rows should say so, and
-    §3.5's `candidate_budget` row should list label values among the candidates it
-    counts. Doc 19 §19.4.5's sidecar is what would remove `V`; nothing here needs it yet.
+    values read — one in the common case — with `V` summed over a request at most
+    `candidate_budget`: a term that would need more ends the response before its item,
+    or refuses the request when its item is the first. Both rows should say so, and
+    §3.5 should say that `candidate_budget` is a window per budgeted phase — a labelled
+    ranked page spends up to two, a labelled `/search` three — which is already true of
+    `/search`'s scoring and resolution. Doc 19 §19.4.5's sidecar is what would remove
+    `V`; nothing here needs it yet.
 86. **`label_source` needs a wire shape.** §3.4.12 says only that it "returns the
     predicate and language actually used". Unit 33 writes `{"predicate": IRI, "lang":
     tag}`, the language left out for an untagged literal as a term object leaves it
@@ -3854,10 +3866,12 @@ following the code.
     versioned answer's meaning. The spec gives it no body form; this implementation
     makes a body's `labels` `true`, `false`, or an array of predicates, on `QUERY
     /fragment` and on the `/labels` batch alike, so one key means one thing everywhere.
-92. **Resolved (unit 34): every release has a `label` role.** Unit 33 left a
-    response-level map out for a release declaring no `label` role, while a row-level
-    `label` was `null`. Defaults now fill role by role, so the case cannot arise and the
-    special case is gone.
+92. **A release with no `label` role answers `labels=true` two ways — now only an old
+    one.** A response-level map is left out, since a null says the cascade looked and
+    found nothing and there is no cascade to look with, while a row-level `label`
+    (`/labels`, `/search`, `/terms`) is `null`. Since unit 34 every manifest written has
+    a `label` role, so only a manifest written before it can reach this; the spec should
+    still pick one.
 93. **§3.4.1 lists `labels` as requiring `search`, and §3.4.12's heading says the same.**
     Labels compose the core permutations every bundle carries, so this implementation
     never gates them (rule 8 in `CLAUDE.md`). Both should read `—`.

@@ -63,7 +63,7 @@ use crate::cursor::{
 use crate::envelope::{ErrorCode, Problem, reflected};
 use crate::label::{LanguageRange, Languages};
 use crate::representation::{RdfSyntax, Representation};
-use crate::service::PredicateRoles;
+use crate::service::{PredicateRoles, RolesByPredicate};
 use crate::term::{Literal as KgfLiteral, PrefixMap, Term};
 use crate::url::Params;
 
@@ -588,8 +588,8 @@ pub struct Search {
     pub predicates: Vec<BoundTerm>,
     /// The release roles each role-member predicate belongs to, so a hit can
     /// say it matched through a synonym rather than a label without the client
-    /// mapping predicates back to roles itself.
-    pub roles_by_predicate: BTreeMap<String, Vec<String>>,
+    /// mapping predicates back to roles itself. The release's own, shared.
+    pub roles_by_predicate: RolesByPredicate,
     /// How each entity's preferred label is resolved; `None` for
     /// `labels=false`.
     pub labels: Option<Labeling>,
@@ -675,7 +675,7 @@ impl Search {
             query,
             roles,
             predicates: predicates.into_values().collect(),
-            roles_by_predicate: roles_by_predicate(profile),
+            roles_by_predicate: profile.by_predicate(),
             labels: Labeling::from_params(params, true, profile, prefixes, limits)?,
             limit: page_size(
                 params,
@@ -758,21 +758,6 @@ impl Labels {
     pub fn iris(&self) -> &[BoundTerm] {
         &self.iris
     }
-}
-
-/// Every predicate a role names, with the roles that name it, in role-name
-/// order.
-fn roles_by_predicate(profile: &PredicateRoles) -> BTreeMap<String, Vec<String>> {
-    let mut roles = BTreeMap::<String, Vec<String>>::new();
-    for (role, predicates) in profile.iter() {
-        for predicate in predicates {
-            roles
-                .entry(predicate.clone())
-                .or_default()
-                .push(role.to_owned());
-        }
-    }
-    roles
 }
 
 fn profile_terms(profile: &PredicateRoles, role: &str) -> Vec<BoundTerm> {
@@ -1357,11 +1342,6 @@ fn one_graph_syntax_carries(
 pub(crate) const QUAD_VIEW_NEEDS_A_DATASET: &str = "the quad view puts each statement in its graph, which a single-graph syntax cannot \
      represent; ask for N-Quads, TriG or JSON-LD, or scope the request with a graph";
 
-/// Refuse a graph scope beside a text constraint.
-///
-/// A ranked text page is assembled from one selection per matching literal,
-/// and this build does not scope those. Refused rather than answered from the
-/// union, for the reason every ignored filter is refused.
 /// Whether the negotiated representation can carry the labels a request asked
 /// for.
 ///
@@ -1393,6 +1373,11 @@ fn labels_carried(
     Ok(())
 }
 
+/// Refuse a graph scope beside a text constraint.
+///
+/// A ranked text page is assembled from one selection per matching literal,
+/// and this build does not scope those. Refused rather than answered from the
+/// union, for the reason every ignored filter is refused.
 fn refuse_scoped_text(pattern: &Pattern, graph: &GraphScope) -> Result<(), Problem> {
     if pattern.text().is_some() && graph.canonical().is_some() {
         return Err(Problem::new(
@@ -4113,7 +4098,14 @@ impl GetRequest for Sample {
 
 impl GetRequest for Search {
     fn normalize_params(params: &Params) -> Params {
-        params.without_empty(&["role", "predicate", "limit", "lang", "label_source"])
+        params.without_empty(&[
+            "role",
+            "predicate",
+            "limit",
+            "labels",
+            "lang",
+            "label_source",
+        ])
     }
 
     fn work_class(&self) -> WorkClass {
@@ -5702,13 +5694,20 @@ mod tests {
             assert_eq!(sample.get(omitted), None, "{omitted}");
         }
 
-        let search = Search::normalize_params(&params("q=&role=&predicate=&labels=&limit="));
-        for omitted in ["role", "predicate", "limit"] {
+        let search = Search::normalize_params(&params(
+            "q=&role=&predicate=&labels=&lang=&label_source=&limit=",
+        ));
+        for omitted in [
+            "role",
+            "predicate",
+            "labels",
+            "lang",
+            "label_source",
+            "limit",
+        ] {
             assert_eq!(search.get(omitted), None, "{omitted}");
         }
-        for strict in ["q", "labels"] {
-            assert_eq!(search.get(strict), Some(""), "{strict}");
-        }
+        assert_eq!(search.get("q"), Some(""));
 
         let schema = Schema::normalize_params(&params(
             "class=&predicate=&datatype=&children=&projection=&view=&limit=&cursor=&format=",
