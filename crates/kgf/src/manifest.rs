@@ -1601,7 +1601,9 @@ mod tests {
 
         let defaults = predicate_roles(&args(&[]), None, &BTreeMap::new()).unwrap();
         assert_eq!(defaults, kgf_store::manifest::default_predicate_roles());
-        assert!(defaults.contains_key("label") && defaults.contains_key("synonym"));
+        for role in ["label", "synonym", "description"] {
+            assert!(defaults.contains_key(role), "{role}");
+        }
 
         // Defaults fill role by role. A declared role replaces its default
         // whole — narrowing it, here — and an undeclared one is the default.

@@ -2744,10 +2744,17 @@ change that; a manifest written earlier gains a default only when its lineage is
 and then only for a role it does not record. *(As first landed the server filled defaults
 on read too, which a review rightly found changed published versions' role semantics
 with no new version, and showed `/manifest` and its page disagreeing; reverted.)* The `synonym`
-default is `skos:altLabel`, `oboInOwl:hasExactSynonym`, `schema:alternateName`, and
-`oboInOwl:hasRelatedSynonym`, `…Narrow…` and `…Broad…` — every kind, since a search
-wants them all and returns the predicate that matched — and it shares no predicate with
-the `label` default: a synonym of any kind is a search target, never a label. Every
+default is `skos:altLabel`, `oboInOwl:hasExactSynonym`, `schema:alternateName`,
+`oboInOwl:hasRelatedSynonym`, `…Narrow…` and `…Broad…`, and `skos:hiddenLabel` — every
+kind, since a search wants them all and returns the predicate that matched — and it shares no predicate with
+the `label` default: a synonym of any kind is a search target, never a label. A
+`description` default followed: `skos:definition` and IAO's `definition` first, then
+`dcterms:description`, `schema:description`, and `rdfs:comment` last, as often an
+editor's note as a description; no predicate is in two defaults. Every schema.org term
+in the defaults is listed under both `https://schema.org/` and `http://schema.org/`: the
+OKN registry shows DREAM-KG, NDE, PROKN, SecureChainKG and Wikidata on the older
+namespace, which the `https`-only `label` default had silently missed, and a predicate
+a release does not hold costs nothing past the cascade's construction. Every
 manifest written now has a `label` role; one written before that records roles without
 one keeps unit 33's behaviour, its response-level map left out (question 92). A search
 hit's `match` carries `roles`, the release roles naming its predicate, from an inverse
@@ -3883,7 +3890,10 @@ following the code.
     is what "the three every consumer may assume the meaning of" needs. A declared role
     replaces its default whole. Doc 19 §19.1's example and §19.4.2's default list should
     show both defaults, and doc 04 §4.3 should say the manifest records the filled
-    profile. `description` has no default yet; nothing here reads it.
+    profile. `description` has one too: definitions first (`skos:definition`, IAO's
+    `definition`), then `dcterms:description` and `schema:description`, and
+    `rdfs:comment` last, since a comment is as often an editor's note. The three
+    defaults share no predicate.
 95. **A search hit should say which role its predicate plays.** Doc 03 §3.4.5's `match`
     is `{predicate, literal, lang}`; unit 34 adds `roles`, the release roles whose lists
     name the predicate, empty for one in none. A client merging hits can then rank a

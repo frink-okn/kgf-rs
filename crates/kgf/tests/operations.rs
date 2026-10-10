@@ -1894,6 +1894,9 @@ fn labels_preserve_input_order_and_search_returns_one_entity_with_evidence() {
     let synonyms = served.search(&store, "q=Alice&role=synonym&limit=20");
     assert_eq!(synonyms["roles"], serde_json::json!(["synonym"]));
     assert!(synonyms["results"].as_array().unwrap().is_empty());
+    // And so is `description`.
+    let described = served.search(&store, "q=Alice&role=description&limit=20");
+    assert_eq!(described["roles"], serde_json::json!(["description"]));
     // A literal no role covers says so with an empty list.
     let note = served.search(&store, "q=blank+subject&limit=20");
     assert_eq!(
