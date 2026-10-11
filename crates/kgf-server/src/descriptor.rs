@@ -256,6 +256,8 @@ impl Resource for ServiceDescriptor<'_> {
                             ("max_search_predicates", Value::Number(u64::from(self.caps.max_search_predicates))),
                             ("max_search_results", Value::Number(u64::from(self.caps.max_search_results))),
                             ("max_label_iris", Value::Number(u64::from(self.caps.max_label_iris))),
+                            ("max_label_languages", Value::Number(u64::from(self.caps.max_label_languages))),
+                            ("max_label_predicates", Value::Number(u64::from(self.caps.max_label_predicates))),
                             ("max_schema_items", Value::Number(u64::from(self.caps.max_schema_items))),
                         ]))
                         h2 { "Response budgets" }
@@ -735,7 +737,7 @@ impl Resource for BundleManifest {
                              label resolution for this version."
                         ))
                         @if predicate_roles.is_empty() {
-                            (note("The federation label defaults apply."))
+                            (note("This manifest records no roles; the federation defaults apply."))
                         } @else {
                             (table(&["Role", "Predicates (strongest first)"], &predicate_roles))
                         }
@@ -786,10 +788,10 @@ fn operations(
     let search = manifest.declares(Capability::Search);
     let graphs = manifest.declares(Capability::Graphs);
     let pattern_parameters = match (search, graphs) {
-        (true, true) => "s, p, o, o.text, g, limit, cursor",
-        (true, false) => "s, p, o, o.text, limit, cursor",
-        (false, true) => "s, p, o, g, limit, cursor",
-        (false, false) => "s, p, o, limit, cursor",
+        (true, true) => "s, p, o, o.text, g, limit, cursor, labels, lang, label_source",
+        (true, false) => "s, p, o, o.text, limit, cursor, labels, lang, label_source",
+        (false, true) => "s, p, o, g, limit, cursor, labels, lang, label_source",
+        (false, false) => "s, p, o, limit, cursor, labels, lang, label_source",
     };
     let count_parameters = match (search, graphs) {
         (true, true) => "s, p, o, o.text, g, cursor",
@@ -805,31 +807,52 @@ fn operations(
             true,
         ),
         ("count", count_parameters, true),
-        ("describe", "iri, direction, limit, cursor", false),
+        (
+            "describe",
+            "iri, direction, limit, cursor, labels, lang, label_source",
+            false,
+        ),
     ];
     if manifest.carries_description_artifacts() {
         operations.extend([
             (
                 "schema",
-                "class, predicate, datatype, children, projection, view, limit, cursor",
+                "class, predicate, datatype, children, projection, view, limit, cursor, labels, \
+                 lang, label_source",
                 true,
             ),
             ("void", "format=ttl|jsonld|html", true),
             ("summary", "format=md|json|html", true),
         ]);
     }
-    operations.push(("sample", "s, p, o, n, seed", true));
+    operations.push((
+        "sample",
+        "s, p, o, n, seed, labels, lang, label_source",
+        true,
+    ));
     if search {
-        operations.push(("search", "q, role, predicate, labels, limit", false));
+        operations.push((
+            "search",
+            "q, role, predicate, labels, lang, label_source, limit",
+            false,
+        ));
     }
     // Browsable with no arguments: an empty prefix is the first page of the whole
     // dictionary, which is a way into a KG whose vocabulary a client does not
     // know yet.
-    operations.push(("terms", "prefix, role, count, limit, labels, cursor", true));
+    operations.push((
+        "terms",
+        "prefix, role, count, limit, labels, lang, label_source, cursor",
+        true,
+    ));
     if graphs {
         operations.push(("graphs", "limit, cursor", true));
     }
-    operations.push(("labels", "QUERY/POST JSON body: iris", false));
+    operations.push((
+        "labels",
+        "QUERY/POST JSON body: iris, labels, lang, label_source",
+        false,
+    ));
     operations
         .into_iter()
         .map(|(operation, parameters, browsable)| {

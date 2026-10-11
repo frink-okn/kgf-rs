@@ -29,7 +29,7 @@ use anyhow::{Context, Result, bail, ensure};
 use kgf_store::manifest::{
     ArtifactDigest, ArtifactEntry, ArtifactView, BundleFacts, Capability, Formats, KeyArtifact,
     KeyEncoding, KeyRole, KeyStructure, Manifest, ManifestDocument, Publisher, Source,
-    content_digest_preimage, default_predicate_roles, validate_predicate_role_iri,
+    content_digest_preimage, effective_predicate_roles, validate_predicate_role_iri,
 };
 use kgf_store::store::artifact;
 use kgf_store::{PublishedBundle, verify_description_artifacts};
@@ -688,14 +688,18 @@ fn predicate_roles(
     previous: Option<&Manifest>,
     prefixes: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, Vec<String>>> {
-    let roles = if requested.roles.is_empty() {
+    // The declared roles — this run's, or the previous manifest's when this
+    // run named none — over the federation defaults, so the manifest records
+    // every role a reader can use rather than leaving a consumer reading it
+    // without the server to know which defaults filled the gaps.
+    let declared = if requested.roles.is_empty() {
         previous
             .map(|manifest| manifest.predicate_roles.clone())
-            .filter(|roles| !roles.is_empty())
-            .unwrap_or_else(default_predicate_roles)
+            .unwrap_or_default()
     } else {
         requested.roles.clone()
     };
+    let roles = effective_predicate_roles(&declared);
 
     // Checked on every path, including the carried-forward one: a role profile
     // that was valid against one prefix map is not automatically valid against
@@ -1596,7 +1600,24 @@ mod tests {
         assert!(repeated.is_err(), "a repeated predicate must be refused");
 
         let defaults = predicate_roles(&args(&[]), None, &BTreeMap::new()).unwrap();
-        assert!(defaults.contains_key("label"));
+        assert_eq!(defaults, kgf_store::manifest::default_predicate_roles());
+        for role in ["label", "synonym", "description"] {
+            assert!(defaults.contains_key(role), "{role}");
+        }
+
+        // Defaults fill role by role. A declared role replaces its default
+        // whole — narrowing it, here — and an undeclared one is the default.
+        let synonyms_only = requested(&[], &["synonym=http://example.org/alias"]);
+        let roles = predicate_roles(&synonyms_only, None, &BTreeMap::new()).unwrap();
+        assert_eq!(roles["synonym"], ["http://example.org/alias"]);
+        assert_eq!(roles["label"], defaults["label"]);
+        // A carried-forward profile written before a default existed gains it.
+        let mut legacy = manifest_with(BTreeMap::new());
+        legacy.predicate_roles =
+            BTreeMap::from([("label".to_owned(), vec!["http://example.org/n".to_owned()])]);
+        let carried = predicate_roles(&args(&[]), Some(&legacy), &BTreeMap::new()).unwrap();
+        assert_eq!(carried["label"], ["http://example.org/n"]);
+        assert_eq!(carried["synonym"], defaults["synonym"]);
 
         let curie = requested(&[], &["label=ex:name"]);
         let prefixes = BTreeMap::from([("ex".to_owned(), "http://example.org/".to_owned())]);

@@ -276,11 +276,51 @@ fn schema_answers_json_html_latest_and_resumable_pages_over_http() {
 }
 
 #[test]
-fn schema_omits_requested_labels_when_the_release_has_no_label_cascade() {
+fn a_release_that_declares_only_synonyms_keeps_the_default_label_role() {
     let deployment = Deployment::new();
-    deployment.publish_description_without_labels("tox", "v1", "2026-08-08T12:00:00Z");
+    deployment.publish_description_declaring_only_synonyms("tox", "v1", "2026-08-08T12:00:00Z");
     let server = deployment.serve();
 
+    // Defaults fill role by role: the declared `synonym` replaces the default
+    // one, and the undeclared `label` is the federation's. The manifest records
+    // both, so a consumer reading it without this server sees what applies.
+    let roles = server.get("/tox").json()["predicate_roles"].clone();
+    assert_eq!(
+        roles["synonym"],
+        serde_json::json!(["https://example.org/synonym"])
+    );
+    assert_eq!(
+        roles["label"][0],
+        "http://www.w3.org/2004/02/skos/core#prefLabel"
+    );
+    let manifest = server.get("/tox/v/v1/manifest").json();
+    assert_eq!(manifest["predicate_roles"], roles);
+
+    let response = server.get("/tox/v/v1/schema?children=classes&labels=true");
+    response.assert_status(200);
+    assert!(response.json()["labels"].is_object(), "{}", response.text());
+}
+
+#[test]
+fn a_release_resolves_with_the_roles_its_manifest_records() {
+    let deployment = Deployment::new();
+    deployment.publish_description_declaring_only_synonyms("tox", "v1", "2026-08-08T12:00:00Z");
+    // As a manifest written before defaults were filled role by role records
+    // it: `synonym` alone. A server must not fill the rest in when reading it,
+    // or the version would mean something different on every upgrade.
+    deployment.set_roles(
+        "tox",
+        "v1",
+        serde_json::json!({"synonym": ["https://example.org/synonym"]}),
+    );
+    let server = deployment.serve();
+
+    assert_eq!(
+        server.get("/tox").json()["predicate_roles"],
+        serde_json::json!({"synonym": ["https://example.org/synonym"]})
+    );
+    // With no `label` role there is no cascade, so the map is left out rather
+    // than filled with nulls that would claim the cascade looked.
     let response = server.get("/tox/v/v1/schema?children=classes&labels=true");
     response.assert_status(200);
     assert!(
@@ -2565,7 +2605,7 @@ fn bindings_query_and_post_answer_over_the_wire() {
 }
 
 #[test]
-fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
+fn search_and_labels_answer_over_the_wire() {
     let deployment = Deployment::new();
     deployment.publish_text("tox", "v1", GROWN_NT, "2026-06-01T14:03:22Z");
     let server = deployment.serve();
@@ -2588,9 +2628,11 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
     server
         .get("/tox/v/v1/search?q=&role=&predicate=&labels=true&limit=")
         .assert_status(400);
-    server
-        .get("/tox/v/v1/search?q=Alice&labels=&limit=")
-        .assert_status(400);
+    // An untouched form control is an absent one here as on every route that
+    // labels, so `labels` takes its default.
+    let blank = server.get("/tox/v/v1/search?q=Alice&labels=&lang=&limit=");
+    blank.assert_status(200);
+    assert_eq!(blank.json()["labels"], true);
     let search_page = server.request(
         "GET",
         "/tox/v/v1/search?q=Alice&predicate=ex%3Aname",
@@ -2620,11 +2662,21 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
     assert!(search_html.contains("<dt>predicates</dt>"), "{search_html}");
     assert!(!search_html.contains("all predicates"), "{search_html}");
 
-    // Locale is not part of the operation: labels are the release's stable
-    // display labels rather than a per-request localization service.
-    let with_lang = server.get("/tox/v/v1/search?q=Alice&lang=en");
-    with_lang.assert_status(400);
-    assert_eq!(with_lang.json()["code"], "malformed_request");
+    // A language preference shapes the label, not the result, and is taken
+    // wherever labels are. Untagged labels are what this release carries, and
+    // an untagged literal outranks every language the request did not name.
+    let with_lang =
+        server.get("/tox/v/v1/search?q=Alice&predicate=ex%3Aname&lang=en&label_source=true");
+    with_lang.assert_status(200);
+    assert_eq!(with_lang.json()["results"][0]["label"], "Alice");
+    assert_eq!(
+        with_lang.json()["results"][0]["label_source"],
+        serde_json::json!({"predicate": "http://example.org/name"})
+    );
+    // Shaping labels nobody asked for would change nothing, so it is refused.
+    let unlabelled = server.get("/tox/v/v1/search?q=Alice&labels=false&lang=en");
+    unlabelled.assert_status(400);
+    assert_eq!(unlabelled.json()["code"], "malformed_request");
 
     let body = serde_json::to_vec(&serde_json::json!({
         "iris": ["ex:bob", "ex:missing"]
@@ -2643,6 +2695,46 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
             {"iri": {"type": "iri", "value": "http://example.org/bob"}, "label": "Bob"},
             {"iri": {"type": "iri", "value": "http://example.org/missing"}, "label": null},
         ])
+    );
+
+    // The body takes the cascade's language preference and the switch for
+    // where each label came from — both refused before this release.
+    let shaped = serde_json::to_vec(&serde_json::json!({
+        "iris": ["ex:bob", "ex:missing"],
+        "lang": ["en", "fr"],
+        "label_source": true
+    }))
+    .unwrap();
+    let sourced = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/labels",
+        &[("Content-Type", "application/json")],
+        &shaped,
+    );
+    sourced.assert_status(200);
+    assert_eq!(
+        sourced.json()["labels"],
+        serde_json::json!([
+            {"iri": {"type": "iri", "value": "http://example.org/bob"}, "label": "Bob",
+             "label_source": {"predicate": "http://example.org/name"}},
+            {"iri": {"type": "iri", "value": "http://example.org/missing"}, "label": null,
+             "label_source": null},
+        ])
+    );
+    let unranged = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/labels",
+        &[("Content-Type", "application/json")],
+        br#"{"iris": ["ex:bob"], "lang": ["en_GB"]}"#,
+    );
+    unranged.assert_status(400);
+    assert!(
+        unranged.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("lang[0]"),
+        "{}",
+        unranged.text()
     );
     assert_eq!(
         labeled.header("accept-query").as_deref(),
@@ -2677,6 +2769,158 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
         "{empty_html}"
     );
     assert!(!empty_html.contains("response budget"), "{empty_html}");
+}
+
+#[test]
+fn row_operations_label_their_iris_when_asked() {
+    let deployment = Deployment::new();
+    // `ex:remoteName` is a label the release does not declare, for the
+    // override below.
+    deployment.publish(
+        "tox",
+        "v1",
+        &format!("{GROWN_NT}{REMOTE_NT}"),
+        "2026-06-01T14:03:22Z",
+    );
+    let server = deployment.serve();
+
+    // The modifier the issue asked for: one label per distinct IRI on the
+    // page, bound terms included, and an explicit null for one with none.
+    let page = server.get("/tox/v/v1/fragment?p=ex%3Aknows&labels=true");
+    page.assert_status(200);
+    let body = page.json();
+    assert_eq!(
+        body["labels"],
+        serde_json::json!({
+            "http://example.org/alice": "Alice",
+            "http://example.org/bob": "Bob",
+            "http://example.org/knows": null,
+        })
+    );
+    assert!(body.get("label_sources").is_none());
+    // Off unless asked for, so a page that did not ask is unchanged.
+    assert!(
+        server
+            .get("/tox/v/v1/fragment?p=ex%3Aknows")
+            .json()
+            .get("labels")
+            .is_none()
+    );
+
+    let sourced = server.get("/tox/v/v1/describe?iri=ex%3Abob&labels=true&label_source=true");
+    sourced.assert_status(200);
+    assert_eq!(
+        sourced.json()["label_sources"]["http://example.org/bob"],
+        serde_json::json!({"predicate": "http://example.org/name"})
+    );
+    assert_eq!(
+        sourced.json()["label_sources"]["http://example.org/knows"],
+        serde_json::Value::Null
+    );
+
+    let sample = server.get("/tox/v/v1/sample?p=ex%3Aknows&n=1&labels=true");
+    sample.assert_status(200);
+    assert_eq!(
+        sample.json()["labels"]["http://example.org/knows"],
+        serde_json::Value::Null
+    );
+
+    // The same field on the body form, bindings pages included.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "pattern": {"s": "?s", "p": "ex:knows", "o": "?o"},
+        "bindings": {"vars": ["?s"], "rows": [["ex:alice"]]},
+        "labels": true,
+        "lang": ["en"]
+    }))
+    .unwrap();
+    let bound = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/fragment",
+        &[("Content-Type", "application/json")],
+        &body,
+    );
+    bound.assert_status(200);
+    assert_eq!(bound.json()["labels"]["http://example.org/bob"], "Bob");
+
+    // RDF carries each label as the statement it came from, beside the page's
+    // own; an IRI with no label simply has no statement.
+    let quads = server.request(
+        "GET",
+        "/tox/v/v1/fragment?p=ex%3Aknows&labels=true",
+        &[("Accept", "application/n-quads")],
+    );
+    quads.assert_status(200);
+    let mut lines: Vec<String> = quads.text().lines().map(str::to_owned).collect();
+    lines.sort();
+    assert_eq!(
+        lines,
+        [
+            "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .",
+            "<http://example.org/alice> <http://example.org/name> \"Alice\" .",
+            "<http://example.org/bob> <http://example.org/name> \"Bob\" .",
+        ]
+    );
+    // But labels are read across every graph, so a page scoped to one cannot
+    // carry their statements without claiming they are in it.
+    let scoped = server.request(
+        "GET",
+        "/tox/v/v1/fragment?p=ex%3Aknows&g=%3Curn%3Ax-kgf%3Aunnamed%3E&labels=true",
+        &[("Accept", "application/n-quads")],
+    );
+    scoped.assert_status(406);
+    assert!(scoped.json()["detail"].as_str().unwrap().contains("union"));
+    server
+        .request(
+            "GET",
+            "/tox/v/v1/fragment?p=ex%3Aknows&g=%3Curn%3Ax-kgf%3Aunnamed%3E&labels=true",
+            &[("Accept", "application/json")],
+        )
+        .assert_status(200);
+
+    // The predicates to label with may be named for the one request, in
+    // place of the release's own and in the order given.
+    let named = server.get("/tox/v/v1/fragment?p=ex%3Aknows&labels=ex%3AremoteName");
+    named.assert_status(200);
+    assert_eq!(
+        named.json()["labels"],
+        serde_json::json!({
+            "http://example.org/alice": null,
+            "http://example.org/bob": "Bobby",
+            "http://example.org/knows": null,
+        })
+    );
+    let fallback = server.get("/tox/v/v1/fragment?p=ex%3Aknows&labels=ex%3AremoteName,ex%3Aname");
+    assert_eq!(
+        fallback.json()["labels"]["http://example.org/alice"],
+        "Alice"
+    );
+    assert_eq!(fallback.json()["labels"]["http://example.org/bob"], "Bobby");
+    let body = serde_json::to_vec(&serde_json::json!({
+        "iris": ["ex:bob"],
+        "labels": ["ex:name"]
+    }))
+    .unwrap();
+    let batch = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/labels",
+        &[("Content-Type", "application/json")],
+        &body,
+    );
+    batch.assert_status(200);
+    assert_eq!(batch.json()["labels"][0]["label"], "Bob");
+
+    // And the page is the same labels, set under each term.
+    let html = server
+        .request(
+            "GET",
+            "/tox/v/v1/fragment?p=ex%3Aknows&labels=true",
+            &[("Accept", "text/html")],
+        )
+        .text();
+    assert!(
+        html.contains("<span class=\"t-label\">Bob</span>"),
+        "{html}"
+    );
 }
 
 #[test]
@@ -4202,19 +4446,24 @@ impl Deployment {
     }
 
     fn publish_description(&self, dataset: &str, version: &str, created: &str) {
-        self.publish_description_with_labels(dataset, version, created, true);
+        self.publish_description_with_roles(dataset, version, created, true);
     }
 
-    fn publish_description_without_labels(&self, dataset: &str, version: &str, created: &str) {
-        self.publish_description_with_labels(dataset, version, created, false);
-    }
-
-    fn publish_description_with_labels(
+    fn publish_description_declaring_only_synonyms(
         &self,
         dataset: &str,
         version: &str,
         created: &str,
-        labels: bool,
+    ) {
+        self.publish_description_with_roles(dataset, version, created, false);
+    }
+
+    fn publish_description_with_roles(
+        &self,
+        dataset: &str,
+        version: &str,
+        created: &str,
+        declares_label: bool,
     ) {
         let bundle = self.bundle(dataset, version);
         Fixture::description().copy_bundle_to(&bundle);
@@ -4238,14 +4487,14 @@ impl Deployment {
             "--prefix".to_owned(),
             "ex=https://example.org/".to_owned(),
         ];
-        if labels {
+        if declares_label {
             arguments.extend([
                 "--role".to_owned(),
                 "label=https://example.org/label".to_owned(),
             ]);
         } else {
-            // Supplying a non-label role opts out of the federation defaults,
-            // whose profile deliberately includes a label cascade.
+            // A role other than `label`, which leaves `label` to the federation
+            // default.
             arguments.extend([
                 "--role".to_owned(),
                 "synonym=https://example.org/synonym".to_owned(),
@@ -4294,6 +4543,15 @@ impl Deployment {
         // built inside one test share a second. The releases here need a
         // defined order, so the timestamps are written explicitly.
         self.set_created(&bundle, created);
+    }
+
+    /// Overwrite the roles a published manifest records.
+    fn set_roles(&self, dataset: &str, version: &str, roles: serde_json::Value) {
+        let path = self.bundle(dataset, version).join("manifest.json");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["predicate_roles"] = roles;
+        std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
     }
 
     fn set_created(&self, bundle: &Path, created: &str) {
