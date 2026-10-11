@@ -1055,7 +1055,9 @@ itself.
 `QUERY` is dispatched through axum's custom-method fallback and POST is registered as
 the permanent compatibility method. Both require `Content-Type: application/json`,
 both answer JSON or HTML at the same URL, and `/fragment` and `/count` advertise
-`Accept-Query: application/json` on successes and problems. QUERY responses use the
+`Accept-Query: application/json` on successes and problems. *(Unit 36 put it on every
+response of every resource that takes QUERY, `/labels` and `/verbalize` included, and
+confined `Allow` to the 405.)* QUERY responses use the
 immutable policy and a strong ETag incorporating both the operation and request body;
 POST executes the same parsed request under `no-store`. Conditional requests remain
 method-correct despite that cache-policy difference: a matching `If-None-Match` yields
@@ -2958,6 +2960,75 @@ in 0.3 s and 38 MB against 22 s and 1.1 GB. That was measured before blank nodes
 the sample and a root's template left the descent (2026-10-11), each of which departs
 from the Python on purpose; neither has been measured against SOCKG since.
 
+### 36. `Allow` on the 405 alone, `Accept-Query` wherever QUERY is taken ✅
+
+Issue 15, 2026-10-11: a successful `QUERY /count` carried `Allow: GET,HEAD,POST`, while
+a `DELETE` on the same resource answered 405 with `Allow: GET, HEAD, POST, QUERY`. A
+client reading `Allow` on the success would conclude the resource does not take QUERY.
+
+**The cause was axum, and the hand-written lists beside it.** axum's `MethodRouter`
+adds `Allow` to *every* response its method fallback produces, whatever the status,
+unless one is already present, and builds it from the methods registered by name. QUERY
+cannot be registered by name, so it is answered from the fallback, and its 200 — like
+its 304 and its errors — got axum's list without it. The 405s were spelled three ways:
+axum's for the read-only routes (`GET,HEAD`) and two static strings for the body routes.
+`Accept-Query` had the same shape of problem: a wrapper added it to some handlers'
+successes and a path-suffix check (`/fragment`, `/count`) to problems, so GET
+`/verbalize` and every error from `/labels` and `/verbalize` — the 415 whose detail
+points at `Accept-Query` included — carried none.
+
+**What landed.** A resource's methods are a `Methods` value (`Read`, `Body`,
+`ReadOrBody`) constructed only by the three functions `routes` mounts a resource with —
+`read(handler)`, `read_or_body(handler, operation)` and `body(operation)` — each from
+the handlers it registers, so what a route answers and what it states cannot drift. One
+route layer, applied last so that it wraps the fallback too, writes `Allow` on the
+resource's 405 and `Accept-Query: application/json` on every response of a resource
+that takes QUERY. Every route is built from axum's `any`, the one constructor that adds
+no `Allow` of its own; the socket test fails if that ever stops holding. The four
+per-route POST handlers and QUERY fallbacks became one generic `with_body`, whose
+fallback refuses a method before reading anything else, so `DELETE` with an undecodable
+version segment is a 405 on `/fragment` as on `/manifest` rather than a 400 (it was a
+400 before this unit too). The `advertise_query` wrappers and `render_problems`' path
+check are gone.
+
+**Why `Allow` is on the 405 alone.** The issue would have accepted either the same
+`Allow` on both paths or none on the success. This unit first chose the former, every
+response, and review turned it round: a versioned success is cached `immutable` for a
+year under an ETag that does not cover the header, and the method list is this
+deployment's routing rather than a fact about the bundle. Were `/terms` to take QUERY
+(question 67), every stored `GET /terms` would go on saying it does not — issue 15 again,
+through caches. A 405 is never stored, so its list is always the live one; a client that
+wants it without guessing can send any method and read the refusal. `Accept-Query` stays
+on cached responses, as unit 16 put it there, because it only ever *adds* a method: a
+stale copy can say QUERY works where it no longer does, which the 405 then corrects, but
+its absence denies nothing.
+
+**What states nothing.** A response no resource produced: the router's 404, the
+`latest` redirect (its methods are its target's), a CORS preflight, and the 413 the wire
+body limit returns for a declared `Content-Length` before routing. A chunked body that
+turns out oversized while the resource reads it is refused by the resource, so that 413
+carries `Accept-Query`; which side a 413 falls on is decided by the framing, and the test
+pins both. A 413 on `/fragment` or `/count` with a declared length carried `Accept-Query`
+by path before and does not now; its remedy is a smaller body, which the header does not
+help with.
+
+**CORS keeps one list for every path.** A preflight is answered before routing, for
+paths that name nothing as well as ones that do, and what it grants is permission for a
+browser to send the request, not a statement of what the target takes: the request then
+meets the resource, whose 405 is the authority. So `cross_origin_methods` approves every
+method some resource takes, and a unit test holds it equal to the union of the `Methods`
+lists, since nothing else keeps the two together. Question 100.
+
+*Verified by* `a_resource_states_its_methods_where_they_cannot_go_stale`, a socket test,
+labelled per case, of the status, `Allow` and `Accept-Query` on successes, a 304,
+parameter, path and media-type errors, and 405s across the service descriptor,
+`/healthz`, a read-only resource, `/tpf`, a download, `/fragment`, `/count`, `/verbalize`
+and `/labels`; of neither header on a redirect and a 404; and of both 413 framings.
+Against the previous router it fails on the issue's own case, against this unit's first
+form on `Allow` on a success, and with the path read before the method on the undecodable
+`DELETE`. `a_preflight_approves_exactly_the_methods_some_resource_takes` holds the CORS
+list to the resources'.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
@@ -4142,6 +4213,17 @@ following the code.
     adopting it means moving that ranking down to where both can call it rather than a
     second copy. Doc 13 §13.1 says nothing of language; doc 19 §19.4's cascade is the
     reference either way.
+
+100. **Which responses carry `Allow` and `Accept-Query`?** Doc 03 §3.6 says "responses
+    carry `Accept-Query`" and §3.6.1 that a 405 carries `Allow`, and neither says which
+    other responses do. Issue 15 was a client reading `Allow` on a 200 and being told
+    the opposite of the 405. Unit 36 settled it here as `Allow` on the 405 alone, because
+    a versioned success is cached for a year and the method list is the deployment's,
+    not the bundle's; and `Accept-Query` on every response of a resource that takes
+    QUERY, because a stale copy of it can only add a method. A client can rely on that
+    only if the spec says so. Proposed for §3.6's methods bullet: `Allow` appears on a
+    405 and on no cacheable response, and a client learns a resource's methods from a
+    405 or from `Accept-Query`, never from a stored success.
 
 ## Not in this plan
 
