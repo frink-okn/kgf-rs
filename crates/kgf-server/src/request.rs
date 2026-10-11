@@ -866,12 +866,7 @@ impl Verbalize {
                 ),
             ));
         }
-        let config: VerbalizeConfig = serde_norway::from_str(text).map_err(|error| {
-            Problem::new(
-                ErrorCode::MalformedRequest,
-                format!("config does not parse as a verbalization config: {error}"),
-            )
-        })?;
+        let config = verbalize_config_text(text, limits.budgets.max_request_bytes)?;
         let mut iris = Vec::new();
         if let Some(list) = params.get("iri") {
             for text in term_list("iri", list)? {
@@ -1129,6 +1124,159 @@ impl ObservedRequest for Verbalize {
             targets: self.resolved.targets.len() as u64,
             roots: self.requested_roots(),
         }
+    }
+}
+
+/// Parse `/verbalize`'s GET config, YAML or JSON, held to `limit` bytes once
+/// its aliases are expanded.
+///
+/// An alias replays its anchored node wherever it appears, so a document of a
+/// few kilobytes can deserialize to gigabytes: one anchored list of IRIs
+/// aliased under every target is the product of the two. The YAML parser's
+/// own guard counts alias jumps, not what a jump replays, so it does not stop
+/// that. A first pass therefore measures the document as if written out —
+/// each scalar's bytes, and one per sequence element and mapping entry —
+/// without building anything, abandoning the walk as soon as the measure
+/// passes `limit`; only a document within it is deserialized. `limit` is
+/// `max_request_bytes`, the bound a body's config has, and a document without
+/// aliases measures under its own length, so this refuses only expansion.
+fn verbalize_config_text(text: &str, limit: u64) -> Result<VerbalizeConfig, Problem> {
+    let budget = ExpansionBudget {
+        remaining: std::cell::Cell::new(limit),
+        exceeded: std::cell::Cell::new(false),
+    };
+    // The walk's own result matters only through `exceeded`: a document it
+    // could not walk fails the real parse the same way, and that parse's
+    // message is the one to report.
+    let _ = serde::de::DeserializeSeed::deserialize(
+        Expanded { budget: &budget },
+        serde_norway::Deserializer::from_str(text),
+    );
+    if budget.exceeded.get() {
+        return Err(Problem::new(
+            ErrorCode::PayloadTooLarge,
+            format!(
+                "config expands past this server's max_request_bytes of {limit} once its YAML \
+                 aliases are replayed; write the repeated lists out, or put them under defaults"
+            ),
+        ));
+    }
+    serde_norway::from_str(text).map_err(|error| {
+        Problem::new(
+            ErrorCode::MalformedRequest,
+            format!("config does not parse as a verbalization config: {error}"),
+        )
+    })
+}
+
+/// What remains of [`verbalize_config_text`]'s limit, and whether a walk
+/// has run past it.
+struct ExpansionBudget {
+    remaining: std::cell::Cell<u64>,
+    exceeded: std::cell::Cell<bool>,
+}
+
+/// A walk of any YAML value that charges its expanded size to a budget and
+/// keeps nothing.
+#[derive(Clone, Copy)]
+struct Expanded<'a> {
+    budget: &'a ExpansionBudget,
+}
+
+impl Expanded<'_> {
+    fn charge<E: serde::de::Error>(self, bytes: usize) -> Result<(), E> {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        match self.budget.remaining.get().checked_sub(bytes) {
+            Some(left) => {
+                self.budget.remaining.set(left);
+                Ok(())
+            }
+            None => {
+                self.budget.exceeded.set(true);
+                Err(E::custom("the config expands past the request limit"))
+            }
+        }
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Expanded<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Expanded<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("any YAML value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        self.charge(1)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        self.charge(1)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        self.charge(1)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        self.charge(1)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<(), E> {
+        self.charge(value.len())
+    }
+
+    fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<(), E> {
+        self.charge(value.len())
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<(), E> {
+        self.charge(1)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        self.charge(1)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_newtype_struct<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq.next_element_seed(self)?.is_some() {
+            self.charge(1)?;
+        }
+        Ok(())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while map.next_key_seed(self)?.is_some() {
+            map.next_value_seed(self)?;
+            self.charge(1)?;
+        }
+        Ok(())
+    }
+
+    fn visit_enum<A: serde::de::EnumAccess<'de>>(self, data: A) -> Result<(), A::Error> {
+        // A tagged node: the tag, then what it tags.
+        use serde::de::VariantAccess as _;
+        let ((), variant) = data.variant_seed(self)?;
+        variant.newtype_variant_seed(self)
     }
 }
 
@@ -6252,5 +6400,49 @@ mod tests {
             fragment("cursor=not-a-token").unwrap_err().code(),
             ErrorCode::StaleCursor
         );
+    }
+
+    #[test]
+    fn a_get_config_is_held_to_the_limit_once_its_aliases_expand() {
+        // One anchored list aliased under every target: a document the size
+        // of the list plus the targets that deserializes to their product.
+        let iris: Vec<String> = (0..100)
+            .map(|i| format!("http://example.org/p{i}"))
+            .collect();
+        let mut bomb = format!(
+            "targets:\n  t0: {{type: http://example.org/T, ignore_predicates: &l [{}]}}\n",
+            iris.join(", ")
+        );
+        for t in 1..100 {
+            bomb.push_str(&format!(
+                "  t{t}: {{type: http://example.org/T, ignore_predicates: *l}}\n"
+            ));
+        }
+        assert!(bomb.len() < 16 * 1024);
+        let refused = verbalize_config_text(&bomb, 64 * 1024).unwrap_err();
+        assert_eq!(refused.code(), ErrorCode::PayloadTooLarge);
+        assert!(problem_detail(&refused).contains("aliases"));
+        // The same document fits a limit its expansion is under.
+        let config = verbalize_config_text(&bomb, 1024 * 1024).unwrap();
+        assert_eq!(config.targets["t99"].ignore_predicates.len(), 100);
+
+        // An alias whose expansion fits is a convenience, not a refusal.
+        let shared = "targets:\n  \
+                      a: {type: http://example.org/A, ignore_predicates: &skip [http://example.org/p]}\n  \
+                      b: {type: http://example.org/B, ignore_predicates: *skip}\n";
+        let config = verbalize_config_text(shared, 1024).unwrap();
+        assert_eq!(
+            config.targets["b"].ignore_predicates,
+            ["http://example.org/p"]
+        );
+
+        // A document without aliases measures within its own length.
+        let plain = r#"{"targets": {"t": {"type": "http://example.org/T",
+                        "label_predicates": ["http://example.org/a", "http://example.org/b"]}}}"#;
+        assert!(verbalize_config_text(plain, plain.len() as u64).is_ok());
+
+        // And a malformed one is reported as malformed, not as large.
+        let broken = verbalize_config_text("targets: [", 1024).unwrap_err();
+        assert_eq!(broken.code(), ErrorCode::MalformedRequest);
     }
 }

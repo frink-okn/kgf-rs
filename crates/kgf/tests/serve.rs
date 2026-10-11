@@ -5467,6 +5467,25 @@ fn verbalize_refuses_what_it_cannot_answer_by_name() {
     // A body operation without JSON is refused as one.
     let not_json = server.request_with_body("QUERY", "/tox/v/2026-06-01/verbalize", &[], b"{}");
     not_json.assert_status(415);
+
+    // YAML aliases that would expand a short GET past the request limit are
+    // refused before the config is built: one anchored list of two hundred
+    // IRIs, aliased under three hundred targets.
+    let iris: Vec<String> = (0..200)
+        .map(|i| format!("http://example.org/p{i}"))
+        .collect();
+    let mut bomb = format!(
+        "targets:\n  t0: {{type: http://example.org/T, ignore_predicates: &l [{}]}}\n",
+        iris.join(", ")
+    );
+    for t in 1..300 {
+        bomb.push_str(&format!(
+            "  t{t}: {{type: http://example.org/T, ignore_predicates: *l}}\n"
+        ));
+    }
+    let expanded = server.get(&verbalize_url(&[("config", &bomb), ("target", "t0")]));
+    expanded.assert_status(413);
+    assert_eq!(expanded.json()["code"], "payload_too_large");
 }
 
 #[test]
