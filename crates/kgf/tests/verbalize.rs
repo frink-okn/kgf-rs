@@ -252,6 +252,26 @@ fn a_predicate_limit_keeps_the_same_sample_on_every_run() {
 }
 
 #[test]
+fn a_blank_node_takes_no_place_in_a_predicate_sample() {
+    // One literal among twenty blank nodes, under a limit of one. A blank
+    // node is never written, so sampled with the rest it would most likely
+    // take the one place and leave the predicate out of the text.
+    let blanks: Vec<String> = (0..20).map(|i| format!("_:b{i}")).collect();
+    let mut triples = vec![("a", RDF_TYPE, "Thing"), ("a", "p", "\"kept\"")];
+    for blank in &blanks {
+        triples.push(("a", "p", blank));
+    }
+    let published = Published::build(&graph(&triples));
+    let config = parse_config(
+        r#"{"targets": {"thing": {"type": "http://example.com/Thing", "predicate_limit": 1}}}"#,
+    );
+    let rendered = one(&published.store, &config, &format!("{EX}a"));
+    assert!(rendered.text.contains("\np: kept"), "{}", rendered.text);
+    // Nor is the predicate counted as sampled down: one nameable value fits.
+    assert_eq!(rendered.limited, 0);
+}
+
+#[test]
 fn an_unchanged_node_reads_the_same_when_ids_shift() {
     // Two bundles holding the same root, one with extra terms that shift every
     // id: the text is the same, because nothing in it is keyed on an id.

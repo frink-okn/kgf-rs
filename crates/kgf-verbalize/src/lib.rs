@@ -35,13 +35,14 @@
 //!    skipped.
 //! 2. Read the root's star `s ? ?`, group by predicate, drop predicates on the
 //!    ignore list or off a declared allow list.
-//! 3. Per predicate, keep the `predicate_limit` values with the smallest
+//! 3. Per predicate, drop blank-node values, which no line can name, and
+//!    keep the `predicate_limit` remaining values with the smallest
 //!    [`text::stable_score`] — a uniform sample keyed on the strings, so an
 //!    unchanged node samples the same values in every build — and emit them
 //!    in score order.
 //! 4. Name each value: a literal's lexical form; an IRI's label through the
 //!    profile for its class, then the label cascade, then its humanized
-//!    fragment. Blank-node values are skipped.
+//!    fragment.
 //! 5. Name the root the same way, except that its target's `label_template`
 //!    is tried first: it was written for this node in this position, so it
 //!    beats the profile of the root's class, which was written for the node
@@ -815,7 +816,12 @@ impl<'a> Verbalizer<'a> {
             let predicate_iri = self.resolve(Role::Predicate, predicate)?;
             let mut scored = Vec::with_capacity(objects.len());
             for &(_, object) in objects {
-                let key = self.score_key(object)?;
+                // A blank node is never written, so it takes no slot: the
+                // sample is drawn from the values a line can name, or a blank
+                // node scoring low would crowd out the value it displaced.
+                let Some(key) = self.score_key(object)? else {
+                    continue;
+                };
                 scored.push((stable_score(root_iri, &predicate_iri, &key), object));
             }
             scored.sort_unstable();
@@ -843,13 +849,15 @@ impl<'a> Verbalizer<'a> {
         })
     }
 
-    /// The object's string as [`text::stable_score`] keys it: a literal's
-    /// lexical form, an IRI, or a blank node with its `_:`.
-    fn score_key(&mut self, object: u64) -> Result<String, Error> {
+    /// The object's string as [`text::stable_score`] keys it — a literal's
+    /// lexical form, or an IRI — or `None` for a blank node, which no line
+    /// names.
+    fn score_key(&mut self, object: u64) -> Result<Option<String>, Error> {
         let text = self.resolve(Role::Object, object)?;
         Ok(match classify(&text) {
-            TermKind::Literal(value) => value.to_owned(),
-            TermKind::Iri(_) | TermKind::BlankNode => text.to_string(),
+            TermKind::Literal(value) => Some(value.to_owned()),
+            TermKind::Iri(_) => Some(text.to_string()),
+            TermKind::BlankNode => None,
         })
     }
 
