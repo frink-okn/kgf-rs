@@ -785,8 +785,9 @@ pub struct Verbalize {
     pub label_predicates: Vec<String>,
     /// Bytes the rendered texts may occupy.
     pub bytes: ResponseBytes,
-    /// Triples the whole request may read: every root's star and every
-    /// probe naming what a text mentions, charged to one figure.
+    /// Reads the whole request may make — each probe of the store, for a
+    /// root's star or for naming what a text mentions, and each row a probe
+    /// yields — charged to one figure.
     pub read_budget: u64,
 }
 

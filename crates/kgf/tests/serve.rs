@@ -5528,3 +5528,47 @@ fn verbalize_charges_every_read_to_one_candidate_budget() {
     let plan = server.get(&verbalize_url(&[("config", VERBALIZE_CONFIG)]));
     assert_eq!(plan.json()["complete"], true);
 }
+
+#[test]
+fn verbalize_charges_a_probe_that_finds_nothing() {
+    // A template may name any number of fields, and a field that is empty
+    // for the node being named is still a probe of the store. Two hundred
+    // fields, every one empty for the location a site mentions, find no rows
+    // between them; charged only by rows they would cost nothing, so the
+    // config would choose the request's cost rather than the budget.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", TYPED_NT, "2026-06-01T14:03:22Z");
+    let fields: serde_json::Map<String, serde_json::Value> = (0..200)
+        .map(|i| (format!("f{i}"), "http://example.org/crop".into()))
+        .collect();
+    let template: String = (0..200).map(|i| format!("{{f{i}}}")).collect();
+    let config = serde_json::json!({
+        "profiles": {"location": {"type": "http://example.org/Location",
+                                  "template": template, "fields": fields}},
+        "targets": {"site": {"type": "http://example.org/Site"}}
+    })
+    .to_string();
+    let url = verbalize_url(&[("config", &config), ("iri", "ex:site1")]);
+
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.candidate_budget = 100;
+    let answer = deployment
+        .serve_with_limits(kgf_server::Caps::new(), budgets)
+        .get(&url);
+    answer.assert_status(200);
+    answer.assert_header("kgf-truncation-reason", "candidate_budget");
+    assert_eq!(answer.json()["records"][0]["truncated"], true);
+
+    // Under the default budget the empty template falls through to the
+    // location's name, and the text is whole.
+    let answer = deployment.serve().get(&url);
+    let body = answer.json();
+    assert_eq!(body["complete"], true);
+    assert!(
+        body["records"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("at: Auburn"),
+        "{body}"
+    );
+}

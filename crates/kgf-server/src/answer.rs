@@ -5513,9 +5513,11 @@ fn scanned_row(
 /// the sampled texts' lengths — the "what would this config produce" question,
 /// answered without a build.
 ///
-/// Every triple the render reads — a root's star, and the type, template and
-/// cascade probes that name each node a text mentions — is charged to one
-/// candidate budget for the request. When it runs out, the root in hand is
+/// Every probe the render makes — a root's star, and the type, template and
+/// cascade probes that name each node a text mentions — and every row a probe
+/// yields is charged to one candidate budget for the request. A probe that
+/// finds nothing is charged too, since the config decides how many there are.
+/// When the budget runs out, the root in hand is
 /// delivered marked `truncated`, no further root is rendered, and the answer
 /// says the candidate budget was exhausted. The roots are bounded by
 /// `max_verbalize_roots`, and the response stops at its byte budget. A

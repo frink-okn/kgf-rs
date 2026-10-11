@@ -549,8 +549,9 @@ pub struct Verbalizer<'a> {
     store: &'a Store,
     dictionary: Dictionary<'a>,
     bound: &'a Bound,
-    /// Triples this verbalizer may still read, across every root; `None`
-    /// reads without bound.
+    /// Reads this verbalizer may still make, across every root: one per
+    /// probe of the store and one per row a probe yields. `None` reads
+    /// without bound.
     budget: Option<usize>,
     /// Whether a read has been cut short by the budget. Once true, every
     /// text rendered from here on is an approximation.
@@ -590,21 +591,24 @@ impl<'a> Verbalizer<'a> {
         }
     }
 
-    /// Read at most `triples` over the life of this verbalizer: every root's
-    /// star, and every probe that names a node a text mentions — its types,
-    /// a template field's values, the cascade — all charged to the one
-    /// figure.
+    /// Make at most `reads` reads over the life of this verbalizer: one per
+    /// probe of the store — a root's star, a mentioned node's types, a
+    /// template field, a cascade predicate — and one per row a probe yields,
+    /// all charged to the one figure.
     ///
     /// A build reads without bound, because `predicate_limit` selects from
     /// all of a predicate's values. A bounded-cost server cannot: one root
     /// with a million edges, or one mention of a node with a million values
     /// under a profiled field, would be a million-row read behind a request
-    /// that asked for one text. Past the budget every read comes back short,
-    /// the texts are marked [`truncated`](Rendered::truncated), and
-    /// [`exhausted`](Self::exhausted) says so, which is a caller's cue to
-    /// stop rendering roots.
-    pub fn with_read_budget(mut self, triples: usize) -> Self {
-        self.budget = Some(triples);
+    /// that asked for one text. A probe is charged before it is made, rows or
+    /// none, because the config chooses how many there are: a template may
+    /// name any number of fields and a cascade any number of predicates, empty
+    /// for most nodes, and each is still a descent per mention. Past the
+    /// budget every read comes back short, the texts are marked
+    /// [`truncated`](Rendered::truncated), and [`exhausted`](Self::exhausted)
+    /// says so, which is a caller's cue to stop rendering roots.
+    pub fn with_read_budget(mut self, reads: usize) -> Self {
+        self.budget = Some(reads);
         self
     }
 
@@ -808,6 +812,9 @@ impl<'a> Verbalizer<'a> {
         pattern: IdPattern,
         map: impl Fn(IdTriple) -> T,
     ) -> Result<Vec<T>, Error> {
+        if !self.take() {
+            return Ok(Vec::new());
+        }
         let selection = self.store.resolve(pattern)?;
         let mut rows = Vec::new();
         for triple in selection.page(0, usize::MAX) {
@@ -819,9 +826,10 @@ impl<'a> Verbalizer<'a> {
         Ok(rows)
     }
 
-    /// Charge one row to the budget: whether it may be read. Every row any
-    /// walk consumes passes through here, so whatever the budget bounds, it
-    /// bounds here; a row refused is what makes the run exhausted.
+    /// Charge one read to the budget — a probe, or a row it yields — and say
+    /// whether it may be made. Every probe and every row any walk consumes
+    /// passes through here, so whatever the budget bounds, it bounds here; a
+    /// read refused is what makes the run exhausted.
     fn take(&mut self) -> bool {
         match &mut self.budget {
             Some(0) => {
@@ -1011,10 +1019,14 @@ impl<'a> Verbalizer<'a> {
     }
 
     /// The first literal value along the target's cascade. Reads no further
-    /// than that value: a label predicate with many values costs one row.
+    /// than that value: a label predicate with many values costs its probe
+    /// and one row.
     fn first_literal(&mut self, subject: u64, target: usize) -> Result<Option<Rc<str>>, Error> {
         let bound = self.bound;
         for predicate in bound.cascade(target) {
+            if !self.take() {
+                return Ok(None);
+            }
             let selection = self.store.resolve(IdPattern {
                 subject: Some(subject),
                 predicate: Some(predicate),
