@@ -2608,6 +2608,167 @@ fn bindings_query_and_post_answer_over_the_wire() {
         .assert_status(405);
 }
 
+/// A resource states the methods it takes on every response it produces, in
+/// one spelling, whichever method asked and however the request ended.
+///
+/// The router adds its own `Allow` to whatever a method fallback produces,
+/// listing only the methods registered by name. `QUERY` is answered from that
+/// fallback, so left alone a successful `QUERY` says its resource does not take
+/// `QUERY` while the 405 beside it says it does.
+#[test]
+fn every_response_states_the_methods_its_resource_takes() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", TYPED_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let base = "/tox/v/2026-06-01";
+    let path = |resource: &str| format!("{base}/{resource}");
+    let json = [("Content-Type", "application/json")];
+    let text = [("Content-Type", "text/plain")];
+    let bindings = serde_json::to_vec(&serde_json::json!({
+        "pattern": {"s": "?site", "p": "ex:name", "o": "?name"},
+        "bindings": {"vars": ["?site"], "rows": [["ex:site1"]]}
+    }))
+    .unwrap();
+    let labels = br#"{"iris": ["ex:site1"]}"#;
+    let verbalize = serde_json::to_vec(&serde_json::json!({
+        "config": serde_json::from_str::<serde_json::Value>(VERBALIZE_CONFIG).unwrap(),
+        "target": "site",
+        "iris": ["ex:site1"],
+    }))
+    .unwrap();
+
+    // The report this began from: a successful QUERY and a refused method on
+    // the same resource disagreed about whether it takes QUERY.
+    let counted = server.request_with_body("QUERY", &path("count"), &json, &bindings);
+    counted.assert_status(200);
+    let refused = server.request("DELETE", &path("count"), &[]);
+    refused.assert_status(405);
+    assert_eq!(counted.header("allow"), refused.header("allow"));
+
+    let etag = server
+        .request_with_body("QUERY", &path("fragment"), &json, &bindings)
+        .header("etag")
+        .expect("a QUERY response carries an ETag");
+    let unchanged = [
+        ("Content-Type", "application/json"),
+        ("If-None-Match", etag.as_str()),
+    ];
+
+    const READ: &str = "GET, HEAD";
+    const READ_OR_BODY: &str = "GET, HEAD, POST, QUERY";
+    const BODY: &str = "POST, QUERY";
+    let answered = [
+        (READ, 200, server.get("/")),
+        (READ, 200, server.get(&path("manifest"))),
+        (READ, 200, server.request("HEAD", &path("manifest"), &[])),
+        (READ, 400, server.get(&path("describe"))),
+        (READ, 405, server.request("QUERY", &path("manifest"), &[])),
+        (READ, 405, server.request("POST", &path("search"), &[])),
+        (
+            READ,
+            200,
+            server.request("HEAD", &path("export/data.hdt"), &[]),
+        ),
+        (READ_OR_BODY, 200, server.get(&path("fragment?p=ex:name"))),
+        (
+            READ_OR_BODY,
+            200,
+            server.request("HEAD", &path("fragment?p=ex:name"), &[]),
+        ),
+        (READ_OR_BODY, 400, server.get(&path("fragment?limit=x"))),
+        (
+            READ_OR_BODY,
+            200,
+            server.request_with_body("QUERY", &path("fragment"), &json, &bindings),
+        ),
+        (
+            READ_OR_BODY,
+            304,
+            server.request_with_body("QUERY", &path("fragment"), &unchanged, &bindings),
+        ),
+        (
+            READ_OR_BODY,
+            200,
+            server.request_with_body("POST", &path("fragment"), &json, &bindings),
+        ),
+        (
+            READ_OR_BODY,
+            415,
+            server.request_with_body("QUERY", &path("fragment"), &text, &bindings),
+        ),
+        (
+            READ_OR_BODY,
+            405,
+            server.request("PUT", &path("fragment"), &[]),
+        ),
+        (READ_OR_BODY, 200, server.get(&path("count?p=ex:name"))),
+        (
+            READ_OR_BODY,
+            200,
+            server.request_with_body("POST", &path("count"), &json, &bindings),
+        ),
+        (
+            READ_OR_BODY,
+            200,
+            server.get(&verbalize_url(&[("config", VERBALIZE_CONFIG)])),
+        ),
+        (READ_OR_BODY, 400, server.get(&path("verbalize"))),
+        (
+            READ_OR_BODY,
+            200,
+            server.request_with_body("QUERY", &path("verbalize"), &json, &verbalize),
+        ),
+        (
+            READ_OR_BODY,
+            415,
+            server.request_with_body("POST", &path("verbalize"), &text, &verbalize),
+        ),
+        (
+            READ_OR_BODY,
+            405,
+            server.request("DELETE", &path("verbalize"), &[]),
+        ),
+        (
+            BODY,
+            200,
+            server.request_with_body("QUERY", &path("labels"), &json, labels),
+        ),
+        (
+            BODY,
+            200,
+            server.request_with_body("POST", &path("labels"), &json, labels),
+        ),
+        (
+            BODY,
+            415,
+            server.request_with_body("QUERY", &path("labels"), &text, labels),
+        ),
+        (BODY, 405, server.get(&path("labels"))),
+        (BODY, 405, server.request("HEAD", &path("labels"), &[])),
+    ];
+    for (index, (allow, status, response)) in answered.iter().enumerate() {
+        response.assert_status(*status);
+        response.assert_header("allow", allow);
+        // `Accept-Query` is the method's own advertisement, so it travels with
+        // `QUERY` in `Allow` and nowhere else.
+        assert_eq!(
+            response.header("accept-query").as_deref(),
+            allow.contains("QUERY").then_some("application/json"),
+            "case {index}"
+        );
+    }
+
+    // No resource answered these, so none states its methods: the redirect's
+    // methods are its target's, and a path that names nothing has none.
+    for response in [
+        server.request("QUERY", "/tox/latest/count", &json),
+        server.get(&path("nothing")),
+    ] {
+        assert_eq!(response.header("allow"), None);
+        assert_eq!(response.header("accept-query"), None);
+    }
+}
+
 #[test]
 fn search_and_labels_answer_over_the_wire() {
     let deployment = Deployment::new();

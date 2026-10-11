@@ -10,9 +10,17 @@
 //! # Method dispatch, including QUERY
 //!
 //! axum has no custom-method filter, so `QUERY` reaches the method fallback
-//! with its method intact. `/fragment` and `/count` dispatch it there, while
-//! their ordinary `POST` fallback is registered directly. Other methods get a
-//! coded 405 whose `Allow` includes the extension method.
+//! with its method intact. A resource that takes a body answers it there,
+//! while its ordinary `POST` fallback is registered directly. Other methods get
+//! a coded 405.
+//!
+//! What a resource takes is declared once, by the function that mounts it —
+//! [`read`], [`read_or_body`] or [`body`] — and that one [`Methods`] value both
+//! registers the handlers and writes the resource's `Allow` and `Accept-Query`
+//! onto every response it produces, success and error alike. Left to itself,
+//! axum supplies `Allow` on every response a method fallback produces, not only
+//! the 405, listing just the methods registered by name: a successful `QUERY`
+//! would say the resource does not take `QUERY`.
 //!
 //! # Every error is rendered in one place
 //!
@@ -24,11 +32,13 @@
 //! code, so none of them can be the one that forgets `Vary` or answers a
 //! browser with raw JSON.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, OriginalUri, Request, State};
+use axum::handler::Handler;
 use axum::http::header::{
     ACCEPT, ALLOW, CACHE_CONTROL, CONTENT_TYPE, ETAG, LOCATION, RETRY_AFTER, VARY,
 };
@@ -92,58 +102,45 @@ pub const RESERVED_DATASET_IDS: &[&str] = &["healthz"];
 /// problem rendering, CORS, access records — is the shared stack both carry.
 pub fn router(service: Arc<Service>) -> Router {
     let api = Router::new()
-        .route("/", read(get(service_descriptor)))
+        .route("/", read(service_descriptor))
         // Before the dataset wildcard in reading order, though not in
         // matching order: the router prefers a static segment to a
         // parameter whatever the registration order, which is exactly why
         // `healthz` is a reserved dataset id.
-        .route(HEALTH_PATH, read(get(health)))
-        .route("/{dataset}", read(get(dataset_descriptor)))
+        .route(HEALTH_PATH, read(health))
+        .route("/{dataset}", read(dataset_descriptor))
         // Method-preserving by construction: `any` hands every method to the
         // same handler, which answers 307. A router that matched only
-        // GET here would answer a QUERY with 405 and hide the redirect.
+        // GET here would answer a QUERY with 405 and hide the redirect. It
+        // states no `Allow`, because the methods are the target's to state.
         .route("/{dataset}/latest/{*rest}", any(latest_redirect))
-        .route(
-            "/{dataset}/v/{version}/manifest",
-            read(get(bundle_manifest)),
-        )
+        .route("/{dataset}/v/{version}/manifest", read(bundle_manifest))
         // Read operations. Bindings use QUERY canonically and POST as a
         // compatibility fallback on `/fragment` and `/count`.
         .route(
             "/{dataset}/v/{version}/fragment",
-            get(fragment)
-                .post(fragment_bindings_post)
-                .fallback(fragment_fallback),
+            read_or_body(fragment, binding_fragment),
         )
-        .route("/{dataset}/v/{version}/tpf", read(get(tpf)))
+        .route("/{dataset}/v/{version}/tpf", read(tpf))
         .route(
             "/{dataset}/v/{version}/count",
-            get(count)
-                .post(count_bindings_post)
-                .fallback(count_fallback),
+            read_or_body(count, binding_count),
         )
-        .route("/{dataset}/v/{version}/describe", read(get(describe)))
-        .route("/{dataset}/v/{version}/sample", read(get(sample)))
-        .route("/{dataset}/v/{version}/search", read(get(search)))
-        .route("/{dataset}/v/{version}/terms", read(get(terms)))
-        .route("/{dataset}/v/{version}/graphs", read(get(graphs)))
-        .route("/{dataset}/v/{version}/schema", read(get(schema)))
-        .route("/{dataset}/v/{version}/void", read(get(void)))
-        .route("/{dataset}/v/{version}/summary", read(get(summary)))
-        .route(
-            "/{dataset}/v/{version}/labels",
-            MethodRouter::new()
-                .post(labels_post)
-                .fallback(labels_fallback),
-        )
+        .route("/{dataset}/v/{version}/describe", read(describe))
+        .route("/{dataset}/v/{version}/sample", read(sample))
+        .route("/{dataset}/v/{version}/search", read(search))
+        .route("/{dataset}/v/{version}/terms", read(terms))
+        .route("/{dataset}/v/{version}/graphs", read(graphs))
+        .route("/{dataset}/v/{version}/schema", read(schema))
+        .route("/{dataset}/v/{version}/void", read(void))
+        .route("/{dataset}/v/{version}/summary", read(summary))
+        .route("/{dataset}/v/{version}/labels", body(labels_operation))
         // The config travels as a GET parameter for a browser and as a JSON
         // body for a program; QUERY is canonical for the body and POST the
         // fallback, as on `/fragment`.
         .route(
             "/{dataset}/v/{version}/verbalize",
-            get(verbalize)
-                .post(verbalize_post)
-                .fallback(verbalize_fallback),
+            read_or_body(verbalize, verbalize_operation),
         )
         .fallback(no_such_route);
     let api = shared_layers(api, &service)
@@ -172,10 +169,7 @@ pub fn router(service: Arc<Service>) -> Router {
         .layer(middleware::from_fn(mark_encoding_negotiated));
 
     let downloads = shared_layers(
-        Router::new().route(
-            "/{dataset}/v/{version}/export/{artifact}",
-            read(get(export)),
-        ),
+        Router::new().route("/{dataset}/v/{version}/export/{artifact}", read(export)),
         &service,
     );
 
@@ -231,13 +225,177 @@ fn query_method() -> Method {
     Method::from_bytes(b"QUERY").expect("QUERY is a valid method token")
 }
 
-/// Mount a read-only route: the given methods, and a coded 405 for the rest.
+/// The methods a resource takes.
 ///
-/// axum supplies the `Allow` header for a method fallback, so what is added
-/// here is the problem document: *every* error response carries a
-/// code, and an empty 405 body is the one an off-the-shelf router gives away.
-fn read(method_router: MethodRouter<Arc<Service>>) -> MethodRouter<Arc<Service>> {
-    method_router.fallback(method_not_allowed)
+/// Only the mounting functions construct one, each from the handlers it
+/// registers, so the methods a resource answers and the methods it states
+/// cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Methods {
+    /// `GET`, and `HEAD` with it.
+    Read,
+    /// A JSON body, by `QUERY` canonically or `POST` as the fallback.
+    Body,
+    /// Both: the request in a query string by `GET`, or in a body.
+    ReadOrBody,
+}
+
+impl Methods {
+    /// The `Allow` value (RFC 9110 §10.2.1), in the one spelling every response
+    /// uses.
+    fn allow(self) -> HeaderValue {
+        HeaderValue::from_static(match self {
+            Self::Read => "GET, HEAD",
+            Self::Body => "POST, QUERY",
+            Self::ReadOrBody => "GET, HEAD, POST, QUERY",
+        })
+    }
+
+    const fn takes_query(self) -> bool {
+        match self {
+            Self::Read => false,
+            Self::Body | Self::ReadOrBody => true,
+        }
+    }
+
+    /// State the methods on one of the resource's responses.
+    ///
+    /// Every response, not only the 405 that RFC 9110 obliges to carry
+    /// `Allow`: which methods a resource takes is a fact about the resource, so
+    /// a client may learn it from whatever the resource last said.
+    /// `Accept-Query` comes with it wherever `QUERY` is taken, because RFC
+    /// 10008 makes that header the advertisement of the method.
+    fn state(self, headers: &mut HeaderMap) {
+        headers.insert(ALLOW, self.allow());
+        if self.takes_query() {
+            headers.insert(ACCEPT_QUERY, HeaderValue::from_static("application/json"));
+        }
+    }
+}
+
+/// RFC 10008's response header naming the media types a `QUERY` body may take.
+const ACCEPT_QUERY: HeaderName = HeaderName::from_static("accept-query");
+
+/// Mount a resource that takes `GET` and `HEAD`, and a coded 405 for the rest.
+///
+/// The problem document is the point of the fallback: *every* error response
+/// carries a code, and an empty 405 body is the one an off-the-shelf router
+/// gives away.
+fn read<H, T>(handler: H) -> MethodRouter<Arc<Service>>
+where
+    H: Handler<T, Arc<Service>>,
+    T: 'static,
+{
+    stated(Methods::Read, get(handler).fallback(method_not_allowed))
+}
+
+/// Mount a resource whose request comes as a query string by `GET` or as a
+/// JSON body by `QUERY` or `POST`.
+fn read_or_body<H, T, Operation, Answer>(
+    handler: H,
+    operation: Operation,
+) -> MethodRouter<Arc<Service>>
+where
+    H: Handler<T, Arc<Service>>,
+    T: 'static,
+    Operation: BodyHandler<Answer>,
+    Answer: Future<Output = Result<Response, Problem>> + Send + 'static,
+{
+    stated(Methods::ReadOrBody, with_body(get(handler), operation))
+}
+
+/// Mount a resource whose request is only ever a JSON body, by `QUERY` or
+/// `POST`.
+fn body<Operation, Answer>(operation: Operation) -> MethodRouter<Arc<Service>>
+where
+    Operation: BodyHandler<Answer>,
+    Answer: Future<Output = Result<Response, Problem>> + Send + 'static,
+{
+    stated(Methods::Body, with_body(MethodRouter::new(), operation))
+}
+
+/// An operation over a request body, whichever method carried it.
+trait BodyHandler<Answer>:
+    Fn(Arc<Service>, BundleId, Wants, HeaderMap, bytes::Bytes, BodyMethod) -> Answer
+    + Clone
+    + Send
+    + Sync
+    + 'static
+{
+}
+
+impl<Operation, Answer> BodyHandler<Answer> for Operation where
+    Operation: Fn(Arc<Service>, BundleId, Wants, HeaderMap, bytes::Bytes, BodyMethod) -> Answer
+        + Clone
+        + Send
+        + Sync
+        + 'static
+{
+}
+
+/// Add `POST` and `QUERY` to a route, both answered by one operation.
+///
+/// `POST` is registered by name. `QUERY` cannot be, so it is answered from the
+/// method fallback, which is therefore also where every method the resource
+/// does not take is refused.
+fn with_body<Operation, Answer>(
+    router: MethodRouter<Arc<Service>>,
+    operation: Operation,
+) -> MethodRouter<Arc<Service>>
+where
+    Operation: BodyHandler<Answer>,
+    Answer: Future<Output = Result<Response, Problem>> + Send + 'static,
+{
+    let post = {
+        let operation = operation.clone();
+        move |State(service): State<Arc<Service>>,
+              Path((dataset, version)): Path<(String, String)>,
+              wants: Wants,
+              headers: HeaderMap,
+              body: bytes::Bytes| {
+            operation(
+                service,
+                BundleId { dataset, version },
+                wants,
+                headers,
+                body,
+                BodyMethod::Post,
+            )
+        }
+    };
+    let query = move |State(service): State<Arc<Service>>,
+                      Path((dataset, version)): Path<(String, String)>,
+                      request: Request| async move {
+        let method = request.method().clone();
+        if method != query_method() {
+            return Err(method_not_allowed_problem(method));
+        }
+        let (wants, headers, body) = binding_body(request, &service).await?;
+        operation(
+            service,
+            BundleId { dataset, version },
+            wants,
+            headers,
+            body,
+            BodyMethod::Query,
+        )
+        .await
+    };
+    router.post(post).fallback(query)
+}
+
+/// State a resource's methods on every response it produces.
+///
+/// Applied after the fallback is set, so that the layer wraps it too. Because
+/// the header is then always present, axum's own `Allow` — which it adds only
+/// where none is — never appears.
+fn stated(methods: Methods, router: MethodRouter<Arc<Service>>) -> MethodRouter<Arc<Service>> {
+    router.layer(middleware::map_response(
+        move |mut response: Response| async move {
+            methods.state(response.headers_mut());
+            response
+        },
+    ))
 }
 
 async fn method_not_allowed(method: Method) -> Problem {
@@ -501,29 +659,27 @@ async fn fragment(
     Path((dataset, version)): Path<(String, String)>,
     wants: Wants,
 ) -> Result<Response, Problem> {
-    advertise_query(
-        operate_represented(
-            service,
-            BundleId { dataset, version },
-            AccessOperation::Fragment,
-            wants,
-            Representation::FRAGMENT,
-            |params, limits, release| {
-                let request = request::Fragment::parse(
-                    params,
-                    limits,
-                    release.prefixes(),
-                    release.predicate_roles(),
-                    &release.binding(),
-                )?;
-                declares_search(release, request.pattern.text().is_some())?;
-                declares_graphs(release, &request.graph)?;
-                Ok(request)
-            },
-            answer::fragment,
-        )
-        .await,
+    operate_represented(
+        service,
+        BundleId { dataset, version },
+        AccessOperation::Fragment,
+        wants,
+        Representation::FRAGMENT,
+        |params, limits, release| {
+            let request = request::Fragment::parse(
+                params,
+                limits,
+                release.prefixes(),
+                release.predicate_roles(),
+                &release.binding(),
+            )?;
+            declares_search(release, request.pattern.text().is_some())?;
+            declares_graphs(release, &request.graph)?;
+            Ok(request)
+        },
+        answer::fragment,
     )
+    .await
 }
 
 async fn tpf(
@@ -557,60 +713,19 @@ async fn count(
     Path((dataset, version)): Path<(String, String)>,
     wants: Wants,
 ) -> Result<Response, Problem> {
-    advertise_query(
-        operate(
-            service,
-            BundleId { dataset, version },
-            AccessOperation::Count,
-            wants,
-            |params, limits, release| {
-                let request =
-                    request::Count::parse(params, limits, release.prefixes(), &release.binding())?;
-                declares_search(release, request.pattern.text().is_some())?;
-                declares_graphs(release, &request.graph)?;
-                Ok(request)
-            },
-            answer::count,
-        )
-        .await,
-    )
-}
-
-async fn fragment_bindings_post(
-    State(service): State<Arc<Service>>,
-    Path((dataset, version)): Path<(String, String)>,
-    wants: Wants,
-    headers: HeaderMap,
-    body: bytes::Bytes,
-) -> Result<Response, Problem> {
-    binding_fragment(
+    operate(
         service,
         BundleId { dataset, version },
+        AccessOperation::Count,
         wants,
-        headers,
-        body,
-        BodyMethod::Post,
-    )
-    .await
-}
-
-async fn fragment_fallback(
-    State(service): State<Arc<Service>>,
-    Path((dataset, version)): Path<(String, String)>,
-    request: Request,
-) -> Result<Response, Problem> {
-    let method = request.method().clone();
-    if method != query_method() {
-        return Ok(method_not_allowed_for_bindings(method));
-    }
-    let (wants, headers, body) = binding_body(request, &service).await?;
-    binding_fragment(
-        service,
-        BundleId { dataset, version },
-        wants,
-        headers,
-        body,
-        BodyMethod::Query,
+        |params, limits, release| {
+            let request =
+                request::Count::parse(params, limits, release.prefixes(), &release.binding())?;
+            declares_search(release, request.pattern.text().is_some())?;
+            declares_graphs(release, &request.graph)?;
+            Ok(request)
+        },
+        answer::count,
     )
     .await
 }
@@ -624,69 +739,28 @@ async fn binding_fragment(
     method: BodyMethod,
 ) -> Result<Response, Problem> {
     require_json(&headers)?;
-    advertise_query(
-        operate_body(
-            service,
-            id,
-            AccessOperation::Fragment,
-            BodyOperation {
-                wants,
+    operate_body(
+        service,
+        id,
+        AccessOperation::Fragment,
+        BodyOperation {
+            wants,
+            body,
+            method,
+        },
+        |params, body, limits, release| {
+            let request = request::BindingFragment::parse(
+                params,
                 body,
-                method,
-            },
-            |params, body, limits, release| {
-                let request = request::BindingFragment::parse(
-                    params,
-                    body,
-                    limits,
-                    release.prefixes(),
-                    release.predicate_roles(),
-                    &release.binding(),
-                )?;
-                declares_graphs(release, &request.graph)?;
-                Ok(request)
-            },
-            answer::binding_fragment,
-        )
-        .await,
-    )
-}
-
-async fn count_bindings_post(
-    State(service): State<Arc<Service>>,
-    Path((dataset, version)): Path<(String, String)>,
-    wants: Wants,
-    headers: HeaderMap,
-    body: bytes::Bytes,
-) -> Result<Response, Problem> {
-    binding_count(
-        service,
-        BundleId { dataset, version },
-        wants,
-        headers,
-        body,
-        BodyMethod::Post,
-    )
-    .await
-}
-
-async fn count_fallback(
-    State(service): State<Arc<Service>>,
-    Path((dataset, version)): Path<(String, String)>,
-    request: Request,
-) -> Result<Response, Problem> {
-    let method = request.method().clone();
-    if method != query_method() {
-        return Ok(method_not_allowed_for_bindings(method));
-    }
-    let (wants, headers, body) = binding_body(request, &service).await?;
-    binding_count(
-        service,
-        BundleId { dataset, version },
-        wants,
-        headers,
-        body,
-        BodyMethod::Query,
+                limits,
+                release.prefixes(),
+                release.predicate_roles(),
+                &release.binding(),
+            )?;
+            declares_graphs(release, &request.graph)?;
+            Ok(request)
+        },
+        answer::binding_fragment,
     )
     .await
 }
@@ -700,26 +774,23 @@ async fn binding_count(
     method: BodyMethod,
 ) -> Result<Response, Problem> {
     require_json(&headers)?;
-    advertise_query(
-        operate_body(
-            service,
-            id,
-            AccessOperation::Count,
-            BodyOperation {
-                wants,
-                body,
-                method,
-            },
-            |params, body, limits, release| {
-                let request =
-                    request::BindingCount::parse(params, body, limits, release.prefixes())?;
-                declares_graphs(release, &request.graph)?;
-                Ok(request)
-            },
-            answer::binding_count,
-        )
-        .await,
+    operate_body(
+        service,
+        id,
+        AccessOperation::Count,
+        BodyOperation {
+            wants,
+            body,
+            method,
+        },
+        |params, body, limits, release| {
+            let request = request::BindingCount::parse(params, body, limits, release.prefixes())?;
+            declares_graphs(release, &request.graph)?;
+            Ok(request)
+        },
+        answer::binding_count,
     )
+    .await
 }
 
 async fn binding_body(
@@ -743,15 +814,6 @@ async fn binding_body(
     Ok((wants, headers, body))
 }
 
-fn method_not_allowed_for_bindings(method: Method) -> Response {
-    let mut response = method_not_allowed_problem(method).into_response();
-    response
-        .headers_mut()
-        .insert(ALLOW, HeaderValue::from_static("GET, HEAD, POST, QUERY"));
-    add_accept_query(&mut response);
-    response
-}
-
 fn require_json(headers: &HeaderMap) -> Result<(), Problem> {
     let values: Vec<_> = headers.get_all(CONTENT_TYPE).iter().collect();
     let json = match values.as_slice() {
@@ -770,20 +832,6 @@ fn require_json(headers: &HeaderMap) -> Result<(), Problem> {
             "this body operation needs exactly one Content-Type: application/json header; the supported request media type is also published in Accept-Query",
         ))
     }
-}
-
-fn advertise_query(result: Result<Response, Problem>) -> Result<Response, Problem> {
-    result.map(|mut response| {
-        add_accept_query(&mut response);
-        response
-    })
-}
-
-fn add_accept_query(response: &mut Response) {
-    response.headers_mut().insert(
-        HeaderName::from_static("accept-query"),
-        HeaderValue::from_static("application/json"),
-    );
 }
 
 async fn describe(
@@ -1087,50 +1135,6 @@ async fn export(
     observed_result(response, observation)
 }
 
-async fn labels_post(
-    State(service): State<Arc<Service>>,
-    Path((dataset, version)): Path<(String, String)>,
-    wants: Wants,
-    headers: HeaderMap,
-    body: bytes::Bytes,
-) -> Result<Response, Problem> {
-    labels_operation(
-        service,
-        BundleId { dataset, version },
-        wants,
-        headers,
-        body,
-        BodyMethod::Post,
-    )
-    .await
-}
-
-async fn labels_fallback(
-    State(service): State<Arc<Service>>,
-    Path((dataset, version)): Path<(String, String)>,
-    request: Request,
-) -> Result<Response, Problem> {
-    let method = request.method().clone();
-    if method != query_method() {
-        let mut response = method_not_allowed_problem(method).into_response();
-        response
-            .headers_mut()
-            .insert(ALLOW, HeaderValue::from_static("POST, QUERY"));
-        add_accept_query(&mut response);
-        return Ok(response);
-    }
-    let (wants, headers, body) = binding_body(request, &service).await?;
-    labels_operation(
-        service,
-        BundleId { dataset, version },
-        wants,
-        headers,
-        body,
-        BodyMethod::Query,
-    )
-    .await
-}
-
 async fn labels_operation(
     service: Arc<Service>,
     id: BundleId,
@@ -1140,30 +1144,28 @@ async fn labels_operation(
     method: BodyMethod,
 ) -> Result<Response, Problem> {
     require_json(&headers)?;
-    advertise_query(
-        operate_body(
-            service,
-            id,
-            AccessOperation::Labels,
-            BodyOperation {
-                wants,
+    operate_body(
+        service,
+        id,
+        AccessOperation::Labels,
+        BodyOperation {
+            wants,
+            body,
+            method,
+        },
+        // Ungated; see `capability_gate`.
+        |params, body, limits, release| {
+            request::Labels::parse(
+                params,
                 body,
-                method,
-            },
-            // Ungated; see `capability_gate`.
-            |params, body, limits, release| {
-                request::Labels::parse(
-                    params,
-                    body,
-                    limits,
-                    release.prefixes(),
-                    release.predicate_roles(),
-                )
-            },
-            answer::labels,
-        )
-        .await,
+                limits,
+                release.prefixes(),
+                release.predicate_roles(),
+            )
+        },
+        answer::labels,
     )
+    .await
 }
 
 async fn verbalize(
@@ -1191,45 +1193,6 @@ async fn verbalize(
     .await
 }
 
-async fn verbalize_post(
-    State(service): State<Arc<Service>>,
-    Path((dataset, version)): Path<(String, String)>,
-    wants: Wants,
-    headers: HeaderMap,
-    body: bytes::Bytes,
-) -> Result<Response, Problem> {
-    verbalize_operation(
-        service,
-        BundleId { dataset, version },
-        wants,
-        headers,
-        body,
-        BodyMethod::Post,
-    )
-    .await
-}
-
-async fn verbalize_fallback(
-    State(service): State<Arc<Service>>,
-    Path((dataset, version)): Path<(String, String)>,
-    request: Request,
-) -> Result<Response, Problem> {
-    let method = request.method().clone();
-    if method != query_method() {
-        return Ok(method_not_allowed_for_bindings(method));
-    }
-    let (wants, headers, body) = binding_body(request, &service).await?;
-    verbalize_operation(
-        service,
-        BundleId { dataset, version },
-        wants,
-        headers,
-        body,
-        BodyMethod::Query,
-    )
-    .await
-}
-
 async fn verbalize_operation(
     service: Arc<Service>,
     id: BundleId,
@@ -1239,29 +1202,27 @@ async fn verbalize_operation(
     method: BodyMethod,
 ) -> Result<Response, Problem> {
     require_json(&headers)?;
-    advertise_query(
-        operate_body(
-            service,
-            id,
-            AccessOperation::Verbalize,
-            BodyOperation {
-                wants,
+    operate_body(
+        service,
+        id,
+        AccessOperation::Verbalize,
+        BodyOperation {
+            wants,
+            body,
+            method,
+        },
+        |params, body, limits, release| {
+            request::Verbalize::parse_body(
+                params,
                 body,
-                method,
-            },
-            |params, body, limits, release| {
-                request::Verbalize::parse_body(
-                    params,
-                    body,
-                    limits,
-                    release.prefixes(),
-                    release.predicate_roles(),
-                )
-            },
-            answer::verbalize,
-        )
-        .await,
+                limits,
+                release.prefixes(),
+                release.predicate_roles(),
+            )
+        },
+        answer::verbalize,
     )
+    .await
 }
 
 /// Refuse an operation whose bytes this bundle may not carry.
@@ -2359,16 +2320,9 @@ async fn render_problems(
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.typed_insert(CachePolicy::Uncacheable.header());
     headers.insert(VARY, HeaderValue::from_static("Accept"));
-    if advertises_query(uri.path()) {
-        add_accept_query(&mut response);
-    }
     response.extensions_mut().insert(code);
     response.extensions_mut().insert(representation);
     response
-}
-
-fn advertises_query(path: &str) -> bool {
-    path.ends_with("/fragment") || path.ends_with("/count")
 }
 
 /// A problem for an error response no handler in this crate produced.
