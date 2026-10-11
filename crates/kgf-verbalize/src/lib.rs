@@ -111,7 +111,7 @@ use kgf_store::pattern::{IdPattern, Selection};
 use kgf_store::{IdTriple, Role, Store, TermId};
 use serde::Serialize;
 
-pub use config::{Config, ConfigError, Resolved};
+pub use config::{Config, ConfigError, Lists, Resolved};
 
 use self::config::{Template, TemplatePart};
 use self::text::{
@@ -230,10 +230,17 @@ pub struct Unknown {
 
 /// A resolved config bound to one bundle: every IRI it names, as that bundle's
 /// ids. Built once per bundle; a [`Verbalizer`] borrows it.
+///
+/// Binding costs one dictionary lookup per IRI as written. The defaults apply
+/// to every target but are bound once, and each target keeps only what it
+/// adds to them: bound into each target, they would cost the product of the
+/// target count and their length, from a config the size of the sum.
 #[derive(Debug)]
 pub struct Bound {
     /// `rdf:type`'s predicate id, or `None` in a graph with no types at all.
     rdf_type: Option<u64>,
+    /// The lists under `defaults`, which every target walks and labels by.
+    defaults: BoundLists,
     targets: Vec<BoundTarget>,
     /// Profiles by the object id of the class they apply to.
     profiles: HashMap<u64, BoundTemplate>,
@@ -245,14 +252,26 @@ struct BoundTarget {
     name: String,
     /// The class as an object id, or `None` if the bundle lacks the IRI.
     class: Option<u64>,
-    /// Label predicates: the target's own first, then the bundle's role.
-    cascade: Vec<u64>,
-    ignore: HashSet<u64>,
-    /// `Some` when an allow list was declared, even if every IRI in it was
-    /// unknown: a declared allow list that matches nothing walks nothing.
-    include: Option<HashSet<u64>>,
+    /// What the target's own lists add to the defaults.
+    own: BoundLists,
+    /// The bundle's `label` role, less any predicate the config already
+    /// names: the end of the target's cascade, after the defaults' label
+    /// predicates and its own.
+    role: Vec<u64>,
     predicate_limit: usize,
     template: Option<BoundTemplate>,
+}
+
+/// One level's predicate lists, as ids.
+#[derive(Debug, Default)]
+struct BoundLists {
+    /// Label predicates in the order written, each once.
+    label: Vec<u64>,
+    ignore: HashSet<u64>,
+    include: HashSet<u64>,
+    /// Whether an allow list was written, even if every IRI in it was
+    /// unknown: a declared allow list that matches nothing walks nothing.
+    include_declared: bool,
 }
 
 #[derive(Debug)]
@@ -288,15 +307,6 @@ impl Bound {
             }
             Ok(id)
         };
-        // Where a list entry was written: under `defaults` if it is there,
-        // else under the target.
-        let list_at = |target: &str, list: &str, written_in_defaults: bool| {
-            if written_in_defaults {
-                format!("defaults.{list}")
-            } else {
-                format!("targets.{target}.{list}")
-            }
-        };
 
         let rdf_type = dictionary
             .locate(Role::Predicate, RDF_TYPE.as_bytes())?
@@ -312,71 +322,48 @@ impl Bound {
             profiles.insert(class, template);
         }
 
+        // An IRI a target repeats from the defaults is bound, and reported if
+        // the bundle lacks it, where it was first written.
+        let written = Written::new(&resolved.defaults);
+        let defaults = bind_lists(
+            &resolved.defaults,
+            "defaults",
+            &Written::default(),
+            &mut locate,
+        )?;
+        // The bundle's own role: absence is the manifest's problem, not this
+        // config's, so it is not reported.
+        let mut role = Vec::with_capacity(label_role.len());
+        for iri in label_role {
+            if let Some(id) = dictionary.locate(Role::Predicate, iri.as_bytes())? {
+                push_unique(&mut role, id.0);
+            }
+        }
+        let default_labels: HashSet<u64> = defaults.label.iter().copied().collect();
+
         let mut targets = Vec::with_capacity(resolved.targets.len());
         for target in &resolved.targets {
             let at = format!("targets.{}", target.name);
             let class = locate(Role::Object, format!("{at}.type"), &target.class)?;
-
-            let mut cascade = Vec::new();
-            for iri in &target.label_predicates {
-                let at = list_at(
-                    &target.name,
-                    "label_predicates",
-                    resolved.defaults.label_predicates.contains(iri),
-                );
-                if let Some(id) = locate(Role::Predicate, at, iri)? {
-                    push_unique(&mut cascade, id);
-                }
-            }
-            for iri in label_role {
-                // The bundle's own role: absence is the manifest's problem, not
-                // this config's, so it is not reported here.
-                if let Some(id) = dictionary.locate(Role::Predicate, iri.as_bytes())? {
-                    push_unique(&mut cascade, id.0);
-                }
-            }
-
-            let mut ignore = HashSet::new();
-            for iri in &target.ignore_predicates {
-                let at = list_at(
-                    &target.name,
-                    "ignore_predicates",
-                    resolved.defaults.ignore_predicates.contains(iri),
-                );
-                if let Some(id) = locate(Role::Predicate, at, iri)? {
-                    ignore.insert(id);
-                }
-            }
-            let include = if target.include_predicates.is_empty() {
-                None
-            } else {
-                let mut include = HashSet::new();
-                for iri in &target.include_predicates {
-                    let at = list_at(
-                        &target.name,
-                        "include_predicates",
-                        resolved.defaults.include_predicates.contains(iri),
-                    );
-                    if let Some(id) = locate(Role::Predicate, at, iri)? {
-                        include.insert(id);
-                    }
-                }
-                Some(include)
-            };
-
+            // An IRI is one id, so skipping the defaults' strings has already
+            // kept their ids out of `own`.
+            let own = bind_lists(&target.lists, &at, &written, &mut locate)?;
+            let role = role
+                .iter()
+                .copied()
+                .filter(|id| !default_labels.contains(id) && !own.label.contains(id))
+                .collect();
             let template = match &target.label_template {
                 Some((template, fields)) => {
                     Some(bind_template(template, fields, &at, &mut locate)?)
                 }
                 None => None,
             };
-
             targets.push(BoundTarget {
                 name: target.name.clone(),
                 class,
-                cascade,
-                ignore,
-                include,
+                own,
+                role,
                 predicate_limit: target.predicate_limit as usize,
                 template,
             });
@@ -384,6 +371,7 @@ impl Bound {
 
         Ok(Self {
             rdf_type,
+            defaults,
             targets,
             profiles,
             unknown,
@@ -399,6 +387,92 @@ impl Bound {
     pub fn targets(&self) -> impl ExactSizeIterator<Item = &str> {
         self.targets.iter().map(|target| target.name.as_str())
     }
+
+    /// `target`'s label cascade, strongest first: the defaults' label
+    /// predicates, its own, then the bundle's role.
+    fn cascade(&self, target: usize) -> impl Iterator<Item = u64> + '_ {
+        let target = &self.targets[target];
+        self.defaults
+            .label
+            .iter()
+            .chain(&target.own.label)
+            .chain(&target.role)
+            .copied()
+    }
+
+    /// Whether `target`'s walk reads `predicate`: on an allow list, if either
+    /// level declares one, and on neither deny list.
+    fn walks(&self, target: usize, predicate: u64) -> bool {
+        let (defaults, own) = (&self.defaults, &self.targets[target].own);
+        if (defaults.include_declared || own.include_declared)
+            && !defaults.include.contains(&predicate)
+            && !own.include.contains(&predicate)
+        {
+            return false;
+        }
+        !defaults.ignore.contains(&predicate) && !own.ignore.contains(&predicate)
+    }
+}
+
+/// The IRIs one level of lists holds, as written: what a target's own lists
+/// skip because the defaults already bound them.
+#[derive(Default)]
+struct Written<'a> {
+    label: HashSet<&'a str>,
+    ignore: HashSet<&'a str>,
+    include: HashSet<&'a str>,
+}
+
+impl<'a> Written<'a> {
+    fn new(lists: &'a Lists) -> Self {
+        let set = |list: &'a [String]| list.iter().map(String::as_str).collect();
+        Self {
+            label: set(&lists.label_predicates),
+            ignore: set(&lists.ignore_predicates),
+            include: set(&lists.include_predicates),
+        }
+    }
+}
+
+/// Bind one level's lists, written under `at`, skipping what `skip` holds.
+fn bind_lists(
+    lists: &Lists,
+    at: &str,
+    skip: &Written<'_>,
+    locate: &mut impl FnMut(Role, String, &str) -> Result<Option<u64>, Error>,
+) -> Result<BoundLists, Error> {
+    let mut bound = BoundLists {
+        include_declared: !lists.include_predicates.is_empty(),
+        ..BoundLists::default()
+    };
+    let mut label = HashSet::new();
+    for iri in &lists.label_predicates {
+        if skip.label.contains(iri.as_str()) {
+            continue;
+        }
+        if let Some(id) = locate(Role::Predicate, format!("{at}.label_predicates"), iri)?
+            && label.insert(id)
+        {
+            bound.label.push(id);
+        }
+    }
+    for iri in &lists.ignore_predicates {
+        if skip.ignore.contains(iri.as_str()) {
+            continue;
+        }
+        if let Some(id) = locate(Role::Predicate, format!("{at}.ignore_predicates"), iri)? {
+            bound.ignore.insert(id);
+        }
+    }
+    for iri in &lists.include_predicates {
+        if skip.include.contains(iri.as_str()) {
+            continue;
+        }
+        if let Some(id) = locate(Role::Predicate, format!("{at}.include_predicates"), iri)? {
+            bound.include.insert(id);
+        }
+    }
+    Ok(bound)
 }
 
 fn bind_template(
@@ -650,7 +724,7 @@ impl<'a> Verbalizer<'a> {
             let objects = &star[i..j];
             i = j;
 
-            if !self.walks(target, predicate) {
+            if !self.bound.walks(target, predicate) {
                 continue;
             }
 
@@ -680,16 +754,6 @@ impl<'a> Verbalizer<'a> {
             text: lines.join("\n"),
             limited,
         })
-    }
-
-    fn walks(&self, target: usize, predicate: u64) -> bool {
-        let target = &self.bound.targets[target];
-        if let Some(include) = &target.include
-            && !include.contains(&predicate)
-        {
-            return false;
-        }
-        !target.ignore.contains(&predicate)
     }
 
     /// The object's string as [`text::stable_score`] keys it: a literal's
@@ -949,8 +1013,8 @@ impl<'a> Verbalizer<'a> {
     /// The first literal value along the target's cascade. Reads no further
     /// than that value: a label predicate with many values costs one row.
     fn first_literal(&mut self, subject: u64, target: usize) -> Result<Option<Rc<str>>, Error> {
-        for i in 0..self.bound.targets[target].cascade.len() {
-            let predicate = self.bound.targets[target].cascade[i];
+        let bound = self.bound;
+        for predicate in bound.cascade(target) {
             let selection = self.store.resolve(IdPattern {
                 subject: Some(subject),
                 predicate: Some(predicate),

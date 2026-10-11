@@ -5,9 +5,10 @@
 //! unknown keys refused so a misspelled key cannot silently do nothing.
 //! [`Resolved`] is the fully defaulted, validated form: IRIs have parsed,
 //! templates have been split into literal text and field references, every
-//! placeholder names a declared field, and per-target lists have been merged
-//! over the defaults. Nothing past [`Config::resolve`] reads a string it has
-//! not already checked.
+//! placeholder names a declared field, and every target has its limit. The
+//! defaults are kept once beside the targets rather than merged into each, so
+//! a config resolves to the size it was written at; binding applies them.
+//! Nothing past [`Config::resolve`] reads a string it has not already checked.
 //!
 //! The document answers four questions: which classes become roots; how a root
 //! and the nodes it mentions get a name; which predicates are walked; and how
@@ -28,7 +29,7 @@
 //! template into every document that references the class, or make every
 //! root's headline as terse as a mention.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -180,12 +181,14 @@ pub enum ConfigError {
 /// A validated, fully defaulted config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
-    /// The document-level lists as written, so a diagnostic about an IRI that
-    /// reached every target through them can name where it was written.
+    /// The document-level lists as written. They apply to every target, and
+    /// are held here once rather than copied into each: copied, a config of
+    /// many targets and long defaults would resolve to the product of the two
+    /// lengths, from a document the size of their sum.
     pub defaults: Lists,
     /// Profiles in name order. Classes are distinct.
     pub profiles: Vec<ResolvedProfile>,
-    /// Targets in name order, each with the defaults merged in.
+    /// Targets in name order.
     pub targets: Vec<ResolvedTarget>,
 }
 
@@ -202,19 +205,17 @@ pub struct ResolvedProfile {
     pub fields: BTreeMap<String, String>,
 }
 
-/// A target with defaults merged and its template parsed.
+/// A target with its limit defaulted and its template parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedTarget {
     /// The target's local name.
     pub name: String,
     /// The class whose members are roots.
     pub class: String,
-    /// Extra label predicates, defaults first, without duplicates.
-    pub label_predicates: Vec<String>,
-    /// Predicates left out of the walk, defaults first, without duplicates.
-    pub ignore_predicates: Vec<String>,
-    /// If non-empty, the only predicates walked.
-    pub include_predicates: Vec<String>,
+    /// The target's own lists, as written. It walks and labels by these and
+    /// [`Resolved::defaults`] together: the defaults first, then these, each
+    /// IRI once.
+    pub lists: Lists,
     /// Values per predicate. At least 1.
     pub predicate_limit: u32,
     /// The root's own label template, if any, with its fields.
@@ -355,12 +356,7 @@ impl Config {
             targets.push(ResolvedTarget {
                 name: name.clone(),
                 class: target.class.clone(),
-                label_predicates: merged(&self.defaults.label_predicates, &own.label_predicates),
-                ignore_predicates: merged(&self.defaults.ignore_predicates, &own.ignore_predicates),
-                include_predicates: merged(
-                    &self.defaults.include_predicates,
-                    &own.include_predicates,
-                ),
+                lists: own,
                 predicate_limit,
                 label_template,
             });
@@ -372,17 +368,6 @@ impl Config {
             targets,
         })
     }
-}
-
-/// Defaults first, then the target's own entries, each IRI once.
-fn merged(defaults: &[String], own: &[String]) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    defaults
-        .iter()
-        .chain(own)
-        .filter(|iri| seen.insert(iri.as_str()))
-        .cloned()
-        .collect()
 }
 
 fn check_iris(at: &str, lists: &Lists) -> Result<(), ConfigError> {
@@ -464,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_merge_under_a_target_without_duplicates() {
+    fn defaults_are_kept_once_beside_each_targets_own_lists() {
         let config = parse(
             r#"{
               "defaults": {
@@ -475,21 +460,26 @@ mod tests {
                 "t": {
                   "type": "http://example.org/T",
                   "ignore_predicates": ["http://b/", "http://c/"]
-                }
+                },
+                "u": {"type": "http://example.org/U"}
               }
             }"#,
         );
         let resolved = config.resolve().unwrap();
-        let target = &resolved.targets[0];
-        assert_eq!(target.name, "t");
         assert_eq!(
-            target.ignore_predicates,
-            ["http://a/", "http://b/", "http://c/"]
+            resolved.defaults.ignore_predicates,
+            ["http://a/", "http://b/"]
         );
-        assert_eq!(target.label_predicates, ["http://l/"]);
-        assert!(target.include_predicates.is_empty());
-        assert_eq!(target.predicate_limit, DEFAULT_PREDICATE_LIMIT);
-        assert!(target.label_template.is_none());
+        assert_eq!(resolved.defaults.label_predicates, ["http://l/"]);
+        let [t, u] = &resolved.targets[..] else {
+            panic!("two targets");
+        };
+        assert_eq!(t.name, "t");
+        assert_eq!(t.lists.ignore_predicates, ["http://b/", "http://c/"]);
+        assert!(t.lists.label_predicates.is_empty());
+        assert_eq!(u.lists, Lists::default());
+        assert_eq!(t.predicate_limit, DEFAULT_PREDICATE_LIMIT);
+        assert!(t.label_template.is_none());
     }
 
     #[test]
