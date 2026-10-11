@@ -643,10 +643,61 @@ fn the_command_refuses_to_write_into_the_bundle_or_run_a_target_twice() {
     ]);
     assert!(!ok);
     assert!(stderr.contains("inside the bundle"), "{stderr}");
-    assert!(
-        std::fs::read(&inside).is_ok(),
+
+    // Nor under another name for an artifact: a link beside the bundle that
+    // points into it, or a second name for the artifact's own bytes. Either
+    // would be truncated under the run's own mapping and take it down.
+    let size = std::fs::metadata(&inside).unwrap().len();
+    #[cfg(unix)]
+    {
+        let link = published.beside("link.jsonl");
+        std::os::unix::fs::symlink(&inside, &link).unwrap();
+        let (ok, stderr) = kgf(&[
+            "--roots",
+            link.to_str().unwrap(),
+            "--texts",
+            texts.to_str().unwrap(),
+        ]);
+        assert!(!ok);
+        assert!(stderr.contains("inside the bundle"), "{stderr}");
+        // A link to a file not there yet would create one inside the bundle.
+        let fresh = published.bundle().join("fresh.jsonl");
+        let dangling = published.beside("dangling.jsonl");
+        std::os::unix::fs::symlink(&fresh, &dangling).unwrap();
+        let (ok, stderr) = kgf(&[
+            "--roots",
+            dangling.to_str().unwrap(),
+            "--texts",
+            texts.to_str().unwrap(),
+        ]);
+        assert!(!ok, "{stderr}");
+        assert!(!fresh.exists());
+    }
+    let hard = published.beside("hard.jsonl");
+    std::fs::hard_link(&inside, &hard).unwrap();
+    let (ok, stderr) = kgf(&[
+        "--roots",
+        out.to_str().unwrap(),
+        "--texts",
+        hard.to_str().unwrap(),
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("under another name"), "{stderr}");
+    assert_eq!(
+        std::fs::metadata(&inside).unwrap().len(),
+        size,
         "the artifact was not truncated"
     );
+
+    // And the two streams are two files, or each writes over the other.
+    let (ok, stderr) = kgf(&[
+        "--roots",
+        out.to_str().unwrap(),
+        "--texts",
+        out.to_str().unwrap(),
+    ]);
+    assert!(!ok);
+    assert!(stderr.contains("same file"), "{stderr}");
 
     let outputs = [
         "--roots",

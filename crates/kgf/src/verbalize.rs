@@ -12,10 +12,11 @@
 //!
 //! The bundle is opened the way `kgf manifest` opens one: this crate asserts
 //! the publication invariant for a directory the operator named, holds the
-//! mappings for the run, and writes nothing into it — an output inside the
-//! bundle is refused before anything is mapped.
+//! mappings for the run, and writes nothing into it — an output that is, by
+//! any name, a file of the bundle is refused before anything is mapped.
 
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -25,6 +26,7 @@ use clap::Parser;
 use kgf_store::manifest::default_predicate_roles;
 use kgf_store::{Manifest, OpenOptions, Store};
 use kgf_verbalize::{Bound, Config, Rendered, RootRecord, Seen, TextRecord, Verbalizer};
+use same_file::Handle;
 
 /// `kgf verbalize` arguments.
 #[derive(Debug, Parser)]
@@ -70,8 +72,7 @@ pub fn run(args: Args) -> Result<()> {
         .resolve()
         .context("resolving the verbalization config")?;
 
-    refuse_output_inside(&args.bundle, &args.roots)?;
-    refuse_output_inside(&args.bundle, &args.texts)?;
+    let outputs = Outputs::open(&args.bundle, &args.roots, &args.texts)?;
     let opened = open_bundle(&args.bundle)?;
     let manifest = Manifest::read(&args.bundle)
         .with_context(|| format!("reading the manifest of {}", args.bundle.display()))?;
@@ -92,7 +93,7 @@ pub fn run(args: Args) -> Result<()> {
 
     let targets = select_targets(&bound, &args.target)?;
     let mut verbalizer = Verbalizer::new(&opened.store, &bound);
-    let mut out = Streams::create(&args.roots, &args.texts, args.text)?;
+    let mut out = Streams::new(outputs, args.text);
     let started = Instant::now();
 
     if args.iri.is_empty() {
@@ -197,21 +198,16 @@ struct Streams {
 }
 
 impl Streams {
-    fn create(roots: &Path, texts: &Path, readable: bool) -> Result<Self> {
-        let open = |path: &Path| {
-            std::fs::File::create(path)
-                .map(BufWriter::new)
-                .with_context(|| format!("creating the output {}", path.display()))
-        };
-        Ok(Self {
-            roots: open(roots)?,
-            texts: open(texts)?,
-            roots_path: roots.to_owned(),
-            texts_path: texts.to_owned(),
+    fn new(outputs: Outputs, readable: bool) -> Self {
+        Self {
+            roots: BufWriter::new(outputs.roots),
+            texts: BufWriter::new(outputs.texts),
+            roots_path: outputs.roots_path,
+            texts_path: outputs.texts_path,
             readable,
             seen: Seen::new(),
             written: 0,
-        })
+        }
     }
 
     /// One root's line, and its text's line if the text is new.
@@ -254,17 +250,94 @@ struct Opened {
     store: Store,
 }
 
-/// Refuse an output under the bundle directory.
+/// The two output files, open and empty, and checked against the bundle.
+struct Outputs {
+    roots: File,
+    texts: File,
+    roots_path: PathBuf,
+    texts_path: PathBuf,
+}
+
+impl Outputs {
+    /// Open both outputs, refusing either one that is a file of the bundle by
+    /// any name, and empty them.
+    ///
+    /// The bundle is about to be mapped on the promise that nothing writes
+    /// into it, and truncating a mapped artifact is not an error but a crash,
+    /// in this process and in any server mapping the same version. A path
+    /// check cannot keep that promise on its own: a symlink or a hard link
+    /// outside the bundle can name an artifact inside it. So each output's
+    /// path is resolved with its links followed and refused under the bundle,
+    /// and the file it opens — opened without truncating — is compared by
+    /// identity with every file the bundle holds before anything is written
+    /// to it. The two outputs must also be two files, or each would write
+    /// over the other.
+    fn open(bundle: &Path, roots: &Path, texts: &Path) -> Result<Self> {
+        let bundle_dir = bundle
+            .canonicalize()
+            .with_context(|| format!("resolving the bundle {}", bundle.display()))?;
+        let published = published_files(&bundle_dir)?;
+        let roots_file = open_output(&bundle_dir, &published, roots)?;
+        let texts_file = open_output(&bundle_dir, &published, texts)?;
+        ensure!(
+            identity(&roots_file, roots)? != identity(&texts_file, texts)?,
+            "--roots {} and --texts {} are the same file, which each would write over",
+            roots.display(),
+            texts.display()
+        );
+        for (file, path) in [(&roots_file, roots), (&texts_file, texts)] {
+            file.set_len(0)
+                .with_context(|| format!("emptying the output {}", path.display()))?;
+        }
+        Ok(Self {
+            roots: roots_file,
+            texts: texts_file,
+            roots_path: roots.to_owned(),
+            texts_path: texts.to_owned(),
+        })
+    }
+}
+
+/// Open one output for writing, without truncating it, unless it is or would
+/// be a file of the bundle.
+fn open_output(bundle: &Path, published: &[(PathBuf, Handle)], output: &Path) -> Result<File> {
+    ensure!(
+        !resolved_output(output)?.starts_with(bundle),
+        "{} is inside the bundle {}, whose files are published and never written",
+        output.display(),
+        bundle.display()
+    );
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(output)
+        .with_context(|| format!("creating the output {}", output.display()))?;
+    let handle = identity(&file, output)?;
+    if let Some((artifact, _)) = published.iter().find(|(_, file)| *file == handle) {
+        bail!(
+            "{} is the bundle's {} under another name, and the bundle's files are published \
+             and never written",
+            output.display(),
+            artifact.display()
+        );
+    }
+    Ok(file)
+}
+
+/// Where an output path lands once its links are followed.
 ///
-/// The bundle is about to be mapped on the promise that nothing writes into
-/// it; the files this command writes must therefore lie elsewhere. Both
-/// paths are canonicalized so that a symlink or a `..` cannot slip the output
-/// inside. The output's directory must already exist for its path to have a
-/// canonical form, which `File::create` would require anyway.
-fn refuse_output_inside(bundle: &Path, output: &Path) -> Result<()> {
-    let bundle = bundle
-        .canonicalize()
-        .with_context(|| format!("resolving the bundle {}", bundle.display()))?;
+/// A path that exists — a link included, since creating a file through a link
+/// writes where the link points — is resolved whole; a link that resolves
+/// nowhere is refused, for the same reason. A new path is its directory's
+/// canonical form plus its name, the directory having to exist for the file to
+/// be created in it.
+fn resolved_output(output: &Path) -> Result<PathBuf> {
+    if output.symlink_metadata().is_ok() {
+        return output
+            .canonicalize()
+            .with_context(|| format!("resolving the output {}", output.display()));
+    }
     let parent = match output.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -275,13 +348,42 @@ fn refuse_output_inside(bundle: &Path, output: &Path) -> Result<()> {
     let Some(name) = output.file_name() else {
         bail!("{} names no file", output.display());
     };
-    ensure!(
-        !parent.join(name).starts_with(&bundle),
-        "{} is inside the bundle {}, whose files are published and never written",
-        output.display(),
-        bundle.display()
-    );
-    Ok(())
+    Ok(parent.join(name))
+}
+
+/// Every file under the bundle directory, links to files followed, with the
+/// handle an output is compared against.
+fn published_files(dir: &Path) -> Result<Vec<(PathBuf, Handle)>> {
+    let mut files = Vec::new();
+    let mut pending = vec![dir.to_owned()];
+    while let Some(dir) = pending.pop() {
+        let entries =
+            std::fs::read_dir(&dir).with_context(|| format!("listing {}", dir.display()))?;
+        for entry in entries {
+            let path = entry
+                .with_context(|| format!("listing {}", dir.display()))?
+                .path();
+            let kind = path
+                .symlink_metadata()
+                .with_context(|| format!("reading {}", path.display()))?
+                .file_type();
+            if kind.is_dir() {
+                pending.push(path);
+            } else if path.is_file() {
+                let handle = Handle::from_path(&path)
+                    .with_context(|| format!("opening {}", path.display()))?;
+                files.push((path, handle));
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// The identity of an open file, to compare with another.
+fn identity(file: &File, path: &Path) -> Result<Handle> {
+    file.try_clone()
+        .and_then(Handle::from_file)
+        .with_context(|| format!("identifying the output {}", path.display()))
 }
 
 /// Open the bundle the operator named.
@@ -292,8 +394,9 @@ fn refuse_output_inside(bundle: &Path, output: &Path) -> Result<()> {
 /// artifacts not be modified or truncated while mapped. This command holds the
 /// mappings for one run over a directory the operator named as published, and
 /// the only files it writes are `--roots` and `--texts`, which
-/// [`refuse_output_inside`] has already placed outside the bundle. What has to hold, as for `kgf manifest`,
-/// is that nothing *else* rewrites a published version while it runs.
+/// [`Outputs::open`] has already opened and found to be no file of the
+/// bundle's by any name. What has to hold, as for `kgf manifest`, is that
+/// nothing *else* rewrites a published version while it runs.
 #[allow(unsafe_code)]
 fn open_bundle(dir: &Path) -> Result<Opened> {
     ensure!(dir.is_dir(), "{} is not a bundle directory", dir.display());
