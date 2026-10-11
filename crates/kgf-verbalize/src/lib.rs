@@ -79,6 +79,15 @@
 //! which node the descent started from, so it is not cached; the next root
 //! that mentions the node computes its own.
 //!
+//! A label that took no cut depends on its position all the same, through
+//! the depth bound: the descent that fit from a star's mention may not fit
+//! from inside a template, where it starts deeper. So a cached label carries
+//! how many templates deep it went, and is reused only where that many more
+//! still fit; elsewhere it is computed again, and cut as it would have been
+//! with no cache at all. A root's text is then a function of the root alone,
+//! not of which roots happened to be rendered before it — the property that
+//! lets one preview stand for a whole build.
+//!
 //! # Caches, and why they are here
 //!
 //! A predicate's display name and a mentioned node's label are recomputed for
@@ -560,7 +569,7 @@ pub struct Verbalizer<'a> {
     /// A predicate's display name, per target (the cascade differs).
     predicate_names: HashMap<(u64, usize), Rc<str>>,
     /// A mentioned node's label, by object id, per target.
-    object_labels: HashMap<(u64, usize), Rc<str>>,
+    object_labels: HashMap<(u64, usize), CachedLabel>,
     /// A predicate IRI's subject id, when it has one, for labelling the
     /// predicate itself.
     predicate_subjects: HashMap<u64, Option<u64>>,
@@ -571,6 +580,16 @@ pub struct Verbalizer<'a> {
     /// label computed while this moved took such a cut and is not cached;
     /// nor is one computed after the budget ran out.
     cuts: u64,
+    /// The greatest length `resolving` has reached since the label being
+    /// computed began: how deep below it the descent went.
+    deepest: usize,
+}
+
+/// A label as cached, with how many templates deep its resolution went: the
+/// room it needs below the depth it is used at to read the same again.
+struct CachedLabel {
+    label: Rc<str>,
+    height: usize,
 }
 
 impl<'a> Verbalizer<'a> {
@@ -588,6 +607,7 @@ impl<'a> Verbalizer<'a> {
             predicate_subjects: HashMap::new(),
             resolving: Vec::new(),
             cuts: 0,
+            deepest: 0,
         }
     }
 
@@ -873,14 +893,29 @@ impl<'a> Verbalizer<'a> {
     ///
     /// `as_root` admits the target's `label_template`, which names a node as
     /// itself rather than as something mentioned.
+    ///
+    /// A cached label is used only where its descent would fit again: a label
+    /// `height` templates deep, used `depth` templates down, reads the same
+    /// computed afresh exactly when `depth + height` is within
+    /// [`MAX_TEMPLATE_DEPTH`]. Past that, a fresh computation would be cut,
+    /// so the label is computed again rather than read from the cache.
     fn display_label(&mut self, node: Node, target: usize, as_root: bool) -> Result<String, Error> {
+        let depth = self.resolving.len();
         if let Node::Object(id) = node
-            && let Some(label) = self.object_labels.get(&(id, target))
+            && let Some(cached) = self.object_labels.get(&(id, target))
+            && depth + cached.height <= MAX_TEMPLATE_DEPTH
         {
-            return Ok(label.to_string());
+            // The descent the cached label stands for counts toward the one
+            // in hand, as it would had it been taken.
+            self.deepest = self.deepest.max(depth + cached.height);
+            return Ok(cached.label.to_string());
         }
         let cuts = self.cuts;
-        let label = self.compute_display_label(node, target, as_root)?;
+        let outer = std::mem::replace(&mut self.deepest, depth);
+        let label = self.compute_display_label(node, target, as_root);
+        let height = self.deepest - depth;
+        self.deepest = outer.max(self.deepest);
+        let label = label?;
         if let Node::Object(id) = node
             && self.cuts == cuts
             && !self.exhausted
@@ -888,7 +923,10 @@ impl<'a> Verbalizer<'a> {
             bounded_insert(
                 &mut self.object_labels,
                 (id, target),
-                Rc::from(label.as_str()),
+                CachedLabel {
+                    label: Rc::from(label.as_str()),
+                    height,
+                },
             );
         }
         Ok(label)
@@ -917,6 +955,7 @@ impl<'a> Verbalizer<'a> {
             if !templates.is_empty() {
                 if self.resolving.len() < MAX_TEMPLATE_DEPTH && !self.resolving.contains(&subject) {
                     self.resolving.push(subject);
+                    self.deepest = self.deepest.max(self.resolving.len());
                     let rendered = self.render_first(&templates, subject, target);
                     self.resolving.pop();
                     if let Some(label) = rendered? {

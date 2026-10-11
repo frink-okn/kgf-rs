@@ -540,6 +540,62 @@ fn a_template_descends_a_bounded_number_of_hops() {
 }
 
 #[test]
+fn a_root_reads_the_same_whatever_was_rendered_before_it() {
+    // A chain of profiled nodes, each named "x" and then the next one's
+    // name, exactly as long as the depth bound: from a mention in a star the
+    // whole chain fits, and from inside a root's label template — one
+    // template deeper — its last node is cut and named by its label. Two
+    // roots of one shape name the chain's head both ways.
+    let nodes: Vec<String> = (1..=MAX_TEMPLATE_DEPTH).map(|i| format!("c{i}")).collect();
+    let mut triples: Vec<(&str, &str, &str)> = Vec::new();
+    for node in &nodes {
+        triples.push((node, RDF_TYPE, "C"));
+    }
+    for pair in nodes.windows(2) {
+        triples.push((&pair[0], "next", &pair[1]));
+    }
+    triples.push((nodes.last().unwrap(), RDFS_LABEL, "\"end\""));
+    for root in ["r1", "r2"] {
+        triples.push((root, RDF_TYPE, "R"));
+        triples.push((root, "next", &nodes[0]));
+    }
+    let published = Published::build(&graph(&triples));
+    let config = parse_config(
+        r#"{
+          "profiles": {
+            "c": {"type": "http://example.com/C", "template": "x{n}",
+                  "fields": {"n": "http://example.com/next"}}
+          },
+          "targets": {
+            "r": {"type": "http://example.com/R", "label_template": "{m}",
+                  "label_fields": {"m": "http://example.com/next"}}
+          }
+        }"#,
+    );
+
+    // The first root's star caches the head's label from the shallow
+    // position; the second root's label template must not reuse it from the
+    // deeper one, where the same descent is cut. Both read alike, one record.
+    let records = all_records(&published.store, &config);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].iris, [format!("{EX}r1"), format!("{EX}r2")]);
+    let cut = format!("{}end", "x".repeat(MAX_TEMPLATE_DEPTH - 1));
+    let whole = "x".repeat(MAX_TEMPLATE_DEPTH);
+    assert_eq!(records[0].label, cut);
+    assert!(
+        records[0]
+            .embedding_text
+            .contains(&format!("\nnext: {whole}\n")),
+        "{records:?}"
+    );
+
+    // And the second root alone — a preview of it — reads as it did in the
+    // whole run.
+    let alone = one(&published.store, &config, &format!("{EX}r2"));
+    assert_eq!(alone.text, records[0].embedding_text);
+}
+
+#[test]
 fn a_root_with_both_takes_its_target_template_and_a_mention_its_profile() {
     let published = Published::build(&graph(&[
         ("loc1", RDF_TYPE, "Location"),
