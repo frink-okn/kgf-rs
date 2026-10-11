@@ -2791,14 +2791,17 @@ only way to guarantee. The crate defines no byte format and knows nothing of HTT
 
 **What a text is.** Roots are the subjects of `? rdf:type <class>`, blank nodes
 skipped. The star `s ? ?` arrives grouped by predicate in id order, which is IRI order,
-so "predicates in IRI order" costs nothing. Per predicate, the `predicate_limit` values
-with the smallest `sha256(root \t predicate \t object)` over the *strings* are kept and
-emitted in score order: a uniform sample keyed on content, so an unchanged node samples
-the same values in every build whatever ids it was assigned, and the sample is neither
-"first n in dictionary order" (a lexical accident) nor "rarest values" (a ranking the
-text would then depend on globally). A value is named by its literal form; an IRI by the
-profile for its class, then the cascade, then its humanized IRI fragment; a blank node
-is skipped. The root is named the same way except that its target's `label_template`
+so "predicates in IRI order" costs nothing. Per predicate, blank-node values are
+dropped — no line can name one — and of the rest the `predicate_limit` values with the
+smallest `sha256(root \t predicate \t object)` over the *strings* are kept and emitted
+in score order: a uniform sample keyed on content, so an unchanged node samples the same
+values in every build whatever ids it was assigned, and the sample is neither "first n
+in dictionary order" (a lexical accident) nor "rarest values" (a ranking the text would
+then depend on globally). Sampled with the rest, as the Python port did, a blank node
+that scored low took a place it could never fill, and one literal among twenty blank
+nodes under a limit of one left its predicate out of the text. A value is named by its
+literal form; an IRI by the profile for its class, then the cascade, then its humanized
+IRI fragment. The root is named the same way except that its target's `label_template`
 is tried first.
 
 **Two label mechanisms, by position.** A *profile* is keyed by class and names a node
@@ -2829,9 +2832,20 @@ depends on where the descent started, so it is not cached. One that took none st
 depends on how deep it started, through the bound, so it is cached with how many
 templates deep it went and reused only where that many more still fit. Cached without
 that, a label computed from a mention in a star — where a chain fits — was reused from
-inside a root's label template, one template deeper, where the same chain is cut: two
-roots of one shape read differently in one build, and a preview of the second matched
-neither. A root's text is a function of the root, not of what was rendered before it.
+inside a root's profile, one template deeper, where the same chain is cut: two roots of
+one shape read differently in one build, and a preview of the second matched neither.
+
+Depth is the only position a cached label depends on because every descent follows the
+same edges, a node's profiles, and a descent that reached a node in progress would
+have reached itself and been cut. A root's `label_template` is the one template that
+names a node by other edges, so it is applied once, at the top, outside any descent:
+its fields are named as their values are named in any text, and a value named by way
+of the root names the root as a mention would — as the Python port does. Applied as
+the first step of a descent, it let a location named by its site, inside the template
+of a site named by its location, reach the site in progress: alone, the site was cut
+there to its `rdfs:label`; after another site's star had cached the location's label,
+the uncut one was reused. A root's text is a function of the root, not of what was
+rendered before it.
 
 **Cost.** The build reads without bound, because `predicate_limit` selects from all of a
 predicate's values. The route cannot. Every probe any walk makes — a root's star, a
@@ -2844,9 +2858,23 @@ the budget runs out the root in hand is delivered marked `truncated`, no further
 rendered, and the answer reports the candidate budget exhausted, as `/search` does.
 Roots are bounded by a new cap, `max_verbalize_roots` (default 100): IRIs named are
 counted against it, a plan with more targets than the cap is refused (no `n` fits), and
-the default `n` shrinks to fit. The response stops at its byte budget. Drawing a member
-is one rank descent and a class's member count a range width, so a plan never
-enumerates a class.
+the default `n` shrinks to fit. Drawing a member is one rank descent and a class's
+member count a range width, so a plan never enumerates a class.
+
+The response stops at its byte budget, and the text built for it is held to the same
+figure as it is built: every line and every piece a template appends to a label is
+charged against `max_response_bytes`, and past it nothing more is appended, written or
+read. Reads do not bound a text's weight. A template copies its fields' labels into
+every label it renders, so a profile of a hundred fields over a chain of four profiled
+nodes assembles a megabyte label from a few hundred reads, and a thousand fields over a
+subclass hierarchy outgrows memory before the read budget is touched. A record that does
+not fit what is left of the response is left out, unless it is the first: that one is
+cut at a line to fit, keeping its label line, and its digest is the cut text's. Every
+route keeps its first row over the budget because a page must carry something and a row
+cannot be split; a text can, at a line, and sent whole it could weigh many times the
+budget. A plan's statistics count only the texts the answer carries. A build has no byte
+budget, so a config that makes labels grow that way is a build that runs out of memory;
+the preview, which does have one, is where such a config shows itself first.
 
 The config costs one dictionary lookup per IRI as written. Its `defaults` are resolved
 and bound once rather than copied into every target — copied, a 140 KB config of 2,000
@@ -2857,7 +2885,7 @@ anchored list aliased under every target is otherwise that same product, and the
 parser's own guard counts alias jumps rather than what each replays. The route is
 therefore one row of the cost table: the config's IRIs, at most `max_request_bytes` of
 them written out, in dictionary lookups; `max_verbalize_roots` rank descents;
-`candidate_budget` reads; and the bytes.
+`candidate_budget` reads; and `max_response_bytes`, built and sent.
 
 **The route's modes.** `iri` renders named roots under one target; `target` without
 IRIs draws `n` seeded-uniform members, the same draw `/sample` makes; a config alone is
@@ -2898,7 +2926,9 @@ followed, a dangling link (creating through it would land where it points), or a
 link, caught by comparing the opened file's identity with every file the bundle holds.
 A path check alone let a symlink beside the bundle through, and the run truncated
 `data.hdt` under its own mapping and died of SIGBUS. `--roots` and `--texts` must be two
-files, or each writes over the other.
+files, or each writes over the other. Checking changes neither file: they are emptied
+only when writing starts, after the bundle is open, the config bound and the targets
+selected, so a run refused for a misspelled target leaves the last run's files whole.
 
 **What the schema pages needed.** Authoring a config starts from two signals per
 (class, predicate): coverage — how many of a class's members carry the predicate — and
@@ -2911,16 +2941,22 @@ sets), and `/schema`'s class-property pages show a per-subject column.
 the config cascade over the bundle role, the stable sample across runs and across
 shifted ids, allow and deny lists, template and profile by position, grouping, unknown
 IRIs, the cycle and depth bounds, a root reading the same whatever was rendered before
-it, and the command's refusals, links and hard links included — by the GET parser's
-alias bound in `request.rs` — and over a listener by
-`verbalize_previews_a_config_in_three_modes_over_get_query_and_post`,
+it, a root template naming its values as any text does, blank nodes kept out of a
+sample, and the command's refusals, links and hard links included, and its leaving the
+last run's files whole — by the GET parser's alias bound in `request.rs` — and over a
+listener by `verbalize_previews_a_config_in_three_modes_over_get_query_and_post`,
 `verbalize_refuses_what_it_cannot_answer_by_name`,
 `verbalize_survives_a_profile_template_over_a_cycle`,
-`verbalize_charges_every_read_to_one_candidate_budget`, and
-`verbalize_charges_a_probe_that_finds_nothing`. On the SOCKG release (27 M
+`verbalize_charges_every_read_to_one_candidate_budget`,
+`verbalize_charges_a_probe_that_finds_nothing`,
+`verbalize_holds_the_text_it_builds_to_the_byte_budget`,
+`verbalize_cuts_its_first_record_to_fit_rather_than_send_it_over`, and
+`verbalize_plan_counts_only_the_texts_it_carries`. On the SOCKG release (27 M
 triples, 1,237 roots over eleven targets) the texts were byte-identical to the Python
 implementation this ports — 1,215 distinct texts, every root joined to the same text —
-in 0.3 s and 38 MB against 22 s and 1.1 GB.
+in 0.3 s and 38 MB against 22 s and 1.1 GB. That was measured before blank nodes left
+the sample and a root's template left the descent (2026-10-11), each of which departs
+from the Python on purpose; neither has been measured against SOCKG since.
 
 ## Testing spine
 
@@ -4076,10 +4112,10 @@ following the code.
     operation in §3.1's sense, and its cost is one row (unit 35 records
     it: a dictionary lookup per config IRI, the config held to `max_request_bytes`
     written out; cap many rank descents; a candidate budget of reads, probes and
-    rows alike; the byte budget). Either
-    doc 03 gains the row and the cap, or doc 13 gains a section saying the preview
-    exists, what it costs, and that it is a deployment's to route rather than a
-    bundle's to declare.
+    rows alike; the byte budget, which holds the text built as well as the text sent).
+    Either doc 03 gains the row and the cap, or doc 13 gains a section saying the
+    preview exists, what it costs, and that it is a deployment's to route rather than
+    a bundle's to declare.
 
 98. **Should an operation the protocol has not defined have a name in the capability
     vocabulary at all?** Unit 35 first declared `verbalize` in every manifest, on the
