@@ -5549,6 +5549,112 @@ fn verbalize_charges_every_read_to_one_candidate_budget() {
 }
 
 #[test]
+fn verbalize_holds_the_text_it_builds_to_the_byte_budget() {
+    // A profile of a hundred fields over a chain of four profiled nodes: each
+    // label is a hundred copies of the next one's, so the head's is a
+    // megabyte, assembled from a few hundred reads. Reads do not bound it;
+    // the byte budget must, while it is being built.
+    let mut nt = String::new();
+    for i in 1..=4 {
+        nt.push_str(&format!(
+            "<http://example.org/c{i}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/C> .\n"
+        ));
+        if i < 4 {
+            nt.push_str(&format!(
+                "<http://example.org/c{i}> <http://example.org/next> <http://example.org/c{}> .\n",
+                i + 1
+            ));
+        }
+    }
+    nt.push_str("<http://example.org/c4> <http://example.org/name> \"x\" .\n");
+    nt.push_str("<http://example.org/r> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/R> .\n");
+    nt.push_str("<http://example.org/r> <http://example.org/name> \"R\" .\n");
+    nt.push_str("<http://example.org/r> <http://example.org/next> <http://example.org/c1> .\n");
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", &nt, "2026-06-01T14:03:22Z");
+    let fields: serde_json::Map<String, serde_json::Value> = (0..100)
+        .map(|i| (format!("f{i}"), "http://example.org/next".into()))
+        .collect();
+    let template: String = (0..100).map(|i| format!("{{f{i}}}")).collect();
+    let config = serde_json::json!({
+        "profiles": {"c": {"type": "http://example.org/C", "template": template, "fields": fields}},
+        "targets": {"r": {"type": "http://example.org/R"}}
+    })
+    .to_string();
+    let url = verbalize_url(&[("config", &config), ("iri", "ex:r")]);
+
+    // Under the default budget the head's megabyte label is written whole.
+    let whole = deployment.serve().get(&url);
+    assert_eq!(whole.json()["complete"], true);
+    assert!(whole.text().len() > 1_000_000);
+
+    // Under a 64 KiB budget the label is abandoned as it passes the budget,
+    // and the text keeps its label line.
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.max_response_bytes = 64 * 1024;
+    let cut = deployment
+        .serve_with_limits(kgf_server::Caps::new(), budgets)
+        .get(&url);
+    cut.assert_status(200);
+    cut.assert_header("kgf-truncation-reason", "response_bytes");
+    let body = cut.json();
+    assert_eq!(body["records"][0]["truncated"], true);
+    assert!(
+        body["records"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("label: R"),
+        "{body}"
+    );
+    assert!(cut.text().len() < 64 * 1024, "{} bytes", cut.text().len());
+}
+
+#[test]
+fn verbalize_cuts_its_first_record_to_fit_rather_than_send_it_over() {
+    use sha2::Digest as _;
+
+    // Forty values of one predicate, all kept, make a text of about two
+    // kilobytes. Under a one-kilobyte budget the first record is the one a
+    // response cannot do without, so it is cut at a line to fit rather than
+    // sent whole past the budget, and its digest is the cut text's.
+    let mut nt = String::from(
+        "<http://example.org/r> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/R> .\n",
+    );
+    for i in 0..40 {
+        nt.push_str(&format!(
+            "<http://example.org/r> <http://example.org/note> \"note \\\"{i:02}\\\" of forty, quoted\" .\n"
+        ));
+    }
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", &nt, "2026-06-01T14:03:22Z");
+    let config = r#"{"targets": {"r": {"type": "http://example.org/R", "predicate_limit": 100}}}"#;
+    let url = verbalize_url(&[("config", config), ("iri", "ex:r")]);
+
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.max_response_bytes = 1024;
+    let answer = deployment
+        .serve_with_limits(kgf_server::Caps::new(), budgets)
+        .get(&url);
+    answer.assert_status(200);
+    answer.assert_header("kgf-truncation-reason", "response_bytes");
+    let body = answer.json();
+    let record = &body["records"][0];
+    assert_eq!(record["truncated"], true);
+    assert!(
+        serde_json::to_string(record).unwrap().len() <= 1024,
+        "{record}"
+    );
+    let text = record["text"].as_str().unwrap();
+    assert!(text.starts_with("label: r\nnote: "), "{text}");
+    assert_eq!(record["lines"], text.lines().count());
+    let digest: String = sha2::Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(record["digest"], digest);
+}
+
+#[test]
 fn verbalize_charges_a_probe_that_finds_nothing() {
     // A template may name any number of fields, and a field that is empty
     // for the node being named is still a probe of the store. Two hundred

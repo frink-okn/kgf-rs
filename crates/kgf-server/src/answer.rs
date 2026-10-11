@@ -87,7 +87,7 @@ use crate::term::{DictionaryTermError, LiteralKind, PrefixMap, Term, TermCache, 
 use crate::url::{self, Mount, Params};
 use kgf_store::graphs::{GraphId, Graphs};
 use kgf_store::scope::{QuadSelection, ScopedSelection};
-use kgf_verbalize::{Bound, Rendered as Verbalized, Unknown, Verbalizer};
+use kgf_verbalize::{Bound, Exhausted, Rendered as Verbalized, Unknown, Verbalizer};
 
 // ---------------------------------------------------------------------------
 // Where a response came from
@@ -5520,9 +5520,16 @@ fn scanned_row(
 /// When the budget runs out, the root in hand is
 /// delivered marked `truncated`, no further root is rendered, and the answer
 /// says the candidate budget was exhausted. The roots are bounded by
-/// `max_verbalize_roots`, and the response stops at its byte budget. A
-/// class's member count is a range width, and drawing a member is one rank
-/// descent, so a plan never enumerates a class.
+/// `max_verbalize_roots`. A class's member count is a range width, and
+/// drawing a member is one rank descent, so a plan never enumerates a class.
+///
+/// The response stops at its byte budget, and so does the text built for it:
+/// the verbalizer charges every line and every piece a template appends to a
+/// label against `max_response_bytes`, because a config can make one label
+/// grow far faster than the reads behind it. A record that does not fit what
+/// is left is left out — unless it is the first, which is cut at a line to
+/// fit, keeping at least its label line: a response must carry something,
+/// as every route keeps its first row, and a text, unlike a row, can be cut.
 pub fn verbalize(
     store: &Store,
     target: Target,
@@ -5531,27 +5538,31 @@ pub fn verbalize(
     let bound = Bound::bind(store, &request.resolved, &request.label_predicates)
         .map_err(|error| unreadable("binding a verbalization config", &error))?;
     let mut verbalizer = Verbalizer::new(store, &bound)
-        .with_read_budget(usize::try_from(request.read_budget).unwrap_or(usize::MAX));
+        .with_read_budget(usize::try_from(request.read_budget).unwrap_or(usize::MAX))
+        .with_byte_budget(usize::try_from(request.bytes.0).unwrap_or(usize::MAX));
     let names: Vec<&str> = bound.targets().collect();
 
     let mut records = Vec::new();
     let mut reports = Vec::new();
     let mut absent = Vec::new();
     let mut spent = 0u64;
-    let mut exhausted = false;
-    let mut cut = false;
+    // Whether a record was left out, or cut, to keep within the byte budget.
+    let mut over_bytes = false;
 
-    // Add one rendered root, unless the byte budget is spent.
+    // Add one rendered root if it fits what is left of the byte budget; the
+    // first is cut to fit instead.
     let mut admit =
         |rendered: Verbalized, index: usize, records: &mut Vec<VerbalizeRecord>| -> bool {
-            let record = VerbalizeRecord::new(names[index].to_owned(), rendered);
-            let next = spent.saturating_add(record.serialized);
-            if next > request.bytes.0 && !records.is_empty() {
-                exhausted = true;
-                return false;
+            let room = request.bytes.0.saturating_sub(spent);
+            let mut record = VerbalizeRecord::new(names[index].to_owned(), rendered);
+            if record.serialized > room {
+                over_bytes = true;
+                if !records.is_empty() {
+                    return false;
+                }
+                record.fit(room);
             }
-            spent = next;
-            cut |= record.truncated;
+            spent = spent.saturating_add(record.serialized);
             records.push(record);
             true
         };
@@ -5565,7 +5576,8 @@ pub fn verbalize(
                     .map_err(|error| unreadable("verbalizing a root", &error))?;
                 match rendered {
                     Some(rendered) => {
-                        if !admit(rendered, index, &mut records) || verbalizer.exhausted() {
+                        if !admit(rendered, index, &mut records) || verbalizer.exhausted().is_some()
+                        {
                             break;
                         }
                     }
@@ -5594,7 +5606,7 @@ pub fn verbalize(
                         continue;
                     };
                     report.observe(&rendered);
-                    if !admit(rendered, index, &mut records) || verbalizer.exhausted() {
+                    if !admit(rendered, index, &mut records) || verbalizer.exhausted().is_some() {
                         reports.push(report);
                         break 'targets;
                     }
@@ -5604,12 +5616,14 @@ pub fn verbalize(
         }
     }
 
-    let completeness = if exhausted {
-        Completeness::budget_exhausted_without_resume(BudgetReason::ResponseBytes)
-    } else if cut {
-        Completeness::budget_exhausted_without_resume(BudgetReason::Candidate)
-    } else {
-        Completeness::complete()
+    let completeness = match (over_bytes, verbalizer.exhausted()) {
+        (true, _) | (false, Some(Exhausted::Bytes)) => {
+            Completeness::budget_exhausted_without_resume(BudgetReason::ResponseBytes)
+        }
+        (false, Some(Exhausted::Reads)) => {
+            Completeness::budget_exhausted_without_resume(BudgetReason::Candidate)
+        }
+        (false, None) => Completeness::complete(),
     };
     Ok(VerbalizeAnswer {
         dataset: target.id.dataset.clone(),
@@ -5643,9 +5657,9 @@ pub struct VerbalizeTargetReport {
     max_chars: u64,
     /// Mean lines per rendered text, the label line included.
     mean_lines: u64,
-    /// Rendered texts the candidate budget ran out in, so that not every
-    /// edge or label was read: a bounded server's approximation, not a
-    /// config problem.
+    /// Rendered texts a budget ran out in — the candidate budget before every
+    /// edge or label was read, or the byte budget before every line was
+    /// written: a bounded server's approximation, not a config problem.
     truncated: u64,
     /// Predicates sampled down to `predicate_limit`, summed over the rendered
     /// texts: the signal for tuning the limit or the lists.
@@ -5731,6 +5745,34 @@ impl VerbalizeRecord {
             truncated: rendered.truncated,
             limited: rendered.limited,
             serialized,
+        }
+    }
+
+    /// Cut the text at a line so the record fits `room` bytes, keeping at
+    /// least the label line, which nothing can stand without; the record is
+    /// then marked truncated and its digest is the cut text's.
+    fn fit(&mut self, room: u64) {
+        let fixed = self.serialized - serialized_json_string(&self.text);
+        // The text's quotes, then each line kept, a line after the first
+        // bringing its newline, escaped to two bytes.
+        let mut size = 2;
+        let mut end = 0;
+        for (index, line) in self.text.split('\n').enumerate() {
+            let newline = if index == 0 { 0 } else { 2 };
+            let cost = serialized_json_string(line) - 2 + newline;
+            if index > 0 && fixed + size + cost > room {
+                break;
+            }
+            size += cost;
+            end += line.len() + newline as usize / 2;
+        }
+        if end < self.text.len() {
+            self.text.truncate(end);
+            self.digest = kgf_verbalize::text::hex(&kgf_verbalize::text::text_digest(&self.text));
+            self.chars = self.text.chars().count() as u64;
+            self.lines = self.text.lines().count() as u64;
+            self.truncated = true;
+            self.serialized = fixed + size;
         }
     }
 }

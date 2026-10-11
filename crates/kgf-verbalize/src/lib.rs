@@ -527,6 +527,17 @@ fn push_unique(ids: &mut Vec<u64>, id: u64) {
     }
 }
 
+/// Which of a [`Verbalizer`]'s budgets ran out first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exhausted {
+    /// The [read budget](Verbalizer::with_read_budget): probes of the store
+    /// and the rows they yield.
+    Reads,
+    /// The [byte budget](Verbalizer::with_byte_budget): the text built, the
+    /// labels templates assemble included.
+    Bytes,
+}
+
 /// One root, verbalized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rendered {
@@ -538,10 +549,10 @@ pub struct Rendered {
     pub text: String,
     /// SHA-256 of `text`: the key a text's vector is matched to its roots by.
     pub digest: [u8; 32],
-    /// Whether the [read budget](Verbalizer::with_read_budget) ran out before
-    /// every edge of the root's star, and every probe naming what it
-    /// mentions, had been read — so the text is a bounded approximation of
-    /// what an unbudgeted run would write.
+    /// Whether a budget ran out before every edge of the root's star had
+    /// been read and named and every line written — so the text is a bounded
+    /// approximation of what an unbudgeted run would write.
+    /// [`Verbalizer::exhausted`] says which.
     pub truncated: bool,
     /// How many of the root's walked predicates had more values than
     /// `predicate_limit`, so that a sample of them stands in for the rest.
@@ -576,9 +587,13 @@ pub struct Verbalizer<'a> {
     /// probe of the store and one per row a probe yields. `None` reads
     /// without bound.
     budget: Option<usize>,
-    /// Whether a read has been cut short by the budget. Once true, every
-    /// text rendered from here on is an approximation.
-    exhausted: bool,
+    /// Bytes of text this verbalizer may still build, across every root:
+    /// each line, and each piece of a label a template assembles. `None`
+    /// builds without bound.
+    bytes: Option<usize>,
+    /// The budget that ran out first, if one has. From then on nothing more
+    /// is read, and every text rendered is an approximation.
+    exhausted: Option<Exhausted>,
     terms: Terms,
     /// A predicate's display name, per target (the cascade differs).
     predicate_names: HashMap<(u64, usize), Rc<str>>,
@@ -614,7 +629,8 @@ impl<'a> Verbalizer<'a> {
             dictionary: store.dict(),
             bound,
             budget: None,
-            exhausted: false,
+            bytes: None,
+            exhausted: None,
             terms: Terms::default(),
             predicate_names: HashMap::new(),
             object_labels: HashMap::new(),
@@ -646,8 +662,27 @@ impl<'a> Verbalizer<'a> {
         self
     }
 
-    /// Whether the read budget has run out.
-    pub fn exhausted(&self) -> bool {
+    /// Build at most `bytes` bytes of text over the life of this verbalizer:
+    /// every line of every text, and every piece a template appends to a
+    /// label, cached or not, all charged to the one figure.
+    ///
+    /// Reads do not bound what a text weighs. A template copies its literal
+    /// text and its fields' labels into every label it renders, and a field's
+    /// label may be a template's in turn, so a profile of a thousand fields
+    /// over a chain of a few profiled nodes assembles a label a thousand to
+    /// the power of the chain's length in size from a few thousand reads.
+    /// Charging every piece appended bounds the bytes built, and with them the
+    /// memory and the copying, whatever the config says. Past the budget no
+    /// piece is appended and no line written, and since nothing is read past
+    /// either budget, the walk ends there: the text in hand keeps its label
+    /// line and is marked [`truncated`](Rendered::truncated).
+    pub fn with_byte_budget(mut self, bytes: usize) -> Self {
+        self.bytes = Some(bytes);
+        self
+    }
+
+    /// The budget that ran out first, if either has.
+    pub fn exhausted(&self) -> Option<Exhausted> {
         self.exhausted
     }
 
@@ -717,10 +752,10 @@ impl<'a> Verbalizer<'a> {
         let digest = text_digest(&built.text);
         Ok(Some(Rendered {
             iri: iri.to_string(),
-            label,
+            label: label.to_string(),
             text: built.text,
             digest,
-            truncated: self.exhausted,
+            truncated: self.exhausted.is_some(),
             limited: built.limited,
         }))
     }
@@ -740,6 +775,10 @@ impl<'a> Verbalizer<'a> {
 
     /// The text: the label line, then one line per selected edge, with what
     /// the walk had to leave out.
+    ///
+    /// The label line is written even past the byte budget — a text is never
+    /// without its name, as a page is never without its first row — and is
+    /// charged all the same; every other line is written only if it fits.
     fn build_text(
         &mut self,
         root: u64,
@@ -747,13 +786,18 @@ impl<'a> Verbalizer<'a> {
         target: usize,
         label: &str,
     ) -> Result<BuiltText, Error> {
-        let mut lines = vec![format!("label: {label}")];
+        let label_line = format!("label: {label}");
+        self.spend(label_line.len());
+        let mut lines = vec![label_line];
         let star = self.star(root)?;
         let limit = self.bound.targets[target].predicate_limit;
         let mut limited = 0u32;
 
         let mut i = 0;
-        while i < star.len() {
+        'walk: while i < star.len() {
+            if self.exhausted == Some(Exhausted::Bytes) {
+                break;
+            }
             let predicate = star[i].0;
             let mut j = i;
             while j < star.len() && star[j].0 == predicate {
@@ -785,7 +829,12 @@ impl<'a> Verbalizer<'a> {
                 let Some(value) = self.object_text(object, target)? else {
                     continue;
                 };
-                lines.push(format!("{predicate_name}: {value}"));
+                let line = format!("{predicate_name}: {value}");
+                // The newline joining it to the line before is part of it.
+                if !self.spend(line.len() + 1) {
+                    break 'walk;
+                }
+                lines.push(line);
             }
         }
         Ok(BuiltText {
@@ -806,7 +855,7 @@ impl<'a> Verbalizer<'a> {
 
     /// What a value contributes to a line, or `None` when it contributes no
     /// line: a blank node, or a label that came out empty.
-    fn object_text(&mut self, object: u64, target: usize) -> Result<Option<String>, Error> {
+    fn object_text(&mut self, object: u64, target: usize) -> Result<Option<Rc<str>>, Error> {
         let text = self.resolve(Role::Object, object)?;
         if text.starts_with("_:") {
             return Ok(None);
@@ -863,16 +912,37 @@ impl<'a> Verbalizer<'a> {
     /// Charge one read to the budget — a probe, or a row it yields — and say
     /// whether it may be made. Every probe and every row any walk consumes
     /// passes through here, so whatever the budget bounds, it bounds here; a
-    /// read refused is what makes the run exhausted.
+    /// read refused is what makes the run exhausted. Nothing is read past
+    /// either budget: past the byte budget nothing read could be written.
     fn take(&mut self) -> bool {
+        if self.exhausted.is_some() {
+            return false;
+        }
         match &mut self.budget {
             Some(0) => {
-                self.exhausted = true;
+                self.exhausted = Some(Exhausted::Reads);
                 false
             }
             Some(remaining) => {
                 *remaining -= 1;
                 true
+            }
+            None => true,
+        }
+    }
+
+    /// Charge `bytes` of text built to the byte budget and say whether they
+    /// may be. Every line and every piece a template appends passes through
+    /// here.
+    fn spend(&mut self, bytes: usize) -> bool {
+        match &mut self.bytes {
+            Some(remaining) if *remaining >= bytes => {
+                *remaining -= bytes;
+                true
+            }
+            Some(_) => {
+                self.exhausted.get_or_insert(Exhausted::Bytes);
+                false
             }
             None => true,
         }
@@ -915,7 +985,12 @@ impl<'a> Verbalizer<'a> {
     /// computed afresh exactly when `depth + height` is within
     /// [`MAX_TEMPLATE_DEPTH`]. Past that, a fresh computation would be cut,
     /// so the label is computed again rather than read from the cache.
-    fn display_label(&mut self, node: Node, target: usize, as_root: bool) -> Result<String, Error> {
+    fn display_label(
+        &mut self,
+        node: Node,
+        target: usize,
+        as_root: bool,
+    ) -> Result<Rc<str>, Error> {
         let depth = self.resolving.len();
         if let Node::Object(id) = node
             && let Some(cached) = self.object_labels.get(&(id, target))
@@ -924,23 +999,23 @@ impl<'a> Verbalizer<'a> {
             // The descent the cached label stands for counts toward the one
             // in hand, as it would had it been taken.
             self.deepest = self.deepest.max(depth + cached.height);
-            return Ok(cached.label.to_string());
+            return Ok(Rc::clone(&cached.label));
         }
         let cuts = self.cuts;
         let outer = std::mem::replace(&mut self.deepest, depth);
         let label = self.compute_display_label(node, target, as_root);
         let height = self.deepest - depth;
         self.deepest = outer.max(self.deepest);
-        let label = label?;
+        let label: Rc<str> = label?.into();
         if let Node::Object(id) = node
             && self.cuts == cuts
-            && !self.exhausted
+            && self.exhausted.is_none()
         {
             bounded_insert(
                 &mut self.object_labels,
                 (id, target),
                 CachedLabel {
-                    label: Rc::from(label.as_str()),
+                    label: Rc::clone(&label),
                     height,
                 },
             );
@@ -1037,15 +1112,24 @@ impl<'a> Verbalizer<'a> {
     ) -> Result<Option<String>, Error> {
         let mut out = String::new();
         for part in &template.parts {
-            match part {
-                BoundPart::Text(text) => out.push_str(text),
-                BoundPart::Field(None) => {}
+            let value;
+            let piece: &str = match part {
+                BoundPart::Text(text) => text,
+                BoundPart::Field(None) => continue,
                 BoundPart::Field(Some(predicate)) => {
-                    if let Some(value) = self.first_direct_value(subject, *predicate, target)? {
-                        out.push_str(&value);
+                    match self.first_direct_value(subject, *predicate, target)? {
+                        Some(found) => {
+                            value = found;
+                            &value
+                        }
+                        None => continue,
                     }
                 }
+            };
+            if !self.spend(piece.len()) {
+                break;
             }
+            out.push_str(piece);
         }
         let label = normalize_label(&out);
         Ok((!label.is_empty()).then_some(label))
@@ -1058,8 +1142,8 @@ impl<'a> Verbalizer<'a> {
         subject: u64,
         predicate: u64,
         target: usize,
-    ) -> Result<Option<String>, Error> {
-        let mut best: Option<String> = None;
+    ) -> Result<Option<Rc<str>>, Error> {
+        let mut best: Option<Rc<str>> = None;
         for object in self.objects(subject, predicate)? {
             let Some(label) = self.object_text(object, target)? else {
                 continue;
