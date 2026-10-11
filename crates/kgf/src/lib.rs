@@ -16,3 +16,4 @@
 pub mod build;
 pub mod manifest;
 pub mod serve;
+pub mod verbalize;

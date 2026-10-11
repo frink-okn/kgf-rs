@@ -66,6 +66,7 @@ use crate::representation::{RdfSyntax, Representation};
 use crate::service::{PredicateRoles, RolesByPredicate};
 use crate::term::{Literal as KgfLiteral, PrefixMap, Term};
 use crate::url::Params;
+use kgf_verbalize::{Config as VerbalizeConfig, Resolved as VerbalizeResolved};
 
 // ---------------------------------------------------------------------------
 // Positions and terms
@@ -757,6 +758,525 @@ impl Labels {
     /// Submitted IRIs, in input order.
     pub fn iris(&self) -> &[BoundTerm] {
         &self.iris
+    }
+}
+
+/// `GET|QUERY /verbalize` — what a verbalization config would write for a
+/// few roots of a served bundle.
+///
+/// The authoring loop for an embedding config: change a line, look at the
+/// text again. It answers three questions, one per [`VerbalizeMode`], and
+/// takes the config itself in the request so that authoring needs nothing but
+/// a served bundle — no local artifacts, no build.
+#[derive(Debug)]
+pub struct Verbalize {
+    /// The config, validated and defaulted.
+    pub resolved: VerbalizeResolved,
+    /// Which roots to render.
+    pub mode: VerbalizeMode,
+    /// The one target the request is about, by config name, when a mode
+    /// needs one or the request narrowed a plan to one.
+    pub target: Option<String>,
+    /// Roots drawn per target in `sample` and `plan` modes.
+    pub n: u32,
+    /// The draw's seed.
+    pub seed: u64,
+    /// The release's `label` role cascade, behind the config's own.
+    pub label_predicates: Vec<String>,
+    /// Bytes the rendered texts may occupy.
+    pub bytes: ResponseBytes,
+    /// Reads the whole request may make — each probe of the store, for a
+    /// root's star or for naming what a text mentions, and each row a probe
+    /// yields — charged to one figure.
+    pub read_budget: u64,
+}
+
+/// Which roots `/verbalize` renders.
+///
+/// Chosen by what the request names: IRIs make it `iris`; a target without
+/// IRIs makes it `sample`; neither makes it `plan`, which `plan=true` can also
+/// ask for by name with a target to narrow it to one.
+#[derive(Debug)]
+pub enum VerbalizeMode {
+    /// These roots, under one target.
+    Iris(Vec<BoundTerm>),
+    /// `n` seeded-uniform members of one target's class.
+    Sample,
+    /// Every target, or the one named: its member count and `n`
+    /// seeded-uniform members' texts, with length statistics.
+    Plan,
+}
+
+impl VerbalizeMode {
+    /// The census spelling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Iris(_) => "iris",
+            Self::Sample => "sample",
+            Self::Plan => "plan",
+        }
+    }
+}
+
+/// Roots drawn per target when a request does not say.
+const VERBALIZE_DEFAULT_N: u32 = 5;
+
+/// The body of a `QUERY|POST /verbalize`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireVerbalize {
+    config: VerbalizeConfig,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    iris: Option<Vec<WireTerm>>,
+    #[serde(default)]
+    n: Option<u32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    plan: Option<bool>,
+}
+
+impl Verbalize {
+    const PARAMETERS: &'static [&'static str] =
+        &["config", "target", "iri", "n", "seed", "plan", "format"];
+
+    /// Parse the GET form: the config as YAML or JSON text in `config`.
+    pub fn parse(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        profile: &PredicateRoles,
+    ) -> Result<Self, Problem> {
+        accept_only(params, VERBALIZE, Self::PARAMETERS)?;
+        let Some(text) = params.get("config") else {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "config is required: the verbalization config, as YAML or JSON",
+            ));
+        };
+        if text.len() as u64 > limits.budgets.max_request_bytes {
+            return Err(Problem::new(
+                ErrorCode::PayloadTooLarge,
+                format!(
+                    "config is {} bytes, over this server's max_request_bytes of {}",
+                    text.len(),
+                    limits.budgets.max_request_bytes
+                ),
+            ));
+        }
+        let config = verbalize_config_text(text, limits.budgets.max_request_bytes)?;
+        let mut iris = Vec::new();
+        if let Some(list) = params.get("iri") {
+            for text in term_list("iri", list)? {
+                iris.push(BoundTerm::parse("iri", text, limits, prefixes)?.require_iri("iri")?);
+            }
+        }
+        let n = match params.get("n") {
+            None => None,
+            Some(_) => Some(page_size(
+                params,
+                "n",
+                VERBALIZE_DEFAULT_N,
+                limits.caps.max_verbalize_roots,
+                "omit n to take the default",
+            )?),
+        };
+        Self::finish(
+            config,
+            params.get("target").map(str::to_owned),
+            iris,
+            n,
+            params.get("seed").map(|_| seed(params)).transpose()?,
+            boolean(params, "plan", false)?,
+            limits,
+            profile,
+        )
+    }
+
+    /// Parse the JSON body form: the config as an object in `config`.
+    pub fn parse_body(
+        params: &Params,
+        body: &[u8],
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        profile: &PredicateRoles,
+    ) -> Result<Self, Problem> {
+        accept_only(params, VERBALIZE, &["format"])?;
+        let wire: WireVerbalize = parse_body(body)?;
+        let mut iris = Vec::new();
+        for (index, iri) in wire.iris.unwrap_or_default().into_iter().enumerate() {
+            iris.push(
+                BoundTerm::parse_body(&format!("iris[{index}]"), iri, limits, prefixes)?
+                    .require_iri(&format!("iris[{index}]"))?,
+            );
+        }
+        if let Some(n) = wire.n {
+            if n == 0 {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    "n=0 asks for nothing back; omit n to take the default",
+                ));
+            }
+            if n > limits.caps.max_verbalize_roots {
+                return Err(Problem::new(
+                    ErrorCode::CapExceeded,
+                    format!(
+                        "n={n} is over this server's max_verbalize_roots of {}",
+                        limits.caps.max_verbalize_roots
+                    ),
+                ));
+            }
+        }
+        Self::finish(
+            wire.config,
+            wire.target,
+            iris,
+            wire.n,
+            wire.seed,
+            wire.plan.unwrap_or(false),
+            limits,
+            profile,
+        )
+    }
+
+    /// The rules both forms share: which mode the request is, and that it
+    /// fits under the root cap.
+    #[allow(clippy::too_many_arguments)]
+    fn finish(
+        config: VerbalizeConfig,
+        target: Option<String>,
+        iris: Vec<BoundTerm>,
+        n: Option<u32>,
+        seed: Option<u64>,
+        plan: bool,
+        limits: Limits<'_>,
+        profile: &PredicateRoles,
+    ) -> Result<Self, Problem> {
+        let resolved = config.resolve().map_err(|error| {
+            Problem::new(
+                ErrorCode::MalformedRequest,
+                format!("config is not a usable verbalization config: {error}"),
+            )
+        })?;
+        let names: Vec<&str> = resolved
+            .targets
+            .iter()
+            .map(|target| target.name.as_str())
+            .collect();
+        if let Some(name) = &target
+            && !names.contains(&name.as_str())
+        {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "target={} is not one the config declares; it declares {}",
+                    reflected(name),
+                    names
+                        .iter()
+                        .map(|name| format!("{name:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+        let cap = limits.caps.max_verbalize_roots;
+
+        let (mode, target, n) = if !iris.is_empty() {
+            if plan || n.is_some() || seed.is_some() {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    "iri names the roots to render, so n, seed and plan do not apply; send one or the other",
+                ));
+            }
+            if iris.len() > cap as usize {
+                return Err(Problem::new(
+                    ErrorCode::CapExceeded,
+                    format!(
+                        "{} IRIs is over this server's max_verbalize_roots of {cap}",
+                        iris.len()
+                    ),
+                ));
+            }
+            (
+                VerbalizeMode::Iris(iris),
+                Self::one_target(target, &names)?,
+                VERBALIZE_DEFAULT_N,
+            )
+        } else if plan || target.is_none() {
+            let selected = if target.is_some() {
+                1
+            } else {
+                names.len() as u32
+            };
+            // A plan renders at least one root per target, so a config
+            // declaring more targets than the cap has no n that fits and is
+            // refused like any other request over a cap. Under that, an
+            // explicit n is held to the cap and the default shrinks to fit,
+            // so a bare config is answerable with fewer roots per target
+            // when it declares many.
+            if selected > cap {
+                return Err(Problem::new(
+                    ErrorCode::CapExceeded,
+                    format!(
+                        "a plan of {selected} targets would render at least {selected} roots, \
+                         over this server's max_verbalize_roots of {cap}; name one target"
+                    ),
+                ));
+            }
+            let n = match n {
+                Some(n) if n.saturating_mul(selected) > cap => {
+                    return Err(Problem::new(
+                        ErrorCode::CapExceeded,
+                        format!(
+                            "a plan of {selected} targets at n={n} would render {} roots, over \
+                             this server's max_verbalize_roots of {cap}; lower n or name one target",
+                            n.saturating_mul(selected)
+                        ),
+                    ));
+                }
+                Some(n) => n,
+                None => VERBALIZE_DEFAULT_N.min(cap / selected.max(1)),
+            };
+            (VerbalizeMode::Plan, target, n)
+        } else {
+            (
+                VerbalizeMode::Sample,
+                Self::one_target(target, &names)?,
+                n.unwrap_or(VERBALIZE_DEFAULT_N.min(cap)),
+            )
+        };
+
+        Ok(Self {
+            resolved,
+            mode,
+            target,
+            n,
+            seed: seed.unwrap_or(0),
+            label_predicates: profile
+                .get("label")
+                .map(<[String]>::to_vec)
+                .unwrap_or_default(),
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            read_budget: limits.budgets.candidate_budget,
+        })
+    }
+
+    /// The target a single-target mode is about: the one named, or the only
+    /// one the config declares.
+    fn one_target(target: Option<String>, names: &[&str]) -> Result<Option<String>, Problem> {
+        match (target, names) {
+            (Some(target), _) => Ok(Some(target)),
+            (None, [only]) => Ok(Some((*only).to_owned())),
+            (None, _) => Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "target is required when the config declares more than one; it declares {}",
+                    names
+                        .iter()
+                        .map(|name| format!("{name:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )),
+        }
+    }
+
+    /// The targets this request renders, as indexes into the resolved config.
+    pub fn target_indexes(&self) -> Vec<usize> {
+        match &self.target {
+            Some(name) => self
+                .resolved
+                .targets
+                .iter()
+                .position(|target| target.name == *name)
+                .into_iter()
+                .collect(),
+            None => (0..self.resolved.targets.len()).collect(),
+        }
+    }
+
+    /// Roots this request asked to render.
+    fn requested_roots(&self) -> u64 {
+        match &self.mode {
+            VerbalizeMode::Iris(iris) => iris.len() as u64,
+            VerbalizeMode::Sample => u64::from(self.n),
+            VerbalizeMode::Plan => u64::from(self.n) * self.target_indexes().len() as u64,
+        }
+    }
+}
+
+impl GetRequest for Verbalize {
+    fn normalize_params(params: &Params) -> Params {
+        params.without_empty(&["target", "iri", "n", "seed", "plan"])
+    }
+
+    fn work_class(&self) -> WorkClass {
+        WorkClass::Heavy
+    }
+}
+
+impl ObservedRequest for Verbalize {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Verbalize {
+            mode: self.mode.as_str(),
+            targets: self.resolved.targets.len() as u64,
+            roots: self.requested_roots(),
+        }
+    }
+}
+
+/// Parse `/verbalize`'s GET config, YAML or JSON, held to `limit` bytes once
+/// its aliases are expanded.
+///
+/// An alias replays its anchored node wherever it appears, so a document of a
+/// few kilobytes can deserialize to gigabytes: one anchored list of IRIs
+/// aliased under every target is the product of the two. The YAML parser's
+/// own guard counts alias jumps, not what a jump replays, so it does not stop
+/// that. A first pass therefore measures the document as if written out —
+/// each scalar's bytes, and one per sequence element and mapping entry —
+/// without building anything, abandoning the walk as soon as the measure
+/// passes `limit`; only a document within it is deserialized. `limit` is
+/// `max_request_bytes`, the bound a body's config has, and a document without
+/// aliases measures under its own length, so this refuses only expansion.
+fn verbalize_config_text(text: &str, limit: u64) -> Result<VerbalizeConfig, Problem> {
+    let budget = ExpansionBudget {
+        remaining: std::cell::Cell::new(limit),
+        exceeded: std::cell::Cell::new(false),
+    };
+    // The walk's own result matters only through `exceeded`: a document it
+    // could not walk fails the real parse the same way, and that parse's
+    // message is the one to report.
+    let _ = serde::de::DeserializeSeed::deserialize(
+        Expanded { budget: &budget },
+        serde_norway::Deserializer::from_str(text),
+    );
+    if budget.exceeded.get() {
+        return Err(Problem::new(
+            ErrorCode::PayloadTooLarge,
+            format!(
+                "config expands past this server's max_request_bytes of {limit} once its YAML \
+                 aliases are replayed; write the repeated lists out, or put them under defaults"
+            ),
+        ));
+    }
+    serde_norway::from_str(text).map_err(|error| {
+        Problem::new(
+            ErrorCode::MalformedRequest,
+            format!("config does not parse as a verbalization config: {error}"),
+        )
+    })
+}
+
+/// What remains of [`verbalize_config_text`]'s limit, and whether a walk
+/// has run past it.
+struct ExpansionBudget {
+    remaining: std::cell::Cell<u64>,
+    exceeded: std::cell::Cell<bool>,
+}
+
+/// A walk of any YAML value that charges its expanded size to a budget and
+/// keeps nothing.
+#[derive(Clone, Copy)]
+struct Expanded<'a> {
+    budget: &'a ExpansionBudget,
+}
+
+impl Expanded<'_> {
+    fn charge<E: serde::de::Error>(self, bytes: usize) -> Result<(), E> {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        match self.budget.remaining.get().checked_sub(bytes) {
+            Some(left) => {
+                self.budget.remaining.set(left);
+                Ok(())
+            }
+            None => {
+                self.budget.exceeded.set(true);
+                Err(E::custom("the config expands past the request limit"))
+            }
+        }
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Expanded<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Expanded<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("any YAML value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        self.charge(1)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        self.charge(1)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        self.charge(1)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        self.charge(1)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<(), E> {
+        self.charge(value.len())
+    }
+
+    fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<(), E> {
+        self.charge(value.len())
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<(), E> {
+        self.charge(1)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        self.charge(1)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_newtype_struct<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq.next_element_seed(self)?.is_some() {
+            self.charge(1)?;
+        }
+        Ok(())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while map.next_key_seed(self)?.is_some() {
+            map.next_value_seed(self)?;
+            self.charge(1)?;
+        }
+        Ok(())
+    }
+
+    fn visit_enum<A: serde::de::EnumAccess<'de>>(self, data: A) -> Result<(), A::Error> {
+        // A tagged node: the tag, then what it tags.
+        use serde::de::VariantAccess as _;
+        let ((), variant) = data.variant_seed(self)?;
+        variant.newtype_variant_seed(self)
     }
 }
 
@@ -4180,6 +4700,7 @@ const TERMS: &str = "terms";
 const LABELS: &str = "labels";
 const GRAPHS: &str = "graphs";
 const EXPORT: &str = "export";
+const VERBALIZE: &str = "verbalize";
 
 /// Refuse anything `operation` does not take.
 fn accept_only(params: &Params, operation: &str, accepted: &[&str]) -> Result<(), Problem> {
@@ -5879,5 +6400,49 @@ mod tests {
             fragment("cursor=not-a-token").unwrap_err().code(),
             ErrorCode::StaleCursor
         );
+    }
+
+    #[test]
+    fn a_get_config_is_held_to_the_limit_once_its_aliases_expand() {
+        // One anchored list aliased under every target: a document the size
+        // of the list plus the targets that deserializes to their product.
+        let iris: Vec<String> = (0..100)
+            .map(|i| format!("http://example.org/p{i}"))
+            .collect();
+        let mut bomb = format!(
+            "targets:\n  t0: {{type: http://example.org/T, ignore_predicates: &l [{}]}}\n",
+            iris.join(", ")
+        );
+        for t in 1..100 {
+            bomb.push_str(&format!(
+                "  t{t}: {{type: http://example.org/T, ignore_predicates: *l}}\n"
+            ));
+        }
+        assert!(bomb.len() < 16 * 1024);
+        let refused = verbalize_config_text(&bomb, 64 * 1024).unwrap_err();
+        assert_eq!(refused.code(), ErrorCode::PayloadTooLarge);
+        assert!(problem_detail(&refused).contains("aliases"));
+        // The same document fits a limit its expansion is under.
+        let config = verbalize_config_text(&bomb, 1024 * 1024).unwrap();
+        assert_eq!(config.targets["t99"].ignore_predicates.len(), 100);
+
+        // An alias whose expansion fits is a convenience, not a refusal.
+        let shared = "targets:\n  \
+                      a: {type: http://example.org/A, ignore_predicates: &skip [http://example.org/p]}\n  \
+                      b: {type: http://example.org/B, ignore_predicates: *skip}\n";
+        let config = verbalize_config_text(shared, 1024).unwrap();
+        assert_eq!(
+            config.targets["b"].ignore_predicates,
+            ["http://example.org/p"]
+        );
+
+        // A document without aliases measures within its own length.
+        let plain = r#"{"targets": {"t": {"type": "http://example.org/T",
+                        "label_predicates": ["http://example.org/a", "http://example.org/b"]}}}"#;
+        assert!(verbalize_config_text(plain, plain.len() as u64).is_ok());
+
+        // And a malformed one is reported as malformed, not as large.
+        let broken = verbalize_config_text("targets: [", 1024).unwrap_err();
+        assert_eq!(broken.code(), ErrorCode::MalformedRequest);
     }
 }

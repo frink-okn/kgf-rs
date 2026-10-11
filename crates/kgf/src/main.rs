@@ -34,6 +34,9 @@ enum Command {
     /// A stand-in for the manifest step of `kgf build`, for bundles assembled
     /// by hand with `hdtc create --perm`.
     Manifest(kgf::manifest::Args),
+
+    /// Write the texts a bundle's roots would be embedded from.
+    Verbalize(kgf::verbalize::Args),
 }
 
 fn main() -> Result<()> {
@@ -47,6 +50,7 @@ fn main() -> Result<()> {
         // its exit status and its own output, and a `tracing` line on stderr
         // would be noise in a build script.
         Command::Manifest(args) => kgf::manifest::run(args),
+        Command::Verbalize(args) => kgf::verbalize::run(args),
     }
 }
 

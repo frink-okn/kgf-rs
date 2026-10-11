@@ -87,6 +87,7 @@ use crate::term::{DictionaryTermError, LiteralKind, PrefixMap, Term, TermCache, 
 use crate::url::{self, Mount, Params};
 use kgf_store::graphs::{GraphId, Graphs};
 use kgf_store::scope::{QuadSelection, ScopedSelection};
+use kgf_verbalize::{Bound, Exhausted, Rendered as Verbalized, Unknown, Verbalizer};
 
 // ---------------------------------------------------------------------------
 // Where a response came from
@@ -390,6 +391,7 @@ impl Target {
             AccessOperation::Graphs => "Graphs",
             AccessOperation::Schema => "Schema",
             AccessOperation::Labels => "Labels",
+            AccessOperation::Verbalize => "Verbalize",
             AccessOperation::Void => "void",
             AccessOperation::Summary => "summary",
             AccessOperation::Manifest => "manifest",
@@ -5499,6 +5501,438 @@ fn scanned_row(
     )))
 }
 
+// ---------------------------------------------------------------------------
+// Verbalization preview
+// ---------------------------------------------------------------------------
+
+/// `GET|QUERY /verbalize` — render what a config would write for a few roots.
+///
+/// Three modes, one answer shape. `iris` renders the named roots under one
+/// target. `sample` draws `n` seeded-uniform members of one target's class.
+/// `plan` does that for every target and reports each one's member count and
+/// the sampled texts' lengths — the "what would this config produce" question,
+/// answered without a build.
+///
+/// Every probe the render makes — a root's star, and the type, template and
+/// cascade probes that name each node a text mentions — and every row a probe
+/// yields is charged to one candidate budget for the request. A probe that
+/// finds nothing is charged too, since the config decides how many there are.
+/// When the budget runs out, the root in hand is
+/// delivered marked `truncated`, no further root is rendered, and the answer
+/// says the candidate budget was exhausted. The roots are bounded by
+/// `max_verbalize_roots`. A class's member count is a range width, and
+/// drawing a member is one rank descent, so a plan never enumerates a class.
+///
+/// The response stops at its byte budget, and so does the text built for it:
+/// the verbalizer charges every line and every piece a template appends to a
+/// label against `max_response_bytes`, because a config can make one label
+/// grow far faster than the reads behind it. A record that does not fit what
+/// is left is left out — unless it is the first, which is cut at a line to
+/// fit, keeping at least its label line: a response must carry something,
+/// as every route keeps its first row, and a text, unlike a row, can be cut.
+pub fn verbalize(
+    store: &Store,
+    target: Target,
+    request: &request::Verbalize,
+) -> Result<VerbalizeAnswer, Problem> {
+    let bound = Bound::bind(store, &request.resolved, &request.label_predicates)
+        .map_err(|error| unreadable("binding a verbalization config", &error))?;
+    let mut verbalizer = Verbalizer::new(store, &bound)
+        .with_read_budget(usize::try_from(request.read_budget).unwrap_or(usize::MAX))
+        .with_byte_budget(usize::try_from(request.bytes.0).unwrap_or(usize::MAX));
+    let names: Vec<&str> = bound.targets().collect();
+
+    let mut records = Vec::new();
+    let mut reports = Vec::new();
+    let mut absent = Vec::new();
+    let mut spent = 0u64;
+    // Whether a record was left out, or cut, to keep within the byte budget.
+    let mut over_bytes = false;
+
+    // Add one rendered root if it fits what is left of the byte budget; the
+    // first is cut to fit instead.
+    let mut admit =
+        |rendered: Verbalized, index: usize, records: &mut Vec<VerbalizeRecord>| -> bool {
+            let room = request.bytes.0.saturating_sub(spent);
+            let mut record = VerbalizeRecord::new(names[index].to_owned(), rendered);
+            if record.serialized > room {
+                over_bytes = true;
+                if !records.is_empty() {
+                    return false;
+                }
+                record.fit(room);
+            }
+            spent = spent.saturating_add(record.serialized);
+            records.push(record);
+            true
+        };
+
+    match &request.mode {
+        request::VerbalizeMode::Iris(iris) => {
+            let index = request.target_indexes()[0];
+            for iri in iris {
+                let rendered = verbalizer
+                    .verbalize_iri(index, iri.dictionary())
+                    .map_err(|error| unreadable("verbalizing a root", &error))?;
+                match rendered {
+                    Some(rendered) => {
+                        if !admit(rendered, index, &mut records) || verbalizer.exhausted().is_some()
+                        {
+                            break;
+                        }
+                    }
+                    None => absent.push(iri.dictionary().to_owned()),
+                }
+            }
+        }
+        request::VerbalizeMode::Sample | request::VerbalizeMode::Plan => {
+            'targets: for index in request.target_indexes() {
+                let count = verbalizer
+                    .root_count(index)
+                    .map_err(|error| unreadable("counting a class", &error))?;
+                let mut report = VerbalizeTargetReport::new(
+                    names[index].to_owned(),
+                    request.resolved.targets[index].class.clone(),
+                    count,
+                );
+                for position in sample_positions(count, u64::from(request.n), request.seed) {
+                    let subject = verbalizer
+                        .root_at(index, position)
+                        .map_err(|error| unreadable("drawing a class member", &error))?;
+                    let rendered = verbalizer
+                        .verbalize(index, subject)
+                        .map_err(|error| unreadable("verbalizing a root", &error))?;
+                    let Some(rendered) = rendered else {
+                        continue;
+                    };
+                    // The statistics describe the texts the answer carries, so
+                    // a text left out for the byte budget is not counted.
+                    let admitted = admit(rendered, index, &mut records);
+                    if admitted {
+                        report.observe(records.last().expect("a record was just admitted"));
+                    }
+                    if !admitted || verbalizer.exhausted().is_some() {
+                        reports.push(report);
+                        break 'targets;
+                    }
+                }
+                reports.push(report);
+            }
+        }
+    }
+
+    let completeness = match (over_bytes, verbalizer.exhausted()) {
+        (true, _) | (false, Some(Exhausted::Bytes)) => {
+            Completeness::budget_exhausted_without_resume(BudgetReason::ResponseBytes)
+        }
+        (false, Some(Exhausted::Reads)) => {
+            Completeness::budget_exhausted_without_resume(BudgetReason::Candidate)
+        }
+        (false, None) => Completeness::complete(),
+    };
+    Ok(VerbalizeAnswer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        mode: request.mode.as_str(),
+        target_name: request.target.clone(),
+        n: request.n,
+        seed: request.seed,
+        unknown: bound.unknown().to_vec(),
+        absent,
+        targets: reports,
+        records,
+        completeness,
+        target,
+    })
+}
+
+/// One target's plan: how many members, and what the sampled texts look like.
+#[derive(Debug, Serialize)]
+pub struct VerbalizeTargetReport {
+    name: String,
+    #[serde(rename = "type")]
+    class: String,
+    /// Members of the class, blank nodes included.
+    members: u64,
+    /// Roots rendered from it whose texts this answer carries.
+    sampled: u64,
+    /// Mean characters per rendered text.
+    mean_chars: u64,
+    /// The longest rendered text, in characters.
+    max_chars: u64,
+    /// Mean lines per rendered text, the label line included.
+    mean_lines: u64,
+    /// Rendered texts a budget ran out in — the candidate budget before every
+    /// edge or label was read, or the byte budget before every line was
+    /// written: a bounded server's approximation, not a config problem.
+    truncated: u64,
+    /// Predicates sampled down to `predicate_limit`, summed over the rendered
+    /// texts: the signal for tuning the limit or the lists.
+    limited: u64,
+    #[serde(skip)]
+    chars: u64,
+    #[serde(skip)]
+    lines: u64,
+}
+
+impl VerbalizeTargetReport {
+    fn new(name: String, class: String, members: u64) -> Self {
+        Self {
+            name,
+            class,
+            members,
+            sampled: 0,
+            mean_chars: 0,
+            max_chars: 0,
+            mean_lines: 0,
+            truncated: 0,
+            limited: 0,
+            chars: 0,
+            lines: 0,
+        }
+    }
+
+    fn observe(&mut self, record: &VerbalizeRecord) {
+        self.sampled += 1;
+        self.chars += record.chars;
+        self.lines += record.lines;
+        self.max_chars = self.max_chars.max(record.chars);
+        self.truncated += u64::from(record.truncated);
+        self.limited += u64::from(record.limited);
+        self.mean_chars = self.chars / self.sampled;
+        self.mean_lines = self.lines / self.sampled;
+    }
+}
+
+/// One rendered root.
+#[derive(Debug)]
+pub struct VerbalizeRecord {
+    target: String,
+    iri: String,
+    label: String,
+    text: String,
+    /// Hex SHA-256 of the text: the key a build's roots and texts streams
+    /// join on, so a preview and a build agree on it.
+    digest: String,
+    chars: u64,
+    lines: u64,
+    truncated: bool,
+    limited: u32,
+    serialized: u64,
+}
+
+impl VerbalizeRecord {
+    fn new(target: String, rendered: Verbalized) -> Self {
+        let chars = rendered.text.chars().count() as u64;
+        let lines = rendered.text.lines().count() as u64;
+        // The JSON object, less a constant the keys and punctuation take.
+        let serialized = serialized_object([
+            ("target", serialized_json_string(&target)),
+            ("iri", serialized_json_string(&rendered.iri) + 24),
+            ("label", serialized_json_string(&rendered.label)),
+            ("text", serialized_json_string(&rendered.text)),
+            ("digest", 66),
+            ("chars", 20),
+            ("lines", 20),
+            ("truncated", 5),
+            ("limited", 10),
+        ]);
+        Self {
+            target,
+            iri: rendered.iri,
+            label: rendered.label,
+            text: rendered.text,
+            digest: kgf_verbalize::text::hex(&rendered.digest),
+            chars,
+            lines,
+            truncated: rendered.truncated,
+            limited: rendered.limited,
+            serialized,
+        }
+    }
+
+    /// Cut the text at a line so the record fits `room` bytes, keeping at
+    /// least the label line, which nothing can stand without; the record is
+    /// then marked truncated and its digest is the cut text's.
+    fn fit(&mut self, room: u64) {
+        let fixed = self.serialized - serialized_json_string(&self.text);
+        // The text's quotes, then each line kept, a line after the first
+        // bringing its newline, escaped to two bytes.
+        let mut size = 2;
+        let mut end = 0;
+        for (index, line) in self.text.split('\n').enumerate() {
+            let newline = if index == 0 { 0 } else { 2 };
+            let cost = serialized_json_string(line) - 2 + newline;
+            if index > 0 && fixed + size + cost > room {
+                break;
+            }
+            size += cost;
+            end += line.len() + newline as usize / 2;
+        }
+        if end < self.text.len() {
+            self.text.truncate(end);
+            self.digest = kgf_verbalize::text::hex(&kgf_verbalize::text::text_digest(&self.text));
+            self.chars = self.text.chars().count() as u64;
+            self.lines = self.text.lines().count() as u64;
+            self.truncated = true;
+            self.serialized = fixed + size;
+        }
+    }
+}
+
+impl Serialize for VerbalizeRecord {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(9))?;
+        map.serialize_entry("target", &self.target)?;
+        map.serialize_entry("iri", &Term::from_dictionary(&self.iri))?;
+        map.serialize_entry("label", &self.label)?;
+        map.serialize_entry("text", &self.text)?;
+        map.serialize_entry("digest", &self.digest)?;
+        map.serialize_entry("chars", &self.chars)?;
+        map.serialize_entry("lines", &self.lines)?;
+        map.serialize_entry("truncated", &self.truncated)?;
+        map.serialize_entry("limited", &self.limited)?;
+        map.end()
+    }
+}
+
+/// `GET|QUERY /verbalize`'s answer.
+#[derive(Debug, Serialize)]
+pub struct VerbalizeAnswer {
+    dataset: String,
+    version: String,
+    mode: &'static str,
+    #[serde(rename = "target", skip_serializing_if = "Option::is_none")]
+    target_name: Option<String>,
+    n: u32,
+    seed: u64,
+    /// The config's IRIs this bundle does not hold.
+    unknown: Vec<Unknown>,
+    /// Requested roots that are not subjects in this bundle.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    absent: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    targets: Vec<VerbalizeTargetReport>,
+    records: Vec<VerbalizeRecord>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+}
+
+impl Renders for VerbalizeAnswer {
+    fn render(self, representation: Representation) -> Result<Rendered, Problem> {
+        let body = standard_body(&self, representation);
+        let rows = Some(self.records.len() as u64);
+        Ok(Rendered {
+            body,
+            completeness: self.completeness,
+            rows,
+            cardinality: None,
+        })
+    }
+}
+
+impl Resource for VerbalizeAnswer {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        let summary = [
+            ("mode", Value::Text(self.mode)),
+            ("rendered", Value::Number(self.records.len() as u64)),
+            (
+                "complete",
+                Value::Text(completeness_text(&self.completeness)),
+            ),
+        ];
+        let target_rows: Vec<Vec<Value<'_>>> = self
+            .targets
+            .iter()
+            .map(|report| {
+                vec![
+                    Value::Text(&report.name),
+                    Value::Code(&report.class),
+                    Value::Number(report.members),
+                    Value::Number(report.sampled),
+                    Value::Number(report.mean_chars),
+                    Value::Number(report.max_chars),
+                    Value::Number(report.mean_lines),
+                    Value::Number(report.limited),
+                    Value::Number(report.truncated),
+                ]
+            })
+            .collect();
+        operation_page(
+            &self.target.mount,
+            "Verbalization preview",
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" { (fields(&summary)) }
+                @if let Some(form) = self.target.form() {
+                    div."query-editor" { (form) }
+                }
+                @for unknown in &self.unknown {
+                    (note(&format!(
+                        "The config's {} names {}, which this bundle does not hold.",
+                        unknown.at, unknown.iri
+                    )))
+                }
+                @if !self.absent.is_empty() {
+                    (note(&format!(
+                        "Not subjects in this bundle: {}.",
+                        self.absent.join(", ")
+                    )))
+                }
+                @if !self.targets.is_empty() {
+                    section."section-block" {
+                        h2 { "Targets" }
+                        (note(
+                            "Members counts every node of the class. Sampled texts are drawn \
+                             uniformly by seed; lengths are in characters and lines. Limited \
+                             counts predicates sampled down to the limit across the texts — the \
+                             number to tune the limit or the lists by. A truncated text needed more \
+                             reads than one request may make."
+                        ))
+                        (results_table(
+                            &["target", "class", "members", "sampled", "mean chars", "max chars", "mean lines", "limited", "truncated"],
+                            &target_rows,
+                        ))
+                    }
+                }
+                section."section-block" {
+                    h2 { "Texts" }
+                    @if self.records.is_empty() {
+                        (note("Nothing was rendered."))
+                    }
+                    @for record in &self.records {
+                        article."verbalized" {
+                            h3 { (record.target) " · " (record.label) }
+                            p { a href=(self.target.ask("describe", "iri", &record.iri)) { code { (record.iri) } } }
+                            pre { (record.text) }
+                            p."note" {
+                                (group_digits(record.chars)) " characters · "
+                                (group_digits(record.lines)) " lines"
+                                @if record.limited > 0 {
+                                    " · " (record.limited) " predicate"
+                                    @if record.limited > 1 { "s" }
+                                    " sampled down"
+                                }
+                                @if record.truncated { " · cut at the candidate budget" }
+                            }
+                        }
+                    }
+                }
+            },
+        )
+    }
+}
+
 /// Count statements matching a text-constrained pattern, in resumable batches.
 ///
 /// hdtc scans matching object IDs without ranking. Each ID is intersected with
@@ -7608,13 +8042,21 @@ impl SchemaNavigationAnswer {
             .iter()
             .map(|item| schema_resource_cell(&self.target, item, self.labels.as_ref()))
             .collect();
-        let rows: Vec<Vec<Value<'_>>> = self
-            .items
-            .as_deref()
-            .unwrap_or_default()
+        let items = self.items.as_deref().unwrap_or_default();
+        let per_subject: Vec<Option<String>> = items
+            .iter()
+            .map(|item| {
+                per_subject(
+                    item.counts.triples,
+                    item.counts.distinct_subjects.or(item.counts.entities),
+                )
+            })
+            .collect();
+        let rows: Vec<Vec<Value<'_>>> = items
             .iter()
             .zip(&item_terms)
-            .map(|(item, term)| {
+            .zip(&per_subject)
+            .map(|((item, term), per_subject)| {
                 vec![
                     Value::Text(item.kind),
                     term.value(),
@@ -7622,6 +8064,7 @@ impl SchemaNavigationAnswer {
                     optional_number(item.counts.triples),
                     optional_number(item.counts.distinct_subjects),
                     optional_number(item.counts.distinct_objects),
+                    per_subject.as_deref().map_or(Value::Absent, Value::Text),
                     optional_number(item.counts.properties),
                 ]
             })
@@ -7730,7 +8173,7 @@ impl SchemaNavigationAnswer {
                             (note("No child items."))
                         } @else {
                             (results_table(
-                                &["kind", "term", "entities", "triples", "distinct subjects", "distinct objects", "properties"],
+                                &["kind", "term", "entities", "triples", "distinct subjects", "distinct objects", "per subject", "properties"],
                                 &rows,
                             ))
                         }
@@ -7928,11 +8371,17 @@ impl SchemaClassPropertiesAnswer {
             .items
             .iter()
             .any(|item| item.distinct_subjects.is_some() || item.distinct_objects.is_some());
+        let per_subject: Vec<Option<String>> = self
+            .items
+            .iter()
+            .map(|item| per_subject(Some(item.triples), item.distinct_subjects))
+            .collect();
         let rows: Vec<Vec<Value<'_>>> = self
             .items
             .iter()
             .zip(&terms)
-            .map(|(item, terms)| {
+            .zip(&per_subject)
+            .map(|((item, terms), per_subject)| {
                 let mut row = vec![
                     terms[0].value(),
                     terms[1].value(),
@@ -7941,6 +8390,7 @@ impl SchemaClassPropertiesAnswer {
                 if has_distinct {
                     row.push(optional_number(item.distinct_subjects));
                     row.push(optional_number(item.distinct_objects));
+                    row.push(per_subject.as_deref().map_or(Value::Absent, Value::Text));
                 }
                 row
             })
@@ -7974,7 +8424,7 @@ impl SchemaClassPropertiesAnswer {
                         (note("No matching class properties."))
                     } @else if has_distinct {
                         (results_table(
-                            &["class", "property", "triples", "distinct subjects", "distinct objects"],
+                            &["class", "property", "triples", "distinct subjects", "distinct objects", "per subject"],
                             &rows,
                         ))
                     } @else {
@@ -7996,6 +8446,18 @@ impl SchemaClassPropertiesAnswer {
 
 fn optional_number(number: Option<u64>) -> Value<'static> {
     number.map_or(Value::Absent, Value::Number)
+}
+
+/// Triples per subject, the fanout a page reader wants first: how many values
+/// of this predicate a member of the class carries. Derived here for the page
+/// only; the JSON keeps the two counts it comes from.
+fn per_subject(triples: Option<u64>, subjects: Option<u64>) -> Option<String> {
+    match (triples, subjects) {
+        (Some(triples), Some(subjects)) if subjects > 0 => {
+            Some(format!("{:.1}", triples as f64 / subjects as f64))
+        }
+        _ => None,
+    }
 }
 
 fn schema_resource_cell<'a>(
