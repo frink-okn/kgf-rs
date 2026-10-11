@@ -46,7 +46,11 @@
 //!    is tried first: it was written for this node in this position, so it
 //!    beats the profile of the root's class, which was written for the node
 //!    as a mention. A class with both reads one way as a root and another
-//!    way as a mention, which is the point of having both.
+//!    way as a mention, which is the point of having both. The template's
+//!    fields are named as those values are named wherever they are
+//!    mentioned — a value named by way of the root names the root as a
+//!    mention would — because the root's own template is applied once, at
+//!    the top, and is no part of any descent.
 //!
 //! The cascade is the target's own `label_predicates`, in the order written,
 //! followed by the bundle's `label` role — the predicates `/labels` answers
@@ -84,9 +88,19 @@
 //! from inside a template, where it starts deeper. So a cached label carries
 //! how many templates deep it went, and is reused only where that many more
 //! still fit; elsewhere it is computed again, and cut as it would have been
-//! with no cache at all. A root's text is then a function of the root alone,
-//! not of which roots happened to be rendered before it — the property that
-//! lets one preview stand for a whole build.
+//! with no cache at all.
+//!
+//! Position is depth and nothing else because every descent follows the same
+//! edges wherever it starts: a node is named by the profiles of its classes,
+//! and a cached label's descent cannot pass through a node in progress,
+//! because then it would have passed through itself and been cut. The one
+//! template that names a node differently by position is a root's own
+//! `label_template`, and that is why it is rendered outside any descent: from
+//! inside one, a value reached through it could reach the root again by its
+//! profile, where a cached label would not have seen the cut that a fresh one
+//! takes. A root's text is then a function of the root alone, not of which
+//! roots happened to be rendered before it — the property that lets one
+//! preview stand for a whole build.
 //!
 //! # Caches, and why they are here
 //!
@@ -892,7 +906,9 @@ impl<'a> Verbalizer<'a> {
     /// template, or cascade entry that yields one; else the IRI's fragment.
     ///
     /// `as_root` admits the target's `label_template`, which names a node as
-    /// itself rather than as something mentioned.
+    /// itself rather than as something mentioned. It is tried before the
+    /// profiles and outside the descent the profiles open, so its fields are
+    /// named exactly as their values are named anywhere else.
     ///
     /// A cached label is used only where its descent would fit again: a label
     /// `height` templates deep, used `depth` templates down, reads the same
@@ -951,7 +967,14 @@ impl<'a> Verbalizer<'a> {
         };
 
         if let Some(subject) = self.subject_of(node)? {
-            let templates = self.templates(subject, target, as_root)?;
+            let bound = self.bound;
+            if as_root
+                && let Some(template) = &bound.targets[target].template
+                && let Some(label) = self.render(template, subject, target)?
+            {
+                return Ok(label);
+            }
+            let templates = self.profiles(subject)?;
             if !templates.is_empty() {
                 if self.resolving.len() < MAX_TEMPLATE_DEPTH && !self.resolving.contains(&subject) {
                     self.resolving.push(subject);
@@ -972,20 +995,11 @@ impl<'a> Verbalizer<'a> {
         Ok(fallback_label(&iri))
     }
 
-    /// The templates that may name `subject`, in the order tried: its
-    /// target's `label_template` as a root, then the profile of each of its
-    /// classes.
-    fn templates(
-        &mut self,
-        subject: u64,
-        target: usize,
-        as_root: bool,
-    ) -> Result<Vec<&'a BoundTemplate>, Error> {
+    /// The profiles that may name `subject`, one for each of its classes that
+    /// has one, in the order its types arrive.
+    fn profiles(&mut self, subject: u64) -> Result<Vec<&'a BoundTemplate>, Error> {
         let bound = self.bound;
         let mut templates = Vec::new();
-        if as_root && let Some(template) = &bound.targets[target].template {
-            templates.push(template);
-        }
         if !bound.profiles.is_empty()
             && let Some(rdf_type) = bound.rdf_type
         {

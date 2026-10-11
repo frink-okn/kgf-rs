@@ -543,9 +543,9 @@ fn a_template_descends_a_bounded_number_of_hops() {
 fn a_root_reads_the_same_whatever_was_rendered_before_it() {
     // A chain of profiled nodes, each named "x" and then the next one's
     // name, exactly as long as the depth bound: from a mention in a star the
-    // whole chain fits, and from inside a root's label template — one
-    // template deeper — its last node is cut and named by its label. Two
-    // roots of one shape name the chain's head both ways.
+    // whole chain fits, and from inside a root's own profile — one template
+    // deeper — its last node is cut and named by its label. Two roots of one
+    // shape name the chain's head both ways.
     let nodes: Vec<String> = (1..=MAX_TEMPLATE_DEPTH).map(|i| format!("c{i}")).collect();
     let mut triples: Vec<(&str, &str, &str)> = Vec::new();
     for node in &nodes {
@@ -564,18 +564,17 @@ fn a_root_reads_the_same_whatever_was_rendered_before_it() {
         r#"{
           "profiles": {
             "c": {"type": "http://example.com/C", "template": "x{n}",
-                  "fields": {"n": "http://example.com/next"}}
+                  "fields": {"n": "http://example.com/next"}},
+            "r": {"type": "http://example.com/R", "template": "{m}",
+                  "fields": {"m": "http://example.com/next"}}
           },
-          "targets": {
-            "r": {"type": "http://example.com/R", "label_template": "{m}",
-                  "label_fields": {"m": "http://example.com/next"}}
-          }
+          "targets": {"r": {"type": "http://example.com/R"}}
         }"#,
     );
 
     // The first root's star caches the head's label from the shallow
-    // position; the second root's label template must not reuse it from the
-    // deeper one, where the same descent is cut. Both read alike, one record.
+    // position; the second root's profile must not reuse it from the deeper
+    // one, where the same descent is cut. Both read alike, one record.
     let records = all_records(&published.store, &config);
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].iris, [format!("{EX}r1"), format!("{EX}r2")]);
@@ -593,6 +592,52 @@ fn a_root_reads_the_same_whatever_was_rendered_before_it() {
     // whole run.
     let alone = one(&published.store, &config, &format!("{EX}r2"));
     assert_eq!(alone.text, records[0].embedding_text);
+}
+
+#[test]
+fn a_root_template_names_its_values_as_they_are_named_anywhere() {
+    // A location is named by its site, and a site — as a mention — by its
+    // code; a site's own label template names it by its location. Inside
+    // that template the location reaches the site again. Were the template a
+    // step of the descent, the site would be in progress there and cut to
+    // its `rdfs:label` when rendered alone, while a run in which another
+    // site's star had already cached the location's label would reuse the
+    // uncut one. Applied once at the top, it names the location as any text
+    // does, alone or after anything.
+    let published = Published::build(&graph(&[
+        ("site0", RDF_TYPE, "Site"),
+        ("site0", "code", "\"S0\""),
+        ("site0", "near", "loc1"),
+        ("site1", RDF_TYPE, "Site"),
+        ("site1", "code", "\"S1\""),
+        ("site1", RDFS_LABEL, "\"Site one\""),
+        ("site1", "at", "loc1"),
+        ("loc1", RDF_TYPE, "Location"),
+        ("loc1", "of", "site1"),
+    ]));
+    let config = parse_config(
+        r#"{
+          "profiles": {
+            "location": {"type": "http://example.com/Location", "template": "{s}",
+                         "fields": {"s": "http://example.com/of"}},
+            "site": {"type": "http://example.com/Site", "template": "{c}",
+                     "fields": {"c": "http://example.com/code"}}
+          },
+          "targets": {
+            "site": {"type": "http://example.com/Site", "label_template": "{l}",
+                     "label_fields": {"l": "http://example.com/at"}}
+          }
+        }"#,
+    );
+    let records = all_records(&published.store, &config);
+    let site1 = records
+        .iter()
+        .find(|record| record.iris == [format!("{EX}site1")])
+        .expect("site1's record");
+    assert_eq!(site1.label, "S1");
+    let alone = one(&published.store, &config, &format!("{EX}site1"));
+    assert_eq!(alone.label, "S1");
+    assert_eq!(alone.text, site1.embedding_text);
 }
 
 #[test]
