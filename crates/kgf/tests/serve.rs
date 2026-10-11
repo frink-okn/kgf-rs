@@ -2315,7 +2315,7 @@ fn a_download_left_partway_is_recorded_with_what_was_sent() {
         .parse()
         .unwrap();
 
-    let stalled = server.stall("GET", target, &[]);
+    let mut stalled = server.stall("GET", target, &[]);
     assert!(
         stalled.status_line.contains(" 200 "),
         "{}",
@@ -2329,6 +2329,10 @@ fn a_download_left_partway_is_recorded_with_what_was_sent() {
             .any(|record| record.method == "GET" && record.route.as_deref() == export_route)
     );
 
+    // The head can arrive before any of the body is produced, and a client
+    // that left then would have been sent nothing. One body byte means a chunk
+    // went out, so what the record counts is a partial transfer.
+    stalled.read_first_body_byte();
     drop(stalled);
     let records = log.wait_for(2);
     let record = records
@@ -4753,7 +4757,7 @@ impl Server {
         let head = String::from_utf8(head).expect("headers are ASCII");
         Stalled {
             status_line: head.lines().next().unwrap_or_default().to_owned(),
-            _stream: stream,
+            stream,
         }
     }
 
@@ -4810,7 +4814,19 @@ fn links(html: &str) -> Vec<(String, bool)> {
 /// A connection whose response body is not being read.
 struct Stalled {
     status_line: String,
-    _stream: TcpStream,
+    stream: TcpStream,
+}
+
+impl Stalled {
+    /// Read the body's first byte and no more.
+    ///
+    /// A response's head can reach the client before the server has produced
+    /// any of its body, so a head alone says nothing about what was sent. A
+    /// body byte means at least one chunk was handed to the connection.
+    fn read_first_body_byte(&mut self) {
+        let mut byte = [0u8];
+        self.stream.read_exact(&mut byte).expect("a body byte");
+    }
 }
 
 struct Response {
