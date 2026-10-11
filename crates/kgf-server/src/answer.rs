@@ -5851,8 +5851,8 @@ impl Resource for VerbalizeAnswer {
                             "Members counts every node of the class. Sampled texts are drawn \
                              uniformly by seed; lengths are in characters and lines. Limited \
                              counts predicates sampled down to the limit across the texts — the \
-                             number to tune the limit or the lists by. A star-cut text had more \
-                             edges than one request may read."
+                             number to tune the limit or the lists by. A truncated text needed more \
+                             reads than one request may make."
                         ))
                         (results_table(
                             &["target", "class", "members", "sampled", "mean chars", "max chars", "mean lines", "limited", "truncated"],

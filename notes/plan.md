@@ -2772,7 +2772,7 @@ that, its `/schema` map left out.
 
 ### 35. Verbalization — a root as the text it is embedded from ✅
 
-**Implemented 2026-09-04 to 2026-10-09, in a crate of its own.** Doc 13 §13.1's first
+**Implemented 2026-09-04 to 2026-10-11, in a crate of its own.** Doc 13 §13.1's first
 pipeline stage: a config names classes whose members become roots, and each root
 becomes one text — a `label:` line, then one `predicate: value` line per selected
 outgoing edge, values named by their labels rather than expanded. The model that reads
@@ -2814,7 +2814,9 @@ that says nothing gets. The config goes first because its author has seen the gr
 a generic label predicate can carry boilerplate beside the domain predicate carrying
 the real name, and only the config can say which to prefer — and because a text is glad
 of description or identifier predicates that a label endpoint should never return. This
-is a deliberate divergence from doc 13 §13.1's wording; see question 96.
+is a deliberate divergence from doc 13 §13.1's wording; see question 96. Nor is the
+cascade unit 33's: it takes a predicate's first literal in id order, whatever its
+language, where unit 33 ranks by language first — question 99.
 
 **Templates stop at a cycle.** A template names a node by its neighbours' labels, and a
 neighbour of a profiled class is named by a template in turn, so one label resolution
@@ -2823,20 +2825,39 @@ that is an instance of itself — and the first implementation descended until t
 thread's stack overflowed, which aborts the process: one GET took the server down. A
 node whose template is already mid-render, or one more than `MAX_TEMPLATE_DEPTH` (8)
 templates down, is now named without its templates. A label that took such a cut
-depends on where the descent started, so it is not cached; every other label is.
+depends on where the descent started, so it is not cached. One that took none still
+depends on how deep it started, through the bound, so it is cached with how many
+templates deep it went and reused only where that many more still fit. Cached without
+that, a label computed from a mention in a star — where a chain fits — was reused from
+inside a root's label template, one template deeper, where the same chain is cut: two
+roots of one shape read differently in one build, and a preview of the second matched
+neither. A root's text is a function of the root, not of what was rendered before it.
 
 **Cost.** The build reads without bound, because `predicate_limit` selects from all of a
-predicate's values. The route cannot: every row any walk consumes — a root's star, the
-probes naming what it mentions — is charged to one candidate budget for the request,
-through the one method that reads a row. When the budget runs out the root in hand is
-delivered marked `truncated`, no further root is rendered, and the answer reports the
-candidate budget exhausted, as `/search` does. Roots are bounded by a new cap,
-`max_verbalize_roots` (default 100): IRIs named are counted against it, a plan with more
-targets than the cap is refused (no `n` fits), and the default `n` shrinks to fit. The
-response stops at its byte budget. Drawing a member is one rank descent and a class's
-member count a range width, so a plan never enumerates a class. The route is therefore
-one row of the cost table: `max_verbalize_roots` rank descents plus `candidate_budget`
-rows plus the bytes.
+predicate's values. The route cannot. Every probe any walk makes — a root's star, a
+mentioned node's types, a template field, a cascade predicate — and every row a probe
+yields is charged to one candidate budget for the request, through the one method that
+charges a read. A probe that finds nothing is charged too, because the config decides
+how many there are: charged by rows alone, a template of two hundred fields empty for
+the node it names cost two hundred lookups per mention that the budget never saw. When
+the budget runs out the root in hand is delivered marked `truncated`, no further root is
+rendered, and the answer reports the candidate budget exhausted, as `/search` does.
+Roots are bounded by a new cap, `max_verbalize_roots` (default 100): IRIs named are
+counted against it, a plan with more targets than the cap is refused (no `n` fits), and
+the default `n` shrinks to fit. The response stops at its byte budget. Drawing a member
+is one rank descent and a class's member count a range width, so a plan never
+enumerates a class.
+
+The config costs one dictionary lookup per IRI as written. Its `defaults` are resolved
+and bound once rather than copied into every target — copied, a 140 KB config of 2,000
+targets and 2,000 default IRIs took 5.6 s and 235 MB before any cap was consulted, the
+product of the two from a document the size of their sum. A GET's YAML is measured with
+its aliases expanded and held to `max_request_bytes`, the bound a body already has: one
+anchored list aliased under every target is otherwise that same product, and the YAML
+parser's own guard counts alias jumps rather than what each replays. The route is
+therefore one row of the cost table: the config's IRIs, at most `max_request_bytes` of
+them written out, in dictionary lookups; `max_verbalize_roots` rank descents;
+`candidate_budget` reads; and the bytes.
 
 **The route's modes.** `iri` renders named roots under one target; `target` without
 IRIs draws `n` seeded-uniform members, the same draw `/sample` makes; a config alone is
@@ -2863,9 +2884,21 @@ its roots' IRIs and a count, was a search payload rather than a pipeline file �
 past the ten could never be given its vector, and there was no key to match vectors
 back by. Both streams are written as the walk goes, a class is walked by position a
 page at a time, and each cache is emptied when it reaches `MAX_CACHE_ENTRIES`, so a run
-retains the set of digests and nothing else that grows with the output. The command
-opens the bundle as `kgf manifest` does, asserting publication for an operator-named
-directory, and refuses an output inside the bundle before mapping anything.
+retains the set of digests and nothing else that grows with the output. That set is
+still linear in the distinct texts — about 33 bytes a bucket as a hash set of 32-byte
+digests, some 4.4 GB at 10⁸ texts, doc 13's upper range, and more while it resizes — and
+past SOCKG's scale it is the first thing to move out of memory, most simply by writing a
+text line per root and letting the embedding stage, which keys on the digest already,
+deduplicate.
+
+The command opens the bundle as `kgf manifest` does, asserting publication for an
+operator-named directory, and opens both outputs before mapping anything. An output is
+refused if it is a bundle file by any name: a path under the bundle once its links are
+followed, a dangling link (creating through it would land where it points), or a hard
+link, caught by comparing the opened file's identity with every file the bundle holds.
+A path check alone let a symlink beside the bundle through, and the run truncated
+`data.hdt` under its own mapping and died of SIGBUS. `--roots` and `--texts` must be two
+files, or each writes over the other.
 
 **What the schema pages needed.** Authoring a config starts from two signals per
 (class, predicate): coverage — how many of a class's members carry the predicate — and
@@ -2877,11 +2910,14 @@ sets), and `/schema`'s class-property pages show a per-subject column.
 *Verified by* the fixture tests in `crates/kgf/tests/verbalize.rs` — the text's shape,
 the config cascade over the bundle role, the stable sample across runs and across
 shifted ids, allow and deny lists, template and profile by position, grouping, unknown
-IRIs, the cycle and depth bounds, and the command's refusals — and over a listener by
+IRIs, the cycle and depth bounds, a root reading the same whatever was rendered before
+it, and the command's refusals, links and hard links included — by the GET parser's
+alias bound in `request.rs` — and over a listener by
 `verbalize_previews_a_config_in_three_modes_over_get_query_and_post`,
 `verbalize_refuses_what_it_cannot_answer_by_name`,
-`verbalize_survives_a_profile_template_over_a_cycle`, and
-`verbalize_charges_every_read_to_one_candidate_budget`. On the SOCKG release (27 M
+`verbalize_survives_a_profile_template_over_a_cycle`,
+`verbalize_charges_every_read_to_one_candidate_budget`, and
+`verbalize_charges_a_probe_that_finds_nothing`. On the SOCKG release (27 M
 triples, 1,237 roots over eleven targets) the texts were byte-identical to the Python
 implementation this ports — 1,215 distinct texts, every root joined to the same text —
 in 0.3 s and 38 MB against 22 s and 1.1 GB.
@@ -4038,7 +4074,9 @@ following the code.
 97. **`/verbalize` and `max_verbalize_roots` are a route and a cap doc 03 does not
     define.** The operation is an authoring tool over a served bundle, not a read
     operation in §3.1's sense, and its cost is one row (unit 35 records
-    it: cap many rank descents, a candidate budget of rows, the byte budget). Either
+    it: a dictionary lookup per config IRI, the config held to `max_request_bytes`
+    written out; cap many rank descents; a candidate budget of reads, probes and
+    rows alike; the byte budget). Either
     doc 03 gains the row and the cap, or doc 13 gains a section saying the preview
     exists, what it costs, and that it is a deployment's to route rather than a
     bundle's to declare.
@@ -4050,6 +4088,24 @@ following the code.
     reads it as a statement about the protocol, not about one implementation. The
     precedent itself is the open question — `sample` and `labels` are declared because
     doc 03 defines them, and if that is the rule it should be written down.
+
+99. **A text's labels are not unit 33's cascade, and their language is nobody's choice.**
+    Unit 33 gave every operation that offers labels one cascade: a term's literal values
+    under the label predicates, ranked by the request's languages, then untagged, then
+    any other tag, then predicate order. Unit 35's verbalizer ranks predicate first and
+    ignores language: a cascade predicate's first literal in term-id order, and a
+    template field's lexically smallest value. A node labelled only
+    `"Acetylsalicylsäure"@de` and `"Aspirin"@en` is named in German, because that sorts
+    first. It is what the Python implementation this ports does, and byte-identity with
+    that is the check the port was built against; and a build has no request to take a
+    language from. But an embedding model reads in a language, so the language a text's
+    labels are in belongs in the recipe — and in its identity, beside the cascade the
+    recipe already depends on. Proposed: a `lang` preference in the config, ranked as
+    unit 33 ranks, with today's behaviour as what a config that names none gets. The
+    ranking lives in `kgf-server`'s `label` module, below which `kgf-verbalize` sits, so
+    adopting it means moving that ranking down to where both can call it rather than a
+    second copy. Doc 13 §13.1 says nothing of language; doc 19 §19.4's cascade is the
+    reference either way.
 
 ## Not in this plan
 
