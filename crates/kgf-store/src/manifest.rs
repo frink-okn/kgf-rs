@@ -56,21 +56,105 @@ pub const BUNDLE_FORMAT: &str = "1";
 /// The HDT format version bundles carry.
 pub const HDT_FORMAT: &str = "1.0";
 
-/// Federation fallback for the role used to name an entity.
+/// Federation fallbacks for the roles every consumer may assume the meaning
+/// of: `label`, the predicates that name an entity, strongest first;
+/// `synonym`, the predicates that name it otherwise, which role-scoped search
+/// widens to; and `description`, the predicates that say what it is.
+///
+/// A synonym of any kind is a search target and never a label: a related,
+/// narrower or broader synonym names a different thing, and even an exact one
+/// would compete with the label on language rather than stand behind it.
+///
+/// A description is strongest as a definition, which says what the entity is
+/// and nothing else; `rdfs:comment` comes last because it is as often an
+/// editor's note as a description. SKOS's other notes (`scopeNote`, `note`,
+/// `editorialNote`, …) document how a concept is used rather than what it is,
+/// and are left to a publisher to declare.
+///
+/// schema.org terms appear under both of the namespaces datasets publish them
+/// in, `https://schema.org/` and the older `http://schema.org/`: they are the
+/// same terms, and a release holding only one never has the other in its
+/// dictionary, which a cascade notices once when it is built rather than per
+/// term.
 ///
 /// Full IRIs rather than CURIEs: this is semantic configuration, while prefix
 /// names are presentation aliases that may differ between releases.
 pub fn default_predicate_roles() -> BTreeMap<String, Vec<String>> {
-    BTreeMap::from([(
-        "label".to_owned(),
-        vec![
-            "http://www.w3.org/2004/02/skos/core#prefLabel".to_owned(),
-            "http://www.w3.org/2000/01/rdf-schema#label".to_owned(),
-            "https://schema.org/name".to_owned(),
-            "http://purl.org/dc/terms/title".to_owned(),
-            "http://xmlns.com/foaf/0.1/name".to_owned(),
-        ],
-    )])
+    const OBO_IN_OWL: &str = "http://www.geneontology.org/formats/oboInOwl#";
+    const SCHEMA: [&str; 2] = ["https://schema.org/", "http://schema.org/"];
+    let schema = |term: &str| SCHEMA.map(|namespace| format!("{namespace}{term}"));
+    BTreeMap::from([
+        (
+            "label".to_owned(),
+            [
+                vec![
+                    "http://www.w3.org/2004/02/skos/core#prefLabel".to_owned(),
+                    "http://www.w3.org/2000/01/rdf-schema#label".to_owned(),
+                ],
+                schema("name").to_vec(),
+                vec![
+                    "http://purl.org/dc/terms/title".to_owned(),
+                    "http://xmlns.com/foaf/0.1/name".to_owned(),
+                ],
+            ]
+            .concat(),
+        ),
+        (
+            "synonym".to_owned(),
+            [
+                vec![
+                    "http://www.w3.org/2004/02/skos/core#altLabel".to_owned(),
+                    format!("{OBO_IN_OWL}hasExactSynonym"),
+                ],
+                schema("alternateName").to_vec(),
+                vec![
+                    format!("{OBO_IN_OWL}hasRelatedSynonym"),
+                    format!("{OBO_IN_OWL}hasNarrowSynonym"),
+                    format!("{OBO_IN_OWL}hasBroadSynonym"),
+                    // Hidden from display and meant for text search, which is
+                    // this role's whole use: misspellings and variants.
+                    "http://www.w3.org/2004/02/skos/core#hiddenLabel".to_owned(),
+                ],
+            ]
+            .concat(),
+        ),
+        (
+            "description".to_owned(),
+            [
+                vec![
+                    "http://www.w3.org/2004/02/skos/core#definition".to_owned(),
+                    // IAO's `definition`, which OBO ontologies use for theirs.
+                    "http://purl.obolibrary.org/obo/IAO_0000115".to_owned(),
+                    "http://purl.org/dc/terms/description".to_owned(),
+                ],
+                schema("description").to_vec(),
+                vec!["http://www.w3.org/2000/01/rdf-schema#comment".to_owned()],
+            ]
+            .concat(),
+        ),
+    ])
+}
+
+/// The roles a release resolves with: each role it declares, and the
+/// federation default for each one it does not.
+///
+/// A declared role replaces the default of the same name entirely rather than
+/// extending it, so a publisher can narrow a role as well as widen it; a role
+/// the publisher left out is never absent. Applied when a manifest is written,
+/// which records the result: a version means what its manifest says, so a
+/// later default reaches a lineage only when it is rebuilt, and then only for
+/// a role its manifest does not already record. Applying it to its own result
+/// changes nothing.
+pub fn effective_predicate_roles(
+    declared: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut roles = default_predicate_roles();
+    roles.extend(
+        declared
+            .iter()
+            .map(|(role, predicates)| (role.clone(), predicates.clone())),
+    );
+    roles
 }
 
 /// Validate one full IRI stored in a predicate-role profile.
@@ -1384,6 +1468,64 @@ mod tests {
         CLASS_PROPERTIES_HEADER, CLASS_RELATIONS_HEADER, Fixture, SCHEMA_NODES_HEADER, TINY_NQ,
         TINY_NT, published_bundle,
     };
+
+    #[test]
+    fn declared_roles_replace_their_defaults_and_the_rest_are_filled() {
+        let defaults = default_predicate_roles();
+        for (role, predicates) in &defaults {
+            for iri in predicates {
+                validate_predicate_role_iri(iri, &BTreeMap::new())
+                    .unwrap_or_else(|detail| panic!("default {role} {iri}: {detail}"));
+            }
+        }
+        // A schema.org term is there under both namespaces it is published in.
+        for (role, term) in [
+            ("label", "name"),
+            ("synonym", "alternateName"),
+            ("description", "description"),
+        ] {
+            for namespace in ["https://schema.org/", "http://schema.org/"] {
+                assert!(
+                    defaults[role].contains(&format!("{namespace}{term}")),
+                    "{role} {namespace}{term}"
+                );
+            }
+        }
+
+        // Each predicate does one job: no synonym is a label fallback, and no
+        // description is either. The three roles share no predicate.
+        let roles = ["label", "synonym", "description"];
+        for (index, role) in roles.iter().enumerate() {
+            for other in &roles[index + 1..] {
+                assert!(
+                    defaults[*role]
+                        .iter()
+                        .all(|predicate| !defaults[*other].contains(predicate)),
+                    "{role} and {other} share a predicate"
+                );
+            }
+        }
+
+        assert_eq!(effective_predicate_roles(&BTreeMap::new()), defaults);
+        let declared = BTreeMap::from([
+            (
+                "label".to_owned(),
+                vec!["http://example.org/name".to_owned()],
+            ),
+            (
+                "identifier".to_owned(),
+                vec!["http://example.org/id".to_owned()],
+            ),
+        ]);
+        let effective = effective_predicate_roles(&declared);
+        assert_eq!(effective["label"], ["http://example.org/name"]);
+        assert_eq!(effective["identifier"], ["http://example.org/id"]);
+        assert_eq!(effective["synonym"], defaults["synonym"]);
+        assert_eq!(effective["description"], defaults["description"]);
+        // Idempotent, so a rebuild that carries a recorded profile forward
+        // records the same one.
+        assert_eq!(effective_predicate_roles(&effective), effective);
+    }
 
     #[test]
     fn predicate_role_iris_are_full_and_not_declared_curies() {

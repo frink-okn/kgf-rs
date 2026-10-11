@@ -663,9 +663,25 @@ impl Dataset {
 /// A release's named predicate groups, expanded to full IRIs.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(transparent)]
-pub struct PredicateRoles(BTreeMap<String, Vec<String>>);
+pub struct PredicateRoles {
+    roles: BTreeMap<String, Vec<String>>,
+    /// The same profile inverted, computed once per release rather than per
+    /// request, since a search hit reports its predicate's roles.
+    #[serde(skip)]
+    by_predicate: RolesByPredicate,
+}
+
+/// Every predicate a release's roles name, with the roles that name it in
+/// role-name order. Shared, so a request and each hit hold it by reference
+/// count rather than by copy.
+pub type RolesByPredicate = Arc<BTreeMap<String, Arc<[String]>>>;
 
 impl PredicateRoles {
+    /// Exactly the roles the manifest records, because they are what this
+    /// version's URLs mean and a server upgrade must not change that. Defaults
+    /// are filled when a manifest is written, not when it is read; only a
+    /// manifest that records no roles at all resolves with the standard
+    /// profile, having nothing else to resolve with.
     fn from_manifest(manifest: &Manifest) -> Result<Self, String> {
         let roles = if manifest.predicate_roles.is_empty() {
             default_predicate_roles()
@@ -699,19 +715,40 @@ impl PredicateRoles {
                 }
             }
         }
-        Ok(Self(roles))
+        let mut by_predicate = BTreeMap::<String, Vec<String>>::new();
+        for (role, predicates) in &roles {
+            for predicate in predicates {
+                by_predicate
+                    .entry(predicate.clone())
+                    .or_default()
+                    .push(role.clone());
+            }
+        }
+        let by_predicate = by_predicate
+            .into_iter()
+            .map(|(predicate, roles)| (predicate, Arc::from(roles)))
+            .collect();
+        Ok(Self {
+            roles,
+            by_predicate: Arc::new(by_predicate),
+        })
     }
 
     /// Predicates in `role`, strongest first.
     pub fn get(&self, role: &str) -> Option<&[String]> {
-        self.0.get(role).map(Vec::as_slice)
+        self.roles.get(role).map(Vec::as_slice)
     }
 
     /// Every declared role and its ordered predicates.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &[String])> {
-        self.0
+        self.roles
             .iter()
             .map(|(role, predicates)| (role.as_str(), predicates.as_slice()))
+    }
+
+    /// Each predicate the roles name, with the roles naming it.
+    pub fn by_predicate(&self) -> RolesByPredicate {
+        Arc::clone(&self.by_predicate)
     }
 }
 
