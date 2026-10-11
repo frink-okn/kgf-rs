@@ -92,11 +92,29 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     let targets = select_targets(&bound, &args.target)?;
+    let iri_target = if args.iri.is_empty() {
+        None
+    } else {
+        let [(index, name)] = targets.as_slice() else {
+            bail!("--iri needs exactly one --target");
+        };
+        Some((*index, name.as_str()))
+    };
     let mut verbalizer = Verbalizer::new(&opened.store, &bound);
-    let mut out = Streams::new(outputs, args.text);
+    // Every check has passed; only now are the outputs emptied, so a run
+    // refused for a misspelled target or an unreadable bundle leaves the last
+    // run's files as they were.
+    let mut out = Streams::start(outputs, args.text)?;
     let started = Instant::now();
 
-    if args.iri.is_empty() {
+    if let Some((index, name)) = iri_target {
+        for iri in &args.iri {
+            match verbalizer.verbalize_iri(index, iri)? {
+                Some(rendered) => out.write(&rendered, name)?,
+                None => eprintln!("warning: {iri} is not a subject in this bundle ({name})"),
+            }
+        }
+    } else {
         for (index, name) in &targets {
             let roots = verbalizer.roots(*index)?;
             let total = args.limit.map_or(roots.len(), |limit| {
@@ -119,16 +137,6 @@ pub fn run(args: Args) -> Result<()> {
                 target_started.elapsed(),
                 out.seen.len()
             );
-        }
-    } else {
-        let [(index, name)] = targets.as_slice() else {
-            bail!("--iri needs exactly one --target");
-        };
-        for iri in &args.iri {
-            match verbalizer.verbalize_iri(*index, iri)? {
-                Some(rendered) => out.write(&rendered, name)?,
-                None => eprintln!("warning: {iri} is not a subject in this bundle ({name})"),
-            }
         }
     }
 
@@ -198,8 +206,17 @@ struct Streams {
 }
 
 impl Streams {
-    fn new(outputs: Outputs, readable: bool) -> Self {
-        Self {
+    /// Empty both outputs and start writing them: the only way to write to
+    /// one, and the first thing that changes it.
+    fn start(outputs: Outputs, readable: bool) -> Result<Self> {
+        for (file, path) in [
+            (&outputs.roots, &outputs.roots_path),
+            (&outputs.texts, &outputs.texts_path),
+        ] {
+            file.set_len(0)
+                .with_context(|| format!("emptying the output {}", path.display()))?;
+        }
+        Ok(Self {
             roots: BufWriter::new(outputs.roots),
             texts: BufWriter::new(outputs.texts),
             roots_path: outputs.roots_path,
@@ -207,7 +224,7 @@ impl Streams {
             readable,
             seen: Seen::new(),
             written: 0,
-        }
+        })
     }
 
     /// One root's line, and its text's line if the text is new.
@@ -250,7 +267,8 @@ struct Opened {
     store: Store,
 }
 
-/// The two output files, open and empty, and checked against the bundle.
+/// The two output files, open and checked against the bundle, and not yet
+/// changed: [`Streams::start`] empties them once the run's other checks pass.
 struct Outputs {
     roots: File,
     texts: File,
@@ -260,7 +278,8 @@ struct Outputs {
 
 impl Outputs {
     /// Open both outputs, refusing either one that is a file of the bundle by
-    /// any name, and empty them.
+    /// any name. Neither is changed: an output that does not exist is created
+    /// empty, and one that does keeps its contents until the run starts.
     ///
     /// The bundle is about to be mapped on the promise that nothing writes
     /// into it, and truncating a mapped artifact is not an error but a crash,
@@ -285,10 +304,6 @@ impl Outputs {
             roots.display(),
             texts.display()
         );
-        for (file, path) in [(&roots_file, roots), (&texts_file, texts)] {
-            file.set_len(0)
-                .with_context(|| format!("emptying the output {}", path.display()))?;
-        }
         Ok(Self {
             roots: roots_file,
             texts: texts_file,

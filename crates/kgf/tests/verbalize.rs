@@ -840,18 +840,28 @@ fn the_command_refuses_to_write_into_the_bundle_or_run_a_target_twice() {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     };
-    let roots = lines(&out);
-    let texts = lines(&texts);
+    let written = (lines(&out), lines(&texts));
+    let (roots, text_lines) = &written;
     assert_eq!(roots.len(), 1, "{roots:?}");
-    assert_eq!(texts.len(), 1, "{texts:?}");
+    assert_eq!(text_lines.len(), 1, "{text_lines:?}");
     assert_eq!(roots[0]["iri"], format!("{EX}a"));
     assert_eq!(roots[0]["target"], "thing");
-    assert_eq!(roots[0]["digest"], texts[0]["digest"]);
+    assert_eq!(roots[0]["digest"], text_lines[0]["digest"]);
     assert_eq!(roots[0]["digest"].as_str().unwrap().len(), 64);
     assert!(
-        texts[0]["text"].as_str().unwrap().starts_with("label: A\n"),
-        "{texts:?}"
+        text_lines[0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("label: A\n"),
+        "{text_lines:?}"
     );
+
+    // A run refused once the outputs are checked — here for a target the
+    // config does not declare — leaves the last run's files as they were.
+    let (ok, stderr) = kgf(&[&outputs[..], &["--target", "thng"]].concat());
+    assert!(!ok);
+    assert!(stderr.contains("no target named"), "{stderr}");
+    assert_eq!((lines(&out), lines(&texts)), written);
 }
 
 #[test]
