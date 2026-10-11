@@ -5605,8 +5605,13 @@ pub fn verbalize(
                     let Some(rendered) = rendered else {
                         continue;
                     };
-                    report.observe(&rendered);
-                    if !admit(rendered, index, &mut records) || verbalizer.exhausted().is_some() {
+                    // The statistics describe the texts the answer carries, so
+                    // a text left out for the byte budget is not counted.
+                    let admitted = admit(rendered, index, &mut records);
+                    if admitted {
+                        report.observe(records.last().expect("a record was just admitted"));
+                    }
+                    if !admitted || verbalizer.exhausted().is_some() {
                         reports.push(report);
                         break 'targets;
                     }
@@ -5649,7 +5654,7 @@ pub struct VerbalizeTargetReport {
     class: String,
     /// Members of the class, blank nodes included.
     members: u64,
-    /// Roots rendered from it in this answer.
+    /// Roots rendered from it whose texts this answer carries.
     sampled: u64,
     /// Mean characters per rendered text.
     mean_chars: u64,
@@ -5687,15 +5692,13 @@ impl VerbalizeTargetReport {
         }
     }
 
-    fn observe(&mut self, rendered: &Verbalized) {
-        let chars = rendered.text.chars().count() as u64;
-        let lines = rendered.text.lines().count() as u64;
+    fn observe(&mut self, record: &VerbalizeRecord) {
         self.sampled += 1;
-        self.chars += chars;
-        self.lines += lines;
-        self.max_chars = self.max_chars.max(chars);
-        self.truncated += u64::from(rendered.truncated);
-        self.limited += u64::from(rendered.limited);
+        self.chars += record.chars;
+        self.lines += record.lines;
+        self.max_chars = self.max_chars.max(record.chars);
+        self.truncated += u64::from(record.truncated);
+        self.limited += u64::from(record.limited);
         self.mean_chars = self.chars / self.sampled;
         self.mean_lines = self.lines / self.sampled;
     }

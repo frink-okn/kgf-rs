@@ -5655,6 +5655,35 @@ fn verbalize_cuts_its_first_record_to_fit_rather_than_send_it_over() {
 }
 
 #[test]
+fn verbalize_plan_counts_only_the_texts_it_carries() {
+    // A budget with room for the plan's first record and not its second:
+    // the second is rendered and left out, and the plan's statistics must
+    // not describe a text the answer does not carry.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", TYPED_NT, "2026-06-01T14:03:22Z");
+    let url = verbalize_url(&[("config", VERBALIZE_CONFIG)]);
+    let whole = deployment.serve().get(&url).json();
+    let first = serde_json::to_string(&whole["records"][0]).unwrap().len() as u64;
+
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.max_response_bytes = first + 10;
+    let body = deployment
+        .serve_with_limits(kgf_server::Caps::new(), budgets)
+        .get(&url)
+        .json();
+    assert_eq!(body["truncation_reason"], "response_bytes");
+    let records = body["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "{body}");
+    for report in body["targets"].as_array().unwrap() {
+        let carried = records
+            .iter()
+            .filter(|record| record["target"] == report["name"])
+            .count();
+        assert_eq!(report["sampled"], carried, "{report}");
+    }
+}
+
+#[test]
 fn verbalize_charges_a_probe_that_finds_nothing() {
     // A template may name any number of fields, and a field that is empty
     // for the node being named is still a probe of the store. Two hundred
