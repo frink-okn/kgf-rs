@@ -16,11 +16,12 @@
 //!
 //! What a resource takes is declared once, by the function that mounts it —
 //! [`read`], [`read_or_body`] or [`body`] — and that one [`Methods`] value both
-//! registers the handlers and writes the resource's `Allow` and `Accept-Query`
-//! onto every response it produces, success and error alike. Left to itself,
-//! axum supplies `Allow` on every response a method fallback produces, not only
-//! the 405, listing just the methods registered by name: a successful `QUERY`
-//! would say the resource does not take `QUERY`.
+//! registers the handlers and states them: `Allow` on the resource's 405, and
+//! `Accept-Query` on everything a resource that takes `QUERY` answers. Every
+//! route is built from axum's `any`, because left to itself axum puts its own
+//! `Allow` on every response a method fallback produces, listing only the
+//! methods registered by name — so a successful `QUERY` would say the resource
+//! does not take `QUERY`, and a year-long cache would keep saying it.
 //!
 //! # Every error is rendered in one place
 //!
@@ -45,7 +46,7 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodRouter, any, get};
+use axum::routing::{MethodRouter, any};
 use axum::{Extension, Router, middleware};
 use headers::{ETag, HeaderMapExt, Host, IfNoneMatch};
 use kgf_store::Capability;
@@ -201,13 +202,12 @@ fn shared_layers(router: Router<Arc<Service>>, service: &Arc<Service>) -> Router
             render_problems,
         ))
         // Permissive CORS, because the data is public and browser and WASM
-        // clients are a target. `QUERY` is listed explicitly — a preflight that
-        // omitted it would leave the canonical method unusable from a browser.
+        // clients are a target.
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_headers(Any)
-                .allow_methods([Method::GET, Method::HEAD, Method::POST, query_method()])
+                .allow_methods(cross_origin_methods())
                 .expose_headers(Any),
         )
         // Applied last, so outermost of these. Access logging therefore sees
@@ -217,6 +217,18 @@ fn shared_layers(router: Router<Arc<Service>>, service: &Arc<Service>) -> Router
             Arc::clone(service),
             crate::access::record_request,
         ))
+}
+
+/// The methods a cross-origin preflight approves, on any path.
+///
+/// Every method some resource takes, rather than the target's own: a preflight
+/// is answered before routing, for paths that name nothing as well as ones that
+/// do, and what it grants is permission for a browser to send the request. The
+/// request itself then meets the resource, whose 405 is the authority on what
+/// it takes. `QUERY` is listed explicitly — a preflight that omitted it would
+/// leave the canonical method unusable from a browser.
+fn cross_origin_methods() -> [Method; 4] {
+    [Method::GET, Method::HEAD, Method::POST, query_method()]
 }
 
 /// RFC 10008's method. Not a constant in `http`, which is the whole reason this
@@ -241,7 +253,7 @@ enum Methods {
 }
 
 impl Methods {
-    /// The `Allow` value (RFC 9110 §10.2.1), in the one spelling every response
+    /// The `Allow` value (RFC 9110 §10.2.1), in the one spelling every 405
     /// uses.
     fn allow(self) -> HeaderValue {
         HeaderValue::from_static(match self {
@@ -260,15 +272,26 @@ impl Methods {
 
     /// State the methods on one of the resource's responses.
     ///
-    /// Every response, not only the 405 that RFC 9110 obliges to carry
-    /// `Allow`: which methods a resource takes is a fact about the resource, so
-    /// a client may learn it from whatever the resource last said.
-    /// `Accept-Query` comes with it wherever `QUERY` is taken, because RFC
-    /// 10008 makes that header the advertisement of the method.
-    fn state(self, headers: &mut HeaderMap) {
-        headers.insert(ALLOW, self.allow());
+    /// `Allow` goes on the 405 that RFC 9110 obliges to carry it, and on
+    /// nothing else. The list is this deployment's routing rather than a fact
+    /// about the bundle, and a success may be cached as immutable for a year,
+    /// under a validator that does not cover the header: a stored `Allow`
+    /// would go on denying a method a later server adds. A 405 is never
+    /// stored, so its list is always the live one.
+    ///
+    /// `Accept-Query` goes on every response of a resource that takes `QUERY`,
+    /// because RFC 10008 makes that header the method's advertisement, and a
+    /// stored copy can only say that `QUERY` works: its absence denies
+    /// nothing, and a resource that stopped taking `QUERY` would answer one
+    /// with a 405 that says so.
+    fn state(self, response: &mut Response) {
+        if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+            response.headers_mut().insert(ALLOW, self.allow());
+        }
         if self.takes_query() {
-            headers.insert(ACCEPT_QUERY, HeaderValue::from_static("application/json"));
+            response
+                .headers_mut()
+                .insert(ACCEPT_QUERY, HeaderValue::from_static("application/json"));
         }
     }
 }
@@ -286,66 +309,72 @@ where
     H: Handler<T, Arc<Service>>,
     T: 'static,
 {
-    stated(Methods::Read, get(handler).fallback(method_not_allowed))
+    stated(Methods::Read, any(method_not_allowed).get(handler))
 }
 
 /// Mount a resource whose request comes as a query string by `GET` or as a
 /// JSON body by `QUERY` or `POST`.
-fn read_or_body<H, T, Operation, Answer>(
-    handler: H,
-    operation: Operation,
-) -> MethodRouter<Arc<Service>>
+fn read_or_body<H, T>(handler: H, operation: impl BodyHandler) -> MethodRouter<Arc<Service>>
 where
     H: Handler<T, Arc<Service>>,
     T: 'static,
-    Operation: BodyHandler<Answer>,
-    Answer: Future<Output = Result<Response, Problem>> + Send + 'static,
 {
-    stated(Methods::ReadOrBody, with_body(get(handler), operation))
+    stated(Methods::ReadOrBody, with_body(operation).get(handler))
 }
 
 /// Mount a resource whose request is only ever a JSON body, by `QUERY` or
 /// `POST`.
-fn body<Operation, Answer>(operation: Operation) -> MethodRouter<Arc<Service>>
-where
-    Operation: BodyHandler<Answer>,
-    Answer: Future<Output = Result<Response, Problem>> + Send + 'static,
-{
-    stated(Methods::Body, with_body(MethodRouter::new(), operation))
+fn body(operation: impl BodyHandler) -> MethodRouter<Arc<Service>> {
+    stated(Methods::Body, with_body(operation))
 }
 
 /// An operation over a request body, whichever method carried it.
-trait BodyHandler<Answer>:
-    Fn(Arc<Service>, BundleId, Wants, HeaderMap, bytes::Bytes, BodyMethod) -> Answer
-    + Clone
-    + Send
-    + Sync
-    + 'static
-{
+trait BodyHandler: Clone + Send + Sync + 'static {
+    type Answer: Future<Output = Result<Response, Problem>> + Send + 'static;
+
+    fn answer(
+        self,
+        service: Arc<Service>,
+        id: BundleId,
+        wants: Wants,
+        headers: HeaderMap,
+        body: bytes::Bytes,
+        method: BodyMethod,
+    ) -> Self::Answer;
 }
 
-impl<Operation, Answer> BodyHandler<Answer> for Operation where
+impl<Operation, Answer> BodyHandler for Operation
+where
     Operation: Fn(Arc<Service>, BundleId, Wants, HeaderMap, bytes::Bytes, BodyMethod) -> Answer
         + Clone
         + Send
         + Sync
-        + 'static
+        + 'static,
+    Answer: Future<Output = Result<Response, Problem>> + Send + 'static,
 {
+    type Answer = Answer;
+
+    fn answer(
+        self,
+        service: Arc<Service>,
+        id: BundleId,
+        wants: Wants,
+        headers: HeaderMap,
+        body: bytes::Bytes,
+        method: BodyMethod,
+    ) -> Answer {
+        self(service, id, wants, headers, body, method)
+    }
 }
 
-/// Add `POST` and `QUERY` to a route, both answered by one operation.
+/// A route taking `POST` and `QUERY`, both answered by one operation.
 ///
 /// `POST` is registered by name. `QUERY` cannot be, so it is answered from the
 /// method fallback, which is therefore also where every method the resource
-/// does not take is refused.
-fn with_body<Operation, Answer>(
-    router: MethodRouter<Arc<Service>>,
-    operation: Operation,
-) -> MethodRouter<Arc<Service>>
-where
-    Operation: BodyHandler<Answer>,
-    Answer: Future<Output = Result<Response, Problem>> + Send + 'static,
-{
+/// does not take is refused — before anything else about the request is read,
+/// so that a method the resource never takes is a 405 whatever the path
+/// holds, as it is on a read-only resource.
+fn with_body(operation: impl BodyHandler) -> MethodRouter<Arc<Service>> {
     let post = {
         let operation = operation.clone();
         move |State(service): State<Arc<Service>>,
@@ -353,7 +382,7 @@ where
               wants: Wants,
               headers: HeaderMap,
               body: bytes::Bytes| {
-            operation(
+            operation.answer(
                 service,
                 BundleId { dataset, version },
                 wants,
@@ -363,36 +392,31 @@ where
             )
         }
     };
-    let query = move |State(service): State<Arc<Service>>,
-                      Path((dataset, version)): Path<(String, String)>,
-                      request: Request| async move {
+    let query = move |State(service): State<Arc<Service>>, request: Request| async move {
         let method = request.method().clone();
         if method != query_method() {
             return Err(method_not_allowed_problem(method));
         }
-        let (wants, headers, body) = binding_body(request, &service).await?;
-        operation(
-            service,
-            BundleId { dataset, version },
-            wants,
-            headers,
-            body,
-            BodyMethod::Query,
-        )
-        .await
+        let (id, wants, headers, body) = query_request(request, &service).await?;
+        operation
+            .answer(service, id, wants, headers, body, BodyMethod::Query)
+            .await
     };
-    router.post(post).fallback(query)
+    // `any`, because it is the one way to build a router that adds no `Allow`
+    // of its own. Otherwise axum puts its list — the methods registered by
+    // name, so never `QUERY` — on every response the fallback produces,
+    // successes included, wherever [`Methods::state`] has not already put one.
+    any(query).post(post)
 }
 
-/// State a resource's methods on every response it produces.
+/// State a resource's methods on the responses it produces.
 ///
-/// Applied after the fallback is set, so that the layer wraps it too. Because
-/// the header is then always present, axum's own `Allow` — which it adds only
-/// where none is — never appears.
+/// Applied last, so that the layer wraps the fallback as well as every handler
+/// registered by name.
 fn stated(methods: Methods, router: MethodRouter<Arc<Service>>) -> MethodRouter<Arc<Service>> {
     router.layer(middleware::map_response(
         move |mut response: Response| async move {
-            methods.state(response.headers_mut());
+            methods.state(&mut response);
             response
         },
     ))
@@ -793,11 +817,15 @@ async fn binding_count(
     .await
 }
 
-async fn binding_body(
+/// What the `QUERY` fallback's handler would have extracted, read in order
+/// once the method is known to be `QUERY`.
+async fn query_request(
     request: Request,
     service: &Arc<Service>,
-) -> Result<(Wants, HeaderMap, bytes::Bytes), Problem> {
+) -> Result<(BundleId, Wants, HeaderMap, bytes::Bytes), Problem> {
     let (mut parts, body) = request.into_parts();
+    let Path((dataset, version)) =
+        Path::<(String, String)>::from_request_parts(&mut parts, service).await?;
     let wants = Wants::from_request_parts(&mut parts, service).await?;
     let headers = parts.headers;
     let limit = usize::try_from(service.config().budgets.max_request_bytes).unwrap_or(usize::MAX);
@@ -811,7 +839,7 @@ async fn binding_body(
             ),
         )
     })?;
-    Ok((wants, headers, body))
+    Ok((BundleId { dataset, version }, wants, headers, body))
 }
 
 fn require_json(headers: &HeaderMap) -> Result<(), Problem> {
@@ -2562,6 +2590,7 @@ mod tests {
         // precedence is the router's rather than ours. Registered wildcard
         // first, so the test would fail if matching ever became order-sensitive
         // instead of static-first.
+        use axum::routing::get;
         use tower::ServiceExt as _;
 
         let router: Router = Router::new()
@@ -2601,6 +2630,25 @@ mod tests {
             "the reserved list must name the route that shadows the wildcard"
         );
         assert_eq!(RESERVED_DATASET_IDS.len(), 1);
+    }
+
+    #[test]
+    fn a_preflight_approves_exactly_the_methods_some_resource_takes() {
+        // Two statements of one set; nothing else keeps them together. A
+        // method missing from the preflight is one no browser can send, and
+        // one present that no resource takes is approved only to be refused.
+        use std::collections::BTreeSet;
+
+        let mut taken = BTreeSet::new();
+        for methods in [Methods::Read, Methods::Body, Methods::ReadOrBody] {
+            let allow = methods.allow();
+            taken.extend(allow.to_str().unwrap().split(", ").map(str::to_owned));
+        }
+        let approved: BTreeSet<_> = cross_origin_methods()
+            .iter()
+            .map(|method| method.as_str().to_owned())
+            .collect();
+        assert_eq!(approved, taken);
     }
 
     #[test]

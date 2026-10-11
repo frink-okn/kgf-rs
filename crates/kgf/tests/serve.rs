@@ -2608,20 +2608,22 @@ fn bindings_query_and_post_answer_over_the_wire() {
         .assert_status(405);
 }
 
-/// A resource states the methods it takes on every response it produces, in
-/// one spelling, whichever method asked and however the request ended.
+/// A resource states the methods it takes on a 405 and nowhere else, in one
+/// spelling, and advertises `QUERY` on everything it answers when it takes it.
 ///
 /// The router adds its own `Allow` to whatever a method fallback produces,
 /// listing only the methods registered by name. `QUERY` is answered from that
 /// fallback, so left alone a successful `QUERY` says its resource does not take
-/// `QUERY` while the 405 beside it says it does.
+/// `QUERY` while the 405 beside it says it does — and a success is cached for a
+/// year.
 #[test]
-fn every_response_states_the_methods_its_resource_takes() {
+fn a_resource_states_its_methods_where_they_cannot_go_stale() {
     let deployment = Deployment::new();
     deployment.publish("tox", "2026-06-01", TYPED_NT, "2026-06-01T14:03:22Z");
     let server = deployment.serve();
     let base = "/tox/v/2026-06-01";
     let path = |resource: &str| format!("{base}/{resource}");
+    let undecodable = |resource: &str| format!("/tox/v/%FF/{resource}");
     let json = [("Content-Type", "application/json")];
     let text = [("Content-Type", "text/plain")];
     let bindings = serde_json::to_vec(&serde_json::json!({
@@ -2637,13 +2639,14 @@ fn every_response_states_the_methods_its_resource_takes() {
     }))
     .unwrap();
 
-    // The report this began from: a successful QUERY and a refused method on
-    // the same resource disagreed about whether it takes QUERY.
+    // The report this began from: a successful QUERY said the resource did
+    // not take QUERY, and a refused method on it said it did.
     let counted = server.request_with_body("QUERY", &path("count"), &json, &bindings);
     counted.assert_status(200);
+    assert_eq!(counted.header("allow"), None);
     let refused = server.request("DELETE", &path("count"), &[]);
     refused.assert_status(405);
-    assert_eq!(counted.header("allow"), refused.header("allow"));
+    refused.assert_header("allow", "GET, HEAD, POST, QUERY");
 
     let etag = server
         .request_with_body("QUERY", &path("fragment"), &json, &bindings)
@@ -2658,114 +2661,241 @@ fn every_response_states_the_methods_its_resource_takes() {
     const READ_OR_BODY: &str = "GET, HEAD, POST, QUERY";
     const BODY: &str = "POST, QUERY";
     let answered = [
-        (READ, 200, server.get("/")),
-        (READ, 200, server.get(&path("manifest"))),
-        (READ, 200, server.request("HEAD", &path("manifest"), &[])),
-        (READ, 400, server.get(&path("describe"))),
-        (READ, 405, server.request("QUERY", &path("manifest"), &[])),
-        (READ, 405, server.request("POST", &path("search"), &[])),
+        ("GET /", READ, 200, server.get("/")),
+        ("GET /healthz", READ, 200, server.get("/healthz")),
+        ("GET manifest", READ, 200, server.get(&path("manifest"))),
         (
+            "HEAD manifest",
+            READ,
+            200,
+            server.request("HEAD", &path("manifest"), &[]),
+        ),
+        ("GET tpf", READ, 200, server.get(&path("tpf"))),
+        (
+            "GET describe, no term",
+            READ,
+            400,
+            server.get(&path("describe")),
+        ),
+        (
+            "HEAD export",
             READ,
             200,
             server.request("HEAD", &path("export/data.hdt"), &[]),
         ),
-        (READ_OR_BODY, 200, server.get(&path("fragment?p=ex:name"))),
         (
+            "QUERY manifest",
+            READ,
+            405,
+            server.request("QUERY", &path("manifest"), &[]),
+        ),
+        (
+            "POST search",
+            READ,
+            405,
+            server.request("POST", &path("search"), &[]),
+        ),
+        (
+            "DELETE manifest, undecodable version",
+            READ,
+            405,
+            server.request("DELETE", &undecodable("manifest"), &[]),
+        ),
+        (
+            "GET fragment",
+            READ_OR_BODY,
+            200,
+            server.get(&path("fragment?p=ex:name")),
+        ),
+        (
+            "HEAD fragment",
             READ_OR_BODY,
             200,
             server.request("HEAD", &path("fragment?p=ex:name"), &[]),
         ),
-        (READ_OR_BODY, 400, server.get(&path("fragment?limit=x"))),
         (
+            "GET fragment, bad limit",
+            READ_OR_BODY,
+            400,
+            server.get(&path("fragment?limit=x")),
+        ),
+        (
+            "QUERY fragment",
             READ_OR_BODY,
             200,
             server.request_with_body("QUERY", &path("fragment"), &json, &bindings),
         ),
         (
+            "QUERY fragment, unchanged",
             READ_OR_BODY,
             304,
             server.request_with_body("QUERY", &path("fragment"), &unchanged, &bindings),
         ),
         (
+            "POST fragment",
             READ_OR_BODY,
             200,
             server.request_with_body("POST", &path("fragment"), &json, &bindings),
         ),
         (
+            "QUERY fragment, text body",
             READ_OR_BODY,
             415,
             server.request_with_body("QUERY", &path("fragment"), &text, &bindings),
         ),
         (
+            "QUERY fragment, undecodable version",
+            READ_OR_BODY,
+            400,
+            server.request_with_body("QUERY", &undecodable("fragment"), &json, &bindings),
+        ),
+        (
+            "PUT fragment",
             READ_OR_BODY,
             405,
             server.request("PUT", &path("fragment"), &[]),
         ),
-        (READ_OR_BODY, 200, server.get(&path("count?p=ex:name"))),
+        // The method is refused before the path is read, as it is on a
+        // read-only resource, rather than the path refused first.
         (
+            "DELETE fragment, undecodable version",
+            READ_OR_BODY,
+            405,
+            server.request("DELETE", &undecodable("fragment"), &[]),
+        ),
+        (
+            "GET count",
+            READ_OR_BODY,
+            200,
+            server.get(&path("count?p=ex:name")),
+        ),
+        (
+            "POST count",
             READ_OR_BODY,
             200,
             server.request_with_body("POST", &path("count"), &json, &bindings),
         ),
         (
+            "GET verbalize",
             READ_OR_BODY,
             200,
             server.get(&verbalize_url(&[("config", VERBALIZE_CONFIG)])),
         ),
-        (READ_OR_BODY, 400, server.get(&path("verbalize"))),
         (
+            "GET verbalize, no config",
+            READ_OR_BODY,
+            400,
+            server.get(&path("verbalize")),
+        ),
+        (
+            "QUERY verbalize",
             READ_OR_BODY,
             200,
             server.request_with_body("QUERY", &path("verbalize"), &json, &verbalize),
         ),
         (
+            "POST verbalize, text body",
             READ_OR_BODY,
             415,
             server.request_with_body("POST", &path("verbalize"), &text, &verbalize),
         ),
         (
+            "DELETE verbalize",
             READ_OR_BODY,
             405,
             server.request("DELETE", &path("verbalize"), &[]),
         ),
         (
+            "QUERY labels",
             BODY,
             200,
             server.request_with_body("QUERY", &path("labels"), &json, labels),
         ),
         (
+            "POST labels",
             BODY,
             200,
             server.request_with_body("POST", &path("labels"), &json, labels),
         ),
         (
+            "QUERY labels, text body",
             BODY,
             415,
             server.request_with_body("QUERY", &path("labels"), &text, labels),
         ),
-        (BODY, 405, server.get(&path("labels"))),
-        (BODY, 405, server.request("HEAD", &path("labels"), &[])),
+        ("GET labels", BODY, 405, server.get(&path("labels"))),
+        (
+            "HEAD labels",
+            BODY,
+            405,
+            server.request("HEAD", &path("labels"), &[]),
+        ),
     ];
-    for (index, (allow, status, response)) in answered.iter().enumerate() {
-        response.assert_status(*status);
-        response.assert_header("allow", allow);
-        // `Accept-Query` is the method's own advertisement, so it travels with
-        // `QUERY` in `Allow` and nowhere else.
+    for (case, methods, status, response) in &answered {
+        assert_eq!(
+            response.status,
+            *status,
+            "{case}: {}",
+            String::from_utf8_lossy(&response.body)
+        );
+        // Only a 405 lists the methods: it is never stored, so the list it
+        // gives is always the live one.
+        assert_eq!(
+            response.header("allow").as_deref(),
+            (*status == 405).then_some(*methods),
+            "{case}"
+        );
+        // `Accept-Query` travels with QUERY, on everything the resource says.
         assert_eq!(
             response.header("accept-query").as_deref(),
-            allow.contains("QUERY").then_some("application/json"),
-            "case {index}"
+            methods.contains("QUERY").then_some("application/json"),
+            "{case}"
         );
     }
 
     // No resource answered these, so none states its methods: the redirect's
     // methods are its target's, and a path that names nothing has none.
-    for response in [
-        server.request("QUERY", "/tox/latest/count", &json),
-        server.get(&path("nothing")),
+    for (case, response) in [
+        (
+            "QUERY latest",
+            server.request("QUERY", "/tox/latest/count", &json),
+        ),
+        ("GET nothing", server.get(&path("nothing"))),
     ] {
+        assert_eq!(response.header("allow"), None, "{case}");
+        assert_eq!(response.header("accept-query"), None, "{case}");
+    }
+
+    // A body over the limit is refused on the wire when its length is declared
+    // — before routing, so by no resource — and by the resource that reads it
+    // when it is chunked. Both are coded; only the second is the resource's.
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.max_request_bytes = 16;
+    let limited = deployment.serve_with_limits(kgf_server::Caps::new(), budgets);
+    let declared = limited.request_with_body("QUERY", &path("fragment"), &json, &bindings);
+    declared.assert_status(413);
+    assert_eq!(declared.json()["code"], "payload_too_large");
+    assert_eq!(declared.header("accept-query"), None);
+    let chunked = limited.exchange(
+        "QUERY",
+        &format!(
+            "QUERY {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
+             Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+            path("fragment"),
+            limited.address,
+        ),
+        &[
+            format!("{:x}\r\n", bindings.len()).as_bytes(),
+            &bindings,
+            b"\r\n0\r\n\r\n",
+        ]
+        .concat(),
+    );
+    chunked.assert_status(413);
+    assert_eq!(chunked.json()["code"], "payload_too_large");
+    chunked.assert_header("accept-query", "application/json");
+    for response in [&declared, &chunked] {
         assert_eq!(response.header("allow"), None);
-        assert_eq!(response.header("accept-query"), None);
     }
 }
 

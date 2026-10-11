@@ -15,9 +15,9 @@
 //! HTTP QUERY (RFC 10008) is canonical for body-carrying reads; POST is a
 //! permanent first-class fallback with identical semantics — the one place this
 //! design ships two paths, because the web does. A route that takes a body
-//! dispatches QUERY through the router's custom-method fallback. Every response
-//! a route produces states the methods it takes in `Allow`, and a method it
-//! does not take is answered `method_not_allowed`.
+//! dispatches QUERY through the router's custom-method fallback and advertises
+//! it with `Accept-Query` on every response; a method a route does not take is
+//! answered `method_not_allowed`, with an `Allow` header listing those it does.
 //!
 //! # One URL, two readers
 //!
