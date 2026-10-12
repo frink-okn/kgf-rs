@@ -130,6 +130,28 @@ impl<'a> TripleTerm<'a> {
         &self.object
     }
 
+    /// The IRIs this triple term holds, in reading order: the subject if it
+    /// is one, the predicate, and the object if it is one, or a nested
+    /// triple term's own. A blank node published under its scoped IRI is an
+    /// IRI here, as it is everywhere a response names it.
+    pub fn iris(&self) -> Vec<&str> {
+        let mut iris = Vec::new();
+        self.collect_iris(&mut iris);
+        iris
+    }
+
+    fn collect_iris<'b>(&'b self, iris: &mut Vec<&'b str>) {
+        if let Term::Iri(iri) = &self.subject {
+            iris.push(iri);
+        }
+        iris.push(&self.predicate);
+        match &self.object {
+            Term::Iri(iri) => iris.push(iri),
+            Term::Triple(nested) => nested.collect_iris(iris),
+            Term::BlankNode(_) | Term::Literal(_) => {}
+        }
+    }
+
     /// How deeply this nests triple terms: 1 for one whose object is not
     /// itself a triple term.
     pub fn depth(&self) -> usize {

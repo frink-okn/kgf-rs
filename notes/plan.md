@@ -3149,6 +3149,14 @@ for a one-hit scan over 5 M literals, and once per hit in ranked search). One-hi
 counts, scans and budgeted searches now take 3–5 µs over 5 M literals, with or
 without the propositions.
 
+**A triple term's IRIs are labelled and linked like any others.** Unit 33's rule is
+that `labels=true` labels every IRI a response returns, and a triple term returns
+the IRIs it holds, so the label map, RDF's label statements and the page take its
+subject, predicate and object — a nested triple term's too, and a bound triple term's
+in place of its encoding, which is never a key. A page shows a triple term's three
+terms each linked to its own description with its label beneath, between brackets
+that link to the rows whose object is the whole triple term.
+
 **A layer is a bitmap or a sparse set, whichever is smaller.** hdtc first kept each
 layer as a bitmap over every triple, three bits per triple of the dataset whatever
 share were reified — 183 MB per layer over ROBOKOP, and the same for a graph that

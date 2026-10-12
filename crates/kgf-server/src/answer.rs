@@ -616,6 +616,19 @@ impl Published {
             Self::Triple(_) => None,
         }
     }
+
+    /// The spellings a label could be keyed by: the term's own, or, for a
+    /// triple term — which is no IRI and has no label of its own — the IRIs
+    /// it holds, nested ones included.
+    fn label_keys(&self) -> Vec<&str> {
+        match self {
+            Self::Text(text) => vec![text],
+            Self::Triple(term) => match term.as_ref() {
+                Term::Triple(triple) => triple.iris(),
+                _ => Vec::new(),
+            },
+        }
+    }
 }
 
 impl Serialize for Published {
@@ -1659,15 +1672,18 @@ impl Answer {
             .into_iter()
             .all(|(position, term)| bound(position).is_none_or(|bound| bound.dictionary() == term))
         };
+        // A triple term is labelled by the IRIs it holds.
         let carried: BTreeSet<&str> = Position::ALL
             .into_iter()
             .filter_map(bound)
-            .map(BoundTerm::dictionary)
+            .flat_map(|bound| match bound.triple() {
+                Some(triple) => triple.iris(),
+                None => vec![bound.dictionary()],
+            })
             .chain(self.rows.iter().take(keep).flat_map(|row| {
-                // A triple term is no IRI and has no label of its own.
                 row.cells
                     .iter()
-                    .filter_map(|(_, term)| term.published.text().map(AsRef::as_ref))
+                    .flat_map(|(_, term)| term.published.label_keys())
                     .chain(row.graph.as_deref())
             }))
             .collect();
@@ -3855,6 +3871,7 @@ fn summary_iri_cell<'a>(target: &Target, iri: &'a str, href: Option<String>) -> 
         href,
         full_iri: full_iri.map(|iri| Cow::Owned(iri.into_owned())),
         structured: true,
+        parts: Vec::new(),
     }
 }
 
@@ -7917,11 +7934,17 @@ impl PageLabeling {
         let labeling = labeling.filter(|labeling| !labeling.predicates.is_empty());
         labeling.map(|labeling| Self {
             labeling: labeling.clone(),
-            bound: bound
-                .into_iter()
-                .map(|term| term.dictionary().to_owned())
-                .collect(),
+            bound: bound.into_iter().flat_map(bound_label_keys).collect(),
         })
+    }
+}
+
+/// The spellings a bound term's labels are keyed by: its own, or, for a triple
+/// term, whose dictionary spelling is its encoding, the IRIs it holds.
+fn bound_label_keys(term: &BoundTerm) -> Vec<String> {
+    match term.triple() {
+        Some(triple) => triple.iris().into_iter().map(str::to_owned).collect(),
+        None => vec![term.dictionary().to_owned()],
     }
 }
 
@@ -7985,17 +8008,29 @@ impl<'s> RowLabeler<'s> {
     /// Resolve the labels `row` adds, or `None` when the allowance cannot
     /// cover them and the page must end before it.
     fn row(&mut self, row: &Row, spend: Spend) -> Result<Option<RowLabels>, Problem> {
-        // A triple term is no IRI and has no label of its own.
-        let cells = row.cells.iter().filter_map(|(_, term)| {
-            term.published
-                .text()
-                .map(|text| (Rc::clone(text), Rc::clone(&term.stored)))
-        });
+        // A triple term is labelled by the IRIs it holds, each of which is
+        // published and stored under the one spelling.
+        let cells = row
+            .cells
+            .iter()
+            .flat_map(|(_, term)| match &term.published {
+                Published::Text(text) => vec![(Rc::clone(text), Rc::clone(&term.stored))],
+                Published::Triple(_) => term
+                    .published
+                    .label_keys()
+                    .into_iter()
+                    .map(|iri| {
+                        let iri: Rc<str> = Rc::from(iri);
+                        (Rc::clone(&iri), iri)
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
         let graph = row
             .graph
             .iter()
             .map(|graph| (Rc::clone(graph), Rc::clone(graph)));
-        self.resolve(cells.chain(graph), spend)
+        self.resolve(cells.into_iter().chain(graph), spend)
     }
 
     fn resolve(
@@ -9495,6 +9530,7 @@ fn schema_cell<'a>(
         href,
         full_iri,
         structured: true,
+        parts: Vec::new(),
     }
 }
 
@@ -9775,6 +9811,7 @@ impl Answer {
             &self.blank_nodes,
             published,
             self.page_labels.get(stored).map(String::as_str),
+            Some(&self.page_labels),
         );
         if published
             .text()
@@ -9788,12 +9825,11 @@ impl Answer {
     /// A cell for a position the request bound.
     fn bound_cell<'a>(&'a self, bound: &'a BoundTerm) -> Cell<'a> {
         match bound.triple() {
-            Some(triple) => published_cell(
+            Some(triple) => triple_cell(
                 &self.target,
                 &self.blank_nodes,
-                Term::Triple(Box::new(triple.clone())),
-                "",
-                None,
+                triple,
+                Some(&self.page_labels),
             ),
             None => {
                 let text = bound.dictionary();
@@ -10098,6 +10134,7 @@ impl Resource for TermsPage {
                     &self.blank_nodes,
                     &row.published,
                     row.label.as_ref().and_then(RowLabel::value),
+                    None,
                 )
             })
             .collect();
@@ -10464,18 +10501,73 @@ fn term_cell<'a>(
     )
 }
 
-/// A cell for a published term, triple terms included.
+/// A cell for a published term, triple terms included. A triple term's own
+/// terms are labelled from `labels`, the page's labels by spelling, when it
+/// has them.
 fn row_cell<'a>(
     target: &Target,
     blank_nodes: &SkolemScope,
     published: &'a Published,
     annotation: Option<&'a str>,
+    labels: Option<&'a HashMap<String, String>>,
 ) -> Cell<'a> {
     match published {
         Published::Text(text) => term_cell(target, blank_nodes, text, annotation),
-        Published::Triple(term) => {
-            published_cell(target, blank_nodes, term.as_ref().clone(), "", annotation)
+        Published::Triple(term) => match term.as_ref() {
+            Term::Triple(triple) => triple_cell(target, blank_nodes, triple, labels),
+            other => published_cell(target, blank_nodes, other.clone(), "", annotation),
+        },
+    }
+}
+
+/// A triple term's cell: its subject, predicate and object each linked and
+/// labelled as a term anywhere else is, and the whole linking to the rows
+/// whose object it is.
+fn triple_cell<'a>(
+    target: &Target,
+    blank_nodes: &SkolemScope,
+    triple: &'a TripleTerm<'_>,
+    labels: Option<&'a HashMap<String, String>>,
+) -> Cell<'a> {
+    let label = |iri: &str| {
+        labels
+            .and_then(|labels| labels.get(iri))
+            .map(String::as_str)
+    };
+    let part = |term: &'a Term<'_>| match term {
+        Term::Iri(iri) => published_cell(
+            target,
+            blank_nodes,
+            Term::Iri(Cow::Borrowed(iri)),
+            iri,
+            label(iri),
+        ),
+        Term::Triple(nested) => triple_cell(target, blank_nodes, nested, labels),
+        Term::BlankNode(_) | Term::Literal(_) => {
+            published_cell(target, blank_nodes, term.clone(), "", None)
         }
+    };
+    let predicate = triple.predicate();
+    let parts = vec![
+        part(triple.subject()),
+        published_cell(
+            target,
+            blank_nodes,
+            Term::Iri(Cow::Borrowed(predicate)),
+            predicate,
+            label(predicate),
+        ),
+        part(triple.object()),
+    ];
+    let whole = Term::Triple(Box::new(triple.clone()));
+    Cell {
+        label: String::new(),
+        qualifier: None,
+        annotation: None,
+        href: Some(target.ask("fragment", "o", &whole.to_request())),
+        full_iri: None,
+        structured: true,
+        parts,
     }
 }
 
@@ -10504,6 +10596,7 @@ fn published_cell<'a>(
         href: Some(href),
         full_iri,
         structured: true,
+        parts: Vec::new(),
     }
 }
 
@@ -10515,6 +10608,9 @@ struct Cell<'a> {
     href: Option<String>,
     full_iri: Option<Cow<'a, str>>,
     structured: bool,
+    /// A triple term's subject, predicate and object, each a cell of its own;
+    /// empty for any other term.
+    parts: Vec<Cell<'a>>,
 }
 
 impl<'a> Cell<'a> {
@@ -10527,6 +10623,7 @@ impl<'a> Cell<'a> {
             href,
             full_iri: None,
             structured: false,
+            parts: Vec::new(),
         }
     }
 
@@ -10539,10 +10636,17 @@ impl<'a> Cell<'a> {
             href: None,
             full_iri: None,
             structured: false,
+            parts: Vec::new(),
         }
     }
 
     fn value(&self) -> Value<'_> {
+        if !self.parts.is_empty() {
+            return Value::TripleTerm {
+                href: self.href.clone().unwrap_or_default(),
+                parts: self.parts.iter().map(Cell::value).collect(),
+            };
+        }
         match &self.href {
             Some(href) => Value::TermLink {
                 href: href.clone(),

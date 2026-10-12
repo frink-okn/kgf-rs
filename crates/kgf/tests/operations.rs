@@ -2206,6 +2206,101 @@ fn the_label_cascade_ranks_language_then_predicate_then_term_id() {
     );
 }
 
+/// A triple term is no IRI, but it holds IRIs, and `labels=true` labels each
+/// of them — subject, predicate and object, a nested triple term's too — in
+/// the JSON map and in RDF's label statements, as it does any IRI a page
+/// carries. A page shows each linked to its own description with its label
+/// beneath, between brackets that link to the whole triple term's rows. A
+/// triple term the request binds is labelled the same way: its encoding is
+/// never a key.
+#[test]
+fn a_triple_terms_iris_are_labelled_and_linked_like_any_others() {
+    let source = concat!(
+        "<http://example.org/alice> <http://example.org/label> \"Alice\" .\n",
+        "<http://example.org/bob> <http://example.org/label> \"Bob\" .\n",
+        "<http://example.org/knows> <http://example.org/label> \"knows\" .\n",
+        "<http://example.org/dan> <http://example.org/label> \"Dan\" .\n",
+        "<http://example.org/says> <http://example.org/label> \"says\" .\n",
+        "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .\n",
+        "<http://example.org/e1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+        "<<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>> .\n",
+        // Unasserted and nested: Dan says that Bob knows Alice.
+        "<http://example.org/x> <http://example.org/claims> <<( <http://example.org/dan> ",
+        "<http://example.org/says> <<( <http://example.org/bob> <http://example.org/knows> ",
+        "<http://example.org/alice> )>> )>> .\n",
+    );
+    let served = Served::from_fixture(Fixture::build(source));
+    let store = served.store();
+    let ex = |local: &str| format!("http://example.org/{local}");
+    let bound = format!(
+        "o={}&labels=true",
+        urlencode("<<( ex:alice ex:knows ex:bob )>>")
+    );
+    for (query, named) in [
+        ("s=ex:e1&labels=true", vec!["alice", "knows", "bob"]),
+        (
+            "s=ex:x&labels=true",
+            vec!["dan", "says", "bob", "knows", "alice"],
+        ),
+        (bound.as_str(), vec!["alice", "knows", "bob"]),
+    ] {
+        let page = served.fragment(&store, query);
+        let labels = page["labels"].as_object().unwrap();
+        for local in named {
+            let expected = match local {
+                "alice" => "Alice",
+                "bob" => "Bob",
+                "dan" => "Dan",
+                other => other,
+            };
+            assert_eq!(labels[&ex(local)], expected, "{query}: {labels:?}");
+        }
+        assert!(
+            labels.keys().all(|key| !key.starts_with("urn:x-kgf")),
+            "{query}: {labels:?}"
+        );
+    }
+
+    let turtle = served.render(
+        &store,
+        "fragment",
+        "s=ex:e1&labels=true",
+        Representation::Turtle,
+    );
+    for (local, label) in [("alice", "Alice"), ("knows", "knows"), ("bob", "Bob")] {
+        assert!(
+            turtle.contains(&format!("<{}> <{}> \"{label}\"", ex(local), ex("label")))
+                || turtle.contains(&format!("ex:{local} ex:label \"{label}\"")),
+            "{local}: {turtle}"
+        );
+    }
+
+    let html = served.render(
+        &store,
+        "fragment",
+        "s=ex:x&labels=true",
+        Representation::Html,
+    );
+    for label in ["Dan", "says", "Bob", "knows", "Alice"] {
+        assert!(
+            html.contains(&format!("class=\"t-label\">{label}<")),
+            "{label}: {html}"
+        );
+    }
+    for local in ["dan", "says", "bob", "knows", "alice"] {
+        assert!(
+            html.contains(&format!("describe?iri=ex%3A{local}"))
+                || html.contains(&format!(
+                    "describe?iri=%3Chttp%3A%2F%2Fexample.org%2F{local}%3E"
+                )),
+            "{local}: {html}"
+        );
+    }
+    // Two triple terms, the nested one inside the other: two pairs of brackets.
+    assert_eq!(html.matches("class=\"tt-mark\"").count(), 4, "{html}");
+    assert!(!html.contains("urn:x-kgf"), "{html}");
+}
+
 #[test]
 fn a_labelled_page_maps_every_iri_it_carries_and_only_those() {
     let served = Served::multilingual();
