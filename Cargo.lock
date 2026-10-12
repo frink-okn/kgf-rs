@@ -1070,7 +1070,7 @@ checksum = "574b0cd5e90ee2ba03a66d0611fc9a09c9a0c28b2ecc2dc8a181dd31a53ca5d7"
 
 [[package]]
 name = "kgf"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1079,9 +1079,11 @@ dependencies = [
  "hdtc",
  "kgf-server",
  "kgf-store",
+ "kgf-verbalize",
  "oxiri",
  "oxrdf",
  "oxrdfio",
+ "same-file",
  "serde",
  "serde_json",
  "serde_norway",
@@ -1095,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "kgf-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1110,6 +1112,7 @@ dependencies = [
  "http-body",
  "jiff",
  "kgf-store",
+ "kgf-verbalize",
  "maud",
  "mediatype 0.21.0",
  "mediatype 0.23.0",
@@ -1119,6 +1122,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
+ "serde_norway",
  "sha2",
  "spargebra",
  "thiserror",
@@ -1131,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "kgf-store"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "hdtc",
@@ -1142,6 +1146,19 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "kgf-verbalize"
+version = "0.4.0"
+dependencies = [
+ "hdtc",
+ "kgf-store",
+ "oxiri",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]

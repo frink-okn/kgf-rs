@@ -39,7 +39,7 @@
 //! answer legitimately resumes at predicate 37.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -74,12 +74,13 @@ use crate::html::{
     Crumb, Resource, TermText, Value, fields, group_digits, json_body, note, operation_page,
     operation_page_with_format, page, pager, results_table, stats, table,
 };
+use crate::label::{LabelCascade, PreferredLabel, Resolution, Spend};
 use crate::rdf::{DatasetFormat, GraphFormat, serialize_dataset, serialize_graph};
 use crate::representation::{RdfSyntax, Representation};
 use crate::request::{
-    self, BindingPattern, BindingRow, BoundTerm, Candidates, Direction, Pattern, Position,
-    ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter, TriplePattern,
-    role_name, term_role_name,
+    self, BindingPattern, BindingRow, BoundTerm, Candidates, Direction, Labeling, Pattern,
+    Position, ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter,
+    TriplePattern, role_name, term_role_name,
 };
 use crate::request::{GraphScope, GraphSelector};
 use crate::skolem::SkolemScope;
@@ -94,6 +95,7 @@ use kgf_store::triple_terms::{
     BudgetedSelection, InnerPattern, Proposition, Source as TripleTermSource, TripleTermPattern,
     TripleTermPosition, TripleTermSelection, TripleTermStep, TripleTerms,
 };
+use kgf_verbalize::{Bound, Exhausted, Rendered as Verbalized, Unknown, Verbalizer};
 
 // ---------------------------------------------------------------------------
 // Where a response came from
@@ -397,6 +399,7 @@ impl Target {
             AccessOperation::Graphs => "Graphs",
             AccessOperation::Schema => "Schema",
             AccessOperation::Labels => "Labels",
+            AccessOperation::Verbalize => "Verbalize",
             AccessOperation::Void => "void",
             AccessOperation::Summary => "summary",
             AccessOperation::Manifest => "manifest",
@@ -459,21 +462,24 @@ pub trait Renders {
     /// Serialize into `representation`, with the metadata its headers need.
     fn render(self, representation: Representation) -> Result<Rendered, Problem>;
 
-    /// Resolve display labels for the page's IRIs, before an HTML render.
+    /// Resolve display labels for a page whose request did not ask for them,
+    /// before an HTML render.
     ///
-    /// A no-op for answers that carry no IRI rows and for JSON, whose clients
-    /// hydrate labels themselves through `/labels`. `label_predicates` is the
-    /// release's frozen `label` role cascade, and `cap` bounds the distinct
-    /// terms one page may resolve — the same `max_label_iris` that bounds a
-    /// `/labels` request, so a page never does work a client could not ask
-    /// for. A page over the cap is served unannotated rather than
-    /// half-annotated.
+    /// A reading affordance, never response data: JSON is not asked to pay
+    /// for it. A no-op for answers that carry no IRIs, and for one whose
+    /// request asked for labels — the operation resolved those itself, with
+    /// the request's own language preference, into the response both
+    /// representations render. `labeling` is the release's frozen cascade with
+    /// no preference, and `cap` bounds the distinct terms one page may resolve
+    /// — the `max_label_iris` that bounds a `/labels` request, so a page never
+    /// does work a client could not ask for. A page over the cap, or one whose
+    /// candidates would spend past the cascade's allowance, is served
+    /// unannotated rather than half-annotated.
     fn hydrate_labels(
         &mut self,
         _store: &Store,
-        _label_predicates: &[String],
+        _labeling: &Labeling,
         _cap: usize,
-        _required: bool,
     ) -> Result<(), Problem> {
         Ok(())
     }
@@ -954,6 +960,232 @@ fn serialized_score(score: f32) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Labels
+// ---------------------------------------------------------------------------
+
+/// The key a row's label is written under.
+const LABEL: &str = "label";
+
+/// The key a row's label source is written under, and the parameter that asks
+/// for it.
+const LABEL_SOURCE: &str = "label_source";
+
+/// Where a label came from: `{"predicate": "…", "lang": "…"}`, the language
+/// left out for an untagged literal as it is in a term object.
+struct Source<'a>(&'a PreferredLabel);
+
+impl Source<'_> {
+    /// The compact JSON this writes.
+    fn serialized(&self) -> u64 {
+        let predicate = serialized_json_string(self.0.predicate());
+        match self.0.language() {
+            Some(language) => serialized_object([
+                ("predicate", predicate),
+                ("lang", serialized_json_string(language)),
+            ]),
+            None => serialized_object([("predicate", predicate)]),
+        }
+    }
+}
+
+impl Serialize for Source<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("predicate", self.0.predicate())?;
+        if let Some(language) = self.0.language() {
+            map.serialize_entry("lang", language)?;
+        }
+        map.end()
+    }
+}
+
+/// The compact JSON a label's value takes, `null` included.
+fn serialized_label(label: Option<&PreferredLabel>) -> u64 {
+    label.map_or(4, |label| serialized_json_string(label.value()))
+}
+
+/// The compact JSON a label's source takes, `null` included.
+fn serialized_source(label: Option<&PreferredLabel>) -> u64 {
+    label.map_or(4, |label| Source(label).serialized())
+}
+
+/// One row's label, as `/labels`, `/search` and `/terms` carry it.
+///
+/// `label` is `None` when the cascade completed and found none, which is
+/// written as an explicit null — never left out, because a missing label and
+/// a label nobody looked for are different answers. `sources` says whether
+/// `label_source` is written beside it.
+#[derive(Debug, Clone)]
+struct RowLabel {
+    label: Option<PreferredLabel>,
+    sources: bool,
+}
+
+impl RowLabel {
+    fn value(&self) -> Option<&str> {
+        self.label.as_ref().map(PreferredLabel::value)
+    }
+
+    /// The compact JSON these entries add to an object that already holds at
+    /// least one: each key and value, and the comma before it.
+    fn appended(&self) -> u64 {
+        let mut bytes = 1 + quoted_key(LABEL) + serialized_label(self.label.as_ref());
+        if self.sources {
+            bytes += 1 + quoted_key(LABEL_SOURCE) + serialized_source(self.label.as_ref());
+        }
+        bytes
+    }
+
+    fn serialize_into<M: SerializeMap>(&self, map: &mut M) -> Result<(), M::Error> {
+        map.serialize_entry(LABEL, &self.value())?;
+        if self.sources {
+            map.serialize_entry(LABEL_SOURCE, &self.label.as_ref().map(Source))?;
+        }
+        Ok(())
+    }
+}
+
+/// The response-level `labels` map, with `label_sources` beside it when the
+/// request asked, each keyed by every labelled IRI as the response publishes
+/// it.
+///
+/// A null is a completed lookup that found no label; an IRI with no entry was
+/// not looked up. A blank node is keyed by the scoped IRI the response names
+/// it by, since that is the only spelling a client can use for it again.
+#[derive(Debug, Clone)]
+struct LabelMap {
+    entries: BTreeMap<Rc<str>, Option<PreferredLabel>>,
+    sources: bool,
+}
+
+impl LabelMap {
+    fn new(sources: bool) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            sources,
+        }
+    }
+
+    fn contains(&self, iri: &str) -> bool {
+        self.entries.contains_key(iri)
+    }
+
+    fn insert(&mut self, iri: Rc<str>, label: Option<PreferredLabel>) {
+        self.entries.insert(iri, label);
+    }
+
+    /// The label for `iri`, if it has one.
+    fn get(&self, iri: &str) -> Option<&str> {
+        self.entries
+            .get(iri)
+            .and_then(Option::as_ref)
+            .map(PreferredLabel::value)
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.entries.retain(|iri, _| keep(iri));
+    }
+
+    /// The compact JSON one entry adds: its key, colon and value in each map
+    /// it appears in, and a separator. Counted as though every entry had a
+    /// comma after it, which overstates each map by one byte rather than
+    /// letting the budget be missed.
+    fn entry_bytes(&self, iri: &str, label: Option<&PreferredLabel>) -> u64 {
+        let key = serialized_json_string(iri) + 1;
+        let mut bytes = key + serialized_label(label) + 1;
+        if self.sources {
+            bytes += key + serialized_source(label) + 1;
+        }
+        bytes
+    }
+}
+
+impl Serialize for LabelMap {
+    /// Two keys of the envelope that holds it, which is why this is written
+    /// to be flattened into one.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        struct Values<'a>(&'a BTreeMap<Rc<str>, Option<PreferredLabel>>);
+        impl Serialize for Values<'_> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_map(
+                    self.0.iter().map(|(iri, label)| {
+                        (iri.as_ref(), label.as_ref().map(PreferredLabel::value))
+                    }),
+                )
+            }
+        }
+        struct Sources<'a>(&'a BTreeMap<Rc<str>, Option<PreferredLabel>>);
+        impl Serialize for Sources<'_> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_map(
+                    self.0
+                        .iter()
+                        .map(|(iri, label)| (iri.as_ref(), label.as_ref().map(Source))),
+                )
+            }
+        }
+
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("labels", &Values(&self.entries))?;
+        if self.sources {
+            map.serialize_entry("label_sources", &Sources(&self.entries))?;
+        }
+        map.end()
+    }
+}
+
+/// A new label cascade for one request.
+fn cascade<'s>(store: &'s Store, labeling: &Labeling) -> Result<LabelCascade<'s>, Problem> {
+    LabelCascade::new(
+        store,
+        labeling.predicate_iris(),
+        labeling.languages.clone(),
+        labeling.candidates.0,
+    )
+}
+
+/// The labels of an operation that labels each item it returns — `/labels`,
+/// `/search`, `/terms` — with whether they report their source.
+struct ItemLabels<'s> {
+    cascade: LabelCascade<'s>,
+    sources: bool,
+}
+
+impl<'s> ItemLabels<'s> {
+    fn new(store: &'s Store, labeling: &Labeling) -> Result<Self, Problem> {
+        Ok(Self {
+            cascade: cascade(store, labeling)?,
+            sources: labeling.source,
+        })
+    }
+
+    /// Labels for a request that asked for them, or `None` for one that did
+    /// not.
+    fn of(store: &'s Store, labeling: Option<&Labeling>) -> Result<Option<Self>, Problem> {
+        labeling
+            .map(|labeling| Self::new(store, labeling))
+            .transpose()
+    }
+
+    /// The label of the term whose subject id is `subject` — which is `None`
+    /// for a term that is no subject, and so has no label — or `None` when
+    /// the allowance cannot settle it and the response ends before this item.
+    fn label(&mut self, subject: Option<u64>, spend: Spend) -> Result<Option<RowLabel>, Problem> {
+        let label = match subject {
+            None => None,
+            Some(subject) => match self.cascade.resolve(subject, spend)? {
+                Resolution::Resolved(label) => label,
+                Resolution::Exhausted => return Ok(None),
+            },
+        };
+        Ok(Some(RowLabel {
+            label,
+            sources: self.sources,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The envelope
 // ---------------------------------------------------------------------------
 
@@ -1054,6 +1286,9 @@ pub struct Answer {
     absent_terms: Vec<AbsentTerm>,
     vars: Vars,
     rows: Vec<Row>,
+    /// The `labels=true` maps; absent when the request did not ask.
+    #[serde(flatten)]
+    labels: Option<LabelMap>,
     #[serde(skip)]
     row_resumes: Vec<RowResume>,
     #[serde(skip)]
@@ -1079,12 +1314,9 @@ pub struct Answer {
     /// Stable, reversible RDF identity for this HDT's data blank nodes.
     #[serde(skip)]
     blank_nodes: SkolemScope,
-    /// Display labels for the page's IRIs, resolved only when this answer is
-    /// being rendered as HTML — a reading affordance, never response data.
-    ///
-    /// Keyed by dictionary spelling. Empty for JSON, where a client hydrates
-    /// labels itself through `/labels`; a future `labels=true` parameter would
-    /// put them in this same envelope field.
+    /// Display labels for the page's terms, keyed by every spelling a cell is
+    /// drawn with: the request's `labels` when it asked for them, otherwise
+    /// resolved only for an HTML render, as a reading affordance.
     #[serde(skip)]
     page_labels: HashMap<String, String>,
     /// The described term's dictionary spelling, so the page can resolve and
@@ -1114,16 +1346,15 @@ impl Renders for Answer {
     }
 
     /// One bounded cascade per distinct IRI or blank node on the page — the
-    /// same probe sequence `/labels` runs, against the same frozen role
-    /// profile, bounded by the same cap.
+    /// cascade `/labels` runs, against the same frozen role profile, bounded
+    /// by the same cap.
     fn hydrate_labels(
         &mut self,
         store: &Store,
-        label_predicates: &[String],
+        labeling: &Labeling,
         cap: usize,
-        required: bool,
     ) -> Result<(), Problem> {
-        if label_predicates.is_empty() {
+        if self.labels.is_some() || labeling.predicates.is_empty() {
             return Ok(());
         }
         let mut wanted: Vec<&str> = Vec::new();
@@ -1159,38 +1390,12 @@ impl Renders for Answer {
         {
             wanted.push(described);
         }
-        if wanted.is_empty() {
-            return Ok(());
-        }
-        if wanted.len() > cap {
-            if required {
-                return Err(Problem::new(
-                    ErrorCode::CapExceeded,
-                    format!(
-                        "this page has {} distinct labelable terms, over this server's max_label_iris of {cap}",
-                        wanted.len()
-                    ),
-                ));
-            }
+        if wanted.is_empty() || wanted.len() > cap {
             return Ok(());
         }
 
         let dictionary = store.dict();
-        let predicates: Vec<u64> = label_predicates
-            .iter()
-            .map(|iri| {
-                dictionary
-                    .locate(Role::Predicate, iri.as_bytes())
-                    .map(|found| found.map(|id| id.0))
-                    .map_err(|error| unreadable("looking a label predicate up", &error))
-            })
-            .filter_map(Result::transpose)
-            .collect::<Result<_, _>>()?;
-        if predicates.is_empty() {
-            return Ok(());
-        }
-
-        let mut cache = TermCache::new();
+        let mut cascade = cascade(store, labeling)?;
         let mut labels = HashMap::new();
         for text in wanted {
             // A blank node reaches this in whichever spelling its position put
@@ -1212,10 +1417,12 @@ impl Renders for Answer {
                     id.0
                 }
             };
-            if let Some(label) =
-                preferred_label(store, &dictionary, &mut cache, subject, &predicates)?
-            {
-                labels.insert(text.to_owned(), label);
+            match cascade.resolve(subject, Spend::WithinAllowance)? {
+                Resolution::Resolved(Some(label)) => {
+                    labels.insert(text.to_owned(), label.value().to_owned());
+                }
+                Resolution::Resolved(None) => {}
+                Resolution::Exhausted => return Ok(()),
             }
         }
         self.page_labels = labels;
@@ -1411,6 +1618,80 @@ impl Answer {
         )
     }
 
+    /// The label statements of the first `keep` rows and the pattern's bound
+    /// terms: the statement each label came from, for every IRI among them
+    /// that has one.
+    ///
+    /// Per prefix rather than once, because byte fitting serializes shorter
+    /// prefixes of the page and each must label exactly the rows it keeps. In
+    /// the default graph, because request parsing admits RDF labels only for a
+    /// page over the union, whose statements are all there.
+    ///
+    /// Never one that matches the page's own pattern. Such a statement is
+    /// indistinguishable from a row — this page's, which the page already
+    /// carries, or another page's, which it would serve twice and count on the
+    /// wrong page — so leaving those out is what lets a client tell the two
+    /// kinds apart by matching the pattern. An unbound position, a variable,
+    /// and a text-constrained object all match anything, so the rule errs
+    /// toward leaving a label out.
+    fn rdf_label_statements(&self, keep: usize) -> Result<Vec<Quad>, Problem> {
+        let Some(labels) = &self.labels else {
+            return Ok(Vec::new());
+        };
+        if self.tagging != GraphTagging::Untagged {
+            tracing::error!("an RDF page labelled over a graph scope reached serialization");
+            return Err(Problem::new(
+                ErrorCode::InternalError,
+                "the fragment page's labels could not be represented as RDF",
+            ));
+        }
+        let bound = |position| match &self.echo {
+            Echo::Fragment { pattern, .. } => pattern.bound(position),
+            Echo::BindingsFragment { pattern, .. } => pattern.bound(position),
+            Echo::Describe { .. } | Echo::Sample { .. } => None,
+        };
+        let matches_pattern = |subject: &str, label: &PreferredLabel| {
+            [
+                (Position::Subject, subject),
+                (Position::Predicate, label.predicate()),
+                (Position::Object, label.term()),
+            ]
+            .into_iter()
+            .all(|(position, term)| bound(position).is_none_or(|bound| bound.dictionary() == term))
+        };
+        let carried: BTreeSet<&str> = Position::ALL
+            .into_iter()
+            .filter_map(bound)
+            .map(BoundTerm::dictionary)
+            .chain(self.rows.iter().take(keep).flat_map(|row| {
+                // A triple term is no IRI and has no label of its own.
+                row.cells
+                    .iter()
+                    .filter_map(|(_, term)| term.published.text().map(AsRef::as_ref))
+                    .chain(row.graph.as_deref())
+            }))
+            .collect();
+        let mut statements = Vec::new();
+        for iri in carried {
+            let Some(Some(label)) = labels.entries.get(iri) else {
+                continue;
+            };
+            if matches_pattern(iri, label) {
+                continue;
+            }
+            statements.push(
+                Triple::new(
+                    rdf_subject(iri.as_bytes())?,
+                    NamedNode::new(label.predicate())
+                        .map_err(|error| unreadable("parsing a label predicate IRI", &error))?,
+                    rdf_object(label.term().as_bytes())?,
+                )
+                .in_graph(GraphName::DefaultGraph),
+            );
+        }
+        Ok(statements)
+    }
+
     fn fragment_rdf_prefix(
         &self,
         representation: Representation,
@@ -1517,6 +1798,11 @@ impl Answer {
                 },
             };
             let quad = triple.in_graph(graph_name);
+            if data.insert(quad.clone()) {
+                statements.push(quad);
+            }
+        }
+        for quad in self.rdf_label_statements(keep)? {
             if data.insert(quad.clone()) {
                 statements.push(quad);
             }
@@ -1971,14 +2257,13 @@ pub struct BindingCountAnswer {
 
 /// One entity returned by `/search`.
 ///
-/// `label` has two optional layers on purpose: the outer one says hydration was
-/// requested, while the inner one says whether this bundle found a label. This
-/// keeps `labels=false` (field absent) distinct from `labels=true` with no label
-/// (explicit `null`).
+/// `label` is absent for `labels=false` and present — an explicit `null` when
+/// the bundle has none — whenever labels were asked for, so the two answers
+/// stay distinguishable.
 #[derive(Debug)]
 struct SearchResult {
     subject: Rc<str>,
-    label: Option<Option<String>>,
+    label: Option<RowLabel>,
     evidence: SearchEvidence,
     ranking: Ranking,
     serialized: u64,
@@ -1988,27 +2273,16 @@ impl SearchResult {
     fn new(
         subject: Rc<str>,
         subject_serialized: u64,
-        label: Option<Option<String>>,
-        predicate: Rc<str>,
-        literal: Rc<str>,
+        label: Option<RowLabel>,
+        evidence: SearchEvidence,
         ranking: Ranking,
     ) -> Self {
-        let evidence = SearchEvidence { predicate, literal };
-        let serialized = match &label {
-            None => serialized_object([
-                ("subject", subject_serialized),
-                ("match", evidence.serialized()),
-                (MATCH_KIND, serialized_json_string(ranking.kind)),
-                (SCORE, serialized_score(ranking.score)),
-            ]),
-            Some(label) => serialized_object([
-                ("subject", subject_serialized),
-                ("label", label.as_deref().map_or(4, serialized_json_string)),
-                ("match", evidence.serialized()),
-                (MATCH_KIND, serialized_json_string(ranking.kind)),
-                (SCORE, serialized_score(ranking.score)),
-            ]),
-        };
+        let serialized = serialized_object([
+            ("subject", subject_serialized),
+            ("match", evidence.serialized()),
+            (MATCH_KIND, serialized_json_string(ranking.kind)),
+            (SCORE, serialized_score(ranking.score)),
+        ]) + label.as_ref().map_or(0, RowLabel::appended);
         Self {
             subject,
             label,
@@ -2024,7 +2298,7 @@ impl Serialize for SearchResult {
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("subject", &Term::from_dictionary(&self.subject))?;
         if let Some(label) = &self.label {
-            map.serialize_entry("label", label)?;
+            label.serialize_into(&mut map)?;
         }
         map.serialize_entry("match", &self.evidence)?;
         map.serialize_entry(MATCH_KIND, self.ranking.kind)?;
@@ -2037,11 +2311,30 @@ impl Serialize for SearchResult {
 #[derive(Debug)]
 struct SearchEvidence {
     predicate: Rc<str>,
+    /// The release roles that name `predicate`, or `None` when none does: a
+    /// search over every literal can match one no role covers. Written as a
+    /// list either way.
+    roles: Option<Arc<[String]>>,
     literal: Rc<str>,
 }
 
 impl SearchEvidence {
+    fn roles(&self) -> &[String] {
+        self.roles.as_deref().unwrap_or_default()
+    }
+
     fn serialized(&self) -> u64 {
+        let roles = 2
+            + self
+                .roles()
+                .iter()
+                .map(|role| serialized_json_string(role))
+                .sum::<u64>()
+            + self.roles().len().saturating_sub(1) as u64;
+        self.serialized_without_roles() + 1 + quoted_key("roles") + roles
+    }
+
+    fn serialized_without_roles(&self) -> u64 {
         let predicate = serialized_json_string(&self.predicate);
         match Term::from_dictionary(&self.literal) {
             Term::Literal(literal) => {
@@ -2074,6 +2367,7 @@ impl Serialize for SearchEvidence {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("predicate", self.predicate.as_ref())?;
+        map.serialize_entry("roles", self.roles())?;
         match Term::from_dictionary(&self.literal) {
             Term::Literal(literal) => {
                 map.serialize_entry("literal", literal.value())?;
@@ -2228,9 +2522,8 @@ impl Renders for SearchAnswer {
 struct TermRow {
     published: Published,
     roles: Vec<&'static str>,
-    /// Two optional layers, as in a search result: the outer says hydration was
-    /// requested, the inner whether this bundle found a label.
-    label: Option<Option<String>>,
+    /// Absent unless labels were asked for, as in a search result.
+    label: Option<RowLabel>,
     serialized: u64,
 }
 
@@ -2239,7 +2532,7 @@ impl TermRow {
         published: Published,
         term: u64,
         roles: Vec<&'static str>,
-        label: Option<Option<String>>,
+        label: Option<RowLabel>,
     ) -> Self {
         let roles_serialized = 2
             + roles
@@ -2247,14 +2540,8 @@ impl TermRow {
                 .map(|role| serialized_json_string(role))
                 .sum::<u64>()
             + roles.len().saturating_sub(1) as u64;
-        let serialized = match &label {
-            None => serialized_object([("term", term), ("roles", roles_serialized)]),
-            Some(label) => serialized_object([
-                ("term", term),
-                ("roles", roles_serialized),
-                ("label", label.as_deref().map_or(4, serialized_json_string)),
-            ]),
-        };
+        let serialized = serialized_object([("term", term), ("roles", roles_serialized)])
+            + label.as_ref().map_or(0, RowLabel::appended);
         Self {
             published,
             roles,
@@ -2270,7 +2557,7 @@ impl Serialize for TermRow {
         map.serialize_entry("term", &self.published)?;
         map.serialize_entry("roles", &self.roles)?;
         if let Some(label) = &self.label {
-            map.serialize_entry("label", label)?;
+            label.serialize_into(&mut map)?;
         }
         map.end()
     }
@@ -2391,20 +2678,17 @@ impl Renders for TermsAnswer {
 #[derive(Debug)]
 struct LabelResult {
     iri: String,
-    label: Option<String>,
+    label: RowLabel,
     serialized: u64,
 }
 
 impl LabelResult {
-    fn new(iri: String, label: Option<String>) -> Self {
+    fn new(iri: String, label: RowLabel) -> Self {
         let iri_term = serialized_object([
             ("type", serialized_json_string("iri")),
             ("value", serialized_json_string(&iri)),
         ]);
-        let serialized = serialized_object([
-            ("iri", iri_term),
-            ("label", label.as_deref().map_or(4, serialized_json_string)),
-        ]);
+        let serialized = serialized_object([("iri", iri_term)]) + label.appended();
         Self {
             iri,
             label,
@@ -2415,9 +2699,9 @@ impl LabelResult {
 
 impl Serialize for LabelResult {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(2))?;
+        let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("iri", &Term::from_dictionary(&self.iri))?;
-        map.serialize_entry("label", &self.label)?;
+        self.label.serialize_into(&mut map)?;
         map.end()
     }
 }
@@ -2690,8 +2974,8 @@ pub struct SchemaNavigationAnswer {
     items: Option<Vec<SchemaResource>>,
     /// Preferred labels keyed by full IRI. Present only for `labels=true` in
     /// JSON; HTML uses the same bounded hydration internally.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    labels: Option<BTreeMap<String, Option<String>>>,
+    #[serde(flatten)]
+    labels: Option<LabelMap>,
     #[serde(flatten)]
     completeness: Completeness,
     #[serde(skip)]
@@ -2718,8 +3002,8 @@ pub struct SchemaRelationsAnswer {
     order: SchemaProjectionOrder,
     items: Vec<ClassRelationResource>,
     /// Preferred labels keyed by full IRI. See [`SchemaNavigationAnswer`].
-    #[serde(skip_serializing_if = "Option::is_none")]
-    labels: Option<BTreeMap<String, Option<String>>>,
+    #[serde(flatten)]
+    labels: Option<LabelMap>,
     #[serde(flatten)]
     completeness: Completeness,
     #[serde(skip)]
@@ -2745,8 +3029,9 @@ pub struct SchemaClassPropertiesAnswer {
     filters: SchemaProjectionFilters,
     order: SchemaProjectionOrder,
     items: Vec<ClassPropertyResource>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    labels: Option<BTreeMap<String, Option<String>>>,
+    /// Preferred labels keyed by full IRI. See [`SchemaNavigationAnswer`].
+    #[serde(flatten)]
+    labels: Option<LabelMap>,
     #[serde(flatten)]
     completeness: Completeness,
     #[serde(skip)]
@@ -2827,26 +3112,27 @@ impl SchemaAnswer {
         }
     }
 
-    fn set_byte_completeness(&mut self, position: u64) {
+    /// End the page before the item at `position`, for `reason`.
+    fn set_truncated(&mut self, reason: BudgetReason, position: u64) {
         match self {
             Self::Navigation(answer) => {
                 answer.byte_continuation = Some(position);
                 answer.completeness = Completeness::budget_exhausted(
-                    BudgetReason::ResponseBytes,
+                    reason,
                     Cursor::at_schema_child(&answer.byte_binding, position).encode(),
                 );
             }
             Self::Relations(answer) => {
                 answer.byte_continuation = Some(position);
                 answer.completeness = Completeness::budget_exhausted(
-                    BudgetReason::ResponseBytes,
+                    reason,
                     Cursor::at_class_relation(&answer.byte_binding, position).encode(),
                 );
             }
             Self::ClassProperties(answer) => {
                 answer.byte_continuation = Some(position);
                 answer.completeness = Completeness::budget_exhausted(
-                    BudgetReason::ResponseBytes,
+                    reason,
                     Cursor::at_class_property(&answer.byte_binding, position).encode(),
                 );
             }
@@ -2854,15 +3140,68 @@ impl SchemaAnswer {
     }
 
     fn prune_labels(&mut self) {
-        let wanted = self.labelable_terms().into_values().collect::<HashSet<_>>();
+        let wanted = self.labelable_terms();
         let labels = match self {
             Self::Navigation(answer) => &mut answer.labels,
             Self::Relations(answer) => &mut answer.labels,
             Self::ClassProperties(answer) => &mut answer.labels,
         };
         if let Some(labels) = labels {
-            labels.retain(|iri, _| wanted.contains(iri));
+            labels.retain(|iri| wanted.contains(iri));
         }
+    }
+
+    fn has_labels(&self) -> bool {
+        match self {
+            Self::Navigation(answer) => answer.labels.is_some(),
+            Self::Relations(answer) => answer.labels.is_some(),
+            Self::ClassProperties(answer) => answer.labels.is_some(),
+        }
+    }
+
+    /// Resolve `labels=true` for this page in item order.
+    ///
+    /// In order so that if the cascade's allowance runs out the page ends
+    /// before an item it can resume from, rather than serving some items
+    /// labelled and others not. The page's own selector and filters head it
+    /// and are resolved whatever they cost, as its first item is.
+    fn label(&mut self, store: &Store, labeling: &Labeling) -> Result<(), Problem> {
+        let dictionary = store.dict();
+        let mut cascade = cascade(store, labeling)?;
+        let mut map = LabelMap::new(labeling.source);
+        let envelope = schema_iris(self.envelope_terms());
+        if let Some(found) = schema_labels(&dictionary, &mut cascade, &map, envelope, Spend::First)?
+        {
+            for (iri, label) in found {
+                map.insert(iri, label);
+            }
+        }
+        for index in 0..self.item_count() {
+            let terms = schema_iris(self.item_terms(index));
+            match schema_labels(
+                &dictionary,
+                &mut cascade,
+                &map,
+                terms,
+                Spend::first_if(index == 0),
+            )? {
+                Some(found) => {
+                    for (iri, label) in found {
+                        map.insert(iri, label);
+                    }
+                }
+                None => {
+                    let position = self
+                        .item_position(index)
+                        .expect("every schema page item carries its resume position");
+                    self.truncate_items(index);
+                    self.set_truncated(BudgetReason::Candidate, position);
+                    break;
+                }
+            }
+        }
+        self.set_labels(map);
+        Ok(())
     }
 
     fn rendered_size(&self, representation: Representation) -> u64 {
@@ -2889,7 +3228,7 @@ impl SchemaAnswer {
         }
         if total == 1 {
             if let Some(position) = original.byte_continuation() {
-                self.set_byte_completeness(position);
+                self.set_truncated(BudgetReason::ResponseBytes, position);
             }
             return;
         }
@@ -2904,7 +3243,7 @@ impl SchemaAnswer {
                 .expect("every schema page item carries its resume position");
             let mut candidate = original.clone();
             candidate.truncate_items(keep);
-            candidate.set_byte_completeness(position);
+            candidate.set_truncated(BudgetReason::ResponseBytes, position);
             candidate.prune_labels();
             if candidate.rendered_size(representation) <= budget {
                 best = Some(keep);
@@ -2920,7 +3259,7 @@ impl SchemaAnswer {
             .expect("a truncated schema page has a first omitted item");
         *self = original;
         self.truncate_items(keep);
-        self.set_byte_completeness(position);
+        self.set_truncated(BudgetReason::ResponseBytes, position);
         self.prune_labels();
     }
 }
@@ -2942,136 +3281,154 @@ impl Renders for SchemaAnswer {
     fn hydrate_labels(
         &mut self,
         store: &Store,
-        label_predicates: &[String],
+        labeling: &Labeling,
         cap: usize,
-        required: bool,
     ) -> Result<(), Problem> {
-        if label_predicates.is_empty() {
+        if self.has_labels() || labeling.predicates.is_empty() {
             return Ok(());
         }
         let wanted = self.labelable_terms();
-        if wanted.is_empty() {
+        if wanted.is_empty() || wanted.len() > cap {
             return Ok(());
         }
-        if wanted.len() > cap {
-            if required {
-                return Err(Problem::new(
-                    ErrorCode::CapExceeded,
-                    format!(
-                        "this schema page has {} distinct IRIs, over this server's max_label_iris of {cap}",
-                        wanted.len()
-                    ),
-                ));
-            }
-            return Ok(());
-        }
-
         let dictionary = store.dict();
-        let predicates: Vec<u64> = label_predicates
-            .iter()
-            .map(|iri| {
-                dictionary
-                    .locate(Role::Predicate, iri.as_bytes())
-                    .map(|found| found.map(|id| id.0))
-                    .map_err(|error| unreadable("looking a label predicate up", &error))
-            })
-            .filter_map(Result::transpose)
-            .collect::<Result<_, _>>()?;
-        let mut cache = TermCache::new();
-        let mut labels = BTreeMap::new();
-        for (term, iri) in wanted {
-            let label = match dictionary
-                .locate(Role::Subject, term.as_bytes())
-                .map_err(|error| unreadable("looking a schema IRI up", &error))?
-            {
-                Some(subject) => {
-                    preferred_label(store, &dictionary, &mut cache, subject.0, &predicates)?
-                }
-                None => None,
-            };
-            labels.insert(iri, label);
+        let mut cascade = cascade(store, labeling)?;
+        let mut map = LabelMap::new(false);
+        let terms = wanted.into_iter().collect();
+        let Some(found) = schema_labels(
+            &dictionary,
+            &mut cascade,
+            &map,
+            terms,
+            Spend::WithinAllowance,
+        )?
+        else {
+            return Ok(());
+        };
+        for (iri, label) in found {
+            map.insert(iri, label);
         }
-        self.set_labels(labels);
+        self.set_labels(map);
         Ok(())
     }
 }
 
 impl SchemaAnswer {
-    fn labelable_terms(&self) -> BTreeMap<String, String> {
-        let mut terms = BTreeMap::new();
-        let mut insert = |term: &SchemaTerm| {
-            if let Term::Iri(iri) = Term::from_dictionary(&term.0) {
-                terms.insert(term.0.to_string(), iri.into_owned());
-            }
-        };
+    /// The schema terms outside the items: the selector, the node, and the
+    /// filters.
+    fn envelope_terms(&self) -> Vec<&SchemaTerm> {
+        let mut terms = Vec::new();
         match self {
             Self::Navigation(answer) => {
                 match &answer.selector {
                     SchemaSelectorResource::Dataset => {}
-                    SchemaSelectorResource::Class { class } => insert(class),
+                    SchemaSelectorResource::Class { class } => terms.push(class),
                     SchemaSelectorResource::Property { class, predicate } => {
-                        if let Some(class) = class {
-                            insert(class);
-                        }
-                        insert(predicate);
+                        terms.extend(class.iter());
+                        terms.push(predicate);
                     }
                     SchemaSelectorResource::Datatype {
                         class,
                         predicate,
                         datatype,
                     } => {
-                        if let Some(class) = class {
-                            insert(class);
-                        }
-                        insert(predicate);
-                        insert(datatype);
+                        terms.extend(class.iter());
+                        terms.push(predicate);
+                        terms.push(datatype);
                     }
                 }
-                if let Some(term) = answer.node.as_ref().and_then(|node| node.term.as_ref()) {
-                    insert(term);
-                }
-                for item in answer.items.as_deref().unwrap_or_default() {
-                    if let Some(term) = &item.term {
-                        insert(term);
-                    }
-                }
+                terms.extend(answer.node.as_ref().and_then(|node| node.term.as_ref()));
             }
             Self::Relations(answer) => {
-                if let Some(class) = &answer.filters.class {
-                    insert(class);
-                }
-                if let Some(predicate) = &answer.filters.predicate {
-                    insert(predicate);
-                }
-                for relation in &answer.items {
-                    insert(&relation.subject_class);
-                    insert(&relation.predicate);
-                    insert(&relation.object_class);
-                }
+                terms.extend(answer.filters.class.iter());
+                terms.extend(answer.filters.predicate.iter());
             }
             Self::ClassProperties(answer) => {
-                if let Some(class) = &answer.filters.class {
-                    insert(class);
-                }
-                if let Some(predicate) = &answer.filters.predicate {
-                    insert(predicate);
-                }
-                for property in &answer.items {
-                    insert(&property.class);
-                    insert(&property.predicate);
-                }
+                terms.extend(answer.filters.class.iter());
+                terms.extend(answer.filters.predicate.iter());
             }
         }
         terms
     }
 
-    fn set_labels(&mut self, labels: BTreeMap<String, Option<String>>) {
+    /// The schema terms of the item at `index`.
+    fn item_terms(&self, index: usize) -> Vec<&SchemaTerm> {
+        match self {
+            Self::Navigation(answer) => answer
+                .items
+                .as_deref()
+                .and_then(|items| items.get(index))
+                .and_then(|item| item.term.as_ref())
+                .into_iter()
+                .collect(),
+            Self::Relations(answer) => answer.items.get(index).map_or_else(Vec::new, |item| {
+                vec![&item.subject_class, &item.predicate, &item.object_class]
+            }),
+            Self::ClassProperties(answer) => answer
+                .items
+                .get(index)
+                .map_or_else(Vec::new, |item| vec![&item.class, &item.predicate]),
+        }
+    }
+
+    /// Every distinct IRI on the page.
+    fn labelable_terms(&self) -> BTreeSet<Rc<str>> {
+        let mut terms = schema_iris(self.envelope_terms());
+        for index in 0..self.item_count() {
+            terms.extend(schema_iris(self.item_terms(index)));
+        }
+        terms.into_iter().collect()
+    }
+
+    fn set_labels(&mut self, labels: LabelMap) {
         match self {
             Self::Navigation(answer) => answer.labels = Some(labels),
             Self::Relations(answer) => answer.labels = Some(labels),
             Self::ClassProperties(answer) => answer.labels = Some(labels),
         }
     }
+}
+
+/// The IRIs among schema terms; a blank node or literal has no label to look
+/// up in the data.
+fn schema_iris(terms: Vec<&SchemaTerm>) -> Vec<Rc<str>> {
+    terms
+        .into_iter()
+        .filter(|term| matches!(Term::from_dictionary(&term.0), Term::Iri(_)))
+        .map(|term| Rc::clone(&term.0))
+        .collect()
+}
+
+/// Schema IRIs with their resolved labels, not yet in a page's map.
+type SchemaLabels = Vec<(Rc<str>, Option<PreferredLabel>)>;
+
+/// Resolve the labels `iris` would add to `map`, or `None` when the cascade's
+/// allowance cannot cover them.
+fn schema_labels(
+    dictionary: &Dictionary<'_>,
+    cascade: &mut LabelCascade<'_>,
+    map: &LabelMap,
+    iris: Vec<Rc<str>>,
+    spend: Spend,
+) -> Result<Option<SchemaLabels>, Problem> {
+    let mut found = SchemaLabels::new();
+    for iri in iris {
+        if map.contains(&iri) || found.iter().any(|(seen, _)| *seen == iri) {
+            continue;
+        }
+        let label = match dictionary
+            .locate(Role::Subject, iri.as_bytes())
+            .map_err(|error| unreadable("looking a schema IRI up", &error))?
+        {
+            None => None,
+            Some(subject) => match cascade.resolve(subject.0, spend)? {
+                Resolution::Resolved(label) => label,
+                Resolution::Exhausted => return Ok(None),
+            },
+        };
+        found.push((iri, label));
+    }
+    Ok(Some(found))
 }
 
 fn standard_body(resource: &impl Resource, representation: Representation) -> Bytes {
@@ -3837,6 +4194,23 @@ pub fn schema(
     target: Target,
     request: &request::Schema,
 ) -> Result<SchemaAnswer, Problem> {
+    let mut answer = schema_page(store, target, request)?;
+    // A release with no `label` role has no cascade, and the map is left out
+    // rather than filled with nulls, as on a page of rows.
+    if let Some(labeling) = &request.labels
+        && !labeling.predicates.is_empty()
+    {
+        answer.label(store, labeling)?;
+    }
+    Ok(answer)
+}
+
+/// The `/schema` page before any label is resolved.
+fn schema_page(
+    store: &Store,
+    target: Target,
+    request: &request::Schema,
+) -> Result<SchemaAnswer, Problem> {
     let description = store.description().ok_or_else(|| {
         Problem::new(
             ErrorCode::CapabilityNotAvailable,
@@ -4545,6 +4919,12 @@ pub fn fragment(
         absent_terms: Vec::new(),
         blank_nodes,
         tagging: GraphTagging::for_scope(&request.graph),
+        labels: PageLabeling::of(
+            request.labels.as_ref(),
+            Position::ALL
+                .into_iter()
+                .filter_map(|position| request.pattern.bound(position)),
+        ),
     };
 
     if let Some(triple) = request.pattern.triple() {
@@ -4773,6 +5153,12 @@ pub fn binding_fragment(
         absent_terms: absent_graph.into_iter().collect(),
         blank_nodes,
         tagging: GraphTagging::for_scope(&request.graph),
+        labels: PageLabeling::of(
+            request.labels.as_ref(),
+            Position::ALL
+                .into_iter()
+                .filter_map(|position| request.pattern.bound(position)),
+        ),
     };
     let paging = Paging {
         cursor: request.cursor.as_ref(),
@@ -4965,7 +5351,7 @@ pub fn search(
     let mut predicate_ids = resolve_predicate_ids(&dictionary, &request.predicates)?;
     predicate_ids.sort_unstable();
     predicate_ids.dedup();
-    let label_predicates = resolve_predicate_ids(&dictionary, &request.label_predicates)?;
+    let mut labels = ItemLabels::of(store, request.labels.as_ref())?;
 
     let mut results = Vec::with_capacity(request.limit as usize);
     let mut seen = HashSet::with_capacity(request.limit as usize);
@@ -4975,6 +5361,7 @@ pub fn search(
     let mut spent_bytes = 0u64;
     let mut resolution_exhausted = false;
     let mut response_exhausted = false;
+    let mut labels_exhausted = false;
 
     'hits: for hit in &found.hits {
         if results.len() >= request.limit as usize {
@@ -5002,8 +5389,7 @@ pub fn search(
             let take = available.min(resolution_budget);
             for triple in selection.page(0, take as usize) {
                 resolution_budget -= 1;
-                if push_search_result(
-                    store,
+                if let Some(reason) = push_search_result(
                     &dictionary,
                     &mut cache,
                     &mut published,
@@ -5011,7 +5397,7 @@ pub fn search(
                     &mut results,
                     &mut spent_bytes,
                     request,
-                    &label_predicates,
+                    labels.as_mut(),
                     triple,
                     hit.object_id,
                     Ranking {
@@ -5019,7 +5405,10 @@ pub fn search(
                         kind: match_kind(hit.kind),
                     },
                 )? {
-                    response_exhausted = true;
+                    match reason {
+                        BudgetReason::Candidate => labels_exhausted = true,
+                        _ => response_exhausted = true,
+                    }
                     break 'hits;
                 }
                 if results.len() >= request.limit as usize {
@@ -5049,8 +5438,7 @@ pub fn search(
                 let take = available.min(resolution_budget);
                 for triple in selection.page(0, take as usize) {
                     resolution_budget -= 1;
-                    if push_search_result(
-                        store,
+                    if let Some(reason) = push_search_result(
                         &dictionary,
                         &mut cache,
                         &mut published,
@@ -5058,7 +5446,7 @@ pub fn search(
                         &mut results,
                         &mut spent_bytes,
                         request,
-                        &label_predicates,
+                        labels.as_mut(),
                         triple,
                         hit.object_id,
                         Ranking {
@@ -5066,7 +5454,10 @@ pub fn search(
                             kind: match_kind(hit.kind),
                         },
                     )? {
-                        response_exhausted = true;
+                        match reason {
+                            BudgetReason::Candidate => labels_exhausted = true,
+                            _ => response_exhausted = true,
+                        }
                         break 'hits;
                     }
                     if results.len() >= request.limit as usize {
@@ -5083,7 +5474,7 @@ pub fn search(
 
     let completeness = if response_exhausted {
         Completeness::budget_exhausted_without_resume(BudgetReason::ResponseBytes)
-    } else if resolution_exhausted || !found.complete {
+    } else if resolution_exhausted || labels_exhausted || !found.complete {
         Completeness::budget_exhausted_without_resume(BudgetReason::Candidate)
     } else {
         Completeness::complete()
@@ -5099,7 +5490,7 @@ pub fn search(
             .iter()
             .map(|predicate| predicate.dictionary().to_owned())
             .collect(),
-        labels: request.labels,
+        labels: request.labels.is_some(),
         results,
         completeness,
         target,
@@ -5107,9 +5498,10 @@ pub fn search(
     })
 }
 
+/// Retain one subject's result, or say which budget it would have spent past:
+/// the response's bytes, or the label cascade's allowance.
 #[allow(clippy::too_many_arguments)]
 fn push_search_result(
-    store: &Store,
     dictionary: &Dictionary<'_>,
     cache: &mut TermCache,
     published: &mut PublishedTerms,
@@ -5117,13 +5509,13 @@ fn push_search_result(
     results: &mut Vec<SearchResult>,
     spent_bytes: &mut u64,
     request: &request::Search,
-    label_predicates: &[u64],
+    labels: Option<&mut ItemLabels<'_>>,
     triple: IdTriple,
     literal_id: u64,
     ranking: Ranking,
-) -> Result<bool, Problem> {
+) -> Result<Option<BudgetReason>, Problem> {
     if !seen.insert(triple.subject) {
-        return Ok(false);
+        return Ok(None);
     }
 
     // Published, not stored: a text hit can land on a blank-node subject, and a
@@ -5152,23 +5544,28 @@ fn push_search_result(
             &format_args!("object term {literal_id} is not a literal"),
         ));
     }
-    let label = if request.labels {
-        Some(preferred_label(
-            store,
-            dictionary,
-            cache,
-            triple.subject,
-            label_predicates,
-        )?)
-    } else {
-        None
+    let label = match labels {
+        None => None,
+        Some(labels) => {
+            match labels.label(Some(triple.subject), Spend::first_if(results.is_empty()))? {
+                Some(label) => Some(label),
+                None => {
+                    seen.remove(&triple.subject);
+                    return Ok(Some(BudgetReason::Candidate));
+                }
+            }
+        }
     };
+    let roles = request.roles_by_predicate.get(predicate.as_ref()).cloned();
     let result = SearchResult::new(
         subject,
         subject_serialized,
         label,
-        predicate,
-        literal,
+        SearchEvidence {
+            predicate,
+            roles,
+            literal,
+        },
         ranking,
     );
     let next = spent_bytes.saturating_add(result.serialized);
@@ -5177,15 +5574,20 @@ fn push_search_result(
     // progress.
     if next > request.bytes.0 && !results.is_empty() {
         seen.remove(&triple.subject);
-        return Ok(true);
+        return Ok(Some(BudgetReason::ResponseBytes));
     }
     *spent_bytes = next;
     results.push(result);
-    Ok(false)
+    Ok(None)
 }
 
 /// `QUERY|POST /labels` — preserve the submitted IRI order and return one
 /// preferred label or an explicit null for each processed member.
+///
+/// A response cut short by the byte budget or the cascade's allowance is a
+/// prefix of the input, and says which budget ended it; it has no cursor,
+/// because the remainder is the client's own list, resent from where this one
+/// stopped.
 pub fn labels(
     store: &Store,
     target: Target,
@@ -5193,36 +5595,38 @@ pub fn labels(
 ) -> Result<LabelsAnswer, Problem> {
     let dictionary = store.dict();
     let blank_nodes = SkolemScope::of(store);
-    let label_predicates = resolve_predicate_ids(&dictionary, &request.label_predicates)?;
-    let mut cache = TermCache::new();
-    let mut resolved_labels: HashMap<String, Option<String>> = HashMap::new();
+    let mut item_labels = ItemLabels::new(store, &request.labeling)?;
+    // By spelling as well as the cascade's own memo by id, so a repeated
+    // absent or foreign IRI is not looked up again either.
+    let mut resolved_labels: HashMap<&str, RowLabel> = HashMap::new();
     let mut labels = Vec::with_capacity(request.iris().len());
     let mut spent = 0u64;
-    let mut exhausted = false;
+    let mut stopped = None;
 
     for requested in request.iris() {
-        let label = if let Some(label) = resolved_labels.get(requested.dictionary()) {
-            label.clone()
-        } else {
-            let label = match locate_scoped(
-                &dictionary,
-                &blank_nodes,
-                store.triple_terms(),
-                Role::Subject,
-                requested,
-            )? {
-                Some(subject) => {
-                    preferred_label(store, &dictionary, &mut cache, subject, &label_predicates)?
-                }
-                None => None,
-            };
-            resolved_labels.insert(requested.dictionary().to_owned(), label.clone());
-            label
+        let label = match resolved_labels.get(requested.dictionary()) {
+            Some(label) => label.clone(),
+            None => {
+                let subject = locate_scoped(
+                    &dictionary,
+                    &blank_nodes,
+                    store.triple_terms(),
+                    Role::Subject,
+                    requested,
+                )?;
+                let Some(label) = item_labels.label(subject, Spend::first_if(labels.is_empty()))?
+                else {
+                    stopped = Some(BudgetReason::Candidate);
+                    break;
+                };
+                resolved_labels.insert(requested.dictionary(), label.clone());
+                label
+            }
         };
         let result = LabelResult::new(requested.dictionary().to_owned(), label);
         let next = spent.saturating_add(result.serialized);
         if next > request.bytes.0 && !labels.is_empty() {
-            exhausted = true;
+            stopped = Some(BudgetReason::ResponseBytes);
             break;
         }
         spent = next;
@@ -5233,10 +5637,9 @@ pub fn labels(
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
         labels,
-        completeness: if exhausted {
-            Completeness::budget_exhausted_without_resume(BudgetReason::ResponseBytes)
-        } else {
-            Completeness::complete()
+        completeness: match stopped {
+            Some(reason) => Completeness::budget_exhausted_without_resume(reason),
+            None => Completeness::complete(),
         },
         target,
     })
@@ -5307,25 +5710,29 @@ pub fn terms(
     };
 
     let blank_nodes = SkolemScope::of(store);
-    let label_predicates = resolve_predicate_ids(&dictionary, &request.label_predicates)?;
+    let mut labels = ItemLabels::of(store, request.labels.as_ref())?;
     let mut cache = TermCache::new();
     let mut published = PublishedTerms::new(blank_nodes.clone(), store);
     let mut rows: Vec<TermRow> = Vec::with_capacity(request.limit as usize);
     let mut spent = 0u64;
-    let mut spent_budget = false;
+    let mut spent_budget = None;
     let mut failure = None;
 
     let stop = scan
         .page(after, request.limit as usize, |term| {
             let row = match scanned_row(
-                store,
                 &dictionary,
                 &mut cache,
                 &mut published,
                 &term,
-                request.labels.then_some(label_predicates.as_slice()),
+                labels.as_mut(),
+                Spend::first_if(rows.is_empty()),
             ) {
-                Ok(row) => row,
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    spent_budget = Some(BudgetReason::Candidate);
+                    return ScanFlow::Reject;
+                }
                 Err(problem) => {
                     failure = Some(problem);
                     return ScanFlow::Reject;
@@ -5336,7 +5743,7 @@ pub fn terms(
             // first row: a page that carries nothing would resume exactly where
             // it was issued, and a client paging on it would never move.
             if spent > request.bytes.0 && !rows.is_empty() {
-                spent_budget = true;
+                spent_budget = Some(BudgetReason::ResponseBytes);
                 return ScanFlow::Reject;
             }
             rows.push(row);
@@ -5361,10 +5768,9 @@ pub fn terms(
         None => Completeness::complete(),
         Some(position) => {
             let token = Cursor::at_dictionary_position(&request.binding, position).encode();
-            if spent_budget {
-                Completeness::budget_exhausted(BudgetReason::ResponseBytes, token)
-            } else {
-                Completeness::page_limit(token)
+            match spent_budget {
+                Some(reason) => Completeness::budget_exhausted(reason, token),
+                None => Completeness::page_limit(token),
             }
         }
     };
@@ -5383,15 +5789,17 @@ pub fn terms(
 }
 
 /// One scanned term as a response row: its published spelling, the positions it
-/// occupies, and its preferred label when one was asked for.
+/// occupies, and its preferred label when one was asked for — or `None` when
+/// the label cascade's allowance cannot cover this term's candidates, and the
+/// page ends before it.
 fn scanned_row(
-    store: &Store,
     dictionary: &Dictionary<'_>,
     cache: &mut TermCache,
     published: &mut PublishedTerms,
     term: &ScannedTerm<'_>,
-    label_predicates: Option<&[u64]>,
-) -> Result<TermRow, Problem> {
+    labels: Option<&mut ItemLabels<'_>>,
+    spend: Spend,
+) -> Result<Option<TermRow>, Problem> {
     // Any role the scan read spells the term the same way, because a published
     // blank node is named by its section and local id rather than by a role. So
     // the first one is as good as any, and there is always one.
@@ -5409,9 +5817,9 @@ fn scanned_row(
         .measured(cache, dictionary, role, id)
         .map_err(|error| unreadable("materializing a scanned term", &error))?;
 
-    let label = match label_predicates {
+    let label = match labels {
         None => None,
-        Some(predicates) => {
+        Some(labels) => {
             // A label statement has the term as its subject, so a term the scan
             // did not read in the subject sections still needs looking up there:
             // a predicate carries `rdfs:label` like anything else, and refusing
@@ -5423,59 +5831,452 @@ fn scanned_row(
                     .map_err(|error| unreadable("looking a scanned term up", &error))?
                     .map(|id| id.0),
             };
-            Some(match subject {
-                None => None,
-                Some(subject) => preferred_label(store, dictionary, cache, subject, predicates)?,
-            })
+            match labels.label(subject, spend)? {
+                Some(label) => Some(label),
+                None => return Ok(None),
+            }
         }
     };
 
     let roles = term.sections().roles().map(term_role_name).collect();
-    Ok(TermRow::new(row_term.published, serialized, roles, label))
+    Ok(Some(TermRow::new(
+        row_term.published,
+        serialized,
+        roles,
+        label,
+    )))
 }
 
-/// First predicate in the frozen cascade with a value, then its lowest object
-/// term id. There is intentionally no language axis: this is the release's one
-/// deterministic display label, independent of client locale.
-fn preferred_label(
+// ---------------------------------------------------------------------------
+// Verbalization preview
+// ---------------------------------------------------------------------------
+
+/// `GET|QUERY /verbalize` — render what a config would write for a few roots.
+///
+/// Three modes, one answer shape. `iris` renders the named roots under one
+/// target. `sample` draws `n` seeded-uniform members of one target's class.
+/// `plan` does that for every target and reports each one's member count and
+/// the sampled texts' lengths — the "what would this config produce" question,
+/// answered without a build.
+///
+/// Every probe the render makes — a root's star, and the type, template and
+/// cascade probes that name each node a text mentions — and every row a probe
+/// yields is charged to one candidate budget for the request. A probe that
+/// finds nothing is charged too, since the config decides how many there are.
+/// When the budget runs out, the root in hand is
+/// delivered marked `truncated`, no further root is rendered, and the answer
+/// says the candidate budget was exhausted. The roots are bounded by
+/// `max_verbalize_roots`. A class's member count is a range width, and
+/// drawing a member is one rank descent, so a plan never enumerates a class.
+///
+/// The response stops at its byte budget, and so does the text built for it:
+/// the verbalizer charges every line and every piece a template appends to a
+/// label against `max_response_bytes`, because a config can make one label
+/// grow far faster than the reads behind it. A record that does not fit what
+/// is left is left out — unless it is the first, which is cut at a line to
+/// fit, keeping at least its label line: a response must carry something,
+/// as every route keeps its first row, and a text, unlike a row, can be cut.
+pub fn verbalize(
     store: &Store,
-    dictionary: &Dictionary<'_>,
-    cache: &mut TermCache,
-    subject: u64,
-    predicates: &[u64],
-) -> Result<Option<String>, Problem> {
-    for predicate in predicates {
-        let selection = select(
-            store,
-            IdPattern {
-                subject: Some(subject),
-                predicate: Some(*predicate),
-                object: None,
-            },
-        )?;
-        let Some(triple) = selection.page(0, 1).next() else {
-            continue;
-        };
-        let text = cache
-            .resolve(dictionary, Role::Object, TermId(triple.object))
-            .map_err(|error| unreadable("materializing a preferred label", &error))?;
-        return match Term::from_dictionary(&text) {
-            Term::Literal(literal) => Ok(Some(literal.value().to_owned())),
-            _ => {
-                tracing::error!(
-                    subject,
-                    predicate,
-                    object = triple.object,
-                    "a declared label predicate has a non-literal value"
-                );
-                Err(Problem::new(
-                    ErrorCode::InternalError,
-                    "the bundle's label profile points to a non-literal value",
-                ))
+    target: Target,
+    request: &request::Verbalize,
+) -> Result<VerbalizeAnswer, Problem> {
+    let bound = Bound::bind(store, &request.resolved, &request.label_predicates)
+        .map_err(|error| unreadable("binding a verbalization config", &error))?;
+    let mut verbalizer = Verbalizer::new(store, &bound)
+        .with_read_budget(usize::try_from(request.read_budget).unwrap_or(usize::MAX))
+        .with_byte_budget(usize::try_from(request.bytes.0).unwrap_or(usize::MAX));
+    let names: Vec<&str> = bound.targets().collect();
+
+    let mut records = Vec::new();
+    let mut reports = Vec::new();
+    let mut absent = Vec::new();
+    let mut spent = 0u64;
+    // Whether a record was left out, or cut, to keep within the byte budget.
+    let mut over_bytes = false;
+
+    // Add one rendered root if it fits what is left of the byte budget; the
+    // first is cut to fit instead.
+    let mut admit =
+        |rendered: Verbalized, index: usize, records: &mut Vec<VerbalizeRecord>| -> bool {
+            let room = request.bytes.0.saturating_sub(spent);
+            let mut record = VerbalizeRecord::new(names[index].to_owned(), rendered);
+            if record.serialized > room {
+                over_bytes = true;
+                if !records.is_empty() {
+                    return false;
+                }
+                record.fit(room);
             }
+            spent = spent.saturating_add(record.serialized);
+            records.push(record);
+            true
         };
+
+    match &request.mode {
+        request::VerbalizeMode::Iris(iris) => {
+            let index = request.target_indexes()[0];
+            for iri in iris {
+                let rendered = verbalizer
+                    .verbalize_iri(index, iri.dictionary())
+                    .map_err(|error| unreadable("verbalizing a root", &error))?;
+                match rendered {
+                    Some(rendered) => {
+                        if !admit(rendered, index, &mut records) || verbalizer.exhausted().is_some()
+                        {
+                            break;
+                        }
+                    }
+                    None => absent.push(iri.dictionary().to_owned()),
+                }
+            }
+        }
+        request::VerbalizeMode::Sample | request::VerbalizeMode::Plan => {
+            'targets: for index in request.target_indexes() {
+                let count = verbalizer
+                    .root_count(index)
+                    .map_err(|error| unreadable("counting a class", &error))?;
+                let mut report = VerbalizeTargetReport::new(
+                    names[index].to_owned(),
+                    request.resolved.targets[index].class.clone(),
+                    count,
+                );
+                for position in sample_positions(count, u64::from(request.n), request.seed) {
+                    let subject = verbalizer
+                        .root_at(index, position)
+                        .map_err(|error| unreadable("drawing a class member", &error))?;
+                    let rendered = verbalizer
+                        .verbalize(index, subject)
+                        .map_err(|error| unreadable("verbalizing a root", &error))?;
+                    let Some(rendered) = rendered else {
+                        continue;
+                    };
+                    // The statistics describe the texts the answer carries, so
+                    // a text left out for the byte budget is not counted.
+                    let admitted = admit(rendered, index, &mut records);
+                    if admitted {
+                        report.observe(records.last().expect("a record was just admitted"));
+                    }
+                    if !admitted || verbalizer.exhausted().is_some() {
+                        reports.push(report);
+                        break 'targets;
+                    }
+                }
+                reports.push(report);
+            }
+        }
     }
-    Ok(None)
+
+    let completeness = match (over_bytes, verbalizer.exhausted()) {
+        (true, _) | (false, Some(Exhausted::Bytes)) => {
+            Completeness::budget_exhausted_without_resume(BudgetReason::ResponseBytes)
+        }
+        (false, Some(Exhausted::Reads)) => {
+            Completeness::budget_exhausted_without_resume(BudgetReason::Candidate)
+        }
+        (false, None) => Completeness::complete(),
+    };
+    Ok(VerbalizeAnswer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        mode: request.mode.as_str(),
+        target_name: request.target.clone(),
+        n: request.n,
+        seed: request.seed,
+        unknown: bound.unknown().to_vec(),
+        absent,
+        targets: reports,
+        records,
+        completeness,
+        target,
+    })
+}
+
+/// One target's plan: how many members, and what the sampled texts look like.
+#[derive(Debug, Serialize)]
+pub struct VerbalizeTargetReport {
+    name: String,
+    #[serde(rename = "type")]
+    class: String,
+    /// Members of the class, blank nodes included.
+    members: u64,
+    /// Roots rendered from it whose texts this answer carries.
+    sampled: u64,
+    /// Mean characters per rendered text.
+    mean_chars: u64,
+    /// The longest rendered text, in characters.
+    max_chars: u64,
+    /// Mean lines per rendered text, the label line included.
+    mean_lines: u64,
+    /// Rendered texts a budget ran out in — the candidate budget before every
+    /// edge or label was read, or the byte budget before every line was
+    /// written: a bounded server's approximation, not a config problem.
+    truncated: u64,
+    /// Predicates sampled down to `predicate_limit`, summed over the rendered
+    /// texts: the signal for tuning the limit or the lists.
+    limited: u64,
+    #[serde(skip)]
+    chars: u64,
+    #[serde(skip)]
+    lines: u64,
+}
+
+impl VerbalizeTargetReport {
+    fn new(name: String, class: String, members: u64) -> Self {
+        Self {
+            name,
+            class,
+            members,
+            sampled: 0,
+            mean_chars: 0,
+            max_chars: 0,
+            mean_lines: 0,
+            truncated: 0,
+            limited: 0,
+            chars: 0,
+            lines: 0,
+        }
+    }
+
+    fn observe(&mut self, record: &VerbalizeRecord) {
+        self.sampled += 1;
+        self.chars += record.chars;
+        self.lines += record.lines;
+        self.max_chars = self.max_chars.max(record.chars);
+        self.truncated += u64::from(record.truncated);
+        self.limited += u64::from(record.limited);
+        self.mean_chars = self.chars / self.sampled;
+        self.mean_lines = self.lines / self.sampled;
+    }
+}
+
+/// One rendered root.
+#[derive(Debug)]
+pub struct VerbalizeRecord {
+    target: String,
+    iri: String,
+    label: String,
+    text: String,
+    /// Hex SHA-256 of the text: the key a build's roots and texts streams
+    /// join on, so a preview and a build agree on it.
+    digest: String,
+    chars: u64,
+    lines: u64,
+    truncated: bool,
+    limited: u32,
+    serialized: u64,
+}
+
+impl VerbalizeRecord {
+    fn new(target: String, rendered: Verbalized) -> Self {
+        let chars = rendered.text.chars().count() as u64;
+        let lines = rendered.text.lines().count() as u64;
+        // The JSON object, less a constant the keys and punctuation take.
+        let serialized = serialized_object([
+            ("target", serialized_json_string(&target)),
+            ("iri", serialized_json_string(&rendered.iri) + 24),
+            ("label", serialized_json_string(&rendered.label)),
+            ("text", serialized_json_string(&rendered.text)),
+            ("digest", 66),
+            ("chars", 20),
+            ("lines", 20),
+            ("truncated", 5),
+            ("limited", 10),
+        ]);
+        Self {
+            target,
+            iri: rendered.iri,
+            label: rendered.label,
+            text: rendered.text,
+            digest: kgf_verbalize::text::hex(&rendered.digest),
+            chars,
+            lines,
+            truncated: rendered.truncated,
+            limited: rendered.limited,
+            serialized,
+        }
+    }
+
+    /// Cut the text at a line so the record fits `room` bytes, keeping at
+    /// least the label line, which nothing can stand without; the record is
+    /// then marked truncated and its digest is the cut text's.
+    fn fit(&mut self, room: u64) {
+        let fixed = self.serialized - serialized_json_string(&self.text);
+        // The text's quotes, then each line kept, a line after the first
+        // bringing its newline, escaped to two bytes.
+        let mut size = 2;
+        let mut end = 0;
+        for (index, line) in self.text.split('\n').enumerate() {
+            let newline = if index == 0 { 0 } else { 2 };
+            let cost = serialized_json_string(line) - 2 + newline;
+            if index > 0 && fixed + size + cost > room {
+                break;
+            }
+            size += cost;
+            end += line.len() + newline as usize / 2;
+        }
+        if end < self.text.len() {
+            self.text.truncate(end);
+            self.digest = kgf_verbalize::text::hex(&kgf_verbalize::text::text_digest(&self.text));
+            self.chars = self.text.chars().count() as u64;
+            self.lines = self.text.lines().count() as u64;
+            self.truncated = true;
+            self.serialized = fixed + size;
+        }
+    }
+}
+
+impl Serialize for VerbalizeRecord {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(9))?;
+        map.serialize_entry("target", &self.target)?;
+        map.serialize_entry("iri", &Term::from_dictionary(&self.iri))?;
+        map.serialize_entry("label", &self.label)?;
+        map.serialize_entry("text", &self.text)?;
+        map.serialize_entry("digest", &self.digest)?;
+        map.serialize_entry("chars", &self.chars)?;
+        map.serialize_entry("lines", &self.lines)?;
+        map.serialize_entry("truncated", &self.truncated)?;
+        map.serialize_entry("limited", &self.limited)?;
+        map.end()
+    }
+}
+
+/// `GET|QUERY /verbalize`'s answer.
+#[derive(Debug, Serialize)]
+pub struct VerbalizeAnswer {
+    dataset: String,
+    version: String,
+    mode: &'static str,
+    #[serde(rename = "target", skip_serializing_if = "Option::is_none")]
+    target_name: Option<String>,
+    n: u32,
+    seed: u64,
+    /// The config's IRIs this bundle does not hold.
+    unknown: Vec<Unknown>,
+    /// Requested roots that are not subjects in this bundle.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    absent: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    targets: Vec<VerbalizeTargetReport>,
+    records: Vec<VerbalizeRecord>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+}
+
+impl Renders for VerbalizeAnswer {
+    fn render(self, representation: Representation) -> Result<Rendered, Problem> {
+        let body = standard_body(&self, representation);
+        let rows = Some(self.records.len() as u64);
+        Ok(Rendered {
+            body,
+            completeness: self.completeness,
+            rows,
+            cardinality: None,
+        })
+    }
+}
+
+impl Resource for VerbalizeAnswer {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        let summary = [
+            ("mode", Value::Text(self.mode)),
+            ("rendered", Value::Number(self.records.len() as u64)),
+            (
+                "complete",
+                Value::Text(completeness_text(&self.completeness)),
+            ),
+        ];
+        let target_rows: Vec<Vec<Value<'_>>> = self
+            .targets
+            .iter()
+            .map(|report| {
+                vec![
+                    Value::Text(&report.name),
+                    Value::Code(&report.class),
+                    Value::Number(report.members),
+                    Value::Number(report.sampled),
+                    Value::Number(report.mean_chars),
+                    Value::Number(report.max_chars),
+                    Value::Number(report.mean_lines),
+                    Value::Number(report.limited),
+                    Value::Number(report.truncated),
+                ]
+            })
+            .collect();
+        operation_page(
+            &self.target.mount,
+            "Verbalization preview",
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" { (fields(&summary)) }
+                @if let Some(form) = self.target.form() {
+                    div."query-editor" { (form) }
+                }
+                @for unknown in &self.unknown {
+                    (note(&format!(
+                        "The config's {} names {}, which this bundle does not hold.",
+                        unknown.at, unknown.iri
+                    )))
+                }
+                @if !self.absent.is_empty() {
+                    (note(&format!(
+                        "Not subjects in this bundle: {}.",
+                        self.absent.join(", ")
+                    )))
+                }
+                @if !self.targets.is_empty() {
+                    section."section-block" {
+                        h2 { "Targets" }
+                        (note(
+                            "Members counts every node of the class. Sampled texts are drawn \
+                             uniformly by seed; lengths are in characters and lines. Limited \
+                             counts predicates sampled down to the limit across the texts — the \
+                             number to tune the limit or the lists by. A truncated text needed more \
+                             reads than one request may make."
+                        ))
+                        (results_table(
+                            &["target", "class", "members", "sampled", "mean chars", "max chars", "mean lines", "limited", "truncated"],
+                            &target_rows,
+                        ))
+                    }
+                }
+                section."section-block" {
+                    h2 { "Texts" }
+                    @if self.records.is_empty() {
+                        (note("Nothing was rendered."))
+                    }
+                    @for record in &self.records {
+                        article."verbalized" {
+                            h3 { (record.target) " · " (record.label) }
+                            p { a href=(self.target.ask("describe", "iri", &record.iri)) { code { (record.iri) } } }
+                            pre { (record.text) }
+                            p."note" {
+                                (group_digits(record.chars)) " characters · "
+                                (group_digits(record.lines)) " lines"
+                                @if record.limited > 0 {
+                                    " · " (record.limited) " predicate"
+                                    @if record.limited > 1 { "s" }
+                                    " sampled down"
+                                }
+                                @if record.truncated { " · cut at the candidate budget" }
+                            }
+                        }
+                    }
+                }
+            },
+        )
+    }
 }
 
 /// Count statements matching a text-constrained pattern, in resumable batches.
@@ -5634,6 +6435,7 @@ pub fn describe(
             absent_terms,
             blank_nodes,
             tagging: GraphTagging::Untagged,
+            labels: PageLabeling::of(request.labels.as_ref(), [&request.resource]),
         },
         phases,
         Paging {
@@ -5686,15 +6488,24 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         })
         .collect();
 
-    let (rows, spent_at) = materialize(
+    let mut labeler = PageLabeling::of(
+        request.labels.as_ref(),
+        Position::ALL
+            .into_iter()
+            .filter_map(|position| request.pattern.bound(position)),
+    )
+    .map(|page| RowLabeler::new(store, &page, &blank_nodes))
+    .transpose()?;
+    let (rows, stopped) = materialize(
         store,
-        &dictionary,
         &blank_nodes,
         None,
         &vars,
         &steps,
         request.bytes,
+        labeler.as_mut(),
     )?;
+    let (labels, page_labels) = labeler.map(RowLabeler::finish).unzip();
     Ok(Answer {
         dataset: target.id.dataset.clone(),
         version: target.id.version.clone(),
@@ -5705,26 +6516,27 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         cardinality: Cardinality::exact(count),
         absent_terms,
         rows,
+        labels,
         row_resumes: Vec::new(),
         row_binding: None,
         rdf_cardinality: None,
         page_limit: request.n,
         byte_budget: request.bytes.0,
         vars,
-        // A sample stops for one reason only. It is not paged, so `n` is what
-        // it returns unless the bundle's own literals spend the byte budget
-        // first — and then it says so, because there is no cursor to offer and
-        // returning fewer members while claiming completeness is the silent
-        // truncation the protocol prohibits.
-        completeness: match spent_at {
+        // A sample is not paged, so `n` is what it returns unless the bundle's
+        // own literals spend the byte budget first, or its labels the cascade's
+        // allowance — and then it says which, because there is no cursor to
+        // offer and returning fewer members while claiming completeness is the
+        // silent truncation the protocol prohibits.
+        completeness: match stopped {
             None => Completeness::complete(),
-            Some(_) => Completeness::budget_exhausted_without_resume(BudgetReason::ResponseBytes),
+            Some(stopped) => Completeness::budget_exhausted_without_resume(stopped.reason),
         },
         directed: false,
         bindings: false,
         target,
         blank_nodes,
-        page_labels: HashMap::new(),
+        page_labels: page_labels.unwrap_or_default(),
         described: None,
         tagging: GraphTagging::Untagged,
     })
@@ -7063,7 +7875,7 @@ fn resolve_binding_pattern(
     Ok(Some(ids))
 }
 
-fn select(store: &Store, ids: IdPattern) -> Result<Selection<'_>, Problem> {
+pub(crate) fn select(store: &Store, ids: IdPattern) -> Result<Selection<'_>, Problem> {
     // Every id here came out of this bundle's own dictionary, so the only error
     // `resolve` defines — an id outside its role's space — is unreachable.
     store
@@ -7080,6 +7892,209 @@ struct Envelope {
     absent_terms: Vec<AbsentTerm>,
     blank_nodes: SkolemScope,
     tagging: GraphTagging,
+    labels: Option<PageLabeling>,
+}
+
+/// What a page labels when its request asked: the cascade, and the request's
+/// own bound terms, which head every page and are labelled before its first
+/// row.
+struct PageLabeling {
+    labeling: Labeling,
+    /// Dictionary spellings — the scoped IRI, for a blank node.
+    bound: Vec<String>,
+}
+
+impl PageLabeling {
+    /// What to label, or nothing when the request did not ask — or asked of a
+    /// release whose manifest records no `label` role, which has no cascade:
+    /// one written before every manifest was given the default. The map is
+    /// then left out rather than filled with nulls: a null says the cascade
+    /// looked and found nothing, and here there was nothing to look with.
+    fn of<'a>(
+        labeling: Option<&Labeling>,
+        bound: impl IntoIterator<Item = &'a BoundTerm>,
+    ) -> Option<Self> {
+        let labeling = labeling.filter(|labeling| !labeling.predicates.is_empty());
+        labeling.map(|labeling| Self {
+            labeling: labeling.clone(),
+            bound: bound
+                .into_iter()
+                .map(|term| term.dictionary().to_owned())
+                .collect(),
+        })
+    }
+}
+
+/// The `labels=true` modifier, applied as a page is materialized.
+///
+/// Labels are resolved and weighed with the row that first carries each term,
+/// so the byte budget and the cascade's allowance end a page at a row boundary
+/// like everything else that ends one: a row is kept with every label it
+/// brings, or not at all, and the cursor resumes at the first row left out.
+struct RowLabeler<'s> {
+    cascade: LabelCascade<'s>,
+    dictionary: Dictionary<'s>,
+    blank_nodes: SkolemScope,
+    map: LabelMap,
+    /// The page's own lookup, by every spelling a cell is drawn with.
+    page: HashMap<String, String>,
+    /// Bytes the labels kept so far take in the response.
+    spent: u64,
+}
+
+/// A row's new labels, resolved and weighed but not yet kept.
+struct RowLabels {
+    /// Published spelling, stored spelling, and the label.
+    entries: Vec<(Rc<str>, Rc<str>, Option<PreferredLabel>)>,
+    /// Terms already in the map that this row spells differently — a blank
+    /// node the request named by its scoped IRI and a row carries under its
+    /// dictionary label — as (stored, published), so the page finds the label
+    /// by the spelling the row's cell is drawn with.
+    aliases: Vec<(Rc<str>, Rc<str>)>,
+    bytes: u64,
+}
+
+impl<'s> RowLabeler<'s> {
+    /// A labeler whose map already holds the request's bound terms.
+    fn new(
+        store: &'s Store,
+        page: &PageLabeling,
+        blank_nodes: &SkolemScope,
+    ) -> Result<Self, Problem> {
+        let mut labeler = Self {
+            cascade: cascade(store, &page.labeling)?,
+            dictionary: store.dict(),
+            blank_nodes: blank_nodes.clone(),
+            map: LabelMap::new(page.labeling.source),
+            page: HashMap::new(),
+            spent: 0,
+        };
+        let bound = page.bound.iter().map(|term| {
+            let term: Rc<str> = Rc::from(term.as_str());
+            (Rc::clone(&term), term)
+        });
+        // Every page carries them, so they are resolved whatever they cost:
+        // a page that cannot afford its own pattern's labels could never be
+        // served at all.
+        if let Some(labels) = labeler.resolve(bound, Spend::First)? {
+            labeler.keep(labels);
+        }
+        Ok(labeler)
+    }
+
+    /// Resolve the labels `row` adds, or `None` when the allowance cannot
+    /// cover them and the page must end before it.
+    fn row(&mut self, row: &Row, spend: Spend) -> Result<Option<RowLabels>, Problem> {
+        // A triple term is no IRI and has no label of its own.
+        let cells = row.cells.iter().filter_map(|(_, term)| {
+            term.published
+                .text()
+                .map(|text| (Rc::clone(text), Rc::clone(&term.stored)))
+        });
+        let graph = row
+            .graph
+            .iter()
+            .map(|graph| (Rc::clone(graph), Rc::clone(graph)));
+        self.resolve(cells.chain(graph), spend)
+    }
+
+    fn resolve(
+        &mut self,
+        terms: impl IntoIterator<Item = (Rc<str>, Rc<str>)>,
+        spend: Spend,
+    ) -> Result<Option<RowLabels>, Problem> {
+        let mut labels = RowLabels {
+            entries: Vec::new(),
+            aliases: Vec::new(),
+            bytes: 0,
+        };
+        for (published, stored) in terms {
+            if !labelable(&published) {
+                continue;
+            }
+            if self.map.contains(&published)
+                || labels.entries.iter().any(|(seen, _, _)| *seen == published)
+            {
+                if published != stored {
+                    labels.aliases.push((stored, published));
+                }
+                continue;
+            }
+            let label = match self.subject(&published, &stored)? {
+                None => None,
+                Some(subject) => match self.cascade.resolve(subject, spend)? {
+                    Resolution::Resolved(label) => label,
+                    Resolution::Exhausted => return Ok(None),
+                },
+            };
+            labels.bytes += self.map.entry_bytes(&published, label.as_ref());
+            labels.entries.push((published, stored, label));
+        }
+        Ok(Some(labels))
+    }
+
+    /// The subject id a term's label statements would have, if it has any.
+    fn subject(&self, published: &str, stored: &str) -> Result<Option<u64>, Problem> {
+        // A row's blank node is published under its scoped IRI and stored
+        // under its label, and the label is what the dictionary finds. A
+        // request's own term arrives as the scoped IRI alone.
+        let text = if published == stored {
+            if let Some(id) = reverse_scoped(
+                &self.dictionary,
+                &self.blank_nodes,
+                Role::Subject,
+                published,
+            )? {
+                return Ok(Some(id));
+            }
+            published
+        } else {
+            stored
+        };
+        self.dictionary
+            .locate(Role::Subject, text.as_bytes())
+            .map(|found| found.map(|id| id.0))
+            .map_err(|error| unreadable("looking a term up", &error))
+    }
+
+    fn keep(&mut self, labels: RowLabels) {
+        self.spent = self.spent.saturating_add(labels.bytes);
+        for (published, stored, label) in labels.entries {
+            if let Some(label) = &label {
+                self.page
+                    .insert(stored.to_string(), label.value().to_owned());
+                if published != stored {
+                    self.page
+                        .insert(published.to_string(), label.value().to_owned());
+                }
+            }
+            self.map.insert(published, label);
+        }
+        for (stored, published) in labels.aliases {
+            if let Some(label) = self.map.get(&published) {
+                self.page.insert(stored.to_string(), label.to_owned());
+            }
+        }
+    }
+
+    fn finish(self) -> (LabelMap, HashMap<String, String>) {
+        (self.map, self.page)
+    }
+}
+
+/// Whether a published term is one a label map keys: an IRI, including the
+/// scoped IRI a blank node is published as. A literal is its own text, and
+/// blank-node syntax in a request names nothing there is to label.
+fn labelable(published: &str) -> bool {
+    matches!(Term::from_dictionary(published), Term::Iri(_))
+}
+
+/// Where materializing stopped short of the steps it was given, and why.
+#[derive(Debug, Clone, Copy)]
+struct Stopped {
+    /// The first step not included, which is where the next page starts.
+    at: usize,
+    reason: BudgetReason,
 }
 
 /// Where a page starts, how far it may go, and what a cursor out of it binds to.
@@ -7278,7 +8293,6 @@ fn finish(
     spent: Option<Spent>,
     cardinality: impl FnOnce(&Completeness, &[Row]) -> Cardinality,
 ) -> Result<Answer, Problem> {
-    let dictionary = store.dict();
     // The row this page cannot carry, kept because it is where the next one
     // begins rather than merely because it exists.
     let dropped = (steps.len() == paging.want())
@@ -7293,30 +8307,37 @@ fn finish(
         absent_terms,
         blank_nodes,
         tagging,
+        labels,
     } = envelope;
 
     // Materializing is where the bytes appear, so it is where the byte budget
     // applies — before the response exists rather than after, which also bounds
-    // the memory a page can take.
-    let (rows, spent_at) = materialize(
+    // the memory a page can take. Labels are resolved there too, for the same
+    // reason and so that they end a page where it can be resumed.
+    let mut labeler = labels
+        .map(|page| RowLabeler::new(store, &page, &blank_nodes))
+        .transpose()?;
+    let (rows, stopped) = materialize(
         store,
-        &dictionary,
         &blank_nodes,
         store.graphs(),
         &vars,
         &steps,
         paging.bytes,
+        labeler.as_mut(),
     )?;
     let row_resumes = steps[..rows.len()].iter().map(Step::row_resume).collect();
+    let (labels, page_labels) = labeler.map(RowLabeler::finish).unzip();
 
     // Whichever bound was reached first names the reason and the resume point.
-    // Bytes first, because a page stopped for bytes never reached its row count
-    // and its cursor is the row the bytes ran out on; then the page limit; then
-    // the candidates, which is the one that means "there may be more, and
-    // finding out costs more than this request is allowed to spend".
-    let completeness = match (spent_at.map(|index| &steps[index]), &dropped, spent) {
-        (Some(next), _, _) => {
-            Completeness::budget_exhausted(BudgetReason::ResponseBytes, next.cursor(paging.binding))
+    // Materializing first, because a page it stopped never reached its row
+    // count and its cursor is the row the bytes or the label allowance ran out
+    // on; then the page limit; then the enumeration's own candidates, which is
+    // the one that means "there may be more, and finding out costs more than
+    // this request is allowed to spend".
+    let completeness = match (stopped, &dropped, spent) {
+        (Some(stopped), _, _) => {
+            Completeness::budget_exhausted(stopped.reason, steps[stopped.at].cursor(paging.binding))
         }
         (None, Some(next), _) => Completeness::page_limit(next.cursor(paging.binding)),
         (None, None, Some(Spent::Deepest)) => {
@@ -7336,6 +8357,7 @@ fn finish(
         cardinality: cardinality(&completeness, &rows),
         absent_terms,
         rows,
+        labels,
         row_resumes,
         row_binding: Some(paging.binding.clone()),
         rdf_cardinality: None,
@@ -7347,7 +8369,7 @@ fn finish(
         bindings,
         target,
         blank_nodes,
-        page_labels: HashMap::new(),
+        page_labels: page_labels.unwrap_or_default(),
         described: None,
         tagging,
     })
@@ -7612,10 +8634,11 @@ fn resume_position(
 }
 
 /// Turn ids into terms once per distinct term, within
-/// `max_response_bytes`.
+/// `max_response_bytes`, labelling them as it goes when `labels` is given.
 ///
-/// Returns the rows and, if the byte budget stopped it, the index of the first
-/// step *not* included — which is where the next page starts.
+/// Returns the rows and, if the byte budget or the label allowance stopped it,
+/// the index of the first step *not* included — which is where the next page
+/// starts — and which of the two it was.
 ///
 /// # Why the budget lands here
 ///
@@ -7644,18 +8667,20 @@ fn resume_position(
 /// removed without replacing it with an equally explicit memory bound.
 fn materialize(
     store: &Store,
-    dictionary: &Dictionary<'_>,
     blank_nodes: &SkolemScope,
     graphs: Option<&Graphs>,
     vars: &Vars,
     steps: &[Step],
     bytes: ResponseBytes,
-) -> Result<(Vec<Row>, Option<usize>), Problem> {
+    mut labels: Option<&mut RowLabeler<'_>>,
+) -> Result<(Vec<Row>, Option<Stopped>), Problem> {
+    let dictionary = &store.dict();
     let mut cache = TermCache::new();
     let mut published = PublishedTerms::new(blank_nodes.clone(), store);
     let mut graph_names = GraphNames::new(*dictionary, blank_nodes);
     let mut rows: Vec<Row> = Vec::with_capacity(steps.len());
-    let mut spent = 0u64;
+    // The bound terms' labels head every page, so they are weighed first.
+    let mut spent = labels.as_ref().map_or(0, |labels| labels.spent);
     for (index, step) in steps.iter().enumerate() {
         let mut cells = Vec::with_capacity(vars.positions().len());
         let mut terms = 0u64;
@@ -7691,13 +8716,43 @@ fn materialize(
             step.ranking,
         );
 
-        spent = spent.saturating_add(row.serialized);
+        // The first row cannot be left out, for the reason it is kept over the
+        // byte budget below, so its labels are settled within the allowance or
+        // the request is refused.
+        let new_labels = match labels.as_mut() {
+            None => None,
+            Some(labeler) => match labeler.row(&row, Spend::first_if(rows.is_empty()))? {
+                Some(new_labels) => Some(new_labels),
+                None => {
+                    return Ok((
+                        rows,
+                        Some(Stopped {
+                            at: index,
+                            reason: BudgetReason::Candidate,
+                        }),
+                    ));
+                }
+            },
+        };
+
+        spent = spent
+            .saturating_add(row.serialized)
+            .saturating_add(new_labels.as_ref().map_or(0, |labels| labels.bytes));
         // Never on the first row of a page. A single term larger than the whole
         // budget would otherwise produce an empty page whose cursor resumes
         // exactly where it was issued, and a client paging on it would never
         // move — one row over a budget beats an enumeration nothing can walk.
         if spent > bytes.0 && !rows.is_empty() {
-            return Ok((rows, Some(index)));
+            return Ok((
+                rows,
+                Some(Stopped {
+                    at: index,
+                    reason: BudgetReason::ResponseBytes,
+                }),
+            ));
+        }
+        if let (Some(labeler), Some(new_labels)) = (labels.as_mut(), new_labels) {
+            labeler.keep(new_labels);
         }
         rows.push(row);
     }
@@ -7754,7 +8809,7 @@ impl<'a> GraphNames<'a> {
 /// A bundle this server published and cannot read is the server's problem, not
 /// the request's — so the classified cause goes to the log and the client is
 /// told only that it failed.
-fn unreadable(what: &'static str, error: &dyn std::fmt::Display) -> Problem {
+pub(crate) fn unreadable(what: &'static str, error: &dyn std::fmt::Display) -> Problem {
     tracing::error!(%error, what, "a bundle that opened could not answer");
     Problem::new(
         ErrorCode::InternalError,
@@ -7904,13 +8959,21 @@ impl SchemaNavigationAnswer {
             .iter()
             .map(|item| schema_resource_cell(&self.target, item, self.labels.as_ref()))
             .collect();
-        let rows: Vec<Vec<Value<'_>>> = self
-            .items
-            .as_deref()
-            .unwrap_or_default()
+        let items = self.items.as_deref().unwrap_or_default();
+        let per_subject: Vec<Option<String>> = items
+            .iter()
+            .map(|item| {
+                per_subject(
+                    item.counts.triples,
+                    item.counts.distinct_subjects.or(item.counts.entities),
+                )
+            })
+            .collect();
+        let rows: Vec<Vec<Value<'_>>> = items
             .iter()
             .zip(&item_terms)
-            .map(|(item, term)| {
+            .zip(&per_subject)
+            .map(|((item, term), per_subject)| {
                 vec![
                     Value::Text(item.kind),
                     term.value(),
@@ -7918,6 +8981,7 @@ impl SchemaNavigationAnswer {
                     optional_number(item.counts.triples),
                     optional_number(item.counts.distinct_subjects),
                     optional_number(item.counts.distinct_objects),
+                    per_subject.as_deref().map_or(Value::Absent, Value::Text),
                     optional_number(item.counts.properties),
                 ]
             })
@@ -8026,7 +9090,7 @@ impl SchemaNavigationAnswer {
                             (note("No child items."))
                         } @else {
                             (results_table(
-                                &["kind", "term", "entities", "triples", "distinct subjects", "distinct objects", "properties"],
+                                &["kind", "term", "entities", "triples", "distinct subjects", "distinct objects", "per subject", "properties"],
                                 &rows,
                             ))
                         }
@@ -8224,11 +9288,17 @@ impl SchemaClassPropertiesAnswer {
             .items
             .iter()
             .any(|item| item.distinct_subjects.is_some() || item.distinct_objects.is_some());
+        let per_subject: Vec<Option<String>> = self
+            .items
+            .iter()
+            .map(|item| per_subject(Some(item.triples), item.distinct_subjects))
+            .collect();
         let rows: Vec<Vec<Value<'_>>> = self
             .items
             .iter()
             .zip(&terms)
-            .map(|(item, terms)| {
+            .zip(&per_subject)
+            .map(|((item, terms), per_subject)| {
                 let mut row = vec![
                     terms[0].value(),
                     terms[1].value(),
@@ -8237,6 +9307,7 @@ impl SchemaClassPropertiesAnswer {
                 if has_distinct {
                     row.push(optional_number(item.distinct_subjects));
                     row.push(optional_number(item.distinct_objects));
+                    row.push(per_subject.as_deref().map_or(Value::Absent, Value::Text));
                 }
                 row
             })
@@ -8270,7 +9341,7 @@ impl SchemaClassPropertiesAnswer {
                         (note("No matching class properties."))
                     } @else if has_distinct {
                         (results_table(
-                            &["class", "property", "triples", "distinct subjects", "distinct objects"],
+                            &["class", "property", "triples", "distinct subjects", "distinct objects", "per subject"],
                             &rows,
                         ))
                     } @else {
@@ -8294,10 +9365,22 @@ fn optional_number(number: Option<u64>) -> Value<'static> {
     number.map_or(Value::Absent, Value::Number)
 }
 
+/// Triples per subject, the fanout a page reader wants first: how many values
+/// of this predicate a member of the class carries. Derived here for the page
+/// only; the JSON keeps the two counts it comes from.
+fn per_subject(triples: Option<u64>, subjects: Option<u64>) -> Option<String> {
+    match (triples, subjects) {
+        (Some(triples), Some(subjects)) if subjects > 0 => {
+            Some(format!("{:.1}", triples as f64 / subjects as f64))
+        }
+        _ => None,
+    }
+}
+
 fn schema_resource_cell<'a>(
     target: &Target,
     resource: &'a SchemaResource,
-    labels: Option<&'a BTreeMap<String, Option<String>>>,
+    labels: Option<&'a LabelMap>,
 ) -> Cell<'a> {
     match &resource.term {
         Some(term) => schema_cell(target, term, preferred_schema_href(&resource.links), labels),
@@ -8377,7 +9460,7 @@ fn relation_cell<'a>(
     view: &str,
     parameter: &str,
     term: &'a SchemaTerm,
-    labels: Option<&'a BTreeMap<String, Option<String>>>,
+    labels: Option<&'a LabelMap>,
 ) -> Cell<'a> {
     let requested = Term::from_dictionary(&term.0).to_request();
     let params = Params::default()
@@ -8396,12 +9479,10 @@ fn schema_cell<'a>(
     target: &Target,
     term: &'a SchemaTerm,
     href: Option<String>,
-    labels: Option<&'a BTreeMap<String, Option<String>>>,
+    labels: Option<&'a LabelMap>,
 ) -> Cell<'a> {
     let annotation = match Term::from_dictionary(&term.0) {
-        Term::Iri(iri) => labels
-            .and_then(|labels| labels.get(iri.as_ref()))
-            .and_then(Option::as_deref),
+        Term::Iri(iri) => labels.and_then(|labels| labels.get(iri.as_ref())),
         Term::BlankNode(_) | Term::Literal(_) | Term::Triple(_) => None,
     };
     let (label, qualifier, full_iri) = Term::from_dictionary(&term.0)
@@ -8877,7 +9958,7 @@ impl Resource for SearchAnswer {
                     &self.target,
                     &self.blank_nodes,
                     &result.subject,
-                    result.label.as_ref().and_then(Option::as_deref),
+                    result.label.as_ref().and_then(RowLabel::value),
                 )
             })
             .collect();
@@ -9016,7 +10097,7 @@ impl Resource for TermsPage {
                     &self.target,
                     &self.blank_nodes,
                     &row.published,
-                    row.label.as_ref().and_then(Option::as_deref),
+                    row.label.as_ref().and_then(RowLabel::value),
                 )
             })
             .collect();
@@ -9150,7 +10231,7 @@ impl Resource for LabelsAnswer {
             .map(|result| {
                 vec![
                     Value::Code(&result.iri),
-                    result.label.as_deref().map_or(Value::Absent, Value::Text),
+                    result.label.value().map_or(Value::Absent, Value::Text),
                 ]
             })
             .collect();
@@ -9642,21 +10723,49 @@ mod tests {
             "\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>",
             "\"a \\\"quoted\\\" \\tvalue\"",
         ];
-        let labels = [
+        let found = [
             None,
-            Some(None),
-            Some(Some("a \"quoted\"\nÜnicode label".to_owned())),
+            Some(PreferredLabel::new(
+                "a \"quoted\"\nÜnicode label",
+                "http://example.org/label",
+                None,
+            )),
+            Some(PreferredLabel::new(
+                "étiquette",
+                "http://example.org/\"odd\" label",
+                Some("fr-ca"),
+            )),
         ];
+        let row_labels: Vec<RowLabel> = [false, true]
+            .into_iter()
+            .flat_map(|sources| {
+                found.iter().map(move |label| RowLabel {
+                    label: label.clone(),
+                    sources,
+                })
+            })
+            .collect();
+        let labels: Vec<Option<RowLabel>> = std::iter::once(None)
+            .chain(row_labels.iter().cloned().map(Some))
+            .collect();
 
         for literal in literals {
-            for label in &labels {
+            for (label, roles) in labels.iter().zip(
+                [vec![], vec!["label"], vec!["label", "syn\"onym"]]
+                    .into_iter()
+                    .cycle(),
+            ) {
                 for score in [0.0, 14.0, 1.0 / 3.0, f32::NAN, f32::INFINITY] {
                     let result = SearchResult::new(
                         Rc::clone(&subject),
                         subject_serialized,
                         label.clone(),
-                        Rc::from("http://example.org/predicate,one"),
-                        Rc::from(literal),
+                        SearchEvidence {
+                            predicate: Rc::from("http://example.org/predicate,one"),
+                            roles: (!roles.is_empty())
+                                .then(|| roles.iter().map(|role| role.to_string()).collect()),
+                            literal: Rc::from(literal),
+                        },
                         Ranking {
                             score,
                             kind: "normalized",
@@ -9671,12 +10780,45 @@ mod tests {
             }
         }
 
-        for label in [None, Some("a \"quoted\"\nÜnicode label".to_owned())] {
-            let result = LabelResult::new("http://example.org/Ünicode".to_owned(), label);
+        for label in &row_labels {
+            let result = LabelResult::new("http://example.org/Ünicode".to_owned(), label.clone());
             assert_eq!(
                 result.serialized,
-                serde_json::to_vec(&result).unwrap().len() as u64
+                serde_json::to_vec(&result).unwrap().len() as u64,
+                "{label:?}"
             );
+            let row = TermRow::new(
+                Published::Text(Rc::clone(&subject)),
+                subject_serialized,
+                vec!["subject", "object"],
+                Some(label.clone()),
+            );
+            assert_eq!(
+                row.serialized,
+                serde_json::to_vec(&row).unwrap().len() as u64,
+                "{label:?}"
+            );
+        }
+
+        // A label map's entries are weighed as though each had a comma after
+        // it: exactly one byte over each map's contents, never under.
+        for sources in [false, true] {
+            let mut map = LabelMap::new(sources);
+            let mut weighed = 0;
+            for (index, label) in found.iter().enumerate() {
+                let iri = format!("http://example.org/Ünicode/{index}?\"q\"");
+                weighed += map.entry_bytes(&iri, label.as_ref());
+                map.insert(Rc::from(iri.as_str()), label.clone());
+            }
+            let written = serde_json::to_value(&map).unwrap();
+            let inner = |key: &str| serde_json::to_vec(&written[key]).unwrap().len() as u64;
+            let expected = if sources {
+                (inner("labels") - 1) + (inner("label_sources") - 1)
+            } else {
+                assert!(written.get("label_sources").is_none());
+                inner("labels") - 1
+            };
+            assert_eq!(weighed, expected, "sources: {sources}");
         }
     }
 

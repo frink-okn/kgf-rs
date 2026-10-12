@@ -276,11 +276,51 @@ fn schema_answers_json_html_latest_and_resumable_pages_over_http() {
 }
 
 #[test]
-fn schema_omits_requested_labels_when_the_release_has_no_label_cascade() {
+fn a_release_that_declares_only_synonyms_keeps_the_default_label_role() {
     let deployment = Deployment::new();
-    deployment.publish_description_without_labels("tox", "v1", "2026-08-08T12:00:00Z");
+    deployment.publish_description_declaring_only_synonyms("tox", "v1", "2026-08-08T12:00:00Z");
     let server = deployment.serve();
 
+    // Defaults fill role by role: the declared `synonym` replaces the default
+    // one, and the undeclared `label` is the federation's. The manifest records
+    // both, so a consumer reading it without this server sees what applies.
+    let roles = server.get("/tox").json()["predicate_roles"].clone();
+    assert_eq!(
+        roles["synonym"],
+        serde_json::json!(["https://example.org/synonym"])
+    );
+    assert_eq!(
+        roles["label"][0],
+        "http://www.w3.org/2004/02/skos/core#prefLabel"
+    );
+    let manifest = server.get("/tox/v/v1/manifest").json();
+    assert_eq!(manifest["predicate_roles"], roles);
+
+    let response = server.get("/tox/v/v1/schema?children=classes&labels=true");
+    response.assert_status(200);
+    assert!(response.json()["labels"].is_object(), "{}", response.text());
+}
+
+#[test]
+fn a_release_resolves_with_the_roles_its_manifest_records() {
+    let deployment = Deployment::new();
+    deployment.publish_description_declaring_only_synonyms("tox", "v1", "2026-08-08T12:00:00Z");
+    // As a manifest written before defaults were filled role by role records
+    // it: `synonym` alone. A server must not fill the rest in when reading it,
+    // or the version would mean something different on every upgrade.
+    deployment.set_roles(
+        "tox",
+        "v1",
+        serde_json::json!({"synonym": ["https://example.org/synonym"]}),
+    );
+    let server = deployment.serve();
+
+    assert_eq!(
+        server.get("/tox").json()["predicate_roles"],
+        serde_json::json!({"synonym": ["https://example.org/synonym"]})
+    );
+    // With no `label` role there is no cascade, so the map is left out rather
+    // than filled with nulls that would claim the cascade looked.
     let response = server.get("/tox/v/v1/schema?children=classes&labels=true");
     response.assert_status(200);
     assert!(
@@ -2275,7 +2315,7 @@ fn a_download_left_partway_is_recorded_with_what_was_sent() {
         .parse()
         .unwrap();
 
-    let stalled = server.stall("GET", target, &[]);
+    let mut stalled = server.stall("GET", target, &[]);
     assert!(
         stalled.status_line.contains(" 200 "),
         "{}",
@@ -2289,6 +2329,10 @@ fn a_download_left_partway_is_recorded_with_what_was_sent() {
             .any(|record| record.method == "GET" && record.route.as_deref() == export_route)
     );
 
+    // The head can arrive before any of the body is produced, and a client
+    // that left then would have been sent nothing. One body byte means a chunk
+    // went out, so what the record counts is a partial transfer.
+    stalled.read_first_body_byte();
     drop(stalled);
     let records = log.wait_for(2);
     let record = records
@@ -2564,8 +2608,299 @@ fn bindings_query_and_post_answer_over_the_wire() {
         .assert_status(405);
 }
 
+/// A resource states the methods it takes on a 405 and nowhere else, in one
+/// spelling, and advertises `QUERY` on everything it answers when it takes it.
+///
+/// The router adds its own `Allow` to whatever a method fallback produces,
+/// listing only the methods registered by name. `QUERY` is answered from that
+/// fallback, so left alone a successful `QUERY` says its resource does not take
+/// `QUERY` while the 405 beside it says it does — and a success is cached for a
+/// year.
 #[test]
-fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
+fn a_resource_states_its_methods_where_they_cannot_go_stale() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", TYPED_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let base = "/tox/v/2026-06-01";
+    let path = |resource: &str| format!("{base}/{resource}");
+    let undecodable = |resource: &str| format!("/tox/v/%FF/{resource}");
+    let json = [("Content-Type", "application/json")];
+    let text = [("Content-Type", "text/plain")];
+    let bindings = serde_json::to_vec(&serde_json::json!({
+        "pattern": {"s": "?site", "p": "ex:name", "o": "?name"},
+        "bindings": {"vars": ["?site"], "rows": [["ex:site1"]]}
+    }))
+    .unwrap();
+    let labels = br#"{"iris": ["ex:site1"]}"#;
+    let verbalize = serde_json::to_vec(&serde_json::json!({
+        "config": serde_json::from_str::<serde_json::Value>(VERBALIZE_CONFIG).unwrap(),
+        "target": "site",
+        "iris": ["ex:site1"],
+    }))
+    .unwrap();
+
+    // The report this began from: a successful QUERY said the resource did
+    // not take QUERY, and a refused method on it said it did.
+    let counted = server.request_with_body("QUERY", &path("count"), &json, &bindings);
+    counted.assert_status(200);
+    assert_eq!(counted.header("allow"), None);
+    let refused = server.request("DELETE", &path("count"), &[]);
+    refused.assert_status(405);
+    refused.assert_header("allow", "GET, HEAD, POST, QUERY");
+
+    let etag = server
+        .request_with_body("QUERY", &path("fragment"), &json, &bindings)
+        .header("etag")
+        .expect("a QUERY response carries an ETag");
+    let unchanged = [
+        ("Content-Type", "application/json"),
+        ("If-None-Match", etag.as_str()),
+    ];
+
+    const READ: &str = "GET, HEAD";
+    const READ_OR_BODY: &str = "GET, HEAD, POST, QUERY";
+    const BODY: &str = "POST, QUERY";
+    let answered = [
+        ("GET /", READ, 200, server.get("/")),
+        ("GET /healthz", READ, 200, server.get("/healthz")),
+        ("GET manifest", READ, 200, server.get(&path("manifest"))),
+        (
+            "HEAD manifest",
+            READ,
+            200,
+            server.request("HEAD", &path("manifest"), &[]),
+        ),
+        ("GET tpf", READ, 200, server.get(&path("tpf"))),
+        (
+            "GET describe, no term",
+            READ,
+            400,
+            server.get(&path("describe")),
+        ),
+        (
+            "HEAD export",
+            READ,
+            200,
+            server.request("HEAD", &path("export/data.hdt"), &[]),
+        ),
+        (
+            "QUERY manifest",
+            READ,
+            405,
+            server.request("QUERY", &path("manifest"), &[]),
+        ),
+        (
+            "POST search",
+            READ,
+            405,
+            server.request("POST", &path("search"), &[]),
+        ),
+        (
+            "DELETE manifest, undecodable version",
+            READ,
+            405,
+            server.request("DELETE", &undecodable("manifest"), &[]),
+        ),
+        (
+            "GET fragment",
+            READ_OR_BODY,
+            200,
+            server.get(&path("fragment?p=ex:name")),
+        ),
+        (
+            "HEAD fragment",
+            READ_OR_BODY,
+            200,
+            server.request("HEAD", &path("fragment?p=ex:name"), &[]),
+        ),
+        (
+            "GET fragment, bad limit",
+            READ_OR_BODY,
+            400,
+            server.get(&path("fragment?limit=x")),
+        ),
+        (
+            "QUERY fragment",
+            READ_OR_BODY,
+            200,
+            server.request_with_body("QUERY", &path("fragment"), &json, &bindings),
+        ),
+        (
+            "QUERY fragment, unchanged",
+            READ_OR_BODY,
+            304,
+            server.request_with_body("QUERY", &path("fragment"), &unchanged, &bindings),
+        ),
+        (
+            "POST fragment",
+            READ_OR_BODY,
+            200,
+            server.request_with_body("POST", &path("fragment"), &json, &bindings),
+        ),
+        (
+            "QUERY fragment, text body",
+            READ_OR_BODY,
+            415,
+            server.request_with_body("QUERY", &path("fragment"), &text, &bindings),
+        ),
+        (
+            "QUERY fragment, undecodable version",
+            READ_OR_BODY,
+            400,
+            server.request_with_body("QUERY", &undecodable("fragment"), &json, &bindings),
+        ),
+        (
+            "PUT fragment",
+            READ_OR_BODY,
+            405,
+            server.request("PUT", &path("fragment"), &[]),
+        ),
+        // The method is refused before the path is read, as it is on a
+        // read-only resource, rather than the path refused first.
+        (
+            "DELETE fragment, undecodable version",
+            READ_OR_BODY,
+            405,
+            server.request("DELETE", &undecodable("fragment"), &[]),
+        ),
+        (
+            "GET count",
+            READ_OR_BODY,
+            200,
+            server.get(&path("count?p=ex:name")),
+        ),
+        (
+            "POST count",
+            READ_OR_BODY,
+            200,
+            server.request_with_body("POST", &path("count"), &json, &bindings),
+        ),
+        (
+            "GET verbalize",
+            READ_OR_BODY,
+            200,
+            server.get(&verbalize_url(&[("config", VERBALIZE_CONFIG)])),
+        ),
+        (
+            "GET verbalize, no config",
+            READ_OR_BODY,
+            400,
+            server.get(&path("verbalize")),
+        ),
+        (
+            "QUERY verbalize",
+            READ_OR_BODY,
+            200,
+            server.request_with_body("QUERY", &path("verbalize"), &json, &verbalize),
+        ),
+        (
+            "POST verbalize, text body",
+            READ_OR_BODY,
+            415,
+            server.request_with_body("POST", &path("verbalize"), &text, &verbalize),
+        ),
+        (
+            "DELETE verbalize",
+            READ_OR_BODY,
+            405,
+            server.request("DELETE", &path("verbalize"), &[]),
+        ),
+        (
+            "QUERY labels",
+            BODY,
+            200,
+            server.request_with_body("QUERY", &path("labels"), &json, labels),
+        ),
+        (
+            "POST labels",
+            BODY,
+            200,
+            server.request_with_body("POST", &path("labels"), &json, labels),
+        ),
+        (
+            "QUERY labels, text body",
+            BODY,
+            415,
+            server.request_with_body("QUERY", &path("labels"), &text, labels),
+        ),
+        ("GET labels", BODY, 405, server.get(&path("labels"))),
+        (
+            "HEAD labels",
+            BODY,
+            405,
+            server.request("HEAD", &path("labels"), &[]),
+        ),
+    ];
+    for (case, methods, status, response) in &answered {
+        assert_eq!(
+            response.status,
+            *status,
+            "{case}: {}",
+            String::from_utf8_lossy(&response.body)
+        );
+        // Only a 405 lists the methods: it is never stored, so the list it
+        // gives is always the live one.
+        assert_eq!(
+            response.header("allow").as_deref(),
+            (*status == 405).then_some(*methods),
+            "{case}"
+        );
+        // `Accept-Query` travels with QUERY, on everything the resource says.
+        assert_eq!(
+            response.header("accept-query").as_deref(),
+            methods.contains("QUERY").then_some("application/json"),
+            "{case}"
+        );
+    }
+
+    // No resource answered these, so none states its methods: the redirect's
+    // methods are its target's, and a path that names nothing has none.
+    for (case, response) in [
+        (
+            "QUERY latest",
+            server.request("QUERY", "/tox/latest/count", &json),
+        ),
+        ("GET nothing", server.get(&path("nothing"))),
+    ] {
+        assert_eq!(response.header("allow"), None, "{case}");
+        assert_eq!(response.header("accept-query"), None, "{case}");
+    }
+
+    // A body over the limit is refused on the wire when its length is declared
+    // — before routing, so by no resource — and by the resource that reads it
+    // when it is chunked. Both are coded; only the second is the resource's.
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.max_request_bytes = 16;
+    let limited = deployment.serve_with_limits(kgf_server::Caps::new(), budgets);
+    let declared = limited.request_with_body("QUERY", &path("fragment"), &json, &bindings);
+    declared.assert_status(413);
+    assert_eq!(declared.json()["code"], "payload_too_large");
+    assert_eq!(declared.header("accept-query"), None);
+    let chunked = limited.exchange(
+        "QUERY",
+        &format!(
+            "QUERY {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
+             Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+            path("fragment"),
+            limited.address,
+        ),
+        &[
+            format!("{:x}\r\n", bindings.len()).as_bytes(),
+            &bindings,
+            b"\r\n0\r\n\r\n",
+        ]
+        .concat(),
+    );
+    chunked.assert_status(413);
+    assert_eq!(chunked.json()["code"], "payload_too_large");
+    chunked.assert_header("accept-query", "application/json");
+    for response in [&declared, &chunked] {
+        assert_eq!(response.header("allow"), None);
+    }
+}
+
+#[test]
+fn search_and_labels_answer_over_the_wire() {
     let deployment = Deployment::new();
     deployment.publish_text("tox", "v1", GROWN_NT, "2026-06-01T14:03:22Z");
     let server = deployment.serve();
@@ -2588,9 +2923,11 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
     server
         .get("/tox/v/v1/search?q=&role=&predicate=&labels=true&limit=")
         .assert_status(400);
-    server
-        .get("/tox/v/v1/search?q=Alice&labels=&limit=")
-        .assert_status(400);
+    // An untouched form control is an absent one here as on every route that
+    // labels, so `labels` takes its default.
+    let blank = server.get("/tox/v/v1/search?q=Alice&labels=&lang=&limit=");
+    blank.assert_status(200);
+    assert_eq!(blank.json()["labels"], true);
     let search_page = server.request(
         "GET",
         "/tox/v/v1/search?q=Alice&predicate=ex%3Aname",
@@ -2620,11 +2957,21 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
     assert!(search_html.contains("<dt>predicates</dt>"), "{search_html}");
     assert!(!search_html.contains("all predicates"), "{search_html}");
 
-    // Locale is not part of the operation: labels are the release's stable
-    // display labels rather than a per-request localization service.
-    let with_lang = server.get("/tox/v/v1/search?q=Alice&lang=en");
-    with_lang.assert_status(400);
-    assert_eq!(with_lang.json()["code"], "malformed_request");
+    // A language preference shapes the label, not the result, and is taken
+    // wherever labels are. Untagged labels are what this release carries, and
+    // an untagged literal outranks every language the request did not name.
+    let with_lang =
+        server.get("/tox/v/v1/search?q=Alice&predicate=ex%3Aname&lang=en&label_source=true");
+    with_lang.assert_status(200);
+    assert_eq!(with_lang.json()["results"][0]["label"], "Alice");
+    assert_eq!(
+        with_lang.json()["results"][0]["label_source"],
+        serde_json::json!({"predicate": "http://example.org/name"})
+    );
+    // Shaping labels nobody asked for would change nothing, so it is refused.
+    let unlabelled = server.get("/tox/v/v1/search?q=Alice&labels=false&lang=en");
+    unlabelled.assert_status(400);
+    assert_eq!(unlabelled.json()["code"], "malformed_request");
 
     let body = serde_json::to_vec(&serde_json::json!({
         "iris": ["ex:bob", "ex:missing"]
@@ -2643,6 +2990,46 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
             {"iri": {"type": "iri", "value": "http://example.org/bob"}, "label": "Bob"},
             {"iri": {"type": "iri", "value": "http://example.org/missing"}, "label": null},
         ])
+    );
+
+    // The body takes the cascade's language preference and the switch for
+    // where each label came from — both refused before this release.
+    let shaped = serde_json::to_vec(&serde_json::json!({
+        "iris": ["ex:bob", "ex:missing"],
+        "lang": ["en", "fr"],
+        "label_source": true
+    }))
+    .unwrap();
+    let sourced = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/labels",
+        &[("Content-Type", "application/json")],
+        &shaped,
+    );
+    sourced.assert_status(200);
+    assert_eq!(
+        sourced.json()["labels"],
+        serde_json::json!([
+            {"iri": {"type": "iri", "value": "http://example.org/bob"}, "label": "Bob",
+             "label_source": {"predicate": "http://example.org/name"}},
+            {"iri": {"type": "iri", "value": "http://example.org/missing"}, "label": null,
+             "label_source": null},
+        ])
+    );
+    let unranged = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/labels",
+        &[("Content-Type", "application/json")],
+        br#"{"iris": ["ex:bob"], "lang": ["en_GB"]}"#,
+    );
+    unranged.assert_status(400);
+    assert!(
+        unranged.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("lang[0]"),
+        "{}",
+        unranged.text()
     );
     assert_eq!(
         labeled.header("accept-query").as_deref(),
@@ -2677,6 +3064,158 @@ fn search_and_labels_answer_over_the_wire_without_a_language_parameter() {
         "{empty_html}"
     );
     assert!(!empty_html.contains("response budget"), "{empty_html}");
+}
+
+#[test]
+fn row_operations_label_their_iris_when_asked() {
+    let deployment = Deployment::new();
+    // `ex:remoteName` is a label the release does not declare, for the
+    // override below.
+    deployment.publish(
+        "tox",
+        "v1",
+        &format!("{GROWN_NT}{REMOTE_NT}"),
+        "2026-06-01T14:03:22Z",
+    );
+    let server = deployment.serve();
+
+    // The modifier the issue asked for: one label per distinct IRI on the
+    // page, bound terms included, and an explicit null for one with none.
+    let page = server.get("/tox/v/v1/fragment?p=ex%3Aknows&labels=true");
+    page.assert_status(200);
+    let body = page.json();
+    assert_eq!(
+        body["labels"],
+        serde_json::json!({
+            "http://example.org/alice": "Alice",
+            "http://example.org/bob": "Bob",
+            "http://example.org/knows": null,
+        })
+    );
+    assert!(body.get("label_sources").is_none());
+    // Off unless asked for, so a page that did not ask is unchanged.
+    assert!(
+        server
+            .get("/tox/v/v1/fragment?p=ex%3Aknows")
+            .json()
+            .get("labels")
+            .is_none()
+    );
+
+    let sourced = server.get("/tox/v/v1/describe?iri=ex%3Abob&labels=true&label_source=true");
+    sourced.assert_status(200);
+    assert_eq!(
+        sourced.json()["label_sources"]["http://example.org/bob"],
+        serde_json::json!({"predicate": "http://example.org/name"})
+    );
+    assert_eq!(
+        sourced.json()["label_sources"]["http://example.org/knows"],
+        serde_json::Value::Null
+    );
+
+    let sample = server.get("/tox/v/v1/sample?p=ex%3Aknows&n=1&labels=true");
+    sample.assert_status(200);
+    assert_eq!(
+        sample.json()["labels"]["http://example.org/knows"],
+        serde_json::Value::Null
+    );
+
+    // The same field on the body form, bindings pages included.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "pattern": {"s": "?s", "p": "ex:knows", "o": "?o"},
+        "bindings": {"vars": ["?s"], "rows": [["ex:alice"]]},
+        "labels": true,
+        "lang": ["en"]
+    }))
+    .unwrap();
+    let bound = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/fragment",
+        &[("Content-Type", "application/json")],
+        &body,
+    );
+    bound.assert_status(200);
+    assert_eq!(bound.json()["labels"]["http://example.org/bob"], "Bob");
+
+    // RDF carries each label as the statement it came from, beside the page's
+    // own; an IRI with no label simply has no statement.
+    let quads = server.request(
+        "GET",
+        "/tox/v/v1/fragment?p=ex%3Aknows&labels=true",
+        &[("Accept", "application/n-quads")],
+    );
+    quads.assert_status(200);
+    let mut lines: Vec<String> = quads.text().lines().map(str::to_owned).collect();
+    lines.sort();
+    assert_eq!(
+        lines,
+        [
+            "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .",
+            "<http://example.org/alice> <http://example.org/name> \"Alice\" .",
+            "<http://example.org/bob> <http://example.org/name> \"Bob\" .",
+        ]
+    );
+    // But labels are read across every graph, so a page scoped to one cannot
+    // carry their statements without claiming they are in it.
+    let scoped = server.request(
+        "GET",
+        "/tox/v/v1/fragment?p=ex%3Aknows&g=%3Curn%3Ax-kgf%3Aunnamed%3E&labels=true",
+        &[("Accept", "application/n-quads")],
+    );
+    scoped.assert_status(406);
+    assert!(scoped.json()["detail"].as_str().unwrap().contains("union"));
+    server
+        .request(
+            "GET",
+            "/tox/v/v1/fragment?p=ex%3Aknows&g=%3Curn%3Ax-kgf%3Aunnamed%3E&labels=true",
+            &[("Accept", "application/json")],
+        )
+        .assert_status(200);
+
+    // The predicates to label with may be named for the one request, in
+    // place of the release's own and in the order given.
+    let named = server.get("/tox/v/v1/fragment?p=ex%3Aknows&labels=ex%3AremoteName");
+    named.assert_status(200);
+    assert_eq!(
+        named.json()["labels"],
+        serde_json::json!({
+            "http://example.org/alice": null,
+            "http://example.org/bob": "Bobby",
+            "http://example.org/knows": null,
+        })
+    );
+    let fallback = server.get("/tox/v/v1/fragment?p=ex%3Aknows&labels=ex%3AremoteName,ex%3Aname");
+    assert_eq!(
+        fallback.json()["labels"]["http://example.org/alice"],
+        "Alice"
+    );
+    assert_eq!(fallback.json()["labels"]["http://example.org/bob"], "Bobby");
+    let body = serde_json::to_vec(&serde_json::json!({
+        "iris": ["ex:bob"],
+        "labels": ["ex:name"]
+    }))
+    .unwrap();
+    let batch = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/labels",
+        &[("Content-Type", "application/json")],
+        &body,
+    );
+    batch.assert_status(200);
+    assert_eq!(batch.json()["labels"][0]["label"], "Bob");
+
+    // And the page is the same labels, set under each term.
+    let html = server
+        .request(
+            "GET",
+            "/tox/v/v1/fragment?p=ex%3Aknows&labels=true",
+            &[("Accept", "text/html")],
+        )
+        .text();
+    assert!(
+        html.contains("<span class=\"t-label\">Bob</span>"),
+        "{html}"
+    );
 }
 
 #[test]
@@ -4202,19 +4741,24 @@ impl Deployment {
     }
 
     fn publish_description(&self, dataset: &str, version: &str, created: &str) {
-        self.publish_description_with_labels(dataset, version, created, true);
+        self.publish_description_with_roles(dataset, version, created, true);
     }
 
-    fn publish_description_without_labels(&self, dataset: &str, version: &str, created: &str) {
-        self.publish_description_with_labels(dataset, version, created, false);
-    }
-
-    fn publish_description_with_labels(
+    fn publish_description_declaring_only_synonyms(
         &self,
         dataset: &str,
         version: &str,
         created: &str,
-        labels: bool,
+    ) {
+        self.publish_description_with_roles(dataset, version, created, false);
+    }
+
+    fn publish_description_with_roles(
+        &self,
+        dataset: &str,
+        version: &str,
+        created: &str,
+        declares_label: bool,
     ) {
         let bundle = self.bundle(dataset, version);
         Fixture::description().copy_bundle_to(&bundle);
@@ -4238,14 +4782,14 @@ impl Deployment {
             "--prefix".to_owned(),
             "ex=https://example.org/".to_owned(),
         ];
-        if labels {
+        if declares_label {
             arguments.extend([
                 "--role".to_owned(),
                 "label=https://example.org/label".to_owned(),
             ]);
         } else {
-            // Supplying a non-label role opts out of the federation defaults,
-            // whose profile deliberately includes a label cascade.
+            // A role other than `label`, which leaves `label` to the federation
+            // default.
             arguments.extend([
                 "--role".to_owned(),
                 "synonym=https://example.org/synonym".to_owned(),
@@ -4294,6 +4838,15 @@ impl Deployment {
         // built inside one test share a second. The releases here need a
         // defined order, so the timestamps are written explicitly.
         self.set_created(&bundle, created);
+    }
+
+    /// Overwrite the roles a published manifest records.
+    fn set_roles(&self, dataset: &str, version: &str, roles: serde_json::Value) {
+        let path = self.bundle(dataset, version).join("manifest.json");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["predicate_roles"] = roles;
+        std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
     }
 
     fn set_created(&self, bundle: &Path, created: &str) {
@@ -4495,7 +5048,7 @@ impl Server {
         let head = String::from_utf8(head).expect("headers are ASCII");
         Stalled {
             status_line: head.lines().next().unwrap_or_default().to_owned(),
-            _stream: stream,
+            stream,
         }
     }
 
@@ -4552,7 +5105,19 @@ fn links(html: &str) -> Vec<(String, bool)> {
 /// A connection whose response body is not being read.
 struct Stalled {
     status_line: String,
-    _stream: TcpStream,
+    stream: TcpStream,
+}
+
+impl Stalled {
+    /// Read the body's first byte and no more.
+    ///
+    /// A response's head can reach the client before the server has produced
+    /// any of its body, so a head alone says nothing about what was sent. A
+    /// body byte means at least one chunk was handed to the connection.
+    fn read_first_body_byte(&mut self) {
+        let mut byte = [0u8];
+        self.stream.read_exact(&mut byte).expect("a body byte");
+    }
 }
 
 struct Response {
@@ -4901,4 +5466,554 @@ fn a_bundle_serves_the_components_it_declares() {
     for view in ["design", "queryable", "component%3Aclosure"] {
         assert!(page.contains(&format!("view={view}")), "missing {view}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// `/verbalize`
+// ---------------------------------------------------------------------------
+
+/// A typed graph for the verbalization preview: two classes, labels, one
+/// high-fanout predicate, and a mention from one class to the other.
+const TYPED_NT: &str = concat!(
+    "<http://example.org/site1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Site> .\n",
+    "<http://example.org/site1> <http://example.org/name> \"Site one\" .\n",
+    "<http://example.org/site1> <http://example.org/at> <http://example.org/loc1> .\n",
+    "<http://example.org/site1> <http://example.org/crop> \"corn\" .\n",
+    "<http://example.org/site1> <http://example.org/crop> \"rye\" .\n",
+    "<http://example.org/site1> <http://example.org/crop> \"soy\" .\n",
+    "<http://example.org/site1> <http://example.org/crop> \"wheat\" .\n",
+    "<http://example.org/site2> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Site> .\n",
+    "<http://example.org/site2> <http://example.org/name> \"Site two\" .\n",
+    "<http://example.org/loc1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Location> .\n",
+    "<http://example.org/loc1> <http://example.org/name> \"Auburn\" .\n",
+    "<http://example.org/loc1> <http://example.org/id> \"ALAU\" .\n",
+);
+
+const VERBALIZE_CONFIG: &str = r#"{
+  "predicate_limit": 2,
+  "profiles": {
+    "location": {"type": "http://example.org/Location", "template": "Location {id}",
+                 "fields": {"id": "http://example.org/id"}}
+  },
+  "targets": {
+    "site": {"type": "http://example.org/Site",
+             "ignore_predicates": ["http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]},
+    "location": {"type": "http://example.org/Location"}
+  }
+}"#;
+
+fn verbalize_url(query: &[(&str, &str)]) -> String {
+    let mut url = "/tox/v/2026-06-01/verbalize".to_owned();
+    for (index, (name, value)) in query.iter().enumerate() {
+        url.push(if index == 0 { '?' } else { '&' });
+        url.push_str(name);
+        url.push('=');
+        url.push_str(&kgf_server::url::encode_value(value));
+    }
+    url
+}
+
+#[test]
+fn verbalize_previews_a_config_in_three_modes_over_get_query_and_post() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", TYPED_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    // The route is this deployment's, not the bundle's: the service
+    // descriptor advertises it, and the manifest — a statement of what the
+    // bundle carries — does not.
+    let manifest = server.get("/tox/v/2026-06-01/manifest").json();
+    assert!(manifest["capabilities"].get("verbalize").is_none());
+    let descriptor = server.get("/").json();
+    assert!(
+        descriptor["datasets"][0]["links"]["verbalize"].is_string(),
+        "{descriptor}"
+    );
+
+    // A bare config is a plan: every target, its member count, sampled texts.
+    let plan = server.get(&verbalize_url(&[("config", VERBALIZE_CONFIG)]));
+    plan.assert_status(200);
+    plan.assert_cache_control(&["public", "max-age=31536000", "immutable"]);
+    let body = plan.json();
+    assert_eq!(body["mode"], "plan");
+    assert_eq!(body["complete"], true);
+    let targets = body["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0]["name"], "location");
+    assert_eq!(targets[0]["members"], 1);
+    assert_eq!(targets[0]["sampled"], 1);
+    assert_eq!(targets[1]["name"], "site");
+    assert_eq!(targets[1]["members"], 2);
+    assert_eq!(targets[1]["sampled"], 2);
+    assert_eq!(body["records"].as_array().unwrap().len(), 3);
+    assert_eq!(body["unknown"].as_array().unwrap().len(), 0);
+
+    // One named root: the text, exactly as the build stage would write it.
+    // The site's mention of the location is named by the location's profile;
+    // the site's own type line is excluded by its target; four crops are
+    // sampled down to two.
+    let one = server.get(&verbalize_url(&[
+        ("config", VERBALIZE_CONFIG),
+        ("target", "site"),
+        ("iri", "ex:site1 ex:nowhere"),
+    ]));
+    one.assert_status(200);
+    let body = one.json();
+    assert_eq!(body["mode"], "iris");
+    assert_eq!(
+        body["absent"],
+        serde_json::json!(["http://example.org/nowhere"])
+    );
+    let records = body["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["target"], "site");
+    assert_eq!(records[0]["iri"]["value"], "http://example.org/site1");
+    assert_eq!(records[0]["label"], "Site one");
+    let text = records[0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("label: Site one\nat: Location ALAU\n"),
+        "{text}"
+    );
+    assert_eq!(text.matches("\ncrop: ").count(), 2, "{text}");
+    assert!(text.ends_with("\nname: Site one"), "{text}");
+    assert_eq!(records[0]["lines"], 5);
+    assert_eq!(records[0]["truncated"], false);
+
+    // A sample of one target is deterministic for a seed.
+    let sample = |seed: &str| {
+        server
+            .get(&verbalize_url(&[
+                ("config", VERBALIZE_CONFIG),
+                ("target", "site"),
+                ("n", "1"),
+                ("seed", seed),
+            ]))
+            .json()
+    };
+    let first = sample("3");
+    assert_eq!(first["mode"], "sample");
+    assert_eq!(first["target"], "site");
+    assert_eq!(first["records"].as_array().unwrap().len(), 1);
+    assert_eq!(first, sample("3"));
+
+    // The body forms carry the config as an object and answer the same.
+    let request = serde_json::json!({
+        "config": serde_json::from_str::<serde_json::Value>(VERBALIZE_CONFIG).unwrap(),
+        "target": "site",
+        "iris": ["ex:site1"],
+    });
+    let body = serde_json::to_vec(&request).unwrap();
+    let query = server.request_with_body(
+        "QUERY",
+        "/tox/v/2026-06-01/verbalize",
+        &[("Content-Type", "application/json")],
+        &body,
+    );
+    query.assert_status(200);
+    query.assert_cache_control(&["public", "max-age=31536000", "immutable"]);
+    assert_eq!(query.json()["records"][0]["text"], records[0]["text"]);
+    let post = server.request_with_body(
+        "POST",
+        "/tox/v/2026-06-01/verbalize",
+        &[("Content-Type", "application/json")],
+        &body,
+    );
+    post.assert_status(200);
+    post.assert_cache_control(&["no-store"]);
+    assert_eq!(post.json()["records"][0]["text"], records[0]["text"]);
+
+    // The page: the form to edit the config, and the texts.
+    let page = server.request(
+        "GET",
+        &verbalize_url(&[
+            ("config", VERBALIZE_CONFIG),
+            ("target", "site"),
+            ("iri", "ex:site1"),
+        ]),
+        &[("Accept", "text/html")],
+    );
+    page.assert_status(200);
+    let html = page.text();
+    assert!(
+        html.contains("<textarea"),
+        "the config is editable on the page"
+    );
+    assert!(html.contains("<pre>label: Site one"), "{html}");
+    assert!(html.contains("Location ALAU"));
+}
+
+#[test]
+fn verbalize_refuses_what_it_cannot_answer_by_name() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", TYPED_NT, "2026-06-01T14:03:22Z");
+    let mut caps = kgf_server::Caps::new();
+    caps.max_verbalize_roots = 3;
+    let server = deployment.serve_with(caps);
+
+    let missing = server.get("/tox/v/2026-06-01/verbalize");
+    missing.assert_status(400);
+    assert_eq!(missing.json()["code"], "malformed_request");
+
+    let unparseable = server.get(&verbalize_url(&[("config", "targets: [")]));
+    unparseable.assert_status(400);
+    assert!(
+        unparseable.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("config")
+    );
+
+    let empty = server.get(&verbalize_url(&[("config", "{}")]));
+    empty.assert_status(400);
+    assert!(
+        empty.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no targets")
+    );
+
+    let no_such_target = server.get(&verbalize_url(&[
+        ("config", VERBALIZE_CONFIG),
+        ("target", "nope"),
+    ]));
+    no_such_target.assert_status(400);
+    assert!(
+        no_such_target.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("\"site\"")
+    );
+
+    // Two targets and IRIs to render: which target is not a guess.
+    let ambiguous = server.get(&verbalize_url(&[
+        ("config", VERBALIZE_CONFIG),
+        ("iri", "ex:site1"),
+    ]));
+    ambiguous.assert_status(400);
+    assert!(
+        ambiguous.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("target is required")
+    );
+
+    // The root cap bounds a plan across its targets, and says what to do.
+    let over = server.get(&verbalize_url(&[
+        ("config", VERBALIZE_CONFIG),
+        ("plan", "true"),
+        ("n", "2"),
+    ]));
+    over.assert_status(400);
+    assert_eq!(over.json()["code"], "cap_exceeded");
+    assert!(
+        over.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("name one target")
+    );
+    let within = server.get(&verbalize_url(&[
+        ("config", VERBALIZE_CONFIG),
+        ("n", "2"),
+        ("target", "site"),
+    ]));
+    within.assert_status(200);
+    // More targets than the cap: no n fits, so a bare config is refused too,
+    // rather than rendering one root per target past the cap.
+    let many = server.get(&verbalize_url(&[(
+        "config",
+        r#"{"targets": {"a": {"type": "http://example.org/A"}, "b": {"type": "http://example.org/B"},
+                        "c": {"type": "http://example.org/C"}, "d": {"type": "http://example.org/D"}}}"#,
+    )]));
+    many.assert_status(400);
+    assert_eq!(many.json()["code"], "cap_exceeded");
+    assert!(
+        many.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("name one target")
+    );
+
+    // A seed alongside iri is refused rather than silently ignored.
+    let seeded = server.get(&verbalize_url(&[
+        ("config", VERBALIZE_CONFIG),
+        ("target", "site"),
+        ("iri", "ex:site1"),
+        ("seed", "7"),
+    ]));
+    seeded.assert_status(400);
+    assert!(seeded.json()["detail"].as_str().unwrap().contains("seed"));
+
+    // A config naming what the bundle lacks is answered, and told.
+    let unknown = server.get(&verbalize_url(&[(
+        "config",
+        r#"{"targets": {"ghost": {"type": "http://example.org/Ghost",
+            "ignore_predicates": ["http://example.org/nope"]}}}"#,
+    )]));
+    unknown.assert_status(200);
+    let body = unknown.json();
+    assert_eq!(body["targets"][0]["members"], 0);
+    assert_eq!(body["unknown"].as_array().unwrap().len(), 2);
+    assert_eq!(body["unknown"][0]["at"], "targets.ghost.type");
+
+    // A body operation without JSON is refused as one.
+    let not_json = server.request_with_body("QUERY", "/tox/v/2026-06-01/verbalize", &[], b"{}");
+    not_json.assert_status(415);
+
+    // YAML aliases that would expand a short GET past the request limit are
+    // refused before the config is built: one anchored list of two hundred
+    // IRIs, aliased under three hundred targets.
+    let iris: Vec<String> = (0..200)
+        .map(|i| format!("http://example.org/p{i}"))
+        .collect();
+    let mut bomb = format!(
+        "targets:\n  t0: {{type: http://example.org/T, ignore_predicates: &l [{}]}}\n",
+        iris.join(", ")
+    );
+    for t in 1..300 {
+        bomb.push_str(&format!(
+            "  t{t}: {{type: http://example.org/T, ignore_predicates: *l}}\n"
+        ));
+    }
+    let expanded = server.get(&verbalize_url(&[("config", &bomb), ("target", "t0")]));
+    expanded.assert_status(413);
+    assert_eq!(expanded.json()["code"], "payload_too_large");
+}
+
+#[test]
+fn verbalize_survives_a_profile_template_over_a_cycle() {
+    // A profile that names a person by whom they know, over two people who
+    // know each other: the descent must stop, not overflow the worker's stack
+    // and take the process with it.
+    const CYCLE_NT: &str = concat!(
+        "<http://example.org/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person> .\n",
+        "<http://example.org/b> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person> .\n",
+        "<http://example.org/a> <http://example.org/knows> <http://example.org/b> .\n",
+        "<http://example.org/b> <http://example.org/knows> <http://example.org/a> .\n",
+    );
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", CYCLE_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let answer = server.get(&verbalize_url(&[(
+        "config",
+        r#"{"profiles": {"p": {"type": "http://example.org/Person", "template": "{k}",
+                             "fields": {"k": "http://example.org/knows"}}},
+            "targets": {"t": {"type": "http://example.org/Person"}}}"#,
+    )]));
+    answer.assert_status(200);
+    let body = answer.json();
+    assert_eq!(body["complete"], true);
+    assert_eq!(body["records"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn verbalize_charges_every_read_to_one_candidate_budget() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", TYPED_NT, "2026-06-01T14:03:22Z");
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.candidate_budget = 6;
+    let server = deployment.serve_with_limits(kgf_server::Caps::new(), budgets);
+
+    // Three roots want more than six triples between their stars and the
+    // probes naming what they mention. The budget is one figure for the
+    // request, not one per root: the root it ran out in is delivered as an
+    // approximation, and nothing after it is rendered.
+    let plan = server.get(&verbalize_url(&[("config", VERBALIZE_CONFIG)]));
+    plan.assert_status(200);
+    plan.assert_header("kgf-truncation-reason", "candidate_budget");
+    let body = plan.json();
+    assert_eq!(body["complete"], false);
+    let records = body["records"].as_array().unwrap();
+    assert!(records.len() < 3, "{body}");
+    assert_eq!(records.last().unwrap()["truncated"], true);
+    let truncated: u64 = body["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|report| report["truncated"].as_u64().unwrap())
+        .sum();
+    assert_eq!(truncated, 1);
+
+    // The same plan under the default budget reads everything.
+    let server = deployment.serve();
+    let plan = server.get(&verbalize_url(&[("config", VERBALIZE_CONFIG)]));
+    assert_eq!(plan.json()["complete"], true);
+}
+
+#[test]
+fn verbalize_holds_the_text_it_builds_to_the_byte_budget() {
+    // A profile of a hundred fields over a chain of four profiled nodes: each
+    // label is a hundred copies of the next one's, so the head's is a
+    // megabyte, assembled from a few hundred reads. Reads do not bound it;
+    // the byte budget must, while it is being built.
+    let mut nt = String::new();
+    for i in 1..=4 {
+        nt.push_str(&format!(
+            "<http://example.org/c{i}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/C> .\n"
+        ));
+        if i < 4 {
+            nt.push_str(&format!(
+                "<http://example.org/c{i}> <http://example.org/next> <http://example.org/c{}> .\n",
+                i + 1
+            ));
+        }
+    }
+    nt.push_str("<http://example.org/c4> <http://example.org/name> \"x\" .\n");
+    nt.push_str("<http://example.org/r> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/R> .\n");
+    nt.push_str("<http://example.org/r> <http://example.org/name> \"R\" .\n");
+    nt.push_str("<http://example.org/r> <http://example.org/next> <http://example.org/c1> .\n");
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", &nt, "2026-06-01T14:03:22Z");
+    let fields: serde_json::Map<String, serde_json::Value> = (0..100)
+        .map(|i| (format!("f{i}"), "http://example.org/next".into()))
+        .collect();
+    let template: String = (0..100).map(|i| format!("{{f{i}}}")).collect();
+    let config = serde_json::json!({
+        "profiles": {"c": {"type": "http://example.org/C", "template": template, "fields": fields}},
+        "targets": {"r": {"type": "http://example.org/R"}}
+    })
+    .to_string();
+    let url = verbalize_url(&[("config", &config), ("iri", "ex:r")]);
+
+    // Under the default budget the head's megabyte label is written whole.
+    let whole = deployment.serve().get(&url);
+    assert_eq!(whole.json()["complete"], true);
+    assert!(whole.text().len() > 1_000_000);
+
+    // Under a 64 KiB budget the label is abandoned as it passes the budget,
+    // and the text keeps its label line.
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.max_response_bytes = 64 * 1024;
+    let cut = deployment
+        .serve_with_limits(kgf_server::Caps::new(), budgets)
+        .get(&url);
+    cut.assert_status(200);
+    cut.assert_header("kgf-truncation-reason", "response_bytes");
+    let body = cut.json();
+    assert_eq!(body["records"][0]["truncated"], true);
+    assert!(
+        body["records"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("label: R"),
+        "{body}"
+    );
+    assert!(cut.text().len() < 64 * 1024, "{} bytes", cut.text().len());
+}
+
+#[test]
+fn verbalize_cuts_its_first_record_to_fit_rather_than_send_it_over() {
+    use sha2::Digest as _;
+
+    // Forty values of one predicate, all kept, make a text of about two
+    // kilobytes. Under a one-kilobyte budget the first record is the one a
+    // response cannot do without, so it is cut at a line to fit rather than
+    // sent whole past the budget, and its digest is the cut text's.
+    let mut nt = String::from(
+        "<http://example.org/r> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/R> .\n",
+    );
+    for i in 0..40 {
+        nt.push_str(&format!(
+            "<http://example.org/r> <http://example.org/note> \"note \\\"{i:02}\\\" of forty, quoted\" .\n"
+        ));
+    }
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", &nt, "2026-06-01T14:03:22Z");
+    let config = r#"{"targets": {"r": {"type": "http://example.org/R", "predicate_limit": 100}}}"#;
+    let url = verbalize_url(&[("config", config), ("iri", "ex:r")]);
+
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.max_response_bytes = 1024;
+    let answer = deployment
+        .serve_with_limits(kgf_server::Caps::new(), budgets)
+        .get(&url);
+    answer.assert_status(200);
+    answer.assert_header("kgf-truncation-reason", "response_bytes");
+    let body = answer.json();
+    let record = &body["records"][0];
+    assert_eq!(record["truncated"], true);
+    assert!(
+        serde_json::to_string(record).unwrap().len() <= 1024,
+        "{record}"
+    );
+    let text = record["text"].as_str().unwrap();
+    assert!(text.starts_with("label: r\nnote: "), "{text}");
+    assert_eq!(record["lines"], text.lines().count());
+    let digest: String = sha2::Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(record["digest"], digest);
+}
+
+#[test]
+fn verbalize_plan_counts_only_the_texts_it_carries() {
+    // A budget with room for the plan's first record and not its second:
+    // the second is rendered and left out, and the plan's statistics must
+    // not describe a text the answer does not carry.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", TYPED_NT, "2026-06-01T14:03:22Z");
+    let url = verbalize_url(&[("config", VERBALIZE_CONFIG)]);
+    let whole = deployment.serve().get(&url).json();
+    let first = serde_json::to_string(&whole["records"][0]).unwrap().len() as u64;
+
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.max_response_bytes = first + 10;
+    let body = deployment
+        .serve_with_limits(kgf_server::Caps::new(), budgets)
+        .get(&url)
+        .json();
+    assert_eq!(body["truncation_reason"], "response_bytes");
+    let records = body["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "{body}");
+    for report in body["targets"].as_array().unwrap() {
+        let carried = records
+            .iter()
+            .filter(|record| record["target"] == report["name"])
+            .count();
+        assert_eq!(report["sampled"], carried, "{report}");
+    }
+}
+
+#[test]
+fn verbalize_charges_a_probe_that_finds_nothing() {
+    // A template may name any number of fields, and a field that is empty
+    // for the node being named is still a probe of the store. Two hundred
+    // fields, every one empty for the location a site mentions, find no rows
+    // between them; charged only by rows they would cost nothing, so the
+    // config would choose the request's cost rather than the budget.
+    let deployment = Deployment::new();
+    deployment.publish("tox", "2026-06-01", TYPED_NT, "2026-06-01T14:03:22Z");
+    let fields: serde_json::Map<String, serde_json::Value> = (0..200)
+        .map(|i| (format!("f{i}"), "http://example.org/crop".into()))
+        .collect();
+    let template: String = (0..200).map(|i| format!("{{f{i}}}")).collect();
+    let config = serde_json::json!({
+        "profiles": {"location": {"type": "http://example.org/Location",
+                                  "template": template, "fields": fields}},
+        "targets": {"site": {"type": "http://example.org/Site"}}
+    })
+    .to_string();
+    let url = verbalize_url(&[("config", &config), ("iri", "ex:site1")]);
+
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.candidate_budget = 100;
+    let answer = deployment
+        .serve_with_limits(kgf_server::Caps::new(), budgets)
+        .get(&url);
+    answer.assert_status(200);
+    answer.assert_header("kgf-truncation-reason", "candidate_budget");
+    assert_eq!(answer.json()["records"][0]["truncated"], true);
+
+    // Under the default budget the empty template falls through to the
+    // location's name, and the text is whole.
+    let answer = deployment.serve().get(&url);
+    let body = answer.json();
+    assert_eq!(body["complete"], true);
+    assert!(
+        body["records"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("at: Auburn"),
+        "{body}"
+    );
 }

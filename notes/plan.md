@@ -17,8 +17,9 @@ builds them and what each unit had to decide. `notes/state.md` is the point-in-t
 handoff — what is built, what was learned. When this file and a design document
 disagree, that is a bug in one of them.
 
-Units 1–29 are complete: all of M1 plus `o.text`, bindings, entity search,
-live labels, the browser workbench, the mandatory description surface, standard RDF
+Units 1–29, 33 and 34 are complete: all of M1 plus `o.text`, bindings, entity search,
+live labels — language first, on every operation that returns IRIs — role defaults
+filled one role at a time, the browser workbench, the mandatory description surface, standard RDF
 serialization, stock Comunica TPF/brTPF interoperability, the bundle builder,
 structured request logging, public-base mounting, the dedicated `/tpf` route, an
 admission policy measured against the work it classes, the sorted dictionary as an
@@ -1054,7 +1055,9 @@ itself.
 `QUERY` is dispatched through axum's custom-method fallback and POST is registered as
 the permanent compatibility method. Both require `Content-Type: application/json`,
 both answer JSON or HTML at the same URL, and `/fragment` and `/count` advertise
-`Accept-Query: application/json` on successes and problems. QUERY responses use the
+`Accept-Query: application/json` on successes and problems. *(Unit 36 put it on every
+response of every resource that takes QUERY, `/labels` and `/verbalize` included, and
+confined `Allow` to the 405.)* QUERY responses use the
 immutable policy and a strong ETag incorporating both the operation and request body;
 POST executes the same parsed request under `no-store`. Conditional requests remain
 method-correct despite that cache-policy difference: a matching `If-None-Match` yields
@@ -1102,7 +1105,8 @@ and its lowest object term id is the deterministic tie-break. There is intention
 no locale axis: a version has one stable display label rather than a request-localized
 answer. A declared label predicate producing a non-literal is a publication/profile
 error, surfaced as a server failure rather than hidden by an unbounded scan for a
-later literal. `/labels` preserves input order and duplicates and emits explicit null
+later literal. *(Unit 33 replaced this cascade with the language-first one docs 03 and
+19 specify, and a non-literal value is now simply not a candidate; question 32.)* `/labels` preserves input order and duplicates and emits explicit null
 for absent, foreign, or unlabeled IRIs; repeated inputs reuse the request-local
 resolution rather than probing the same cascade again.
 
@@ -1115,7 +1119,8 @@ older design: mutable authoring metadata may inform the next publication, but an
 immutable version URL cannot let `role=label` change meaning. Prefixes and roles
 therefore participate in the release binding used by ETags and cursors even though the
 artifact `content_digest` remains the release-history checksum. New manifests receive
-the federation label defaults unless the publisher supplies a profile.
+the federation label defaults unless the publisher supplies a profile. *(Unit 34: defaults
+now fill each role a publisher leaves undeclared, and `synonym` has one.)*
 
 No new sidecar was added. The live algorithms have explicit caps
 (`max_search_predicates`, `max_search_results`, `max_label_iris`) and budgets, so the
@@ -1172,7 +1177,8 @@ unannotated rather than half-annotated). Labels render under the term's CURIE
 in result cells; `/describe` also resolves its target's label into the headline
 and leaves its requested identifier directly below it. JSON pays nothing for
 this and stays byte-identical; question 35 records the `labels=true` parameter
-that would give JSON parity.
+that would give JSON parity. *(Unit 33 added it: a page whose request asked renders
+the same map its JSON carries.)*
 
 Fragment pages deliberately show full triples even though fragment JSON rows
 continue to carry only variable bindings: the HTML renderer merges requested
@@ -2625,7 +2631,405 @@ with a year's `max-age`, so a browser never revalidates, and the deployment dige
 the `ETag` that would have caught a rendering change is never consulted. The caching
 policy for pages needs settling before or with the revamp.
 
-### 33. RDF 1.2 triple terms — the `reification` capability
+### 33. One label cascade, language first, wherever labels are offered ✅
+
+Issue 23, 2026-10-08: `labels=true` was refused on `/fragment`, `/describe` and `/sample`
+with a 501 that named the `labels` capability — which the bundle declared and `QUERY
+/labels` answered — and `QUERY /labels` refused the `lang` and `label_source` its spec
+gives it. The first is question 35; the second reverses question 32.
+
+**The cascade** (`label.rs`) is docs 03 and 19's: candidates are a term's literal values
+under the release's frozen `label` predicates, ordered by language rank, then predicate
+rank, then lowest term id. Language rank is the request's ranges in order, matched by RFC
+4647 basic filtering without regard to case, then every literal without a language tag,
+then every other tag. A non-literal value is not a candidate. A request that names no
+language therefore prefers untagged labels and then any tag — which differs from unit
+17's cascade wherever a subject's first predicate carried tagged values or several
+predicates mixed tagged and untagged ones: the same URL can now answer a different label
+than it did before this change. Nothing has been released, and that is the change the
+spec asked for; deployed caches will hold old answers until they expire, the
+page-caching question unit 32 notes.
+
+**Where it applies.** `lang` (a comma list in a query string, an array in a body) and
+`label_source` are taken by every operation that labels: the `/labels` batch, `/search`
+and `/terms` (labels on by default), `/schema`, and now `/fragment` — GET and QUERY/POST,
+bindings included — `/describe` and `/sample`. One `request::Labeling` parses all of them,
+so the parameters cannot drift apart. Either one without labels is refused rather than
+ignored. `labels` may also name the predicates to label with — a list in a query string,
+an array in a body — in place of the release's role for that one request, capped by
+`max_label_predicates` (question 91). The row operations' response gets the map `/schema` already
+had — `labels: {IRI: string|null}` over every IRI the response carries: the pattern's
+bound positions or the described resource, and every IRI in a row, graph column included,
+a blank node under its scoped IRI and no literal — plus `label_sources` beside it when
+asked. The map is left out for a release with no `label` role (question 92). *(Unit 34
+made that case impossible for a manifest written since.)* An RDF page
+carries each label as the statement it came from, beside its own, deduplicated against
+them and computed per prefix so that RDF byte fitting keeps exactly the labels of the rows
+it keeps; a page scoped to a graph, or in the quad view, is refused in RDF (406), because
+labels are read over the union and a statement written into a graph claims it is there
+(question 90).
+
+**Cost.** Per IRI, one descent per label predicate; then values in (predicate, term id)
+order until no later one can win — usually one. Each value is charged as it is read to an
+allowance of `candidate_budget`, a window of its own as `/search`'s resolution window is
+— shared with the enumeration it would leave a ranked page's labels nothing, since
+ranking legitimately spends the whole budget — and none is read past it. A term the
+allowance cannot settle ends the response before the item that carries it, resumably
+where the operation pages; a response's *first* item, which nothing can precede, is
+refused instead (`cap_exceeded`, naming the budget), so no request reads more label
+values than the allowance whoever chose its predicates. *(As first landed, the first item
+was resolved whatever it cost and a term was admitted only if every value its groups held
+fit; a review found the first unbounded under a client's `labels=` predicates, and the
+second refusing terms that one value would settle. Both changed to the above.)* `max_label_iris` still bounds the `/labels` batch and the HTML
+affordance for a page that did not ask; a requested map is bounded by the page it labels,
+at most `max_limit` rows of a few terms each, which is §3.5's "bounded by
+`max_output_terms`" and why `/schema?labels=true` no longer refuses over the cap.
+Question 85 carries the cost row. Admission classes are unchanged, and that is not yet a
+measured decision: by `WorkClass`'s first question the scan's ceiling is the candidate
+budget, which would make a labelled page heavy, while its second — whether that bound
+grows in practice — has not been profiled. One value per group is the expectation for
+the OKN graphs, not an observation; a profile of labelled pages is what should settle the
+class.
+
+**Pages end at a row.** The modifier is resolved in `materialize`, not after it: each row
+is weighed with the label entries it is first to bring, against `max_response_bytes`, and
+an allowance that cannot cover a row's new terms ends the page before it with
+`truncation_reason: candidate_budget` and a cursor to it, exactly as the byte budget does.
+`/terms` and `/schema` stop the same way at their own items; the `/labels` batch,
+`/search` and `/sample` have no cursor and say which budget ended them. A cursor does not
+bind to the label parameters, so a client may turn labels on, or change language,
+part-way through paging. Because the operation now resolves requested labels itself,
+`routes` adds labels only to an HTML page that did not ask; a `labels=true` page renders
+the same map as its JSON.
+
+**Not done.** `lang`, `label_source` and a predicate list in the GET editors (a `labels=true&lang=fr` URL renders, but the forms do not offer it); and the
+access record's row-operation shapes still say nothing about labels.
+
+*Verified by* `label.rs` tests of range syntax, basic filtering and rank order; request
+tests of every refusal above, the published cap, the body forms, and a cursor binding
+indifferent to labels; the exact-size oracles extended to label sources and the map; a
+multilingual fixture pinning each rule of the cascade through `/labels`, the map's
+contents on fragment, describe and sample pages, and exhaustive paging under a one-byte
+response budget and a one-candidate allowance, each reassembling the unconstrained page
+and its map; N-Quads pages carrying label statements, and an RDF fit one byte under the
+whole document whose every page labels exactly its own rows; and socket tests of the
+modifier on every route and method, the predicate override in a query string and a
+body, RDF labels and the 406 for a scoped page, the HTML rendering, `QUERY /labels` with
+`lang` and `label_source`, and `/search?lang=`.
+
+### 34. Role defaults one role at a time, and a default `synonym` ✅
+
+Roles were already open-ended: `/search?role=synonym` expanded any role a release
+declared, and nothing else read one but `label`. What was missing was a default.
+Defaults were all-or-nothing — a manifest declaring any role got none of the federation
+defaults — so a release declaring only `synonym` silently had no labels, and a release
+declaring only `label` refused `role=synonym`. Ubergraph v0.0.2 is the second case, and
+put `oboInOwl:hasExactSynonym` in its `label` role to make entity search reach synonyms.
+
+That workaround is the reason for the change as much as the defaults are. Under unit 33's
+cascade a predicate's place in `label` breaks ties only within a language rank, so a
+synonym in the role competes with the primary label on language and wins whenever its
+tagging fits the request better. Sampling Ubergraph on 2026-10-09 found both directions:
+`WBPhenotype_0002623`'s label is tagged `@en` and an untagged exact synonym would replace
+it when no `lang` is sent, and `ENVO_00000484`'s untagged label "polynya" would lose to
+the exact synonym `"Polyn'ya"@en` under `lang=en`. Its next release should declare
+`label: [rdfs:label, skos:prefLabel]` and leave synonyms to `synonym`, which the default
+now covers; `role=label,synonym` is the entity search.
+
+**What landed.** `kgf_store::manifest::effective_predicate_roles` is the federation
+defaults overlaid by the declared roles, a declared role replacing its default whole. `kgf
+manifest` and `kgf build` record its result in every new manifest, so a consumer reading
+manifests without a server sees every role that applies. The server resolves each release
+with exactly what its manifest records — standard profile only for a manifest recording
+none, as before — because a version means what its manifest says and an upgrade must not
+change that; a manifest written earlier gains a default only when its lineage is rebuilt,
+and then only for a role it does not record. *(As first landed the server filled defaults
+on read too, which a review rightly found changed published versions' role semantics
+with no new version, and showed `/manifest` and its page disagreeing; reverted.)* The `synonym`
+default is `skos:altLabel`, `oboInOwl:hasExactSynonym`, `schema:alternateName`,
+`oboInOwl:hasRelatedSynonym`, `…Narrow…` and `…Broad…`, and `skos:hiddenLabel` — every
+kind, since a search wants them all and returns the predicate that matched — and it shares no predicate with
+the `label` default: a synonym of any kind is a search target, never a label. A
+`description` default followed: `skos:definition` and IAO's `definition` first, then
+`dcterms:description`, `schema:description`, and `rdfs:comment` last, as often an
+editor's note as a description; no predicate is in two defaults. Every schema.org term
+in the defaults is listed under both `https://schema.org/` and `http://schema.org/`: the
+OKN registry shows DREAM-KG, NDE, PROKN, SecureChainKG and Wikidata on the older
+namespace, which the `https`-only `label` default had silently missed, and a predicate
+a release does not hold costs nothing past the cascade's construction. Every
+manifest written now has a `label` role; one written before that records roles without
+one keeps unit 33's behaviour, its response-level map left out (question 92). A search
+hit's `match` carries `roles`, the release roles naming its predicate, from an inverse
+each release computes once (question 95).
+
+*Verified by* a store test that every default is a valid role IRI, that the two defaults
+are disjoint, and that the overlay replaces, fills and is idempotent; manifest tests that
+a synonym-only declaration keeps the default `label` and that a carried-forward profile
+gains a new default; a socket test that a synonym-only release serves the default label
+role in its descriptor, records it in its manifest, and labels `/schema`; and search
+tests of `match.roles` for a role-member predicate and for one in no role, and of
+`role=synonym` on a release that declares only `label`; the exact-size oracle covers
+`roles`; and a socket test that a manifest recording only `synonym` is served with exactly
+that, its `/schema` map left out.
+
+### 35. Verbalization — a root as the text it is embedded from ✅
+
+**Implemented 2026-09-04 to 2026-10-11, in a crate of its own.** Doc 13 §13.1's first
+pipeline stage: a config names classes whose members become roots, and each root
+becomes one text — a `label:` line, then one `predicate: value` line per selected
+outgoing edge, values named by their labels rather than expanded. The model that reads
+those texts stays outside this workspace. This unit is the read half: the crate, the
+command that writes records for a build, and the route that renders a few roots of a
+served bundle so that a config can be authored against the graph without a local copy.
+
+**Where it lives, and why not hdtc.** `kgf-verbalize` sits between `kgf-store` and
+`kgf-server`, because it has two callers that are peers — the build stage and
+`/verbalize` — and neither owns it, and because it reads through the mapped `Store`:
+a root's star, a mentioned node's types, a template field's values, the label cascade,
+all star lookups in id space over the permutations. hdtc's readers seek a file with
+bounded memory, the opposite model, and the preview is only worth having if it predicts
+the build's text byte for byte, which one implementation serving both callers is the
+only way to guarantee. The crate defines no byte format and knows nothing of HTTP.
+
+**What a text is.** Roots are the subjects of `? rdf:type <class>`, blank nodes
+skipped. The star `s ? ?` arrives grouped by predicate in id order, which is IRI order,
+so "predicates in IRI order" costs nothing. Per predicate, blank-node values are
+dropped — no line can name one — and of the rest the `predicate_limit` values with the
+smallest `sha256(root \t predicate \t object)` over the *strings* are kept and emitted
+in score order: a uniform sample keyed on content, so an unchanged node samples the same
+values in every build whatever ids it was assigned, and the sample is neither "first n
+in dictionary order" (a lexical accident) nor "rarest values" (a ranking the text would
+then depend on globally). Sampled with the rest, as the Python port did, a blank node
+that scored low took a place it could never fill, and one literal among twenty blank
+nodes under a limit of one left its predicate out of the text. A value is named by its
+literal form; an IRI by the profile for its class, then the cascade, then its humanized
+IRI fragment. The root is named the same way except that its target's `label_template`
+is tried first.
+
+**Two label mechanisms, by position.** A *profile* is keyed by class and names a node
+wherever it appears; a target's *`label_template`* names the node only as the root of
+its own document. The same class may carry both, and when it does the root takes the
+template — written for exactly that node in exactly that position — and a mention takes
+the profile, so a Location is `Location 123: Cover crops` as a headline and `Cover
+crops` inside a Site's text. A single mechanism would push one string into both slots.
+
+**The cascade is the config's, then the bundle's.** A target's `label_predicates` are
+tried in the order written, and the bundle's `label` role follows as what a config
+that says nothing gets. The config goes first because its author has seen the graph —
+a generic label predicate can carry boilerplate beside the domain predicate carrying
+the real name, and only the config can say which to prefer — and because a text is glad
+of description or identifier predicates that a label endpoint should never return. This
+is a deliberate divergence from doc 13 §13.1's wording; see question 96. Nor is the
+cascade unit 33's: it takes a predicate's first literal in id order, whatever its
+language, where unit 33 ranks by language first — question 99.
+
+**Templates stop at a cycle.** A template names a node by its neighbours' labels, and a
+neighbour of a profiled class is named by a template in turn, so one label resolution
+can descend through several. Graphs have cycles — `owl:sameAs`, inverse pairs, a class
+that is an instance of itself — and the first implementation descended until the worker
+thread's stack overflowed, which aborts the process: one GET took the server down. A
+node whose template is already mid-render, or one more than `MAX_TEMPLATE_DEPTH` (8)
+templates down, is now named without its templates. A label that took such a cut
+depends on where the descent started, so it is not cached. One that took none still
+depends on how deep it started, through the bound, so it is cached with how many
+templates deep it went and reused only where that many more still fit. Cached without
+that, a label computed from a mention in a star — where a chain fits — was reused from
+inside a root's profile, one template deeper, where the same chain is cut: two roots of
+one shape read differently in one build, and a preview of the second matched neither.
+
+Depth is the only position a cached label depends on because every descent follows the
+same edges, a node's profiles, and a descent that reached a node in progress would
+have reached itself and been cut. A root's `label_template` is the one template that
+names a node by other edges, so it is applied once, at the top, outside any descent:
+its fields are named as their values are named in any text, and a value named by way
+of the root names the root as a mention would — as the Python port does. Applied as
+the first step of a descent, it let a location named by its site, inside the template
+of a site named by its location, reach the site in progress: alone, the site was cut
+there to its `rdfs:label`; after another site's star had cached the location's label,
+the uncut one was reused. A root's text is a function of the root, not of what was
+rendered before it.
+
+**Cost.** The build reads without bound, because `predicate_limit` selects from all of a
+predicate's values. The route cannot. Every probe any walk makes — a root's star, a
+mentioned node's types, a template field, a cascade predicate — and every row a probe
+yields is charged to one candidate budget for the request, through the one method that
+charges a read. A probe that finds nothing is charged too, because the config decides
+how many there are: charged by rows alone, a template of two hundred fields empty for
+the node it names cost two hundred lookups per mention that the budget never saw. When
+the budget runs out the root in hand is delivered marked `truncated`, no further root is
+rendered, and the answer reports the candidate budget exhausted, as `/search` does.
+Roots are bounded by a new cap, `max_verbalize_roots` (default 100): IRIs named are
+counted against it, a plan with more targets than the cap is refused (no `n` fits), and
+the default `n` shrinks to fit. Drawing a member is one rank descent and a class's
+member count a range width, so a plan never enumerates a class.
+
+The response stops at its byte budget, and the text built for it is held to the same
+figure as it is built: every line and every piece a template appends to a label is
+charged against `max_response_bytes`, and past it nothing more is appended, written or
+read. Reads do not bound a text's weight. A template copies its fields' labels into
+every label it renders, so a profile of a hundred fields over a chain of four profiled
+nodes assembles a megabyte label from a few hundred reads, and a thousand fields over a
+subclass hierarchy outgrows memory before the read budget is touched. A record that does
+not fit what is left of the response is left out, unless it is the first: that one is
+cut at a line to fit, keeping its label line, and its digest is the cut text's. Every
+route keeps its first row over the budget because a page must carry something and a row
+cannot be split; a text can, at a line, and sent whole it could weigh many times the
+budget. A plan's statistics count only the texts the answer carries. A build has no byte
+budget, so a config that makes labels grow that way is a build that runs out of memory;
+the preview, which does have one, is where such a config shows itself first.
+
+The config costs one dictionary lookup per IRI as written. Its `defaults` are resolved
+and bound once rather than copied into every target — copied, a 140 KB config of 2,000
+targets and 2,000 default IRIs took 5.6 s and 235 MB before any cap was consulted, the
+product of the two from a document the size of their sum. A GET's YAML is measured with
+its aliases expanded and held to `max_request_bytes`, the bound a body already has: one
+anchored list aliased under every target is otherwise that same product, and the YAML
+parser's own guard counts alias jumps rather than what each replays. The route is
+therefore one row of the cost table: the config's IRIs, at most `max_request_bytes` of
+them written out, in dictionary lookups; `max_verbalize_roots` rank descents;
+`candidate_budget` reads; and `max_response_bytes`, built and sent.
+
+**The route's modes.** `iri` renders named roots under one target; `target` without
+IRIs draws `n` seeded-uniform members, the same draw `/sample` makes; a config alone is
+a *plan* — every target's member count and `n` sampled texts with length statistics,
+each text reporting `limited` (predicates sampled down to the limit: the tuning signal)
+and `truncated` (the server's bound, not a config problem). The config travels as YAML
+or JSON text in a GET parameter for a browser and as a JSON body on `QUERY` (canonical)
+and `POST` (fallback), with the same fields either way. The HTML representation carries
+the config in a form, so a config can be drafted in a browser against a served bundle.
+
+**Not a manifest capability.** The route needs no artifact, so declaring it would tell a
+reader of the manifest nothing about the bundle (unit 27's rule), and the manifest is a
+protocol-level document: a capability there says any server honouring doc 03 answers it
+for this bundle, which is not true of an operation doc 03 does not define. The service
+descriptor links the route on every release, as what this deployment routes.
+
+**The command, and its two streams.** `kgf verbalize <bundle> --config --roots --texts`
+writes one JSON line per root — its IRI, its target, and the hex SHA-256 of its text —
+and one per distinct text under that digest, the first time the digest is seen. The
+digest is the key between the stages: the model embeds the texts, each distinct text
+once however many roots share it, and returns vectors keyed by digest; the index stage
+joins the roots to them through it. The first shape, one record per text keeping ten of
+its roots' IRIs and a count, was a search payload rather than a pipeline file — a root
+past the ten could never be given its vector, and there was no key to match vectors
+back by. Both streams are written as the walk goes, a class is walked by position a
+page at a time, and each cache is emptied when it reaches `MAX_CACHE_ENTRIES`, so a run
+retains the set of digests and nothing else that grows with the output. That set is
+still linear in the distinct texts — about 33 bytes a bucket as a hash set of 32-byte
+digests, some 4.4 GB at 10⁸ texts, doc 13's upper range, and more while it resizes — and
+past SOCKG's scale it is the first thing to move out of memory, most simply by writing a
+text line per root and letting the embedding stage, which keys on the digest already,
+deduplicate.
+
+The command opens the bundle as `kgf manifest` does, asserting publication for an
+operator-named directory, and opens both outputs before mapping anything. An output is
+refused if it is a bundle file by any name: a path under the bundle once its links are
+followed, a dangling link (creating through it would land where it points), or a hard
+link, caught by comparing the opened file's identity with every file the bundle holds.
+A path check alone let a symlink beside the bundle through, and the run truncated
+`data.hdt` under its own mapping and died of SIGBUS. `--roots` and `--texts` must be two
+files, or each writes over the other. Checking changes neither file: they are emptied
+only when writing starts, after the bundle is open, the config bound and the targets
+selected, so a run refused for a misspelled target leaves the last run's files whole.
+
+**What the schema pages needed.** Authoring a config starts from two signals per
+(class, predicate): coverage — how many of a class's members carry the predicate — and
+fanout — triples per subject. The build now passes `--partition-distinct-counts all`
+so every VoID partition carries exact distinct-subject counts, the class-level ones
+included (hdtc keeps a scalar tracker per emitted partition, so this costs words, not
+sets), and `/schema`'s class-property pages show a per-subject column.
+
+*Verified by* the fixture tests in `crates/kgf/tests/verbalize.rs` — the text's shape,
+the config cascade over the bundle role, the stable sample across runs and across
+shifted ids, allow and deny lists, template and profile by position, grouping, unknown
+IRIs, the cycle and depth bounds, a root reading the same whatever was rendered before
+it, a root template naming its values as any text does, blank nodes kept out of a
+sample, and the command's refusals, links and hard links included, and its leaving the
+last run's files whole — by the GET parser's alias bound in `request.rs` — and over a
+listener by `verbalize_previews_a_config_in_three_modes_over_get_query_and_post`,
+`verbalize_refuses_what_it_cannot_answer_by_name`,
+`verbalize_survives_a_profile_template_over_a_cycle`,
+`verbalize_charges_every_read_to_one_candidate_budget`,
+`verbalize_charges_a_probe_that_finds_nothing`,
+`verbalize_holds_the_text_it_builds_to_the_byte_budget`,
+`verbalize_cuts_its_first_record_to_fit_rather_than_send_it_over`, and
+`verbalize_plan_counts_only_the_texts_it_carries`. On the SOCKG release (27 M
+triples, 1,237 roots over eleven targets) the texts were byte-identical to the Python
+implementation this ports — 1,215 distinct texts, every root joined to the same text —
+in 0.3 s and 38 MB against 22 s and 1.1 GB. That was measured before blank nodes left
+the sample and a root's template left the descent (2026-10-11), each of which departs
+from the Python on purpose; neither has been measured against SOCKG since.
+
+### 36. `Allow` on the 405 alone, `Accept-Query` wherever QUERY is taken ✅
+
+Issue 15, 2026-10-11: a successful `QUERY /count` carried `Allow: GET,HEAD,POST`, while
+a `DELETE` on the same resource answered 405 with `Allow: GET, HEAD, POST, QUERY`. A
+client reading `Allow` on the success would conclude the resource does not take QUERY.
+
+**The cause was axum, and the hand-written lists beside it.** axum's `MethodRouter`
+adds `Allow` to *every* response its method fallback produces, whatever the status,
+unless one is already present, and builds it from the methods registered by name. QUERY
+cannot be registered by name, so it is answered from the fallback, and its 200 — like
+its 304 and its errors — got axum's list without it. The 405s were spelled three ways:
+axum's for the read-only routes (`GET,HEAD`) and two static strings for the body routes.
+`Accept-Query` had the same shape of problem: a wrapper added it to some handlers'
+successes and a path-suffix check (`/fragment`, `/count`) to problems, so GET
+`/verbalize` and every error from `/labels` and `/verbalize` — the 415 whose detail
+points at `Accept-Query` included — carried none.
+
+**What landed.** A resource's methods are a `Methods` value (`Read`, `Body`,
+`ReadOrBody`) constructed only by the three functions `routes` mounts a resource with —
+`read(handler)`, `read_or_body(handler, operation)` and `body(operation)` — each from
+the handlers it registers, so what a route answers and what it states cannot drift. One
+route layer, applied last so that it wraps the fallback too, writes `Allow` on the
+resource's 405 and `Accept-Query: application/json` on every response of a resource
+that takes QUERY. Every route is built from axum's `any`, the one constructor that adds
+no `Allow` of its own; the socket test fails if that ever stops holding. The four
+per-route POST handlers and QUERY fallbacks became one generic `with_body`, whose
+fallback refuses a method before reading anything else, so `DELETE` with an undecodable
+version segment is a 405 on `/fragment` as on `/manifest` rather than a 400 (it was a
+400 before this unit too). The `advertise_query` wrappers and `render_problems`' path
+check are gone.
+
+**Why `Allow` is on the 405 alone.** The issue would have accepted either the same
+`Allow` on both paths or none on the success. This unit first chose the former, every
+response, and review turned it round: a versioned success is cached `immutable` for a
+year under an ETag that does not cover the header, and the method list is this
+deployment's routing rather than a fact about the bundle. Were `/terms` to take QUERY
+(question 67), every stored `GET /terms` would go on saying it does not — issue 15 again,
+through caches. A 405 is never stored, so its list is always the live one; a client that
+wants it without guessing can send any method and read the refusal. `Accept-Query` stays
+on cached responses, as unit 16 put it there, because it only ever *adds* a method: a
+stale copy can say QUERY works where it no longer does, which the 405 then corrects, but
+its absence denies nothing.
+
+**What states nothing.** A response no resource produced: the router's 404, the
+`latest` redirect (its methods are its target's), a CORS preflight, and the 413 the wire
+body limit returns for a declared `Content-Length` before routing. A chunked body that
+turns out oversized while the resource reads it is refused by the resource, so that 413
+carries `Accept-Query`; which side a 413 falls on is decided by the framing, and the test
+pins both. A 413 on `/fragment` or `/count` with a declared length carried `Accept-Query`
+by path before and does not now; its remedy is a smaller body, which the header does not
+help with.
+
+**CORS keeps one list for every path.** A preflight is answered before routing, for
+paths that name nothing as well as ones that do, and what it grants is permission for a
+browser to send the request, not a statement of what the target takes: the request then
+meets the resource, whose 405 is the authority. So `cross_origin_methods` approves every
+method some resource takes, and a unit test holds it equal to the union of the `Methods`
+lists, since nothing else keeps the two together. Question 100.
+
+*Verified by* `a_resource_states_its_methods_where_they_cannot_go_stale`, a socket test,
+labelled per case, of the status, `Allow` and `Accept-Query` on successes, a 304,
+parameter, path and media-type errors, and 405s across the service descriptor,
+`/healthz`, a read-only resource, `/tpf`, a download, `/fragment`, `/count`, `/verbalize`
+and `/labels`; of neither header on a redirect and a 404; and of both 413 framings.
+Against the previous router it fails on the issue's own case, against this unit's first
+form on `Allow` on a success, and with the path read before the method on the undecodable
+`DELETE`. `a_preflight_approves_exactly_the_methods_some_resource_takes` holds the CORS
+list to the resources'.
+
+### 37. RDF 1.2 triple terms — the `reification` capability
 
 **Planned 2026-10-04.** hdtc (branch `triple-terms`) now builds RDF 1.2 triple terms
 without forking `data.hdt`. Each distinct triple term is an IRI of `data.hdt` under the
@@ -2680,7 +3084,7 @@ The steps, each a commit reviewed on its own:
    A triple term in the subject or predicate position is refused: RDF 1.2 has none.
 6. **Variables inside a triple term** (`?e rdf:reifies <<( :s ?p ?o )>>`), depth 1.
    *As built:* in `o` on `/fragment` and `/count`, in request syntax with `?name`
-   placeholders, rather than in the bindings body form — see question 85. The store answers them with one of three plans, chosen on cost from
+   placeholders, rather than in the bindings body form — see question 101. The store answers them with one of three plans, chosen on cost from
    the bundle alone, so a cursor resumes on the plan that issued it:
    - **no inner constraint** — every triple whose object is a triple term is one
      contiguous range of OPS, or of POS under a bound outer predicate: an ordinary
@@ -2694,14 +3098,14 @@ The steps, each a commit reviewed on its own:
    a page may end early with a cursor, and a count is exact when its scan completes
    and a lower bound with a cursor otherwise. The row's object is the whole triple
    term, which carries the values the inner variables took; separate columns for
-   them wait for the tabular formats (question 85).
+   them wait for the tabular formats (question 101).
 7. **`kgf build`**: RDF input with triple terms produces the three artifacts, an
    HDT input brings them along (or is refused without them), and the stats layer
    leaves the encoding namespace out of the namespace inventory.
 8. **Notes**: this unit's *What landed*, and the questions for `../kgf` it raises.
 
 **What landed (2026-10-04).** All eight steps, each reviewed on its own, against hdtc
-branch `triple-terms`. Two decisions moved from the plan, recorded as questions 85–86:
+branch `triple-terms`. Two decisions moved from the plan, recorded as questions 101–102:
 inner variables are written in `o` with `?name` placeholders, and `reification` is a
 declaration, not a gate. Three findings from building it:
 
@@ -3242,12 +3646,17 @@ following the code.
     omits `dedupe=false`: entity-level
     resolution is the operation's contract, while occurrence-oriented text access is
     already `/fragment?o.text=`. The spec is the stale side of both choices.
-32. **Labels have no request language.** Doc 03 §3.4.12 and doc 19 §19.4 make language
-    dominate predicate order. The implemented contract has one stable label per
-    release, chosen by predicate order and lowest term id, so neither `/search` nor
-    `/labels` accepts `lang`. Localization can be a distinct future operation if a
-    federation use case needs it; it should not make ordinary display hydration vary
-    by an optional parameter. The spec is intentionally stale here.
+32. **Reversed (unit 33): labels have a request language, as the spec always said.**
+    Unit 17 shipped one stable label per release, chosen by predicate order and lowest
+    term id, refused `lang` on `/search` and `/labels`, and called the spec
+    intentionally stale. That was the wrong side. A client could not prefer a
+    language, and the release's "one stable label" was not language-neutral either: it
+    ignored language, so a subject carrying `"Asthma"@de` and `"asthma"@en` was labelled
+    in German because `A` sorts first. Leaving the spec stale also had a cost of its
+    own: a client written against doc 03 sent `lang` and was told the body was
+    malformed (issue 23). Determinism was never at stake — the same request still gets
+    the same label, and `lang` is part of the URL or body that caches key on. The
+    cascade is now docs 03 and 19's, language first, everywhere labels are offered.
 33. **Mutable role declarations conflict with immutable version URLs.** Doc 19 §19.1
     puts roles only in the mutable dataset descriptor and says a correction takes
     effect without rebuild. That makes the same cache-forever `/v/{version}/search`
@@ -3267,7 +3676,7 @@ following the code.
     root must stay thin; if adopted, which fields are required and whether
     `description` may be truncated at the source both need a sentence. Surfaced by the
     unit 18 web UI revamp.
-35. **Row operations should take `labels=true` so JSON can match the pages.** §3.5's
+35. **Resolved (unit 33) as a response-level map.** §3.5's
     modifier table already prices a `labels=true` row for "operations that return
     rows", but §3.4.1's envelope never defines where the labels would go, and this
     implementation currently rejects the parameter on `/fragment`. Meanwhile unit 18's
@@ -3276,7 +3685,9 @@ following the code.
     JSON clients must fetch separately. The fix is to specify the envelope shape for
     hydrated labels (a `labels` sibling map keyed by IRI? a per-cell annotation?) and
     let `labels=true` turn it on for `/fragment`, `/describe` and `/sample`; the HTML
-    pages then become the `labels=true` rendering rather than a special case.
+    pages then become the `labels=true` rendering rather than a special case. Unit 33
+    chose the sibling map `/schema` already used (question 40), with `label_sources`
+    beside it; §3.4.1's envelope should show both.
 36. **Resolved: `/schema?children=object-classes` omits the untyped target partition.**
     The response shape requires every child to carry a semantic `term`, and an
     untyped target has no `void:class`; §3.4.10 explicitly says such a partition is
@@ -3717,7 +4128,8 @@ following the code.
     number that names a stored term independently of role — and it binds to `prefix` and
     `role`, not to `limit` or `labels`, so a client may change page size or ask for labels
     mid-scan and keep paging.
-71. **`labels=true` now applies to three operations and not the other three.** `/search`,
+71. **Resolved (unit 33): `labels=true` applies to every operation that returns IRIs.**
+    As first written: `/search`,
     `/schema`, and now `/terms` hydrate the release's frozen label cascade; `/fragment`,
     `/describe`, and `/sample` still refuse the parameter and label only their HTML. Item
     35 asked for the uniform rule and this widens the inconsistency by one operation
@@ -3825,8 +4237,153 @@ following the code.
 84. **`range_not_satisfiable` (416) joins the error table.** A download needs it, with
     `Content-Range: bytes */{len}`, for unsatisfiable and for refused multi-range
     requests alike.
+85. **The live cascade's cost row leaves out the language axis.** Doc 03 §3.5 and doc 19
+    §19.5 price a live `/labels` at `O(|label preds| · log N)` per IRI, which is the
+    predicate-first cascade unit 17 had. A language tag ends a literal's spelling, so
+    the values of one `(subject, predicate)` group are not grouped by language and the
+    best one cannot be searched for: the language-first cascade reads values until no
+    later one can win. Unit 33's row is `O(|label preds| · log N + V)` per IRI, `V` the
+    values read — one in the common case — with `V` summed over a request at most
+    `candidate_budget`: a term that would need more ends the response before its item,
+    or refuses the request when its item is the first. Both rows should say so, and
+    §3.5 should say that `candidate_budget` is a window per budgeted phase — a labelled
+    ranked page spends up to two, a labelled `/search` three — which is already true of
+    `/search`'s scoring and resolution. Doc 19 §19.4.5's sidecar is what would remove
+    `V`; nothing here needs it yet.
+86. **`label_source` needs a wire shape.** §3.4.12 says only that it "returns the
+    predicate and language actually used". Unit 33 writes `{"predicate": IRI, "lang":
+    tag}`, the language left out for an untagged literal as a term object leaves it
+    out, or `null` when there is no label: as a `label_source` field beside a row's
+    `label` (`/labels`, `/search`, `/terms`), and as a `label_sources` map beside a
+    response-level `labels` map (`/fragment`, `/describe`, `/sample`, `/schema`). An RDF
+    page needs neither: the label statement it carries names its predicate and language.
+87. **`lang` on `/search` should be said to mean the label's language.** §3.4.5's example
+    carries `lang=en` without saying whether it filters the matched literals or orders
+    the label cascade. Here it is the cascade, as on every operation that labels; a
+    match-language filter would be a different parameter, since it changes the result
+    rather than its annotation. §3.4.5 should also list `label_source`.
+88. **`max_label_languages` and `max_label_predicates` are new caps.** A `lang` list is
+    matched once per distinct language tag the cascade meets, so its length multiplies a
+    constant rather than the scan, but without a cap it is bounded only by the request
+    size. A predicate list is a descent per labelled term each, so it multiplies the
+    cascade itself. Unit 33 publishes 16 for both. §3.5's caps belong in the same table.
+89. **What "untagged" covers, and what is not a candidate.** Doc 19 §19.4.2 ranks
+    "untagged literals (plain literals / `xsd:string`)". Unit 33 ranks every literal
+    without a language tag there, typed ones included, since none of them asserts a
+    language; and a label predicate's non-literal value is not a candidate, where unit
+    17 refused the request with a server error. Both docs should say which.
+90. **`labels=true` in RDF carries the label statements, over the union only.** §3.4.12
+    says the modifier applies to "any response", and an RDF document has no envelope for
+    a map, so it carries each label as the statement it came from — a triple of the same
+    dataset, so the document is still a set of the bundle's statements, with the
+    predicate and language in it. Two limits the spec should state. Labels are read
+    across every graph, and an RDF document places each statement in one, so a page
+    scoped to a graph or in the quad view would claim memberships nothing checked; it is
+    refused, 406, rather than labelled from inside the graph, which would make JSON and
+    RDF choose different labels. And RDF has no null: an IRI looked up and found
+    unlabelled has no statement, which is indistinguishable from one not looked up.
+91. **The per-request predicate override needs a body spelling.** `labels=rdfs:label,…`
+    (§3.4.12, doc 19 §19.4.2) is implemented as a list in either term syntax, each
+    predicate kept once in its first place, capped by `max_label_predicates`, replacing
+    the release's role while language still dominates it. It composes with question 33
+    — the override lives in the URL or body a cache keys on, so it cannot change a
+    versioned answer's meaning. The spec gives it no body form; this implementation
+    makes a body's `labels` `true`, `false`, or an array of predicates, on `QUERY
+    /fragment` and on the `/labels` batch alike, so one key means one thing everywhere.
+92. **A release with no `label` role answers `labels=true` two ways — now only an old
+    one.** A response-level map is left out, since a null says the cascade looked and
+    found nothing and there is no cascade to look with, while a row-level `label`
+    (`/labels`, `/search`, `/terms`) is `null`. Since unit 34 every manifest written has
+    a `label` role, so only a manifest written before it can reach this; the spec should
+    still pick one.
+93. **§3.4.1 lists `labels` as requiring `search`, and §3.4.12's heading says the same.**
+    Labels compose the core permutations every bundle carries, so this implementation
+    never gates them (rule 8 in `CLAUDE.md`). Both should read `—`.
+94. **Role defaults should fill role by role, and `synonym` should have one.** Doc 19
+    §19.1 says a dataset that declares no roles gets the federation label cascade and no
+    field filtering for search. Unit 34 reads "declares none" per role: an undeclared
+    `label` is the default cascade even when `synonym` is declared, and an undeclared
+    `synonym` is a default list too, so `role=synonym` answers on every release — which
+    is what "the three every consumer may assume the meaning of" needs. A declared role
+    replaces its default whole. Doc 19 §19.1's example and §19.4.2's default list should
+    show both defaults, and doc 04 §4.3 should say the manifest records the filled
+    profile. `description` has one too: definitions first (`skos:definition`, IAO's
+    `definition`), then `dcterms:description` and `schema:description`, and
+    `rdfs:comment` last, since a comment is as often an editor's note. The three
+    defaults share no predicate.
+95. **A search hit should say which role its predicate plays.** Doc 03 §3.4.5's `match`
+    is `{predicate, literal, lang}`; unit 34 adds `roles`, the release roles whose lists
+    name the predicate, empty for one in none. A client merging hits can then rank a
+    label match above a synonym match without the release's profile in hand.
 
-85. **Variables inside a triple term live in `o`, not in the bindings body.** Doc 09
+96. **Doc 13 §13.1's cascade should be the config's first, then the roles.** It says
+    verbalization "should draw on the declared predicate roles rather than its own
+    predicate lists, so a KG's label and description predicates are stated once". Unit
+    35 does the opposite on purpose: a target's `label_predicates` come first, in the
+    order written, and the bundle's `label` role follows as the fallback for whatever
+    the config did not name. The case that forced it: SOCKG's journal articles carry
+    `rdfs:label` and `dcterms:title`, and the label is boilerplate — "Journal article
+    about data" on many of them — while the title is the name. With the role first,
+    every text citing an article read `cites: Journal article about data`. The role
+    cannot say "prefer the title for this class": it is one list for the whole graph,
+    and for `/labels` that generic answer is correct, since the boilerplate *is* the
+    node's label. A label endpoint and a text ask different questions — "what is this
+    node called" against "what should a model read about it" — and the text also wants
+    description or identifier predicates a label endpoint must never return, because a
+    node named by its description still beats one named by its IRI fragment. Stating
+    the predicates once assumed one list serves both questions. Proposed wording: the
+    roles are the default a config inherits, not the list it must use; a config that
+    says nothing gets the bundle's behaviour, and one that names predicates gets them
+    first.
+
+97. **`/verbalize` and `max_verbalize_roots` are a route and a cap doc 03 does not
+    define.** The operation is an authoring tool over a served bundle, not a read
+    operation in §3.1's sense, and its cost is one row (unit 35 records
+    it: a dictionary lookup per config IRI, the config held to `max_request_bytes`
+    written out; cap many rank descents; a candidate budget of reads, probes and
+    rows alike; the byte budget, which holds the text built as well as the text sent).
+    Either doc 03 gains the row and the cap, or doc 13 gains a section saying the
+    preview exists, what it costs, and that it is a deployment's to route rather than
+    a bundle's to declare.
+
+98. **Should an operation the protocol has not defined have a name in the capability
+    vocabulary at all?** Unit 35 first declared `verbalize` in every manifest, on the
+    `sample`/`labels` precedent, and withdrew it: unit 27 settled that a declaration
+    tells a reader nothing when no artifact can be absent, and the manifest's audience
+    reads it as a statement about the protocol, not about one implementation. The
+    precedent itself is the open question — `sample` and `labels` are declared because
+    doc 03 defines them, and if that is the rule it should be written down.
+
+99. **A text's labels are not unit 33's cascade, and their language is nobody's choice.**
+    Unit 33 gave every operation that offers labels one cascade: a term's literal values
+    under the label predicates, ranked by the request's languages, then untagged, then
+    any other tag, then predicate order. Unit 35's verbalizer ranks predicate first and
+    ignores language: a cascade predicate's first literal in term-id order, and a
+    template field's lexically smallest value. A node labelled only
+    `"Acetylsalicylsäure"@de` and `"Aspirin"@en` is named in German, because that sorts
+    first. It is what the Python implementation this ports does, and byte-identity with
+    that is the check the port was built against; and a build has no request to take a
+    language from. But an embedding model reads in a language, so the language a text's
+    labels are in belongs in the recipe — and in its identity, beside the cascade the
+    recipe already depends on. Proposed: a `lang` preference in the config, ranked as
+    unit 33 ranks, with today's behaviour as what a config that names none gets. The
+    ranking lives in `kgf-server`'s `label` module, below which `kgf-verbalize` sits, so
+    adopting it means moving that ranking down to where both can call it rather than a
+    second copy. Doc 13 §13.1 says nothing of language; doc 19 §19.4's cascade is the
+    reference either way.
+
+100. **Which responses carry `Allow` and `Accept-Query`?** Doc 03 §3.6 says "responses
+    carry `Accept-Query`" and §3.6.1 that a 405 carries `Allow`, and neither says which
+    other responses do. Issue 15 was a client reading `Allow` on a 200 and being told
+    the opposite of the 405. Unit 36 settled it here as `Allow` on the 405 alone, because
+    a versioned success is cached for a year and the method list is the deployment's,
+    not the bundle's; and `Accept-Query` on every response of a resource that takes
+    QUERY, because a stale copy of it can only add a method. A client can rely on that
+    only if the spec says so. Proposed for §3.6's methods bullet: `Allow` appears on a
+    405 and on no cacheable response, and a client learns a resource's methods from a
+    405 or from `Accept-Query`, never from a stored success.
+
+101. **Variables inside a triple term live in `o`, not in the bindings body.** Doc 09
     §9.2 names inner variables through the JSON body form so that they surface as output
     columns. This implementation takes them in `o` on `/fragment` and `/count`, in
     request syntax — `o=<<( ex:s ?p ?o )>>` — for three reasons. The body form here *is*
@@ -3839,23 +4396,32 @@ following the code.
     question. The names are placeholders: a repeated name is refused rather than
     read as a join. Proposed: doc 03 §3.7 admits `?name` inside the `o` triple term
     on GET, keeps the body form for bindings, and leaves columns to item 33.
-86. **`reification` should not be a gate.** A bundle whose dictionary holds
+102. **`reification` should not be a gate.** A bundle whose dictionary holds
     triple-term IRIs without `data.hdt.tt` is refused at open, so a bundle without
     the index provably holds no triple terms and answers every pattern naming one —
     exactly, with nothing. Doc 03 §3.7 has such patterns return
     `capability_not_available` without the capability; that would make a federated
     client special-case bundles that can answer. The capability remains, as the
     statement a router reads without the bundle.
-87. **A directional literal's JSON term object.** RDF 1.2's base direction is kept in
+103. **A directional literal's JSON term object.** RDF 1.2's base direction is kept in
     `lang` as N-Triples 1.2 writes it, `"lang": "ar--rtl"`, which round-trips through
     request syntax and the dictionary. SPARQL 1.2 results JSON instead splits it,
     `"xml:lang": "ar", "its:dir": "rtl"`. Doc 03's term object should choose before a
     bundle with directional literals is served.
-88. **Blank nodes found only in the propositions HDT.** They need a published name and
+104. **Blank nodes found only in the propositions HDT.** They need a published name and
     have no dictionary id in `data.hdt`; this implementation scopes them by the
     propositions HDT's digest, the graph-only blank name's precedent (question 80). A
     node the data also holds is published under the data's IRI, and the propositions
     spelling of it is refused, so each node has one name.
+105. **What a triple term reads as in a verbalized text.** Unit 35's verbalizer met triple
+    terms only through this branch's merge, and read them as the IRIs they are stored
+    as: a reifier's text carried its triple term as the encoding's hash, humanized, and
+    in a predicate sample that hash took the place of a nameable value. A triple term
+    is now treated as a blank node is — no line, no place in a sample, no label — so
+    the encoding is never written. A reifier's text therefore leaves out the very
+    statement it is about. Reading `<<( s p o )>>` as its three labels, as one line or
+    as the root's label when it has none, is the likely answer; doc 13's embedding
+    view should say which.
 
 ## Not in this plan
 

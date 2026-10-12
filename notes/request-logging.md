@@ -91,7 +91,7 @@ the line is also readable by eye.
 | `request_hash` | 16 hex chars or `null` | `CanonicalRequest::hash` where a binding exists, §5 | shape |
 | `open_ms`, `first_open` | integer or `null`, bool | §8 | shape |
 | `client_hash`, `forwarded_hash` | 16 hex chars or `null` | §4 | shape |
-| `client_class` | `comunica` / `browser` / `curl` / `python` / `node` / `kgf` / `unknown` | §4 | shape |
+| `client_class` | `comunica` / `kgf-sparql` / `browser` / `curl` / `python` / `node` / `kgf` / `unknown` | §4 | shape |
 | `user_agent` | truncated to 200 bytes | header | **raw** |
 | `client_request_id` | truncated inbound `X-Request-Id`, if any | header | **raw** |
 | `shape` | object, per operation — §2.2 | typed request | shape |
@@ -315,10 +315,21 @@ the end of the combined list, every header line included, and a list shorter tha
 (starts `Mozilla/`), `curl`, `python` (`python-requests`, `httpx`, `aiohttp`,
 `urllib`), `node` (`node`, `undici`), `kgf` (the client library and `kgfq`, once
 they exist — **they should send `User-Agent: kgf-client/<version>`**, and this note
-is where that requirement is recorded until doc 06 says it), else `unknown`. Keep
+is where that requirement is recorded until doc 06 says it), `kgf-sparql` (contains
+`kgf-sparql`), else `unknown`. Matching runs most specific first, `kgf` before
+`kgf-sparql` before `comunica`: kgfq runs SPARQL through kgf-sparql, which runs on
+Comunica, and a client that names its runtime belongs to the client. Keep
 the truncated raw UA only in the raw tier; the classifier will need refining from
 access-controlled samples once real clients appear, and doc 12 §12.5.2 shows how
 much a UA fingerprint can identify.
+
+`kgf-sparql` was added 2026-10-06, when the public deployment's access log showed the
+engine's `kgf-sparql/<version> (+https://github.com/frink-okn/kgf-sparql)` agent — the
+bulk of that week's traffic, from benchmark runs — landing in `unknown`. It is its own
+class rather than `kgf` or `comunica` because its workload is neither: a SPARQL engine
+issuing hundreds of thousands of native-source requests per run, where an agent client
+issues a few and stock Comunica reads `/tpf`. Folding it into either would hide the
+distinction the client mix exists to measure.
 
 **`request_id`.** `{process_nonce:016x}-{counter:08x}`: the same per-process nonce
 and an `AtomicU64`. Unique across restarts by the nonce, ordered within one by the
