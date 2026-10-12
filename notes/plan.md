@@ -4421,15 +4421,17 @@ following the code.
     propositions HDT's digest, the graph-only blank name's precedent (question 80). A
     node the data also holds is published under the data's IRI, and the propositions
     spelling of it is refused, so each node has one name.
-105. **What a triple term reads as in a verbalized text.** Unit 35's verbalizer met triple
-    terms only through this branch's merge, and read them as the IRIs they are stored
-    as: a reifier's text carried its triple term as the encoding's hash, humanized, and
-    in a predicate sample that hash took the place of a nameable value. A triple term
-    is now treated as a blank node is — no line, no place in a sample, no label — so
-    the encoding is never written. A reifier's text therefore leaves out the very
-    statement it is about. Reading `<<( s p o )>>` as its three labels, as one line or
-    as the root's label when it has none, is the likely answer; doc 13's embedding
-    view should say which.
+105. **Resolved (2026-10-12): a triple term reads as its terms in a verbalized text.**
+    Unit 35's verbalizer met triple terms only through this branch's merge, and read
+    them as the IRIs they are stored as: a reifier's text carried its triple term as
+    the encoding's hash, humanized, and in a predicate sample that hash took the place
+    of a nameable value. A triple term now reads as its subject, predicate and object,
+    each named as a mention and a line's predicate are — `reifies: Alice knows Bob` —
+    a nested one in parentheses, a blank node left out, and an unasserted one's terms
+    named by the data's terms of the same spelling, where their labels are. It takes a
+    place in a sample as an IRI does, keyed by its IRI, which its content fixes.
+    Whether a reifier with no label of its own should take its triple term's reading
+    as its label is left to doc 13's embedding view.
 
 ## Not in this plan
 

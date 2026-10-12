@@ -132,6 +132,7 @@ use std::rc::Rc;
 use hdtc::format::{is_triple_term_iri, parse_literal};
 use kgf_store::dict::Dictionary;
 use kgf_store::pattern::{IdPattern, Selection};
+use kgf_store::triple_terms::Source;
 use kgf_store::{IdTriple, Role, Store, TermId};
 use serde::Serialize;
 
@@ -219,9 +220,8 @@ impl Terms {
 /// literals quoted; a literal's lexical form is what a text wants, and the
 /// language tag or datatype is not. An RDF 1.2 triple term is stored as an
 /// IRI under hdtc's reserved namespace, an encoding that names nothing a
-/// reader should see; until a text says what a triple term reads as, it is
-/// treated as a blank node is — no line, no place in a sample, no label —
-/// so the encoding is never written.
+/// reader should see: a text reads it as its subject, predicate and object
+/// instead ([`Verbalizer::triple_term_text`]), and never writes the encoding.
 enum TermKind<'a> {
     Iri(&'a str),
     BlankNode,
@@ -862,8 +862,10 @@ impl<'a> Verbalizer<'a> {
         let text = self.resolve(Role::Object, object)?;
         Ok(match classify(&text) {
             TermKind::Literal(value) => Some(value.to_owned()),
-            TermKind::Iri(_) => Some(text.to_string()),
-            TermKind::BlankNode | TermKind::TripleTerm => None,
+            // A triple term's IRI is minted from its content, so it keys the
+            // same triple term the same way in every build.
+            TermKind::Iri(_) | TermKind::TripleTerm => Some(text.to_string()),
+            TermKind::BlankNode => None,
         })
     }
 
@@ -871,7 +873,7 @@ impl<'a> Verbalizer<'a> {
     /// line: a blank node, or a label that came out empty.
     fn object_text(&mut self, object: u64, target: usize) -> Result<Option<Rc<str>>, Error> {
         let text = self.resolve(Role::Object, object)?;
-        if matches!(classify(&text), TermKind::BlankNode | TermKind::TripleTerm) {
+        if text.starts_with("_:") {
             return Ok(None);
         }
         let label = self.display_label(Node::Object(object), target, false)?;
@@ -1052,7 +1054,7 @@ impl<'a> Verbalizer<'a> {
         let iri = match classify(&text) {
             TermKind::Literal(value) => return Ok(normalize_label(value)),
             TermKind::BlankNode => return Ok(text.to_string()),
-            TermKind::TripleTerm => return Ok(String::new()),
+            TermKind::TripleTerm => return self.triple_term_text(Source::Data, id, target),
             TermKind::Iri(iri) => iri.to_owned(),
         };
 
@@ -1195,6 +1197,124 @@ impl<'a> Verbalizer<'a> {
             }
         }
         Ok(None)
+    }
+
+    /// A triple term as a text reads it: its subject, predicate and object,
+    /// each named as a mentioned node and a line's predicate are — `Alice
+    /// knows Bob` — with a nested triple term in parentheses and a blank node
+    /// left out, as it is from a line.
+    ///
+    /// `object` is the triple term's object id in `source`. An asserted one's
+    /// terms are `data.hdt`'s; an unasserted one's are the propositions HDT's,
+    /// and each is named by the data's term of the same spelling when the
+    /// data has one, which is where its labels are.
+    fn triple_term_text(
+        &mut self,
+        source: Source,
+        object: u64,
+        target: usize,
+    ) -> Result<String, Error> {
+        let Some(terms) = self.store.triple_terms() else {
+            return Ok(String::new());
+        };
+        let Some(proposition) = terms.decode_in(source, object) else {
+            return Ok(String::new());
+        };
+        let triple = proposition.triple;
+        let parts = match proposition.source {
+            Source::Data => [
+                self.term_text(Node::Subject(triple.subject), target)?,
+                self.predicate_name(triple.predicate, target)?.to_string(),
+                match terms.decode_in(Source::Data, triple.object) {
+                    Some(_) => self.nested_text(Source::Data, triple.object, target)?,
+                    None => self.term_text(Node::Object(triple.object), target)?,
+                },
+            ],
+            Source::Propositions => {
+                let dictionary = terms
+                    .propositions_dict()
+                    .expect("an unasserted triple term has a propositions HDT");
+                let spelled = |role: Role, id: u64| -> Result<String, Error> {
+                    let mut buffer = Vec::new();
+                    let bytes = dictionary.extract(role, TermId(id), &mut buffer)?;
+                    String::from_utf8(bytes.to_vec()).map_err(|_| Error::NotUtf8 { role, id })
+                };
+                let subject = spelled(Role::Subject, triple.subject)?;
+                let predicate = spelled(Role::Predicate, triple.predicate)?;
+                [
+                    self.spelled_text(&subject, target)?,
+                    match self
+                        .dictionary
+                        .locate(Role::Predicate, predicate.as_bytes())?
+                    {
+                        Some(id) => self.predicate_name(id.0, target)?.to_string(),
+                        None => fallback_label(&predicate).to_lowercase(),
+                    },
+                    match terms.decode_in(Source::Propositions, triple.object) {
+                        Some(_) => self.nested_text(Source::Propositions, triple.object, target)?,
+                        None => {
+                            let object = spelled(Role::Object, triple.object)?;
+                            self.spelled_text(&object, target)?
+                        }
+                    },
+                ]
+            }
+        };
+        Ok(parts
+            .iter()
+            .filter(|part| !part.is_empty())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" "))
+    }
+
+    /// A nested triple term, in parentheses, or nothing if it reads as
+    /// nothing.
+    fn nested_text(&mut self, source: Source, object: u64, target: usize) -> Result<String, Error> {
+        let text = self.triple_term_text(source, object, target)?;
+        Ok(if text.is_empty() {
+            text
+        } else {
+            format!("({text})")
+        })
+    }
+
+    /// A `data.hdt` term of a triple term, named as a mention is; nothing for
+    /// a blank node.
+    fn term_text(&mut self, node: Node, target: usize) -> Result<String, Error> {
+        let role = match node {
+            Node::Subject(_) => Role::Subject,
+            Node::Object(_) => Role::Object,
+            Node::Predicate(_) => Role::Predicate,
+        };
+        let id = match node {
+            Node::Subject(id) | Node::Object(id) | Node::Predicate(id) => id,
+        };
+        if self.resolve(role, id)?.starts_with("_:") {
+            return Ok(String::new());
+        }
+        Ok(self.display_label(node, target, false)?.to_string())
+    }
+
+    /// A propositions-HDT term of a triple term, by its spelling: a
+    /// literal's lexical form; an IRI named as the data's term of that IRI
+    /// is, or by its fragment if the data lacks it; nothing for a blank node.
+    fn spelled_text(&mut self, spelling: &str, target: usize) -> Result<String, Error> {
+        match classify(spelling) {
+            TermKind::Literal(value) => Ok(normalize_label(value)),
+            TermKind::BlankNode | TermKind::TripleTerm => Ok(String::new()),
+            TermKind::Iri(iri) => {
+                for (role, node) in [
+                    (Role::Subject, Node::Subject as fn(u64) -> Node),
+                    (Role::Object, Node::Object as fn(u64) -> Node),
+                ] {
+                    if let Some(id) = self.dictionary.locate(role, iri.as_bytes())? {
+                        return Ok(self.display_label(node(id.0), target, false)?.to_string());
+                    }
+                }
+                Ok(fallback_label(iri))
+            }
+        }
     }
 
     /// How a predicate reads at the head of a line: its label along the

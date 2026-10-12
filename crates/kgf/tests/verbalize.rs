@@ -896,39 +896,41 @@ fn a_class_is_walked_by_position_across_pages() {
 }
 
 #[test]
-fn a_triple_term_is_never_written_and_takes_no_place_in_a_sample() {
-    // A reifier: its triple term is stored as an IRI under hdtc's reserved
-    // namespace, which no text may show — not as an IRI, not as the hash its
-    // fragment would humanize to. Under a limit of one, among twenty triple
-    // terms, the one nameable value keeps its place.
+fn a_triple_term_reads_as_its_terms() {
+    // A claim node: what it reifies, what it claims — a triple term nesting
+    // another, neither asserted — and one whose subject is a blank node. Each
+    // reads as its subject, predicate and object, named as any mention and
+    // any line's predicate are; the nested one in parentheses; the blank node
+    // left out. The encoding a triple term is stored under is never written.
     let reifies = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
     let mut source = graph(&[
         ("e", RDF_TYPE, "Claim"),
         ("e", RDFS_LABEL, "\"A claim\""),
-        ("e", "source", "\"survey\""),
-        ("e", "about", "\"kept\""),
-        ("a", "p", "b"),
+        ("alice", RDFS_LABEL, "\"Alice\""),
+        ("bob", RDFS_LABEL, "\"Bob\""),
+        ("dan", RDFS_LABEL, "\"Dan\""),
+        ("knows", RDFS_LABEL, "\"knows\""),
+        ("says", RDFS_LABEL, "\"says\""),
+        ("alice", "knows", "bob"),
     ]);
     source.push_str(&format!(
-        "<{EX}e> <{reifies}> <<( <{EX}a> <{EX}p> <{EX}b> )>> .\n"
+        "<{EX}e> <{reifies}> <<( <{EX}alice> <{EX}knows> <{EX}bob> )>> .\n\
+         <{EX}e> <{EX}claims> <<( <{EX}dan> <{EX}says> <<( <{EX}bob> <{EX}knows> <{EX}alice> )>> )>> .\n\
+         <{EX}e> <{EX}about> <<( _:someone <{EX}knows> <{EX}bob> )>> .\n"
     ));
-    for i in 0..20 {
-        source.push_str(&format!(
-            "<{EX}e> <{EX}about> <<( <{EX}a> <{EX}p> <{EX}c{i}> )>> .\n"
-        ));
-    }
     let published = Published::build(&source);
-    let config = parse_config(
-        r#"{"targets": {"claim": {"type": "http://example.com/Claim", "predicate_limit": 1}}}"#,
-    );
+    let config = parse_config(r#"{"targets": {"claim": {"type": "http://example.com/Claim"}}}"#);
     let rendered = one(&published.store, &config, &format!("{EX}e"));
-    assert!(!rendered.text.contains("urn:x-kgf"), "{}", rendered.text);
-    assert!(!rendered.text.contains("reifies"), "{}", rendered.text);
-    assert!(rendered.text.contains("\nabout: kept"), "{}", rendered.text);
-    assert!(
-        rendered.text.contains("\nsource: survey"),
-        "{}",
-        rendered.text
-    );
-    assert_eq!(rendered.limited, 0, "{}", rendered.text);
+    assert!(!rendered.text.contains("urn:x"), "{}", rendered.text);
+    for line in [
+        "\nreifies: Alice knows Bob",
+        "\nclaims: Dan says (Bob knows Alice)",
+        "\nabout: knows Bob",
+    ] {
+        assert!(
+            rendered.text.contains(line),
+            "{line:?} in {}",
+            rendered.text
+        );
+    }
 }
