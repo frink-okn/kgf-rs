@@ -577,7 +577,7 @@ impl<'a> Term<'a> {
             return Err(TermSyntaxError::Empty);
         }
         if text.starts_with("<<") {
-            return parse_triple_syntax(text, prefixes, depth + 1)
+            return parse_triple_syntax(text, Grammar::Request(prefixes), depth + 1)
                 .map(|triple| Term::Triple(Box::new(triple)));
         }
         if text.starts_with('"') {
@@ -597,9 +597,23 @@ impl<'a> Term<'a> {
 
     /// Parse Hydra ExplicitRepresentation, whose IRIs are bare and never
     /// expanded through the manifest prefix map.
+    ///
+    /// Hydra has no spelling for an RDF 1.2 triple term, so one is written as
+    /// request syntax writes it, `<<( subject predicate object )>>`, with each
+    /// of its terms in this grammar: `<<( http://ex/s http://ex/p "o"@en )>>`.
     pub fn parse_explicit(text: &'a str) -> Result<Self, TermSyntaxError> {
+        Self::parse_explicit_nested(text, 0)
+    }
+
+    /// [`parse_explicit`](Self::parse_explicit) at a nesting depth: the number
+    /// of triple terms enclosing `text`.
+    fn parse_explicit_nested(text: &'a str, depth: usize) -> Result<Self, TermSyntaxError> {
         if text.is_empty() {
             return Err(TermSyntaxError::Empty);
+        }
+        if text.starts_with("<<") {
+            return parse_triple_syntax(text, Grammar::Explicit, depth + 1)
+                .map(|triple| Term::Triple(Box::new(triple)));
         }
         if text.starts_with('"') {
             return parse_literal_syntax(text, parse_explicit_iri).map(Term::Literal);
@@ -988,41 +1002,81 @@ fn component(term: &Term<'_>) -> TripleTermComponent {
     }
 }
 
+/// The grammar a triple term's own terms are written in: the grammar of the
+/// parameter that holds it.
+#[derive(Debug, Clone, Copy)]
+enum Grammar<'p> {
+    /// Request syntax: bracketed IRIs and CURIEs, expanded by the prefixes.
+    Request(&'p PrefixMap),
+    /// Hydra's `ExplicitRepresentation`, the TPF route's: bare IRIs.
+    Explicit,
+}
+
+impl Grammar<'_> {
+    fn term<'a>(self, text: &'a str, depth: usize) -> Result<Term<'a>, TermSyntaxError> {
+        match self {
+            Self::Request(prefixes) => Term::parse_nested(text, prefixes, depth),
+            Self::Explicit => Term::parse_explicit_nested(text, depth),
+        }
+    }
+
+    fn iri<'a>(self, text: &'a str) -> Result<Cow<'a, str>, TermSyntaxError> {
+        match self {
+            Self::Request(prefixes) => parse_iri_syntax(text, prefixes),
+            Self::Explicit => parse_explicit_iri(text),
+        }
+    }
+
+    /// Where a variable inside a triple term is answered, said where one is
+    /// not.
+    fn variables(self) -> &'static str {
+        match self {
+            Self::Request(_) => {
+                "a variable inside a triple term makes it a pattern, which `/fragment` and \
+                 `/count` take as `o`, at the outermost triple term only"
+            }
+            Self::Explicit => {
+                "a variable inside a triple term makes it a pattern, which the TPF route does \
+                 not answer; `/fragment` and `/count` take one as `o`"
+            }
+        }
+    }
+}
+
 /// Parse `<<( subject predicate object )>>`, `depth` being how many triple
-/// terms this one is inside of, itself included.
+/// terms this one is inside of, itself included, and its terms written in
+/// `grammar`.
 ///
-/// The subject and predicate are single tokens — a bracketed IRI, a CURIE, or
-/// a blank node — and the object is everything up to the closing `)>>`,
-/// parsed as a term in its own right. That is what lets a literal object keep
-/// the request syntax's rule that its closing quote is the last one, quotes
-/// and parentheses inside included, and lets a triple term nest.
+/// The subject and predicate are single tokens — an IRI, a CURIE, or a blank
+/// node — and the object is everything up to the closing `)>>`, parsed as a
+/// term in its own right. That is what lets a literal object keep the rule
+/// that its closing quote is the last one, quotes and parentheses inside
+/// included, and lets a triple term nest.
 fn parse_triple_syntax<'a>(
     text: &'a str,
-    prefixes: &PrefixMap,
+    grammar: Grammar<'_>,
     depth: usize,
 ) -> Result<TripleTerm<'a>, TermSyntaxError> {
     let (subject, predicate, object) = triple_parts(text, depth)?;
     if subject.starts_with('?') || predicate.starts_with('?') || object.starts_with('?') {
         return Err(TermSyntaxError::MalformedTripleTerm {
             token: text.to_owned(),
-            detail: "a variable inside a triple term makes it a pattern, which `/fragment` \
-                     and `/count` take as `o`, at the outermost triple term only"
-                .to_owned(),
+            detail: grammar.variables().to_owned(),
         });
     }
-    let subject = Term::parse_nested(subject, prefixes, depth)?;
-    let predicate = parse_iri_syntax(predicate, prefixes)?;
-    let object = Term::parse_nested(object, prefixes, depth)?;
+    let subject = grammar.term(subject, depth)?;
+    let predicate = grammar.iri(predicate)?;
+    let object = grammar.term(object, depth)?;
     Ok(TripleTerm::new(subject, predicate, object).expect("the subject was checked"))
 }
 
 /// The subject, predicate and object texts of `<<( s p o )>>`.
 ///
 /// The subject and predicate are single tokens — a bracketed IRI, a CURIE, a
-/// blank node, or a variable — and the object is everything up to the closing
-/// `)>>`, to be parsed as a term in its own right. That is what lets a literal
-/// object keep the request syntax's rule that its closing quote is the last
-/// one, quotes and parentheses inside included, and lets a triple term nest.
+/// bare IRI, a blank node, or a variable — and the object is everything up to
+/// the closing `)>>`, to be parsed as a term in its own right. That is what
+/// lets a literal object keep the rule that its closing quote is the last one,
+/// quotes and parentheses inside included, and lets a triple term nest.
 fn triple_parts(text: &str, depth: usize) -> Result<(&str, &str, &str), TermSyntaxError> {
     let malformed = |detail: &str| TermSyntaxError::MalformedTripleTerm {
         token: text.to_owned(),
@@ -2199,6 +2253,59 @@ mod tests {
         assert_eq!(
             Term::from_json(&serde_json::to_value(&nested).unwrap()).unwrap(),
             nested
+        );
+    }
+
+    /// The TPF route writes a triple term's terms in its own grammar, bare
+    /// IRIs and all, and means the same triple term request syntax does.
+    #[test]
+    fn a_triple_term_parses_in_explicit_representation() {
+        let prefixes = prefixes(&[("ex", "http://example.org/")]);
+        let request = Term::parse(
+            "<<( ex:a ex:says <<( ex:b ex:p \"x )>> y\"@en )>> )>>",
+            &prefixes,
+        )
+        .unwrap();
+        for explicit in [
+            "<<( http://example.org/a http://example.org/says <<( http://example.org/b http://example.org/p \"x )>> y\"@en )>> )>>",
+            "<<(http://example.org/a  http://example.org/says <<(http://example.org/b http://example.org/p \"x )>> y\"@EN)>>)>>",
+        ] {
+            let parsed = Term::parse_explicit(explicit).unwrap();
+            assert_eq!(parsed, request, "{explicit}");
+            assert_eq!(parsed.to_dictionary(), request.to_dictionary());
+        }
+        let typed = Term::parse_explicit(
+            "<<( http://example.org/a http://example.org/p \"1\"^^http://www.w3.org/2001/XMLSchema#integer )>>",
+        )
+        .unwrap();
+        let Term::Triple(typed) = typed else {
+            panic!("not a triple term")
+        };
+        assert_eq!(
+            typed.object(),
+            &Term::Literal(Literal::typed(
+                "1",
+                "http://www.w3.org/2001/XMLSchema#integer"
+            ))
+        );
+
+        // Brackets are request syntax, and a variable makes a pattern this
+        // route does not answer.
+        assert!(
+            Term::parse_explicit(
+                "<<( <http://example.org/a> http://example.org/p http://example.org/o )>>"
+            )
+            .is_err()
+        );
+        let Err(TermSyntaxError::MalformedTripleTerm { detail, .. }) =
+            Term::parse_explicit("<<( ?s http://example.org/p http://example.org/o )>>")
+        else {
+            panic!("a variable inside is refused")
+        };
+        assert!(detail.contains("TPF route"), "{detail}");
+        assert!(
+            Term::parse_explicit("<<( \"a\" http://example.org/p http://example.org/o )>>")
+                .is_err()
         );
     }
 

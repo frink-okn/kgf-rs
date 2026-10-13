@@ -112,6 +112,7 @@ layer, as it does today.
 | `"lex"` | plain literal |
 | `"lex"@tag` | language-tagged literal; the tag is validated as today |
 | `"lex"^^IRI` | typed literal, datatype **bare**; `^^http://www.w3.org/2001/XMLSchema#string` folds to plain as `KgfLiteral::typed` already does |
+| `<<( s p o )>>` | a ground RDF 1.2 triple term, `object` only, its three terms in this grammar: `<<( http://ex/s http://ex/p "o"@en )>>` |
 | anything else | an IRI, and it must be one: `oxrdf::NamedNode::new` accepts it or the value is a 400 |
 
 Rules that follow from "nothing else":
@@ -127,6 +128,12 @@ Rules that follow from "nothing else":
   precedes `@`, `^^`, or the end of the value. Hydra says the form "requires no
   escaping"; a value that opens a quote and never closes it is a 400.
 - `_:x` is parsed and never matched, the rule doc 03 §3.3 already applies.
+- Hydra has no spelling for an RDF 1.2 triple term, so this route borrows request
+  syntax's delimiters and keeps its own terms inside them (added 2026-10-12, with
+  triple terms). `<< s p o >>` is a reifying triple, not a term, and is refused as on
+  `/fragment`; so is a variable inside, since patterns inside triple terms are
+  `/fragment`'s and `/count`'s. A triple term as `subject` or `predicate` is a 400:
+  RDF 1.2 has none there.
 - `max_term_bytes` applies to the canonical form, as in `BoundTerm::parse`.
 
 ### `values=`

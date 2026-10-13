@@ -2510,6 +2510,59 @@ fn triple_terms_travel_with_rdf_and_hdt_inputs() {
     }
 }
 
+/// A triple term named by `rdf:type` is no class, as a blank node is not. A
+/// bundle holding one builds, and the description it publishes — what
+/// `/schema` and `/summary` serve — never names the IRI the triple term is
+/// stored under: the VoID HDT would refuse it as input, and every request
+/// refuses it.
+#[test]
+fn a_triple_term_type_is_no_class_in_the_description() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tt.nt");
+    let rdf_type = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
+    std::fs::write(
+        &source,
+        format!(
+            "{TRIPLE_TERMS}<http://example.org/alice> {rdf_type} <http://example.org/Person> .\n\
+             <http://example.org/bob> {rdf_type} <<( <http://example.org/a> \
+             <http://example.org/b> <http://example.org/c> )>> .\n"
+        ),
+    )
+    .unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    let schema = std::fs::read_to_string(out.join("stats/schema-nodes.tsv")).unwrap();
+    assert!(schema.contains("http://example.org/Person"), "{schema}");
+    for name in [
+        "schema-nodes.tsv",
+        "class-relations.tsv",
+        "class-properties.tsv",
+        "namespaces.json",
+        "summary.json",
+        "summary.md",
+    ] {
+        let text = std::fs::read_to_string(out.join("stats").join(name)).unwrap();
+        assert!(
+            !text.contains(hdtc::format::TRIPLE_TERM_NAMESPACE),
+            "{name} names a triple term's stored IRI: {text}"
+        );
+    }
+}
+
 /// A partial set of triple-term files beside an HDT input is refused before
 /// any work, naming the caller's files and leaving them where they were; an
 /// index-only input and one without a permutation index build; a dry run

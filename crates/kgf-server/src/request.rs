@@ -457,7 +457,7 @@ impl BoundTerm {
                 ErrorCode::BadTermSyntax,
                 format!(
                     "`{parameter}` is a triple term, but a triple term is only ever an object; \
-                     bind it as `o`"
+                     bind it in the object position"
                 ),
             ));
         }
@@ -2367,7 +2367,10 @@ impl BindingPattern {
                 Some(value) if value.starts_with('?') => {
                     BindingCell::Variable(Variable::parse(value, parameter)?)
                 }
-                Some(value) => BindingCell::Term(BoundTerm::parse_tpf(parameter, value, limits)?),
+                Some(value) => BindingCell::Term(
+                    BoundTerm::parse_tpf(parameter, value, limits)?
+                        .require_not_triple(position, parameter)?,
+                ),
                 None => BindingCell::Unbound(position),
             };
             cells.push(cell);

@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 use kgf_server::service::Service;
 use kgf_server::{AccessLog, AccessRecord};
-use kgf_store::testing::{Fixture, TINY_NT, WORKED_EXAMPLE_NQ};
+use kgf_store::testing::{Fixture, TINY_NT, TRIPLE_TERMS_NT, WORKED_EXAMPLE_NQ};
 use sha2::{Digest, Sha256};
 
 /// A second fixture graph, so two versions of one dataset differ in content and
@@ -616,6 +616,71 @@ fn every_tpf_page_names_one_canonical_fragment() {
         .collect::<Result<_, _>>()
         .expect("the second page parses");
     assert_eq!(object_for(&second_quads, primary_topic), Some(fragment));
+}
+
+/// The TPF route takes a ground triple term in its own grammar — bare IRIs
+/// inside `<<( … )>>` — and finds the rows whose object it is, as `/fragment`
+/// does with request syntax. One in the subject position, or with a variable
+/// inside, is refused.
+#[test]
+fn tpf_finds_a_ground_triple_term_written_with_bare_iris() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TRIPLE_TERMS_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let triple = "<<( http://example.org/alice http://example.org/knows http://example.org/bob )>>";
+    let page = server.request(
+        "GET",
+        &format!(
+            "/tox/v/v1/tpf?object={}",
+            kgf_server::url::encode_value(triple)
+        ),
+        &[("Accept", "application/n-quads")],
+    );
+    page.assert_status(200);
+    let body = page.text();
+    for reifier in ["e1", "e2"] {
+        assert!(
+            body.contains(&format!(
+                "<http://example.org/{reifier}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> \
+                 <<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>>"
+            )),
+            "{reifier}: {body}"
+        );
+    }
+    assert!(!body.contains("urn:x-kgf:tt"), "{body}");
+
+    for query in [
+        format!("subject={}", kgf_server::url::encode_value(triple)),
+        format!(
+            "object={}",
+            kgf_server::url::encode_value(
+                "<<( ?s http://example.org/knows http://example.org/bob )>>"
+            )
+        ),
+    ] {
+        let refused = server.get(&format!("/tox/v/v1/tpf?{query}"));
+        refused.assert_status(400);
+        assert_eq!(refused.json()["code"], "bad_term_syntax", "{query}");
+    }
+    // No prefix expansion inside either: `ex:alice` is an IRI of scheme `ex`
+    // here, as it is anywhere on this route, and names nothing this bundle
+    // holds.
+    let curies = server.request(
+        "GET",
+        &format!(
+            "/tox/v/v1/tpf?object={}",
+            kgf_server::url::encode_value("<<( ex:alice ex:knows ex:bob )>>")
+        ),
+        &[("Accept", "application/n-quads")],
+    );
+    curies.assert_status(200);
+    assert!(
+        curies
+            .text()
+            .contains("<http://www.w3.org/ns/hydra/core#totalItems> \"0\""),
+        "{}",
+        curies.text()
+    );
 }
 
 #[test]

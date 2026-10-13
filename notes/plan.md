@@ -3082,6 +3082,8 @@ The steps, each a commit reviewed on its own:
 5. **Ground triple terms in patterns.** `o=<<( … )>>` on `/fragment`, `/count`,
    `/describe`, bindings, and `/tpf`, through minting and an ordinary lookup.
    A triple term in the subject or predicate position is refused: RDF 1.2 has none.
+   *As built:* `/tpf` writes a triple term's own terms in its `ExplicitRepresentation`,
+   bare IRIs inside `<<( … )>>` (`notes/tpf-route.md`); Hydra has no spelling for one.
 6. **Variables inside a triple term** (`?e rdf:reifies <<( :s ?p ?o )>>`), depth 1.
    *As built:* in `o` on `/fragment` and `/count`, in request syntax with `?name`
    placeholders, rather than in the bindings body form — see question 101. The store answers them with one of three plans, chosen on cost from
@@ -3161,6 +3163,14 @@ itself take a triple term's IRIs as the label map does. The terms bound inside a
 triple pattern (`<<( ex:alice ?p ?o )>>`) are labelled before any row, as a bound
 position's are, and RDF's label statements carry them: a label's object is a literal,
 so it can never be mistaken for a row of a pattern whose object is a triple term.
+
+**A triple term is no class** (2026-10-12). hdtc's VoID took any `rdf:type` object
+that was not a blank node or a literal for a class IRI, so a triple term named by
+`rdf:type` became a `void:class` under the IRI it is stored by — which `hdtc create`
+then refused when the build turned that VoID into `stats/void.hdt`, so such a dataset
+could not be built at all. hdtc now treats a triple term as it treats a blank node
+there (`hdtc/docs/void-format.md` §2.3): no class partition, no typed subject, an
+untyped target.
 
 **A term held only inside unasserted triple terms is not absent** (2026-10-12).
 `absent_terms` says a release does not hold a term, a fact about the data remedied by
