@@ -3107,7 +3107,8 @@ The steps, each a commit reviewed on its own:
 8. **Notes**: this unit's *What landed*, and the questions for `../kgf` it raises.
 
 **What landed (2026-10-04).** All eight steps, each reviewed on its own, against hdtc
-branch `triple-terms`. Two decisions moved from the plan, recorded as questions 101–102:
+branch `triple-terms` — released as hdtc v1.3.0 (2026-10-13), which `Cargo.lock`, CI and
+the image now pin. Two decisions moved from the plan, recorded as questions 101–102:
 inner variables are written in `o` with `?name` placeholders, and `reification` is a
 declaration, not a gate. Three findings from building it:
 
