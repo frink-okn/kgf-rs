@@ -291,7 +291,9 @@ pub fn resolve(perms: &Permutations, pattern: IdPattern) -> Result<Selection<'_>
     })
 }
 
-fn validate_pattern(counts: &DictCounts, pattern: IdPattern) -> Result<()> {
+/// Refuse an identifier outside its role's dictionary range, before any
+/// structure is addressed with it.
+pub(crate) fn validate_pattern(counts: &DictCounts, pattern: IdPattern) -> Result<()> {
     validate_id(counts, Role::Subject, pattern.subject)?;
     validate_id(counts, Role::Predicate, pattern.predicate)?;
     validate_id(counts, Role::Object, pattern.object)

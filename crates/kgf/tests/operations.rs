@@ -206,6 +206,76 @@ fn triple_terms_are_published_decoded_and_found_by_their_content() {
     );
 }
 
+/// A term the release holds only inside unasserted triple terms is held: a
+/// pattern naming it is empty, and names nothing absent. A term the release
+/// holds nowhere is absent, and each one a triple pattern binds is reported.
+#[test]
+fn a_term_held_only_inside_unasserted_triple_terms_is_not_absent() {
+    let served = Served::from_fixture(Fixture::build(TRIPLE_TERMS_NT));
+    let store = served.store();
+    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+    // `ex:dan`, `ex:says` and `ex:erin` occur only in the unasserted claim
+    // `<<( ex:dan ex:says <<( ex:bob ex:knows ex:erin )>> )>>`, and the nested
+    // triple term only inside it.
+    for query in [
+        "s=ex:dan".to_owned(),
+        "p=ex:says".to_owned(),
+        "o=ex:erin".to_owned(),
+        format!("o={}", urlencode("<<( ex:bob ex:knows ex:erin )>>")),
+        format!("s=ex:dan&o={}", urlencode("<<( ?s ?p ?o )>>")),
+    ] {
+        let answer = served.fragment(&store, &query);
+        assert!(
+            answer["rows"].as_array().unwrap().is_empty(),
+            "{query}: {answer}"
+        );
+        assert!(answer.get("absent_terms").is_none(), "{query}: {answer}");
+        let counted = served.count(&store, &query);
+        assert_eq!(counted["count"]["value"], 0, "{query}: {counted}");
+        assert!(counted.get("absent_terms").is_none(), "{query}: {counted}");
+    }
+    let dan = served.describe(&store, "iri=ex:dan");
+    assert_eq!(dan["cardinality"]["value"], serde_json::json!(0));
+    assert!(dan.get("absent_terms").is_none(), "{dan}");
+
+    // So is a blank node only the propositions HDT holds, by the IRI its
+    // triple term is published with, and a page shows it apart from the
+    // data's nodes.
+    let e6 = served.fragment(&store, &format!("s=ex:e6&p={reifies}"));
+    let m = e6["rows"][0]["o"]["value"]["subject"]["value"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(m.starts_with("urn:fdc:"), "{e6}");
+    let described = served.describe(&store, &format!("iri=<{m}>"));
+    assert!(described.get("absent_terms").is_none(), "{described}");
+    let page = served.render(
+        &store,
+        "fragment",
+        &format!("s=ex:e6&p={reifies}"),
+        Representation::Html,
+    );
+    assert!(page.contains("_:tt-"), "{page}");
+
+    // Held nowhere: absent, every one of them.
+    let nobody = served.fragment(
+        &store,
+        &format!("o={}", urlencode("<<( ex:nobody ex:nothing ?o )>>")),
+    );
+    assert_eq!(
+        nobody["absent_terms"],
+        serde_json::json!([
+            {"parameter": "o", "reason": "not_in_bundle"},
+            {"parameter": "o", "reason": "not_in_bundle"}
+        ]),
+        "{nobody}"
+    );
+    assert_eq!(
+        served.fragment(&store, "s=ex:nobody")["absent_terms"],
+        serde_json::json!([{"parameter": "s", "reason": "not_in_bundle"}])
+    );
+}
+
 /// What a lenient ingest stores is published whatever it is: a language tag
 /// no validator passes, or a datatype IRI holding a quote. And a blank node inside a triple term is found
 /// again by the IRI it was published under, whichever role the data holds it
@@ -2299,6 +2369,29 @@ fn a_triple_terms_iris_are_labelled_and_linked_like_any_others() {
     // Two triple terms, the nested one inside the other: two pairs of brackets.
     assert_eq!(html.matches("class=\"tt-mark\"").count(), 4, "{html}");
     assert!(!html.contains("urn:x-kgf"), "{html}");
+
+    // A page labels them unasked, as it labels every IRI it shows.
+    let page = served.fragment_page(&store, "s=ex:x");
+    for label in ["Dan", "says", "Bob", "knows", "Alice"] {
+        assert!(
+            page.contains(&format!("class=\"t-label\">{label}<")),
+            "{label}: {page}"
+        );
+    }
+
+    // The terms a triple pattern binds are labelled before any row, as a
+    // bound position's are — in the map, and in RDF's label statements, which
+    // a label cannot be mistaken for: its object is no triple term. Here on a
+    // page with no row to carry them.
+    let pattern = format!(
+        "p=ex:claims&o={}&labels=true",
+        urlencode("<<( ex:alice ?p ?o )>>")
+    );
+    let empty = served.fragment(&store, &pattern);
+    assert!(empty["rows"].as_array().unwrap().is_empty(), "{empty}");
+    assert_eq!(empty["labels"][&ex("alice")], "Alice", "{empty}");
+    let turtle = served.render(&store, "fragment", &pattern, Representation::Turtle);
+    assert!(turtle.contains("\"Alice\""), "{turtle}");
 }
 
 #[test]
@@ -2947,6 +3040,30 @@ impl Served {
         )?;
         let answer = answer::fragment(store, self.target("fragment", query), &request)?;
         Ok(json(answer, Representation::Json))
+    }
+
+    /// A fragment's page as the router serves one: labelled by the release's
+    /// default cascade although the request did not ask.
+    fn fragment_page(&self, store: &Store, query: &str) -> String {
+        use kgf_server::answer::Renders;
+
+        let request = self.parse_fragment(query);
+        let mut answer = answer::fragment(store, self.target("fragment", query), &request)
+            .expect("a fragment answer");
+        answer
+            .hydrate_labels(
+                store,
+                &request::Labeling::release_default(
+                    self.release().predicate_roles(),
+                    self.limits(),
+                ),
+                1_000,
+            )
+            .expect("hydrate page labels");
+        let rendered = answer
+            .render(Representation::Html)
+            .expect("render a fragment page");
+        String::from_utf8(rendered.body.to_vec()).expect("a UTF-8 page")
     }
 
     fn fragment(&self, store: &Store, query: &str) -> serde_json::Value {

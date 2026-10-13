@@ -2041,26 +2041,27 @@ mod tests {
         let path = fixture
             .bundle_path()
             .join(crate::store::artifact::TRIPLE_TERMS);
-        let mut bytes = std::fs::read(&path).unwrap();
-        let get = |bytes: &[u8], at: usize, n: usize| {
-            let mut value = [0u8; 8];
-            value[..n].copy_from_slice(&bytes[at..at + n]);
-            u64::from_le_bytes(value)
-        };
-        let directory = get(&bytes, 56, 8) as usize;
-        let sections = get(&bytes, 40, 4) as usize;
-        let wanted = u64::from(section_type(component::DATA_POS, kind::LAYER_SUPERRANK));
-        let entry = (0..sections)
-            .map(|i| directory + i * 64)
-            .find(|&at| get(&bytes, at, 4) == wanted)
+        // Found through hdtc's own reading of the directory, so that only the
+        // tampering below is this test's.
+        let (_, sections) = read_triple_term_directory(&path).unwrap();
+        let wanted = section_type(component::DATA_POS, kind::LAYER_SUPERRANK);
+        let directory = sections
+            .iter()
+            .find(|section| section.section_type == wanted)
             .expect("the POS rank directory");
-        // Raise the population the directory's sentinel records: the
-        // directory's shape, and every count hdtc checks from it, still hold,
-        // but the layer now claims one mark its reverse array lacks.
-        let (offset, entries) = (get(&bytes, entry + 8, 8), get(&bytes, entry + 24, 8));
-        let sentinel = (offset + (entries - 1) * 8) as usize;
-        let marks = get(&bytes, sentinel, 8);
-        bytes[sentinel..sentinel + 8].copy_from_slice(&(marks + 1).to_le_bytes());
+        assert_eq!(
+            directory.bits_per_entry, 64,
+            "a superblock rank is a whole little-endian word"
+        );
+        // Raise the population the directory's sentinel — its last entry —
+        // records: the directory's shape, and every count hdtc checks from it,
+        // still hold, but the layer now claims one mark its reverse array
+        // lacks.
+        let sentinel = (directory.offset + (directory.entry_count - 1) * 8) as usize;
+        let mut bytes = std::fs::read(&path).unwrap();
+        let word: [u8; 8] = bytes[sentinel..sentinel + 8].try_into().unwrap();
+        let marks = u64::from_le_bytes(word) + 1;
+        bytes[sentinel..sentinel + 8].copy_from_slice(&marks.to_le_bytes());
         std::fs::write(&path, bytes).unwrap();
         let error = Store::open(
             &published_bundle(fixture.bundle_path()),

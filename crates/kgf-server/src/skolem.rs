@@ -20,6 +20,8 @@
 //! data's IRI. One that occurs only there is scoped by the propositions HDT's
 //! digest, for the same reason a graph-only name is scoped by the sidecar's.
 
+use std::borrow::Cow;
+
 use kgf_store::Store;
 use kgf_store::dict::{DictCounts, Section, SectionTermId};
 use kgf_store::graphs::GraphId;
@@ -122,12 +124,7 @@ impl SkolemScope {
     pub(crate) fn iri(&self, role: Role, id: TermId, dictionary_term: &str) -> Option<String> {
         dictionary_term.strip_prefix("_:")?;
         let section_id = self.counts.section_id(role, id).ok()?;
-        let section = match section_id.section() {
-            Section::Shared => "sh",
-            Section::Subjects => "s",
-            Section::Objects => "o",
-            Section::Predicates => return None,
-        };
+        let section = section_name(section_id.section())?;
         Some(format!(
             "{}{section}-{}",
             self.iri_prefix,
@@ -174,15 +171,27 @@ impl SkolemScope {
     /// page shows `_:sh-7` because `_:` is what an RDF reader recognizes, while
     /// the IRI it abbreviates stays in the link and the tooltip. Display only —
     /// nothing expands it, and it is not a spelling any parameter accepts.
-    pub(crate) fn display_label<'a>(&self, term: &'a str) -> Option<&'a str> {
+    ///
+    /// A node found only inside unasserted triple terms shows as
+    /// `tt-{section}-{local-id}`: its tail counts the propositions HDT's
+    /// sections, so without the mark it would read as the data's node with the
+    /// same tail, which is another node.
+    pub(crate) fn display_label<'a>(&self, term: &'a str) -> Option<Cow<'a, str>> {
         // Parsed rather than merely stripped, so a malformed or out-of-range
         // tail is shown as the ordinary IRI it is treated as everywhere else.
         if self.suffix(term).is_some() {
-            return term.strip_prefix(&self.iri_prefix);
+            return term.strip_prefix(&self.iri_prefix).map(Cow::Borrowed);
+        }
+        if let Some((prefix, _)) = &self.propositions
+            && let Some(tail) = term.strip_prefix(prefix.as_str())
+            && split_suffix(tail).is_some()
+        {
+            return Some(Cow::Owned(format!("tt-{tail}")));
         }
 
         self.graph_id(term)?;
         term.strip_prefix(self.graph_prefix.as_deref()?)
+            .map(Cow::Borrowed)
     }
 
     /// Split a URN of this scope into its section and canonical local id.
@@ -275,7 +284,7 @@ mod tests {
         assert!(!iri.starts_with(first.iri_prefix()), "{iri}");
         assert_eq!(first.graph_id(&iri), Some(GraphId(3)));
         assert_eq!(regrouped.graph_id(&iri), None);
-        assert_eq!(first.display_label(&iri), Some("g-3"));
+        assert_eq!(first.display_label(&iri).as_deref(), Some("g-3"));
 
         // Not a data blank node's spelling, and no data blank node's is one.
         assert_eq!(first.role_id(Role::Subject, &iri), None);
@@ -322,6 +331,35 @@ mod tests {
             first
                 .iri(Role::Subject, TermId(12), "http://example.org/named")
                 .is_none()
+        );
+    }
+
+    /// A node only the propositions HDT holds is named under that HDT's
+    /// digest, reversed only from it, and shown apart from the data's node
+    /// with the same section and local id.
+    #[test]
+    fn a_propositions_only_blank_node_is_scoped_and_shown_apart_from_the_data() {
+        let scope = SkolemScope::new([1; 32], counts()).with_propositions([9; 32], counts());
+        let only = scope
+            .propositions_iri(Role::Subject, TermId(12), "_:m")
+            .unwrap();
+        let data = scope.iri(Role::Subject, TermId(12), "_:n").unwrap();
+        assert_ne!(only, data);
+        assert_eq!(
+            scope.propositions_role_id(Role::Subject, &only),
+            Some(TermId(12))
+        );
+        assert_eq!(scope.propositions_role_id(Role::Subject, &data), None);
+        assert_eq!(scope.role_id(Role::Subject, &only), None);
+        assert_eq!(scope.display_label(&only).as_deref(), Some("tt-s-2"));
+        assert_eq!(scope.display_label(&data).as_deref(), Some("s-2"));
+
+        // A scope without a propositions HDT shows it as the IRI it is.
+        let bare = SkolemScope::new([1; 32], counts());
+        assert_eq!(bare.display_label(&only), None);
+        assert_eq!(
+            bare.propositions_iri(Role::Subject, TermId(12), "_:m"),
+            None
         );
     }
 }

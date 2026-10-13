@@ -174,7 +174,8 @@ impl<'a> TripleTerm<'a> {
         }
     }
 
-    fn into_owned(self) -> TripleTerm<'static> {
+    /// The same triple term, owning its text.
+    pub fn into_owned(self) -> TripleTerm<'static> {
         TripleTerm {
             subject: self.subject.into_owned(),
             predicate: Cow::Owned(self.predicate.into_owned()),
@@ -1141,11 +1142,7 @@ impl Serialize for Term<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         match self {
-            // SPARQL 1.2 Query Results JSON's triple term object.
-            Term::Triple(triple) => {
-                map.serialize_entry("type", "triple")?;
-                map.serialize_entry("value", &TripleValue(triple))?;
-            }
+            Term::Triple(triple) => triple_entries(&mut map, triple)?,
             Term::Iri(iri) => {
                 map.serialize_entry("type", "iri")?;
                 map.serialize_entry("value", iri.as_ref())?;
@@ -1170,6 +1167,23 @@ impl Serialize for Term<'_> {
         }
         map.end()
     }
+}
+
+impl Serialize for TripleTerm<'_> {
+    /// The term object [`Term::Triple`] writes, for a caller holding the
+    /// triple term alone.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        triple_entries(&mut map, self)?;
+        map.end()
+    }
+}
+
+/// SPARQL 1.2 Query Results JSON's triple term object: its `type`, and its
+/// three components as its `value`.
+fn triple_entries<M: SerializeMap>(map: &mut M, triple: &TripleTerm<'_>) -> Result<(), M::Error> {
+    map.serialize_entry("type", "triple")?;
+    map.serialize_entry("value", &TripleValue(triple))
 }
 
 /// The `value` of a triple term object: its three components, each a term
@@ -1470,8 +1484,9 @@ impl TermCache {
     }
 }
 
-/// The bytes a term object occupies, without producing them.
-pub(crate) fn serialized_bytes(term: &Term<'_>) -> u64 {
+/// The bytes a term object occupies, without producing them: a [`Term`], or a
+/// [`TripleTerm`] held on its own.
+pub(crate) fn serialized_bytes<T: Serialize + ?Sized>(term: &T) -> u64 {
     struct Counter(u64);
     impl std::io::Write for Counter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {

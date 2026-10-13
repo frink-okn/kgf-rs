@@ -279,12 +279,16 @@ impl Store {
         pattern: TripleTermPattern,
     ) -> Result<Option<TripleTermSelection<'_>>> {
         // The outer ids are validated whether or not there is anything to
-        // match, as for every pattern.
-        self.data.resolve(IdPattern {
-            subject: pattern.subject,
-            predicate: pattern.predicate,
-            object: None,
-        })?;
+        // match, as for every pattern — by their ranges alone, since nothing
+        // is looked up until a plan is chosen.
+        crate::pattern::validate_pattern(
+            self.data.dict_counts(),
+            IdPattern {
+                subject: pattern.subject,
+                predicate: pattern.predicate,
+                object: None,
+            },
+        )?;
         match &self.triple_terms {
             None => Ok(None),
             Some(terms) => terms.select(&self.data, pattern).map(Some),

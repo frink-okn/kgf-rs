@@ -3155,7 +3155,24 @@ the IRIs it holds, so the label map, RDF's label statements and the page take it
 subject, predicate and object — a nested triple term's too, and a bound triple term's
 in place of its encoding, which is never a key. A page shows a triple term's three
 terms each linked to its own description with its label beneath, between brackets
-that link to the rows whose object is the whole triple term.
+that link to the rows whose object is the whole triple term. That holds for every
+page, not only one that asked for `labels=true`: the labels a page resolves for
+itself take a triple term's IRIs as the label map does. The terms bound inside a
+triple pattern (`<<( ex:alice ?p ?o )>>`) are labelled before any row, as a bound
+position's are, and RDF's label statements carry them: a label's object is a literal,
+so it can never be mistaken for a row of a pattern whose object is a triple term.
+
+**A term held only inside unasserted triple terms is not absent** (2026-10-12).
+`absent_terms` says a release does not hold a term, a fact about the data remedied by
+asking another release. A term the propositions HDT holds — `ex:dan` in an
+unasserted `<<( ex:dan ex:says … )>>`, or a blank node only it holds, by its
+propositions-scoped IRI — is published by this release in every triple term holding
+it, so a pattern or `/describe` naming it is empty without calling it absent. As for
+`data.hdt`, a term is held in a role: the propositions HDT must hold it in the role
+the pattern names. Every inner term of a triple pattern held nowhere is reported,
+not only the first. A page shows a blank node only the propositions HDT holds as
+`_:tt-{section}-{local-id}`, apart from the data's node with the same section and
+local id, which is a different node.
 
 **A layer is a bitmap or a sparse set, whichever is smaller.** hdtc first kept each
 layer as a bitmap over every triple, three bits per triple of the dataset whatever
