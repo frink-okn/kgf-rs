@@ -13,6 +13,14 @@
 //! id is a layer of the membership sidecar, and two sidecars over one HDT can
 //! give the same layer id to different graphs, so it is scoped by the
 //! sidecar's digest instead.
+//!
+//! A blank node inside an unasserted RDF 1.2 triple term lives in the
+//! propositions HDT. When the data has a node with the same label it *is* that
+//! node — hdtc labels an input's two HDTs alike — and is published under the
+//! data's IRI. One that occurs only there is scoped by the propositions HDT's
+//! digest, for the same reason a graph-only name is scoped by the sidecar's.
+
+use std::borrow::Cow;
 
 use kgf_store::Store;
 use kgf_store::dict::{DictCounts, Section, SectionTermId};
@@ -29,6 +37,9 @@ pub(crate) struct SkolemScope {
     /// memberships, which has no such graph to name.
     graph_prefix: Option<String>,
     counts: DictCounts,
+    /// Where blank nodes found only in the propositions HDT are minted, with
+    /// that HDT's dictionary counts; `None` for a bundle without one.
+    propositions: Option<(String, DictCounts)>,
 }
 
 impl SkolemScope {
@@ -38,16 +49,58 @@ impl SkolemScope {
             iri_prefix: scoped_prefix(hdt_identity_digest),
             graph_prefix: None,
             counts,
+            propositions: None,
         }
     }
 
     /// The scope of every blank node one open bundle publishes.
     pub(crate) fn of(store: &Store) -> Self {
         let scope = Self::new(store.hdt_identity_digest(), *store.dict().counts());
-        match store.graphs() {
+        let scope = match store.graphs() {
             Some(graphs) => scope.with_graph_sidecar(graphs.sidecar_identity_digest()),
             None => scope,
+        };
+        let propositions = store.triple_terms().and_then(|terms| {
+            Some((
+                terms.propositions_identity_digest()?,
+                *terms.propositions_dict()?.counts(),
+            ))
+        });
+        match propositions {
+            Some((digest, counts)) => scope.with_propositions(digest, counts),
+            None => scope,
         }
+    }
+
+    /// Bind blank nodes found only in the propositions HDT to its digest.
+    pub(crate) fn with_propositions(self, digest: [u8; 32], counts: DictCounts) -> Self {
+        Self {
+            propositions: Some((scoped_prefix(digest), counts)),
+            ..self
+        }
+    }
+
+    /// Replace a propositions-HDT blank node, one the data does not hold, with
+    /// its stable RDF IRI. `None` in a scope without a propositions HDT.
+    pub(crate) fn propositions_iri(
+        &self,
+        role: Role,
+        id: TermId,
+        dictionary_term: &str,
+    ) -> Option<String> {
+        dictionary_term.strip_prefix("_:")?;
+        let (prefix, counts) = self.propositions.as_ref()?;
+        let section_id = counts.section_id(role, id).ok()?;
+        let section = section_name(section_id.section())?;
+        Some(format!("{prefix}{section}-{}", section_id.local_id()))
+    }
+
+    /// Recover the role-scoped propositions-HDT id one of its blank-node URNs
+    /// names. The caller still verifies the id names a blank node there.
+    pub(crate) fn propositions_role_id(&self, role: Role, term: &str) -> Option<TermId> {
+        let (prefix, counts) = self.propositions.as_ref()?;
+        let (section, local_id) = split_suffix(term.strip_prefix(prefix.as_str())?)?;
+        counts.role_id(role, SectionTermId::new(section, local_id)?)
     }
 
     /// Bind graph-only blank names to the membership sidecar's digest.
@@ -71,12 +124,7 @@ impl SkolemScope {
     pub(crate) fn iri(&self, role: Role, id: TermId, dictionary_term: &str) -> Option<String> {
         dictionary_term.strip_prefix("_:")?;
         let section_id = self.counts.section_id(role, id).ok()?;
-        let section = match section_id.section() {
-            Section::Shared => "sh",
-            Section::Subjects => "s",
-            Section::Objects => "o",
-            Section::Predicates => return None,
-        };
+        let section = section_name(section_id.section())?;
         Some(format!(
             "{}{section}-{}",
             self.iri_prefix,
@@ -123,27 +171,54 @@ impl SkolemScope {
     /// page shows `_:sh-7` because `_:` is what an RDF reader recognizes, while
     /// the IRI it abbreviates stays in the link and the tooltip. Display only —
     /// nothing expands it, and it is not a spelling any parameter accepts.
-    pub(crate) fn display_label<'a>(&self, term: &'a str) -> Option<&'a str> {
+    ///
+    /// A node found only inside unasserted triple terms shows as
+    /// `tt-{section}-{local-id}`: its tail counts the propositions HDT's
+    /// sections, so without the mark it would read as the data's node with the
+    /// same tail, which is another node.
+    pub(crate) fn display_label<'a>(&self, term: &'a str) -> Option<Cow<'a, str>> {
         // Parsed rather than merely stripped, so a malformed or out-of-range
         // tail is shown as the ordinary IRI it is treated as everywhere else.
         if self.suffix(term).is_some() {
-            return term.strip_prefix(&self.iri_prefix);
+            return term.strip_prefix(&self.iri_prefix).map(Cow::Borrowed);
         }
+        if let Some((prefix, _)) = &self.propositions
+            && let Some(tail) = term.strip_prefix(prefix.as_str())
+            && split_suffix(tail).is_some()
+        {
+            return Some(Cow::Owned(format!("tt-{tail}")));
+        }
+
         self.graph_id(term)?;
         term.strip_prefix(self.graph_prefix.as_deref()?)
+            .map(Cow::Borrowed)
     }
 
     /// Split a URN of this scope into its section and canonical local id.
     fn suffix(&self, term: &str) -> Option<(Section, u64)> {
-        let local = term.strip_prefix(&self.iri_prefix)?;
-        let (section, id) = local.split_once('-')?;
-        let section = match section {
-            "sh" => Section::Shared,
-            "s" => Section::Subjects,
-            "o" => Section::Objects,
-            _ => return None,
-        };
-        Some((section, canonical_id(id)?))
+        split_suffix(term.strip_prefix(&self.iri_prefix)?)
+    }
+}
+
+/// The section and canonical local id a `{section}-{local-id}` tail names.
+fn split_suffix(local: &str) -> Option<(Section, u64)> {
+    let (section, id) = local.split_once('-')?;
+    let section = match section {
+        "sh" => Section::Shared,
+        "s" => Section::Subjects,
+        "o" => Section::Objects,
+        _ => return None,
+    };
+    Some((section, canonical_id(id)?))
+}
+
+/// How a URN tail names a dictionary section; predicates are never blank.
+fn section_name(section: Section) -> Option<&'static str> {
+    match section {
+        Section::Shared => Some("sh"),
+        Section::Subjects => Some("s"),
+        Section::Objects => Some("o"),
+        Section::Predicates => None,
     }
 }
 
@@ -209,7 +284,7 @@ mod tests {
         assert!(!iri.starts_with(first.iri_prefix()), "{iri}");
         assert_eq!(first.graph_id(&iri), Some(GraphId(3)));
         assert_eq!(regrouped.graph_id(&iri), None);
-        assert_eq!(first.display_label(&iri), Some("g-3"));
+        assert_eq!(first.display_label(&iri).as_deref(), Some("g-3"));
 
         // Not a data blank node's spelling, and no data blank node's is one.
         assert_eq!(first.role_id(Role::Subject, &iri), None);
@@ -256,6 +331,35 @@ mod tests {
             first
                 .iri(Role::Subject, TermId(12), "http://example.org/named")
                 .is_none()
+        );
+    }
+
+    /// A node only the propositions HDT holds is named under that HDT's
+    /// digest, reversed only from it, and shown apart from the data's node
+    /// with the same section and local id.
+    #[test]
+    fn a_propositions_only_blank_node_is_scoped_and_shown_apart_from_the_data() {
+        let scope = SkolemScope::new([1; 32], counts()).with_propositions([9; 32], counts());
+        let only = scope
+            .propositions_iri(Role::Subject, TermId(12), "_:m")
+            .unwrap();
+        let data = scope.iri(Role::Subject, TermId(12), "_:n").unwrap();
+        assert_ne!(only, data);
+        assert_eq!(
+            scope.propositions_role_id(Role::Subject, &only),
+            Some(TermId(12))
+        );
+        assert_eq!(scope.propositions_role_id(Role::Subject, &data), None);
+        assert_eq!(scope.role_id(Role::Subject, &only), None);
+        assert_eq!(scope.display_label(&only).as_deref(), Some("tt-s-2"));
+        assert_eq!(scope.display_label(&data).as_deref(), Some("s-2"));
+
+        // A scope without a propositions HDT shows it as the IRI it is.
+        let bare = SkolemScope::new([1; 32], counts());
+        assert_eq!(bare.display_label(&only), None);
+        assert_eq!(
+            bare.propositions_iri(Role::Subject, TermId(12), "_:m"),
+            None
         );
     }
 }

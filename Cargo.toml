@@ -38,7 +38,7 @@ base64 = "0.22"
 oxiri = "0.2"
 oxrdf = "0.3"
 oxrdfio = "0.2"
-spargebra = "0.4"
+spargebra = { version = "0.4", features = ["sparql-12"] }
 tempfile = "3"
 # Whether two paths name one file, links followed: how `kgf verbalize` refuses
 # an output that is a published artifact under another name. Already in the tree

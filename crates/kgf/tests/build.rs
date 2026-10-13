@@ -2428,3 +2428,282 @@ fn a_graph_index_from_another_sidecar_is_refused_even_when_the_counts_agree() {
         "{stderr}"
     );
 }
+
+/// RDF 1.2 triple terms, asserted and not, in both kinds of input.
+const TRIPLE_TERMS: &str = concat!(
+    "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .\n",
+    "<http://example.org/e1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+    "<<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>> .\n",
+    "<http://example.org/e2> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+    "<<( <http://example.org/bob> <http://example.org/knows> <http://example.org/carol> )>> .\n",
+);
+
+/// A bundle built from RDF with triple terms carries the index and the
+/// propositions HDT and declares `reification`; one built from that bundle's
+/// HDT brings them along, and `--adopt` releases them with the HDT.
+#[test]
+fn triple_terms_travel_with_rdf_and_hdt_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tt.nt");
+    std::fs::write(&source, TRIPLE_TERMS).unwrap();
+    let files = [
+        "data.hdt.tt",
+        "data.hdt.props.hdt",
+        "data.hdt.props.hdt.perm",
+    ];
+    let first = dir.path().join("staging/tinykg/v0");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&first),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    for file in files {
+        assert!(first.join(file).is_file(), "missing {file}");
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(first.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        manifest["capabilities"].get("reification").is_some(),
+        "{}",
+        manifest["capabilities"]
+    );
+    kgf(&["manifest", path(&first), "--check"], "").ok();
+
+    for (version, adopt) in [("2026-06-01", false), ("2026-06-02", true)] {
+        let out = dir.path().join(format!("root/tinykg/{version}"));
+        let hdt = first.join("data.hdt");
+        let hdtc = hdtc();
+        let mut args = vec![
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--hdt",
+            path(&hdt),
+            "--hdtc",
+            &hdtc,
+        ];
+        if adopt {
+            args.push("--adopt");
+        }
+        kgf(&args, CONFIG).ok();
+        for file in files {
+            assert!(out.join(file).is_file(), "{version}: missing {file}");
+            assert_eq!(
+                first.join(file).exists(),
+                !adopt,
+                "{version}: {file} beside the input"
+            );
+        }
+        kgf(&["manifest", path(&out), "--check"], "").ok();
+    }
+}
+
+/// A triple term named by `rdf:type` is no class, as a blank node is not. A
+/// bundle holding one builds, and the description it publishes — what
+/// `/schema` and `/summary` serve — never names the IRI the triple term is
+/// stored under: the VoID HDT would refuse it as input, and every request
+/// refuses it.
+#[test]
+fn a_triple_term_type_is_no_class_in_the_description() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tt.nt");
+    let rdf_type = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
+    std::fs::write(
+        &source,
+        format!(
+            "{TRIPLE_TERMS}<http://example.org/alice> {rdf_type} <http://example.org/Person> .\n\
+             <http://example.org/bob> {rdf_type} <<( <http://example.org/a> \
+             <http://example.org/b> <http://example.org/c> )>> .\n"
+        ),
+    )
+    .unwrap();
+    let out = dir.path().join("root/tinykg/v1");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc(),
+        ],
+        CONFIG,
+    )
+    .ok();
+    let schema = std::fs::read_to_string(out.join("stats/schema-nodes.tsv")).unwrap();
+    assert!(schema.contains("http://example.org/Person"), "{schema}");
+    for name in [
+        "schema-nodes.tsv",
+        "class-relations.tsv",
+        "class-properties.tsv",
+        "namespaces.json",
+        "summary.json",
+        "summary.md",
+    ] {
+        let text = std::fs::read_to_string(out.join("stats").join(name)).unwrap();
+        assert!(
+            !text.contains(hdtc::format::TRIPLE_TERM_NAMESPACE),
+            "{name} names a triple term's stored IRI: {text}"
+        );
+    }
+}
+
+/// A partial set of triple-term files beside an HDT input is refused before
+/// any work, naming the caller's files and leaving them where they were; an
+/// index-only input and one without a permutation index build; a dry run
+/// names the files it would take.
+#[test]
+fn a_partial_triple_term_set_is_refused_before_any_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tt.nt");
+    std::fs::write(&source, TRIPLE_TERMS).unwrap();
+    let hdtc = hdtc();
+    let built = dir.path().join("staging/tinykg/v0");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&built),
+            "--input",
+            path(&source),
+            "--hdtc",
+            &hdtc,
+        ],
+        CONFIG,
+    )
+    .ok();
+
+    // A copy of the input with one file of the set removed at a time.
+    for missing in [
+        "data.hdt.tt",
+        "data.hdt.props.hdt",
+        "data.hdt.props.hdt.perm",
+    ] {
+        let input = dir.path().join(format!("partial-{missing}"));
+        std::fs::create_dir_all(&input).unwrap();
+        for file in [
+            "data.hdt",
+            "data.hdt.perm",
+            "data.hdt.tt",
+            "data.hdt.props.hdt",
+            "data.hdt.props.hdt.perm",
+        ] {
+            if file != missing {
+                std::fs::copy(built.join(file), input.join(file)).unwrap();
+            }
+        }
+        let out = dir.path().join(format!("root/tinykg/{missing}"));
+        let run = kgf(
+            &[
+                "build",
+                "--config",
+                "-",
+                "--out",
+                path(&out),
+                "--hdt",
+                path(&input.join("data.hdt")),
+                "--adopt",
+                "--hdtc",
+                &hdtc,
+            ],
+            CONFIG,
+        );
+        assert!(!run.status.success(), "{missing}: built from a partial set");
+        assert!(
+            run.stderr.contains(input.to_str().unwrap()),
+            "{missing}: the refusal names the caller's files:\n{}",
+            run.stderr
+        );
+        assert!(
+            input.join("data.hdt").exists(),
+            "{missing}: --adopt lost the input"
+        );
+        assert!(!out.exists(), "{missing}: something was published");
+    }
+
+    // Every triple term asserted, and no permutation index beside the HDT.
+    let asserted = dir.path().join("asserted.nt");
+    std::fs::write(
+        &asserted,
+        concat!(
+            "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .\n",
+            "<http://example.org/e1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+            "<<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>> .\n",
+        ),
+    )
+    .unwrap();
+    let staged = dir.path().join("staging/tinykg/v1");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&staged),
+            "--input",
+            path(&asserted),
+            "--hdtc",
+            &hdtc,
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(!staged.join("data.hdt.props.hdt").exists());
+    let input = dir.path().join("index-only");
+    std::fs::create_dir_all(&input).unwrap();
+    for file in ["data.hdt", "data.hdt.tt"] {
+        std::fs::copy(staged.join(file), input.join(file)).unwrap();
+    }
+    let rehearsed = kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&dir.path().join("root/tinykg/dry")),
+            "--hdt",
+            path(&input.join("data.hdt")),
+            "--hdtc",
+            &hdtc,
+            "--dry-run",
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(rehearsed.contains("data.hdt.tt beside it"), "{rehearsed}");
+    let out = dir.path().join("root/tinykg/index-only");
+    kgf(
+        &[
+            "build",
+            "--config",
+            "-",
+            "--out",
+            path(&out),
+            "--hdt",
+            path(&input.join("data.hdt")),
+            "--hdtc",
+            &hdtc,
+        ],
+        CONFIG,
+    )
+    .ok();
+    assert!(out.join("data.hdt.tt").is_file() && out.join("data.hdt.perm").is_file());
+    kgf(&["manifest", path(&out), "--check"], "").ok();
+}

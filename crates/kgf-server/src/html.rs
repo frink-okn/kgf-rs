@@ -281,6 +281,9 @@ pub struct TermText<'a> {
     pub full_iri: Option<&'a str>,
 }
 
+/// What a triple term's brackets link to, said where the pointer rests.
+const TRIPLE_TERM_ROWS: &str = "the rows whose object is this triple term";
+
 /// One cell or field value on a page.
 #[derive(Debug, Clone)]
 pub enum Value<'a> {
@@ -309,6 +312,15 @@ pub enum Value<'a> {
     Term {
         /// The structured spelling.
         term: TermText<'a>,
+    },
+    /// An RDF 1.2 triple term: each of its three terms shown, linked and
+    /// labelled as a term anywhere else is, between brackets that link to the
+    /// rows whose object is the whole triple term.
+    TripleTerm {
+        /// The whole triple term's rows.
+        href: String,
+        /// Subject, predicate and object; a nested triple term is one of these.
+        parts: Vec<Value<'a>>,
     },
     /// A field the resource does not carry.
     Absent,
@@ -349,6 +361,15 @@ impl maud::Render for Value<'_> {
                         @if let Some(annotation) = term.annotation {
                             span."t-label" { (annotation) }
                         }
+                    }
+                },
+                Value::TripleTerm { href, parts } => {
+                    span."triple" {
+                        a."tt-mark" href=(href) rel="nofollow" title=(TRIPLE_TERM_ROWS) { "<<(" }
+                        @for part in parts {
+                            (part)
+                        }
+                        a."tt-mark" href=(href) rel="nofollow" title=(TRIPLE_TERM_ROWS) { ")>>" }
                     }
                 },
                 Value::Absent => {}
@@ -756,6 +777,9 @@ a.term:hover { color: var(--accent-hover); text-decoration: underline; text-unde
 span.term-static { color: var(--dim); }
 .t-qual { padding-left: .1em; color: var(--dim); font-size: .9em; }
 .t-label { display: block; margin-top: .12rem; color: var(--dim); font: .78rem/1.4 var(--sans); }
+.triple { display: inline-flex; flex-wrap: wrap; align-items: flex-start; gap: .1rem .45rem; max-width: 38rem; }
+.tt-mark { font: .8rem/1.45 var(--mono); color: var(--dim); text-decoration: none; }
+.tt-mark:hover { color: var(--accent-hover); text-decoration: underline; text-underline-offset: .18em; }
 .chips { display: flex; flex-wrap: wrap; gap: .38rem; margin: 0 0 1rem; padding: 0; list-style: none; }
 .chip {
   border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--rule));

@@ -97,6 +97,21 @@ pub(super) fn execute(build: &Build) -> Result<Built> {
     if let Some(facts) = graph_facts {
         refuse_undescribed_design(plan, facts)?;
         runner.run(&graphs_index_step(&layout, wants_transpose(plan, facts)))?;
+    }
+    // As soon as every artifact a server opens exists — data.hdt, its
+    // permutation index, and the graph pair when there is one — and before the
+    // graph check, so a problem here is not reported as one with the
+    // memberships: the triple-term artifacts must bind to these bytes, which
+    // only opening them as a server would can tell.
+    if hdtc::format::triple_term_index_path(&layout.data).is_file() {
+        crate::manifest::check_staged_triple_terms(&layout.staging).with_context(|| {
+            format!(
+                "the triple terms of {} cannot be read back, so nothing was published",
+                plan.input.describe()
+            )
+        })?;
+    }
+    if graph_facts.is_some() {
         // Before the expensive sidecars, not after: a sidecar this server
         // cannot read is worth hearing about now rather than once the text
         // index, the sketches, the key sets and the description set have been
@@ -466,6 +481,11 @@ pub(super) fn rehearse(build: &Build) -> Result<String> {
                 hdtc::format::permutation_index_path(path).display()
             );
         }
+        for file in triple_term_files(path) {
+            if file.is_file() {
+                let _ = writeln!(out, "# {verb} {} beside it", file.display());
+            }
+        }
     }
     // The rehearsal cannot read a sidecar that does not exist yet, so an unset
     // transpose prints as the choice a bundle under the threshold gets, and
@@ -527,12 +547,72 @@ pub(super) fn rehearse(build: &Build) -> Result<String> {
 ///
 /// Only the files it actually placed: `--adopt` promises the input goes away,
 /// and a file this build did not take is not its to remove.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct Adopted {
     /// The graph membership sidecar.
     graphs: bool,
     /// The permutation index.
     permutation: bool,
+    /// The triple-term files placed beside `data.hdt`, by their paths beside
+    /// the input: the index, and the propositions HDT with its permutation
+    /// index when the input has unasserted triple terms.
+    triple_terms: Vec<std::path::PathBuf>,
+}
+
+/// Refuse a partial set of triple-term files beside an HDT input before any
+/// work is spent on it, naming the files as the caller has them.
+///
+/// The set is the index alone, or the index with the propositions HDT and its
+/// permutation index — whichever the index's header says. Anything else is
+/// what an interrupted copy leaves, and a bundle built from it would be refused
+/// only once every other artifact had been built.
+fn check_triple_term_companions(input: &Path) -> Result<()> {
+    let [index, propositions_perm, propositions] = triple_term_files(input);
+    let present = |path: &Path| path.is_file();
+    if !present(&index) {
+        for orphan in [&propositions, &propositions_perm] {
+            ensure!(
+                !present(orphan),
+                "{} is beside {} without the triple-term index {} that names its \
+                 propositions; restore the index, or remove both propositions files",
+                orphan.display(),
+                input.display(),
+                index.display()
+            );
+        }
+        return Ok(());
+    }
+    let (header, _) = hdtc::format::read_triple_term_directory(&index)
+        .with_context(|| format!("reading the triple-term index {}", index.display()))?;
+    let wanted = header.has_propositions();
+    for file in [&propositions, &propositions_perm] {
+        ensure!(
+            present(file) == wanted,
+            "{} says the input {} unasserted triple terms, so {} must {}",
+            index.display(),
+            if wanted { "has" } else { "has no" },
+            file.display(),
+            if wanted {
+                "be beside it; rebuild it with `hdtc create`, or `hdtc perm` for a missing \
+                 permutation index"
+            } else {
+                "not be beside it"
+            }
+        );
+    }
+    Ok(())
+}
+
+/// The files that carry an HDT's RDF 1.2 triple terms: the index, and the
+/// propositions HDT with its permutation index, which exist only when some
+/// triple term is unasserted.
+fn triple_term_files(hdt: &Path) -> [std::path::PathBuf; 3] {
+    let propositions = hdtc::format::propositions_hdt_path(hdt);
+    [
+        hdtc::format::triple_term_index_path(hdt),
+        hdtc::format::permutation_index_path(&propositions),
+        propositions,
+    ]
 }
 
 /// `data.hdt` and everything that came with it, and what was read to hash it.
@@ -551,6 +631,9 @@ fn materialize(
     let data = &layout.data;
     match &plan.input {
         Input::Hdt { path, adopt } => {
+            // Before anything is moved: a partial set fails here, with the
+            // caller's paths, rather than once every artifact is built.
+            check_triple_term_companions(path)?;
             // kace's conversion also writes an HDT-FoQ index, which KGF never
             // reads. Only the HDT itself is taken.
             let digest = place(path, data, *adopt)?;
@@ -581,6 +664,21 @@ fn materialize(
                     )
                 })?;
             }
+            // Triple terms travel too, and for the same reason: the index and
+            // the propositions HDT bind to these bytes, and the propositions
+            // are data no other file holds. Without them a `data.hdt` holding
+            // triple-term IRIs is refused when the bundle is described.
+            let mut triple_terms = Vec::new();
+            for (from, to) in triple_term_files(path)
+                .into_iter()
+                .zip(triple_term_files(data))
+            {
+                if from.is_file() {
+                    place_unhashed(&from, &to, *adopt)
+                        .with_context(|| format!("copying {} beside the HDT", from.display()))?;
+                    triple_terms.push(from);
+                }
+            }
             // The graph *index* beside an input is deliberately not taken. It
             // is derived from the sidecar in minutes, and this server requires
             // layer sets an arbitrary one need not carry.
@@ -593,6 +691,7 @@ fn materialize(
                 adopted: Adopted {
                     graphs,
                     permutation,
+                    triple_terms,
                 },
             })
         }
@@ -846,9 +945,11 @@ fn release_adopted_input(plan: &BundlePlan, adopted: Adopted) {
     let permutation = adopted
         .permutation
         .then(|| hdtc::format::permutation_index_path(path));
+    let triple_terms = adopted.triple_terms;
     let released = std::iter::once(path.as_path())
         .chain(sidecar.as_deref())
         .chain(permutation.as_deref())
+        .chain(triple_terms.iter().map(std::path::PathBuf::as_path))
         .filter(|file| file.is_file());
     for file in released {
         if let Err(error) = std::fs::remove_file(file) {

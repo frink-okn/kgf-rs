@@ -3029,6 +3029,200 @@ form on `Allow` on a success, and with the path read before the method on the un
 `DELETE`. `a_preflight_approves_exactly_the_methods_some_resource_takes` holds the CORS
 list to the resources'.
 
+### 37. RDF 1.2 triple terms — the `reification` capability
+
+**Planned 2026-10-04.** hdtc (branch `triple-terms`) now builds RDF 1.2 triple terms
+without forking `data.hdt`. Each distinct triple term is an IRI of `data.hdt` under the
+reserved namespace `urn:x-kgf:tt:`, minted from its content (hdtc
+`docs/triple-terms-format.md` §2), and two artifacts sit beside it:
+`data.hdt.tt`, an index binding each such IRI to its proposition and marking, per
+permutation, the triples that are propositions; and `data.hdt.props.hdt` with its own
+`.perm`, an ordinary HDT holding only the **unasserted** propositions. An asserted
+triple term is decoded through `data.hdt` itself. What is missing is on this side:
+today a triple-term IRI leaks out as an ordinary IRI, `<<( … )>>` in a request is
+refused as an unbalanced IRI, and nothing can match a pattern inside a triple term.
+
+The steps, each a commit reviewed on its own:
+
+1. **hdtc façade** (`../hdtc`, done in b5fe434): the index's header and typed section
+   directory, the two paths, strict validation, and minting (`triple_term_iri`) — the
+   one piece of runtime logic that must be shared, because a request naming a ground
+   triple term is answered by minting its IRI and looking that up.
+2. **`kgf-store::triple_terms`.** Map `data.hdt.tt`; bind it to `data.hdt` and to the
+   propositions HDT the way the permutation index is bound (counts and lengths at
+   open, digests at verify); open the propositions HDT and its `.perm` as a second
+   `IndexedHdt`. Decode an IRI to its proposition (three packed reads), and expose each
+   layer as a `RankedBitmap` plus its reverse array, over the existing `rank` and
+   `map` code — the layers use the permutation index's directory geometry. **Refuse at
+   open** a `data.hdt` whose object dictionary holds triple-term IRIs without the
+   index (a prefix probe), a propositions HDT without its index or its `.perm`, and
+   the index without the HDT it names: one implementation per operation. The three
+   files join the artifact vocabulary, `content_digest`, and the fixture copier;
+   `reification` is declared exactly when `data.hdt.tt` is present. It is **not a
+   gate**: because a bundle holding triple-term IRIs without the index is refused,
+   a bundle without `data.hdt.tt` provably holds no triple terms, and answers every
+   triple-term pattern exactly — with nothing. The capability tells a router which
+   bundles are worth asking; it does not license refusing the others.
+3. **The term model.** `Term::Triple` beside `Iri`, `BlankNode` and `Literal`; request
+   syntax `<<( s p o )>>` (N-Triples 1.2, with the same CURIE and bracket rules inside
+   as outside, a literal only as the object, nesting allowed); the response term
+   object `{"type": "triple", "value": {"subject", "predicate", "object"}}` of SPARQL
+   1.2 results JSON, accepted back in bodies; RDF serializations through oxrdf's
+   `rdf-12`; the HTML cell. The dictionary spelling of a ground triple term is its
+   minted IRI, computed without the store, so a cursor binding stays store-free. A
+   bare `urn:x-kgf:tt:` IRI in a request is refused with the remedy to write the triple
+   term; the namespace is an encoding, not a vocabulary.
+4. **Triple terms at the output edge.** Every place a dictionary string becomes a
+   response term decodes a triple-term IRI into a triple term, recursively, through
+   the store — the per-request cache memoizes it like any term, and `max_response_bytes`
+   measures the nested object. Blank nodes inside a triple term are published as the
+   scoped IRIs every other blank node gets: the `data.hdt` node with that label when
+   there is one, and otherwise a propositions-scoped IRI keyed by the propositions
+   HDT's digest (the graph-only blank name is the precedent).
+5. **Ground triple terms in patterns.** `o=<<( … )>>` on `/fragment`, `/count`,
+   `/describe`, bindings, and `/tpf`, through minting and an ordinary lookup.
+   A triple term in the subject or predicate position is refused: RDF 1.2 has none.
+   *As built:* `/tpf` writes a triple term's own terms in its `ExplicitRepresentation`,
+   bare IRIs inside `<<( … )>>` (`notes/tpf-route.md`); Hydra has no spelling for one.
+6. **Variables inside a triple term** (`?e rdf:reifies <<( :s ?p ?o )>>`), depth 1.
+   *As built:* in `o` on `/fragment` and `/count`, in request syntax with `?name`
+   placeholders, rather than in the bindings body form — see question 101. The store answers them with one of three plans, chosen on cost from
+   the bundle alone, so a cursor resumes on the plan that issued it:
+   - **no inner constraint** — every triple whose object is a triple term is one
+     contiguous range of OPS, or of POS under a bound outer predicate: an ordinary
+     selection, exact count;
+   - **inner first** — the inner pattern is a range of SPO, POS or OPS in each HDT
+     that holds propositions; the layer's set bits in it are the matching triple
+     terms, each one OPS group of `data.hdt` away;
+   - **outer subject first**, when the outer subject's triple-term objects are fewer
+     than the inner matches — each is decoded and tested.
+   Inner-first and outer-first enumerations are candidate-budgeted like `o.text`:
+   a page may end early with a cursor, and a count is exact when its scan completes
+   and a lower bound with a cursor otherwise. The row's object is the whole triple
+   term, which carries the values the inner variables took; separate columns for
+   them wait for the tabular formats (question 101).
+7. **`kgf build`**: RDF input with triple terms produces the three artifacts, an
+   HDT input brings them along (or is refused without them), and the stats layer
+   leaves the encoding namespace out of the namespace inventory.
+8. **Notes**: this unit's *What landed*, and the questions for `../kgf` it raises.
+
+**What landed (2026-10-04).** All eight steps, each reviewed on its own, against hdtc
+branch `triple-terms` — released as hdtc v1.3.0 (2026-10-13), which `Cargo.lock`, CI and
+the image now pin. Two decisions moved from the plan, recorded as questions 101–102:
+inner variables are written in `o` with `?name` placeholders, and `reification` is a
+declaration, not a gate. Three findings from building it:
+
+**A triple term's name is a function of dictionary strings.** hdtc reads a
+component's kind from the string the dictionary stores — `_:` a blank node, `"` a
+literal, anything else an IRI — in its build, its validation and its search, and
+writes a string that is not a literal in its encoded form as an escaped IRI
+(`docs/triple-terms-format.md` §2.1). The request side mints through the same
+`TripleTermComponent::from_dictionary`, so a request IRI the dictionary would hold as
+a literal's string (`<"a"@en>`) names the triple term hdtc named. Every name minted
+from valid input is unchanged: re-minting all of ROBOKOP's reproduced each one.
+Publishing follows the same rule: inside a triple term, an object string that is not
+a literal in hdtc's encoded form (`hdtc::format::is_encoded_literal`) is published as
+an IRI, so that sent back it names the term hdtc named; RDF serializations convert
+each component by its kind, so a lenient IRI no RDF syntax can carry fails the page
+as any unreadable term does rather than turning back into a literal. Open: a plain
+row still publishes its terms by spelling, under the canonical-dictionary assumption
+`Term::from_dictionary` documents, so for such a lenient IRI an asserted row's object
+(`"a"@en`) and its triple term's (`<"a"@EN>`) differ. Publishing plain rows by the
+same rule would also publish a foreign HDT's non-canonical literals as IRIs, so it is
+a policy question, not a fix.
+
+JSON-LD 1.1 has no triple terms, so a page holding one is 406 `not_acceptable`,
+naming N-Quads and TriG. The refusal depends on the page, as the quad view's does on
+the request: a client paging an unbound-object fragment in JSON-LD can be answered on
+one page and refused on the next, and negotiation has already chosen JSON-LD by then,
+so `Accept: application/ld+json, text/turtle;q=0.5` is refused rather than served
+Turtle. Settling that means refusing JSON-LD for any request that *could* return a
+triple term on a bundle with `reification`, which would refuse every unbound pattern
+there; left as is until a JSON-LD client asks.
+
+**Leaving the propositions' literals out of a text query is free.** hdtc's text index
+covers literals found only in unasserted triple terms; `o.text` and `/search` resolve
+hits through `data.hdt` and ask for `propositions: false`. A range on the document ID
+did that at a cost in proportion to the index on every query, since Tantivy decodes a
+fast column's block headers to open it — 100–200 µs per one-hit search over 2 M
+propositions literals. hdtc now publishes them as a segment of their own, skipped
+whole, and opens every segment's object column once, when the index opens, rather
+than per query — which every text query had paid, triple terms or not (about 250 µs
+for a one-hit scan over 5 M literals, and once per hit in ranked search). One-hit
+counts, scans and budgeted searches now take 3–5 µs over 5 M literals, with or
+without the propositions.
+
+**A triple term's IRIs are labelled and linked like any others.** Unit 33's rule is
+that `labels=true` labels every IRI a response returns, and a triple term returns
+the IRIs it holds, so the label map, RDF's label statements and the page take its
+subject, predicate and object — a nested triple term's too, and a bound triple term's
+in place of its encoding, which is never a key. A page shows a triple term's three
+terms each linked to its own description with its label beneath, between brackets
+that link to the rows whose object is the whole triple term. That holds for every
+page, not only one that asked for `labels=true`: the labels a page resolves for
+itself take a triple term's IRIs as the label map does. The terms bound inside a
+triple pattern (`<<( ex:alice ?p ?o )>>`) are labelled before any row, as a bound
+position's are, and RDF's label statements carry them: a label's object is a literal,
+so it can never be mistaken for a row of a pattern whose object is a triple term.
+
+**A triple term is no class** (2026-10-12). hdtc's VoID took any `rdf:type` object
+that was not a blank node or a literal for a class IRI, so a triple term named by
+`rdf:type` became a `void:class` under the IRI it is stored by — which `hdtc create`
+then refused when the build turned that VoID into `stats/void.hdt`, so such a dataset
+could not be built at all. hdtc now treats a triple term as it treats a blank node
+there (`hdtc/docs/void-format.md` §2.3): no class partition, no typed subject, an
+untyped target.
+
+**A term held only inside unasserted triple terms is not absent** (2026-10-12).
+`absent_terms` says a release does not hold a term, a fact about the data remedied by
+asking another release. A term the propositions HDT holds — `ex:dan` in an
+unasserted `<<( ex:dan ex:says … )>>`, or a blank node only it holds, by its
+propositions-scoped IRI — is published by this release in every triple term holding
+it, so a pattern or `/describe` naming it is empty without calling it absent. As for
+`data.hdt`, a term is held in a role: the propositions HDT must hold it in the role
+the pattern names. Every inner term of a triple pattern held nowhere is reported,
+not only the first. A page shows a blank node only the propositions HDT holds as
+`_:tt-{section}-{local-id}`, apart from the data's node with the same section and
+local id, which is a different node.
+
+**A layer is a bitmap or a sparse set, whichever is smaller.** hdtc first kept each
+layer as a bitmap over every triple, three bits per triple of the dataset whatever
+share were reified — 183 MB per layer over ROBOKOP, and the same for a graph that
+annotates a hundredth as many edges. It now stores each in the smaller of that and
+the Elias–Fano encoding of the marked positions, chosen by the counts
+(`triple-terms-format.md` §8.1); `Layer` answers `rank`, `count_in`, `select`,
+`contains` and `rank_if_marked` either way, so nothing above it changed. A sparse
+rank is one select in the high bits, a scan to the bucket's closing bit, and a binary
+search of the bucket's low bits. ROBOKOP's layers are sparse at 10% marked: the index
+is 2.75 GB instead of 3.03 GB. At the sparse end — the 10 M sample with 1% of its
+edges annotated — it is 2.1 MB instead of 50 MB. Every plan answers the same rows in
+the same time either way (within ±6%, one client, warm cache); a bundle built before
+the change is refused, since its layers are not in the encoding its counts choose.
+
+**Measured at scale.** ROBOKOP annotated — 1.40 B triples, 133 M triple terms, all
+asserted — built with hdtc and served by `kgf serve` from a bundle of `data.hdt`,
+`.perm` and `.tt` (Apple silicon, external SSD, warm page cache, one client):
+
+| Request | Median |
+|---|---|
+| `p=rdf:reifies&o=<<( s p o )>>` (ground) | 0.18 ms |
+| `s=<reifier>&o=<<( ?s ?p ?o )>>` (outer subject first) | 0.15 ms |
+| `o=<<( :TP53 ?p :x )>>` (inner `s ? o`, probed) | 0.16 ms |
+| `o=<<( :TP53 ?p ?o )>>`, 100 rows; its 28th page | 0.47 ms; 0.22 ms |
+| `o=<<( ?s :subclass_of ?o )>>`, 100 rows; its 301st page | 0.50 ms; 0.46 ms |
+| `/count o=<<( :TP53 ?p ?o )>>` (2,717, exact) | 2.9 ms |
+| `/count o=<<( ?s :treats ?o )>>` (9,388, exact) | 10.5 ms |
+| `/count o=<<( ?s ?p ?o )>>` (137,483,585, one OPS range) | 0.17 ms |
+| `/count o=<<( ?s :subclass_of ?o )>>` (past the 1 M budget) | 1.28 s, lower bound + cursor |
+
+Exhaustive paging reaches exactly the exact count. An exact inner count costs about 1 µs
+per match, and one past the candidate budget returns a resumable lower bound, as the
+plan said. Each triple term decoded into a response costs about 1.3 µs (1,000 rows of
+`p=rdf:reifies`: 2.6 ms, against 1.3 ms for the same rows as bare IRIs from main).
+Patterns without triple terms are unchanged: over the same files, main and this branch
+answer 1,000-row pages of `s=`, `o=` and `p=` in the same 0.67–0.73 ms with
+byte-identical bodies.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
@@ -4224,6 +4418,48 @@ following the code.
     only if the spec says so. Proposed for §3.6's methods bullet: `Allow` appears on a
     405 and on no cacheable response, and a client learns a resource's methods from a
     405 or from `Accept-Query`, never from a stored success.
+
+101. **Variables inside a triple term live in `o`, not in the bindings body.** Doc 09
+    §9.2 names inner variables through the JSON body form so that they surface as output
+    columns. This implementation takes them in `o` on `/fragment` and `/count`, in
+    request syntax — `o=<<( ex:s ?p ?o )>>` — for three reasons. The body form here *is*
+    the bindings form, whose per-row phases are counted exactly up front, while a
+    pattern inside triple terms is candidate-budgeted like `o.text`; joining the two
+    is a design of its own. GET is what an agent tries first. And the row already
+    carries what the variables took: its object is the whole triple term, decoded,
+    so JSON loses nothing. Columns per inner variable matter for CSV/Parquet/Arrow,
+    which this implementation does not yet serve, and are doc 07 §7.5 item 33's
+    question. The names are placeholders: a repeated name is refused rather than
+    read as a join. Proposed: doc 03 §3.7 admits `?name` inside the `o` triple term
+    on GET, keeps the body form for bindings, and leaves columns to item 33.
+102. **`reification` should not be a gate.** A bundle whose dictionary holds
+    triple-term IRIs without `data.hdt.tt` is refused at open, so a bundle without
+    the index provably holds no triple terms and answers every pattern naming one —
+    exactly, with nothing. Doc 03 §3.7 has such patterns return
+    `capability_not_available` without the capability; that would make a federated
+    client special-case bundles that can answer. The capability remains, as the
+    statement a router reads without the bundle.
+103. **A directional literal's JSON term object.** RDF 1.2's base direction is kept in
+    `lang` as N-Triples 1.2 writes it, `"lang": "ar--rtl"`, which round-trips through
+    request syntax and the dictionary. SPARQL 1.2 results JSON instead splits it,
+    `"xml:lang": "ar", "its:dir": "rtl"`. Doc 03's term object should choose before a
+    bundle with directional literals is served.
+104. **Blank nodes found only in the propositions HDT.** They need a published name and
+    have no dictionary id in `data.hdt`; this implementation scopes them by the
+    propositions HDT's digest, the graph-only blank name's precedent (question 80). A
+    node the data also holds is published under the data's IRI, and the propositions
+    spelling of it is refused, so each node has one name.
+105. **Resolved (2026-10-12): a triple term reads as its terms in a verbalized text.**
+    Unit 35's verbalizer met triple terms only through this branch's merge, and read
+    them as the IRIs they are stored as: a reifier's text carried its triple term as
+    the encoding's hash, humanized, and in a predicate sample that hash took the place
+    of a nameable value. A triple term now reads as its subject, predicate and object,
+    each named as a mention and a line's predicate are — `reifies: Alice knows Bob` —
+    a nested one in parentheses, a blank node left out, and an unasserted one's terms
+    named by the data's terms of the same spelling, where their labels are. It takes a
+    place in a sample as an IRI does, keyed by its IRI, which its content fixes.
+    Whether a reifier with no label of its own should take its triple term's reading
+    as its label is left to doc 13's embedding view.
 
 ## Not in this plan
 

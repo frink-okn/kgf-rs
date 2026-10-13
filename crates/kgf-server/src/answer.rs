@@ -47,7 +47,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use maud::html;
 use oxrdf::{
-    BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term as RdfTerm, Triple,
+    BaseDirection, BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad,
+    Term as RdfTerm, Triple,
 };
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
@@ -74,19 +75,26 @@ use crate::html::{
     operation_page_with_format, page, pager, results_table, stats, table,
 };
 use crate::label::{LabelCascade, PreferredLabel, Resolution, Spend};
-use crate::rdf::{GraphFormat, serialize_dataset, serialize_graph};
+use crate::rdf::{DatasetFormat, GraphFormat, serialize_dataset, serialize_graph};
 use crate::representation::{RdfSyntax, Representation};
 use crate::request::{
     self, BindingPattern, BindingRow, BoundTerm, Candidates, Direction, Labeling, Pattern,
-    Position, ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter, role_name,
-    term_role_name,
+    Position, ResponseBytes, SchemaChildren, SchemaQuery, SchemaSelection, TextFilter,
+    TriplePattern, role_name, term_role_name,
 };
 use crate::request::{GraphScope, GraphSelector};
 use crate::skolem::SkolemScope;
-use crate::term::{DictionaryTermError, LiteralKind, PrefixMap, Term, TermCache, serialized_bytes};
+use crate::term::{
+    DictionaryTermError, LiteralKind, PrefixMap, Term, TermCache, TripleTerm, serialized_bytes,
+};
 use crate::url::{self, Mount, Params};
+use hdtc::format::{TripleTermComponent, TripleTermProposition, is_encoded_literal};
 use kgf_store::graphs::{GraphId, Graphs};
 use kgf_store::scope::{QuadSelection, ScopedSelection};
+use kgf_store::triple_terms::{
+    BudgetedSelection, InnerPattern, Proposition, Source as TripleTermSource, TripleTermPattern,
+    TripleTermPosition, TripleTermSelection, TripleTermStep, TripleTerms,
+};
 use kgf_verbalize::{Bound, Exhausted, Rendered as Verbalized, Unknown, Verbalizer};
 
 // ---------------------------------------------------------------------------
@@ -580,26 +588,89 @@ impl AbsentTerm {
 #[derive(Debug, Clone)]
 struct RowTerm {
     /// What a response carries, and what its byte accounting weighs.
-    published: Rc<str>,
+    published: Published,
     /// The dictionary spelling, which `locate` matches and labels key on.
     stored: Rc<str>,
+}
+
+impl RowTerm {
+    /// The spellings a page's own labels are resolved by: the dictionary's,
+    /// under which a blank node's label is found, or a triple term's IRIs,
+    /// each published as a request would name it.
+    fn page_label_keys(&self) -> impl Iterator<Item = &str> {
+        let (stored, iris) = match &self.published {
+            Published::Text(_) => (Some(self.stored.as_ref()), Vec::new()),
+            Published::Triple(triple) => (None, triple.iris()),
+        };
+        stored.into_iter().chain(iris)
+    }
+}
+
+/// A term as this API publishes it.
+///
+/// Typed rather than a string because a triple term is published decoded,
+/// as a structure. Reading one back out of a spelling would take a parser
+/// accepting everything a lenient ingest stores — unvalidated IRIs and
+/// language tags among it — which no request grammar is, and a dictionary
+/// string could be mistaken for such a spelling.
+#[derive(Debug, Clone)]
+enum Published {
+    /// A dictionary spelling, a blank node already replaced by its scoped IRI.
+    Text(Rc<str>),
+    /// A triple term, decoded, its blank nodes published.
+    Triple(Rc<TripleTerm<'static>>),
+}
+
+impl Published {
+    /// The spelling, unless this is a triple term.
+    fn text(&self) -> Option<&Rc<str>> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Triple(_) => None,
+        }
+    }
+
+    /// The spellings a label could be keyed by: the term's own, or, for a
+    /// triple term — which is no IRI and has no label of its own — the IRIs
+    /// it holds, nested ones included.
+    fn label_keys(&self) -> impl Iterator<Item = &str> {
+        let (text, iris) = match self {
+            Self::Text(text) => (Some(text.as_ref()), Vec::new()),
+            Self::Triple(triple) => (None, triple.iris()),
+        };
+        text.into_iter().chain(iris)
+    }
+}
+
+impl Serialize for Published {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Text(text) => Term::from_dictionary(text).serialize(serializer),
+            Self::Triple(triple) => triple.serialize(serializer),
+        }
+    }
 }
 
 /// Terms as this API publishes them, memoized for one request.
 ///
 /// [`TermCache`] materializes and measures a term as the dictionary spells it.
-/// This adds the one substitution the wire makes, and memoizes that separately
-/// so a blank node repeated down a page is formatted and weighed once rather
-/// than once per row — the same reason the cache underneath it exists.
-struct PublishedTerms {
+/// This adds the substitutions the wire makes, and memoizes them separately so
+/// a blank node repeated down a page is formatted and weighed once rather than
+/// once per row — the same reason the cache underneath it exists. There are
+/// two: a blank node becomes its scoped IRI, and a triple-term IRI becomes the
+/// triple term it encodes, decoded through the bundle's triple-term index,
+/// nested terms included.
+struct PublishedTerms<'s> {
     blank_nodes: SkolemScope,
-    published: HashMap<(Role, u64), (Rc<str>, u64)>,
+    triple_terms: Option<&'s TripleTerms>,
+    published: HashMap<(Role, u64), (Published, u64)>,
 }
 
-impl PublishedTerms {
-    fn new(blank_nodes: SkolemScope) -> Self {
+impl<'s> PublishedTerms<'s> {
+    fn new(blank_nodes: SkolemScope, store: &'s Store) -> Self {
         Self {
             blank_nodes,
+            triple_terms: store.triple_terms(),
             published: HashMap::new(),
         }
     }
@@ -616,27 +687,144 @@ impl PublishedTerms {
         if let Some((published, serialized)) = self.published.get(&(role, id.0)) {
             return Ok((
                 RowTerm {
-                    published: Rc::clone(published),
+                    published: published.clone(),
                     stored,
                 },
                 *serialized,
             ));
         }
-        let Some(iri) = self.blank_nodes.iri(role, id, &stored) else {
-            return Ok((
-                RowTerm {
-                    published: Rc::clone(&stored),
-                    stored,
-                },
-                serialized,
-            ));
+        let decoded = match self.triple_terms {
+            Some(terms) if role == Role::Object => terms.decode(id.0),
+            _ => None,
         };
-        let published: Rc<str> = Rc::from(iri.as_str());
-        let serialized = serialized_bytes(&Term::Iri(Cow::Borrowed(published.as_ref())));
+        let (published, serialized) = match decoded {
+            Some(proposition) => {
+                let triple = self.publish_triple(dictionary, proposition)?;
+                let serialized = serialized_bytes(&triple);
+                (Published::Triple(Rc::new(triple)), serialized)
+            }
+            None => match self.blank_nodes.iri(role, id, &stored) {
+                Some(iri) => {
+                    let iri: Rc<str> = Rc::from(iri.as_str());
+                    let serialized = serialized_bytes(&Term::Iri(Cow::Borrowed(&iri)));
+                    (Published::Text(iri), serialized)
+                }
+                None => {
+                    return Ok((
+                        RowTerm {
+                            published: Published::Text(Rc::clone(&stored)),
+                            stored,
+                        },
+                        serialized,
+                    ));
+                }
+            },
+        };
         self.published
-            .insert((role, id.0), (Rc::clone(&published), serialized));
+            .insert((role, id.0), (published.clone(), serialized));
         Ok((RowTerm { published, stored }, serialized))
     }
+
+    /// A triple term, built from its stored components: IRIs and literals as
+    /// the dictionary holds them — never re-validated, since lenient ingest
+    /// stores what no strict grammar would accept — and blank nodes as their
+    /// scoped IRIs.
+    fn publish_triple(
+        &self,
+        data: &Dictionary<'_>,
+        proposition: Proposition,
+    ) -> Result<TripleTerm<'static>, DictionaryTermError> {
+        let terms = self
+            .triple_terms
+            .expect("a proposition was decoded through the index");
+        let dictionary = match proposition.source {
+            TripleTermSource::Data => *data,
+            TripleTermSource::Propositions => terms
+                .propositions_dict()
+                .expect("an unasserted triple term has a propositions HDT"),
+        };
+        let triple = proposition.triple;
+        let subject = self.publish_component(
+            data,
+            &dictionary,
+            proposition.source,
+            Role::Subject,
+            triple.subject,
+        )?;
+        let predicate = extract(&dictionary, Role::Predicate, triple.predicate)?;
+        let object = match terms.decode_in(proposition.source, triple.object) {
+            Some(nested) => Term::Triple(Box::new(self.publish_triple(data, nested)?)),
+            None => self.publish_component(
+                data,
+                &dictionary,
+                proposition.source,
+                Role::Object,
+                triple.object,
+            )?,
+        };
+        Ok(TripleTerm::new(subject, predicate, object)
+            .expect("a stored subject is an IRI or a blank node"))
+    }
+
+    /// One non-triple component of a triple term, published.
+    fn publish_component(
+        &self,
+        data: &Dictionary<'_>,
+        dictionary: &Dictionary<'_>,
+        source: TripleTermSource,
+        role: Role,
+        id: u64,
+    ) -> Result<Term<'static>, DictionaryTermError> {
+        let stored = extract(dictionary, role, id)?;
+        if !stored.starts_with("_:") {
+            // By role, not by spelling: lenient ingest can store a subject IRI
+            // that begins with a quote, which only an object could read as a
+            // literal. And an object is a literal only in hdtc's encoded form:
+            // hdtc names any other quoted string — an IRI spelled like a
+            // literal, `<"a"@EN>` — by its IRI form, so it is published as an
+            // IRI, and sent back it names the triple term hdtc named.
+            return Ok(match role {
+                Role::Object if stored.starts_with('"') && !is_encoded_literal(&stored) => {
+                    Term::Iri(Cow::Owned(stored))
+                }
+                Role::Object => Term::from_dictionary(&stored).into_owned(),
+                Role::Subject | Role::Predicate => Term::Iri(Cow::Owned(stored)),
+            });
+        }
+        let iri = match source {
+            TripleTermSource::Data => self.blank_nodes.iri(role, TermId(id), &stored),
+            // The data's node with this label is this node: hdtc labels an
+            // input's two HDTs alike. Only a node the data lacks is scoped by
+            // the propositions HDT.
+            TripleTermSource::Propositions => {
+                let mut in_data = None;
+                for role in [Role::Subject, Role::Object] {
+                    if let Some(found) = data.locate(role, stored.as_bytes())? {
+                        in_data = Some((role, found));
+                        break;
+                    }
+                }
+                match in_data {
+                    Some((role, found)) => self.blank_nodes.iri(role, found, &stored),
+                    None => self.blank_nodes.propositions_iri(role, TermId(id), &stored),
+                }
+            }
+        };
+        Ok(Term::Iri(Cow::Owned(iri.expect(
+            "a blank node of a dictionary role has a scoped IRI",
+        ))))
+    }
+}
+
+/// One stored term, as text.
+fn extract(
+    dictionary: &Dictionary<'_>,
+    role: Role,
+    id: u64,
+) -> Result<String, DictionaryTermError> {
+    let mut buffer = Vec::new();
+    let bytes = dictionary.extract(role, TermId(id), &mut buffer)?;
+    String::from_utf8(bytes.to_vec()).map_err(|_| DictionaryTermError::NotUtf8 { role, id })
 }
 
 /// One result row: a term per variable, and for `/describe` which side of the
@@ -674,7 +862,7 @@ impl Serialize for Row {
             map.serialize_entry(BINDING, &binding)?;
         }
         for (position, term) in &self.cells {
-            map.serialize_entry(position.as_str(), &Term::from_dictionary(&term.published))?;
+            map.serialize_entry(position.as_str(), &term.published)?;
         }
         if let Some(graph) = &self.graph {
             map.serialize_entry(GRAPH, &Term::from_dictionary(graph))?;
@@ -1195,32 +1383,32 @@ impl Renders for Answer {
         }
         let mut wanted: Vec<&str> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
-        let named = |text: &str| !text.starts_with('"');
-        if let Echo::Fragment { pattern, .. } | Echo::Sample { pattern, .. } = &self.echo {
-            for position in Position::ALL {
-                if let Some(bound) = pattern.bound(position) {
-                    let text = bound.dictionary();
-                    if named(text) && seen.insert(text) {
-                        wanted.push(text);
-                    }
-                }
+        // Literals have no labels, and neither do triple terms: a triple
+        // term's IRI is an encoding, never the subject of a label. A triple
+        // term is labelled by the IRIs it holds instead, as `labels=true`
+        // labels it, and so are the terms bound inside a triple pattern.
+        let named = |text: &str| {
+            !text.starts_with('"') && !text.starts_with(kgf_store::triple_terms::NAMESPACE)
+        };
+        let bound: Vec<&str> = match &self.echo {
+            Echo::Fragment { pattern, .. } | Echo::Sample { pattern, .. } => {
+                pattern.bound_terms().flat_map(bound_label_keys).collect()
             }
-        }
-        for row in &self.rows {
-            for (_, term) in &row.cells {
-                // The dictionary spelling: a published blank-node IRI is not a
-                // term this bundle holds, so it would never resolve a label.
-                let text = term.stored.as_ref();
-                if named(text) && seen.insert(text) {
-                    wanted.push(text);
-                }
-            }
-        }
-        if let Some(described) = &self.described
-            && named(described)
-            && seen.insert(described)
+            Echo::BindingsFragment { .. } | Echo::Describe { .. } => Vec::new(),
+        };
+        let cells = self
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .flat_map(|(_, term)| term.page_label_keys());
+        for text in bound
+            .into_iter()
+            .chain(cells)
+            .chain(self.described.as_deref())
         {
-            wanted.push(described);
+            if named(text) && seen.insert(text) {
+                wanted.push(text);
+            }
         }
         if wanted.is_empty() || wanted.len() > cap {
             return Ok(());
@@ -1465,7 +1653,8 @@ impl Answer {
     /// wrong page — so leaving those out is what lets a client tell the two
     /// kinds apart by matching the pattern. An unbound position, a variable,
     /// and a text-constrained object all match anything, so the rule errs
-    /// toward leaving a label out.
+    /// toward leaving a label out. An object constrained to triple terms
+    /// matches none: a label is a literal.
     fn rdf_label_statements(&self, keep: usize) -> Result<Vec<Quad>, Problem> {
         let Some(labels) = &self.labels else {
             return Ok(Vec::new());
@@ -1477,28 +1666,38 @@ impl Answer {
                 "the fragment page's labels could not be represented as RDF",
             ));
         }
-        let bound = |position| match &self.echo {
-            Echo::Fragment { pattern, .. } => pattern.bound(position),
-            Echo::BindingsFragment { pattern, .. } => pattern.bound(position),
-            Echo::Describe { .. } | Echo::Sample { .. } => None,
-        };
+        let triple_object =
+            matches!(&self.echo, Echo::Fragment { pattern, .. } if pattern.triple().is_some());
         let matches_pattern = |subject: &str, label: &PreferredLabel| {
-            [
-                (Position::Subject, subject),
-                (Position::Predicate, label.predicate()),
-                (Position::Object, label.term()),
-            ]
-            .into_iter()
-            .all(|(position, term)| bound(position).is_none_or(|bound| bound.dictionary() == term))
+            !triple_object
+                && [
+                    (Position::Subject, subject),
+                    (Position::Predicate, label.predicate()),
+                    (Position::Object, label.term()),
+                ]
+                .into_iter()
+                .all(|(position, term)| {
+                    self.echo_bound(position)
+                        .is_none_or(|bound| bound.dictionary() == term)
+                })
         };
-        let carried: BTreeSet<&str> = Position::ALL
+        // A triple term is labelled by the IRIs it holds, and the terms bound
+        // inside a triple pattern as any bound term is.
+        let bound: Vec<&BoundTerm> = match &self.echo {
+            Echo::Fragment { pattern, .. } => pattern.bound_terms().collect(),
+            Echo::BindingsFragment { pattern, .. } => Position::ALL
+                .into_iter()
+                .filter_map(|position| pattern.bound(position))
+                .collect(),
+            Echo::Describe { .. } | Echo::Sample { .. } => Vec::new(),
+        };
+        let carried: BTreeSet<&str> = bound
             .into_iter()
-            .filter_map(bound)
-            .map(BoundTerm::dictionary)
+            .flat_map(bound_label_keys)
             .chain(self.rows.iter().take(keep).flat_map(|row| {
                 row.cells
                     .iter()
-                    .map(|(_, term)| term.published.as_ref())
+                    .flat_map(|(_, term)| term.published.label_keys())
                     .chain(row.graph.as_deref())
             }))
             .collect();
@@ -1521,6 +1720,16 @@ impl Answer {
             );
         }
         Ok(statements)
+    }
+
+    /// The term a fragment's pattern bound at `position`; `None` for an
+    /// operation that publishes no RDF graph.
+    fn echo_bound(&self, position: Position) -> Option<&BoundTerm> {
+        match &self.echo {
+            Echo::Fragment { pattern, .. } => pattern.bound(position),
+            Echo::BindingsFragment { pattern, .. } => pattern.bound(position),
+            Echo::Describe { .. } | Echo::Sample { .. } => None,
+        }
     }
 
     fn fragment_rdf_prefix(
@@ -1573,32 +1782,52 @@ impl Answer {
             }
             GraphTagging::Fixed(_) | GraphTagging::Untagged | GraphTagging::PerRow => None,
         };
+        // JSON-LD 1.1 has no RDF 1.2 triple terms, and oxrdf refuses to write
+        // one; that is the client's choice of syntax, not a broken bundle, so
+        // it is refused before any term of the page is converted.
+        let bound_object = self.echo_bound(Position::Object);
+        if matches!(syntax, RdfSyntax::Dataset(DatasetFormat::JsonLd)) {
+            let holds_triple_terms = self.rows.iter().take(keep).any(|row| {
+                rdf_fragment_cell(bound_object, row, Position::Object)
+                    .is_some_and(|cell| cell.is_triple())
+            });
+            if holds_triple_terms {
+                return Err(Problem::new(
+                    ErrorCode::NotAcceptable,
+                    JSON_LD_HAS_NO_TRIPLE_TERMS,
+                ));
+            }
+        }
+        // A bound object is one term on every row — a triple term among them,
+        // whose conversion walks every component — so it is converted once,
+        // and only when a statement needs it.
+        let fixed_object = bound_object
+            .filter(|_| keep > 0)
+            .map(|bound| FragmentCell::Bound(bound).object())
+            .transpose()?;
         let mut statements = Vec::with_capacity(keep);
         let mut data = HashSet::with_capacity(keep);
         for row in self.rows.iter().take(keep) {
-            let cell = |position| {
-                let bound = match &self.echo {
-                    Echo::Fragment { pattern, .. } => pattern.bound(position),
-                    Echo::BindingsFragment { pattern, .. } => pattern.bound(position),
-                    Echo::Describe { .. } | Echo::Sample { .. } => None,
-                };
-                rdf_fragment_cell(bound, row, position)
-            };
+            let cell = |position| rdf_fragment_cell(self.echo_bound(position), row, position);
             let subject =
                 cell(Position::Subject).expect("every fragment row binds every triple position");
             let predicate =
                 cell(Position::Predicate).expect("every fragment row binds every triple position");
-            let object =
-                cell(Position::Object).expect("every fragment row binds every triple position");
+            let object = match &fixed_object {
+                Some(object) => object.clone(),
+                None => cell(Position::Object)
+                    .expect("every fragment row binds every triple position")
+                    .object()?,
+            };
             // No skolemization here: a row is materialized in its published
             // spelling, so a data blank node is already the scoped IRI and
             // these see a named node. That is what keeps the RDF and native
             // representations naming one node the same way.
             let triple = Triple::new(
-                rdf_subject(subject.as_bytes())?,
-                NamedNode::new(predicate)
+                rdf_subject(subject.text().as_bytes())?,
+                NamedNode::new(predicate.text())
                     .map_err(|error| unreadable("parsing an RDF predicate IRI", &error))?,
-                rdf_object(object.as_bytes())?,
+                object,
             );
             let graph_name = match &self.tagging {
                 GraphTagging::Untagged | GraphTagging::Fixed(_) => {
@@ -1885,12 +2114,53 @@ fn rdf_fragment_cell<'a>(
     bound: Option<&'a BoundTerm>,
     row: &'a Row,
     position: Position,
-) -> Option<&'a str> {
-    bound.map(BoundTerm::dictionary).or_else(|| {
-        row.cells
-            .iter()
-            .find_map(|(found, term)| (*found == position).then_some(term.published.as_ref()))
+) -> Option<FragmentCell<'a>> {
+    bound.map(FragmentCell::Bound).or_else(|| {
+        row.cells.iter().find_map(|(found, term)| {
+            (*found == position).then_some(FragmentCell::Row(&term.published))
+        })
     })
+}
+
+/// Where an RDF fragment row's term comes from: the request, or the row.
+enum FragmentCell<'a> {
+    Bound(&'a BoundTerm),
+    Row(&'a Published),
+}
+
+impl FragmentCell<'_> {
+    /// Whether this is a triple term, bound by the request or published.
+    fn is_triple(&self) -> bool {
+        match self {
+            Self::Bound(bound) => bound.triple().is_some(),
+            Self::Row(published) => matches!(published, Published::Triple(_)),
+        }
+    }
+
+    /// The spelling of an IRI or blank-node position: the subject or the
+    /// predicate, which are never triple terms.
+    fn text(&self) -> &str {
+        match self {
+            Self::Bound(bound) => bound.dictionary(),
+            Self::Row(published) => published
+                .text()
+                .expect("a subject or predicate is never a triple term"),
+        }
+    }
+
+    /// The object as `oxrdf` holds it. A bound triple term's dictionary
+    /// spelling is its minted IRI, so it is converted from the request's term,
+    /// as a row's is from its decoded one.
+    fn object(&self) -> Result<RdfTerm, Problem> {
+        match self {
+            Self::Bound(bound) => match bound.triple() {
+                Some(triple) => rdf_triple_term(triple),
+                None => rdf_object(bound.dictionary().as_bytes()),
+            },
+            Self::Row(Published::Text(text)) => rdf_object(text.as_bytes()),
+            Self::Row(Published::Triple(triple)) => rdf_triple_term(triple),
+        }
+    }
 }
 
 fn id_pattern_matches(pattern: IdPattern, triple: IdTriple) -> bool {
@@ -2291,7 +2561,7 @@ impl Renders for SearchAnswer {
 /// come out of the same step that emitted it.
 #[derive(Debug)]
 struct TermRow {
-    published: Rc<str>,
+    published: Published,
     roles: Vec<&'static str>,
     /// Absent unless labels were asked for, as in a search result.
     label: Option<RowLabel>,
@@ -2300,7 +2570,7 @@ struct TermRow {
 
 impl TermRow {
     fn new(
-        published: Rc<str>,
+        published: Published,
         term: u64,
         roles: Vec<&'static str>,
         label: Option<RowLabel>,
@@ -2325,7 +2595,7 @@ impl TermRow {
 impl Serialize for TermRow {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
-        map.serialize_entry("term", &Term::from_dictionary(&self.published))?;
+        map.serialize_entry("term", &self.published)?;
         map.serialize_entry("roles", &self.roles)?;
         if let Some(label) = &self.label {
             label.serialize_into(&mut map)?;
@@ -3626,6 +3896,7 @@ fn summary_iri_cell<'a>(target: &Target, iri: &'a str, href: Option<String>) -> 
         href,
         full_iri: full_iri.map(|iri| Cow::Owned(iri.into_owned())),
         structured: true,
+        parts: Vec::new(),
     }
 }
 
@@ -3866,9 +4137,23 @@ fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
     if let Some(literal) = parse_literal(term) {
         let value = rdf_text(literal.value)?.to_owned();
         if let Some(language) = literal.language {
-            return Literal::new_language_tagged_literal(value, rdf_text(language)?)
+            let language = rdf_text(language)?;
+            // RDF 1.2's base direction, which the dictionary writes after the
+            // tag as `--ltr` or `--rtl`.
+            let directed = [("--ltr", BaseDirection::Ltr), ("--rtl", BaseDirection::Rtl)]
+                .into_iter()
+                .find_map(|(suffix, direction)| {
+                    language.strip_suffix(suffix).map(|tag| (tag, direction))
+                });
+            let literal = match directed {
+                Some((tag, direction)) => {
+                    Literal::new_directional_language_tagged_literal(value, tag, direction)
+                }
+                None => Literal::new_language_tagged_literal(value, language),
+            };
+            return literal
                 .map(Into::into)
-                .map_err(|error| unreadable("parsing a VoID literal language", &error));
+                .map_err(|error| unreadable("parsing an RDF literal language", &error));
         }
         if let Some(datatype) = literal.datatype {
             let datatype = NamedNode::new(rdf_text(datatype)?)
@@ -3886,6 +4171,57 @@ fn rdf_object(term: &[u8]) -> Result<RdfTerm, Problem> {
     NamedNode::new(text)
         .map(Into::into)
         .map_err(|error| unreadable("parsing a VoID object IRI", &error))
+}
+
+/// What a client is told when it asks for JSON-LD of statements whose object
+/// is a triple term.
+pub(crate) const JSON_LD_HAS_NO_TRIPLE_TERMS: &str = "JSON-LD 1.1 cannot represent RDF 1.2 \
+     triple terms, which this page holds; ask for N-Quads or TriG";
+
+/// A triple term as `oxrdf` holds it, its nested triple terms included.
+fn rdf_triple_term(triple: &TripleTerm<'_>) -> Result<RdfTerm, Problem> {
+    // A subject is an IRI or a blank node in RDF whatever it spells, so one
+    // spelled like a literal fails as an unreadable IRI.
+    let subject: NamedOrBlankNode = match triple.subject() {
+        Term::BlankNode(label) => BlankNode::new(label.as_ref())
+            .map(Into::into)
+            .map_err(|error| unreadable("parsing a triple term's blank node", &error))?,
+        subject => NamedNode::new(subject.to_dictionary())
+            .map(Into::into)
+            .map_err(|error| unreadable("parsing a triple term's subject", &error))?,
+    };
+    let predicate = NamedNode::new(triple.predicate())
+        .map_err(|error| unreadable("parsing a triple term's predicate", &error))?;
+    Ok(RdfTerm::Triple(Box::new(Triple::new(
+        subject,
+        predicate,
+        rdf_term(triple.object())?,
+    ))))
+}
+
+/// A triple term's component as `oxrdf` holds it.
+fn rdf_term(term: &Term<'_>) -> Result<RdfTerm, Problem> {
+    match term {
+        Term::Triple(triple) => rdf_triple_term(triple),
+        // As hdtc named the component: an IRI that spells an encoded literal
+        // is that literal — a request may write `<"a"@en>`, and minted the
+        // name of the triple term holding "a"@en — while one that spells no
+        // encoded literal (`"a"@EN`, published so) must not turn back into a
+        // literal here. That one is no IRI RDF can carry, so it fails as any
+        // lenient IRI does.
+        Term::Iri(iri) if iri.starts_with('"') && is_encoded_literal(iri) => {
+            rdf_object(iri.as_bytes())
+        }
+        Term::Iri(iri) => NamedNode::new(iri.as_ref())
+            .map(Into::into)
+            .map_err(|error| unreadable("parsing a triple term's IRI", &error)),
+        Term::BlankNode(label) => BlankNode::new(label.as_ref())
+            .map(Into::into)
+            .map_err(|error| unreadable("parsing a triple term's blank node", &error)),
+        // Every published literal is in hdtc's encoded form, so its spelling
+        // reads back as itself.
+        Term::Literal(_) => rdf_object(term.to_dictionary().as_bytes()),
+    }
 }
 
 fn rdf_text(bytes: &[u8]) -> Result<&str, Problem> {
@@ -4628,19 +4964,30 @@ pub fn fragment(
         absent_terms: Vec::new(),
         blank_nodes,
         tagging: GraphTagging::for_scope(&request.graph),
-        labels: PageLabeling::of(
-            request.labels.as_ref(),
-            Position::ALL
-                .into_iter()
-                .filter_map(|position| request.pattern.bound(position)),
-        ),
+        labels: PageLabeling::of(request.labels.as_ref(), request.pattern.bound_terms()),
     };
 
+    if let Some(triple) = request.pattern.triple() {
+        return triple_fragment(
+            store,
+            target,
+            envelope,
+            &request.pattern,
+            triple,
+            paging,
+            request.candidates,
+        );
+    }
     match (
-        resolve(&dictionary, &envelope.blank_nodes, &request.pattern)?,
+        resolve(
+            &dictionary,
+            &envelope.blank_nodes,
+            store.triple_terms(),
+            &request.pattern,
+        )?,
         request.pattern.text(),
     ) {
-        (Resolved::Absent(absent), _) => paged(
+        (Resolved::Empty(absent), _) => paged(
             store,
             target,
             Envelope {
@@ -4716,13 +5063,39 @@ pub fn count(
 ) -> Result<CountAnswer, Problem> {
     let dictionary = store.dict();
     let blank_nodes = SkolemScope::of(store);
+    if let Some(triple) = request.pattern.triple() {
+        let (count, completeness, absent_terms) = triple_count(
+            store,
+            &blank_nodes,
+            &request.pattern,
+            triple,
+            request.candidates,
+            request.cursor.as_ref(),
+            &request.binding,
+        )?;
+        return Ok(CountAnswer {
+            dataset: target.id.dataset.clone(),
+            version: target.id.version.clone(),
+            pattern: request.pattern.clone(),
+            g: request.graph.requested().map(str::to_owned),
+            count,
+            absent_terms,
+            completeness,
+            target,
+        });
+    }
     if request.cursor.is_some() && request.pattern.text().is_none() {
         // Parsing enforces this too; keep the operation correct for callers
         // constructing the public request type directly.
         return Err(Problem::from(StaleCursor));
     }
     let (count, completeness, absent_terms) = match (
-        resolve(&dictionary, &blank_nodes, &request.pattern)?,
+        resolve(
+            &dictionary,
+            &blank_nodes,
+            store.triple_terms(),
+            &request.pattern,
+        )?,
         request.pattern.text(),
     ) {
         // Exact and free of the enumeration: a range width after bounded
@@ -4744,10 +5117,10 @@ pub fn count(
                 ),
             }
         }
-        (Resolved::Absent(_), Some(_)) if request.cursor.is_some() => {
+        (Resolved::Empty(_), Some(_)) if request.cursor.is_some() => {
             return Err(Problem::from(StaleCursor));
         }
-        (Resolved::Absent(absent), _) => (Cardinality::exact(0), Completeness::complete(), absent),
+        (Resolved::Empty(absent), _) => (Cardinality::exact(0), Completeness::complete(), absent),
         (Resolved::Ids(ids), Some(filter)) => {
             let (count, completeness) = text_count(
                 store,
@@ -4781,7 +5154,7 @@ pub fn binding_fragment(
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
     let blank_nodes = SkolemScope::of(store);
-    let mut cache = LookupCache::new(dictionary, blank_nodes.clone());
+    let mut cache = LookupCache::new(dictionary, blank_nodes.clone(), store.triple_terms());
     let mut restrictions = Vec::new();
     for row in request.rows() {
         let Some(ids) = resolve_binding(&mut cache, row)? else {
@@ -4864,7 +5237,7 @@ pub fn binding_count(
 ) -> Result<BindingCountAnswer, Problem> {
     let dictionary = store.dict();
     let blank_nodes = SkolemScope::of(store);
-    let mut cache = LookupCache::new(dictionary, blank_nodes.clone());
+    let mut cache = LookupCache::new(dictionary, blank_nodes.clone(), store.triple_terms());
     // A graph this bundle does not hold makes every row zero, and the answer
     // says so rather than letting a client read the zeros as data.
     let scope = Scope::resolve(store, &target, &blank_nodes, &request.graph)?;
@@ -5023,7 +5396,7 @@ pub fn search(
     let mut results = Vec::with_capacity(request.limit as usize);
     let mut seen = HashSet::with_capacity(request.limit as usize);
     let mut cache = TermCache::new();
-    let mut published = PublishedTerms::new(blank_nodes.clone());
+    let mut published = PublishedTerms::new(blank_nodes.clone(), store);
     let mut resolution_budget = request.candidates.0;
     let mut spent_bytes = 0u64;
     let mut resolution_exhausted = false;
@@ -5190,7 +5563,14 @@ fn push_search_result(
     // one that collides with every other graph's.
     let (subject, subject_serialized) = published
         .measured(cache, dictionary, Role::Subject, TermId(triple.subject))
-        .map(|(term, serialized)| (term.published, serialized))
+        .map(|(term, serialized)| {
+            let subject = term
+                .published
+                .text()
+                .cloned()
+                .expect("a subject is never a triple term");
+            (subject, serialized)
+        })
         .map_err(|error| unreadable("materializing a search subject", &error))?;
     let predicate = cache
         .resolve(dictionary, Role::Predicate, TermId(triple.predicate))
@@ -5267,7 +5647,13 @@ pub fn labels(
         let label = match resolved_labels.get(requested.dictionary()) {
             Some(label) => label.clone(),
             None => {
-                let subject = locate_scoped(&dictionary, &blank_nodes, Role::Subject, requested)?;
+                let subject = locate_scoped(
+                    &dictionary,
+                    &blank_nodes,
+                    store.triple_terms(),
+                    Role::Subject,
+                    requested,
+                )?;
                 let Some(label) = item_labels.label(subject, Spend::first_if(labels.is_empty()))?
                 else {
                     stopped = Some(BudgetReason::Candidate);
@@ -5366,7 +5752,7 @@ pub fn terms(
     let blank_nodes = SkolemScope::of(store);
     let mut labels = ItemLabels::of(store, request.labels.as_ref())?;
     let mut cache = TermCache::new();
-    let mut published = PublishedTerms::new(blank_nodes.clone());
+    let mut published = PublishedTerms::new(blank_nodes.clone(), store);
     let mut rows: Vec<TermRow> = Vec::with_capacity(request.limit as usize);
     let mut spent = 0u64;
     let mut spent_budget = None;
@@ -6026,8 +6412,13 @@ pub fn describe(
 
     let mut phases = Vec::new();
     if request.direction.walks_out()
-        && let Some(subject) =
-            locate_scoped(&dictionary, &blank_nodes, Role::Subject, &request.resource)?
+        && let Some(subject) = locate_scoped(
+            &dictionary,
+            &blank_nodes,
+            store.triple_terms(),
+            Role::Subject,
+            &request.resource,
+        )?
     {
         let selection = select(
             store,
@@ -6043,8 +6434,13 @@ pub fn describe(
         )?);
     }
     if request.direction.walks_in()
-        && let Some(object) =
-            locate_scoped(&dictionary, &blank_nodes, Role::Object, &request.resource)?
+        && let Some(object) = locate_scoped(
+            &dictionary,
+            &blank_nodes,
+            store.triple_terms(),
+            Role::Object,
+            &request.resource,
+        )?
     {
         let selection = select(
             store,
@@ -6057,11 +6453,28 @@ pub fn describe(
         phases.push(phase(Enumeration::Triples(selection), Some(Direction::In))?);
     }
     // Absent in the sense that matters for *this* request: the bundle holds no
-    // term that could match it in any of the roles the direction walks.
-    let absent_terms = if phases.is_empty() {
-        vec![AbsentTerm::new("iri", &request.resource)]
-    } else {
+    // term that could match it in any of the roles the direction walks — in
+    // the data, or inside unasserted triple terms, where it is published but
+    // has no edges to walk.
+    let mut held = !phases.is_empty();
+    for (walks, role) in [
+        (request.direction.walks_out(), Role::Subject),
+        (request.direction.walks_in(), Role::Object),
+    ] {
+        if walks && !held {
+            held = held_by_propositions(
+                &dictionary,
+                &blank_nodes,
+                store.triple_terms(),
+                role,
+                &request.resource,
+            )?;
+        }
+    }
+    let absent_terms = if held {
         Vec::new()
+    } else {
+        vec![AbsentTerm::new("iri", &request.resource)]
     };
 
     let mut answer = paged(
@@ -6104,9 +6517,13 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
     };
     let vars = Vars::new(request.pattern.vars(), false);
 
-    let (count, triples, absent_terms) = match resolve(&dictionary, &blank_nodes, &request.pattern)?
-    {
-        Resolved::Absent(absent) => (0, Vec::new(), absent),
+    let (count, triples, absent_terms) = match resolve(
+        &dictionary,
+        &blank_nodes,
+        store.triple_terms(),
+        &request.pattern,
+    )? {
+        Resolved::Empty(absent) => (0, Vec::new(), absent),
         Resolved::Ids(ids) => {
             let (count, drawn) = draw(&select(store, ids)?, u64::from(request.n), request.seed);
             (count, drawn, Vec::new())
@@ -6128,16 +6545,11 @@ pub fn sample(store: &Store, target: Target, request: &request::Sample) -> Resul
         })
         .collect();
 
-    let mut labeler = PageLabeling::of(
-        request.labels.as_ref(),
-        Position::ALL
-            .into_iter()
-            .filter_map(|position| request.pattern.bound(position)),
-    )
-    .map(|page| RowLabeler::new(store, &page, &blank_nodes))
-    .transpose()?;
+    let mut labeler = PageLabeling::of(request.labels.as_ref(), request.pattern.bound_terms())
+        .map(|page| RowLabeler::new(store, &page, &blank_nodes))
+        .transpose()?;
     let (rows, stopped) = materialize(
-        &dictionary,
+        store,
         &blank_nodes,
         None,
         &vars,
@@ -6758,15 +7170,19 @@ fn ranked(
     })
 }
 
-/// A pattern's ids, or the parameters whose terms the bundle does not hold.
+/// A pattern's ids, or proof that it matches nothing.
 enum Resolved {
     Ids(IdPattern),
-    Absent(Vec<AbsentTerm>),
+    /// A bound term `data.hdt` does not hold in its position. The parameters
+    /// listed are those whose terms the release holds nowhere; one found only
+    /// inside unasserted triple terms empties the answer without being one.
+    Empty(Vec<AbsentTerm>),
 }
 
 fn resolve(
     dictionary: &Dictionary<'_>,
     blank_nodes: &SkolemScope,
+    triple_terms: Option<&TripleTerms>,
     pattern: &Pattern,
 ) -> Result<Resolved, Problem> {
     let mut ids = IdPattern {
@@ -6775,25 +7191,38 @@ fn resolve(
         object: None,
     };
     let mut absent = Vec::new();
+    let mut empty = false;
     for position in Position::ALL {
         let Some(term) = pattern.bound(position) else {
             continue;
         };
-        match locate_scoped(dictionary, blank_nodes, position.role(), term)? {
+        match locate_scoped(dictionary, blank_nodes, triple_terms, position.role(), term)? {
             Some(id) => match position {
                 Position::Subject => ids.subject = Some(id),
                 Position::Predicate => ids.predicate = Some(id),
                 Position::Object => ids.object = Some(id),
             },
             // Not an error: the term is well formed and simply not in this
-            // bundle, so the answer is provably empty rather than unanswerable.
-            None => absent.push(AbsentTerm::new(position.as_str(), term)),
+            // bundle's data, so the answer is provably empty rather than
+            // unanswerable.
+            None => {
+                empty = true;
+                if !held_by_propositions(
+                    dictionary,
+                    blank_nodes,
+                    triple_terms,
+                    position.role(),
+                    term,
+                )? {
+                    absent.push(AbsentTerm::new(position.as_str(), term));
+                }
+            }
         }
     }
-    if absent.is_empty() {
-        Ok(Resolved::Ids(ids))
+    if empty {
+        Ok(Resolved::Empty(absent))
     } else {
-        Ok(Resolved::Absent(absent))
+        Ok(Resolved::Ids(ids))
     }
 }
 
@@ -6856,9 +7285,13 @@ fn reverse_scoped(
 fn locate_scoped(
     dictionary: &Dictionary<'_>,
     blank_nodes: &SkolemScope,
+    triple_terms: Option<&TripleTerms>,
     role: Role,
     term: &BoundTerm,
 ) -> Result<Option<u64>, Problem> {
+    if let Some(triple) = term.triple() {
+        return locate_triple(dictionary, blank_nodes, triple_terms, role, triple);
+    }
     if term.denotes_blank_node() {
         return Ok(None);
     }
@@ -6871,18 +7304,608 @@ fn locate_scoped(
         .map_err(|error| unreadable("looking a term up", &error))
 }
 
+/// Look a triple term up: mint the IRI hdtc gave it and find that object.
+///
+/// A published blank-node IRI inside is first reversed to the label it was
+/// minted under — the data's, or the propositions HDT's for a node only it
+/// holds — since minting reads labels. A blank node written as `_:label`
+/// addresses nothing here, as everywhere in a request, and so neither does a
+/// triple term containing one. Only an object can be a triple term.
+fn locate_triple(
+    dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    triple_terms: Option<&TripleTerms>,
+    role: Role,
+    triple: &TripleTerm<'_>,
+) -> Result<Option<u64>, Problem> {
+    let Some(terms) = triple_terms else {
+        // A bundle without the index holds no triple terms: `Store::open`
+        // refuses one whose dictionary holds their IRIs.
+        return Ok(None);
+    };
+    if role != Role::Object {
+        return Ok(None);
+    }
+    let Some(proposition) = proposition_of(dictionary, blank_nodes, terms, triple)? else {
+        return Ok(None);
+    };
+    dictionary
+        .locate(
+            Role::Object,
+            hdtc::format::triple_term_iri(&proposition).as_bytes(),
+        )
+        .map(|found| found.map(|id| id.0))
+        .map_err(|error| unreadable("looking a triple term up", &error))
+}
+
+/// The proposition hdtc minted a request's triple term from, or `None` if a
+/// component cannot be one the bundle holds.
+fn proposition_of(
+    dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    terms: &TripleTerms,
+    triple: &TripleTerm<'_>,
+) -> Result<Option<TripleTermProposition>, Problem> {
+    let Some(subject) = component_of(dictionary, blank_nodes, terms, triple.subject())? else {
+        return Ok(None);
+    };
+    let Some(object) = component_of(dictionary, blank_nodes, terms, triple.object())? else {
+        return Ok(None);
+    };
+    Ok(Some(TripleTermProposition {
+        subject,
+        predicate: triple.predicate().to_owned(),
+        object,
+    }))
+}
+
+fn component_of(
+    dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    terms: &TripleTerms,
+    term: &Term<'_>,
+) -> Result<Option<TripleTermComponent>, Problem> {
+    Ok(Some(match term {
+        Term::BlankNode(_) => return Ok(None),
+        Term::Literal(_) => TripleTermComponent::Literal(term.to_dictionary().into_owned()),
+        Term::Triple(inner) => match proposition_of(dictionary, blank_nodes, terms, inner)? {
+            Some(proposition) => TripleTermComponent::Triple(Box::new(proposition)),
+            None => return Ok(None),
+        },
+        // Blank-node syntax never resolves: a node is named by its published
+        // IRI alone. Every entry point refuses `_:` already; this keeps
+        // `from_dictionary` from reading one as a label if a new one does not.
+        Term::Iri(iri) if iri.starts_with("_:") => return Ok(None),
+        Term::Iri(iri) => match blank_label_of(dictionary, blank_nodes, Some(terms), iri)? {
+            Some(label) => TripleTermComponent::Blank(label),
+            None => TripleTermComponent::from_dictionary(iri.clone().into_owned()),
+        },
+    }))
+}
+
+/// The stored label of the blank node a published IRI names, without `_:`,
+/// or `None` if it names none.
+///
+/// Role-independent: a node published in a triple term is named by the
+/// section its label is stored in, which need not be the role it fills there
+/// — a node the data holds only as an object can be a triple term's subject.
+/// A propositions-scoped IRI names a node only when the data lacks its label;
+/// otherwise the data's IRI is the node's one spelling, and this other one is
+/// refused rather than aliased.
+fn blank_label_of(
+    dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    terms: Option<&TripleTerms>,
+    iri: &str,
+) -> Result<Option<String>, Problem> {
+    for role in [Role::Subject, Role::Object] {
+        if let Some(id) = reverse_scoped(dictionary, blank_nodes, role, iri)? {
+            return stored_label(dictionary, role, id);
+        }
+    }
+    let Some(props) = terms.and_then(TripleTerms::propositions_dict) else {
+        return Ok(None);
+    };
+    for role in [Role::Subject, Role::Object] {
+        let Some(id) = blank_nodes.propositions_role_id(role, iri) else {
+            continue;
+        };
+        let Some(label) = stored_label(&props, role, id.0)? else {
+            return Ok(None);
+        };
+        let spelled = format!("_:{label}");
+        for data_role in [Role::Subject, Role::Object] {
+            let held = dictionary
+                .locate(data_role, spelled.as_bytes())
+                .map_err(|error| unreadable("looking a blank node up", &error))?;
+            if held.is_some() {
+                return Ok(None);
+            }
+        }
+        return Ok(Some(label));
+    }
+    Ok(None)
+}
+
+/// The label of the blank node stored at `id`, or `None` if it is not one.
+fn stored_label(
+    dictionary: &Dictionary<'_>,
+    role: Role,
+    id: u64,
+) -> Result<Option<String>, Problem> {
+    let mut buffer = Vec::new();
+    let stored = dictionary
+        .extract(role, TermId(id), &mut buffer)
+        .map_err(|error| unreadable("reversing a blank-node IRI", &error))?;
+    let stored = std::str::from_utf8(stored)
+        .map_err(|error| unreadable("reading a blank-node label", &error))?;
+    Ok(stored.strip_prefix("_:").map(str::to_owned))
+}
+
+// ---------------------------------------------------------------------------
+// Patterns inside triple terms
+// ---------------------------------------------------------------------------
+
+/// What a pattern inside triple terms resolves to.
+///
+/// Unboxed although the variants differ in size: one exists per request, and
+/// moving it once costs less than an allocation would.
+#[allow(clippy::large_enum_variant)]
+enum TripleResolved<'s> {
+    /// A bound term this bundle does not hold: outer, or inner and in
+    /// neither HDT that holds propositions.
+    Absent(Vec<AbsentTerm>),
+    /// Every bound term is held, but nothing can match: the bundle has no
+    /// triple terms, none in either HDT with these inner terms, or an outer
+    /// term occurs only inside unasserted triple terms.
+    Empty,
+    /// The store's plan.
+    Selected(TripleTermSelection<'s>),
+}
+
+/// Resolve `S P <<( inner )>>`: the outer terms in `data.hdt`, and the inner
+/// pattern separately in each HDT that holds propositions, since a term has
+/// different identifiers in each.
+fn resolve_triple_pattern<'s>(
+    store: &'s Store,
+    blank_nodes: &SkolemScope,
+    pattern: &Pattern,
+    triple: &TriplePattern,
+) -> Result<TripleResolved<'s>, Problem> {
+    let dictionary = store.dict();
+    let terms = store.triple_terms();
+    let mut outer = [None, None];
+    let mut absent = Vec::new();
+    let mut unmatched = false;
+    for (slot, position) in outer
+        .iter_mut()
+        .zip([Position::Subject, Position::Predicate])
+    {
+        let Some(term) = pattern.bound(position) else {
+            continue;
+        };
+        match locate_scoped(&dictionary, blank_nodes, terms, position.role(), term)? {
+            Some(id) => *slot = Some(id),
+            None => {
+                unmatched = true;
+                if !held_by_propositions(&dictionary, blank_nodes, terms, position.role(), term)? {
+                    absent.push(AbsentTerm::new(position.as_str(), term));
+                }
+            }
+        }
+    }
+    // The inner terms, in each HDT that holds propositions. A bound one that
+    // neither holds is a term this release does not hold, and is reported as
+    // a ground object would be; one that is held but in no matching triple
+    // term makes an answer that is simply empty.
+    let props = terms.and_then(TripleTerms::propositions_dict);
+    let data_ids = inner_ids(&dictionary, blank_nodes, terms, None, triple)?;
+    let props_ids = match &props {
+        Some(props) => Some(inner_ids(
+            &dictionary,
+            blank_nodes,
+            terms,
+            Some(props),
+            triple,
+        )?),
+        None => None,
+    };
+    for (i, position) in Position::ALL.into_iter().enumerate() {
+        let held_in_data = !matches!(data_ids[i], Some(None));
+        let held_in_props = props_ids.is_some_and(|ids| !matches!(ids[i], Some(None)));
+        if let Some(term) = triple.bound(position)
+            && !held_in_data
+            && !held_in_props
+        {
+            absent.push(AbsentTerm::new("o", term));
+        }
+    }
+    if !absent.is_empty() {
+        return Ok(TripleResolved::Absent(absent));
+    }
+    if unmatched {
+        return Ok(TripleResolved::Empty);
+    }
+    let Some(terms) = terms else {
+        return Ok(TripleResolved::Empty);
+    };
+    let data = inner_pattern(data_ids);
+    let propositions = props_ids.and_then(inner_pattern);
+    if data.is_none() && propositions.is_none() {
+        return Ok(TripleResolved::Empty);
+    }
+    let selection = store
+        .resolve_triple_terms(TripleTermPattern {
+            subject: outer[0],
+            predicate: outer[1],
+            data,
+            propositions,
+        })
+        .map_err(|error| unreadable("resolving a pattern inside triple terms", &error))?;
+    debug_assert!(terms.propositions_dict().is_some() || propositions.is_none());
+    Ok(TripleResolved::Selected(selection.expect(
+        "a bundle with triple terms resolves patterns inside them",
+    )))
+}
+
+/// The inner pattern in one HDT, if every bound position was found there.
+fn inner_pattern(ids: [Option<Option<u64>>; 3]) -> Option<InnerPattern> {
+    let id = |slot: Option<Option<u64>>| -> Option<Option<u64>> {
+        match slot {
+            None => Some(None),
+            Some(found) => found.map(Some),
+        }
+    };
+    Some(InnerPattern {
+        subject: id(ids[0])?,
+        predicate: id(ids[1])?,
+        object: id(ids[2])?,
+    })
+}
+
+/// Each inner position's identifier in one HDT — `data.hdt` when `props` is
+/// `None`, else the propositions HDT: `None` for a variable, `Some(None)` for
+/// a bound term that HDT does not hold.
+fn inner_ids(
+    data: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    terms: Option<&TripleTerms>,
+    props: Option<&Dictionary<'_>>,
+    triple: &TriplePattern,
+) -> Result<[Option<Option<u64>>; 3], Problem> {
+    let dictionary = props.unwrap_or(data);
+    let mut ids = [None; 3];
+    for (slot, position) in ids.iter_mut().zip(Position::ALL) {
+        let Some(term) = triple.bound(position) else {
+            continue;
+        };
+        *slot = Some(locate_in(
+            data,
+            blank_nodes,
+            terms,
+            dictionary,
+            position.role(),
+            term,
+        )?);
+    }
+    Ok(ids)
+}
+
+/// A bound term's identifier in `role` of one HDT that holds propositions —
+/// `hdt`, which is `data.hdt`'s dictionary or the propositions HDT's — or
+/// `None` if that HDT does not hold it there.
+///
+/// A published blank-node IRI names its node by the label both HDTs store it
+/// under, and a ground triple term is minted from its stored labels and looked
+/// for among the HDT's objects.
+fn locate_in(
+    data: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    terms: Option<&TripleTerms>,
+    hdt: &Dictionary<'_>,
+    role: Role,
+    term: &BoundTerm,
+) -> Result<Option<u64>, Problem> {
+    if let Some(triple) = term.triple() {
+        let proposition = match terms {
+            Some(terms) if role == Role::Object => {
+                proposition_of(data, blank_nodes, terms, triple)?
+            }
+            _ => None,
+        };
+        let Some(proposition) = proposition else {
+            return Ok(None);
+        };
+        return hdt
+            .locate(
+                Role::Object,
+                hdtc::format::triple_term_iri(&proposition).as_bytes(),
+            )
+            .map(|found| found.map(|id| id.0))
+            .map_err(|error| unreadable("looking a triple term up", &error));
+    }
+    if term.denotes_blank_node() {
+        return Ok(None);
+    }
+    let label = match role {
+        Role::Subject | Role::Object => {
+            blank_label_of(data, blank_nodes, terms, term.dictionary())?
+        }
+        Role::Predicate => None,
+    };
+    let spelled = match &label {
+        Some(label) => Cow::Owned(format!("_:{label}")),
+        None => Cow::Borrowed(term.dictionary()),
+    };
+    hdt.locate(role, spelled.as_bytes())
+        .map(|found| found.map(|id| id.0))
+        .map_err(|error| unreadable("looking a term up", &error))
+}
+
+/// Whether the propositions HDT holds `term` in `role`: a term the release
+/// publishes inside unasserted triple terms.
+///
+/// Asked of a term `data.hdt` does not hold. A pattern naming such a term
+/// matches nothing, but the release holds it — its responses name it — so it
+/// is not reported as a term the release lacks.
+fn held_by_propositions(
+    data: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    terms: Option<&TripleTerms>,
+    role: Role,
+    term: &BoundTerm,
+) -> Result<bool, Problem> {
+    let Some(props) = terms.and_then(TripleTerms::propositions_dict) else {
+        return Ok(false);
+    };
+    Ok(locate_in(data, blank_nodes, terms, &props, role, term)?.is_some())
+}
+
+/// Where a request resumes a budgeted triple-term enumeration.
+fn triple_term_resume(
+    cursor: Option<&Cursor>,
+    space: PositionSpace,
+) -> Result<Option<TripleTermPosition>, Problem> {
+    match cursor {
+        None => Ok(None),
+        Some(cursor)
+            if cursor.space == space
+                && cursor.binding_index.is_none()
+                && cursor.scan_position.is_some() =>
+        {
+            Ok(Some(TripleTermPosition {
+                term: cursor.position,
+                row: cursor.scan_position.expect("checked above"),
+            }))
+        }
+        Some(_) => Err(Problem::from(StaleCursor)),
+    }
+}
+
+/// A step that resumes at `at`, for a cursor.
+fn triple_term_step(triple: IdTriple, at: TripleTermPosition) -> Step {
+    Step {
+        triple,
+        graph: None,
+        space: PositionSpace::TripleTerm,
+        resume: at.term,
+        scan: Some(at.row),
+        binding_index: None,
+        direction: None,
+        ranking: None,
+    }
+}
+
+/// `/fragment` with a pattern inside the object's triple term.
+///
+/// A plan whose candidates all match is an ordinary selection and pages like
+/// one. The others are budgeted on candidates, as `o.text` is: a candidate
+/// triple term need not contribute a row — one named only under another
+/// predicate contributes nothing to `? rdf:reifies <<( … )>>` — so a page may
+/// end with a cursor before it fills, and say so.
+fn triple_fragment(
+    store: &Store,
+    target: Target,
+    envelope: Envelope,
+    pattern: &Pattern,
+    triple: &TriplePattern,
+    paging: Paging<'_>,
+    candidates: Candidates,
+) -> Result<Answer, Problem> {
+    let selection = match resolve_triple_pattern(store, &envelope.blank_nodes, pattern, triple)? {
+        TripleResolved::Absent(absent) => {
+            return paged(
+                store,
+                target,
+                Envelope {
+                    absent_terms: absent,
+                    ..envelope
+                },
+                Vec::new(),
+                paging,
+            );
+        }
+        TripleResolved::Empty => return paged(store, target, envelope, Vec::new(), paging),
+        TripleResolved::Selected(TripleTermSelection::Range(selection)) => {
+            return paged(
+                store,
+                target,
+                envelope,
+                vec![phase(Enumeration::Triples(selection), None)?],
+                paging,
+            );
+        }
+        TripleResolved::Selected(TripleTermSelection::Budgeted(selection)) => selection,
+    };
+    let from = triple_term_resume(paging.cursor, PositionSpace::TripleTerm)?;
+    let from_start = from.is_none();
+    let (steps, spent) = budgeted_steps(
+        &selection,
+        from.unwrap_or_default(),
+        paging.want(),
+        candidates,
+    )?;
+    let exact = selection.exact_count();
+    finish(
+        store,
+        target,
+        envelope,
+        steps,
+        paging,
+        spent,
+        |completeness, rows| {
+            let rows = rows.len() as u64;
+            match exact {
+                Some(count) => Cardinality::exact(count),
+                None if completeness.is_complete() && from_start => Cardinality::exact(rows),
+                // Only the rows this page found, as an estimate. Not a floor:
+                // a floor that fell as a client paged would contradict
+                // itself, and `/count` gives one that holds.
+                None => Cardinality::estimated(rows),
+            }
+        },
+    )
+}
+
+/// Up to `want` steps of a budgeted triple-term enumeration from `from`.
+fn budgeted_steps(
+    selection: &BudgetedSelection<'_>,
+    from: TripleTermPosition,
+    want: usize,
+    candidates: Candidates,
+) -> Result<(Vec<Step>, Option<Spent>), Problem> {
+    // A position the store does not recognize names no candidate of this
+    // enumeration: an edited token, or one issued by another request.
+    let walk = selection
+        .steps(from, candidates.0)
+        .map_err(|_| Problem::from(StaleCursor))?;
+    let mut steps = Vec::with_capacity(want.min(1024));
+    let mut spent = None;
+    for step in walk {
+        match step {
+            TripleTermStep::Row { triple, at } => {
+                steps.push(triple_term_step(triple, at));
+                // Stop at once: pulling once more could spend the rest of the
+                // candidate budget looking for a row no page carries.
+                if steps.len() >= want {
+                    break;
+                }
+            }
+            TripleTermStep::Spent(at) => {
+                spent = Some(Spent::Candidate(triple_term_step(
+                    IdTriple {
+                        subject: 0,
+                        predicate: 0,
+                        object: 0,
+                    },
+                    at,
+                )));
+            }
+        }
+    }
+    Ok((steps, spent))
+}
+
+/// `/count` with a pattern inside the object's triple term: exact when the
+/// plan's count is arithmetic or its scan completes within the candidate
+/// budget, and otherwise the rows counted so far as a lower bound, with a
+/// cursor that continues the scan.
+fn triple_count(
+    store: &Store,
+    blank_nodes: &SkolemScope,
+    pattern: &Pattern,
+    triple: &TriplePattern,
+    candidates: Candidates,
+    cursor: Option<&Cursor>,
+    binding: &CursorBinding,
+) -> Result<(Cardinality, Completeness, Vec<AbsentTerm>), Problem> {
+    let selection = match resolve_triple_pattern(store, blank_nodes, pattern, triple)? {
+        TripleResolved::Absent(_) | TripleResolved::Empty if cursor.is_some() => {
+            return Err(Problem::from(StaleCursor));
+        }
+        TripleResolved::Absent(absent) => {
+            return Ok((Cardinality::exact(0), Completeness::complete(), absent));
+        }
+        TripleResolved::Empty => {
+            return Ok((Cardinality::exact(0), Completeness::complete(), Vec::new()));
+        }
+        TripleResolved::Selected(TripleTermSelection::Range(selection)) => {
+            if cursor.is_some() {
+                return Err(Problem::from(StaleCursor));
+            }
+            return Ok((
+                Cardinality::exact(selection.count().value),
+                Completeness::complete(),
+                Vec::new(),
+            ));
+        }
+        TripleResolved::Selected(TripleTermSelection::Budgeted(selection)) => selection,
+    };
+    if let Some(count) = selection.exact_count() {
+        if cursor.is_some() {
+            return Err(Problem::from(StaleCursor));
+        }
+        return Ok((
+            Cardinality::exact(count),
+            Completeness::complete(),
+            Vec::new(),
+        ));
+    }
+    // The cursor carries the candidate to resume at and the rows counted
+    // before it.
+    let (from, accumulated) = match triple_term_resume(cursor, PositionSpace::TripleTermScan)? {
+        None => (TripleTermPosition::default(), 0),
+        Some(position) => (
+            TripleTermPosition {
+                term: position.term,
+                row: 0,
+            },
+            position.row,
+        ),
+    };
+    let progress = selection
+        .count(from, candidates.0)
+        .map_err(|_| Problem::from(StaleCursor))?;
+    // Only an edited token's accumulator can overflow.
+    let counted = accumulated
+        .checked_add(progress.counted)
+        .ok_or_else(|| Problem::from(StaleCursor))?;
+    match progress.next {
+        None => Ok((
+            Cardinality::exact(counted),
+            Completeness::complete(),
+            Vec::new(),
+        )),
+        Some(next) => {
+            let mut cursor = Cursor::at(binding, PositionSpace::TripleTermScan, next.term);
+            cursor.scan_position = Some(counted);
+            Ok((
+                Cardinality::estimated(counted).at_least(counted),
+                Completeness::budget_exhausted(BudgetReason::Candidate, cursor.encode()),
+                Vec::new(),
+            ))
+        }
+    }
+}
+
 /// Dictionary probes shared by all rows of one binding table.
 struct LookupCache<'a> {
     dictionary: Dictionary<'a>,
     blank_nodes: SkolemScope,
+    triple_terms: Option<&'a TripleTerms>,
     found: [HashMap<String, Option<u64>>; 3],
 }
 
 impl<'a> LookupCache<'a> {
-    fn new(dictionary: Dictionary<'a>, blank_nodes: SkolemScope) -> Self {
+    fn new(
+        dictionary: Dictionary<'a>,
+        blank_nodes: SkolemScope,
+        triple_terms: Option<&'a TripleTerms>,
+    ) -> Self {
         Self {
             dictionary,
             blank_nodes,
+            triple_terms,
             found: std::array::from_fn(|_| HashMap::new()),
         }
     }
@@ -6892,7 +7915,13 @@ impl<'a> LookupCache<'a> {
         if let Some(found) = by_term.get(term.dictionary()) {
             return Ok(*found);
         }
-        let found = locate_scoped(&self.dictionary, &self.blank_nodes, role, term)?;
+        let found = locate_scoped(
+            &self.dictionary,
+            &self.blank_nodes,
+            self.triple_terms,
+            role,
+            term,
+        )?;
         by_term.insert(term.dictionary().to_owned(), found);
         Ok(found)
     }
@@ -7004,10 +8033,21 @@ impl PageLabeling {
             labeling: labeling.clone(),
             bound: bound
                 .into_iter()
-                .map(|term| term.dictionary().to_owned())
+                .flat_map(bound_label_keys)
+                .map(str::to_owned)
                 .collect(),
         })
     }
+}
+
+/// The spellings a bound term's labels are keyed by: its own, or, for a triple
+/// term, whose dictionary spelling is its encoding, the IRIs it holds.
+fn bound_label_keys(term: &BoundTerm) -> impl Iterator<Item = &str> {
+    let (own, iris) = match term.triple() {
+        Some(triple) => (None, triple.iris()),
+        None => (Some(term.dictionary()), Vec::new()),
+    };
+    own.into_iter().chain(iris)
 }
 
 /// The `labels=true` modifier, applied as a page is materialized.
@@ -7070,10 +8110,20 @@ impl<'s> RowLabeler<'s> {
     /// Resolve the labels `row` adds, or `None` when the allowance cannot
     /// cover them and the page must end before it.
     fn row(&mut self, row: &Row, spend: Spend) -> Result<Option<RowLabels>, Problem> {
-        let cells = row
-            .cells
-            .iter()
-            .map(|(_, term)| (Rc::clone(&term.published), Rc::clone(&term.stored)));
+        // A triple term is labelled by the IRIs it holds, each of which is
+        // published and stored under the one spelling.
+        let cells = row.cells.iter().flat_map(|(_, term)| {
+            let (text, iris) = match &term.published {
+                Published::Text(text) => {
+                    (Some((Rc::clone(text), Rc::clone(&term.stored))), Vec::new())
+                }
+                Published::Triple(triple) => (None, triple.iris()),
+            };
+            text.into_iter().chain(iris.into_iter().map(|iri| {
+                let iri: Rc<str> = Rc::from(iri);
+                (Rc::clone(&iri), iri)
+            }))
+        });
         let graph = row
             .graph
             .iter()
@@ -7376,7 +8426,6 @@ fn finish(
     spent: Option<Spent>,
     cardinality: impl FnOnce(&Completeness, &[Row]) -> Cardinality,
 ) -> Result<Answer, Problem> {
-    let dictionary = store.dict();
     // The row this page cannot carry, kept because it is where the next one
     // begins rather than merely because it exists.
     let dropped = (steps.len() == paging.want())
@@ -7402,7 +8451,7 @@ fn finish(
         .map(|page| RowLabeler::new(store, &page, &blank_nodes))
         .transpose()?;
     let (rows, stopped) = materialize(
-        &dictionary,
+        store,
         &blank_nodes,
         store.graphs(),
         &vars,
@@ -7750,7 +8799,7 @@ fn resume_position(
 /// bound applied. The two passes bound different resources; neither can be
 /// removed without replacing it with an equally explicit memory bound.
 fn materialize(
-    dictionary: &Dictionary<'_>,
+    store: &Store,
     blank_nodes: &SkolemScope,
     graphs: Option<&Graphs>,
     vars: &Vars,
@@ -7758,8 +8807,9 @@ fn materialize(
     bytes: ResponseBytes,
     mut labels: Option<&mut RowLabeler<'_>>,
 ) -> Result<(Vec<Row>, Option<Stopped>), Problem> {
+    let dictionary = &store.dict();
     let mut cache = TermCache::new();
-    let mut published = PublishedTerms::new(blank_nodes.clone());
+    let mut published = PublishedTerms::new(blank_nodes.clone(), store);
     let mut graph_names = GraphNames::new(*dictionary, blank_nodes);
     let mut rows: Vec<Row> = Vec::with_capacity(steps.len());
     // The bound terms' labels head every page, so they are weighed first.
@@ -8566,7 +9616,7 @@ fn schema_cell<'a>(
 ) -> Cell<'a> {
     let annotation = match Term::from_dictionary(&term.0) {
         Term::Iri(iri) => labels.and_then(|labels| labels.get(iri.as_ref())),
-        Term::BlankNode(_) | Term::Literal(_) => None,
+        Term::BlankNode(_) | Term::Literal(_) | Term::Triple(_) => None,
     };
     let (label, qualifier, full_iri) = Term::from_dictionary(&term.0)
         .into_display(&target.prefixes)
@@ -8578,6 +9628,7 @@ fn schema_cell<'a>(
         href,
         full_iri,
         structured: true,
+        parts: Vec::new(),
     }
 }
 
@@ -8796,20 +9847,15 @@ impl Answer {
                     // has one spelling — the request's, which for a blank node
                     // is already the scoped IRI, since nothing else resolves.
                     for position in Position::ALL {
-                        let found = pattern
-                            .bound(position)
-                            .map(|bound| (bound.dictionary(), bound.dictionary()))
-                            .or_else(|| {
-                                row.cells
-                                    .iter()
-                                    .find(|(row_position, _)| *row_position == position)
-                                    .map(|(_, term)| {
-                                        (term.published.as_ref(), term.stored.as_ref())
-                                    })
-                            });
-                        if let Some((published, stored)) = found {
-                            cells.push(self.cell(published, stored));
-                        }
+                        let cell = match pattern.bound(position) {
+                            Some(bound) => Some(self.bound_cell(bound)),
+                            None => row
+                                .cells
+                                .iter()
+                                .find(|(row_position, _)| *row_position == position)
+                                .map(|(_, term)| self.cell(&term.published, &term.stored)),
+                        };
+                        cells.extend(cell);
                     }
                 } else {
                     cells.extend(
@@ -8857,17 +9903,46 @@ impl Answer {
     /// literal to every triple carrying it.
     /// `published` is what the cell shows and links to; `stored` is the
     /// dictionary spelling the page's labels were resolved against.
-    fn cell<'a>(&'a self, published: &'a str, stored: &'a str) -> Cell<'a> {
-        let mut cell = term_cell(
+    fn cell<'a>(&'a self, published: &'a Published, stored: &'a str) -> Cell<'a> {
+        let mut cell = row_cell(
             &self.target,
             &self.blank_nodes,
             published,
             self.page_labels.get(stored).map(String::as_str),
+            Some(&self.page_labels),
         );
-        if self.described.as_deref() == Some(published) {
+        if published
+            .text()
+            .is_some_and(|text| self.described.as_deref() == Some(text.as_ref()))
+        {
             cell.href = None;
         }
         cell
+    }
+
+    /// A cell for a position the request bound.
+    fn bound_cell<'a>(&'a self, bound: &'a BoundTerm) -> Cell<'a> {
+        match bound.triple() {
+            Some(triple) => triple_cell(
+                &self.target,
+                &self.blank_nodes,
+                triple,
+                Some(&self.page_labels),
+            ),
+            None => {
+                let text = bound.dictionary();
+                let mut cell = term_cell(
+                    &self.target,
+                    &self.blank_nodes,
+                    text,
+                    self.page_labels.get(text).map(String::as_str),
+                );
+                if self.described.as_deref() == Some(text) {
+                    cell.href = None;
+                }
+                cell
+            }
+        }
     }
 }
 
@@ -9152,11 +10227,12 @@ impl Resource for TermsPage {
                 // sections *this scan read*, so a `role=predicate` scan calls
                 // every row a predicate whether or not the term is described
                 // elsewhere in the graph.
-                term_cell(
+                row_cell(
                     &self.target,
                     &self.blank_nodes,
                     &row.published,
                     row.label.as_ref().and_then(RowLabel::value),
+                    None,
                 )
             })
             .collect();
@@ -9355,7 +10431,17 @@ impl Resource for CountAnswer {
                         absent_terms_text(&self.absent_terms)
                     )))
                 }
-                @if self.pattern.text().is_none() {
+                @if self.pattern.triple().is_some() && !self.completeness.is_complete() {
+                    (note(
+                        "A count inside triple terms examines a bounded number of candidate triple \
+                         terms. Continue from the cursor until the count is exact."
+                    ))
+                } @else if self.pattern.triple().is_some() {
+                    (note(
+                        "A count inside triple terms examines a bounded number of candidate triple \
+                         terms; this one finished within it, so it is exact."
+                    ))
+                } @else if self.pattern.text().is_none() {
                     (note(
                         "A plain pattern's count is exact and costs a bounded descent rather than an \
                          enumeration, which is what makes it worth asking before /fragment."
@@ -9445,9 +10531,12 @@ fn pattern_fields(pattern: &Pattern, operation: AccessOperation) -> Vec<(&str, V
         .map(|position| {
             (
                 pattern_parameter(position, operation),
-                pattern
-                    .bound(position)
-                    .map_or(Value::Text("(any)"), |term| Value::Code(term.requested())),
+                match (position, pattern.triple()) {
+                    (Position::Object, Some(triple)) => Value::Code(triple.requested()),
+                    _ => pattern
+                        .bound(position)
+                        .map_or(Value::Text("(any)"), |term| Value::Code(term.requested())),
+                },
             )
         })
         .collect();
@@ -9501,10 +10590,94 @@ fn term_cell<'a>(
     text: &'a str,
     annotation: Option<&'a str>,
 ) -> Cell<'a> {
-    let term = Term::from_dictionary(text);
+    published_cell(
+        target,
+        blank_nodes,
+        Term::from_dictionary(text),
+        text,
+        annotation,
+    )
+}
+
+/// A cell for a published term, triple terms included. A triple term's own
+/// terms are labelled from `labels`, the page's labels by spelling, when it
+/// has them.
+fn row_cell<'a>(
+    target: &Target,
+    blank_nodes: &SkolemScope,
+    published: &'a Published,
+    annotation: Option<&'a str>,
+    labels: Option<&'a HashMap<String, String>>,
+) -> Cell<'a> {
+    match published {
+        Published::Text(text) => term_cell(target, blank_nodes, text, annotation),
+        Published::Triple(triple) => triple_cell(target, blank_nodes, triple, labels),
+    }
+}
+
+/// A triple term's cell: its subject, predicate and object each linked and
+/// labelled as a term anywhere else is, and the whole linking to the rows
+/// whose object it is.
+fn triple_cell<'a>(
+    target: &Target,
+    blank_nodes: &SkolemScope,
+    triple: &'a TripleTerm<'_>,
+    labels: Option<&'a HashMap<String, String>>,
+) -> Cell<'a> {
+    let label = |iri: &str| {
+        labels
+            .and_then(|labels| labels.get(iri))
+            .map(String::as_str)
+    };
+    let part = |term: &'a Term<'_>| match term {
+        Term::Iri(iri) => published_cell(
+            target,
+            blank_nodes,
+            Term::Iri(Cow::Borrowed(iri)),
+            iri,
+            label(iri),
+        ),
+        Term::Triple(nested) => triple_cell(target, blank_nodes, nested, labels),
+        Term::BlankNode(_) | Term::Literal(_) => {
+            published_cell(target, blank_nodes, term.clone(), "", None)
+        }
+    };
+    let predicate = triple.predicate();
+    let parts = vec![
+        part(triple.subject()),
+        published_cell(
+            target,
+            blank_nodes,
+            Term::Iri(Cow::Borrowed(predicate)),
+            predicate,
+            label(predicate),
+        ),
+        part(triple.object()),
+    ];
+    let whole = Term::Triple(Box::new(triple.clone()));
+    Cell {
+        label: String::new(),
+        qualifier: None,
+        annotation: None,
+        href: Some(target.ask("fragment", "o", &whole.to_request())),
+        full_iri: None,
+        structured: true,
+        parts,
+    }
+}
+
+/// A cell for `term`, whose published spelling is `text` unless it is a
+/// triple term.
+fn published_cell<'a>(
+    target: &Target,
+    blank_nodes: &SkolemScope,
+    term: Term<'a>,
+    text: &'a str,
+    annotation: Option<&'a str>,
+) -> Cell<'a> {
     let request = term.to_request();
     let href = match &term {
-        Term::Literal(_) => target.ask("fragment", "o", &request),
+        Term::Literal(_) | Term::Triple(_) => target.ask("fragment", "o", &request),
         _ => target.ask("describe", "iri", &request),
     };
     let (label, qualifier, full_iri) = match blank_nodes.display_label(text) {
@@ -9518,6 +10691,7 @@ fn term_cell<'a>(
         href: Some(href),
         full_iri,
         structured: true,
+        parts: Vec::new(),
     }
 }
 
@@ -9529,6 +10703,9 @@ struct Cell<'a> {
     href: Option<String>,
     full_iri: Option<Cow<'a, str>>,
     structured: bool,
+    /// A triple term's subject, predicate and object, each a cell of its own;
+    /// empty for any other term.
+    parts: Vec<Cell<'a>>,
 }
 
 impl<'a> Cell<'a> {
@@ -9541,6 +10718,7 @@ impl<'a> Cell<'a> {
             href,
             full_iri: None,
             structured: false,
+            parts: Vec::new(),
         }
     }
 
@@ -9553,10 +10731,17 @@ impl<'a> Cell<'a> {
             href: None,
             full_iri: None,
             structured: false,
+            parts: Vec::new(),
         }
     }
 
     fn value(&self) -> Value<'_> {
+        if !self.parts.is_empty() {
+            return Value::TripleTerm {
+                href: self.href.clone().unwrap_or_default(),
+                parts: self.parts.iter().map(Cell::value).collect(),
+            };
+        }
         match &self.href {
             Some(href) => Value::TermLink {
                 href: href.clone(),
@@ -9617,7 +10802,10 @@ mod tests {
             other => panic!("fragment data became {other:?} rather than a named node"),
         }
         // And the page spells that IRI back as a blank node for a reader.
-        assert_eq!(blank_nodes.display_label(&published), Some("sh-1"));
+        assert_eq!(
+            blank_nodes.display_label(&published).as_deref(),
+            Some("sh-1")
+        );
     }
 
     #[test]
@@ -9677,7 +10865,7 @@ mod tests {
                                     (
                                         *position,
                                         RowTerm {
-                                            published: Rc::clone(&text),
+                                            published: Published::Text(Rc::clone(&text)),
                                             stored: text,
                                         },
                                     )
@@ -9802,7 +10990,7 @@ mod tests {
                 "{label:?}"
             );
             let row = TermRow::new(
-                Rc::clone(&subject),
+                Published::Text(Rc::clone(&subject)),
                 subject_serialized,
                 vec!["subject", "object"],
                 Some(label.clone()),

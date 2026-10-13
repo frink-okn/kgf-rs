@@ -71,6 +71,38 @@ pub(crate) fn published_root(path: &std::path::Path) -> crate::map::PublishedRoo
     crate::map::PublishedRoot::for_test(path)
 }
 
+/// RDF 1.2 triple terms in every shape the read layer distinguishes.
+///
+/// Asserted and unasserted propositions, one reified by two reifiers, one
+/// named only under a predicate other than `rdf:reifies`, one nested inside
+/// another (and named nowhere else), a literal and a blank node inside, and a
+/// directional language tag — so that both HDTs, nesting, and the
+/// `:claims`-only case that defeats a page-fill bound all occur.
+pub const TRIPLE_TERMS_NT: &str = concat!(
+    "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .\n",
+    "<http://example.org/e1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+    "<<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>> .\n",
+    "<http://example.org/e1> <http://example.org/source> <http://example.org/survey> .\n",
+    "<http://example.org/e2> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+    "<<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>> .\n",
+    "<http://example.org/e3> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+    "<<( <http://example.org/bob> <http://example.org/knows> <http://example.org/carol> )>> .\n",
+    "<http://example.org/e3> <http://example.org/confidence> \"0.4\" .\n",
+    "<http://example.org/x> <http://example.org/claims> ",
+    "<<( <http://example.org/bob> <http://example.org/likes> <http://example.org/alice> )>> .\n",
+    "<http://example.org/x> <http://example.org/claims> ",
+    "<<( <http://example.org/dan> <http://example.org/says> ",
+    "<<( <http://example.org/bob> <http://example.org/knows> <http://example.org/erin> )>> )>> .\n",
+    "<http://example.org/e4> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+    "<<( <http://example.org/alice> <http://example.org/name> \"Alice\"@en--ltr )>> .\n",
+    "<http://example.org/alice> <http://example.org/name> \"Alice\"@en--ltr .\n",
+    "_:n <http://example.org/knows> <http://example.org/carol> .\n",
+    "<http://example.org/e5> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+    "<<( _:n <http://example.org/knows> <http://example.org/carol> )>> .\n",
+    "<http://example.org/e6> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+    "<<( _:m <http://example.org/knows> \"a literal\" )>> .\n",
+);
+
 /// The golden fixture graph: small enough to reason about, wide enough to
 /// exercise the structures.
 ///
@@ -454,6 +486,9 @@ impl Fixture {
             PERM,
             GRAPHS,
             GRAPHS_IDX,
+            crate::store::artifact::TRIPLE_TERMS,
+            crate::store::artifact::PROPOSITIONS,
+            crate::store::artifact::PROPOSITIONS_PERM,
             crate::store::artifact::VOID_HDT,
             crate::store::artifact::VOID_PERM,
             crate::store::artifact::SCHEMA_NODES,

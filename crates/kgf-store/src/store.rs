@@ -22,6 +22,7 @@ use crate::indexed::IndexedHdt;
 use crate::map::{PublishedBundle, open_published};
 use crate::pattern::{IdPattern, Selection};
 use crate::perm::Permutations;
+use crate::triple_terms::{TripleTermPattern, TripleTermSelection, TripleTerms};
 
 /// Names of the artifacts the store knows about.
 pub mod artifact {
@@ -35,6 +36,15 @@ pub mod artifact {
     pub const GRAPHS: &str = "data.hdt.graphs";
     /// POS/OPS-keyed membership layers. Required whenever [`GRAPHS`] is present.
     pub const GRAPHS_IDX: &str = "data.hdt.graphs.idx";
+    /// RDF 1.2 triple-term index: each triple-term IRI's proposition, and the
+    /// layers marking propositions in each permutation. Optional; declares
+    /// `reification`. Required when `data.hdt` holds triple-term IRIs.
+    pub const TRIPLE_TERMS: &str = "data.hdt.tt";
+    /// The unasserted propositions of triple terms, as standard HDT. Present
+    /// exactly when the triple-term index says the bundle has some.
+    pub const PROPOSITIONS: &str = "data.hdt.props.hdt";
+    /// Permutations and rank directories for [`PROPOSITIONS`]. Required with it.
+    pub const PROPOSITIONS_PERM: &str = "data.hdt.props.hdt.perm";
     /// Full-text index over the dictionary's literals. Optional; gates `search`.
     ///
     /// **A directory, not a file** — the only artifact that is. Its bytes are
@@ -132,6 +142,7 @@ pub struct Store {
     bundle: PublishedBundle,
     data: IndexedHdt,
     graphs: Option<Graphs>,
+    triple_terms: Option<TripleTerms>,
     description: Option<DescriptionStore>,
     text: Option<TextSearcher>,
 }
@@ -146,6 +157,7 @@ impl std::fmt::Debug for Store {
             .field("bundle", &self.bundle)
             .field("data", &self.data)
             .field("graphs", &self.graphs.is_some())
+            .field("triple_terms", &self.triple_terms.is_some())
             .field("description", &self.description.is_some())
             .field("text", &self.text.is_some())
             .finish()
@@ -181,6 +193,7 @@ impl Store {
         let data = IndexedHdt::open(hdt, perm)?;
 
         let graphs = artifacts.open_graphs(bundle)?;
+        let triple_terms = artifacts.open_triple_terms(bundle, &data)?;
         let document = crate::manifest::ManifestDocument::read(dir)?
             .expect("manifest existence was required immediately above");
         let manifest_description = document.lists_description_artifacts();
@@ -218,6 +231,7 @@ impl Store {
             bundle: bundle.clone(),
             data,
             graphs,
+            triple_terms,
             description,
             text: artifacts.open_text()?,
         })
@@ -245,6 +259,40 @@ impl Store {
     /// An unscoped request never needs this: the union is `data.hdt` itself.
     pub fn graphs(&self) -> Option<&Graphs> {
         self.graphs.as_ref()
+    }
+
+    /// The RDF 1.2 triple terms of this bundle, if it has any.
+    ///
+    /// `None` exactly when the bundle holds no triple term: a `data.hdt` whose
+    /// dictionary holds triple-term IRIs without the index that defines them
+    /// is refused at open, so absence here is a fact about the data, not a
+    /// missing artifact.
+    pub fn triple_terms(&self) -> Option<&TripleTerms> {
+        self.triple_terms.as_ref()
+    }
+
+    /// Resolve a pattern inside triple terms, `S P <<( s p o )>>`. `O(log N)`;
+    /// enumerates nothing. `None` for a bundle without triple terms, where
+    /// every such pattern is empty.
+    pub fn resolve_triple_terms(
+        &self,
+        pattern: TripleTermPattern,
+    ) -> Result<Option<TripleTermSelection<'_>>> {
+        // The outer ids are validated whether or not there is anything to
+        // match, as for every pattern — by their ranges alone, since nothing
+        // is looked up until a plan is chosen.
+        crate::pattern::validate_pattern(
+            self.data.dict_counts(),
+            IdPattern {
+                subject: pattern.subject,
+                predicate: pattern.predicate,
+                object: None,
+            },
+        )?;
+        match &self.triple_terms {
+            None => Ok(None),
+            Some(terms) => terms.select(&self.data, pattern).map(Some),
+        }
     }
 
     /// The full-text index over this bundle's literals, if it published one.
@@ -326,6 +374,9 @@ pub(crate) struct ArtifactSet {
     pub(crate) perm: PathBuf,
     pub(crate) graphs: Option<PathBuf>,
     pub(crate) graph_index: Option<PathBuf>,
+    pub(crate) triple_terms: Option<PathBuf>,
+    pub(crate) propositions: Option<PathBuf>,
+    pub(crate) propositions_perm: Option<PathBuf>,
     pub(crate) text: Option<PathBuf>,
     pub(crate) description: Option<DescriptionArtifacts>,
     /// The `filters/` files present, a subset of [`artifact::FILTERS`].
@@ -380,11 +431,47 @@ impl ArtifactSet {
             _ => {}
         }
 
+        let triple_terms = optional_file(dir, artifact::TRIPLE_TERMS)?;
+        let propositions = optional_file(dir, artifact::PROPOSITIONS)?;
+        let propositions_perm = optional_file(dir, artifact::PROPOSITIONS_PERM)?;
+        match (&triple_terms, &propositions, &propositions_perm) {
+            (None, Some(orphan), _) | (None, None, Some(orphan)) => {
+                return Err(Error::Malformed {
+                    artifact: orphan.clone(),
+                    detail: format!(
+                        "propositions of triple terms are present without the triple-term \
+                         index {} that names them",
+                        dir.join(artifact::TRIPLE_TERMS).display()
+                    ),
+                });
+            }
+            (Some(_), Some(props), None) => {
+                return Err(Error::MissingRequiredArtifact {
+                    bundle: dir.to_path_buf(),
+                    artifact: artifact::PROPOSITIONS_PERM.to_owned(),
+                    remedy: format!("hdtc perm {}", props.display()),
+                });
+            }
+            (Some(_), None, Some(index)) => {
+                return Err(Error::Malformed {
+                    artifact: index.clone(),
+                    detail: format!(
+                        "permutation index present without its propositions HDT {}",
+                        dir.join(artifact::PROPOSITIONS).display()
+                    ),
+                });
+            }
+            _ => {}
+        }
+
         Ok(Self {
             hdt,
             perm,
             graphs,
             graph_index,
+            triple_terms,
+            propositions,
+            propositions_perm,
             text: optional_dir(dir, artifact::TEXT)?,
             description: DescriptionArtifacts::resolve(dir)?,
             filters: complete_families(dir, &artifact::FILTER_FAMILIES)?,
@@ -437,6 +524,54 @@ impl ArtifactSet {
                 artifact: dir.clone(),
                 detail: format!("text index could not be opened: {error:#}"),
             })
+    }
+
+    /// Open the triple-term artifacts, if the bundle carries them, and refuse
+    /// a `data.hdt` that holds triple terms without them.
+    ///
+    /// Shared with [`crate::manifest::BundleFacts::read`] for the reason
+    /// [`open_graphs`](Self::open_graphs) is. Without the index a triple-term
+    /// IRI is an opaque string: it could be neither rendered as the triple
+    /// term it is nor matched inside, and a bundle answering as if it held no
+    /// triple terms would be wrong rather than degraded. Two prefix searches
+    /// per role decide it.
+    pub(crate) fn open_triple_terms(
+        &self,
+        bundle: &PublishedBundle,
+        data: &IndexedHdt,
+    ) -> Result<Option<TripleTerms>> {
+        let Some(index) = &self.triple_terms else {
+            let dict = data.dict();
+            for role in [
+                crate::Role::Subject,
+                crate::Role::Predicate,
+                crate::Role::Object,
+            ] {
+                if dict
+                    .prefix_bounds(role, crate::triple_terms::NAMESPACE.as_bytes())?
+                    .count()
+                    != 0
+                {
+                    return Err(Error::MissingRequiredArtifact {
+                        bundle: bundle.path().to_path_buf(),
+                        artifact: artifact::TRIPLE_TERMS.to_owned(),
+                        remedy: format!(
+                            "hdtc create, rebuilding {} from its source RDF",
+                            self.hdt.display()
+                        ),
+                    });
+                }
+            }
+            return Ok(None);
+        };
+        let index = open_published(bundle, index)?;
+        let propositions = match (&self.propositions, &self.propositions_perm) {
+            (Some(hdt), Some(perm)) => {
+                Some((open_published(bundle, hdt)?, open_published(bundle, perm)?))
+            }
+            _ => None,
+        };
+        TripleTerms::open(data, index, propositions).map(Some)
     }
 
     /// Open the graph sidecar pair, if the bundle carries it.

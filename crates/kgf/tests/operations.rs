@@ -25,7 +25,7 @@ use kgf_server::{Budgets, Caps, Limits};
 use kgf_store::catalog::BundleId;
 use kgf_store::dict::Section;
 use kgf_store::pattern::IdPattern;
-use kgf_store::testing::{Fixture, WORKED_EXAMPLE_NQ};
+use kgf_store::testing::{Fixture, TRIPLE_TERMS_NT, WORKED_EXAMPLE_NQ};
 use kgf_store::{IdTriple, Role, Store, TermId};
 
 /// Small, and every term shape in it.
@@ -46,6 +46,760 @@ const GRAPH: &str = concat!(
     "\"31\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
     "_:b1 <http://example.org/note> \"a blank subject\" .\n",
 );
+
+/// RDF 1.2 triple terms, end to end: a row whose object is a triple term
+/// carries it as SPARQL 1.2's triple term object, decoded however it is
+/// stored — asserted, unasserted, nested, or holding a blank node — and a
+/// ground triple term in a request finds what the row says it is.
+#[test]
+fn triple_terms_are_published_decoded_and_found_by_their_content() {
+    let served = Served::from_fixture(Fixture::build(TRIPLE_TERMS_NT));
+    let store = served.store();
+    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+    let iri = |local: &str| serde_json::json!({"type": "iri", "value": format!("http://example.org/{local}")});
+    let triple = |s: serde_json::Value, p: &str, o: serde_json::Value| serde_json::json!({"type": "triple", "value": {"subject": s, "predicate": iri(p), "object": o}});
+
+    // Every object of `rdf:reifies` comes back as the triple term it encodes.
+    let answer = served.fragment(&store, &format!("p={reifies}&limit=100"));
+    let objects: Vec<serde_json::Value> = answer["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["o"].clone())
+        .collect();
+    assert_eq!(objects.len(), 6, "{answer}");
+    assert!(objects.iter().all(|o| o["type"] == "triple"), "{objects:?}");
+    let alice_knows_bob = triple(iri("alice"), "knows", iri("bob"));
+    assert_eq!(
+        objects.iter().filter(|o| **o == alice_knows_bob).count(),
+        2,
+        "reified twice"
+    );
+    assert!(objects.contains(&triple(iri("bob"), "knows", iri("carol"))));
+    assert!(objects.contains(&triple(
+        iri("alice"),
+        "name",
+        serde_json::json!({"type": "literal", "value": "Alice", "lang": "en--ltr"})
+    )));
+    // A blank node inside is published as the data's node with that label.
+    let data_blank = answer["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|row| {
+            let subject = &row["o"]["value"]["subject"];
+            (row["o"]["value"]["object"] == iri("carol")
+                && subject["value"].as_str().unwrap().starts_with("urn:fdc:"))
+            .then(|| subject["value"].as_str().unwrap().to_owned())
+        })
+        .expect("the triple term holding `_:n`");
+    let n = served.fragment(&store, &format!("s=<{data_blank}>&p=ex:knows"));
+    assert_eq!(n["rows"][0]["o"], iri("carol"), "the same node: {n}");
+    // Nested, and named only under `:claims`.
+    let claims = served.fragment(&store, "p=ex:claims&limit=100");
+    let nested = claims["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["o"].clone())
+        .find(|o| o["value"]["predicate"] == iri("says"))
+        .expect("the nested claim");
+    assert_eq!(
+        nested,
+        triple(iri("dan"), "says", triple(iri("bob"), "knows", iri("erin")))
+    );
+
+    // A ground triple term finds the rows whose object it is, under every
+    // spelling: CURIEs, brackets, and a published blank-node IRI inside.
+    for (term, reifiers) in [
+        ("<<( ex:alice ex:knows ex:bob )>>", vec!["e1", "e2"]),
+        (
+            "<<(<http://example.org/bob> <http://example.org/knows> <http://example.org/carol>)>>",
+            vec!["e3"],
+        ),
+        ("<<( ex:alice ex:name \"Alice\"@en--ltr )>>", vec!["e4"]),
+        (
+            &format!("<<( <{data_blank}> ex:knows ex:carol )>>"),
+            vec!["e5"],
+        ),
+        ("<<( ex:carol ex:knows ex:alice )>>", vec![]),
+    ] {
+        let query = format!("o={}", urlencode(term));
+        let found = served.fragment(&store, &query);
+        let subjects: Vec<String> = found["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                row["s"]["value"]
+                    .as_str()
+                    .unwrap()
+                    .replace("http://example.org/", "")
+            })
+            .collect();
+        assert_eq!(subjects, reifiers, "{term}: {found}");
+        let counted = served.count(&store, &query);
+        assert_eq!(counted["count"]["value"], reifiers.len(), "{term}");
+    }
+    // The nested term, by its content.
+    let found = served.fragment(
+        &store,
+        &format!(
+            "o={}",
+            urlencode("<<( ex:dan ex:says <<( ex:bob ex:knows ex:erin )>> )>>")
+        ),
+    );
+    assert_eq!(found["rows"][0]["s"], iri("x"), "{found}");
+
+    // A triple term is never a subject or a predicate, and the encoding
+    // namespace is not a vocabulary.
+    for query in [
+        format!("s={}", urlencode("<<( ex:alice ex:knows ex:bob )>>")),
+        "o=<urn:x-kgf:tt:g:0123456789abcdef0123456789abcdef>".to_owned(),
+        format!("o={}", urlencode("<< ex:alice ex:knows ex:bob >>")),
+    ] {
+        let error = served.try_fragment(&store, &query).unwrap_err();
+        assert_eq!(error.code().as_str(), "bad_term_syntax", "{query}");
+    }
+
+    // JSON-LD cannot carry it, and says so; a page of the same bundle that
+    // holds no triple term is still JSON-LD.
+    let error = served
+        .try_render_fragment(&store, &format!("p={reifies}"), Representation::JsonLd)
+        .unwrap_err();
+    assert_eq!(error.code().as_str(), "not_acceptable", "{error:?}");
+    let plain = served
+        .try_render_fragment(&store, "p=ex:knows", Representation::JsonLd)
+        .expect("JSON-LD of a page without triple terms");
+    assert!(plain.contains("http://example.org/bob"), "{plain}");
+
+    // RDF carries the triple term itself.
+    let turtle = served.render(
+        &store,
+        "fragment",
+        &format!("o={}", urlencode("<<( ex:alice ex:knows ex:bob )>>")),
+        Representation::Turtle,
+    );
+    assert!(turtle.contains("<<("), "{turtle}");
+    assert!(!turtle.contains("urn:x-kgf:tt"), "{turtle}");
+    let unbound = served.render(
+        &store,
+        "fragment",
+        &format!("p={reifies}"),
+        Representation::NQuads,
+    );
+    assert!(
+        unbound.contains("<<( <http://example.org/bob>"),
+        "{unbound}"
+    );
+    assert!(!unbound.contains("urn:x-kgf:tt"), "{unbound}");
+    // And the page links a triple term to the rows that name it.
+    let page = served.render(
+        &store,
+        "fragment",
+        &format!("p={reifies}"),
+        Representation::Html,
+    );
+    assert!(
+        !page.contains("urn:x-kgf:tt"),
+        "a page shows triple terms, not their encoding"
+    );
+}
+
+/// A term the release holds only inside unasserted triple terms is held: a
+/// pattern naming it is empty, and names nothing absent. A term the release
+/// holds nowhere is absent, and each one a triple pattern binds is reported.
+#[test]
+fn a_term_held_only_inside_unasserted_triple_terms_is_not_absent() {
+    let served = Served::from_fixture(Fixture::build(TRIPLE_TERMS_NT));
+    let store = served.store();
+    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+    // `ex:dan`, `ex:says` and `ex:erin` occur only in the unasserted claim
+    // `<<( ex:dan ex:says <<( ex:bob ex:knows ex:erin )>> )>>`, and the nested
+    // triple term only inside it.
+    for query in [
+        "s=ex:dan".to_owned(),
+        "p=ex:says".to_owned(),
+        "o=ex:erin".to_owned(),
+        format!("o={}", urlencode("<<( ex:bob ex:knows ex:erin )>>")),
+        format!("s=ex:dan&o={}", urlencode("<<( ?s ?p ?o )>>")),
+    ] {
+        let answer = served.fragment(&store, &query);
+        assert!(
+            answer["rows"].as_array().unwrap().is_empty(),
+            "{query}: {answer}"
+        );
+        assert!(answer.get("absent_terms").is_none(), "{query}: {answer}");
+        let counted = served.count(&store, &query);
+        assert_eq!(counted["count"]["value"], 0, "{query}: {counted}");
+        assert!(counted.get("absent_terms").is_none(), "{query}: {counted}");
+    }
+    let dan = served.describe(&store, "iri=ex:dan");
+    assert_eq!(dan["cardinality"]["value"], serde_json::json!(0));
+    assert!(dan.get("absent_terms").is_none(), "{dan}");
+
+    // So is a blank node only the propositions HDT holds, by the IRI its
+    // triple term is published with, and a page shows it apart from the
+    // data's nodes.
+    let e6 = served.fragment(&store, &format!("s=ex:e6&p={reifies}"));
+    let m = e6["rows"][0]["o"]["value"]["subject"]["value"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(m.starts_with("urn:fdc:"), "{e6}");
+    let described = served.describe(&store, &format!("iri=<{m}>"));
+    assert!(described.get("absent_terms").is_none(), "{described}");
+    let page = served.render(
+        &store,
+        "fragment",
+        &format!("s=ex:e6&p={reifies}"),
+        Representation::Html,
+    );
+    assert!(page.contains("_:tt-"), "{page}");
+
+    // Held nowhere: absent, every one of them.
+    let nobody = served.fragment(
+        &store,
+        &format!("o={}", urlencode("<<( ex:nobody ex:nothing ?o )>>")),
+    );
+    assert_eq!(
+        nobody["absent_terms"],
+        serde_json::json!([
+            {"parameter": "o", "reason": "not_in_bundle"},
+            {"parameter": "o", "reason": "not_in_bundle"}
+        ]),
+        "{nobody}"
+    );
+    assert_eq!(
+        served.fragment(&store, "s=ex:nobody")["absent_terms"],
+        serde_json::json!([{"parameter": "s", "reason": "not_in_bundle"}])
+    );
+}
+
+/// What a lenient ingest stores is published whatever it is: a language tag
+/// no validator passes, or a datatype IRI holding a quote. And a blank node inside a triple term is found
+/// again by the IRI it was published under, whichever role the data holds it
+/// in, or when only the propositions HDT holds it.
+#[test]
+fn triple_terms_survive_lenient_content_and_name_blank_nodes_in_any_role() {
+    let source = concat!(
+        "<http://example.org/e1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+        "<<( <http://example.org/s> <http://example.org/p> \"x\"@zh-classical )>> .\n",
+        "<http://example.org/e2> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+        "<<( <http://example.org/s> <http://example.org/p> \"y\"^^<http://example.org/d\\u0022t> )>> .\n",
+        // `_:k` is only an object in the data, and a subject in a triple term.
+        "<http://example.org/x> <http://example.org/p> _:k .\n",
+        "<http://example.org/e3> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+        "<<( _:k <http://example.org/q> <http://example.org/o> )>> .\n",
+        // A subject IRI that begins with a quote, inside a triple term.
+        "<\"x> <http://example.org/p> <http://example.org/o> .\n",
+        "<http://example.org/e5> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+        "<<( <\"x> <http://example.org/p> <http://example.org/o> )>> .\n",
+        // `_:m` occurs only inside an unasserted triple term.
+        "<http://example.org/e4> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+        "<<( _:m <http://example.org/q> <http://example.org/o> )>> .\n",
+    );
+    let served = Served::from_fixture(Fixture::build(source));
+    let store = served.store();
+    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+
+    // Every row publishes, in every representation.
+    let answer = served.fragment(&store, &format!("p={reifies}&limit=100"));
+    assert_eq!(answer["rows"].as_array().unwrap().len(), 5, "{answer}");
+    let all = served.fragment(&store, "limit=100");
+    assert_eq!(all["rows"].as_array().unwrap().len(), 7, "{all}");
+    let page = served.render(&store, "fragment", "limit=100", Representation::Html);
+    assert!(page.contains("zh-classical"), "{page}");
+
+    // Blank nodes inside triple terms resolve by their published IRIs.
+    for reifier in ["e3", "e4"] {
+        let row = answer["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["s"]["value"] == format!("http://example.org/{reifier}"))
+            .unwrap();
+        let blank = row["o"]["value"]["subject"]["value"].as_str().unwrap();
+        assert!(blank.starts_with("urn:fdc:"), "{row}");
+        let found = served.fragment(
+            &store,
+            &format!("o={}", urlencode(&format!("<<( <{blank}> ex:q ex:o )>>"))),
+        );
+        let subjects: Vec<&str> = found["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["s"]["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            subjects,
+            vec![format!("http://example.org/{reifier}").as_str()],
+            "{blank}"
+        );
+    }
+
+    // In RDF, a lenient IRI that no IRI grammar accepts fails the page as an
+    // unreadable term would — never a panic, and never a different term:
+    // the `<"x>` subject is not read back as a literal. JSON-LD is refused
+    // first, as the client's syntax rather than the bundle.
+    for (representation, code) in [
+        (Representation::Turtle, "internal_error"),
+        (Representation::NQuads, "internal_error"),
+        (Representation::TriG, "internal_error"),
+        (Representation::JsonLd, "not_acceptable"),
+    ] {
+        let error = served
+            .try_render_fragment(&store, &format!("s=ex:e5&p={reifies}"), representation)
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), code, "{representation:?}");
+    }
+
+    // A triple term names no graph.
+    let error = served
+        .try_fragment(
+            &store,
+            &format!("g={}", urlencode("<<( ex:s ex:p ex:o )>>")),
+        )
+        .unwrap_err();
+    assert_eq!(error.code().as_str(), "bad_term_syntax");
+}
+
+/// A triple term whose components lenient ingest stored spelled like literals
+/// it is not — an IRI `<"a"@EN>`, `<"x>`, `<"@en>` — is published so that,
+/// sent back, it names the term hdtc named: such an object as an IRI, an
+/// encoded literal as a literal, asserted or not.
+#[test]
+fn published_triple_terms_name_themselves_even_with_lenient_components() {
+    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+    let mut source = String::new();
+    for (i, object) in [
+        "<\\u0022a\\u0022@EN>",
+        "\"a\"@en",
+        "<\\u0022x>",
+        "<\\u0022@en>",
+        "<\\u0022q\\u0022>",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let triple = format!("<http://example.org/s> <http://example.org/p{i}> {object}");
+        source.push_str(&format!(
+            "<http://example.org/e{i}> {reifies} <<( {triple} )>> .\n"
+        ));
+        if i % 2 == 0 {
+            source.push_str(&format!("{triple} .\n"));
+        }
+    }
+    let served = Served::from_fixture(Fixture::build(&source));
+    let store = served.store();
+    let answer = served.fragment(&store, &format!("p={reifies}&limit=100"));
+    let rows = answer["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 5, "{answer}");
+    for row in rows {
+        let object = &row["o"]["value"]["object"];
+        // By predicate: p1 is the real literal, p4's `"q"` is spelled as one.
+        let expected = match row["o"]["value"]["predicate"]["value"].as_str().unwrap() {
+            "http://example.org/p1" | "http://example.org/p4" => "literal",
+            _ => "iri",
+        };
+        assert_eq!(object["type"], expected, "{row}");
+        let body = serde_json::json!({
+            "pattern": {"s": "?r", "p": reifies, "o": "?t"},
+            "bindings": {"vars": ["?t"], "rows": [[row["o"].clone()]]},
+        });
+        let found = served.binding_fragment(&store, &body);
+        let subjects: Vec<&serde_json::Value> = found["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|found| &found["s"])
+            .collect();
+        assert_eq!(subjects, vec![&row["s"]], "{row}: {found}");
+    }
+    // A request may spell the literal as an IRI, as hdtc reads it; RDF then
+    // writes the triple term it named, holding the literal.
+    let turtle = served.render(
+        &store,
+        "fragment",
+        &format!(
+            "o={}",
+            urlencode("<<( <http://example.org/s> <http://example.org/p1> <\"a\"@en> )>>")
+        ),
+        Representation::Turtle,
+    );
+    assert!(turtle.contains("example.org/e1"), "{turtle}");
+    assert!(turtle.contains("\"a\"@en"), "{turtle}");
+}
+
+/// Variables inside a triple term: every plan answers what a filter over all
+/// rows answers, pages to the same rows at every size and under a one-candidate
+/// budget, and counts them — exactly, or as a floor that resumes to the total.
+#[test]
+fn patterns_inside_triple_terms_answer_what_a_filter_over_every_row_answers() {
+    inner_patterns_answer_what_a_filter_answers(TRIPLE_TERMS_NT, false);
+}
+
+/// The same among thousands of other triples, where the data layers are
+/// stored sparse (Elias–Fano) rather than as bitmaps: every plan, page size,
+/// budget and count answers the same.
+#[test]
+fn patterns_inside_triple_terms_answer_the_same_over_sparse_layers() {
+    let mut source = TRIPLE_TERMS_NT.to_owned();
+    for i in 0..3_000 {
+        source.push_str(&format!(
+            "<http://example.org/f{i}> <http://example.org/filler> <http://example.org/g{}> .\n",
+            i % 50
+        ));
+    }
+    inner_patterns_answer_what_a_filter_answers(&source, true);
+}
+
+fn inner_patterns_answer_what_a_filter_answers(source: &str, sparse: bool) {
+    let served = Served::from_fixture(Fixture::build(source));
+    let store = served.store();
+    let layer = store
+        .triple_terms()
+        .unwrap()
+        .layer(
+            kgf_store::triple_terms::Source::Data,
+            kgf_store::pattern::Permutation::Spo,
+        )
+        .unwrap();
+    assert_eq!(layer.is_sparse(), sparse);
+    let all = served.fragment(&store, "limit=10000");
+    let every: Vec<serde_json::Value> = all["rows"].as_array().unwrap().clone();
+    let ex = |local: &str| format!("http://example.org/{local}");
+    let reifies = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
+
+    // (query, outer s, outer p, inner s, inner p, inner o): `None` is a variable.
+    type Case = (String, Option<String>, Option<String>, [Option<String>; 3]);
+    let cases: Vec<Case> = vec![
+        ("<<( ?a ?b ?c )>>".into(), None, None, [None, None, None]),
+        (
+            "<<( ?a ex:knows ?c )>>".into(),
+            None,
+            None,
+            [None, Some(ex("knows")), None],
+        ),
+        (
+            "<<( ex:alice ?b ?c )>>".into(),
+            None,
+            None,
+            [Some(ex("alice")), None, None],
+        ),
+        (
+            "<<( ?a ?b ex:carol )>>".into(),
+            None,
+            None,
+            [None, None, Some(ex("carol"))],
+        ),
+        (
+            "<<( ex:alice ?b ex:bob )>>".into(),
+            None,
+            None,
+            [Some(ex("alice")), None, Some(ex("bob"))],
+        ),
+        (
+            "<<( ?a ex:knows ex:carol )>>".into(),
+            None,
+            None,
+            [None, Some(ex("knows")), Some(ex("carol"))],
+        ),
+        (
+            "<<( ?a ?b \"Alice\"@en--ltr )>>".into(),
+            None,
+            None,
+            [None, None, Some("\"Alice\"@en--ltr".into())],
+        ),
+        (
+            "<<( ?a ex:says <<( ex:bob ex:knows ex:erin )>> )>>".into(),
+            None,
+            None,
+            [
+                None,
+                Some(ex("says")),
+                Some(format!(
+                    "<<( {} {} {} )>>",
+                    ex("bob"),
+                    ex("knows"),
+                    ex("erin")
+                )),
+            ],
+        ),
+        (
+            "<<( ?a ex:knows ?c )>>".into(),
+            None,
+            Some(reifies.into()),
+            [None, Some(ex("knows")), None],
+        ),
+        (
+            "<<( ?a ?b ?c )>>".into(),
+            None,
+            Some(ex("claims")),
+            [None, None, None],
+        ),
+        (
+            "<<( ?a ?b ?c )>>".into(),
+            Some(ex("x")),
+            None,
+            [None, None, None],
+        ),
+        (
+            "<<( ?a ex:likes ?c )>>".into(),
+            Some(ex("x")),
+            Some(ex("claims")),
+            [None, Some(ex("likes")), None],
+        ),
+        (
+            "<<( ex:bob ?b ?c )>>".into(),
+            Some(ex("e3")),
+            None,
+            [Some(ex("bob")), None, None],
+        ),
+        (
+            "<<( ex:nobody ?b ?c )>>".into(),
+            None,
+            None,
+            [Some(ex("nobody")), None, None],
+        ),
+    ];
+    let total = cases.len();
+    let mut nonempty = 0;
+    for (inner, s, p, [is, ip, io]) in cases {
+        let mut query = format!("o={}", urlencode(&inner));
+        if let Some(s) = &s {
+            query.push_str(&format!("&s={}", urlencode(&format!("<{s}>"))));
+        }
+        if let Some(p) = &p {
+            query.push_str(&format!("&p={}", urlencode(&format!("<{p}>"))));
+        }
+        let mut expected: Vec<Vec<String>> = every
+            .iter()
+            .filter(|row| {
+                let o = &row["o"];
+                o["type"] == "triple"
+                    && s.as_deref().is_none_or(|s| row["s"]["value"] == s)
+                    && p.as_deref().is_none_or(|p| row["p"]["value"] == p)
+                    && is
+                        .as_deref()
+                        .is_none_or(|v| dictionary_spelling(&o["value"]["subject"]) == v)
+                    && ip
+                        .as_deref()
+                        .is_none_or(|v| dictionary_spelling(&o["value"]["predicate"]) == v)
+                    && io
+                        .as_deref()
+                        .is_none_or(|v| dictionary_spelling(&o["value"]["object"]) == v)
+            })
+            .map(|row| {
+                ["s", "p", "o"]
+                    .into_iter()
+                    .filter(|position| match *position {
+                        "s" => s.is_none(),
+                        "p" => p.is_none(),
+                        _ => true,
+                    })
+                    .map(|position| dictionary_spelling(&row[position]))
+                    .collect()
+            })
+            .collect();
+        expected.sort();
+        nonempty += usize::from(!expected.is_empty());
+        // One order, whatever the page size.
+        let in_order = served.page_through(&store, &query, 10_000);
+        for size in [1usize, 2, 3] {
+            assert_eq!(
+                served.page_through(&store, &query, size),
+                in_order,
+                "?{query} at limit={size}"
+            );
+        }
+        let mut sorted = in_order.clone();
+        sorted.sort();
+        assert_eq!(sorted, expected, "?{query}");
+        let counted = served.count(&store, &query);
+        assert_eq!(
+            counted["count"]["value"].as_u64().unwrap() as usize,
+            expected.len(),
+            "/count?{query}: {counted}"
+        );
+
+        // Under a one-candidate budget, pages end early and resume; counts
+        // are floors that resume to the total.
+        let budgets = Budgets {
+            candidate_budget: 1,
+            ..Budgets::new()
+        };
+        let mut found = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..1_000 {
+            let paged = match &cursor {
+                Some(token) => format!("{query}&limit=10&cursor={token}"),
+                None => format!("{query}&limit=10"),
+            };
+            let page = served.fragment_within(&store, &paged, &budgets);
+            found.extend(rows(&page));
+            match page["next"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => break,
+            }
+        }
+        found.sort();
+        assert_eq!(found, expected, "?{query} under a one-candidate budget");
+        let mut counted = None;
+        let mut cursor: Option<String> = None;
+        for _ in 0..1_000 {
+            let paged = match &cursor {
+                Some(token) => format!("{query}&cursor={token}"),
+                None => query.clone(),
+            };
+            let request = request::Count::parse(
+                &params(&paged),
+                served.within(&budgets),
+                served.release().prefixes(),
+                &served.release().binding(),
+            )
+            .unwrap();
+            let answer = json(
+                answer::count(&store, served.target("count", &paged), &request).unwrap(),
+                Representation::Json,
+            );
+            match answer["next"].as_str() {
+                Some(next) => {
+                    assert_eq!(answer["count"]["exact"], false, "{answer}");
+                    cursor = Some(next.to_owned());
+                }
+                None => {
+                    counted = answer["count"]["value"].as_u64();
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            counted,
+            Some(expected.len() as u64),
+            "/count?{query} under a budget"
+        );
+    }
+
+    // Not vacuous: all but the deliberately absent subject match something.
+    assert_eq!(nonempty, total - 1);
+
+    // A page that ran out from the start is the whole answer, exactly; one
+    // that stopped claims nothing it could later contradict.
+    let pattern = format!("o={}", urlencode("<<( ?a ex:knows ?c )>>"));
+    let whole = served.fragment(&store, &format!("{pattern}&limit=100"));
+    assert_eq!(whole["cardinality"]["exact"], true, "{whole}");
+    let first = served.fragment(&store, &format!("{pattern}&limit=1"));
+    assert_eq!(first["cardinality"]["exact"], false, "{first}");
+    assert!(first["cardinality"].get("min").is_none(), "{first}");
+    // An inner term the bundle does not hold is reported, like a ground one,
+    // on both operations, beside an absent outer term.
+    let query = format!("o={}", urlencode("<<( ex:nobody ?b ?c )>>"));
+    for answer in [
+        served.fragment(&store, &query),
+        served.count(&store, &query),
+    ] {
+        assert_eq!(
+            answer["absent_terms"],
+            serde_json::json!([{"parameter": "o", "reason": "not_in_bundle"}]),
+            "{answer}"
+        );
+    }
+    let both = served.fragment(&store, &format!("{query}&s=ex:zzz"));
+    assert_eq!(
+        both["absent_terms"].as_array().unwrap().len(),
+        2,
+        "every absent term is named: {both}"
+    );
+    // A held inner term in no matching triple term is an empty answer, not
+    // an absent one: `ex:x` is a subject, but of no proposition.
+    let held = served.fragment(&store, &format!("o={}", urlencode("<<( ex:x ?b ?c )>>")));
+    assert!(
+        held.get("absent_terms")
+            .is_none_or(|a| a.as_array().unwrap().is_empty()),
+        "{held}"
+    );
+
+    // The page says what was asked, and RDF carries the triple terms.
+    let page = served.render(&store, "fragment", &pattern, Representation::Html);
+    assert!(page.contains("ex:knows ?c"), "the page echoes the pattern");
+    let counted = served.render(&store, "count", &pattern, Representation::Html);
+    assert!(counted.contains("candidate triple"), "{counted}");
+    let nquads = served.render(&store, "fragment", &pattern, Representation::NQuads);
+    assert!(
+        nquads.contains("<<( <http://example.org/alice>"),
+        "{nquads}"
+    );
+    assert!(!nquads.contains("urn:x-kgf:tt"), "{nquads}");
+
+    // Repeated variables, variables nested deeper, and `o.text` beside a
+    // pattern are refused rather than answered differently.
+    for query in [
+        format!("o={}", urlencode("<<( ?a ex:knows ?a )>>")),
+        format!(
+            "o={}",
+            urlencode("<<( ?a ex:says <<( ?b ex:knows ex:erin )>> )>>")
+        ),
+        format!("o={}&o.text=Alice", urlencode("<<( ?a ?b ?c )>>")),
+        format!("o={}&g=*", urlencode("<<( ?a ?b ?c )>>")),
+    ] {
+        assert!(served.try_fragment(&store, &query).is_err(), "{query}");
+    }
+    let sample = request::Sample::parse(
+        &params(&format!("o={}", urlencode("<<( ?a ?b ?c )>>"))),
+        served.limits(),
+        served.release().prefixes(),
+        served.release().predicate_roles(),
+    );
+    assert!(
+        sample.is_err(),
+        "a sample has no exact cardinality to draw from"
+    );
+}
+
+/// A bundle without triple terms answers a pattern inside one with nothing,
+/// naming as absent only a bound inner term it does not hold.
+#[test]
+fn a_bundle_without_triple_terms_answers_patterns_inside_them_with_nothing() {
+    let served = Served::new();
+    let store = served.store();
+    for (inner, absent) in [
+        ("<<( ?a ?b ?c )>>", false),
+        ("<<( ex:alice ?b ?c )>>", false),
+        ("<<( ex:nobody ?b ?c )>>", true),
+    ] {
+        let query = format!("o={}", urlencode(inner));
+        for answer in [
+            served.fragment(&store, &query),
+            served.count(&store, &query),
+        ] {
+            let reported = answer
+                .get("absent_terms")
+                .and_then(|terms| terms.as_array())
+                .is_some_and(|terms| !terms.is_empty());
+            assert_eq!(reported, absent, "{inner}: {answer}");
+        }
+        let counted = served.count(&store, &query);
+        assert_eq!(
+            counted["count"],
+            serde_json::json!({"value": 0, "exact": true})
+        );
+    }
+}
+
+/// Percent-encode a query value: triple-term syntax carries spaces, quotes
+/// and `#`, which a URL must not carry raw.
+fn urlencode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
 
 /// Labels in several languages under the two label predicates the served
 /// release declares, `ex:label` then `ex:name`, each subject arranged to pin one
@@ -1522,6 +2276,124 @@ fn the_label_cascade_ranks_language_then_predicate_then_term_id() {
     );
 }
 
+/// A triple term is no IRI, but it holds IRIs, and `labels=true` labels each
+/// of them — subject, predicate and object, a nested triple term's too — in
+/// the JSON map and in RDF's label statements, as it does any IRI a page
+/// carries. A page shows each linked to its own description with its label
+/// beneath, between brackets that link to the whole triple term's rows. A
+/// triple term the request binds is labelled the same way: its encoding is
+/// never a key.
+#[test]
+fn a_triple_terms_iris_are_labelled_and_linked_like_any_others() {
+    let source = concat!(
+        "<http://example.org/alice> <http://example.org/label> \"Alice\" .\n",
+        "<http://example.org/bob> <http://example.org/label> \"Bob\" .\n",
+        "<http://example.org/knows> <http://example.org/label> \"knows\" .\n",
+        "<http://example.org/dan> <http://example.org/label> \"Dan\" .\n",
+        "<http://example.org/says> <http://example.org/label> \"says\" .\n",
+        "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .\n",
+        "<http://example.org/e1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+        "<<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>> .\n",
+        // Unasserted and nested: Dan says that Bob knows Alice.
+        "<http://example.org/x> <http://example.org/claims> <<( <http://example.org/dan> ",
+        "<http://example.org/says> <<( <http://example.org/bob> <http://example.org/knows> ",
+        "<http://example.org/alice> )>> )>> .\n",
+    );
+    let served = Served::from_fixture(Fixture::build(source));
+    let store = served.store();
+    let ex = |local: &str| format!("http://example.org/{local}");
+    let bound = format!(
+        "o={}&labels=true",
+        urlencode("<<( ex:alice ex:knows ex:bob )>>")
+    );
+    for (query, named) in [
+        ("s=ex:e1&labels=true", vec!["alice", "knows", "bob"]),
+        (
+            "s=ex:x&labels=true",
+            vec!["dan", "says", "bob", "knows", "alice"],
+        ),
+        (bound.as_str(), vec!["alice", "knows", "bob"]),
+    ] {
+        let page = served.fragment(&store, query);
+        let labels = page["labels"].as_object().unwrap();
+        for local in named {
+            let expected = match local {
+                "alice" => "Alice",
+                "bob" => "Bob",
+                "dan" => "Dan",
+                other => other,
+            };
+            assert_eq!(labels[&ex(local)], expected, "{query}: {labels:?}");
+        }
+        assert!(
+            labels.keys().all(|key| !key.starts_with("urn:x-kgf")),
+            "{query}: {labels:?}"
+        );
+    }
+
+    let turtle = served.render(
+        &store,
+        "fragment",
+        "s=ex:e1&labels=true",
+        Representation::Turtle,
+    );
+    for (local, label) in [("alice", "Alice"), ("knows", "knows"), ("bob", "Bob")] {
+        assert!(
+            turtle.contains(&format!("<{}> <{}> \"{label}\"", ex(local), ex("label")))
+                || turtle.contains(&format!("ex:{local} ex:label \"{label}\"")),
+            "{local}: {turtle}"
+        );
+    }
+
+    let html = served.render(
+        &store,
+        "fragment",
+        "s=ex:x&labels=true",
+        Representation::Html,
+    );
+    for label in ["Dan", "says", "Bob", "knows", "Alice"] {
+        assert!(
+            html.contains(&format!("class=\"t-label\">{label}<")),
+            "{label}: {html}"
+        );
+    }
+    for local in ["dan", "says", "bob", "knows", "alice"] {
+        assert!(
+            html.contains(&format!("describe?iri=ex%3A{local}"))
+                || html.contains(&format!(
+                    "describe?iri=%3Chttp%3A%2F%2Fexample.org%2F{local}%3E"
+                )),
+            "{local}: {html}"
+        );
+    }
+    // Two triple terms, the nested one inside the other: two pairs of brackets.
+    assert_eq!(html.matches("class=\"tt-mark\"").count(), 4, "{html}");
+    assert!(!html.contains("urn:x-kgf"), "{html}");
+
+    // A page labels them unasked, as it labels every IRI it shows.
+    let page = served.fragment_page(&store, "s=ex:x");
+    for label in ["Dan", "says", "Bob", "knows", "Alice"] {
+        assert!(
+            page.contains(&format!("class=\"t-label\">{label}<")),
+            "{label}: {page}"
+        );
+    }
+
+    // The terms a triple pattern binds are labelled before any row, as a
+    // bound position's are — in the map, and in RDF's label statements, which
+    // a label cannot be mistaken for: its object is no triple term. Here on a
+    // page with no row to carry them.
+    let pattern = format!(
+        "p=ex:claims&o={}&labels=true",
+        urlencode("<<( ex:alice ?p ?o )>>")
+    );
+    let empty = served.fragment(&store, &pattern);
+    assert!(empty["rows"].as_array().unwrap().is_empty(), "{empty}");
+    assert_eq!(empty["labels"][&ex("alice")], "Alice", "{empty}");
+    let turtle = served.render(&store, "fragment", &pattern, Representation::Turtle);
+    assert!(turtle.contains("\"Alice\""), "{turtle}");
+}
+
 #[test]
 fn a_labelled_page_maps_every_iri_it_carries_and_only_those() {
     let served = Served::multilingual();
@@ -2170,6 +3042,30 @@ impl Served {
         Ok(json(answer, Representation::Json))
     }
 
+    /// A fragment's page as the router serves one: labelled by the release's
+    /// default cascade although the request did not ask.
+    fn fragment_page(&self, store: &Store, query: &str) -> String {
+        use kgf_server::answer::Renders;
+
+        let request = self.parse_fragment(query);
+        let mut answer = answer::fragment(store, self.target("fragment", query), &request)
+            .expect("a fragment answer");
+        answer
+            .hydrate_labels(
+                store,
+                &request::Labeling::release_default(
+                    self.release().predicate_roles(),
+                    self.limits(),
+                ),
+                1_000,
+            )
+            .expect("hydrate page labels");
+        let rendered = answer
+            .render(Representation::Html)
+            .expect("render a fragment page");
+        String::from_utf8(rendered.body.to_vec()).expect("a UTF-8 page")
+    }
+
     fn fragment(&self, store: &Store, query: &str) -> serde_json::Value {
         self.try_fragment(store, query)
             .unwrap_or_else(|error| panic!("GET /fragment?{query}: {error}"))
@@ -2521,17 +3417,9 @@ impl Served {
         );
         let rendered = match operation {
             "fragment" => {
-                let request = request::Fragment::parse(
-                    &params(query),
-                    self.limits(),
-                    self.release().prefixes(),
-                    self.release().predicate_roles(),
-                    &self.release().binding(),
-                )
-                .expect("a well-formed request");
-                answer::fragment(store, target, &request)
-                    .expect("an answer")
-                    .render(representation)
+                return self
+                    .try_render_fragment(store, query, representation)
+                    .expect("render a fragment");
             }
             "describe" => {
                 let request = request::Describe::parse(
@@ -2580,6 +3468,34 @@ impl Served {
         }
         .expect("render an operation answer");
         String::from_utf8(rendered.body.to_vec()).expect("a UTF-8 body")
+    }
+
+    /// A fragment rendered in `representation`, or the problem rendering it.
+    fn try_render_fragment(
+        &self,
+        store: &Store,
+        query: &str,
+        representation: Representation,
+    ) -> Result<String, kgf_server::envelope::Problem> {
+        use kgf_server::answer::Renders;
+
+        let target = Target::new(
+            self.id(),
+            access_operation("fragment"),
+            params(query),
+            self.release().prefixes().clone(),
+            kgf_server::url::Mount::default(),
+        );
+        let request = request::Fragment::parse(
+            &params(query),
+            self.limits(),
+            self.release().prefixes(),
+            self.release().predicate_roles(),
+            &self.release().binding(),
+        )
+        .expect("a well-formed request");
+        let rendered = answer::fragment(store, target, &request)?.render(representation)?;
+        Ok(String::from_utf8(rendered.body.to_vec()).expect("a UTF-8 body"))
     }
 
     /// Every term of the bundle, per role, in request syntax.
@@ -4157,6 +5073,15 @@ fn published_spelling(store: &Store, role: Role, id: u64, stored: &str) -> Strin
 /// response shape and hdtc's dictionary encoding rather than calling the code
 /// under test.
 fn dictionary_spelling(term: &serde_json::Value) -> String {
+    if term["type"] == "triple" {
+        let value = &term["value"];
+        return format!(
+            "<<( {} {} {} )>>",
+            dictionary_spelling(&value["subject"]),
+            dictionary_spelling(&value["predicate"]),
+            dictionary_spelling(&value["object"])
+        );
+    }
     let value = term["value"].as_str().expect("a term value");
     match term["type"].as_str().expect("a term type") {
         "iri" => value.to_owned(),
@@ -4170,4 +5095,32 @@ fn dictionary_spelling(term: &serde_json::Value) -> String {
         },
         other => panic!("unknown term type {other}"),
     }
+}
+
+/// A text index over a bundle with unasserted triple terms also holds the
+/// literals found only inside them, numbered past `data.hdt`'s objects. They
+/// are not objects of any triple here, so text answers do not include them —
+/// and above all do not fail on them.
+#[test]
+fn text_over_triple_terms_answers_from_data_hdt_alone() {
+    let served = Served::from_fixture(Fixture::build(TRIPLE_TERMS_NT).with_text());
+    let store = served.store();
+    // "a literal" occurs only inside the unasserted `<<( _:m ex:knows "a literal" )>>`.
+    let answer = served
+        .try_fragment(&store, "o.text=literal")
+        .expect("an answer");
+    assert_eq!(answer["rows"].as_array().unwrap().len(), 0, "{answer}");
+    let counted = served.count(&store, "o.text=literal");
+    assert_eq!(counted["count"]["value"], 0, "{counted}");
+    let searched = served.search(&store, "q=literal");
+    assert_eq!(
+        searched["results"].as_array().map_or(0, Vec::len),
+        0,
+        "{searched}"
+    );
+    // A literal of data.hdt is still found.
+    let alice = served
+        .try_fragment(&store, "o.text=Alice")
+        .expect("an answer");
+    assert!(!alice["rows"].as_array().unwrap().is_empty(), "{alice}");
 }

@@ -894,3 +894,43 @@ fn a_class_is_walked_by_position_across_pages() {
     }
     assert_eq!(walked, MEMBERS);
 }
+
+#[test]
+fn a_triple_term_reads_as_its_terms() {
+    // A claim node: what it reifies, what it claims — a triple term nesting
+    // another, neither asserted — and one whose subject is a blank node. Each
+    // reads as its subject, predicate and object, named as any mention and
+    // any line's predicate are; the nested one in parentheses; the blank node
+    // left out. The encoding a triple term is stored under is never written.
+    let reifies = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
+    let mut source = graph(&[
+        ("e", RDF_TYPE, "Claim"),
+        ("e", RDFS_LABEL, "\"A claim\""),
+        ("alice", RDFS_LABEL, "\"Alice\""),
+        ("bob", RDFS_LABEL, "\"Bob\""),
+        ("dan", RDFS_LABEL, "\"Dan\""),
+        ("knows", RDFS_LABEL, "\"knows\""),
+        ("says", RDFS_LABEL, "\"says\""),
+        ("alice", "knows", "bob"),
+    ]);
+    source.push_str(&format!(
+        "<{EX}e> <{reifies}> <<( <{EX}alice> <{EX}knows> <{EX}bob> )>> .\n\
+         <{EX}e> <{EX}claims> <<( <{EX}dan> <{EX}says> <<( <{EX}bob> <{EX}knows> <{EX}alice> )>> )>> .\n\
+         <{EX}e> <{EX}about> <<( _:someone <{EX}knows> <{EX}bob> )>> .\n"
+    ));
+    let published = Published::build(&source);
+    let config = parse_config(r#"{"targets": {"claim": {"type": "http://example.com/Claim"}}}"#);
+    let rendered = one(&published.store, &config, &format!("{EX}e"));
+    assert!(!rendered.text.contains("urn:x"), "{}", rendered.text);
+    for line in [
+        "\nreifies: Alice knows Bob",
+        "\nclaims: Dan says (Bob knows Alice)",
+        "\nabout: knows Bob",
+    ] {
+        assert!(
+            rendered.text.contains(line),
+            "{line:?} in {}",
+            rendered.text
+        );
+    }
+}

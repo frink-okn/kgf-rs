@@ -57,7 +57,10 @@
 //! containing a literal `%20` becomes a different term. [`Term::parse`] takes
 //! text that has been decoded exactly once.
 
-use hdtc::format::{XSD_STRING, encode_literal, parse_literal};
+use hdtc::format::{
+    MAX_TRIPLE_TERM_NESTING, TripleTermComponent, TripleTermProposition, XSD_STRING,
+    encode_literal, parse_literal, triple_term_iri,
+};
 use kgf_store::dict::Dictionary;
 use kgf_store::{Manifest, Role, TermId};
 use oxrdf::{BlankNodeRef, Literal as RdfLiteral, NamedNodeRef};
@@ -80,6 +83,105 @@ pub enum Term<'a> {
     BlankNode(Cow<'a, str>),
     /// A literal.
     Literal(Literal<'a>),
+    /// An RDF 1.2 triple term: a triple used as a term, in object position.
+    Triple(Box<TripleTerm<'a>>),
+}
+
+/// The content of an RDF 1.2 triple term.
+///
+/// Its subject is an IRI or a blank node and its predicate an IRI, as RDF 1.2
+/// requires; [`TripleTerm::new`] is the only way to build one, so a triple
+/// term with a literal or a triple in subject position cannot exist. The
+/// object is any term, another triple term included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TripleTerm<'a> {
+    subject: Term<'a>,
+    predicate: Cow<'a, str>,
+    object: Term<'a>,
+}
+
+impl<'a> TripleTerm<'a> {
+    /// A triple term, or `None` if `subject` is neither an IRI nor a blank
+    /// node.
+    pub fn new(
+        subject: Term<'a>,
+        predicate: impl Into<Cow<'a, str>>,
+        object: Term<'a>,
+    ) -> Option<Self> {
+        matches!(subject, Term::Iri(_) | Term::BlankNode(_)).then(|| Self {
+            subject,
+            predicate: predicate.into(),
+            object,
+        })
+    }
+
+    /// The subject: an IRI or a blank node.
+    pub fn subject(&self) -> &Term<'a> {
+        &self.subject
+    }
+
+    /// The predicate IRI.
+    pub fn predicate(&self) -> &str {
+        &self.predicate
+    }
+
+    /// The object.
+    pub fn object(&self) -> &Term<'a> {
+        &self.object
+    }
+
+    /// The IRIs this triple term holds, in reading order: the subject if it
+    /// is one, the predicate, and the object if it is one, or a nested
+    /// triple term's own. A blank node published under its scoped IRI is an
+    /// IRI here, as it is everywhere a response names it.
+    pub fn iris(&self) -> Vec<&str> {
+        let mut iris = Vec::new();
+        self.collect_iris(&mut iris);
+        iris
+    }
+
+    fn collect_iris<'b>(&'b self, iris: &mut Vec<&'b str>) {
+        if let Term::Iri(iri) = &self.subject {
+            iris.push(iri);
+        }
+        iris.push(&self.predicate);
+        match &self.object {
+            Term::Iri(iri) => iris.push(iri),
+            Term::Triple(nested) => nested.collect_iris(iris),
+            Term::BlankNode(_) | Term::Literal(_) => {}
+        }
+    }
+
+    /// How deeply this nests triple terms: 1 for one whose object is not
+    /// itself a triple term.
+    pub fn depth(&self) -> usize {
+        let mut depth = 1;
+        let mut object = &self.object;
+        while let Term::Triple(inner) = object {
+            depth += 1;
+            object = &inner.object;
+        }
+        depth
+    }
+
+    /// The proposition hdtc's minting takes: each component as the
+    /// dictionary spells it.
+    fn proposition(&self) -> TripleTermProposition {
+        TripleTermProposition {
+            subject: component(&self.subject),
+            predicate: self.predicate.clone().into_owned(),
+            object: component(&self.object),
+        }
+    }
+
+    /// The same triple term, owning its text.
+    pub fn into_owned(self) -> TripleTerm<'static> {
+        TripleTerm {
+            subject: self.subject.into_owned(),
+            predicate: Cow::Owned(self.predicate.into_owned()),
+            object: self.object.into_owned(),
+        }
+    }
 }
 
 /// A literal: a lexical form and at most one of a language tag and a datatype.
@@ -158,6 +260,21 @@ impl<'a> Literal<'a> {
     /// The lexical form, unescaped.
     pub fn value(&self) -> &str {
         &self.value
+    }
+
+    fn into_owned(self) -> Literal<'static> {
+        Literal {
+            value: Cow::Owned(self.value.into_owned()),
+            kind: match self.kind {
+                LiteralKind::Plain => LiteralKind::Plain,
+                LiteralKind::Language(language) => {
+                    LiteralKind::Language(Cow::Owned(language.into_owned()))
+                }
+                LiteralKind::Datatype(datatype) => {
+                    LiteralKind::Datatype(Cow::Owned(datatype.into_owned()))
+                }
+            },
+        }
     }
 
     /// The language tag or datatype, if any.
@@ -392,8 +509,30 @@ pub enum TermSyntaxError {
         suffix: String,
     },
 
-    /// A term object whose `type` is not one of the three.
-    #[error("`{found}` is not a term type; expected `iri`, `literal` or `bnode`")]
+    /// Text that opens a triple term but is not one.
+    #[error(
+        "`{token}` is not a triple term: {detail}; a triple term is written \
+         `<<( subject predicate object )>>`"
+    )]
+    MalformedTripleTerm {
+        /// The offending token.
+        token: String,
+        /// What was wrong.
+        detail: String,
+    },
+
+    /// Triple terms nested deeper than any bundle can hold.
+    #[error(
+        "`{token}` nests triple terms more than {MAX_TRIPLE_TERM_NESTING} deep, \
+         which no bundle holds"
+    )]
+    TripleTermTooDeep {
+        /// The offending token.
+        token: String,
+    },
+
+    /// A term object whose `type` is not one of the four.
+    #[error("`{found}` is not a term type; expected `iri`, `literal`, `bnode` or `triple`")]
     UnknownTermType {
         /// The offending value.
         found: String,
@@ -424,8 +563,22 @@ impl<'a> Term<'a> {
     /// A leading `_:` is a blank node, allowing every returned blank node to be
     /// used in a later request.
     pub fn parse(text: &'a str, prefixes: &PrefixMap) -> Result<Self, TermSyntaxError> {
+        Self::parse_nested(text, prefixes, 0)
+    }
+
+    /// [`parse`](Self::parse) at a nesting depth: the number of triple terms
+    /// enclosing `text`.
+    fn parse_nested(
+        text: &'a str,
+        prefixes: &PrefixMap,
+        depth: usize,
+    ) -> Result<Self, TermSyntaxError> {
         if text.is_empty() {
             return Err(TermSyntaxError::Empty);
+        }
+        if text.starts_with("<<") {
+            return parse_triple_syntax(text, Grammar::Request(prefixes), depth + 1)
+                .map(|triple| Term::Triple(Box::new(triple)));
         }
         if text.starts_with('"') {
             return parse_literal_syntax(text, |datatype| parse_iri_syntax(datatype, prefixes))
@@ -444,9 +597,23 @@ impl<'a> Term<'a> {
 
     /// Parse Hydra ExplicitRepresentation, whose IRIs are bare and never
     /// expanded through the manifest prefix map.
+    ///
+    /// Hydra has no spelling for an RDF 1.2 triple term, so one is written as
+    /// request syntax writes it, `<<( subject predicate object )>>`, with each
+    /// of its terms in this grammar: `<<( http://ex/s http://ex/p "o"@en )>>`.
     pub fn parse_explicit(text: &'a str) -> Result<Self, TermSyntaxError> {
+        Self::parse_explicit_nested(text, 0)
+    }
+
+    /// [`parse_explicit`](Self::parse_explicit) at a nesting depth: the number
+    /// of triple terms enclosing `text`.
+    fn parse_explicit_nested(text: &'a str, depth: usize) -> Result<Self, TermSyntaxError> {
         if text.is_empty() {
             return Err(TermSyntaxError::Empty);
+        }
+        if text.starts_with("<<") {
+            return parse_triple_syntax(text, Grammar::Explicit, depth + 1)
+                .map(|triple| Term::Triple(Box::new(triple)));
         }
         if text.starts_with('"') {
             return parse_literal_syntax(text, parse_explicit_iri).map(Term::Literal);
@@ -519,8 +686,16 @@ impl<'a> Term<'a> {
     ///
     /// Borrows for an IRI, which is the overwhelmingly common case on a lookup
     /// path; the other two shapes have to add their punctuation back.
+    ///
+    /// A triple term is spelled as the IRI hdtc minted for it, by hdtc's own
+    /// minting (`hdtc/docs/triple-terms-format.md` §2), from its components'
+    /// dictionary spellings. A blank node inside is minted under the label
+    /// written here; a published blank-node IRI inside is minted as the IRI it
+    /// is, and is reversed to its stored label only where the bundle is at
+    /// hand.
     pub fn to_dictionary(&self) -> Cow<'_, str> {
         match self {
+            Term::Triple(triple) => Cow::Owned(triple_term_iri(&triple.proposition())),
             Term::Iri(iri) => Cow::Borrowed(iri.as_ref()),
             Term::BlankNode(label) => Cow::Owned(format!("_:{label}")),
             Term::Literal(literal) => {
@@ -548,6 +723,12 @@ impl<'a> Term<'a> {
     /// than assumed.
     pub fn to_request(&self) -> String {
         match self {
+            Term::Triple(triple) => format!(
+                "<<( {} <{}> {} )>>",
+                triple.subject.to_request(),
+                triple.predicate,
+                triple.object.to_request()
+            ),
             Term::Iri(iri) => format!("<{iri}>"),
             Term::BlankNode(label) => format!("_:{label}"),
             Term::Literal(literal) => match &literal.kind {
@@ -570,6 +751,23 @@ impl<'a> Term<'a> {
     /// for its datatype IRI; other term shapes are unchanged.
     pub(crate) fn into_display(self, prefixes: &PrefixMap) -> TermDisplay<'a> {
         match self {
+            Term::Triple(triple) => {
+                let TripleTerm {
+                    subject,
+                    predicate,
+                    object,
+                } = *triple;
+                let predicate = Term::Iri(predicate).into_display(prefixes).into_parts().0;
+                TermDisplay {
+                    label: format!(
+                        "<<( {} {predicate} {} )>>",
+                        subject.into_display(prefixes).into_parts().0,
+                        object.into_display(prefixes).into_parts().0
+                    ),
+                    qualifier: None,
+                    full_iri: None,
+                }
+            }
             Term::Iri(iri) => {
                 let label = prefixes
                     .compact_iri(iri.as_ref())
@@ -607,6 +805,16 @@ impl<'a> Term<'a> {
                     }
                 }
             },
+        }
+    }
+
+    /// The same term, owning its text.
+    pub fn into_owned(self) -> Term<'static> {
+        match self {
+            Term::Iri(iri) => Term::Iri(Cow::Owned(iri.into_owned())),
+            Term::BlankNode(label) => Term::BlankNode(Cow::Owned(label.into_owned())),
+            Term::Literal(literal) => Term::Literal(literal.into_owned()),
+            Term::Triple(triple) => Term::Triple(Box::new(triple.into_owned())),
         }
     }
 
@@ -734,7 +942,22 @@ fn parse_literal_syntax<'a>(
                 token: text.to_owned(),
             });
         }
-        RdfLiteral::new_language_tagged_literal("", language).map_err(|error| {
+        // RDF 1.2 writes a base direction after the tag, `@ar--rtl`, and the
+        // dictionary stores it that way; the tag itself is validated alone.
+        // Case-insensitively, like the tag it follows.
+        let tag = match language.len().checked_sub(5) {
+            Some(cut)
+                if language.is_char_boundary(cut)
+                    && matches!(
+                        language[cut..].to_ascii_lowercase().as_str(),
+                        "--ltr" | "--rtl"
+                    ) =>
+            {
+                &language[..cut]
+            }
+            _ => language,
+        };
+        RdfLiteral::new_language_tagged_literal("", tag).map_err(|error| {
             TermSyntaxError::InvalidLanguageTag {
                 token: text.to_owned(),
                 detail: error.to_string(),
@@ -764,6 +987,199 @@ fn parse_explicit_iri(value: &str) -> Result<Cow<'_, str>, TermSyntaxError> {
     Ok(Cow::Borrowed(value))
 }
 
+/// A triple-term component as hdtc's minting takes it. An IRI goes through
+/// `from_dictionary`, hdtc's one reading of a stored string's kind: the
+/// dictionary holds an IRI spelled like a literal as that literal's string,
+/// so a request must mint the name the build did — whether it arrives in
+/// compact syntax (`<"a"@EN>`) or, as this server publishes a lenient
+/// component, as a JSON `iri` term (`{"type": "iri", "value": "\"a\"@EN"}`).
+fn component(term: &Term<'_>) -> TripleTermComponent {
+    match term {
+        Term::Iri(iri) => TripleTermComponent::from_dictionary(iri.clone().into_owned()),
+        Term::BlankNode(label) => TripleTermComponent::Blank(label.clone().into_owned()),
+        Term::Literal(_) => TripleTermComponent::Literal(term.to_dictionary().into_owned()),
+        Term::Triple(triple) => TripleTermComponent::Triple(Box::new(triple.proposition())),
+    }
+}
+
+/// The grammar a triple term's own terms are written in: the grammar of the
+/// parameter that holds it.
+#[derive(Debug, Clone, Copy)]
+enum Grammar<'p> {
+    /// Request syntax: bracketed IRIs and CURIEs, expanded by the prefixes.
+    Request(&'p PrefixMap),
+    /// Hydra's `ExplicitRepresentation`, the TPF route's: bare IRIs.
+    Explicit,
+}
+
+impl Grammar<'_> {
+    fn term<'a>(self, text: &'a str, depth: usize) -> Result<Term<'a>, TermSyntaxError> {
+        match self {
+            Self::Request(prefixes) => Term::parse_nested(text, prefixes, depth),
+            Self::Explicit => Term::parse_explicit_nested(text, depth),
+        }
+    }
+
+    fn iri<'a>(self, text: &'a str) -> Result<Cow<'a, str>, TermSyntaxError> {
+        match self {
+            Self::Request(prefixes) => parse_iri_syntax(text, prefixes),
+            Self::Explicit => parse_explicit_iri(text),
+        }
+    }
+
+    /// Where a variable inside a triple term is answered, said where one is
+    /// not.
+    fn variables(self) -> &'static str {
+        match self {
+            Self::Request(_) => {
+                "a variable inside a triple term makes it a pattern, which `/fragment` and \
+                 `/count` take as `o`, at the outermost triple term only"
+            }
+            Self::Explicit => {
+                "a variable inside a triple term makes it a pattern, which the TPF route does \
+                 not answer; `/fragment` and `/count` take one as `o`"
+            }
+        }
+    }
+}
+
+/// Parse `<<( subject predicate object )>>`, `depth` being how many triple
+/// terms this one is inside of, itself included, and its terms written in
+/// `grammar`.
+///
+/// The subject and predicate are single tokens — an IRI, a CURIE, or a blank
+/// node — and the object is everything up to the closing `)>>`, parsed as a
+/// term in its own right. That is what lets a literal object keep the rule
+/// that its closing quote is the last one, quotes and parentheses inside
+/// included, and lets a triple term nest.
+fn parse_triple_syntax<'a>(
+    text: &'a str,
+    grammar: Grammar<'_>,
+    depth: usize,
+) -> Result<TripleTerm<'a>, TermSyntaxError> {
+    let (subject, predicate, object) = triple_parts(text, depth)?;
+    if subject.starts_with('?') || predicate.starts_with('?') || object.starts_with('?') {
+        return Err(TermSyntaxError::MalformedTripleTerm {
+            token: text.to_owned(),
+            detail: grammar.variables().to_owned(),
+        });
+    }
+    let subject = grammar.term(subject, depth)?;
+    let predicate = grammar.iri(predicate)?;
+    let object = grammar.term(object, depth)?;
+    Ok(TripleTerm::new(subject, predicate, object).expect("the subject was checked"))
+}
+
+/// The subject, predicate and object texts of `<<( s p o )>>`.
+///
+/// The subject and predicate are single tokens — a bracketed IRI, a CURIE, a
+/// bare IRI, a blank node, or a variable — and the object is everything up to
+/// the closing `)>>`, to be parsed as a term in its own right. That is what
+/// lets a literal object keep the rule that its closing quote is the last one,
+/// quotes and parentheses inside included, and lets a triple term nest.
+fn triple_parts(text: &str, depth: usize) -> Result<(&str, &str, &str), TermSyntaxError> {
+    let malformed = |detail: &str| TermSyntaxError::MalformedTripleTerm {
+        token: text.to_owned(),
+        detail: detail.to_owned(),
+    };
+    if !text.starts_with("<<(") {
+        return Err(malformed(
+            "`<< … >>` is a reified triple, which names a reifier rather than being a term",
+        ));
+    }
+    if depth > MAX_TRIPLE_TERM_NESTING {
+        return Err(TermSyntaxError::TripleTermTooDeep {
+            token: text.to_owned(),
+        });
+    }
+    let inner = text
+        .strip_prefix("<<(")
+        .and_then(|inner| inner.strip_suffix(")>>"))
+        .ok_or_else(|| malformed("it does not close with `)>>`"))?
+        .trim();
+    let (subject, rest) = split_token(inner).ok_or_else(|| malformed("it has no subject"))?;
+    let (predicate, rest) =
+        split_token(rest.trim_start()).ok_or_else(|| malformed("it has no predicate"))?;
+    let object = rest.trim();
+    if object.is_empty() {
+        return Err(malformed("it has no object"));
+    }
+    if subject.starts_with('"') || subject.starts_with("<<") {
+        return Err(malformed("its subject must be an IRI or a blank node"));
+    }
+    // An object that is not a literal or a triple term is one token, like
+    // the subject and predicate; anything after it is not part of the term.
+    if !object.starts_with('"')
+        && !object.starts_with("<<")
+        && split_token(object).is_some_and(|(_, rest)| !rest.trim().is_empty())
+    {
+        return Err(malformed("it has something after its object"));
+    }
+    Ok((subject, predicate, object))
+}
+
+/// One position of a pattern inside a triple term.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatternTerm<'a> {
+    /// A variable, by its name without the `?`.
+    Variable(&'a str),
+    /// A term.
+    Term(Term<'a>),
+}
+
+/// Parse `<<( s p o )>>` whose own positions may be variables, `?name`.
+///
+/// Depth 1 only: a nested triple term in the object position must be ground,
+/// because a variable there has no bounded evaluation. `Ok(None)` when no
+/// position is a variable, which is a ground triple term and parses as one.
+pub fn parse_triple_pattern<'a>(
+    text: &'a str,
+    prefixes: &PrefixMap,
+) -> Result<Option<[PatternTerm<'a>; 3]>, TermSyntaxError> {
+    let (subject, predicate, object) = triple_parts(text, 1)?;
+    if ![subject, predicate, object]
+        .iter()
+        .any(|part| part.starts_with('?'))
+    {
+        return Ok(None);
+    }
+    let variable = |part: &'a str| -> Result<Option<&'a str>, TermSyntaxError> {
+        let Some(name) = part.strip_prefix('?') else {
+            return Ok(None);
+        };
+        oxrdf::VariableRef::new(name).map_err(|_| TermSyntaxError::MalformedTripleTerm {
+            token: text.to_owned(),
+            detail: format!("`{part}` is not a SPARQL variable name"),
+        })?;
+        Ok(Some(name))
+    };
+    let position = |part: &'a str| -> Result<PatternTerm<'a>, TermSyntaxError> {
+        Ok(match variable(part)? {
+            Some(name) => PatternTerm::Variable(name),
+            None => PatternTerm::Term(Term::parse_nested(part, prefixes, 1)?),
+        })
+    };
+    let predicate = match variable(predicate)? {
+        Some(name) => PatternTerm::Variable(name),
+        None => PatternTerm::Term(Term::Iri(parse_iri_syntax(predicate, prefixes)?)),
+    };
+    Ok(Some([position(subject)?, predicate, position(object)?]))
+}
+
+/// The first token of `text` and what follows it: a bracketed IRI up to its
+/// `>`, or anything else up to whitespace. `None` if `text` is empty.
+fn split_token(text: &str) -> Option<(&str, &str)> {
+    if text.is_empty() {
+        return None;
+    }
+    let end = if text.starts_with('<') && !text.starts_with("<<") {
+        text.find('>').map_or(text.len(), |close| close + 1)
+    } else {
+        text.find(char::is_whitespace).unwrap_or(text.len())
+    };
+    Some(text.split_at(end))
+}
+
 // ---------------------------------------------------------------------------
 // Response syntax
 // ---------------------------------------------------------------------------
@@ -780,6 +1196,7 @@ impl Serialize for Term<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         match self {
+            Term::Triple(triple) => triple_entries(&mut map, triple)?,
             Term::Iri(iri) => {
                 map.serialize_entry("type", "iri")?;
                 map.serialize_entry("value", iri.as_ref())?;
@@ -802,6 +1219,37 @@ impl Serialize for Term<'_> {
                 }
             }
         }
+        map.end()
+    }
+}
+
+impl Serialize for TripleTerm<'_> {
+    /// The term object [`Term::Triple`] writes, for a caller holding the
+    /// triple term alone.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2))?;
+        triple_entries(&mut map, self)?;
+        map.end()
+    }
+}
+
+/// SPARQL 1.2 Query Results JSON's triple term object: its `type`, and its
+/// three components as its `value`.
+fn triple_entries<M: SerializeMap>(map: &mut M, triple: &TripleTerm<'_>) -> Result<(), M::Error> {
+    map.serialize_entry("type", "triple")?;
+    map.serialize_entry("value", &TripleValue(triple))
+}
+
+/// The `value` of a triple term object: its three components, each a term
+/// object.
+struct TripleValue<'t, 'a>(&'t TripleTerm<'a>);
+
+impl Serialize for TripleValue<'_, '_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("subject", &self.0.subject)?;
+        map.serialize_entry("predicate", &Term::Iri(Cow::Borrowed(&self.0.predicate)))?;
+        map.serialize_entry("object", &self.0.object)?;
         map.end()
     }
 }
@@ -832,6 +1280,9 @@ impl<'a> Term<'a> {
         };
 
         let kind = string("type")?.ok_or_else(|| malformed("no `type`"))?;
+        if kind == "triple" {
+            return Self::triple_from_json(object, 1);
+        }
         let value = string("value")?.ok_or_else(|| malformed("no `value`"))?;
 
         // A term object is closed. The two SRJ spellings get their own remedy,
@@ -882,6 +1333,67 @@ impl<'a> Term<'a> {
                 found: other.to_owned(),
             }),
         }
+    }
+}
+
+impl<'a> Term<'a> {
+    /// A `{"type": "triple", "value": {…}}` term object, at `depth` triple
+    /// terms deep counting itself.
+    fn triple_from_json(
+        object: &'a serde_json::Map<String, serde_json::Value>,
+        depth: usize,
+    ) -> Result<Self, TermSyntaxError> {
+        let malformed = |detail: &str| TermSyntaxError::MalformedTermObject {
+            detail: detail.to_owned(),
+        };
+        if depth > MAX_TRIPLE_TERM_NESTING {
+            return Err(TermSyntaxError::TripleTermTooDeep {
+                token: "a triple term object".to_owned(),
+            });
+        }
+        if let Some(unknown) = object
+            .keys()
+            .find(|key| !["type", "value"].contains(&key.as_str()))
+        {
+            return Err(malformed(&format!(
+                "`{unknown}` is not a key of a `triple` term object"
+            )));
+        }
+        let value = object
+            .get("value")
+            .ok_or_else(|| malformed("no `value`"))?
+            .as_object()
+            .ok_or_else(|| {
+                malformed("a `triple` value is an object with `subject`, `predicate` and `object`")
+            })?;
+        if let Some(unknown) = value
+            .keys()
+            .find(|key| !["subject", "predicate", "object"].contains(&key.as_str()))
+        {
+            return Err(malformed(&format!(
+                "`{unknown}` is not a component of a triple term; they are `subject`, \
+                 `predicate` and `object`"
+            )));
+        }
+        let part = |name: &str| -> Result<Term<'a>, TermSyntaxError> {
+            let term = value
+                .get(name)
+                .ok_or_else(|| malformed(&format!("a triple term has no `{name}`")))?;
+            match term.as_object() {
+                Some(inner) if inner.get("type").and_then(|t| t.as_str()) == Some("triple") => {
+                    Self::triple_from_json(inner, depth + 1)
+                }
+                _ => Self::from_json(term),
+            }
+        };
+        let subject = part("subject")?;
+        let Term::Iri(predicate) = part("predicate")? else {
+            return Err(malformed("a triple term's `predicate` is an `iri`"));
+        };
+        let object = part("object")?;
+        TripleTerm::new(subject, predicate, object)
+            .map(|triple| Term::Triple(Box::new(triple)))
+            .ok_or_else(|| malformed("a triple term's `subject` is an `iri` or a `bnode`"))
     }
 }
 
@@ -1026,8 +1538,9 @@ impl TermCache {
     }
 }
 
-/// The bytes a term object occupies, without producing them.
-pub(crate) fn serialized_bytes(term: &Term<'_>) -> u64 {
+/// The bytes a term object occupies, without producing them: a [`Term`], or a
+/// [`TripleTerm`] held on its own.
+pub(crate) fn serialized_bytes<T: Serialize + ?Sized>(term: &T) -> u64 {
     struct Counter(u64);
     impl std::io::Write for Counter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -1149,6 +1662,12 @@ mod tests {
                     format!("\"{}\"^^<{}>", literal.value(), datatype)
                 }
             },
+            Term::Triple(triple) => format!(
+                "<<( {} <{}> {} )>>",
+                as_request_syntax(triple.subject()),
+                triple.predicate(),
+                as_request_syntax(triple.object())
+            ),
         }
     }
 
@@ -1167,7 +1686,7 @@ mod tests {
                     .map(|local| format!("\"{}\"^^{prefix}:{local}", literal.value())),
                 _ => None,
             },
-            Term::BlankNode(_) => None,
+            Term::BlankNode(_) | Term::Triple(_) => None,
         }
     }
 
@@ -1208,6 +1727,7 @@ mod tests {
                     LiteralKind::Language(_) => tagged += 1,
                     LiteralKind::Datatype(_) => typed += 1,
                 },
+                Term::Triple(_) => unreachable!("a dictionary spelling is never a triple term"),
             }
 
             // Out to the client and back through request syntax.
@@ -1674,5 +2194,167 @@ mod tests {
 
         let term = Term::parse("<http://example.org/nobody>", &PrefixMap::default()).unwrap();
         assert_eq!(term.locate(&dictionary, Role::Subject).unwrap(), None);
+    }
+
+    #[test]
+    fn a_triple_term_parses_from_every_spelling_and_mints_as_hdtc_does() {
+        let prefixes = prefixes(&[("ex", "http://example.org/")]);
+        let spelled = [
+            "<<( ex:a ex:p \"x )>> y\"@en )>>",
+            "<<(<http://example.org/a> <http://example.org/p> \"x )>> y\"@EN)>>",
+            "<<(  ex:a   <http://example.org/p>   \"x )>> y\"@en   )>>",
+        ];
+        let parsed: Vec<Term<'_>> = spelled
+            .iter()
+            .map(|text| Term::parse(text, &prefixes).unwrap())
+            .collect();
+        assert!(
+            parsed.windows(2).all(|pair| pair[0] == pair[1]),
+            "{parsed:?}"
+        );
+        let Term::Triple(triple) = &parsed[0] else {
+            panic!("not a triple term")
+        };
+        // The object's closing quote is the last one, as for any literal.
+        assert_eq!(
+            triple.object(),
+            &Term::Literal(Literal::tagged("x )>> y", "en"))
+        );
+        // Minting is hdtc's, over the dictionary spellings.
+        assert_eq!(
+            parsed[0].to_dictionary(),
+            triple_term_iri(&TripleTermProposition {
+                subject: TripleTermComponent::Iri("http://example.org/a".to_owned()),
+                predicate: "http://example.org/p".to_owned(),
+                object: TripleTermComponent::Literal("\"x )>> y\"@en".to_owned()),
+            })
+        );
+        // Request syntax round-trips, and so does the JSON term object.
+        let request = parsed[0].to_request();
+        assert_eq!(
+            Term::parse(&request, &PrefixMap::default()).unwrap(),
+            parsed[0]
+        );
+        let json = serde_json::to_value(&parsed[0]).unwrap();
+        assert_eq!(json["type"], "triple");
+        assert_eq!(json["value"]["predicate"]["type"], "iri");
+        assert_eq!(Term::from_json(&json).unwrap(), parsed[0]);
+
+        // Nested, with a directional literal inside.
+        let nested = Term::parse(
+            "<<( ex:a ex:says <<( ex:b ex:p \"x\"@ar--rtl )>> )>>",
+            &prefixes,
+        )
+        .unwrap();
+        let Term::Triple(outer) = &nested else {
+            panic!("not a triple term")
+        };
+        assert_eq!(outer.depth(), 2);
+        assert_eq!(
+            Term::from_json(&serde_json::to_value(&nested).unwrap()).unwrap(),
+            nested
+        );
+    }
+
+    /// The TPF route writes a triple term's terms in its own grammar, bare
+    /// IRIs and all, and means the same triple term request syntax does.
+    #[test]
+    fn a_triple_term_parses_in_explicit_representation() {
+        let prefixes = prefixes(&[("ex", "http://example.org/")]);
+        let request = Term::parse(
+            "<<( ex:a ex:says <<( ex:b ex:p \"x )>> y\"@en )>> )>>",
+            &prefixes,
+        )
+        .unwrap();
+        for explicit in [
+            "<<( http://example.org/a http://example.org/says <<( http://example.org/b http://example.org/p \"x )>> y\"@en )>> )>>",
+            "<<(http://example.org/a  http://example.org/says <<(http://example.org/b http://example.org/p \"x )>> y\"@EN)>>)>>",
+        ] {
+            let parsed = Term::parse_explicit(explicit).unwrap();
+            assert_eq!(parsed, request, "{explicit}");
+            assert_eq!(parsed.to_dictionary(), request.to_dictionary());
+        }
+        let typed = Term::parse_explicit(
+            "<<( http://example.org/a http://example.org/p \"1\"^^http://www.w3.org/2001/XMLSchema#integer )>>",
+        )
+        .unwrap();
+        let Term::Triple(typed) = typed else {
+            panic!("not a triple term")
+        };
+        assert_eq!(
+            typed.object(),
+            &Term::Literal(Literal::typed(
+                "1",
+                "http://www.w3.org/2001/XMLSchema#integer"
+            ))
+        );
+
+        // Brackets are request syntax, and a variable makes a pattern this
+        // route does not answer.
+        assert!(
+            Term::parse_explicit(
+                "<<( <http://example.org/a> http://example.org/p http://example.org/o )>>"
+            )
+            .is_err()
+        );
+        let Err(TermSyntaxError::MalformedTripleTerm { detail, .. }) =
+            Term::parse_explicit("<<( ?s http://example.org/p http://example.org/o )>>")
+        else {
+            panic!("a variable inside is refused")
+        };
+        assert!(detail.contains("TPF route"), "{detail}");
+        assert!(
+            Term::parse_explicit("<<( \"a\" http://example.org/p http://example.org/o )>>")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_malformed_triple_term_says_what_is_wrong() {
+        let prefixes = prefixes(&[("ex", "http://example.org/")]);
+        for text in [
+            "<<( ex:a ex:p )>>",
+            "<<( ex:a )>>",
+            "<<( )>>",
+            "<<( ex:a ex:p ex:o",
+            "<<( \"lit\" ex:p ex:o )>>",
+            "<<( <<( ex:a ex:p ex:o )>> ex:p ex:o )>>",
+            "<< ex:a ex:p ex:o >>",
+        ] {
+            assert!(
+                matches!(
+                    Term::parse(text, &prefixes),
+                    Err(TermSyntaxError::MalformedTripleTerm { .. })
+                ),
+                "{text}: {:?}",
+                Term::parse(text, &prefixes)
+            );
+        }
+        // A literal predicate is refused as the IRI it is not.
+        assert!(Term::parse("<<( ex:a \"p\" ex:o )>>", &prefixes).is_err());
+        // Nesting past what a bundle holds is refused, not recursed into.
+        let mut deep = "ex:o".to_owned();
+        for _ in 0..=MAX_TRIPLE_TERM_NESTING {
+            deep = format!("<<( ex:s ex:p {deep} )>>");
+        }
+        assert!(matches!(
+            Term::parse(&deep, &prefixes),
+            Err(TermSyntaxError::TripleTermTooDeep { .. })
+        ));
+        // A triple term object's components are closed and typed.
+        for json in [
+            serde_json::json!({"type": "triple", "value": "<<( a b c )>>"}),
+            serde_json::json!({"type": "triple", "value": {"subject": {"type": "iri", "value": "a"},
+                "predicate": {"type": "iri", "value": "p"}}}),
+            serde_json::json!({"type": "triple", "value": {"subject": {"type": "literal", "value": "a"},
+                "predicate": {"type": "iri", "value": "p"}, "object": {"type": "iri", "value": "o"}}}),
+            serde_json::json!({"type": "triple", "value": {"subject": {"type": "iri", "value": "a"},
+                "predicate": {"type": "bnode", "value": "p"}, "object": {"type": "iri", "value": "o"}}}),
+            serde_json::json!({"type": "triple", "value": {"subject": {"type": "iri", "value": "a"},
+                "predicate": {"type": "iri", "value": "p"}, "object": {"type": "iri", "value": "o"},
+                "graph": {"type": "iri", "value": "g"}}}),
+        ] {
+            assert!(Term::from_json(&json).is_err(), "{json}");
+        }
     }
 }

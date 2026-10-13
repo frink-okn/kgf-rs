@@ -64,7 +64,7 @@ use crate::envelope::{ErrorCode, Problem, reflected};
 use crate::label::{LanguageRange, Languages};
 use crate::representation::{RdfSyntax, Representation};
 use crate::service::{PredicateRoles, RolesByPredicate};
-use crate::term::{Literal as KgfLiteral, PrefixMap, Term};
+use crate::term::{Literal as KgfLiteral, PrefixMap, Term, TripleTerm};
 use crate::url::Params;
 use kgf_verbalize::{Config as VerbalizeConfig, Resolved as VerbalizeResolved};
 
@@ -161,27 +161,65 @@ pub struct BoundTerm {
     kind: BoundKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What kind of term a request bound, with a triple term's content.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum BoundKind {
     Iri,
     Literal,
     BlankNode,
+    /// The parsed triple term. Kept because its dictionary spelling is a
+    /// minted IRI, and a published blank-node IRI inside it has to be
+    /// reversed against the bundle before minting can find it.
+    Triple(Box<TripleTerm<'static>>),
 }
 
 impl BoundKind {
-    fn of(term: &Term<'_>) -> Self {
+    /// The kind of `term`, taking a triple term's content with it.
+    fn of(term: Term<'_>) -> Self {
         match term {
             Term::Iri(_) => Self::Iri,
             Term::Literal(_) => Self::Literal,
             Term::BlankNode(_) => Self::BlankNode,
+            Term::Triple(triple) => Self::Triple(Box::new(triple.into_owned())),
         }
     }
 
-    const fn shape(self) -> char {
+    const fn shape(&self) -> char {
         match self {
             Self::Iri => 'i',
             Self::Literal => 'l',
             Self::BlankNode => 'b',
+            Self::Triple(_) => 't',
+        }
+    }
+}
+
+/// A SPARQL ground term as this crate's term, a triple term's components
+/// included. A ground term has no blank nodes, so a ground triple's subject is
+/// an IRI.
+fn ground_term(term: GroundTerm) -> Term<'static> {
+    match term {
+        GroundTerm::NamedNode(node) => Term::Iri(node.into_string().into()),
+        GroundTerm::Literal(literal) => {
+            let value = literal.value().to_owned();
+            Term::Literal(match (literal.language(), literal.direction()) {
+                // RDF 1.2's base direction, spelled as hdtc's dictionary
+                // spells it: after the tag, `--ltr` or `--rtl`.
+                (Some(language), Some(direction)) => {
+                    KgfLiteral::tagged(value, format!("{language}--{direction}"))
+                }
+                (Some(language), None) => KgfLiteral::tagged(value, language.to_owned()),
+                (None, _) => KgfLiteral::typed(value, literal.datatype().as_str().to_owned()),
+            })
+        }
+        GroundTerm::Triple(triple) => {
+            let triple = *triple;
+            let subject = Term::Iri(triple.subject.into_string().into());
+            let object = ground_term(triple.object);
+            Term::Triple(Box::new(
+                TripleTerm::new(subject, triple.predicate.into_string(), object)
+                    .expect("a ground triple's subject is an IRI"),
+            ))
         }
     }
 }
@@ -193,24 +231,29 @@ impl BoundTerm {
         term: Term<'_>,
         limits: Limits<'_>,
     ) -> Result<Self, Problem> {
-        let kind = BoundKind::of(&term);
         let dictionary = term.to_dictionary().into_owned();
         let max = limits.budgets.max_term_bytes;
-        if dictionary.len() as u64 > max {
+        // A triple term's dictionary spelling is a fixed-length minted IRI, so
+        // it is weighed by its content instead.
+        let weighed = match &term {
+            Term::Triple(_) => term.to_request().len(),
+            _ => dictionary.len(),
+        };
+        if weighed as u64 > max {
             return Err(Problem::new(
                 ErrorCode::CapExceeded,
                 format!(
-                    "the term in `{parameter}` is {} bytes in canonical form, over this \
-                     server's max_term_bytes of {max}",
-                    dictionary.len()
+                    "the term in `{parameter}` is {weighed} bytes in canonical form, over this \
+                     server's max_term_bytes of {max}"
                 ),
             ));
         }
-        Ok(Self {
+        Self {
             requested,
             dictionary,
-            kind,
-        })
+            kind: BoundKind::of(term),
+        }
+        .refuse_encoding(parameter)
     }
 
     /// Whether this term denotes a blank node, however it was written.
@@ -257,12 +300,12 @@ impl BoundTerm {
                 format!("parameter `{parameter}`: {error}"),
             )
         })?;
-        let kind = BoundKind::of(&term);
-        Ok(Self {
+        Self {
             requested: text.to_owned(),
             dictionary: term.to_dictionary().into_owned(),
-            kind,
-        })
+            kind: BoundKind::of(term),
+        }
+        .refuse_encoding(parameter)
     }
 
     /// Parse either compact request syntax or the JSON term-object form.
@@ -304,18 +347,43 @@ impl BoundTerm {
         term: GroundTerm,
         limits: Limits<'_>,
     ) -> Result<Self, Problem> {
-        let term = match term {
-            GroundTerm::NamedNode(node) => Term::Iri(node.into_string().into()),
-            GroundTerm::Literal(literal) => {
-                let value = literal.value().to_owned();
-                let literal = match literal.language() {
-                    Some(language) => KgfLiteral::tagged(value, language.to_owned()),
-                    None => KgfLiteral::typed(value, literal.datatype().as_str().to_owned()),
-                };
-                Term::Literal(literal)
-            }
-        };
+        let term = ground_term(term);
         Self::from_canonical_term(parameter, term.to_request(), term, limits)
+    }
+
+    /// Refuse an IRI under the triple-term namespace, wherever it appears in
+    /// the term: it is how a bundle encodes a triple term, not a name anyone
+    /// uses, and the triple term itself is the spelling that works.
+    fn refuse_encoding(self, parameter: &str) -> Result<Self, Problem> {
+        fn names_encoding(iri: &str) -> bool {
+            iri.starts_with(kgf_store::triple_terms::NAMESPACE)
+        }
+        fn holds_encoding(triple: &TripleTerm<'_>) -> bool {
+            let component = |term: &Term<'_>| match term {
+                Term::Iri(iri) => names_encoding(iri),
+                Term::Triple(nested) => holds_encoding(nested),
+                Term::BlankNode(_) | Term::Literal(_) => false,
+            };
+            component(triple.subject())
+                || names_encoding(triple.predicate())
+                || component(triple.object())
+        }
+        let encoded = match &self.kind {
+            BoundKind::Iri => names_encoding(&self.dictionary),
+            BoundKind::Triple(triple) => holds_encoding(triple),
+            BoundKind::Literal | BoundKind::BlankNode => false,
+        };
+        if encoded {
+            return Err(Problem::new(
+                ErrorCode::BadTermSyntax,
+                format!(
+                    "`{parameter}` names an IRI under `{}`, which is how a bundle encodes a \
+                     triple term; write the triple term itself, `<<( subject predicate object )>>`",
+                    kgf_store::triple_terms::NAMESPACE
+                ),
+            ));
+        }
+        Ok(self)
     }
 
     /// Parse Hydra `ExplicitRepresentation`, used only by `/tpf`.
@@ -352,7 +420,7 @@ impl BoundTerm {
     }
 
     fn require_iri(self, parameter: &str) -> Result<Self, Problem> {
-        if self.kind == BoundKind::Iri {
+        if matches!(self.kind, BoundKind::Iri) {
             Ok(self)
         } else {
             Err(Problem::new(
@@ -372,6 +440,29 @@ impl BoundTerm {
             kind: BoundKind::Iri,
         }
     }
+
+    /// The triple term this binds, if it binds one.
+    pub fn triple(&self) -> Option<&TripleTerm<'static>> {
+        match &self.kind {
+            BoundKind::Triple(triple) => Some(triple),
+            BoundKind::Iri | BoundKind::Literal | BoundKind::BlankNode => None,
+        }
+    }
+
+    /// Refuse a triple term in a position RDF 1.2 gives none: the subject and
+    /// the predicate.
+    fn require_not_triple(self, position: Position, parameter: &str) -> Result<Self, Problem> {
+        if matches!(self.kind, BoundKind::Triple(_)) && position != Position::Object {
+            return Err(Problem::new(
+                ErrorCode::BadTermSyntax,
+                format!(
+                    "`{parameter}` is a triple term, but a triple term is only ever an object; \
+                     bind it in the object position"
+                ),
+            ));
+        }
+        Ok(self)
+    }
 }
 
 /// A triple pattern, as far as it can be read without a bundle.
@@ -386,6 +477,105 @@ pub struct Pattern {
     predicate: Option<BoundTerm>,
     object: Option<BoundTerm>,
     text: Option<TextFilter>,
+    triple: Option<TriplePattern>,
+}
+
+/// A pattern inside the object's triple term, `<<( s ?p ?o )>>`: the object is
+/// unbound, and constrained to triple terms whose positions match.
+///
+/// Like `o.text`, it constrains the object position rather than binding it,
+/// so a row still reports its object — the whole triple term, whose
+/// components are the values the variables took. The variables are
+/// placeholders: a name may not repeat, since equating two positions is a
+/// join this operation does not evaluate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriplePattern {
+    requested: String,
+    canonical: String,
+    subject: Option<BoundTerm>,
+    predicate: Option<BoundTerm>,
+    object: Option<BoundTerm>,
+}
+
+impl TriplePattern {
+    /// Parse `o` when it is a triple term with variables in it; `None` when
+    /// it is not one.
+    fn parse(
+        text: &str,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+    ) -> Result<Option<Self>, Problem> {
+        if !text.starts_with("<<(") {
+            return Ok(None);
+        }
+        // Before parsing, as for any term: the cap bounds the parse too.
+        let max = limits.budgets.max_term_bytes;
+        if text.len() as u64 > max {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "the term in `o` is {} bytes, over this server's max_term_bytes of {max}",
+                    text.len()
+                ),
+            ));
+        }
+        let bad = |error: crate::term::TermSyntaxError| {
+            Problem::new(ErrorCode::BadTermSyntax, format!("parameter `o`: {error}"))
+        };
+        let Some(parts) = crate::term::parse_triple_pattern(text, prefixes).map_err(bad)? else {
+            return Ok(None);
+        };
+        let mut names = BTreeSet::new();
+        let mut slots = Vec::with_capacity(3);
+        let mut canonical = String::from("<<(");
+        for part in parts {
+            canonical.push(' ');
+            match part {
+                crate::term::PatternTerm::Variable(name) => {
+                    if !names.insert(name) {
+                        return Err(Problem::new(
+                            ErrorCode::MalformedRequest,
+                            format!(
+                                "`?{name}` appears twice in the triple term in `o`; equating two \
+                                 of its positions is a join this operation does not evaluate"
+                            ),
+                        ));
+                    }
+                    canonical.push('?');
+                    slots.push(None);
+                }
+                crate::term::PatternTerm::Term(term) => {
+                    let bound =
+                        BoundTerm::from_canonical_term("o", term.to_request(), term, limits)?;
+                    canonical.push_str(&bound.dictionary);
+                    slots.push(Some(bound));
+                }
+            }
+        }
+        canonical.push_str(" )>>");
+        let mut slots = slots.into_iter();
+        Ok(Some(Self {
+            requested: text.to_owned(),
+            canonical,
+            subject: slots.next().expect("three positions"),
+            predicate: slots.next().expect("three positions"),
+            object: slots.next().expect("three positions"),
+        }))
+    }
+
+    /// The pattern as the client wrote it.
+    pub fn requested(&self) -> &str {
+        &self.requested
+    }
+
+    /// The term bound at an inner position, or `None` for a variable.
+    pub fn bound(&self, position: Position) -> Option<&BoundTerm> {
+        match position {
+            Position::Subject => self.subject.as_ref(),
+            Position::Predicate => self.predicate.as_ref(),
+            Position::Object => self.object.as_ref(),
+        }
+    }
 }
 
 impl Pattern {
@@ -396,8 +586,16 @@ impl Pattern {
                 .get(position.as_str())
                 .filter(|text| !text.is_empty())
             {
-                *pattern.slot(position) =
-                    Some(BoundTerm::parse(position.as_str(), text, limits, prefixes)?);
+                if position == Position::Object
+                    && let Some(triple) = TriplePattern::parse(text, limits, prefixes)?
+                {
+                    pattern.triple = Some(triple);
+                    continue;
+                }
+                *pattern.slot(position) = Some(
+                    BoundTerm::parse(position.as_str(), text, limits, prefixes)?
+                        .require_not_triple(position, position.as_str())?,
+                );
             }
         }
         // Part of the pattern rather than beside it: the constraint sits in
@@ -411,6 +609,12 @@ impl Pattern {
     /// The ranked text constraint on the object, if the request carried one.
     pub fn text(&self) -> Option<&TextFilter> {
         self.text.as_ref()
+    }
+
+    /// The pattern inside the object's triple term, if the request carried
+    /// one.
+    pub fn triple(&self) -> Option<&TriplePattern> {
+        self.triple.as_ref()
     }
 
     fn slot(&mut self, position: Position) -> &mut Option<BoundTerm> {
@@ -430,6 +634,21 @@ impl Pattern {
         }
     }
 
+    /// Every term the request bound: the bound positions, then the terms
+    /// bound inside the object's triple pattern, which constrain the object
+    /// rather than binding it but name terms all the same.
+    pub fn bound_terms(&self) -> impl Iterator<Item = &BoundTerm> {
+        let inner = self.triple.iter().flat_map(|triple| {
+            Position::ALL
+                .into_iter()
+                .filter_map(|position| triple.bound(position))
+        });
+        Position::ALL
+            .into_iter()
+            .filter_map(|position| self.bound(position))
+            .chain(inner)
+    }
+
     /// The positions a row carries: the unbound ones.
     ///
     /// `o.text` leaves the object *unbound* — it ranks candidates rather than
@@ -445,7 +664,10 @@ impl Pattern {
     fn shape(&self) -> String {
         Position::ALL
             .into_iter()
-            .map(|position| self.bound(position).map_or('?', BoundTerm::shape))
+            .map(|position| match (position, &self.triple) {
+                (Position::Object, Some(_)) => 'T',
+                _ => self.bound(position).map_or('?', BoundTerm::shape),
+            })
             .collect()
     }
 
@@ -457,7 +679,12 @@ impl Pattern {
                 self.bound(position).map(BoundTerm::dictionary),
             );
         }
-        request.with_opt("o.text", self.text.as_ref().map(TextFilter::query))
+        request
+            .with_opt("o.text", self.text.as_ref().map(TextFilter::query))
+            .with_opt(
+                "o.triple",
+                self.triple.as_ref().map(|t| t.canonical.as_str()),
+            )
     }
 }
 
@@ -471,6 +698,13 @@ impl Serialize for Pattern {
             // position it constrains, where a bound one echoes as its term.
             match (position, &self.text) {
                 (Position::Object, Some(text)) => map.serialize_entry("o", text)?,
+                (Position::Object, None) if self.triple.is_some() => map.serialize_entry(
+                    "o",
+                    self.triple
+                        .as_ref()
+                        .map(TriplePattern::requested)
+                        .unwrap_or_default(),
+                )?,
                 _ => map.serialize_entry(
                     position.as_str(),
                     &self.bound(position).map(BoundTerm::requested),
@@ -508,6 +742,13 @@ impl TextFilter {
                      or search for it, not both",
                     reflected(bound.requested())
                 ),
+            ));
+        }
+        if pattern.triple().is_some() {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "`o` is a pattern inside a triple term and `o.text` searches literals; \
+                 an object cannot be both",
             ));
         }
         if text.is_empty() {
@@ -573,6 +814,11 @@ impl TextFilter {
     pub fn to_query(&self) -> TextQuery {
         TextQuery {
             text: self.0.clone(),
+            // Every hit is resolved through `data.hdt`'s permutations, so the
+            // literals found only inside unasserted triple terms — objects of
+            // no triple here — stay out of the query, its budget and its
+            // counts.
+            propositions: false,
             ..TextQuery::default()
         }
     }
@@ -1701,7 +1947,7 @@ impl GraphScope {
             }
             Some(text) => {
                 let term = BoundTerm::parse_tpf("graph", text, limits)?;
-                if term.kind != BoundKind::Iri {
+                if !matches!(term.kind, BoundKind::Iri) {
                     return Err(Problem::new(
                         ErrorCode::BadTermSyntax,
                         format!(
@@ -1763,13 +2009,18 @@ impl GraphScope {
             });
         }
         let term = parse(text)?;
-        if term.kind == BoundKind::Literal {
+        if matches!(term.kind, BoundKind::Literal | BoundKind::Triple(_)) {
             return Err(Problem::new(
                 ErrorCode::BadTermSyntax,
                 format!(
-                    "`{}` names a graph by IRI, or `*` for every graph; {} is a literal",
+                    "`{}` names a graph by IRI, or `*` for every graph; {} is a {}",
                     parameter.as_str(),
-                    reflected(text)
+                    reflected(text),
+                    if matches!(term.kind, BoundKind::Literal) {
+                        "literal"
+                    } else {
+                        "triple term"
+                    }
                 ),
             ));
         }
@@ -1899,6 +2150,13 @@ fn labels_carried(
 /// and this build does not scope those. Refused rather than answered from the
 /// union, for the reason every ignored filter is refused.
 fn refuse_scoped_text(pattern: &Pattern, graph: &GraphScope) -> Result<(), Problem> {
+    if pattern.triple().is_some() && graph.canonical().is_some() {
+        return Err(Problem::new(
+            ErrorCode::MalformedRequest,
+            "`g` and a pattern inside a triple term cannot be combined in this build; \
+             scope the pattern or match inside the triple term, not both",
+        ));
+    }
     if pattern.text().is_some() && graph.canonical().is_some() {
         return Err(Problem::new(
             ErrorCode::MalformedRequest,
@@ -2081,9 +2339,10 @@ impl BindingPattern {
                 WireTerm::Text(text) if text.starts_with('?') => {
                     BindingCell::Variable(Variable::parse(&text, &parameter)?)
                 }
-                term => {
-                    BindingCell::Term(BoundTerm::parse_body(&parameter, term, limits, prefixes)?)
-                }
+                term => BindingCell::Term(
+                    BoundTerm::parse_body(&parameter, term, limits, prefixes)?
+                        .require_not_triple(position, &parameter)?,
+                ),
             };
             cells.push(cell);
         }
@@ -2108,7 +2367,10 @@ impl BindingPattern {
                 Some(value) if value.starts_with('?') => {
                     BindingCell::Variable(Variable::parse(value, parameter)?)
                 }
-                Some(value) => BindingCell::Term(BoundTerm::parse_tpf(parameter, value, limits)?),
+                Some(value) => BindingCell::Term(
+                    BoundTerm::parse_tpf(parameter, value, limits)?
+                        .require_not_triple(position, parameter)?,
+                ),
                 None => BindingCell::Unbound(position),
             };
             cells.push(cell);
@@ -3159,7 +3421,7 @@ impl Count {
                 .with_opt("g", graph.canonical()),
         );
         let cursor = resume(params, &binding)?;
-        if cursor.is_some() && pattern.text().is_none() {
+        if cursor.is_some() && pattern.text().is_none() && pattern.triple().is_none() {
             // Ordinary counts finish in one bounded descent and never issue a
             // continuation. Accepting one would mean silently ignoring it.
             return Err(Problem::from(StaleCursor));
@@ -4164,6 +4426,13 @@ impl Sample {
     ) -> Result<Self, Problem> {
         accept_only(params, SAMPLE, Self::PARAMETERS)?;
         let pattern = Pattern::parse(params, limits, prefixes)?;
+        if pattern.triple().is_some() {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "`/sample` draws from a pattern's exact cardinality, which a pattern inside a \
+                 triple term does not have; use `/fragment`",
+            ));
+        }
         let n = page_size(
             params,
             "n",
@@ -4506,7 +4775,9 @@ impl GetRequest for Fragment {
     /// Every representation of that page — JSON, RDF, HTML — costs within a
     /// small constant of the others, so none of them changes the class.
     fn work_class(&self) -> WorkClass {
-        if self.pattern.text().is_some() {
+        // Both examine up to the candidate budget, each candidate a few
+        // binary searches, where a plain pattern is one bounded descent.
+        if self.pattern.text().is_some() || self.pattern.triple().is_some() {
             WorkClass::Heavy
         } else {
             WorkClass::Ordinary
@@ -4542,7 +4813,9 @@ impl GetRequest for Count {
     }
 
     fn work_class(&self) -> WorkClass {
-        if self.pattern.text().is_some() {
+        // Both examine up to the candidate budget, each candidate a few
+        // binary searches, where a plain pattern is one bounded descent.
+        if self.pattern.text().is_some() || self.pattern.triple().is_some() {
             WorkClass::Heavy
         } else {
             WorkClass::Ordinary

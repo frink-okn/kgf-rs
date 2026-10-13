@@ -56,6 +56,7 @@ pub mod perm;
 pub mod rank;
 pub mod scope;
 pub mod store;
+pub mod triple_terms;
 
 // Golden-bundle fixtures. Behind a feature rather than `cfg(test)` because
 // `kgf-server` and the `kgf` binary need the same hdtc-built bundles, and a

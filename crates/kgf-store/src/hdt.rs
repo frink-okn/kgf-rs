@@ -367,6 +367,33 @@ impl<'a> BitmapTriples<'a> {
         upper_bound_in(self.array_y, range, value)
     }
 
+    /// First `ArrayY` position in a sorted range whose value is at least
+    /// `value`.
+    pub(crate) fn level2_lower_bound(&self, range: Range<u64>, value: u64) -> u64 {
+        match value.checked_sub(1) {
+            Some(below) => upper_bound_in(self.array_y, range, below),
+            None => range.start,
+        }
+    }
+
+    /// First `ArrayZ` position in a sorted range whose value is at least
+    /// `value`.
+    pub(crate) fn level3_lower_bound(&self, range: Range<u64>, value: u64) -> u64 {
+        match value.checked_sub(1) {
+            Some(below) => upper_bound_in(self.array_z, range, below),
+            None => range.start,
+        }
+    }
+
+    /// The `ArrayZ` positions under a range of `ArrayY` positions: empty for
+    /// an empty range.
+    pub(crate) fn z_span(&self, y_range: Range<u64>) -> Range<u64> {
+        if y_range.is_empty() {
+            return 0..0;
+        }
+        self.level3_range(y_range.start).start..self.level3_range(y_range.end - 1).end
+    }
+
     /// Binary search for `value` within a sorted `ArrayZ` range.
     ///
     /// # Panics

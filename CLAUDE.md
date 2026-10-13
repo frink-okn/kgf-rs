@@ -194,7 +194,10 @@ quietly.
    missing a required artifact is refused at open with a message naming what to build.
    Concretely: `data.hdt.perm` is required and never derived at open, the HDT-FoQ
    index is never read, and `data.hdt.graphs` and `data.hdt.graphs.idx` must occur
-   together. If a fallback looks tempting, the answer is to build the artifact.
+   together. `data.hdt.tt` is required whenever `data.hdt` holds a triple-term IRI,
+   and `data.hdt.props.hdt` with its `.perm` exactly when the index says some
+   triple term is unasserted. If a fallback looks tempting, the answer is to build
+   the artifact.
    *Not* covered by this rule: one algorithm choosing between equivalent routes on
    cost — `s ? o` probing whichever endpoint is smaller emits in the same order from
    either route and resumes from the same cursor.

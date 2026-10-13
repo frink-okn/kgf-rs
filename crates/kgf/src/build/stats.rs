@@ -659,6 +659,7 @@ impl VoidGraph {
                 Term::NamedNode(node) => Ok(NamedOrBlankNode::NamedNode(node.clone())),
                 Term::BlankNode(node) => Ok(NamedOrBlankNode::BlankNode(node.clone())),
                 Term::Literal(_) => bail!("VoID partition edge {predicate} has literal target"),
+                Term::Triple(_) => bail!("VoID partition edge {predicate} has triple-term target"),
             })
             .collect()
     }

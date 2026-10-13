@@ -12,9 +12,15 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Warnings are denied by the clippy step's `-D warnings`, which covers every
+# target of this workspace and nothing outside it. There is deliberately no
+# `RUSTFLAGS: -D warnings`: hdtc and its vendored crates are path dependencies,
+# so RUSTFLAGS would deny their warnings too, compiled against this repo's
+# Cargo.lock rather than hdtc's. A dependency deprecating an API hdtc calls then
+# fails CI here with no change on either side, as tempfile 3.27 deprecating
+# `TempPath::from_path` did. hdtc's own CI holds hdtc to its warnings.
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
 jobs:
   test:
@@ -29,7 +35,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frink-okn/hdtc
-          ref: v1.2.2
+          ref: v1.3.0
           path: hdtc
 
       # Pinned, not `@stable`. A floating toolchain means CI can go red with no
