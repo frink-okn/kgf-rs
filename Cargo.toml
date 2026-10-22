@@ -55,6 +55,11 @@ nix = { version = "0.30", default-features = false, features = ["resource"] }
 # it needs a C++ toolchain. One crate writes the index in `kgf build` and reads
 # it in `kgf serve`, so `--locked` pins writer and reader together.
 usearch = "2.26"
+# The embedding stage's vectors arrive as Parquet, read once at build time by
+# the `kgf` binary to build the index and the id map; a server never parses
+# Parquet, so neither crate is linked into `kgf-store` or `kgf-server`.
+parquet = "60"
+arrow = "60"
 
 # The HTTP stack supports QUERY: hyper parses the extension method and axum
 # routes it through
