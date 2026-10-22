@@ -35,8 +35,10 @@ pub struct Args {
     pub bundle: PathBuf,
 
     /// The verbalization config, YAML or JSON. `-` reads standard input.
+    /// Omitted, the bundle's own (`vectors/verbalize.json`) is used, as
+    /// `/verbalize` uses it.
     #[arg(long, value_name = "FILE")]
-    pub config: PathBuf,
+    pub config: Option<PathBuf>,
 
     /// Where to write the roots: one JSON object per root, with the digest
     /// of its text.
@@ -67,7 +69,18 @@ pub struct Args {
 
 /// Run the command.
 pub fn run(args: Args) -> Result<()> {
-    let config = read_config(&args.config)?;
+    let config = match &args.config {
+        Some(path) => read_config(path)?,
+        None => {
+            let published = args.bundle.join(kgf_store::store::artifact::VECTORS_CONFIG);
+            ensure!(
+                published.is_file(),
+                "no --config, and {} publishes no verbalization config to fall back on",
+                args.bundle.display()
+            );
+            read_config(&published)?
+        }
+    };
     let resolved = config
         .resolve()
         .context("resolving the verbalization config")?;
