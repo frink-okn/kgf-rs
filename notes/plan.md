@@ -3300,6 +3300,22 @@ that disagrees with its header as `Malformed` rather than asserting, after unit 
 review found one request could take the process down: open establishes the header and
 the sentinels, not the regions, so a request over a corrupt map must refuse, not panic.
 
+**`kgf vectors` assembles the sidecar; `kgf manifest` verifies it.** The command takes
+the embedding stage's Parquet and the roots stream, joins them through the dictionary,
+and writes the four files into a scratch directory renamed into place, so the sidecar
+exists whole or not at all; an existing `vectors/` is never replaced, since a sidecar
+is part of a version's identity. The `parquet` and `arrow` crates are linked into the
+`kgf` binary only. It refuses, naming the line, a root whose text the embeddings do
+not hold or whose IRI is not a subject (the two files come from different runs), a
+record no root names, a Parquet in the record layout or under another metric, a digest
+held twice, and a digest that is not hex — checked for ASCII before it is sliced, so a
+bad line is refused rather than a panic. The manifest is not rewritten: `kgf manifest`
+derives the capability from the files, and on both its paths now walks the id map with
+`Vectors::verify` and checks its recorded parent digest against the Parquet's checksum,
+beside the graph index's binding check. The `vectors` block the manifest should carry
+for a reader without the bundle — model, `convention_id`, width, the probes, the index's
+build parameters, the declared scope — is unit 40's, with the build stage.
+
 **The f16 fixed point.** A stored vector read back is the f16 the index keeps, widened;
 fed into a fresh index it is stored bit-identically, so the stored precision is a fixed
 point and the cosine metric does not renormalize on insert. `/vector` can therefore
@@ -3327,7 +3343,11 @@ binding mismatch, an id map disagreeing with its index is refused naming both co
 `verify` catches each corruption open does not; the writer refuses an empty record, id
 zero and an entity named twice; and the f16 round trip — and by `map.rs`'s tests that a
 truncated index, trailing bytes and removed keys are refused at open and that as many
-searches as contexts run at once.
+searches as contexts run at once — and by `crates/kgf/tests/vectors.rs`, which takes the
+verbalizer's streams through a Parquet written as the embedding stage writes one,
+`kgf vectors`, `kgf manifest`, and the catalog, and checks the refusals of both
+commands, the never-replaced sidecar, and `kgf manifest` catching an id map whose
+parent digest or regions disagree.
 
 ## Testing spine
 
