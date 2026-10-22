@@ -121,6 +121,10 @@ pub struct ReleaseLinks {
     #[serde(skip_serializing_if = "Option::is_none")]
     verbalize: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    vector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    similar: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     graphs: Option<String>,
     /// The whole dataset as standard HDT, resumable by byte range.
     hdt: String,
@@ -262,6 +266,8 @@ impl Resource for ServiceDescriptor<'_> {
                             ("max_label_predicates", Value::Number(u64::from(self.caps.max_label_predicates))),
                             ("max_verbalize_roots", Value::Number(u64::from(self.caps.max_verbalize_roots))),
                             ("max_schema_items", Value::Number(u64::from(self.caps.max_schema_items))),
+                            ("max_vector_iris", Value::Number(u64::from(self.caps.max_vector_iris))),
+                            ("max_similar_k", Value::Number(u64::from(self.caps.max_similar_k))),
                         ]))
                         h2 { "Response budgets" }
                         (note(
@@ -500,6 +506,12 @@ fn release_links(
         terms: Some(operation("terms")),
         labels: Some(operation("labels")),
         verbalize: Some(operation("verbalize")),
+        vector: release
+            .declares(Capability::Vectors)
+            .then(|| operation("vector")),
+        similar: release
+            .declares(Capability::Vectors)
+            .then(|| operation("similar")),
         graphs: release
             .declares(Capability::Graphs)
             .then(|| operation("graphs")),
@@ -858,6 +870,14 @@ fn operations(
         false,
     ));
     operations.push(("verbalize", "config, target, iri, n, seed, plan", true));
+    if manifest.declares(Capability::Vectors) {
+        operations.push(("vector", "iri; or QUERY/POST JSON body: iris", false));
+        operations.push((
+            "similar",
+            "iri, k; or QUERY/POST JSON body: iri or vector, k",
+            false,
+        ));
+    }
     operations
         .into_iter()
         .map(|(operation, parameters, browsable)| {

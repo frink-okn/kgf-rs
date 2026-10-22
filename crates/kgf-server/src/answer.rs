@@ -400,6 +400,8 @@ impl Target {
             AccessOperation::Schema => "Schema",
             AccessOperation::Labels => "Labels",
             AccessOperation::Verbalize => "Verbalize",
+            AccessOperation::Vector => "Vector",
+            AccessOperation::Similar => "Similar",
             AccessOperation::Void => "void",
             AccessOperation::Summary => "summary",
             AccessOperation::Manifest => "manifest",
@@ -5055,6 +5057,23 @@ fn searcher<'a>(store: &'a Store, target: &Target) -> Result<&'a TextSearcher, P
     })
 }
 
+/// The vector sidecar, or the 501 for a bundle that declared `vectors`
+/// without carrying it — the second half of the gate, as [`searcher`] is for
+/// `search`.
+fn vectors<'a>(store: &'a Store, target: &Target) -> Result<&'a kgf_store::Vectors, Problem> {
+    store.vectors().ok_or_else(|| {
+        tracing::error!(
+            dataset = %target.id.dataset,
+            version = %target.id.version,
+            "a bundle declaring `vectors` has no vector sidecar",
+        );
+        Problem::new(
+            ErrorCode::CapabilityNotAvailable,
+            "this bundle declares `vectors` but carries no vector sidecar",
+        )
+    })
+}
+
 /// `GET /count` — a pattern's cardinality.
 pub fn count(
     store: &Store,
@@ -5683,6 +5702,350 @@ pub fn labels(
         },
         target,
     })
+}
+
+/// `GET|QUERY /vector` — each submitted entity's stored vector.
+pub fn vector(
+    store: &Store,
+    target: Target,
+    request: &request::Vector,
+) -> Result<VectorAnswer, Problem> {
+    let dictionary = store.dict();
+    let blank_nodes = SkolemScope::of(store);
+    let vectors = vectors(store, &target)?;
+    let dimensions = vectors.dimensions();
+    let mut results = Vec::with_capacity(request.iris().len());
+    let mut spent = 0u64;
+    let mut stopped = None;
+
+    for requested in request.iris() {
+        let located = locate_scoped(
+            &dictionary,
+            &blank_nodes,
+            store.triple_terms(),
+            Role::Subject,
+            requested,
+        )?;
+        let result = match located {
+            None => VectorResult::absent(requested.dictionary(), "unknown_term"),
+            Some(id) => {
+                let row = vectors
+                    .row_of(TermId(id))
+                    .map_err(|error| unreadable("looking up an entity's record", &error))?;
+                match row {
+                    None => VectorResult::absent(requested.dictionary(), "not_embedded"),
+                    Some(row) => {
+                        let stored = vectors
+                            .vector(row)
+                            .map_err(|error| unreadable("reading a stored vector", &error))?;
+                        VectorResult::found(requested.dictionary(), row.0, stored)
+                    }
+                }
+            }
+        };
+        let next = spent.saturating_add(result.serialized);
+        if next > request.bytes.0 && !results.is_empty() {
+            stopped = Some(BudgetReason::ResponseBytes);
+            break;
+        }
+        spent = next;
+        results.push(result);
+    }
+
+    Ok(VectorAnswer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        dimensions,
+        vectors: results,
+        completeness: match stopped {
+            Some(reason) => Completeness::budget_exhausted_without_resume(reason),
+            None => Completeness::complete(),
+        },
+        target,
+    })
+}
+
+/// `GET|QUERY /similar` — the records nearest a vector, and their entities.
+pub fn similar(
+    store: &Store,
+    target: Target,
+    request: &request::Similar,
+) -> Result<SimilarAnswer, Problem> {
+    let dictionary = store.dict();
+    let blank_nodes = SkolemScope::of(store);
+    let vectors = vectors(store, &target)?;
+
+    // The query vector, and the record to leave out of the answer when it is
+    // an entity's own.
+    let (query, own, echo) = match &request.query {
+        request::SimilarQuery::Entity(entity) => {
+            let located = locate_scoped(
+                &dictionary,
+                &blank_nodes,
+                store.triple_terms(),
+                Role::Subject,
+                entity,
+            )?;
+            let Some(id) = located else {
+                return Err(Problem::new(
+                    ErrorCode::NotEmbedded,
+                    format!(
+                        "{} is not a subject of this bundle, so it has no vector; find it through /search or /describe",
+                        entity.dictionary()
+                    ),
+                ));
+            };
+            let row = vectors
+                .row_of(TermId(id))
+                .map_err(|error| unreadable("looking up an entity's record", &error))?;
+            let Some(row) = row else {
+                return Err(Problem::new(
+                    ErrorCode::NotEmbedded,
+                    format!(
+                        "{} is a subject of this bundle but not an embedding target of this version, so it has no vector to compare; the manifest's `vectors` block says which classes were embedded, and /search answers for the rest",
+                        entity.dictionary()
+                    ),
+                ));
+            };
+            let stored = vectors
+                .vector(row)
+                .map_err(|error| unreadable("reading a stored vector", &error))?;
+            (stored, Some(row), SimilarEcho::entity(entity.dictionary()))
+        }
+        request::SimilarQuery::Vector(vector) => {
+            (vector.clone(), None, SimilarEcho::vector(vector.len()))
+        }
+    };
+
+    // One more than asked when the entity's own record will be dropped.
+    let probe = request.k as usize + usize::from(own.is_some());
+    let hits = vectors
+        .similar(&query, probe)
+        .map_err(|error| match error {
+            kgf_store::Error::QueryDimension { expected, found } => Problem::new(
+                ErrorCode::MalformedRequest,
+                format!("`vector` has {found} dimensions; this bundle's vectors have {expected}"),
+            ),
+            kgf_store::Error::QueryNotFinite { position } => Problem::new(
+                ErrorCode::MalformedRequest,
+                format!("vector[{position}] is not a finite number"),
+            ),
+            other => unreadable("searching the vector index", &other),
+        })?;
+
+    let mut cache = TermCache::new();
+    let mut published = PublishedTerms::new(blank_nodes.clone(), store);
+    let mut results = Vec::with_capacity(request.k as usize);
+    let mut spent = 0u64;
+    let mut stopped = None;
+    for hit in hits {
+        if results.len() >= request.k as usize {
+            break;
+        }
+        if own == Some(hit.row) {
+            continue;
+        }
+        let mut entities = Vec::new();
+        let mut serialized = SimilarResult::FIXED_BYTES;
+        let members = vectors
+            .entities_of(hit.row)
+            .map_err(|error| unreadable("reading a record's entities", &error))?;
+        for entity in members {
+            let (term, bytes) = published
+                .measured(&mut cache, &dictionary, Role::Subject, entity)
+                .map_err(|error| unreadable("materializing an embedded entity", &error))?;
+            let text = term
+                .published
+                .text()
+                .cloned()
+                .expect("a subject is never a triple term");
+            entities.push(EntityTerm(text));
+            serialized += bytes;
+        }
+        let next = spent.saturating_add(serialized);
+        if next > request.bytes.0 && !results.is_empty() {
+            stopped = Some(BudgetReason::ResponseBytes);
+            break;
+        }
+        spent = next;
+        results.push(SimilarResult {
+            record: hit.row.0,
+            distance: hit.distance,
+            similarity: 1.0 - hit.distance,
+            entities,
+        });
+    }
+
+    Ok(SimilarAnswer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        query: echo,
+        k: request.k,
+        dimensions: vectors.dimensions(),
+        results,
+        completeness: match stopped {
+            Some(reason) => Completeness::budget_exhausted_without_resume(reason),
+            None => Completeness::complete(),
+        },
+        target,
+        blank_nodes,
+    })
+}
+
+/// A published subject, written as a term object.
+#[derive(Debug, Clone)]
+struct EntityTerm(Rc<str>);
+
+impl Serialize for EntityTerm {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Term::from_dictionary(&self.0).serialize(serializer)
+    }
+}
+
+/// `/vector`'s response: one entry per submitted entity, in request order.
+#[derive(Debug, Serialize)]
+pub struct VectorAnswer {
+    dataset: String,
+    version: String,
+    dimensions: usize,
+    vectors: Vec<VectorResult>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+}
+
+/// One submitted entity: its vector, or why it has none.
+#[derive(Debug, Serialize)]
+struct VectorResult {
+    iri: EntityTerm,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record: Option<u64>,
+    vector: Option<Vec<f32>>,
+    /// `unknown_term` or `not_embedded`; absent when the vector is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    absent: Option<&'static str>,
+    #[serde(skip)]
+    serialized: u64,
+}
+
+impl VectorResult {
+    fn found(iri: &str, record: u64, vector: Vec<f32>) -> Self {
+        // A float writes in at most 16 characters plus its comma.
+        let serialized = Self::fixed_bytes(iri) + 17 * vector.len() as u64;
+        Self {
+            iri: EntityTerm(Rc::from(iri)),
+            record: Some(record),
+            vector: Some(vector),
+            absent: None,
+            serialized,
+        }
+    }
+
+    fn absent(iri: &str, reason: &'static str) -> Self {
+        Self {
+            iri: EntityTerm(Rc::from(iri)),
+            record: None,
+            vector: None,
+            absent: Some(reason),
+            serialized: Self::fixed_bytes(iri),
+        }
+    }
+
+    fn fixed_bytes(iri: &str) -> u64 {
+        serialized_object([
+            ("type", serialized_json_string("iri")),
+            ("value", serialized_json_string(iri)),
+        ]) + 64
+    }
+}
+
+impl Renders for VectorAnswer {
+    fn render(self, representation: Representation) -> Result<Rendered, Problem> {
+        let body = standard_body(&self, representation);
+        let rows = Some(self.vectors.len() as u64);
+        Ok(Rendered {
+            body,
+            completeness: self.completeness,
+            rows,
+            cardinality: None,
+        })
+    }
+}
+
+/// What a `/similar` request ranked against, echoed.
+#[derive(Debug, Serialize)]
+struct SimilarEcho {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iri: Option<EntityTerm>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vector: Option<SimilarEchoVector>,
+}
+
+#[derive(Debug, Serialize)]
+struct SimilarEchoVector {
+    dimensions: usize,
+}
+
+impl SimilarEcho {
+    fn entity(iri: &str) -> Self {
+        Self {
+            iri: Some(EntityTerm(Rc::from(iri))),
+            vector: None,
+        }
+    }
+
+    fn vector(dimensions: usize) -> Self {
+        Self {
+            iri: None,
+            vector: Some(SimilarEchoVector { dimensions }),
+        }
+    }
+}
+
+/// `/similar`'s response: records nearest first, each with its entities.
+#[derive(Debug, Serialize)]
+pub struct SimilarAnswer {
+    dataset: String,
+    version: String,
+    query: SimilarEcho,
+    k: u32,
+    dimensions: usize,
+    results: Vec<SimilarResult>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+    #[serde(skip)]
+    blank_nodes: SkolemScope,
+}
+
+/// One record found: its distance under the index's metric, and the entities
+/// whose text it is — several where identical texts share a record.
+#[derive(Debug, Serialize)]
+struct SimilarResult {
+    record: u64,
+    distance: f32,
+    similarity: f32,
+    entities: Vec<EntityTerm>,
+}
+
+impl SimilarResult {
+    /// The row's bytes before its entities: the numbers and the keys.
+    const FIXED_BYTES: u64 = 96;
+}
+
+impl Renders for SimilarAnswer {
+    fn render(self, representation: Representation) -> Result<Rendered, Problem> {
+        let body = standard_body(&self, representation);
+        let rows = Some(self.results.len() as u64);
+        Ok(Rendered {
+            body,
+            completeness: self.completeness,
+            rows,
+            cardinality: None,
+        })
+    }
 }
 
 fn resolve_predicate_ids(
@@ -10389,6 +10752,161 @@ impl Resource for LabelsAnswer {
                         (note("No IRIs were submitted."))
                     } @else {
                         (results_table(&["iri", "label"], &rows))
+                    }
+                }
+            },
+        )
+    }
+}
+
+impl Resource for VectorAnswer {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let rendered: Vec<String> = self
+            .vectors
+            .iter()
+            .map(|result| match &result.vector {
+                Some(vector) => vector
+                    .iter()
+                    .map(|x| format!("{x:.4}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                None => String::new(),
+            })
+            .collect();
+        let records: Vec<String> = self
+            .vectors
+            .iter()
+            .map(|result| result.record.map(|r| r.to_string()).unwrap_or_default())
+            .collect();
+        let rows: Vec<Vec<Value<'_>>> = self
+            .vectors
+            .iter()
+            .enumerate()
+            .map(|(index, result)| {
+                vec![
+                    Value::Code(&result.iri.0),
+                    match result.absent {
+                        Some(reason) => Value::Text(reason),
+                        None => Value::Text(&records[index]),
+                    },
+                    if result.vector.is_some() {
+                        Value::Text(&rendered[index])
+                    } else {
+                        Value::Absent
+                    },
+                ]
+            })
+            .collect();
+        let returned = self.vectors.len() as u64;
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        operation_page(
+            &self.target.mount,
+            &self.target.title(),
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" {
+                    (fields(&[
+                        ("dimensions", Value::Number(self.dimensions as u64)),
+                        ("returned", Value::Number(returned)),
+                        ("complete", Value::Text(completeness_text(&self.completeness))),
+                    ]))
+                }
+                @if let Some(form) = self.target.form() {
+                    div."query-editor" { (form) }
+                }
+                section."section-block" {
+                    h2 { "Vectors" }
+                    @if rows.is_empty() {
+                        (note("No entities were submitted."))
+                    } @else {
+                        (results_table(&["entity", "record", "vector"], &rows))
+                    }
+                }
+            },
+        )
+    }
+}
+
+impl Resource for SimilarAnswer {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        // One row per entity, so a record shared by several reads as several
+        // neighbours at one distance.
+        let cells: Vec<(Cell<'_>, String, String, String)> = self
+            .results
+            .iter()
+            .flat_map(|result| {
+                result.entities.iter().map(move |entity| {
+                    (
+                        term_cell(&self.target, &self.blank_nodes, &entity.0, None),
+                        format!("{:.4}", result.distance),
+                        format!("{:.4}", result.similarity),
+                        result.record.to_string(),
+                    )
+                })
+            })
+            .collect();
+        let rows: Vec<Vec<Value<'_>>> = cells
+            .iter()
+            .map(|(cell, distance, similarity, record)| {
+                vec![
+                    cell.value(),
+                    Value::Text(distance),
+                    Value::Text(similarity),
+                    Value::Text(record),
+                ]
+            })
+            .collect();
+        let query_text = match &self.query.iri {
+            Some(iri) => iri.0.to_string(),
+            None => format!("a client vector of {} dimensions", self.dimensions),
+        };
+        let heading = match &self.query.iri {
+            Some(iri) => format!("Similar to {}", iri.0),
+            None => "Similar to a vector".to_owned(),
+        };
+        let returned = self.results.len() as u64;
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        operation_page(
+            &self.target.mount,
+            &heading,
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" {
+                    (fields(&[
+                        ("query", if self.query.iri.is_some() { Value::Code(&query_text) } else { Value::Text(&query_text) }),
+                        ("k", Value::Number(u64::from(self.k))),
+                        ("records", Value::Number(returned)),
+                        ("complete", Value::Text(completeness_text(&self.completeness))),
+                    ]))
+                }
+                @if let Some(form) = self.target.form() {
+                    div."query-editor" { (form) }
+                }
+                @if !self.completeness.is_complete() {
+                    (note(
+                        "The response's byte budget stopped the answer before its k records; ask for fewer."
+                    ))
+                }
+                section."section-block" {
+                    h2 { "Nearest" }
+                    @if rows.is_empty() {
+                        (note("No records."))
+                    } @else {
+                        (results_table(&["entity", "distance", "similarity", "record"], &rows))
                     }
                 }
             },

@@ -358,6 +358,10 @@ pub enum AccessOperation {
     Labels,
     /// Verbalization preview.
     Verbalize,
+    /// Stored vectors by entity.
+    Vector,
+    /// Nearest records by vector.
+    Similar,
     /// Immutable bundle manifest.
     Manifest,
     /// Service descriptor.
@@ -385,6 +389,8 @@ impl AccessOperation {
         Self::Void,
         Self::Summary,
         Self::Labels,
+        Self::Vector,
+        Self::Similar,
         Self::Manifest,
         Self::Export,
     ];
@@ -409,6 +415,8 @@ impl AccessOperation {
             Self::Summary => "summary",
             Self::Labels => "labels",
             Self::Verbalize => "verbalize",
+            Self::Vector => "vector",
+            Self::Similar => "similar",
             Self::Manifest => "manifest",
             Self::Service => "service",
             Self::Dataset => "dataset",
@@ -564,6 +572,18 @@ pub enum RequestShape {
         targets: u64,
         /// Roots the request asked to render.
         roots: u64,
+    },
+    /// Stored-vector lookup.
+    Vector {
+        /// Submitted entities.
+        iris: u64,
+    },
+    /// Nearest-record search.
+    Similar {
+        /// `iri` or `vector`: what the request ranked against.
+        by: &'static str,
+        /// Neighbours asked for.
+        k: u32,
     },
     /// Graph listing.
     Graphs {
@@ -1356,6 +1376,8 @@ fn operation_for_route(route: &str) -> Option<AccessOperation> {
         "/{dataset}/v/{version}/summary" => Some(AccessOperation::Summary),
         "/{dataset}/v/{version}/labels" => Some(AccessOperation::Labels),
         "/{dataset}/v/{version}/verbalize" => Some(AccessOperation::Verbalize),
+        "/{dataset}/v/{version}/vector" => Some(AccessOperation::Vector),
+        "/{dataset}/v/{version}/similar" => Some(AccessOperation::Similar),
         "/{dataset}/v/{version}/export/{artifact}" => Some(AccessOperation::Export),
         _ => None,
     }

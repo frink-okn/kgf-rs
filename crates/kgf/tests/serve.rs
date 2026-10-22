@@ -2870,6 +2870,20 @@ fn a_resource_states_its_methods_where_they_cannot_go_stale() {
             405,
             server.request("DELETE", &path("verbalize"), &[]),
         ),
+        // This bundle declares no `vectors`: the gate answers, and the
+        // resource still states what it takes.
+        (
+            "GET vector, undeclared",
+            READ_OR_BODY,
+            501,
+            server.get(&path("vector?iri=ex:site1")),
+        ),
+        (
+            "DELETE similar",
+            READ_OR_BODY,
+            405,
+            server.request("DELETE", &path("similar"), &[]),
+        ),
         (
             "QUERY labels",
             BODY,
@@ -6080,5 +6094,203 @@ fn verbalize_charges_a_probe_that_finds_nothing() {
             .unwrap()
             .contains("at: Auburn"),
         "{body}"
+    );
+}
+
+/// Five typed subjects of which four are embedded — `b` and `c` with one
+/// shared record — and one subject that is not.
+const EMBEDDED_NT: &str = concat!(
+    "<http://example.org/a> <http://example.org/type> <http://example.org/T> .\n",
+    "<http://example.org/b> <http://example.org/type> <http://example.org/T> .\n",
+    "<http://example.org/c> <http://example.org/type> <http://example.org/T> .\n",
+    "<http://example.org/d> <http://example.org/type> <http://example.org/T> .\n",
+    "<http://example.org/e> <http://example.org/type> <http://example.org/T> .\n",
+    "<http://example.org/f> <http://example.org/name> \"not embedded\" .\n",
+    "<http://example.org/T> <http://example.org/name> \"a class\" .\n",
+);
+
+const EMBEDDED_GROUPS: &[&[&str]] = &[
+    &["http://example.org/a"],
+    &["http://example.org/b", "http://example.org/c"],
+    &["http://example.org/d", "http://example.org/e"],
+    &["http://example.org/T"],
+];
+
+#[test]
+fn vectors_answer_over_the_wire_and_refuse_what_is_not_embedded() {
+    use kgf_store::testing::fixture_vector;
+
+    let deployment = Deployment::new();
+    deployment.publish_fixture(
+        "vec",
+        "v1",
+        Fixture::build(EMBEDDED_NT).with_vectors(EMBEDDED_GROUPS),
+        "2026-10-22T10:00:00Z",
+    );
+    deployment.publish("tox", "v1", TYPED_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let json = [("Content-Type", "application/json")];
+    let html = [("Accept", "text/html")];
+
+    // Declared where a client looks: the manifest, and the descriptor's links
+    // for this release only.
+    let manifest = server.get("/vec/v/v1/manifest").json();
+    assert!(manifest["capabilities"].get("vectors").is_some());
+    let descriptor = server.get("/").json();
+    let links = |dataset: &str| {
+        descriptor["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"] == dataset)
+            .unwrap()["links"]
+            .clone()
+    };
+    assert!(links("vec")["vector"].is_string() && links("vec")["similar"].is_string());
+    assert!(links("tox").get("vector").is_none() && links("tox").get("similar").is_none());
+
+    // One entity by GET.
+    let one = server.get("/vec/v/v1/vector?iri=ex:a");
+    one.assert_status(200);
+    let one = one.json();
+    assert_eq!(one["dimensions"], 8);
+    assert_eq!(one["complete"], true);
+    let entry = &one["vectors"][0];
+    assert_eq!(entry["iri"]["value"], "http://example.org/a");
+    assert_eq!(entry["record"], 0);
+    let stored: Vec<f32> = entry["vector"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_f64().unwrap() as f32)
+        .collect();
+    assert_eq!(stored.len(), 8);
+    for (got, want) in stored.iter().zip(fixture_vector(0)) {
+        assert!((got - want).abs() < 1e-3, "{got} vs {want}");
+    }
+
+    // A batch by QUERY: in request order, the absent ones saying why.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "iris": ["ex:c", "ex:f", "ex:nobody", "ex:a"]
+    }))
+    .unwrap();
+    let batch = server.request_with_body("QUERY", "/vec/v/v1/vector", &json, &body);
+    batch.assert_status(200);
+    let batch = batch.json();
+    let entries = batch["vectors"].as_array().unwrap();
+    assert_eq!(entries.len(), 4);
+    assert_eq!(entries[0]["record"], 1);
+    assert!(entries[0]["vector"].is_array());
+    assert_eq!(entries[1]["absent"], "not_embedded");
+    assert!(entries[1]["vector"].is_null() && entries[1].get("record").is_none());
+    assert_eq!(entries[2]["absent"], "unknown_term");
+    assert_eq!(entries[3]["record"], 0);
+
+    // Nearest an entity's own vector, its own record left out. b and c share
+    // record 1, so neither appears for b.
+    let near = server.get("/vec/v/v1/similar?iri=ex:b&k=2");
+    near.assert_status(200);
+    let near = near.json();
+    assert_eq!(near["query"]["iri"]["value"], "http://example.org/b");
+    assert_eq!(near["k"], 2);
+    let results = near["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    for result in results {
+        assert_ne!(result["record"], 1);
+        let distance = result["distance"].as_f64().unwrap();
+        assert!((0.0..=2.0).contains(&distance));
+        assert!(
+            result["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["type"] == "iri")
+        );
+    }
+    assert!(results[0]["distance"].as_f64() <= results[1]["distance"].as_f64());
+
+    // A client's own vector: record 0's vector finds record 0 first, with a.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "vector": fixture_vector(0),
+        "k": 3
+    }))
+    .unwrap();
+    let own = server.request_with_body("QUERY", "/vec/v/v1/similar", &json, &body);
+    own.assert_status(200);
+    let own = own.json();
+    assert_eq!(own["query"]["vector"]["dimensions"], 8);
+    assert_eq!(own["results"][0]["record"], 0);
+    assert_eq!(
+        own["results"][0]["entities"][0]["value"],
+        "http://example.org/a"
+    );
+    assert!(own["results"][0]["distance"].as_f64().unwrap() < 1e-3);
+    assert_eq!(own["results"].as_array().unwrap().len(), 3);
+    // Two entities on one shared record come back together.
+    let shared = own["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["record"] == 1)
+        .expect("record 1 is among three of four");
+    assert_eq!(shared["entities"].as_array().unwrap().len(), 2);
+
+    // Not embedded is a refusal with its own code, never an empty answer.
+    for (iri, says) in [
+        ("ex:f", "not an embedding target"),
+        ("ex:nobody", "not a subject of this bundle"),
+    ] {
+        let refused = server.get(&format!("/vec/v/v1/similar?iri={iri}"));
+        refused.assert_status(422);
+        let problem = refused.json();
+        assert_eq!(problem["code"], "not_embedded");
+        assert!(
+            problem["detail"].as_str().unwrap().contains(says),
+            "{problem}"
+        );
+    }
+
+    // Caps and shapes.
+    let over = server.get("/vec/v/v1/similar?iri=ex:a&k=101");
+    over.assert_status(400);
+    assert_eq!(over.json()["code"], "cap_exceeded");
+    let body = serde_json::to_vec(&serde_json::json!({"vector": [0.5, 0.5]})).unwrap();
+    let narrow = server.request_with_body("QUERY", "/vec/v/v1/similar", &json, &body);
+    narrow.assert_status(400);
+    assert_eq!(narrow.json()["code"], "malformed_request");
+    assert!(
+        narrow.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("2 dimensions")
+    );
+    let body = serde_json::to_vec(&serde_json::json!({"iri": "ex:a", "vector": [0.5]})).unwrap();
+    let both = server.request_with_body("QUERY", "/vec/v/v1/similar", &json, &body);
+    both.assert_status(400);
+    let body = serde_json::to_vec(&serde_json::json!({"iris": vec!["ex:a"; 1001]})).unwrap();
+    let many = server.request_with_body("QUERY", "/vec/v/v1/vector", &json, &body);
+    many.assert_status(400);
+    assert_eq!(many.json()["code"], "cap_exceeded");
+
+    // The gate on a bundle without the sidecar.
+    let gated = server.get("/tox/v/v1/similar?iri=ex:site1");
+    gated.assert_status(501);
+    assert_eq!(gated.json()["code"], "capability_not_available");
+
+    // Every route has a page.
+    for path in [
+        "/vec/v/v1/vector?iri=ex:a",
+        "/vec/v/v1/similar?iri=ex:a&k=2",
+    ] {
+        let page = server.request("GET", path, &html);
+        page.assert_status(200);
+        let text = page.text();
+        assert!(text.contains("<form"), "{path}: {text}");
+        assert!(text.contains("http://example.org/"), "{path}");
+    }
+    let manifest_page = server.request("GET", "/vec/v/v1/manifest", &html).text();
+    assert!(
+        manifest_page.contains("/vec/v/v1/similar"),
+        "the manifest page offers the form"
     );
 }

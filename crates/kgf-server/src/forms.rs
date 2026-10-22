@@ -27,6 +27,7 @@ pub(crate) fn manifest_forms(
         graphs: manifest.declares(Capability::Graphs),
     };
     let search = offers.search;
+    let vectors = manifest.declares(Capability::Vectors);
 
     html! {
         h2 { "Try a query" }
@@ -45,6 +46,10 @@ pub(crate) fn manifest_forms(
             }
             (terms(mount, dataset, version, &empty, false))
             (verbalize(mount, dataset, version, &empty, false))
+            @if vectors {
+                (vector_form(mount, dataset, version, &empty, false))
+                (similar_form(mount, dataset, version, &empty, false))
+            }
         }
     }
 }
@@ -67,6 +72,8 @@ pub(crate) fn operation_form(
         "search" => Some(search_form(mount, dataset, version, params, false)),
         "terms" => Some(terms(mount, dataset, version, params, false)),
         "verbalize" => Some(verbalize(mount, dataset, version, params, false)),
+        "vector" => Some(vector_form(mount, dataset, version, params, false)),
+        "similar" => Some(similar_form(mount, dataset, version, params, false)),
         _ => None,
     }?;
     Some(html! { div."query-stack" { (form) } })
@@ -343,6 +350,58 @@ fn verbalize(mount: &Mount, dataset: &str, version: &str, params: &Params, open:
             ),
         ],
         "Render",
+        open,
+    )
+}
+
+fn vector_form(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
+    form(
+        "Vector",
+        "The stored vector of one embedded entity. Several go in a QUERY body as `iris`.",
+        mount.operation(dataset, version, "vector"),
+        vec![text_control(
+            "vector",
+            "iri",
+            "Entity",
+            params.get("iri"),
+            "ex:resource or <https://example.org/resource>",
+            true,
+        )],
+        "Look up",
+        open,
+    )
+}
+
+fn similar_form(
+    mount: &Mount,
+    dataset: &str,
+    version: &str,
+    params: &Params,
+    open: bool,
+) -> Markup {
+    form(
+        "Similar",
+        "The entities whose embedded text is nearest one entity's. A client with a vector of its own sends it in a QUERY body as `vector`.",
+        mount.operation(dataset, version, "similar"),
+        vec![
+            text_control(
+                "similar",
+                "iri",
+                "Entity",
+                params.get("iri"),
+                "ex:resource or <https://example.org/resource>",
+                true,
+            ),
+            number_control(
+                "similar",
+                "k",
+                "Neighbours",
+                params.get("k"),
+                1,
+                "server default",
+            ),
+        ],
+        "Find",
         open,
     )
 }

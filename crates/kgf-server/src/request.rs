@@ -4968,6 +4968,252 @@ const SAMPLE: &str = "sample";
 const SCHEMA: &str = "schema";
 const VOID: &str = "void";
 const SUMMARY: &str = "summary";
+const VECTOR: &str = "vector";
+const SIMILAR: &str = "similar";
+
+/// `GET|QUERY /vector` — the stored vector of each submitted entity.
+///
+/// A lookup table like `/labels`: the answer is an array in input order, and
+/// an entity with no vector is an entry saying why rather than a refusal, so
+/// a mixed batch gets one answer. `/similar` is where "not embedded" is an
+/// error, because there the operation cannot proceed.
+pub struct Vector {
+    iris: Vec<BoundTerm>,
+    /// Bytes the result rows may occupy.
+    pub bytes: ResponseBytes,
+}
+
+impl Vector {
+    const PARAMETERS: &'static [&'static str] = &["iri", "format"];
+
+    /// Parse the GET form: one entity in `iri`.
+    pub fn parse(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+    ) -> Result<Self, Problem> {
+        accept_only(params, VECTOR, Self::PARAMETERS)?;
+        let Some(text) = params.get("iri") else {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "`iri` names the entity whose vector to return; several go in a QUERY body as `iris`",
+            ));
+        };
+        let iri = BoundTerm::parse("iri", text, limits, prefixes)?.require_iri("iri")?;
+        Ok(Self {
+            iris: vec![iri],
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+        })
+    }
+
+    /// Parse the JSON body form: entities in `iris`, held to `max_vector_iris`.
+    pub fn parse_body(
+        params: &Params,
+        body: &[u8],
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+    ) -> Result<Self, Problem> {
+        accept_only(params, VECTOR, &["format"])?;
+        let wire: WireVector = parse_body(body)?;
+        if wire.iris.len() > limits.caps.max_vector_iris as usize {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "vector received {} IRIs, over this server's max_vector_iris of {}",
+                    wire.iris.len(),
+                    limits.caps.max_vector_iris
+                ),
+            ));
+        }
+        let mut iris = Vec::with_capacity(wire.iris.len());
+        for (index, iri) in wire.iris.into_iter().enumerate() {
+            iris.push(
+                BoundTerm::parse_body(&format!("iris[{index}]"), iri, limits, prefixes)?
+                    .require_iri(&format!("iris[{index}]"))?,
+            );
+        }
+        Ok(Self {
+            iris,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+        })
+    }
+
+    /// The entities, in request order.
+    pub fn iris(&self) -> &[BoundTerm] {
+        &self.iris
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireVector {
+    iris: Vec<WireTerm>,
+}
+
+impl ObservedRequest for Vector {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Vector {
+            iris: self.iris.len() as u64,
+        }
+    }
+}
+
+impl GetRequest for Vector {
+    fn normalize_params(params: &Params) -> Params {
+        params.without_empty(&[])
+    }
+}
+
+/// What `/similar` ranks the bundle's records against.
+pub enum SimilarQuery {
+    /// An embedded entity's own stored vector; the entity's record is left
+    /// out of the answer.
+    Entity(BoundTerm),
+    /// A vector the client computed, in the bundle's space.
+    Vector(Vec<f32>),
+}
+
+/// `GET|QUERY /similar` — the `k` records nearest a vector, with the entities
+/// each one names.
+pub struct Similar {
+    /// What to rank against.
+    pub query: SimilarQuery,
+    /// Records wanted.
+    pub k: u32,
+    /// Bytes the result rows may occupy.
+    pub bytes: ResponseBytes,
+}
+
+impl Similar {
+    const PARAMETERS: &'static [&'static str] = &["iri", "k", "format"];
+
+    /// Parse the GET form: an entity in `iri`, and `k`.
+    pub fn parse(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+    ) -> Result<Self, Problem> {
+        accept_only(params, SIMILAR, Self::PARAMETERS)?;
+        let Some(text) = params.get("iri") else {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "`iri` names the entity to find the neighbours of; a vector goes in a QUERY body as `vector`",
+            ));
+        };
+        let iri = BoundTerm::parse("iri", text, limits, prefixes)?.require_iri("iri")?;
+        let k = page_size(
+            params,
+            "k",
+            Self::default_k(limits),
+            limits.caps.max_similar_k,
+            "omit similar when no neighbours are wanted",
+        )?;
+        Ok(Self {
+            query: SimilarQuery::Entity(iri),
+            k,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+        })
+    }
+
+    /// Parse the JSON body form: one of `iri` and `vector`, and `k`.
+    pub fn parse_body(
+        params: &Params,
+        body: &[u8],
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+    ) -> Result<Self, Problem> {
+        accept_only(params, SIMILAR, &["format"])?;
+        let wire: WireSimilar = parse_body(body)?;
+        let query = match (wire.iri, wire.vector) {
+            (Some(iri), None) => SimilarQuery::Entity(
+                BoundTerm::parse_body("iri", iri, limits, prefixes)?.require_iri("iri")?,
+            ),
+            (None, Some(vector)) => {
+                if vector.is_empty() {
+                    return Err(Problem::new(
+                        ErrorCode::MalformedRequest,
+                        "`vector` is empty; it must have the bundle's number of dimensions",
+                    ));
+                }
+                if let Some(position) = vector.iter().position(|x| !x.is_finite()) {
+                    return Err(Problem::new(
+                        ErrorCode::MalformedRequest,
+                        format!("vector[{position}] is not a finite number"),
+                    ));
+                }
+                SimilarQuery::Vector(vector)
+            }
+            (Some(_), Some(_)) => {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    "`iri` and `vector` are alternatives; name one",
+                ));
+            }
+            (None, None) => {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    "name the entity to find the neighbours of in `iri`, or a vector in `vector`",
+                ));
+            }
+        };
+        let k = match wire.k {
+            None => Self::default_k(limits),
+            Some(0) => {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    "k=0 asks for nothing back; omit k to take the default",
+                ));
+            }
+            Some(k) if k > limits.caps.max_similar_k => {
+                return Err(Problem::new(
+                    ErrorCode::CapExceeded,
+                    format!(
+                        "k={k} is over this server's max_similar_k of {}",
+                        limits.caps.max_similar_k
+                    ),
+                ));
+            }
+            Some(k) => k,
+        };
+        Ok(Self {
+            query,
+            k,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+        })
+    }
+
+    /// `k` when the request names none: the page default, within the cap.
+    fn default_k(limits: Limits<'_>) -> u32 {
+        limits.caps.default_limit.min(limits.caps.max_similar_k)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireSimilar {
+    iri: Option<WireTerm>,
+    vector: Option<Vec<f32>>,
+    k: Option<u32>,
+}
+
+impl ObservedRequest for Similar {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Similar {
+            by: match self.query {
+                SimilarQuery::Entity(_) => "iri",
+                SimilarQuery::Vector(_) => "vector",
+            },
+            k: self.k,
+        }
+    }
+}
+
+impl GetRequest for Similar {
+    fn normalize_params(params: &Params) -> Params {
+        params.without_empty(&["k"])
+    }
+}
+
 const SEARCH: &str = "search";
 const TERMS: &str = "terms";
 const LABELS: &str = "labels";

@@ -146,7 +146,15 @@ impl Service {
             .admission
             .validate()
             .map_err(|detail| ServiceError::Configuration { detail })?;
-        let catalog = Catalog::scan(config.bundle_root.clone(), OpenOptions::default())?;
+        // A vector search leases one of a fixed pool of contexts and fails
+        // rather than waits when none is free, so the pool is the admission
+        // bound: as many as requests that may run at once.
+        let catalog = Catalog::scan(
+            config.bundle_root.clone(),
+            OpenOptions::default().with_search_contexts(
+                usize::try_from(config.admission.max_concurrent_work).unwrap_or(usize::MAX),
+            ),
+        )?;
         // Before any manifest is read, because this is a fact about the
         // directory name rather than about the bundle inside it: a hand-
         // assembled or externally produced tree can carry a name `kgf build`
