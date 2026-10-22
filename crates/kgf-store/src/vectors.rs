@@ -46,8 +46,11 @@
 //! and width against the header — a fixed number of reads however many
 //! entities there are. It does not walk the regions: that an entity's record
 //! is in range, that `offsets` is monotone, that the two directions agree, is
-//! [`Vectors::verify`]'s pass, run by `kgf manifest --check`. The accessors
-//! bound-check with `assert!` as every mapped accessor in this crate does.
+//! [`Vectors::verify`]'s pass, run by `kgf manifest --check`. Because open
+//! leaves the regions unread, an accessor that finds one disagreeing with the
+//! header reports it as [`Error::Malformed`] rather than asserting: this
+//! crate's other accessors assert on conditions their open already excluded,
+//! and these are not, so a request over a corrupt map must refuse, not panic.
 
 use std::io::Write;
 use std::path::Path;
@@ -451,6 +454,14 @@ impl Vectors {
                 found: query.len(),
             });
         }
+        // A NaN or infinite component makes every distance NaN, and NaN
+        // distances order arbitrarily: a confident answer that means nothing.
+        if let Some(position) = query.iter().position(|x| !x.is_finite()) {
+            return Err(Error::QueryNotFinite { position });
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
         let matches = self
             .index
             .index()
@@ -596,8 +607,9 @@ pub struct IdMapSummary {
 ///
 /// Refuses a row with no entities, an id of zero, and an entity named by two
 /// rows: each is a map that would answer wrongly rather than a map with less
-/// in it. Holds every (entity, record) pair in memory to sort them — sixteen
-/// bytes an entity — which is the one thing here that grows with the output.
+/// in it. Holds everything in memory until the header's counts are known — about
+/// 24 bytes an entity and 40 a record — which is the one thing here that
+/// grows with the output.
 pub fn write_id_map(
     out: &mut impl Write,
     identity: IdMapIdentity,
@@ -769,6 +781,16 @@ mod tests {
             ),
             "{error}"
         );
+        let mut query = vectors.vector(Row(0)).unwrap();
+        assert!(vectors.similar(&query, 0).unwrap().is_empty());
+        query[5] = f32::NAN;
+        let error = vectors.similar(&query, 1).unwrap_err();
+        assert!(
+            matches!(error, Error::QueryNotFinite { position: 5 }),
+            "{error}"
+        );
+        query[5] = f32::INFINITY;
+        assert!(vectors.similar(&query, 1).is_err());
     }
 
     #[test]

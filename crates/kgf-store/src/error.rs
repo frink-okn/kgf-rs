@@ -158,6 +158,14 @@ pub enum Error {
         found: usize,
     },
 
+    /// A query vector holds a NaN or infinite component, under which every
+    /// distance is NaN and the ranking means nothing.
+    #[error("query vector component {position} is not a finite number")]
+    QueryNotFinite {
+        /// The first such component.
+        position: usize,
+    },
+
     /// The ANN library refused a search it had the capacity reserved for.
     #[error("vector search failed: {0}")]
     VectorSearch(String),

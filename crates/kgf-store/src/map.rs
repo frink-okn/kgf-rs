@@ -384,10 +384,12 @@ impl MappedIndex {
             ..Default::default()
         })
         .map_err(|e| malformed(format!("cannot hold this index: {e}")))?;
-        // SAFETY: the view keeps a pointer into the mapped bytes. They are moved
-        // into `Self` beside it, declared after it so they are unmapped only
-        // once it is dropped, and the mapping is of a published artifact, which
-        // does not change while any mapping of it lives.
+        // SAFETY: the view keeps a pointer into the mapped bytes, so it needs
+        // them unchanged and alive for as long as it exists. Unchanged is
+        // `Mapping::open`'s own contract — whoever opened `mapping` undertook
+        // that the file does not change while the mapping lives. Alive is the
+        // field order: the mapping is moved into `Self` beside the view and
+        // declared after it, so it is unmapped only once the view is dropped.
         unsafe { index.view_from_buffer(mapping.as_bytes()) }
             .map_err(|e| malformed(format!("cannot be viewed: {e}")))?;
         if index.serialized_length() as u64 != mapping.byte_len() {
