@@ -1235,6 +1235,14 @@ enum Echo {
     Describe {
         resource: String,
         direction: Direction,
+        /// Whether the resource has a vector in this bundle: the third of the
+        /// three states a term can be in, answered for free by the id map.
+        /// Absent when the bundle publishes no vectors.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        embedded: Option<bool>,
+        /// Its record, when embedded.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        record: Option<u64>,
     },
     Sample {
         pattern: Pattern,
@@ -6768,9 +6776,32 @@ pub fn describe(
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
     let blank_nodes = SkolemScope::of(store);
+    // One binary search in the id map, so the page offers "more like this"
+    // only where /similar will answer, and a client reads the same fact.
+    let (embedded, record) = match store.vectors() {
+        None => (None, None),
+        Some(vectors) => {
+            let located = locate_scoped(
+                &dictionary,
+                &blank_nodes,
+                store.triple_terms(),
+                Role::Subject,
+                &request.resource,
+            )?;
+            let row = match located {
+                Some(id) => vectors
+                    .row_of(TermId(id))
+                    .map_err(|error| unreadable("looking up an entity's record", &error))?,
+                None => None,
+            };
+            (Some(row.is_some()), row.map(|row| row.0))
+        }
+    };
     let echo = Echo::Describe {
         resource: request.resource.requested().to_owned(),
         direction: request.direction,
+        embedded,
+        record,
     };
 
     let mut phases = Vec::new();
@@ -10029,6 +10060,9 @@ impl Resource for Answer {
                 @if let Some(identifier) = self.described_identifier() {
                     p."focus-identifier" { code { (identifier) } }
                 }
+                @if let Some(link) = self.more_like_this() {
+                    p."more-like-this" { a href=(link) { "More like this →" } }
+                }
                 div."answer-summary" {
                     (fields(&summary))
                 }
@@ -10090,6 +10124,20 @@ impl Answer {
             }
             Echo::Sample { .. } => "Sample".to_owned(),
         }
+    }
+
+    /// A link to the resource's nearest neighbours, offered only where
+    /// `/similar` will answer: the id map said it has a vector.
+    fn more_like_this(&self) -> Option<String> {
+        let Echo::Describe {
+            resource,
+            embedded: Some(true),
+            ..
+        } = &self.echo
+        else {
+            return None;
+        };
+        Some(self.target.ask("similar", "iri", resource))
     }
 
     fn described_label(&self) -> Option<&str> {
