@@ -6235,6 +6235,32 @@ fn vectors_answer_over_the_wire_and_refuse_what_is_not_embedded() {
         .expect("record 1 is among three of four");
     assert_eq!(shared["entities"].as_array().unwrap().len(), 2);
 
+    // The same vector by GET, comma-separated, and by POST: three methods,
+    // one answer.
+    let text = fixture_vector(0)
+        .iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let by_get = server.get(&format!("/vec/v/v1/similar?vector={text}&k=3"));
+    by_get.assert_status(200);
+    assert_eq!(by_get.json()["results"], own["results"]);
+    let by_post = server.request_with_body("POST", "/vec/v/v1/similar", &json, &body);
+    by_post.assert_status(200);
+    assert_eq!(by_post.json()["results"], own["results"]);
+    let both = server.get(&format!("/vec/v/v1/similar?iri=ex:a&vector={text}"));
+    both.assert_status(400);
+    assert_eq!(both.json()["code"], "malformed_request");
+    let nan = server.get("/vec/v/v1/similar?vector=0.1,x,0.3");
+    nan.assert_status(400);
+    assert!(nan.json()["detail"].as_str().unwrap().contains("vector[1]"));
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.max_term_bytes = 16;
+    let narrow_terms = deployment.serve_with_limits(kgf_server::Caps::new(), budgets);
+    let long = narrow_terms.get(&format!("/vec/v/v1/similar?vector={text}"));
+    long.assert_status(400);
+    assert_eq!(long.json()["code"], "cap_exceeded");
+
     // Not embedded is a refusal with its own code, never an empty answer.
     for (iri, says) in [
         ("ex:f", "not an embedding target"),

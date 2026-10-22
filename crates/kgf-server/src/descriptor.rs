@@ -874,7 +874,7 @@ fn operations(
         operations.push(("vector", "iri; or QUERY/POST JSON body: iris", false));
         operations.push((
             "similar",
-            "iri, k; or QUERY/POST JSON body: iri or vector, k",
+            "iri or vector, k; or QUERY/POST JSON body: iri or vector, k",
             false,
         ));
     }

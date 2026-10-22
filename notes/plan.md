@@ -3364,7 +3364,8 @@ body by QUERY (canonical) or POST, each with a page, each a row in the cost tabl
 `QUERY /vector {"iris": […]}` answer an array in request order, one entry per entity
 with its record and stored vector — the index's f16, widened — or `"vector": null` and
 `absent: "not_embedded" | "unknown_term"`, so a mixed batch gets one answer, as
-`/labels` gives one. `GET /similar?iri=&k=` and `QUERY /similar {"iri": …} |
+`/labels` gives one. `GET /similar?iri=|vector=&k=` — the vector comma-separated,
+held to `max_term_bytes` as a term is — and `QUERY /similar {"iri": …} |
 {"vector": […]}, "k"` rank the bundle's records against a vector and return the `k`
 nearest, nearest first, each with its distance (cosine, `1 − similarity`) and the
 entities whose text it is — several where identical texts share a record. An entity's

@@ -5085,22 +5085,34 @@ pub struct Similar {
 }
 
 impl Similar {
-    const PARAMETERS: &'static [&'static str] = &["iri", "k", "format"];
+    const PARAMETERS: &'static [&'static str] = &["iri", "vector", "k", "format"];
 
-    /// Parse the GET form: an entity in `iri`, and `k`.
+    /// Parse the GET form: one of an entity in `iri` and a comma-separated
+    /// vector in `vector`, and `k`.
     pub fn parse(
         params: &Params,
         limits: Limits<'_>,
         prefixes: &PrefixMap,
     ) -> Result<Self, Problem> {
         accept_only(params, SIMILAR, Self::PARAMETERS)?;
-        let Some(text) = params.get("iri") else {
-            return Err(Problem::new(
-                ErrorCode::MalformedRequest,
-                "`iri` names the entity to find the neighbours of; a vector goes in a QUERY body as `vector`",
-            ));
+        let query = match (params.get("iri"), params.get("vector")) {
+            (Some(text), None) => SimilarQuery::Entity(
+                BoundTerm::parse("iri", text, limits, prefixes)?.require_iri("iri")?,
+            ),
+            (None, Some(text)) => SimilarQuery::Vector(Self::parse_vector_text(text, limits)?),
+            (Some(_), Some(_)) => {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    "`iri` and `vector` are alternatives; name one",
+                ));
+            }
+            (None, None) => {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    "name the entity to find the neighbours of in `iri`, or a vector in `vector`",
+                ));
+            }
         };
-        let iri = BoundTerm::parse("iri", text, limits, prefixes)?.require_iri("iri")?;
         let k = page_size(
             params,
             "k",
@@ -5109,10 +5121,56 @@ impl Similar {
             "omit similar when no neighbours are wanted",
         )?;
         Ok(Self {
-            query: SimilarQuery::Entity(iri),
+            query,
             k,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
         })
+    }
+
+    /// A GET `vector`: decimal numbers separated by commas.
+    ///
+    /// Held to `max_term_bytes` before it is split, as a term is: the bundle's
+    /// width is not known until the store answers, and a parse must not be
+    /// bounded only by what a URL can carry.
+    fn parse_vector_text(text: &str, limits: Limits<'_>) -> Result<Vec<f32>, Problem> {
+        let max = limits.budgets.max_term_bytes;
+        if text.len() as u64 > max {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "`vector` is {} bytes, over this server's max_term_bytes of {max}",
+                    text.len()
+                ),
+            ));
+        }
+        let mut vector = Vec::new();
+        for (position, piece) in text.split(',').enumerate() {
+            let number: f32 = piece.trim().parse().map_err(|_| {
+                Problem::new(
+                    ErrorCode::MalformedRequest,
+                    format!("vector[{position}] is not a number: {piece:?}"),
+                )
+            })?;
+            vector.push(number);
+        }
+        Self::finite_vector(vector)
+    }
+
+    /// A vector with at least one component, every one finite.
+    fn finite_vector(vector: Vec<f32>) -> Result<Vec<f32>, Problem> {
+        if vector.is_empty() {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "`vector` is empty; it must have the bundle's number of dimensions",
+            ));
+        }
+        if let Some(position) = vector.iter().position(|x| !x.is_finite()) {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!("vector[{position}] is not a finite number"),
+            ));
+        }
+        Ok(vector)
     }
 
     /// Parse the JSON body form: one of `iri` and `vector`, and `k`.
@@ -5128,21 +5186,7 @@ impl Similar {
             (Some(iri), None) => SimilarQuery::Entity(
                 BoundTerm::parse_body("iri", iri, limits, prefixes)?.require_iri("iri")?,
             ),
-            (None, Some(vector)) => {
-                if vector.is_empty() {
-                    return Err(Problem::new(
-                        ErrorCode::MalformedRequest,
-                        "`vector` is empty; it must have the bundle's number of dimensions",
-                    ));
-                }
-                if let Some(position) = vector.iter().position(|x| !x.is_finite()) {
-                    return Err(Problem::new(
-                        ErrorCode::MalformedRequest,
-                        format!("vector[{position}] is not a finite number"),
-                    ));
-                }
-                SimilarQuery::Vector(vector)
-            }
+            (None, Some(vector)) => SimilarQuery::Vector(Self::finite_vector(vector)?),
             (Some(_), Some(_)) => {
                 return Err(Problem::new(
                     ErrorCode::MalformedRequest,
@@ -5210,7 +5254,7 @@ impl ObservedRequest for Similar {
 
 impl GetRequest for Similar {
     fn normalize_params(params: &Params) -> Params {
-        params.without_empty(&["k"])
+        params.without_empty(&["iri", "vector", "k"])
     }
 }
 
