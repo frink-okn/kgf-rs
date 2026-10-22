@@ -268,6 +268,8 @@ pub enum Capability {
     /// The declaration is for a reader without the bundle: it says which
     /// datasets are worth asking about statements.
     Reification,
+    /// `GET /vector` and `QUERY /similar`; needs the `vectors/` sidecar.
+    Vectors,
 }
 
 impl Capability {
@@ -286,6 +288,7 @@ impl Capability {
             Self::Filters => "filters",
             Self::Keysets => "keysets",
             Self::Reification => "reification",
+            Self::Vectors => "vectors",
         }
     }
 }
@@ -329,6 +332,7 @@ impl BundleFacts {
 
         let _graphs = artifacts.open_graphs(bundle)?;
         let _triple_terms = artifacts.open_triple_terms(bundle, &data)?;
+        let _vectors = artifacts.open_vectors(bundle, &data, 1)?;
         let _description = artifacts.open_description(bundle)?;
         // A manifest must not describe an optional capability whose complete
         // artifact cannot be opened. Reading only hdtc-text.meta would accept
@@ -408,6 +412,9 @@ fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
     if artifacts.triple_terms.is_some() {
         capabilities.insert(Capability::Reification);
     }
+    if artifacts.vectors.is_some() {
+        capabilities.insert(Capability::Vectors);
+    }
     // Each sketch family is all-or-nothing: both filter roles or neither, both
     // sketch roles or neither. A bundle carrying one role of a
     // family is not a bundle with a partial capability — it is a bundle whose
@@ -427,7 +434,7 @@ fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
 /// The artifact file names present, in canonical bundle-layout order.
 ///
 /// **This list must grow with every sidecar.** Reserved future locations include `labels/`,
-/// `ranges/`, `closures/`, `geo/` and `vectors/`, none of which has a
+/// `ranges/`, `closures/` and `geo/`, none of which has a
 /// producer yet; an artifact absent from here
 /// is absent from the manifest's checksums and therefore from
 /// `content_digest`. Adding a sidecar without adding it here silently narrows a
@@ -463,6 +470,9 @@ fn artifact_names_for(artifacts: &ArtifactSet) -> Vec<&'static str> {
     }
     names.extend(artifacts.filters.iter().copied());
     names.extend(artifacts.keysets.iter().copied());
+    if let Some(vectors) = &artifacts.vectors {
+        names.extend(vectors.names());
+    }
     names
 }
 

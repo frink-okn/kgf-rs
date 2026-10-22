@@ -49,6 +49,12 @@ same-file = "1"
 # only, where the server is deployed and tested; FreeBSD and OpenBSD keep the same
 # per-thread counters but are untested, and macOS keeps no per-thread fault counts.
 nix = { version = "0.30", default-features = false, features = ["resource"] }
+# The ANN index over a bundle's vectors. A cxx binding over the C++ header-only
+# library: it maps the index file itself, outside `kgf_store::map`, under the
+# same published-bundle immutability premise (see `kgf_store::vectors`). Building
+# it needs a C++ toolchain. One crate writes the index in `kgf build` and reads
+# it in `kgf serve`, so `--locked` pins writer and reader together.
+usearch = "2.26"
 
 # The HTTP stack supports QUERY: hyper parses the extension method and axum
 # routes it through

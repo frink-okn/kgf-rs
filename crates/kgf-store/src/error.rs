@@ -149,6 +149,23 @@ pub enum Error {
         remedy: String,
     },
 
+    /// A query vector is not the width of the bundle's vectors.
+    #[error("query vector has {found} dimensions; this bundle's vectors have {expected}")]
+    QueryDimension {
+        /// The bundle's vector width.
+        expected: usize,
+        /// The width of the vector given.
+        found: usize,
+    },
+
+    /// The ANN library refused a search it had the capacity reserved for.
+    #[error("vector search failed: {0}")]
+    VectorSearch(String),
+
+    /// Rows offered to the id-map writer that no id map can hold.
+    #[error("id map input: {0}")]
+    IdMapInput(String),
+
     /// Anything the OS refused.
     #[error(transparent)]
     Io(#[from] std::io::Error),

@@ -23,6 +23,7 @@ use crate::map::{PublishedBundle, open_published};
 use crate::pattern::{IdPattern, Selection};
 use crate::perm::Permutations;
 use crate::triple_terms::{TripleTermPattern, TripleTermSelection, TripleTerms};
+use crate::vectors::Vectors;
 
 /// Names of the artifacts the store knows about.
 pub mod artifact {
@@ -109,6 +110,19 @@ pub mod artifact {
         "keysets/subjects.keys",
     ];
 
+    /// The ANN index over the embedded entities' vectors, record `i` under
+    /// key `i`. Optional; with [`VECTORS_ENTITIES`], gates `vectors`.
+    pub const VECTORS_INDEX: &str = "vectors/index.usearch";
+    /// The id map: entity ↔ record, and each record's text digest. Required
+    /// whenever [`VECTORS_INDEX`] is present, and the reverse.
+    pub const VECTORS_ENTITIES: &str = "vectors/entities.idmap";
+    /// The canonical vectors, one row per record, as the embedding stage
+    /// wrote them. Served as bytes; never read here.
+    pub const VECTORS_EMBEDDINGS: &str = "vectors/embeddings.parquet";
+    /// Entity IRI → text digest, for a client holding the vectors without
+    /// the bundle. Served as bytes; never read here.
+    pub const VECTORS_ROOTS: &str = "vectors/roots.parquet";
+
     /// The complete tier-1 description artifact set, in bundle-layout order.
     pub const DESCRIPTION: [&str; 8] = [
         VOID_HDT,
@@ -127,9 +141,34 @@ pub mod artifact {
 ///
 /// Full digest and checksum verification deliberately does not belong here: it
 /// runs at publication or registry ingest and through `kgf verify`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
-pub struct OpenOptions {}
+pub struct OpenOptions {
+    /// How many vector searches may run at once on this store.
+    ///
+    /// The ANN index reserves a search context per concurrent search at open
+    /// and fails, rather than waits, when none is free, so this is the bound
+    /// the caller's own admission control imposes. Fixed memory per context;
+    /// nothing proportional to the bundle.
+    pub search_contexts: usize,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            search_contexts: 32,
+        }
+    }
+}
+
+impl OpenOptions {
+    /// Allow `search_contexts` concurrent vector searches.
+    #[must_use]
+    pub fn with_search_contexts(mut self, search_contexts: usize) -> Self {
+        self.search_contexts = search_contexts;
+        self
+    }
+}
 
 /// An open bundle version.
 ///
@@ -145,6 +184,7 @@ pub struct Store {
     triple_terms: Option<TripleTerms>,
     description: Option<DescriptionStore>,
     text: Option<TextSearcher>,
+    vectors: Option<Vectors>,
 }
 
 impl std::fmt::Debug for Store {
@@ -160,6 +200,7 @@ impl std::fmt::Debug for Store {
             .field("triple_terms", &self.triple_terms.is_some())
             .field("description", &self.description.is_some())
             .field("text", &self.text.is_some())
+            .field("vectors", &self.vectors.is_some())
             .finish()
     }
 }
@@ -180,7 +221,7 @@ impl Store {
     /// Constructing [`PublishedBundle`] is where the caller acknowledges the
     /// external immutability requirement. This method is safe because it
     /// cannot be called with an unqualified path.
-    pub fn open(bundle: &PublishedBundle, _opts: OpenOptions) -> Result<Self> {
+    pub fn open(bundle: &PublishedBundle, opts: OpenOptions) -> Result<Self> {
         let dir = bundle.path();
         // The manifest is what makes an artifact set a *bundle*,
         // so it is required here and not by `ArtifactSet::resolve`, which the
@@ -194,6 +235,7 @@ impl Store {
 
         let graphs = artifacts.open_graphs(bundle)?;
         let triple_terms = artifacts.open_triple_terms(bundle, &data)?;
+        let vectors = artifacts.open_vectors(bundle, &data, opts.search_contexts)?;
         let document = crate::manifest::ManifestDocument::read(dir)?
             .expect("manifest existence was required immediately above");
         let manifest_description = document.lists_description_artifacts();
@@ -234,7 +276,13 @@ impl Store {
             triple_terms,
             description,
             text: artifacts.open_text()?,
+            vectors,
         })
+    }
+
+    /// The vector sidecar, if the bundle published one.
+    pub fn vectors(&self) -> Option<&Vectors> {
+        self.vectors.as_ref()
     }
 
     /// The immutable bundle-version directory backing this store.
@@ -379,10 +427,79 @@ pub(crate) struct ArtifactSet {
     pub(crate) propositions_perm: Option<PathBuf>,
     pub(crate) text: Option<PathBuf>,
     pub(crate) description: Option<DescriptionArtifacts>,
+    pub(crate) vectors: Option<VectorArtifacts>,
     /// The `filters/` files present, a subset of [`artifact::FILTERS`].
     pub(crate) filters: Vec<&'static str>,
     /// The `keysets/` files present, a subset of [`artifact::KEYSETS`].
     pub(crate) keysets: Vec<&'static str>,
+}
+
+/// The `vectors/` sidecar's files.
+///
+/// The index and the id map occur together: neither answers anything
+/// without the other. The two Parquet files are the sidecar's data and
+/// export — never read by a server, so a bundle is servable without them —
+/// and are listed, and checksummed, when present.
+#[derive(Debug, Clone)]
+pub(crate) struct VectorArtifacts {
+    pub(crate) index: PathBuf,
+    pub(crate) entities: PathBuf,
+    pub(crate) embeddings: Option<PathBuf>,
+    pub(crate) roots: Option<PathBuf>,
+}
+
+impl VectorArtifacts {
+    fn resolve(dir: &Path) -> Result<Option<Self>> {
+        let index = optional_file(dir, artifact::VECTORS_INDEX)?;
+        let entities = optional_file(dir, artifact::VECTORS_ENTITIES)?;
+        let embeddings = optional_file(dir, artifact::VECTORS_EMBEDDINGS)?;
+        let roots = optional_file(dir, artifact::VECTORS_ROOTS)?;
+        match (index, entities) {
+            (Some(index), Some(entities)) => Ok(Some(Self {
+                index,
+                entities,
+                embeddings,
+                roots,
+            })),
+            (None, None) => {
+                if let Some(orphan) = embeddings.or(roots) {
+                    return Err(Error::Malformed {
+                        artifact: orphan,
+                        detail: format!(
+                            "vectors are present without the index {} and id map {} that serve them",
+                            dir.join(artifact::VECTORS_INDEX).display(),
+                            dir.join(artifact::VECTORS_ENTITIES).display()
+                        ),
+                    });
+                }
+                Ok(None)
+            }
+            (Some(_), None) => Err(Error::MissingRequiredArtifact {
+                bundle: dir.to_path_buf(),
+                artifact: artifact::VECTORS_ENTITIES.to_owned(),
+                remedy: "kgf build".to_owned(),
+            }),
+            (None, Some(_)) => Err(Error::MissingRequiredArtifact {
+                bundle: dir.to_path_buf(),
+                artifact: artifact::VECTORS_INDEX.to_owned(),
+                remedy: "kgf build".to_owned(),
+            }),
+        }
+    }
+
+    /// The files present, in bundle-layout order.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &'static str> {
+        [
+            Some(artifact::VECTORS_INDEX),
+            Some(artifact::VECTORS_ENTITIES),
+            self.embeddings
+                .as_ref()
+                .map(|_| artifact::VECTORS_EMBEDDINGS),
+            self.roots.as_ref().map(|_| artifact::VECTORS_ROOTS),
+        ]
+        .into_iter()
+        .flatten()
+    }
 }
 
 /// The all-or-none artifact set behind the tier-1 description surface.
@@ -474,6 +591,7 @@ impl ArtifactSet {
             propositions_perm,
             text: optional_dir(dir, artifact::TEXT)?,
             description: DescriptionArtifacts::resolve(dir)?,
+            vectors: VectorArtifacts::resolve(dir)?,
             filters: complete_families(dir, &artifact::FILTER_FAMILIES)?,
             keysets: present(dir, &artifact::KEYSETS)?,
         })
@@ -524,6 +642,26 @@ impl ArtifactSet {
                 artifact: dir.clone(),
                 detail: format!("text index could not be opened: {error:#}"),
             })
+    }
+
+    /// Open the vector sidecar, if the bundle published one, bound to `data`.
+    pub(crate) fn open_vectors(
+        &self,
+        bundle: &PublishedBundle,
+        data: &IndexedHdt,
+        search_contexts: usize,
+    ) -> Result<Option<Vectors>> {
+        let Some(vectors) = &self.vectors else {
+            return Ok(None);
+        };
+        Vectors::open(
+            bundle,
+            &vectors.entities,
+            &vectors.index,
+            data,
+            search_contexts,
+        )
+        .map(Some)
     }
 
     /// Open the triple-term artifacts, if the bundle carries them, and refuse
