@@ -81,7 +81,7 @@ pub use manifest::{BundleFacts, Capability, Manifest, ManifestDocument};
 pub use map::{PublishedBundle, PublishedRoot};
 pub use scope::{QuadRow, QuadSelection, ScopedSelection};
 pub use store::{OpenOptions, Store};
-pub use vectors::{Hit, Row, Vectors};
+pub use vectors::{Hit, Row, Vectors, verify_vectors_artifacts};
 
 /// A term identifier in one of HDT's role-scoped id spaces.
 ///

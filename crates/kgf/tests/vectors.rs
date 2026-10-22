@@ -65,6 +65,11 @@ impl Published {
 
     /// `kgf manifest`, as `kgf build` would write one.
     fn describe(&self) {
+        self.try_describe().expect("describe the bundle");
+    }
+
+    /// `kgf manifest`, with its refusal.
+    fn try_describe(&self) -> anyhow::Result<()> {
         #[derive(clap::Parser)]
         struct Cli {
             #[command(flatten)]
@@ -78,7 +83,7 @@ impl Published {
             "--version",
             VERSION,
         ]);
-        kgf::manifest::run(cli.args).expect("describe the bundle");
+        kgf::manifest::run(cli.args)
     }
 
     /// `kgf manifest --check`.
@@ -329,6 +334,46 @@ fn the_verbalizers_streams_become_a_sidecar_the_server_opens() {
             .collect::<Vec<_>>(),
         ["iri", "target", "text_digest"]
     );
+}
+
+#[test]
+fn kgf_manifest_refuses_a_sidecar_that_does_not_describe_its_bundle() {
+    let published = Published::build(&graph());
+    let (roots, texts) = (
+        published.beside("roots.jsonl"),
+        published.beside("texts.jsonl"),
+    );
+    published.verbalize(&roots, &texts);
+    let embeddings = published.beside("embeddings.parquet");
+    embed(&texts, &embeddings, "2");
+    kgf::vectors::assemble(&published.bundle(), &embeddings, &roots).unwrap();
+    published.describe();
+    let id_map = published.bundle().join("vectors/entities.idmap");
+    let good = std::fs::read(&id_map).unwrap();
+
+    // The id map records a different Parquet than the one beside it.
+    let mut bytes = good.clone();
+    bytes[104..136].fill(0xAB);
+    std::fs::write(&id_map, &bytes).unwrap();
+    let error = format!("{:#}", published.try_describe().unwrap_err());
+    assert!(error.contains("different embeddings.parquet"), "{error}");
+
+    // A region open does not read: the first two member ids swapped.
+    let mut bytes = good.clone();
+    let members = 152 + 32 + 32 + 32;
+    let (x, y) = (
+        bytes[members..members + 8].to_vec(),
+        bytes[members + 8..members + 16].to_vec(),
+    );
+    bytes[members..members + 8].copy_from_slice(&y);
+    bytes[members + 8..members + 16].copy_from_slice(&x);
+    std::fs::write(&id_map, &bytes).unwrap();
+    let error = format!("{:#}", published.try_describe().unwrap_err());
+    assert!(error.contains("entity table puts in"), "{error}");
+
+    std::fs::write(&id_map, &good).unwrap();
+    published.describe();
+    published.check().expect("restored, it checks again");
 }
 
 #[test]

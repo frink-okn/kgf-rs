@@ -569,6 +569,40 @@ impl Vectors {
     }
 }
 
+/// Open a bundle's vector sidecar as a server would and walk what open does
+/// not: [`Vectors::verify`], and the id map's record of the Parquet it was
+/// built from against `parent_sha256`, the whole-file digest the caller has
+/// computed — which this crate never does. `Ok` for a bundle without the
+/// sidecar.
+///
+/// For `kgf manifest`, which checks a bundle as it describes it; the failure
+/// it prevents is an id map and an index rebuilt from different vectors than
+/// the Parquet published beside them.
+pub fn verify_vectors_artifacts(
+    bundle: &PublishedBundle,
+    parent_sha256: Option<[u8; 32]>,
+) -> Result<()> {
+    let artifacts = crate::store::ArtifactSet::resolve(bundle.path())?;
+    let hdt = open_published(bundle, &artifacts.hdt)?;
+    let perm = open_published(bundle, &artifacts.perm)?;
+    let data = IndexedHdt::open(hdt, perm)?;
+    let Some(vectors) = artifacts.open_vectors(bundle, &data, 1)? else {
+        return Ok(());
+    };
+    vectors.verify(data.dict_counts().len(crate::Role::Subject))?;
+    if let Some(parent) = parent_sha256
+        && vectors.header().parent_digest != parent
+    {
+        return Err(Error::ArtifactBindingMismatch {
+            artifact: vectors.entities.path().to_path_buf(),
+            hdt: bundle.path().join(crate::store::artifact::VECTORS_EMBEDDINGS),
+            detail: "the id map records a different embeddings.parquet than the one published beside it; assemble the sidecar again with `kgf vectors`"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// One record as the id-map writer takes it: in record order, so the `n`th
 /// row given is record `n`.
 #[derive(Debug, Clone)]
