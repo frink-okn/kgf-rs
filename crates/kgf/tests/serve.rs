@@ -6227,6 +6227,36 @@ fn vectors_answer_over_the_wire_and_refuse_what_is_not_embedded() {
         own["results"][0]["entities"][0]["value"],
         "http://example.org/a"
     );
+    // Labelled by default, through the release's label role; an entity with
+    // no label says so with null; labels=false leaves the key out.
+    assert_eq!(own["labels"], true);
+    assert_eq!(own["results"][0]["entities"][0]["label"], "Alpha");
+    let unlabelled = own["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["record"] == 1)
+        .unwrap();
+    assert!(unlabelled["entities"][0]["label"].is_null());
+    let bare_body = serde_json::to_vec(&serde_json::json!({
+        "vector": fixture_vector(0),
+        "k": 1,
+        "labels": false
+    }))
+    .unwrap();
+    let bare = server
+        .request_with_body("QUERY", "/vec/v/v1/similar", &json, &bare_body)
+        .json();
+    assert_eq!(bare["labels"], false);
+    assert!(bare["results"][0]["entities"][0].get("label").is_none());
+    let page = server
+        .request(
+            "GET",
+            "/vec/v/v1/similar?vector=0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1&k=4",
+            &html,
+        )
+        .text();
+    assert!(page.contains("Alpha"), "{page}");
     assert!(own["results"][0]["distance"].as_f64().unwrap() < 1e-3);
     assert_eq!(own["results"].as_array().unwrap().len(), 3);
     // Two entities on one shared record come back together.

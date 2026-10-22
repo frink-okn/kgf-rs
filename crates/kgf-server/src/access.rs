@@ -584,6 +584,8 @@ pub enum RequestShape {
         by: &'static str,
         /// Neighbours asked for.
         k: u32,
+        /// Whether preferred labels were requested.
+        labels: bool,
     },
     /// Graph listing.
     Graphs {

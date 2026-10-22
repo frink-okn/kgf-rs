@@ -5909,10 +5909,11 @@ pub fn similar(
 
     let mut cache = TermCache::new();
     let mut published = PublishedTerms::new(blank_nodes.clone(), store);
+    let mut labels = ItemLabels::of(store, request.labels.as_ref())?;
     let mut results = Vec::with_capacity(request.k as usize);
     let mut spent = 0u64;
     let mut stopped = None;
-    for hit in hits {
+    'hits: for hit in hits {
         if results.len() >= request.k as usize {
             break;
         }
@@ -5933,8 +5934,23 @@ pub fn similar(
                 .text()
                 .cloned()
                 .expect("a subject is never a triple term");
-            entities.push(EntityTerm(text));
-            serialized += bytes;
+            // The label cascade's allowance is shared by the request; a
+            // record it cannot settle ends the answer there, as a search
+            // hit's does.
+            let label = match &mut labels {
+                None => None,
+                Some(labels) => {
+                    match labels.label(Some(entity.0), Spend::first_if(results.is_empty()))? {
+                        Some(label) => Some(label),
+                        None => {
+                            stopped = Some(BudgetReason::Candidate);
+                            break 'hits;
+                        }
+                    }
+                }
+            };
+            serialized += bytes + label.as_ref().map_or(0, RowLabel::appended);
+            entities.push(Entity { term: text, label });
         }
         let next = spent.saturating_add(serialized);
         if next > request.bytes.0 && !results.is_empty() {
@@ -5955,6 +5971,7 @@ pub fn similar(
         version: target.id.version.clone(),
         query: echo,
         k: request.k,
+        labels: request.labels.is_some(),
         dimensions: vectors.dimensions(),
         results,
         completeness: match stopped {
@@ -5964,6 +5981,30 @@ pub fn similar(
         target,
         blank_nodes,
     })
+}
+
+/// A published subject with its label, written as one term object: the
+/// term's `type` and `value`, then `label` (and `label_source`) when labels
+/// were asked for — the shape a search hit's subject has.
+#[derive(Debug, Clone)]
+struct Entity {
+    term: Rc<str>,
+    label: Option<RowLabel>,
+}
+
+impl Serialize for Entity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        // A published subject is always an IRI: a blank node is published
+        // under its bundle-scoped IRI.
+        map.serialize_entry("type", "iri")?;
+        map.serialize_entry("value", &*self.term)?;
+        if let Some(label) = &self.label {
+            label.serialize_into(&mut map)?;
+        }
+        map.end()
+    }
 }
 
 /// A published subject, written as a term object.
@@ -6084,6 +6125,7 @@ pub struct SimilarAnswer {
     version: String,
     query: SimilarEcho,
     k: u32,
+    labels: bool,
     dimensions: usize,
     results: Vec<SimilarResult>,
     #[serde(flatten)]
@@ -6101,7 +6143,7 @@ struct SimilarResult {
     record: u64,
     distance: f32,
     similarity: f32,
-    entities: Vec<EntityTerm>,
+    entities: Vec<Entity>,
 }
 
 impl SimilarResult {
@@ -11038,7 +11080,12 @@ impl Resource for SimilarAnswer {
             .flat_map(|result| {
                 result.entities.iter().map(move |entity| {
                     (
-                        term_cell(&self.target, &self.blank_nodes, &entity.0, None),
+                        term_cell(
+                            &self.target,
+                            &self.blank_nodes,
+                            &entity.term,
+                            entity.label.as_ref().and_then(RowLabel::value),
+                        ),
                         format!("{:.4}", result.distance),
                         format!("{:.4}", result.similarity),
                         result.record.to_string(),

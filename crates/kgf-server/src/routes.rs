@@ -1273,7 +1273,12 @@ async fn similar(
         wants,
         |params, limits, release| {
             capability_gate(release, Capability::Vectors)?;
-            request::Similar::parse(params, limits, release.prefixes())
+            request::Similar::parse(
+                params,
+                limits,
+                release.prefixes(),
+                release.predicate_roles(),
+            )
         },
         answer::similar,
     )
@@ -1300,7 +1305,13 @@ async fn similar_operation(
         },
         |params, body, limits, release| {
             capability_gate(release, Capability::Vectors)?;
-            request::Similar::parse_body(params, body, limits, release.prefixes())
+            request::Similar::parse_body(
+                params,
+                body,
+                limits,
+                release.prefixes(),
+                release.predicate_roles(),
+            )
         },
         answer::similar,
     )

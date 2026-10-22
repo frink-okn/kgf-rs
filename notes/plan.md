@@ -3421,9 +3421,16 @@ disambiguates better than the client guessing. The text is also what a
 client needs to embed a query the way the bundle embeds its entities: the recipe is a
 public config plus a public verbalizer.
 
-**Not here.** `filter` (over-fetch with a candidate budget against one pattern) and
-`labels=true` on `/similar`'s entities: both compose with what exists and neither is
-needed for the first end-to-end run. `/export` of the sidecar's files — the Parquet
+**`/similar`'s entities are labelled by default**, as `/search`'s subjects are: an
+entity list unlabelled names nothing. Each entity's term object carries `label` (and
+`label_source` on request) through the release's cascade with `labels`, `lang` and
+`label_source` as every labelled route takes them, under the one label allowance per
+request — a record the allowance cannot settle ends the answer there as `candidate`,
+as a search hit's does — and `labels=false` leaves the key out.
+
+**Not here.** `filter` (over-fetch with a candidate budget against one pattern): it
+composes with what exists and is not needed for the first end-to-end run. `/export`
+of the sidecar's files — the Parquet
 for DuckDB, the config for a client — waits on the export route taking nested
 artifact names; today it serves `data.hdt` and `data.nt` alone.
 

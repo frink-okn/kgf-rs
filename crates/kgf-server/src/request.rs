@@ -5145,10 +5145,22 @@ pub struct Similar {
     pub k: u32,
     /// Bytes the result rows may occupy.
     pub bytes: ResponseBytes,
+    /// How each entity's preferred label is resolved; `None` for
+    /// `labels=false`. On by default, as `/search` has it: a list of entities
+    /// is what this operation returns, and unlabelled it names nothing.
+    pub labels: Option<Labeling>,
 }
 
 impl Similar {
-    const PARAMETERS: &'static [&'static str] = &["iri", "vector", "k", "format"];
+    const PARAMETERS: &'static [&'static str] = &[
+        "iri",
+        "vector",
+        "k",
+        "labels",
+        "lang",
+        "label_source",
+        "format",
+    ];
 
     /// Parse the GET form: one of an entity in `iri` and a comma-separated
     /// vector in `vector`, and `k`.
@@ -5156,6 +5168,7 @@ impl Similar {
         params: &Params,
         limits: Limits<'_>,
         prefixes: &PrefixMap,
+        profile: &PredicateRoles,
     ) -> Result<Self, Problem> {
         accept_only(params, SIMILAR, Self::PARAMETERS)?;
         let query = match (params.get("iri"), params.get("vector")) {
@@ -5187,6 +5200,7 @@ impl Similar {
             query,
             k,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            labels: Labeling::from_params(params, true, profile, prefixes, limits)?,
         })
     }
 
@@ -5242,6 +5256,7 @@ impl Similar {
         body: &[u8],
         limits: Limits<'_>,
         prefixes: &PrefixMap,
+        profile: &PredicateRoles,
     ) -> Result<Self, Problem> {
         accept_only(params, SIMILAR, &["format"])?;
         let wire: WireSimilar = parse_body(body)?;
@@ -5286,6 +5301,15 @@ impl Similar {
             query,
             k,
             bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            labels: Labeling::from_body(
+                wire.labels,
+                wire.lang,
+                wire.label_source,
+                true,
+                profile,
+                prefixes,
+                limits,
+            )?,
         })
     }
 
@@ -5301,6 +5325,9 @@ struct WireSimilar {
     iri: Option<WireTerm>,
     vector: Option<Vec<f32>>,
     k: Option<u32>,
+    labels: Option<WireLabelsControl>,
+    lang: Option<Vec<String>>,
+    label_source: Option<bool>,
 }
 
 impl ObservedRequest for Similar {
@@ -5311,13 +5338,14 @@ impl ObservedRequest for Similar {
                 SimilarQuery::Vector(_) => "vector",
             },
             k: self.k,
+            labels: self.labels.is_some(),
         }
     }
 }
 
 impl GetRequest for Similar {
     fn normalize_params(params: &Params) -> Params {
-        params.without_empty(&["iri", "vector", "k"])
+        params.without_empty(&["iri", "vector", "k", "labels", "lang", "label_source"])
     }
 }
 
