@@ -248,7 +248,13 @@ fn the_verbalizers_streams_become_a_sidecar_the_server_opens() {
     let digests = embed(&texts, &embeddings, "2");
     assert_eq!(digests.len(), 3, "four roots, two reading the same");
 
-    let assembled = kgf::vectors::assemble(&published.bundle(), &embeddings, &roots).unwrap();
+    let assembled = kgf::vectors::assemble(
+        &published.bundle(),
+        &embeddings,
+        &roots,
+        &published.beside("config.json"),
+    )
+    .unwrap();
     assert_eq!(
         (
             assembled.records,
@@ -262,12 +268,19 @@ fn the_verbalizers_streams_become_a_sidecar_the_server_opens() {
         "entities.idmap",
         "embeddings.parquet",
         "roots.parquet",
+        "verbalize.json",
     ] {
         assert!(
             published.bundle().join("vectors").join(name).is_file(),
             "{name}"
         );
     }
+    // The config is published canonically: the same config, the same bytes.
+    let stored: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(published.bundle().join("vectors/verbalize.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored["targets"]["things"]["type"], T);
 
     published.describe();
     published.check().expect("the described bundle checks");
@@ -282,6 +295,30 @@ fn the_verbalizers_streams_become_a_sidecar_the_server_opens() {
         declared.contains_key(Capability::Vectors.as_str()),
         "{declared:?}"
     );
+    assert!(
+        manifest["artifacts"]
+            .get("vectors/verbalize.json")
+            .is_some()
+    );
+
+    // A live render under the stored config is the text that was embedded:
+    // its digest is the one the id map holds for the root's record.
+    let config: kgf_verbalize::Config = serde_json::from_value(stored).unwrap();
+    let resolved = config.resolve().unwrap();
+    let bound = kgf_verbalize::Bound::bind(&store, &resolved, &[RDFS_LABEL.to_owned()]).unwrap();
+    let mut verbalizer = kgf_verbalize::Verbalizer::new(&store, &bound);
+    let rendered = verbalizer
+        .verbalize_iri(0, "http://example.org/a")
+        .unwrap()
+        .expect("a is a subject");
+    let a = store
+        .dict()
+        .locate(Role::Subject, b"http://example.org/a")
+        .unwrap()
+        .unwrap();
+    let row = vectors.row_of(a).unwrap().unwrap();
+    assert_eq!(vectors.digest_of(row).unwrap(), rendered.digest);
+    assert_eq!(bound.target_of(&store, a.0).unwrap(), Some(0));
 
     for (iri, digest) in read_roots(&roots) {
         let id = store
@@ -346,7 +383,13 @@ fn kgf_manifest_refuses_a_sidecar_that_does_not_describe_its_bundle() {
     published.verbalize(&roots, &texts);
     let embeddings = published.beside("embeddings.parquet");
     embed(&texts, &embeddings, "2");
-    kgf::vectors::assemble(&published.bundle(), &embeddings, &roots).unwrap();
+    kgf::vectors::assemble(
+        &published.bundle(),
+        &embeddings,
+        &roots,
+        &published.beside("config.json"),
+    )
+    .unwrap();
     published.describe();
     let id_map = published.bundle().join("vectors/entities.idmap");
     let good = std::fs::read(&id_map).unwrap();
@@ -386,9 +429,21 @@ fn an_existing_sidecar_is_never_replaced() {
     published.verbalize(&roots, &texts);
     let embeddings = published.beside("embeddings.parquet");
     embed(&texts, &embeddings, "2");
-    kgf::vectors::assemble(&published.bundle(), &embeddings, &roots).unwrap();
+    kgf::vectors::assemble(
+        &published.bundle(),
+        &embeddings,
+        &roots,
+        &published.beside("config.json"),
+    )
+    .unwrap();
 
-    let error = kgf::vectors::assemble(&published.bundle(), &embeddings, &roots).unwrap_err();
+    let error = kgf::vectors::assemble(
+        &published.bundle(),
+        &embeddings,
+        &roots,
+        &published.beside("config.json"),
+    )
+    .unwrap_err();
 
     assert!(error.to_string().contains("never replaced"), "{error:#}");
 }
@@ -413,7 +468,13 @@ fn roots_and_embeddings_from_different_runs_are_refused_naming_the_root() {
         "ab".repeat(32)
     )
     .unwrap();
-    let error = kgf::vectors::assemble(&published.bundle(), &embeddings, &foreign).unwrap_err();
+    let error = kgf::vectors::assemble(
+        &published.bundle(),
+        &embeddings,
+        &foreign,
+        &published.beside("config.json"),
+    )
+    .unwrap_err();
     assert!(
         error
             .to_string()
@@ -434,7 +495,13 @@ fn roots_and_embeddings_from_different_runs_are_refused_naming_the_root() {
         kgf_verbalize::text::hex(&digests[0])
     )
     .unwrap();
-    let error = kgf::vectors::assemble(&published.bundle(), &embeddings, &stranger).unwrap_err();
+    let error = kgf::vectors::assemble(
+        &published.bundle(),
+        &embeddings,
+        &stranger,
+        &published.beside("config.json"),
+    )
+    .unwrap_err();
     assert!(
         error
             .to_string()
@@ -451,15 +518,51 @@ fn roots_and_embeddings_from_different_runs_are_refused_naming_the_root() {
             format!(r#"{{"iri": "http://example.org/a", "target": "things", "digest": "{bad}"}}"#),
         )
         .unwrap();
-        let error = kgf::vectors::assemble(&published.bundle(), &embeddings, &odd).unwrap_err();
+        let error = kgf::vectors::assemble(
+            &published.bundle(),
+            &embeddings,
+            &odd,
+            &published.beside("config.json"),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("digest"), "{bad:?}: {error:#}");
     }
+
+    // Roots under a target the config does not declare.
+    let other = published.beside("other.jsonl");
+    std::fs::write(
+        &other,
+        format!(
+            r#"{{"iri": "http://example.org/a", "target": "elsewhere", "digest": "{}"}}"#,
+            kgf_verbalize::text::hex(&digests[0])
+        ),
+    )
+    .unwrap();
+    let error = kgf::vectors::assemble(
+        &published.bundle(),
+        &embeddings,
+        &other,
+        &published.beside("config.json"),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("which the config does not declare"),
+        "{error:#}"
+    );
 
     // A record no root names.
     digests.push([0xEE; 32]);
     let wider = published.beside("wider.parquet");
     write_parquet(&wider, &digests, "2");
-    let error = kgf::vectors::assemble(&published.bundle(), &wider, &roots).unwrap_err();
+    let error = kgf::vectors::assemble(
+        &published.bundle(),
+        &wider,
+        &roots,
+        &published.beside("config.json"),
+    )
+    .unwrap_err();
     assert!(
         error.to_string().contains("is named by no root"),
         "{error:#}"
@@ -468,6 +571,12 @@ fn roots_and_embeddings_from_different_runs_are_refused_naming_the_root() {
     // The record layout, not the texts layout.
     let old = published.beside("old.parquet");
     write_parquet(&old, &digests[..3], "1");
-    let error = kgf::vectors::assemble(&published.bundle(), &old, &roots).unwrap_err();
+    let error = kgf::vectors::assemble(
+        &published.bundle(),
+        &old,
+        &roots,
+        &published.beside("config.json"),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("layout format 1"), "{error:#}");
 }

@@ -6,11 +6,14 @@
 //! per text, in the same order: the text's digest and its vector, with the
 //! model's identity in the footer. This command joins that file to the roots
 //! `kgf verbalize --roots` wrote — each root's IRI, target and text digest —
-//! through the bundle's dictionary, and writes the four files a server and a
+//! through the bundle's dictionary, and writes the five files a server and a
 //! client need: the ANN index with row `i` under key `i`, the id map in
-//! subject ids, the Parquet itself (linked where the file system allows), and
+//! subject ids, the Parquet itself (linked where the file system allows),
 //! `roots.parquet`, entity IRI → digest for a client holding the vectors
-//! without the bundle.
+//! without the bundle, and `verbalize.json`, the config the texts were
+//! rendered under, in canonical JSON — the recipe, published and
+//! digest-covered beside what it produced, so a server can render an
+//! entity's text live and a client can embed a query the same way.
 //!
 //! Everything is written into a scratch directory beside `vectors/` and
 //! renamed into place at the end, so the sidecar exists whole or not at all.
@@ -91,6 +94,11 @@ pub struct Args {
     /// its IRI, target and text digest.
     #[arg(long)]
     pub roots: PathBuf,
+
+    /// The verbalization config the roots and texts were written under,
+    /// YAML or JSON. Published in the sidecar in canonical JSON.
+    #[arg(long, value_name = "FILE")]
+    pub config: PathBuf,
 }
 
 /// What was assembled.
@@ -108,7 +116,7 @@ pub struct Assembled {
 
 /// Run the command.
 pub fn run(args: Args) -> Result<()> {
-    let assembled = assemble(&args.bundle, &args.embeddings, &args.roots)?;
+    let assembled = assemble(&args.bundle, &args.embeddings, &args.roots, &args.config)?;
     println!(
         "wrote {} with {} records over {} entities ({} dimensions, at most {} entities a record)",
         sidecar_dir(&args.bundle).display(),
@@ -121,9 +129,23 @@ pub fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Assemble `bundle/vectors/` from `embeddings` and `roots`.
-pub fn assemble(bundle: &Path, embeddings: &Path, roots: &Path) -> Result<Assembled> {
+/// Assemble `bundle/vectors/` from `embeddings`, `roots` and `config`.
+pub fn assemble(
+    bundle: &Path,
+    embeddings: &Path,
+    roots: &Path,
+    config: &Path,
+) -> Result<Assembled> {
     let target = sidecar_dir(bundle);
+    let verbalize = read_config(config)?;
+    let resolved = verbalize
+        .resolve()
+        .with_context(|| format!("{} is not a usable verbalization config", config.display()))?;
+    let target_names: Vec<&str> = resolved
+        .targets
+        .iter()
+        .map(|target| target.name.as_str())
+        .collect();
     ensure!(
         !target.exists(),
         "{} already exists; a version's sidecar is never replaced, so assemble a new version",
@@ -144,8 +166,18 @@ pub fn assemble(bundle: &Path, embeddings: &Path, roots: &Path) -> Result<Assemb
         &store,
         roots,
         &read,
+        &target_names,
         &scratch.path().join(file_name(artifact::VECTORS_ROOTS)),
     )?;
+
+    // Canonical: keys sorted, as the config type's maps are, and the field
+    // order fixed by the type, so the same config always has the same bytes
+    // and the artifact's checksum is the recipe's hash.
+    let mut canonical = serde_json::to_vec_pretty(&verbalize).context("serializing the config")?;
+    canonical.push(b'\n');
+    let config_path = scratch.path().join(file_name(artifact::VECTORS_CONFIG));
+    std::fs::write(&config_path, canonical)
+        .with_context(|| format!("writing {}", config_path.display()))?;
 
     let identity = IdMapIdentity {
         dimensions: read.dimensions,
@@ -388,11 +420,13 @@ struct RootLine {
 }
 
 /// Resolve every root to a subject id and a record, write `roots.parquet`,
-/// and return the id-map rows in record order.
+/// and return the id-map rows in record order. A root under a target the
+/// config does not declare was verbalized under another config.
 fn join_roots(
     store: &Store,
     path: &Path,
     read: &ReadEmbeddings,
+    targets: &[&str],
     roots_parquet: &Path,
 ) -> Result<Vec<IdMapRow>> {
     let reader =
@@ -425,6 +459,15 @@ fn join_roots(
         }
         let root: RootLine = serde_json::from_str(&line)
             .with_context(|| format!("{}:{number} is not a roots line", path.display()))?;
+        if !targets.contains(&root.target.as_str()) {
+            bail!(
+                "{}:{number}: root {} is under target {:?}, which the config does not declare ({}); the roots were verbalized under a different config",
+                path.display(),
+                root.iri,
+                root.target,
+                targets.join(", ")
+            );
+        }
         let digest = parse_digest(&root.digest)
             .with_context(|| format!("{}:{number}'s digest", path.display()))?;
         let row = read.row_of(&digest).ok_or_else(|| {
@@ -518,6 +561,13 @@ impl RootsBatch {
             .write(&batch)
             .with_context(|| format!("writing {}", path.display()))
     }
+}
+
+/// The config as given, YAML or JSON.
+fn read_config(path: &Path) -> Result<kgf_verbalize::Config> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the config {}", path.display()))?;
+    serde_norway::from_str(&text).with_context(|| format!("parsing the config {}", path.display()))
 }
 
 /// Hard-link `from` at `to`, or copy it where linking is refused.

@@ -418,6 +418,30 @@ impl Bound {
         self.targets.iter().map(|target| target.name.as_str())
     }
 
+    /// The first target whose class `subject` is an instance of: one
+    /// existence probe per target, in config order. How a page showing a
+    /// node finds the config that governs it. `None` when no target claims
+    /// the subject, or when the bundle has no `rdf:type`.
+    pub fn target_of(&self, store: &Store, subject: u64) -> Result<Option<usize>, Error> {
+        let Some(rdf_type) = self.rdf_type else {
+            return Ok(None);
+        };
+        for (index, target) in self.targets.iter().enumerate() {
+            let Some(class) = target.class else {
+                continue;
+            };
+            let selection = store.resolve(IdPattern {
+                subject: Some(subject),
+                predicate: Some(rdf_type),
+                object: Some(class),
+            })?;
+            if selection.count().value > 0 {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+
     /// `target`'s label cascade, strongest first: the defaults' label
     /// predicates, its own, then the bundle's role.
     fn cascade(&self, target: usize) -> impl Iterator<Item = u64> + '_ {

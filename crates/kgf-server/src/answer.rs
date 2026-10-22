@@ -1243,12 +1243,31 @@ enum Echo {
         /// Its record, when embedded.
         #[serde(skip_serializing_if = "Option::is_none")]
         record: Option<u64>,
+        /// The text the vector was computed from, rendered live under the
+        /// bundle's config, when it publishes one and a target claims the
+        /// resource.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        embedded_text: Option<EmbeddedText>,
     },
     Sample {
         pattern: Pattern,
         n: u32,
         seed: u64,
     },
+}
+
+/// An embedded resource's text, rendered live under the bundle's config.
+#[derive(Debug, Clone, Serialize)]
+struct EmbeddedText {
+    /// The config target whose class the resource is an instance of.
+    target: String,
+    text: String,
+    /// Whether the live text's digest is the one the id map recorded for
+    /// the resource's record: false means the verbalizer has changed since
+    /// this version was built, and the vector was computed from other text.
+    matches_embedded: bool,
+    /// Whether the render stopped at a budget.
+    truncated: bool,
 }
 
 /// The keys a page's rows carry: the unbound positions, and `g` in the quad
@@ -5712,6 +5731,53 @@ pub fn labels(
     })
 }
 
+/// Render an embedded resource's text live under the bundle's config, and
+/// say whether it is the text the vector was computed from.
+///
+/// One bounded render: the config's IRIs bound once (a dictionary lookup
+/// each), one existence probe per target to find the resource's, then the
+/// walk `/verbalize` makes for one root, under the request's read and byte
+/// budgets. `None` when no target claims the resource.
+fn embedded_text(
+    store: &Store,
+    vectors: &kgf_store::Vectors,
+    row: kgf_store::Row,
+    subject: u64,
+    config: &request::DescribeVerbalize,
+    bytes: u64,
+) -> Result<Option<EmbeddedText>, Problem> {
+    let bound = Bound::bind(store, &config.resolved, &config.label_predicates)
+        .map_err(|error| unreadable("binding the bundle's verbalization config", &error))?;
+    let Some(index) = bound
+        .target_of(store, subject)
+        .map_err(|error| unreadable("finding a resource's target", &error))?
+    else {
+        return Ok(None);
+    };
+    let mut verbalizer = Verbalizer::new(store, &bound)
+        .with_read_budget(usize::try_from(config.read_budget).unwrap_or(usize::MAX))
+        .with_byte_budget(usize::try_from(bytes).unwrap_or(usize::MAX));
+    let Some(rendered) = verbalizer
+        .verbalize(index, subject)
+        .map_err(|error| unreadable("verbalizing a resource", &error))?
+    else {
+        return Ok(None);
+    };
+    let recorded = vectors
+        .digest_of(row)
+        .map_err(|error| unreadable("reading a record's digest", &error))?;
+    Ok(Some(EmbeddedText {
+        target: bound
+            .targets()
+            .nth(index)
+            .expect("the target index came from this binding")
+            .to_owned(),
+        matches_embedded: rendered.digest == recorded,
+        truncated: rendered.truncated,
+        text: rendered.text,
+    }))
+}
+
 /// `GET|QUERY /vector` — each submitted entity's stored vector.
 pub fn vector(
     store: &Store,
@@ -6778,8 +6844,8 @@ pub fn describe(
     let blank_nodes = SkolemScope::of(store);
     // One binary search in the id map, so the page offers "more like this"
     // only where /similar will answer, and a client reads the same fact.
-    let (embedded, record) = match store.vectors() {
-        None => (None, None),
+    let (embedded, record, embedded_text) = match store.vectors() {
+        None => (None, None, None),
         Some(vectors) => {
             let located = locate_scoped(
                 &dictionary,
@@ -6791,10 +6857,17 @@ pub fn describe(
             let row = match located {
                 Some(id) => vectors
                     .row_of(TermId(id))
-                    .map_err(|error| unreadable("looking up an entity's record", &error))?,
+                    .map_err(|error| unreadable("looking up an entity's record", &error))?
+                    .map(|row| (id, row)),
                 None => None,
             };
-            (Some(row.is_some()), row.map(|row| row.0))
+            let text = match (row, &request.verbalize) {
+                (Some((id, row)), Some(config)) => {
+                    embedded_text(store, vectors, row, id, config, request.bytes.0)?
+                }
+                _ => None,
+            };
+            (Some(row.is_some()), row.map(|(_, row)| row.0), text)
         }
     };
     let echo = Echo::Describe {
@@ -6802,6 +6875,7 @@ pub fn describe(
         direction: request.direction,
         embedded,
         record,
+        embedded_text,
     };
 
     let mut phases = Vec::new();
@@ -10063,6 +10137,23 @@ impl Resource for Answer {
                 @if let Some(link) = self.more_like_this() {
                     p."more-like-this" { a href=(link) { "More like this →" } }
                 }
+                @if let Some(embedded) = self.embedded_text() {
+                    section."section-block" {
+                        h2 { "Embedded text" }
+                        @if embedded.matches_embedded {
+                            (note(&format!(
+                                "The text this resource's vector was computed from, rendered live under the bundle's verbalization config as target {:?}.",
+                                embedded.target
+                            )))
+                        } @else {
+                            (note(&format!(
+                                "Rendered live under the bundle's verbalization config as target {:?}; it differs from the text the vector was computed from, so the verbalizer has changed since this version was built.",
+                                embedded.target
+                            )))
+                        }
+                        pre."embedded-text" { (embedded.text) }
+                    }
+                }
                 div."answer-summary" {
                     (fields(&summary))
                 }
@@ -10123,6 +10214,13 @@ impl Answer {
                 self.described_label().unwrap_or(resource).to_owned()
             }
             Echo::Sample { .. } => "Sample".to_owned(),
+        }
+    }
+
+    fn embedded_text(&self) -> Option<&EmbeddedText> {
+        match &self.echo {
+            Echo::Describe { embedded_text, .. } => embedded_text.as_ref(),
+            _ => None,
         }
     }
 

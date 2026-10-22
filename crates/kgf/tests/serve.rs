@@ -6100,14 +6100,18 @@ fn verbalize_charges_a_probe_that_finds_nothing() {
 /// Five typed subjects of which four are embedded — `b` and `c` with one
 /// shared record — and one subject that is not.
 const EMBEDDED_NT: &str = concat!(
-    "<http://example.org/a> <http://example.org/type> <http://example.org/T> .\n",
-    "<http://example.org/b> <http://example.org/type> <http://example.org/T> .\n",
-    "<http://example.org/c> <http://example.org/type> <http://example.org/T> .\n",
-    "<http://example.org/d> <http://example.org/type> <http://example.org/T> .\n",
-    "<http://example.org/e> <http://example.org/type> <http://example.org/T> .\n",
+    "<http://example.org/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/T> .\n",
+    "<http://example.org/a> <http://example.org/name> \"Alpha\" .\n",
+    "<http://example.org/b> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/T> .\n",
+    "<http://example.org/c> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/T> .\n",
+    "<http://example.org/d> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/T> .\n",
+    "<http://example.org/e> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/T> .\n",
     "<http://example.org/f> <http://example.org/name> \"not embedded\" .\n",
     "<http://example.org/T> <http://example.org/name> \"a class\" .\n",
 );
+
+/// The config the fixture's texts would be rendered under.
+const EMBEDDED_CONFIG: &str = r#"{"targets": {"things": {"type": "http://example.org/T"}}}"#;
 
 const EMBEDDED_GROUPS: &[&[&str]] = &[
     &["http://example.org/a"],
@@ -6124,7 +6128,9 @@ fn vectors_answer_over_the_wire_and_refuse_what_is_not_embedded() {
     deployment.publish_fixture(
         "vec",
         "v1",
-        Fixture::build(EMBEDDED_NT).with_vectors(EMBEDDED_GROUPS),
+        Fixture::build(EMBEDDED_NT)
+            .with_vectors(EMBEDDED_GROUPS)
+            .with_verbalize_config(EMBEDDED_CONFIG),
         "2026-10-22T10:00:00Z",
     );
     deployment.publish("tox", "v1", TYPED_NT, "2026-06-01T14:03:22Z");
@@ -6308,6 +6314,44 @@ fn vectors_answer_over_the_wire_and_refuse_what_is_not_embedded() {
     let embedded = server.get("/vec/v/v1/describe?iri=ex:a").json();
     assert_eq!(embedded["embedded"], true);
     assert_eq!(embedded["record"], 0);
+    // The text rendered live under the bundle's own config; the fixture's
+    // digests are not of any text, so it is reported as not the embedded one.
+    assert_eq!(embedded["embedded_text"]["target"], "things");
+    assert!(
+        embedded["embedded_text"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("label: Alpha\n"),
+        "{embedded}"
+    );
+    assert_eq!(embedded["embedded_text"]["matches_embedded"], false);
+    let page = server
+        .request("GET", "/vec/v/v1/describe?iri=ex:a", &html)
+        .text();
+    assert!(
+        page.contains("Embedded text") && page.contains("label: Alpha"),
+        "{page}"
+    );
+
+    // /verbalize falls back to the bundle's config, and only there.
+    let rendered = server.get("/vec/v/v1/verbalize?target=things&iri=ex:a");
+    rendered.assert_status(200);
+    assert!(
+        rendered.json()["records"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("label: Alpha"),
+        "{}",
+        rendered.json()
+    );
+    let unconfigured = server.get("/tox/v/v1/verbalize?iri=ex:site1");
+    unconfigured.assert_status(400);
+    assert!(
+        unconfigured.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("publishes none")
+    );
     let page = server
         .request("GET", "/vec/v/v1/describe?iri=ex:a", &html)
         .text();

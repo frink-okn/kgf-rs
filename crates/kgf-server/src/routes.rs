@@ -892,6 +892,13 @@ async fn describe(
                 release.predicate_roles(),
                 &release.binding(),
             )
+            .map(|request| {
+                request.with_verbalize(
+                    release.verbalize_config(),
+                    release.predicate_roles(),
+                    limits,
+                )
+            })
         },
         answer::describe,
     )
@@ -1318,6 +1325,7 @@ async fn verbalize(
                 limits,
                 release.prefixes(),
                 release.predicate_roles(),
+                release.verbalize_config(),
             )
         },
         answer::verbalize,
@@ -1350,6 +1358,7 @@ async fn verbalize_operation(
                 limits,
                 release.prefixes(),
                 release.predicate_roles(),
+                release.verbalize_config(),
             )
         },
         answer::verbalize,

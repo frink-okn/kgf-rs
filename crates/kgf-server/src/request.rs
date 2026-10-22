@@ -66,6 +66,8 @@ use crate::representation::{RdfSyntax, Representation};
 use crate::service::{PredicateRoles, RolesByPredicate};
 use crate::term::{Literal as KgfLiteral, PrefixMap, Term, TripleTerm};
 use crate::url::Params;
+use std::sync::Arc;
+
 use kgf_verbalize::{Config as VerbalizeConfig, Resolved as VerbalizeResolved};
 
 // ---------------------------------------------------------------------------
@@ -1071,7 +1073,8 @@ const VERBALIZE_DEFAULT_N: u32 = 5;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireVerbalize {
-    config: VerbalizeConfig,
+    #[serde(default)]
+    config: Option<VerbalizeConfig>,
     #[serde(default)]
     target: Option<String>,
     #[serde(default)]
@@ -1094,25 +1097,28 @@ impl Verbalize {
         limits: Limits<'_>,
         prefixes: &PrefixMap,
         profile: &PredicateRoles,
+        default: Option<&Arc<VerbalizeResolved>>,
     ) -> Result<Self, Problem> {
         accept_only(params, VERBALIZE, Self::PARAMETERS)?;
-        let Some(text) = params.get("config") else {
-            return Err(Problem::new(
-                ErrorCode::MalformedRequest,
-                "config is required: the verbalization config, as YAML or JSON",
-            ));
+        let resolved = match params.get("config") {
+            None => Self::default_config(default)?,
+            Some(text) => {
+                if text.len() as u64 > limits.budgets.max_request_bytes {
+                    return Err(Problem::new(
+                        ErrorCode::PayloadTooLarge,
+                        format!(
+                            "config is {} bytes, over this server's max_request_bytes of {}",
+                            text.len(),
+                            limits.budgets.max_request_bytes
+                        ),
+                    ));
+                }
+                resolve_config(verbalize_config_text(
+                    text,
+                    limits.budgets.max_request_bytes,
+                )?)?
+            }
         };
-        if text.len() as u64 > limits.budgets.max_request_bytes {
-            return Err(Problem::new(
-                ErrorCode::PayloadTooLarge,
-                format!(
-                    "config is {} bytes, over this server's max_request_bytes of {}",
-                    text.len(),
-                    limits.budgets.max_request_bytes
-                ),
-            ));
-        }
-        let config = verbalize_config_text(text, limits.budgets.max_request_bytes)?;
         let mut iris = Vec::new();
         if let Some(list) = params.get("iri") {
             for text in term_list("iri", list)? {
@@ -1130,7 +1136,7 @@ impl Verbalize {
             )?),
         };
         Self::finish(
-            config,
+            resolved,
             params.get("target").map(str::to_owned),
             iris,
             n,
@@ -1141,16 +1147,22 @@ impl Verbalize {
         )
     }
 
-    /// Parse the JSON body form: the config as an object in `config`.
+    /// Parse the JSON body form: the config as an object in `config`, or the
+    /// bundle's own when the body carries none.
     pub fn parse_body(
         params: &Params,
         body: &[u8],
         limits: Limits<'_>,
         prefixes: &PrefixMap,
         profile: &PredicateRoles,
+        default: Option<&Arc<VerbalizeResolved>>,
     ) -> Result<Self, Problem> {
         accept_only(params, VERBALIZE, &["format"])?;
         let wire: WireVerbalize = parse_body(body)?;
+        let resolved = match wire.config {
+            None => Self::default_config(default)?,
+            Some(config) => resolve_config(config)?,
+        };
         let mut iris = Vec::new();
         for (index, iri) in wire.iris.unwrap_or_default().into_iter().enumerate() {
             iris.push(
@@ -1176,7 +1188,7 @@ impl Verbalize {
             }
         }
         Self::finish(
-            wire.config,
+            resolved,
             wire.target,
             iris,
             wire.n,
@@ -1189,9 +1201,22 @@ impl Verbalize {
 
     /// The rules both forms share: which mode the request is, and that it
     /// fits under the root cap.
+    /// The bundle's own config, for a request that sent none.
+    fn default_config(
+        default: Option<&Arc<VerbalizeResolved>>,
+    ) -> Result<VerbalizeResolved, Problem> {
+        match default {
+            Some(resolved) => Ok((**resolved).clone()),
+            None => Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "config is required: the verbalization config, as YAML or JSON; this bundle publishes none to fall back on",
+            )),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn finish(
-        config: VerbalizeConfig,
+        resolved: VerbalizeResolved,
         target: Option<String>,
         iris: Vec<BoundTerm>,
         n: Option<u32>,
@@ -1200,12 +1225,6 @@ impl Verbalize {
         limits: Limits<'_>,
         profile: &PredicateRoles,
     ) -> Result<Self, Problem> {
-        let resolved = config.resolve().map_err(|error| {
-            Problem::new(
-                ErrorCode::MalformedRequest,
-                format!("config is not a usable verbalization config: {error}"),
-            )
-        })?;
         let names: Vec<&str> = resolved
             .targets
             .iter()
@@ -1355,7 +1374,7 @@ impl Verbalize {
 
 impl GetRequest for Verbalize {
     fn normalize_params(params: &Params) -> Params {
-        params.without_empty(&["target", "iri", "n", "seed", "plan"])
+        params.without_empty(&["config", "target", "iri", "n", "seed", "plan"])
     }
 
     fn work_class(&self) -> WorkClass {
@@ -1371,6 +1390,16 @@ impl ObservedRequest for Verbalize {
             roots: self.requested_roots(),
         }
     }
+}
+
+/// A config as sent, validated and defaulted.
+fn resolve_config(config: VerbalizeConfig) -> Result<VerbalizeResolved, Problem> {
+    config.resolve().map_err(|error| {
+        Problem::new(
+            ErrorCode::MalformedRequest,
+            format!("config is not a usable verbalization config: {error}"),
+        )
+    })
 }
 
 /// Parse `/verbalize`'s GET config, YAML or JSON, held to `limit` bytes once
@@ -3709,6 +3738,20 @@ pub struct Describe {
     pub binding: CursorBinding,
     /// How the response labels its IRIs; `None` unless `labels=true`.
     pub labels: Option<Labeling>,
+    /// What renders an embedded resource's text live, when the bundle
+    /// publishes a verbalization config.
+    pub verbalize: Option<DescribeVerbalize>,
+}
+
+/// The bundle's verbalization config as a describe request carries it.
+#[derive(Debug)]
+pub struct DescribeVerbalize {
+    /// The resolved config, shared with the release.
+    pub resolved: Arc<VerbalizeResolved>,
+    /// The release's `label` role, the cascade's last resort.
+    pub label_predicates: Vec<String>,
+    /// Reads one render may make.
+    pub read_budget: u64,
 }
 
 impl Describe {
@@ -3766,7 +3809,28 @@ impl Describe {
             cursor: resume(params, &binding)?,
             binding,
             labels: Labeling::from_params(params, false, profile, prefixes, limits)?,
+            verbalize: None,
         })
+    }
+
+    /// Carry the bundle's verbalization config, so the answer can render the
+    /// resource's embedded text.
+    #[must_use]
+    pub fn with_verbalize(
+        mut self,
+        config: Option<&Arc<VerbalizeResolved>>,
+        profile: &PredicateRoles,
+        limits: Limits<'_>,
+    ) -> Self {
+        self.verbalize = config.map(|resolved| DescribeVerbalize {
+            resolved: Arc::clone(resolved),
+            label_predicates: profile
+                .get("label")
+                .map(<[String]>::to_vec)
+                .unwrap_or_default(),
+            read_budget: limits.budgets.candidate_budget,
+        });
+        self
     }
 }
 

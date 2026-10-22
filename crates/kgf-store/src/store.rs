@@ -122,6 +122,10 @@ pub mod artifact {
     /// Entity IRI → text digest, for a client holding the vectors without
     /// the bundle. Served as bytes; never read here.
     pub const VECTORS_ROOTS: &str = "vectors/roots.parquet";
+    /// The verbalization config the texts were rendered under, in canonical
+    /// JSON: the recipe, digest-covered with the vectors it produced. A
+    /// server renders an entity's text live under it; never read here.
+    pub const VECTORS_CONFIG: &str = "vectors/verbalize.json";
 
     /// The complete tier-1 description artifact set, in bundle-layout order.
     pub const DESCRIPTION: [&str; 8] = [
@@ -446,6 +450,7 @@ pub(crate) struct VectorArtifacts {
     pub(crate) entities: PathBuf,
     pub(crate) embeddings: Option<PathBuf>,
     pub(crate) roots: Option<PathBuf>,
+    pub(crate) config: Option<PathBuf>,
 }
 
 impl VectorArtifacts {
@@ -454,15 +459,17 @@ impl VectorArtifacts {
         let entities = optional_file(dir, artifact::VECTORS_ENTITIES)?;
         let embeddings = optional_file(dir, artifact::VECTORS_EMBEDDINGS)?;
         let roots = optional_file(dir, artifact::VECTORS_ROOTS)?;
+        let config = optional_file(dir, artifact::VECTORS_CONFIG)?;
         match (index, entities) {
             (Some(index), Some(entities)) => Ok(Some(Self {
                 index,
                 entities,
                 embeddings,
                 roots,
+                config,
             })),
             (None, None) => {
-                if let Some(orphan) = embeddings.or(roots) {
+                if let Some(orphan) = embeddings.or(roots).or(config) {
                     return Err(Error::Malformed {
                         artifact: orphan,
                         detail: format!(
@@ -496,6 +503,7 @@ impl VectorArtifacts {
                 .as_ref()
                 .map(|_| artifact::VECTORS_EMBEDDINGS),
             self.roots.as_ref().map(|_| artifact::VECTORS_ROOTS),
+            self.config.as_ref().map(|_| artifact::VECTORS_CONFIG),
         ]
         .into_iter()
         .flatten()

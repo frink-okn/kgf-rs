@@ -523,6 +523,16 @@ impl Fixture {
         self
     }
 
+    /// Add the verbalization config a vector sidecar's texts were rendered
+    /// under, as `kgf vectors` writes it. The JSON is written as given.
+    #[must_use]
+    pub fn with_verbalize_config(self, json: &str) -> Self {
+        let dir = self.dir.path().join("vectors");
+        std::fs::create_dir_all(&dir).expect("create vectors/");
+        std::fs::write(dir.join("verbalize.json"), json).expect("write the config");
+        self
+    }
+
     fn build_with(source: &str, graphs: bool) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let input = dir
@@ -595,6 +605,7 @@ impl Fixture {
             crate::store::artifact::VECTORS_ENTITIES,
             crate::store::artifact::VECTORS_EMBEDDINGS,
             crate::store::artifact::VECTORS_ROOTS,
+            crate::store::artifact::VECTORS_CONFIG,
         ] {
             if !self.dir.path().join(name).exists() {
                 continue;
