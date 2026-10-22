@@ -165,10 +165,10 @@ promise.** `PublishedBundle::new` and `PublishedRoot::new` are `pub unsafe` prec
 that promise is made from *outside* `kgf-store`, by the layer that can know it: a
 library cannot establish that a directory will not be rewritten, and a deployment can.
 That layer is the `kgf` binary, and only it carries `#[allow(unsafe_code)]`: `serve`
-asserts it for the root a deployment serves, and the one-shot commands `manifest` and
-`verbalize` assert it for a directory the operator named (or a build's own staging
-directory), each under a SAFETY comment saying what the command writes and why that is
-not the mapped bytes. `kgf-server` stays `deny(unsafe_code)` and takes a `PublishedRoot`
+asserts it for the root a deployment serves, and the one-shot commands `manifest`,
+`verbalize` and `vectors` assert it for a directory the operator named (or a build's
+own staging directory), each under a SAFETY comment saying what the command writes and
+why that is not the mapped bytes. `kgf-server` stays `deny(unsafe_code)` and takes a `PublishedRoot`
 in its `Config` rather than a path, because it is a library that can be embedded and
 must not make the promise on an unknown caller's behalf. A site of a new kind — in a
 library, or over a directory nobody has promised anything about — is a design change to

@@ -3280,13 +3280,18 @@ index that allows several vectors per key, or has removed any, is refused. What 
 library trusts within that length is vouched for by the build that wrote it and the
 manifest's digest, as every artifact's bytes are.
 
-**Search contexts are the concurrency bound.** The library takes a search context from
-a fixed pool per running search and fails — does not wait — when none is free, so
+**Search contexts are the concurrency bound — and the one lock on the read path.** The
+library takes a search context from a fixed pool per running search and fails — does
+not wait — when none is free, so
 `OpenOptions::search_contexts` reserves the pool once at open, at the figure the
 caller's admission control bounds concurrency by (default 32, `max_concurrent_work`'s
 default). Fixed memory per context, nothing proportional to the bundle. A probe's cost
 is the index's stored search expansion times its connectivity, both readable from the
-open store for the cost table.
+open store for the cost table. Leasing a context is a ring pop under the library's
+mutex — a few instructions, but a lock, which rule 4 forbids on the read path. Accepted
+and recorded rather than hidden: it is the dependency's, not this crate's, and the C++
+API has a lock-free path (a search given its thread id outright) that the Rust binding
+does not expose. Removing it is a binding change, to make if contention ever shows.
 
 **Open is size-independent; `verify` is the walk.** Open reads the header, checks the
 file is exactly the length its counts imply, reads the two sentinel offsets, binds the

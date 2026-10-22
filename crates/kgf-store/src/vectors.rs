@@ -391,8 +391,11 @@ impl Vectors {
 
     /// The entities whose text is `row`'s, as subject ids, in id order.
     ///
-    /// Several when identical texts were deduplicated into one record; the
-    /// header's `max_entities_per_record` bounds how many.
+    /// Several when identical texts were deduplicated into one record. The
+    /// header's `max_entities_per_record` says how many at most — a statement
+    /// the build made and `kgf manifest` verified, not one open checks — so a
+    /// caller with a budget charges each entity to it rather than trusting the
+    /// figure.
     pub fn entities_of(&self, row: Row) -> Result<impl Iterator<Item = TermId> + '_> {
         let row = self.checked_row(row)?;
         let offsets = self.spec.offsets.view(&self.entities);
@@ -442,11 +445,15 @@ impl Vectors {
         Ok(vector)
     }
 
-    /// The `k` records nearest `query`, nearest first.
+    /// The `k` records nearest `query`, nearest first — fewer when the
+    /// bundle holds fewer than `k`.
     ///
     /// One probe of the index at its stored search expansion; the library
     /// fails rather than waits if more searches are running than contexts
     /// were reserved at open, and that failure is reported, not retried.
+    /// `k` is held to the number of records before it reaches the library,
+    /// which sizes its result by it: what bounds the answer is the bundle,
+    /// not the caller.
     pub fn similar(&self, query: &[f32], k: usize) -> Result<Vec<Hit>> {
         if query.len() != self.dimensions() {
             return Err(Error::QueryDimension {
@@ -459,6 +466,7 @@ impl Vectors {
         if let Some(position) = query.iter().position(|x| !x.is_finite()) {
             return Err(Error::QueryNotFinite { position });
         }
+        let k = k.min(usize::try_from(self.header.records).unwrap_or(usize::MAX));
         if k == 0 {
             return Ok(Vec::new());
         }

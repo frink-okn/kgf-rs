@@ -14,6 +14,9 @@
 //!
 //! Everything is written into a scratch directory beside `vectors/` and
 //! renamed into place at the end, so the sidecar exists whole or not at all.
+//! The Parquet is hard-linked rather than copied where the file system
+//! allows, so it inherits the promise `kgf build --adopt` already relies on:
+//! the operator does not rewrite an input after handing it to a bundle.
 //! An existing `vectors/` is never replaced: a sidecar is part of a version's
 //! identity, and a different one is a different version. The manifest is not
 //! rewritten here — `kgf manifest` derives the `vectors` capability from the
