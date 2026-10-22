@@ -3412,7 +3412,12 @@ target to find the resource's (`Bound::target_of`; `verbalize(target, subject)` 
 admits any subject, by design), then the one bounded walk `/verbalize` makes for a
 root — and says whether its digest is the one the id map recorded (`matches_embedded`).
 A false there means the verbalizer changed since the build, said on the page rather
-than discovered; on SOCKG a treatment's live text matches. The text is also what a
+than discovered; on SOCKG a treatment's live text matches. The same probe makes
+`target` optional on `/verbalize`'s `iri` mode: without one, each IRI renders under the
+first target whose class it is an instance of, and the record says which; a subject no
+target claims is listed as `unclaimed`, since naming a target renders any subject under
+it by design. A target was required before only to disambiguate, and membership
+disambiguates better than the client guessing. The text is also what a
 client needs to embed a query the way the bundle embeds its entities: the recipe is a
 public config plus a public verbalizer.
 

@@ -5763,18 +5763,15 @@ fn verbalize_refuses_what_it_cannot_answer_by_name() {
             .contains("\"site\"")
     );
 
-    // Two targets and IRIs to render: which target is not a guess.
-    let ambiguous = server.get(&verbalize_url(&[
+    // Two targets and IRIs to render, none named: each IRI's target is the
+    // one whose class it is an instance of, and the record says which.
+    let inferred = server.get(&verbalize_url(&[
         ("config", VERBALIZE_CONFIG),
         ("iri", "ex:site1"),
     ]));
-    ambiguous.assert_status(400);
-    assert!(
-        ambiguous.json()["detail"]
-            .as_str()
-            .unwrap()
-            .contains("target is required")
-    );
+    inferred.assert_status(200);
+    assert_eq!(inferred.json()["records"][0]["target"], "site");
+    assert!(inferred.json().get("target").is_none());
 
     // The root cap bounds a plan across its targets, and says what to do.
     let over = server.get(&verbalize_url(&[
@@ -6344,6 +6341,26 @@ fn vectors_answer_over_the_wire_and_refuse_what_is_not_embedded() {
         "{}",
         rendered.json()
     );
+    // No target named: each IRI renders under the target whose class it is
+    // an instance of, and one no target claims is said to be unclaimed.
+    let inferred = server.get("/vec/v/v1/verbalize?iri=ex:a,ex:f");
+    inferred.assert_status(200);
+    let inferred = inferred.json();
+    assert_eq!(
+        inferred["records"].as_array().unwrap().len(),
+        1,
+        "{inferred}"
+    );
+    assert_eq!(inferred["records"][0]["target"], "things");
+    assert_eq!(
+        inferred["unclaimed"],
+        serde_json::json!(["http://example.org/f"])
+    );
+    assert!(inferred.get("target").is_none());
+    // Named, a target admits any subject.
+    let forced = server.get("/vec/v/v1/verbalize?target=things&iri=ex:f");
+    forced.assert_status(200);
+    assert_eq!(forced.json()["records"].as_array().unwrap().len(), 1);
     let unconfigured = server.get("/tox/v/v1/verbalize?iri=ex:site1");
     unconfigured.assert_status(400);
     assert!(

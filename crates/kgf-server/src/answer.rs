@@ -6368,6 +6368,7 @@ pub fn verbalize(
     let mut records = Vec::new();
     let mut reports = Vec::new();
     let mut absent = Vec::new();
+    let mut unclaimed = Vec::new();
     let mut spent = 0u64;
     // Whether a record was left out, or cut, to keep within the byte budget.
     let mut over_bytes = false;
@@ -6392,10 +6393,40 @@ pub fn verbalize(
 
     match &request.mode {
         request::VerbalizeMode::Iris(iris) => {
-            let index = request.target_indexes()[0];
+            // Under a named target every IRI renders there, member or not —
+            // a target's class drives enumeration and profiles, not
+            // admission. Without one, each IRI's target is the first whose
+            // class it is an instance of: one existence probe per target.
+            let named = request.target.as_ref().map(|name| {
+                names
+                    .iter()
+                    .position(|candidate| candidate == name)
+                    .expect("the request's target is one the config declares")
+            });
+            let dictionary = store.dict();
             for iri in iris {
+                let Some(subject) = dictionary
+                    .locate(Role::Subject, iri.dictionary().as_bytes())
+                    .map_err(|error| unreadable("looking a root up", &error))?
+                else {
+                    absent.push(iri.dictionary().to_owned());
+                    continue;
+                };
+                let index = match named {
+                    Some(index) => index,
+                    None => match bound
+                        .target_of(store, subject.0)
+                        .map_err(|error| unreadable("finding a root's target", &error))?
+                    {
+                        Some(index) => index,
+                        None => {
+                            unclaimed.push(iri.dictionary().to_owned());
+                            continue;
+                        }
+                    },
+                };
                 let rendered = verbalizer
-                    .verbalize_iri(index, iri.dictionary())
+                    .verbalize(index, subject.0)
                     .map_err(|error| unreadable("verbalizing a root", &error))?;
                 match rendered {
                     Some(rendered) => {
@@ -6462,6 +6493,7 @@ pub fn verbalize(
         seed: request.seed,
         unknown: bound.unknown().to_vec(),
         absent,
+        unclaimed,
         targets: reports,
         records,
         completeness,
@@ -6634,6 +6666,11 @@ pub struct VerbalizeAnswer {
     /// Requested roots that are not subjects in this bundle.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     absent: Vec<String>,
+    /// Requested roots that are subjects, but instances of none of the
+    /// config's target classes, so no target claims them; name one with
+    /// `target` to render them under it anyway.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unclaimed: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     targets: Vec<VerbalizeTargetReport>,
     records: Vec<VerbalizeRecord>,
@@ -6710,6 +6747,13 @@ impl Resource for VerbalizeAnswer {
                     (note(&format!(
                         "Not subjects in this bundle: {}.",
                         self.absent.join(", ")
+                    )))
+                }
+                @if !self.unclaimed.is_empty() {
+                    (note(&format!(
+                        "Instances of none of the config's target classes, so no target claims \
+                         them; name one with target to render them under it: {}",
+                        self.unclaimed.join(", ")
                     )))
                 }
                 @if !self.targets.is_empty() {

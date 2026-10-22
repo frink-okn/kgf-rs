@@ -1264,11 +1264,10 @@ impl Verbalize {
                     ),
                 ));
             }
-            (
-                VerbalizeMode::Iris(iris),
-                Self::one_target(target, &names)?,
-                VERBALIZE_DEFAULT_N,
-            )
+            // A target is needed only to disambiguate: without one, each
+            // IRI renders under the first target whose class it is an
+            // instance of, and the answer says which.
+            (VerbalizeMode::Iris(iris), target, VERBALIZE_DEFAULT_N)
         } else if plan || target.is_none() {
             let selected = if target.is_some() {
                 1
