@@ -3354,6 +3354,59 @@ verbalizer's streams through a Parquet written as the embedding stage writes one
 commands, the never-replaced sidecar, and `kgf manifest` catching an id map whose
 parent digest or regions disagree.
 
+### 39. `/vector` and `/similar` — the vector sidecar over HTTP ✅
+
+**Implemented 2026-10-22, on `vectors-store`.** Two routes over unit 38's store, gated on
+`vectors` as `search` is on its sidecar, each with a GET form for a browser and a JSON
+body by QUERY (canonical) or POST, each with a page, each a row in the cost table.
+
+**`/vector` is a lookup table; `/similar` is an operation.** `GET /vector?iri=` and
+`QUERY /vector {"iris": […]}` answer an array in request order, one entry per entity
+with its record and stored vector — the index's f16, widened — or `"vector": null` and
+`absent: "not_embedded" | "unknown_term"`, so a mixed batch gets one answer, as
+`/labels` gives one. `GET /similar?iri=&k=` and `QUERY /similar {"iri": …} |
+{"vector": […]}, "k"` rank the bundle's records against a vector and return the `k`
+nearest, nearest first, each with its distance (cosine, `1 − similarity`) and the
+entities whose text it is — several where identical texts share a record. An entity's
+own record is left out of its own answer. Here "not embedded" is a refusal with its
+own code: **`not_embedded`, 422** — the request is well formed and the bundle does
+publish `vectors`, which rules out `malformed_request` and `capability_not_available`;
+it is never an empty 200, because "nothing similar" and "not embedded" are opposite
+facts; and it is permanent for the version, so a client may cache it. One code for the
+two states a term can be in — not a subject of the bundle, or a subject the build gave
+no vector — with the detail naming which, since the remedy is the same: `/search` and
+`/describe`. Coverage is partial by design (a measurement node embeds as noise), and
+nothing is approximated in its place.
+
+**Bounds, as unit 35's review asked.** `k` is held to `max_similar_k` (default 100) at
+parse, and by the store to the records that exist; a batch to `max_vector_iris` (1,000);
+a vector to the bundle's width and to finite components, refused as `malformed_request`
+with the width named; a request above a cap is `cap_exceeded`. A probe costs the index's
+search expansion times its connectivity, both readable from the open store and
+published in the manifest's `vectors` block once unit 40 writes it. The entities a
+record expands to are not trusted to the header's `max_entities_per_record`: each is
+charged to the response's byte budget, which stops the answer with
+`budget_exhausted: response_bytes` and the first record always kept. Search contexts
+are reserved at `max_concurrent_work`, so admission is the bound the library's pool is
+sized to. Work class is ordinary: a probe is microseconds. No lock is added; the
+library's own context lease is recorded under unit 38.
+
+**Not here.** `filter` (over-fetch with a candidate budget against one pattern) and
+`labels=true` on `/similar`'s entities: both compose with what exists and neither is
+needed for the first end-to-end run. A "more like this" link on an entity's `/describe`
+row, rendered only when the entity is embedded, waits for the same reason.
+
+*Verified by* `vectors_answer_over_the_wire_and_refuse_what_is_not_embedded` in
+`crates/kgf/tests/serve.rs`: the capability in the manifest and the links in the
+descriptor for the embedded release only; one entity by GET with its stored vector;
+a batch by QUERY in order with `not_embedded` and `unknown_term` entries; neighbours
+of an entity with its own record left out and distances ascending; a client vector
+finding its record first with the shared record's two entities together; `not_embedded`
+for a subject without a vector and for a term that is not a subject; `cap_exceeded` on
+`k` and on the batch; `malformed_request` on a narrow vector and on `iri` with `vector`;
+the 501 gate on a bundle without the sidecar; and a page for each route — plus the
+methods-statement test, which now covers the gate's 501 and a 405 on the new resources.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
@@ -4611,6 +4664,13 @@ following the code.
     requires the current embedder to reproduce them within a tolerance. Doc 13 should
     make the probes part of the convention, and say that reuse — and any client
     claiming the space — is gated on them, not on the hash.
+110. **`/vector`, `/similar`, `not_embedded`, `max_vector_iris` and `max_similar_k` are
+    additions to doc 03.** Doc 13 §13.2 sketches the two routes; doc 03's URL space,
+    error table and cap list do not have them. Unit 39 fixes the wire shapes: `/vector`
+    as an ordered array with `absent` reasons, `/similar` with `record`, `distance`,
+    `similarity` and `entities`, an entity's own record excluded, and `not_embedded` at
+    422 as the one code for a term the bundle cannot rank. Doc 03 should carry them as
+    question 97 asked for `/verbalize`, and doc 13 §13.2's `filter` stays open.
 109. **`/vector` publishes the index's precision.** The stored vector is f16 and is a
     fixed point of storage (unit 38); `/vector` should return exactly what the index
     compares, with full precision available through the Parquet export. Doc 13 §13.2
