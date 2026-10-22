@@ -5810,7 +5810,7 @@ pub fn similar(
                 return Err(Problem::new(
                     ErrorCode::NotEmbedded,
                     format!(
-                        "{} is a subject of this bundle but not an embedding target of this version, so it has no vector to compare; the manifest's `vectors` block says which classes were embedded, and /search answers for the rest",
+                        "{} is a subject of this bundle but not an embedding target of this version, so it has no vector to compare; /search and /describe answer for it",
                         entity.dictionary()
                     ),
                 ));
