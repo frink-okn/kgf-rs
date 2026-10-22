@@ -3398,9 +3398,29 @@ publishes vectors, and its page offers "More like this" — a link to `/similar`
 when true: `/similar` refuses a term without a vector, and a page should not offer a
 link that fails.
 
+**The recipe travels with the vectors.** A bundle carried vectors without the config
+that produced their texts. `kgf vectors --config` now writes `vectors/verbalize.json`
+in canonical JSON — sorted keys, fixed field order — so the same config is the same
+bytes and the artifact's checksum is the recipe's hash the unit 35 review asked for,
+covered by `content_digest` with the vectors it produced; a roots line under a target
+the config does not declare is refused. A server reads it beside the manifest at
+startup, resolved once, and refuses to start on one that does not parse. With it,
+`/verbalize` takes the bundle's config as its default by every method and refuses a
+request without one only where the bundle publishes none; and `/describe` renders an
+embedded resource's text live — the config's IRIs bound once, one existence probe per
+target to find the resource's (`Bound::target_of`; `verbalize(target, subject)` itself
+admits any subject, by design), then the one bounded walk `/verbalize` makes for a
+root — and says whether its digest is the one the id map recorded (`matches_embedded`).
+A false there means the verbalizer changed since the build, said on the page rather
+than discovered; on SOCKG a treatment's live text matches. The text is also what a
+client needs to embed a query the way the bundle embeds its entities: the recipe is a
+public config plus a public verbalizer.
+
 **Not here.** `filter` (over-fetch with a candidate budget against one pattern) and
 `labels=true` on `/similar`'s entities: both compose with what exists and neither is
-needed for the first end-to-end run.
+needed for the first end-to-end run. `/export` of the sidecar's files — the Parquet
+for DuckDB, the config for a client — waits on the export route taking nested
+artifact names; today it serves `data.hdt` and `data.nt` alone.
 
 **Run end to end on SOCKG (2026-10-22).** From `../okn-embeddings/graph.hdt` (27.1 M
 triples): `kgf build` with the authoring run's config, then `kgf verbalize` (1,237 roots
