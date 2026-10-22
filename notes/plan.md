@@ -3321,6 +3321,16 @@ beside the graph index's binding check. The `vectors` block the manifest should 
 for a reader without the bundle — model, `convention_id`, width, the probes, the index's
 build parameters, the declared scope — is unit 40's, with the build stage.
 
+**The build's memory is linear in the records, and the library cannot bound it.** The
+usearch crate's `add` copies every vector in and builds the graph in memory; there is
+no external-memory build, no graph merge, and a mapped index is immutable. A build's
+peak memory is therefore the finished index — ~920 bytes a record at 384 dimensions,
+~1 GB at 10⁶ records and ~90 GB at 10⁸ — where every hdtc stage runs under
+`--memory-limit`. Known and accepted for the sizes OKN embeds today; what makes it a
+bounded risk rather than a trap is that the Parquet is canonical: a library with a
+disk-backed build replaces `index.usearch` by a rebuild from `embeddings.parquet`,
+minutes against the days a re-embed would cost (question 111).
+
 **The f16 fixed point.** A stored vector read back is the f16 the index keeps, widened;
 fed into a fresh index it is stored bit-identically, so the stored precision is a fixed
 point and the cosine metric does not renormalize on insert. `/vector` can therefore
@@ -4722,6 +4732,14 @@ following the code.
     `similarity` and `entities`, an entity's own record excluded, and `not_embedded` at
     422 as the one code for a term the bundle cannot rank. Doc 03 should carry them as
     question 97 asked for `/verbalize`, and doc 13 §13.2's `filter` stays open.
+111. **Doc 13's sizing paragraph should say what bounds the index build.** §13.1's
+    "sizing honesty" sizes the sidecar on disk; the build's memory is the other half.
+    An in-memory HNSW build (usearch, unit 38) needs RAM for the finished index, linear
+    in the records, and the library has no bounded alternative — ~90 GB at the 10⁸
+    entities §13.1 contemplates. The design's answer is already in place: with the
+    vectors canonical and the index derived, a disk-backed library (§13.1's
+    Vamana/DiskANN candidates) is a rebuild, not a re-embed. Doc 13 should say so, and
+    say the manifest names the index's library and version so a reader knows which.
 109. **`/vector` publishes the index's precision.** The stored vector is f16 and is a
     fixed point of storage (unit 38); `/vector` should return exactly what the index
     compares, with full precision available through the Parquet export. Doc 13 §13.2
