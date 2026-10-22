@@ -3391,10 +3391,28 @@ are reserved at `max_concurrent_work`, so admission is the bound the library's p
 sized to. Work class is ordinary: a probe is microseconds. No lock is added; the
 library's own context lease is recorded under unit 38.
 
+**`/describe` answers the third state.** One binary search in the id map adds
+`"embedded": true|false` (and `record` when true) to a describe answer on a bundle that
+publishes vectors, and its page offers "More like this" — a link to `/similar` — only
+when true: `/similar` refuses a term without a vector, and a page should not offer a
+link that fails.
+
 **Not here.** `filter` (over-fetch with a candidate budget against one pattern) and
 `labels=true` on `/similar`'s entities: both compose with what exists and neither is
-needed for the first end-to-end run. A "more like this" link on an entity's `/describe`
-row, rendered only when the entity is embedded, waits for the same reason.
+needed for the first end-to-end run.
+
+**Run end to end on SOCKG (2026-10-22).** From `../okn-embeddings/graph.hdt` (27.1 M
+triples): `kgf build` with the authoring run's config, then `kgf verbalize` (1,237 roots
+over eleven targets, 1,215 distinct texts, 3.1 s), `okn-indexing embed-texts` (52 s on
+eight CPU cores, no GPU; 453 texts over the model's 256 tokens, the treatment and
+location texts the plan mode had already flagged), `kgf vectors` (0.3 s), `kgf manifest`
+and `--check`. The sidecar is 3.2 MB: Parquet 2.0 MB (1,654 B a record at f32), index
+1.1 MB (916 B a record at f16, as estimated), id map 78 KB, roots table 137 KB. Served:
+`/describe` on a treatment says embedded with its record; `/similar?k=5` answers in
+under a millisecond with five treatments at distances 0.0045–0.0137, the query's own
+record left out; a class and an unknown term refuse as `not_embedded` with their
+details; the vector `/vector` returns, sent back as a client vector, finds its own
+record at distance 0 and the same neighbour next; the pages render with the link.
 
 *Verified by* `vectors_answer_over_the_wire_and_refuse_what_is_not_embedded` in
 `crates/kgf/tests/serve.rs`: the capability in the manifest and the links in the
