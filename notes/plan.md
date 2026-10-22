@@ -3223,6 +3223,112 @@ Patterns without triple terms are unchanged: over the same files, main and this 
 answer 1,000-row pages of `s=`, `o=` and `p=` in the same 0.67–0.73 ms with
 byte-identical bodies.
 
+### 38. The `vectors/` sidecar in `kgf-store` — the id map and the mapped index ✅
+
+**Implemented 2026-10-22, on `vectors-store`.** Doc 13 §13.1's third stage, read side:
+a bundle may carry one vector per embedded entity and an ANN index over them, and a
+`Store` that opens such a bundle answers entity → record, record → entities, record →
+stored vector, record → text digest, and nearest-`k` by vector, all in id space. No
+HTTP: the routes are unit 39's. The embedding stage that produces the vectors is
+Python (`okn-indexing embed-texts`, in `../okn-embeddings`), and the build stage that
+assembles the sidecar from its output is unit 40's; this unit is the format, the
+reader, the one writer of the format, and the binding checks.
+
+**Who owns what, and why not hdtc.** Review of unit 35 proposed that hdtc own the
+sidecar format, the quantization and the index build, as it owns `sketch` and `keyset`.
+Declined, for the sidecar as a whole: the index is a third-party library's file and the
+id map carries no HDT knowledge beyond subject ids, so neither is an HDT-family format
+for hdtc's façade to define; and the library that *reads* the index at serve time has
+to be linked into `kgf-store` whatever writes it, so the one way to pin writer and
+reader together is for the same crate to do both — `--locked` then pins them as it pins
+hdtc, where a Python-written index would pair a pip-installed version with a crate
+version and be checked only at open. So `kgf build` builds the index and the id map,
+reading the embedding stage's Parquet at build time only; a server never parses
+Parquet. The Python stage's contract is texts in, vectors out, keyed by text digest —
+the digest-keyed streams unit 35's `--roots`/`--texts` already write — and it never
+sees an IRI or an id. The division falls on doc 04 §4.3's data/index line: the Parquet
+is data, recoverable only by re-running a model; the index and the id map are indexes
+over it, rebuilt from it in minutes.
+
+**The Parquet is canonical; the index is derived.** The alternative — publish the
+index alone and recover unchanged vectors from it for the next build — was rejected
+for the reason a full-text index is not a store of documents: every retrieval knob
+(dtype, connectivity, quantization) would become a one-way step, the canonical record
+would live in a library's private format, and an artifact recoverable only by GPU-days
+is data in every sense that matters. The vectors part of a bundle is ~2.7× the index
+alone at f32; it scales with embedded records, not triples.
+
+**Two files, one relation twice.** `vectors/index.usearch` holds record `i` under key
+`i`. `vectors/entities.idmap` is this crate's own format, little-endian, 8-byte-aligned
+regions after a 152-byte header: entity ids sorted with their records (binary search),
+record offsets into a grouped member list (two reads and a slice), and a 32-byte text
+digest per record. The header records the HDT's identity digest, the embedding stage's
+`convention_id`, the Parquet's SHA-256, and the widest record. Subject ids only: roots
+are subjects. `vectors/embeddings.parquet` and `vectors/roots.parquet` (entity IRI →
+digest, for a client holding the vectors without the bundle) are listed and
+checksummed when present and never read by a server.
+
+**No second mapping site.** The usearch crate can map a file itself, and the working
+plan assumed it would, making a C++ mapping outside the audited module. It does not
+have to: `map.rs` maps the index like any artifact and hands the library the slice
+(`view_from_buffer`), which reads in place. The `unsafe` is that call, in `map.rs`, and
+its obligation — the bytes outlive the view and never change — is the published-bundle
+premise the mapping already rests on, held together as `MappedIndex` with the view
+declared before the mapping so it drops first. The library refuses a file too short for
+its nodes; the view is refused unless it accounts for exactly the file's length; an
+index that allows several vectors per key, or has removed any, is refused. What the
+library trusts within that length is vouched for by the build that wrote it and the
+manifest's digest, as every artifact's bytes are.
+
+**Search contexts are the concurrency bound.** The library takes a search context from
+a fixed pool per running search and fails — does not wait — when none is free, so
+`OpenOptions::search_contexts` reserves the pool once at open, at the figure the
+caller's admission control bounds concurrency by (default 32, `max_concurrent_work`'s
+default). Fixed memory per context, nothing proportional to the bundle. A probe's cost
+is the index's stored search expansion times its connectivity, both readable from the
+open store for the cost table.
+
+**Open is size-independent; `verify` is the walk.** Open reads the header, checks the
+file is exactly the length its counts imply, reads the two sentinel offsets, binds the
+identity digest to `data.hdt`, and checks the index's size and width against the
+header. The index and the id map must occur together; a Parquet without them is
+refused. What open does not walk — ids strictly increasing and within the dictionary,
+rows in range, offsets monotone and every record non-empty, the two directions
+agreeing, the header's widest record, every index key below `records` present exactly
+once — `Vectors::verify` does, for `kgf manifest --check`. The accessors report a region
+that disagrees with its header as `Malformed` rather than asserting, after unit 35's
+review found one request could take the process down: open establishes the header and
+the sentinels, not the regions, so a request over a corrupt map must refuse, not panic.
+
+**The f16 fixed point.** A stored vector read back is the f16 the index keeps, widened;
+fed into a fresh index it is stored bit-identically, so the stored precision is a fixed
+point and the cosine metric does not renormalize on insert. `/vector` can therefore
+publish what the index compares (question 109).
+
+**Reuse across builds, in the Python stage.** Embedding is the one slow stage, and
+texts are addressed by content, so `embed-texts --reuse <earlier Parquet>` copies any
+vector whose digest it holds and embeds the rest. Gated on the model's *output*, not its
+name: twelve fixed probe texts embedded as one batch are stamped in every file, and a
+file is a source only if the current embedder reproduces them within 1e-5 — the same
+model name under a library upgrade can move every vector by far more. No cache
+directory and nothing shared across graphs: the source is a file the operator names.
+`--checkpoint DIR` writes whole parts as a run goes and a rerun reuses them, so a crash
+costs at most one part. Reused output matches a fresh run to ~1e-7, not bit for bit:
+the same text in a different batch rounds differently in the last place, which is why
+the probes are a fixed batch and the sidecar's identity is its recipe, not its bytes.
+
+*Verified by* `crates/kgf-store/src/vectors.rs`'s tests over a golden bundle given a
+sidecar by `Fixture::with_vectors` — every entity round-trips and every record maps
+back; a record is nearest its own stored vector and hits come nearest first; a query of
+the wrong width is refused; the capability and the file names are declared exactly when
+the files are present; an index without its id map is refused naming the id map, vectors
+without their index are refused, a sidecar copied beside another HDT is refused as a
+binding mismatch, an id map disagreeing with its index is refused naming both counts;
+`verify` catches each corruption open does not; the writer refuses an empty record, id
+zero and an entity named twice; and the f16 round trip — and by `map.rs`'s tests that a
+truncated index, trailing bytes and removed keys are refused at open and that as many
+searches as contexts run at once.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
@@ -4460,6 +4566,30 @@ following the code.
     place in a sample as an IRI does, keyed by its IRI, which its content fixes.
     Whether a reifier with no label of its own should take its triple term's reading
     as its label is left to doc 13's embedding view.
+106. **Who builds the vectors sidecar.** Doc 04 §4.3 has components (external tools)
+    and sidecars (`kgf build` itself); doc 13 §13.1 leaves the index build to
+    measurement. Unit 38 settles it for this implementation: the model runs in Python
+    and produces the data (`embeddings.parquet`, keyed by text digest, never seeing an
+    IRI or an id); `kgf build` builds the index and the id map from it, with the crate
+    that serves them, so `--locked` pins writer and reader; hdtc owns neither, since
+    neither is an HDT-family format. Doc 13 should say the embedding stage's contract
+    is texts in, vectors out, and that the index is built by whoever serves it.
+107. **Data inside a sidecar.** The Parquet is recoverable only by re-running a model,
+    which makes it data by doc 04 §4.3's own test, yet it lives under `vectors/` beside
+    the indexes derived from it. The line is the model's output as data, the ANN
+    structure as index — and the reason an index is never the canonical store of
+    vectors (unit 38). Doc 13 §13.1 item 3 should draw it.
+108. **`convention_id` names a space; probes show it.** Doc 13 §13.3's recipe hash is
+    what two parties *say* they share. A library upgrade under the same model name
+    moves every vector, and mixing two such spaces fails silently. The embedding stage
+    now stamps twelve fixed texts' vectors into every file, and reuse across builds
+    requires the current embedder to reproduce them within a tolerance. Doc 13 should
+    make the probes part of the convention, and say that reuse — and any client
+    claiming the space — is gated on them, not on the hash.
+109. **`/vector` publishes the index's precision.** The stored vector is f16 and is a
+    fixed point of storage (unit 38); `/vector` should return exactly what the index
+    compares, with full precision available through the Parquet export. Doc 13 §13.2
+    should say which precision the route carries.
 
 ## Not in this plan
 

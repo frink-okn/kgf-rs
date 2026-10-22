@@ -223,9 +223,9 @@ quietly.
 8. **A capability gate belongs only where an artifact can be absent.** A manifest's
    capability list is derived entirely from which artifact files a bundle carries, so it
    tells a server holding that bundle nothing new; its audience is the consumer reading
-   manifests *without* the bundle. `search`, `graphs`, and the sketch families are
-   therefore refused before the open when undeclared, because the bytes may really be
-   missing. `sample`, `labels`, and `terms` are never gated: they compose artifacts every
+   manifests *without* the bundle. `search`, `graphs`, `vectors`, and the sketch
+   families are therefore refused before the open when undeclared, because the bytes
+   may really be missing. `sample`, `labels`, and `terms` are never gated: they compose artifacts every
    bundle is required to carry, so a check could only suppress work the bytes support
    because the metadata is older than the code. What the *bundle carries* is the
    manifest's statement; what this *deployment routes* is the service descriptor's.
