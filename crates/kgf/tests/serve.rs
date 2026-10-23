@@ -5719,6 +5719,9 @@ fn verbalize_previews_a_config_in_three_modes_over_get_query_and_post() {
     );
     assert!(html.contains("<pre>label: Site one"), "{html}");
     assert!(html.contains("Location ALAU"));
+    // Each text links to its root's description by a bracketed IRI, which
+    // resolves whether or not the bundle declares a prefix covering it.
+    assert!(html.contains("/describe?iri=%3Chttp"), "{html}");
 }
 
 #[test]

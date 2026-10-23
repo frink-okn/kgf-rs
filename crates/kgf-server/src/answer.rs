@@ -6833,7 +6833,7 @@ impl Resource for VerbalizeAnswer {
                     @for record in &self.records {
                         article."verbalized" {
                             h3 { (record.target) " · " (record.label) }
-                            p { a href=(self.target.ask("describe", "iri", &record.iri)) { code { (record.iri) } } }
+                            p { a href=(self.target.ask("describe", "iri", &format!("<{}>", record.iri))) { code { (record.iri) } } }
                             pre { (record.text) }
                             p."note" {
                                 (group_digits(record.chars)) " characters · "
