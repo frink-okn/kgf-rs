@@ -6746,6 +6746,24 @@ impl Renders for VerbalizeAnswer {
     }
 }
 
+impl VerbalizeAnswer {
+    /// What the texts below are, for the two modes that draw them: a seeded
+    /// uniform sample, so the same seed shows the same roots on every reload.
+    /// Named roots need no explanation.
+    fn draw_note(&self) -> Option<String> {
+        let of = match (self.mode, &self.target_name) {
+            ("plan", _) => "each target".to_owned(),
+            ("sample", Some(target)) => format!("target {target:?}"),
+            _ => return None,
+        };
+        Some(format!(
+            "Up to {} roots of {of}, drawn uniformly at random with seed {}. The same seed \
+             draws the same roots; change it to see others.",
+            self.n, self.seed
+        ))
+    }
+}
+
 impl Resource for VerbalizeAnswer {
     fn to_json(&self) -> Bytes {
         json_body(self)
@@ -6816,17 +6834,22 @@ impl Resource for VerbalizeAnswer {
                             "Members counts every node of the class. Sampled texts are drawn \
                              uniformly by seed; lengths are in characters and lines. Limited \
                              counts predicates sampled down to the limit across the texts — the \
-                             number to tune the limit or the lists by. A truncated text needed more \
-                             reads than one request may make."
+                             number to tune the limit or the lists by. Cut by budget counts texts \
+                             this preview stopped short because one request may read or send only \
+                             so much; a build is not cut this way, and this is not the embedding \
+                             model's own limit on what it reads."
                         ))
                         (results_table(
-                            &["target", "class", "members", "sampled", "mean chars", "max chars", "mean lines", "limited", "truncated"],
+                            &["target", "class", "members", "sampled", "mean chars", "max chars", "mean lines", "limited", "cut by budget"],
                             &target_rows,
                         ))
                     }
                 }
                 section."section-block" {
                     h2 { "Texts" }
+                    @if let Some(draw) = self.draw_note() {
+                        (note(&draw))
+                    }
                     @if self.records.is_empty() {
                         (note("Nothing was rendered."))
                     }
