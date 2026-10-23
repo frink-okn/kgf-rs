@@ -119,6 +119,9 @@ pub struct Target {
     mount: Mount,
     body: bool,
     offers: Offers,
+    /// The release's verbalization config as YAML, for the verbalize form to
+    /// start from; `None` when it publishes none.
+    verbalize_yaml: Option<Arc<str>>,
     /// Logical dataset identity and the description link this release can
     /// actually answer, from the immutable manifest.
     dataset: Option<DatasetMetadata>,
@@ -189,10 +192,17 @@ impl Target {
             mount,
             body: false,
             offers,
+            verbalize_yaml: None,
             request_url,
             dataset: None,
             declarations: None,
         }
+    }
+
+    /// Attach the release's verbalization config, for its form to start from.
+    pub(crate) fn with_verbalize_yaml(mut self, yaml: Option<Arc<str>>) -> Self {
+        self.verbalize_yaml = yaml;
+        self
     }
 
     /// Attach the release's manifest, for the declarations a page renders.
@@ -245,6 +255,7 @@ impl Target {
             mount,
             body: true,
             offers: Offers::default(),
+            verbalize_yaml: None,
             request_url: None,
             dataset: None,
             declarations: None,
@@ -432,6 +443,7 @@ impl Target {
                 self.operation.path_segment(),
                 &self.params,
                 self.offers,
+                self.verbalize_yaml.as_deref(),
             )
         };
         (form.is_some() || !panels.0.is_empty()).then(

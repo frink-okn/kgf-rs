@@ -651,7 +651,8 @@ async fn bundle_manifest(
             .iter()
             .map(|&artifact| (artifact, release.export(artifact).clone()))
             .collect(),
-    );
+    )
+    .with_verbalize_yaml(release.verbalize_yaml().cloned());
 
     // The manifest itself is already in memory, but a bundle that cannot be
     // opened must not be described as though it can: a client reads
@@ -1564,7 +1565,8 @@ where
         wants.request_url.clone(),
     )
     .with_dataset_metadata(release.dataset_iri(), release.carries_description())
-    .with_declarations(release.declarations());
+    .with_declarations(release.declarations())
+    .with_verbalize_yaml(release.verbalize_yaml().cloned());
     let labels = PageLabelProfile::for_request(&service, release, representation);
     let opened = Arc::clone(&service);
     let result = blocking(service.admission(), work_class, move || {
@@ -1659,7 +1661,8 @@ where
         wants.request_url.clone(),
     )
     .with_dataset_metadata(release.dataset_iri(), release.carries_description())
-    .with_declarations(release.declarations());
+    .with_declarations(release.declarations())
+    .with_verbalize_yaml(release.verbalize_yaml().cloned());
     let opened = Arc::clone(&service);
     let result = blocking(service.admission(), work_class, move || {
         let (store, open) = opened.open_observed(target.id())?;

@@ -344,7 +344,20 @@ pub struct PublishedManifest {
     digest: ContentDigest,
     /// The vector sidecar's verbalization config, read beside the manifest
     /// when it lists one; see [`read_verbalize_config`].
-    verbalize: Option<Arc<VerbalizeResolved>>,
+    verbalize: Option<Arc<BundleVerbalize>>,
+}
+
+/// A bundle's published verbalization config, held the two ways it is used.
+#[derive(Debug)]
+pub struct BundleVerbalize {
+    /// Resolved once: `/verbalize`'s default, and what renders an embedded
+    /// entity's text live.
+    resolved: Arc<VerbalizeResolved>,
+    /// The same config as YAML, the form a person edits, for a page's config
+    /// field to start from. Rendered from the published JSON, so it says
+    /// exactly what the bundle's texts were rendered under; comments in the
+    /// file the config was authored as are not part of that and are not here.
+    yaml: Arc<str>,
 }
 
 impl PublishedManifest {
@@ -410,7 +423,12 @@ impl PublishedManifest {
 
     /// The bundle's verbalization config, when it publishes one.
     pub fn verbalize_config(&self) -> Option<&Arc<VerbalizeResolved>> {
-        self.verbalize.as_ref()
+        self.verbalize.as_ref().map(|verbalize| &verbalize.resolved)
+    }
+
+    /// The same config as YAML, for a form to start from.
+    pub fn verbalize_yaml(&self) -> Option<&Arc<str>> {
+        self.verbalize.as_ref().map(|verbalize| &verbalize.yaml)
     }
 
     /// Identity of the complete immutable publication profile.
@@ -488,7 +506,7 @@ impl Datasets {
             // defects rather than discovered by the first client to ask.
             let hdt =
                 ArtifactIdentity::from_manifest(&manifest, ExportArtifact::Hdt).map_err(&refuse)?;
-            let verbalize = published.verbalize_config().cloned();
+            let verbalize = published.verbalize.clone();
 
             datasets.entry(id.dataset).or_default().insert(
                 id.version,
@@ -785,9 +803,10 @@ pub struct Release {
     hdt: ArtifactIdentity,
     manifest: PublishedManifest,
     /// The verbalization config the vector sidecar's texts were rendered
-    /// under, resolved once: `/verbalize`'s default, and what renders an
-    /// embedded entity's text live. `None` when the bundle publishes none.
-    verbalize: Option<Arc<VerbalizeResolved>>,
+    /// under: `/verbalize`'s default, what renders an embedded entity's text
+    /// live, and what the verbalize form starts from. `None` when the bundle
+    /// publishes none.
+    verbalize: Option<Arc<BundleVerbalize>>,
 }
 
 impl Release {
@@ -808,7 +827,12 @@ impl Release {
 
     /// The bundle's own verbalization config, if it publishes one.
     pub fn verbalize_config(&self) -> Option<&Arc<VerbalizeResolved>> {
-        self.verbalize.as_ref()
+        self.verbalize.as_ref().map(|verbalize| &verbalize.resolved)
+    }
+
+    /// The same config as YAML, for the verbalize form to start from.
+    pub fn verbalize_yaml(&self) -> Option<&Arc<str>> {
+        self.verbalize.as_ref().map(|verbalize| &verbalize.yaml)
     }
 
     /// The logical dataset identity declared by this immutable release.
@@ -937,14 +961,14 @@ fn offset_is_rfc_3339(text: &str) -> bool {
 
 use jiff::Timestamp as Instant;
 
-/// The vector sidecar's verbalization config, resolved, when the manifest
-/// lists one. Read at startup with the manifest: a config that does not
+/// The vector sidecar's verbalization config, resolved and as YAML, when the
+/// manifest lists one. Read at startup with the manifest: a config that does not
 /// parse or resolve stops the server naming the file, as a manifest that
 /// does not parse does, rather than failing the first request that needs it.
 fn read_verbalize_config(
     bundle: &Path,
     manifest: &kgf_store::Manifest,
-) -> Result<Option<Arc<VerbalizeResolved>>, String> {
+) -> Result<Option<Arc<BundleVerbalize>>, String> {
     let name = kgf_store::store::artifact::VECTORS_CONFIG;
     if !manifest.artifacts.contains_key(name) {
         return Ok(None);
@@ -964,7 +988,12 @@ fn read_verbalize_config(
             path.display()
         )
     })?;
-    Ok(Some(Arc::new(resolved)))
+    let yaml = serde_norway::to_string(&config)
+        .map_err(|error| format!("rendering {} as YAML: {error}", path.display()))?;
+    Ok(Some(Arc::new(BundleVerbalize {
+        resolved: Arc::new(resolved),
+        yaml: yaml.into(),
+    })))
 }
 
 #[cfg(test)]

@@ -6394,6 +6394,28 @@ fn vectors_answer_over_the_wire_and_refuse_what_is_not_embedded() {
     let forced = server.get("/vec/v/v1/verbalize?target=things&iri=ex:f");
     forced.assert_status(200);
     assert_eq!(forced.json()["records"].as_array().unwrap().len(), 1);
+    // The page's config field starts from the bundle's config as YAML, is
+    // optional, and is marked to be left out of the URL while unchanged.
+    let page = server.request("GET", "/vec/v/v1/verbalize", &html).text();
+    assert!(
+        page.contains("data-omit-unchanged>targets:\n  things:\n    type: http://example.org/T"),
+        "{page}"
+    );
+    assert!(!page.contains("required"), "{page}");
+    // A sent config is shown as sent, and still optional here.
+    let page = server
+        .request(
+            "GET",
+            "/vec/v/v1/verbalize?config=targets%3A%7Bx%3A%7Btype%3A%20ex%3AT%7D%7D",
+            &html,
+        )
+        .text();
+    assert!(!page.contains("data-omit-unchanged>"), "{page}");
+    // Without a bundle config there is nothing to start from: the field is
+    // required and empty.
+    let page = server.request("GET", "/tox/v/v1/manifest", &html).text();
+    assert!(page.contains("name=\"config\""), "{page}");
+    assert!(!page.contains("data-omit-unchanged>"), "{page}");
     let unconfigured = server.get("/tox/v/v1/verbalize?iri=ex:site1");
     unconfigured.assert_status(400);
     assert!(

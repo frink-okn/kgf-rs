@@ -916,12 +916,18 @@ footer a:hover { text-decoration: underline; }
 /// server gives those the same meaning as omission; removing them here is a
 /// progressive enhancement that also keeps the browser's address-bar URL
 /// canonical. Required controls are never empty after browser validation.
+/// A control marked `data-omit-unchanged` starts from the server's own default
+/// — the verbalize form's bundle config — so it too is removed while it still
+/// holds what the page rendered: sending it would mean the same as omitting it.
 ///
 /// This is intentionally the whole client-side layer: navigation and response
 /// rendering remain ordinary HTTP, and fixed source contains no interpolated
 /// bundle data.
 const FORM_SCRIPT: &str = "\
 document.addEventListener('formdata',event=>{\
+for(const field of event.target.querySelectorAll('[data-omit-unchanged]')){\
+if(field.value===field.defaultValue)event.formData.delete(field.name);\
+}\
 for(const [name,value] of Array.from(event.formData.entries())){\
 if(typeof value==='string'&&value==='')event.formData.delete(name);\
 }\

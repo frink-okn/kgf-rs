@@ -536,6 +536,9 @@ pub struct BundleManifest {
     /// — so the page shows the digest the `ETag` carries, not a second reading
     /// of the manifest's text.
     downloads: Vec<(ExportArtifact, ArtifactIdentity)>,
+    /// The release's verbalization config as YAML, for the verbalize form to
+    /// start from.
+    verbalize_yaml: Option<std::sync::Arc<str>>,
 }
 
 impl BundleManifest {
@@ -556,7 +559,14 @@ impl BundleManifest {
             published,
             parsed,
             downloads,
+            verbalize_yaml: None,
         }
+    }
+
+    /// Attach the release's verbalization config, for its form to start from.
+    pub fn with_verbalize_yaml(mut self, yaml: Option<std::sync::Arc<str>>) -> Self {
+        self.verbalize_yaml = yaml;
+        self
     }
 }
 
@@ -669,7 +679,13 @@ impl Resource for BundleManifest {
                 }
 
                 section."workbench" {
-                    (forms::manifest_forms(&self.mount, &self.dataset, &self.version, manifest))
+                    (forms::manifest_forms(
+                        &self.mount,
+                        &self.dataset,
+                        &self.version,
+                        manifest,
+                        self.verbalize_yaml.as_deref(),
+                    ))
                 }
 
                 div."dashboard-grid" {
