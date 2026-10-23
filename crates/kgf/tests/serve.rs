@@ -6395,13 +6395,19 @@ fn vectors_answer_over_the_wire_and_refuse_what_is_not_embedded() {
     forced.assert_status(200);
     assert_eq!(forced.json()["records"].as_array().unwrap().len(), 1);
     // The page's config field starts from the bundle's config as YAML, is
-    // optional, and is marked to be left out of the URL while unchanged.
+    // optional, and is marked to be left out of the URL while unchanged; the
+    // plan table links each target alone, and the texts offer another draw.
     let page = server.request("GET", "/vec/v/v1/verbalize", &html).text();
     assert!(
         page.contains("data-omit-unchanged>targets:\n  things:\n    type: http://example.org/T"),
         "{page}"
     );
     assert!(!page.contains("required"), "{page}");
+    assert!(
+        page.contains("/vec/v/v1/verbalize?n=20&amp;target=things"),
+        "{page}"
+    );
+    assert!(page.contains("/vec/v/v1/verbalize?seed=1"), "{page}");
     // A sent config is shown as sent, and still optional here.
     let page = server
         .request(

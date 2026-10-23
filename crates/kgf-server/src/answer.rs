@@ -351,6 +351,13 @@ impl Target {
         (!self.body).then(|| query(self.base(), &self.params.with("cursor", token)))
     }
 
+    /// This same request with its parameters rewritten by `edit`, for a link
+    /// that varies it; `None` for a body-addressed request, which has no URL
+    /// to vary.
+    fn varied(&self, edit: impl FnOnce(&Params) -> Params) -> Option<String> {
+        (!self.body).then(|| query(self.base(), &edit(&self.params)))
+    }
+
     /// A one-parameter request against another operation of the same bundle,
     /// for a link on a page.
     fn ask(&self, operation: &str, parameter: &str, value: &str) -> String {
@@ -6758,7 +6765,33 @@ impl Renders for VerbalizeAnswer {
     }
 }
 
+/// Roots a target's link in the plan table asks for: enough to read the
+/// target's range of texts, well under the request cap.
+const VERBALIZE_TARGET_LINK_N: u32 = 20;
+
 impl VerbalizeAnswer {
+    /// One target alone, with more of its roots, under the same config and
+    /// seed. Only the plan mode's table links its targets; a single-target
+    /// table is already that page.
+    fn target_link(&self, name: &str) -> Option<String> {
+        if self.mode != "plan" {
+            return None;
+        }
+        self.target.varied(|params| {
+            params
+                .without("plan")
+                .with("target", name)
+                .with("n", &VERBALIZE_TARGET_LINK_N.to_string())
+        })
+    }
+
+    /// The same request under the next seed: another sample of the same size.
+    fn redraw_link(&self) -> Option<String> {
+        let seed = self.seed.checked_add(1)?;
+        self.target
+            .varied(|params| params.with("seed", &seed.to_string()))
+    }
+
     /// What the texts below are, for the two modes that draw them: a seeded
     /// uniform sample, so the same seed shows the same roots on every reload.
     /// Named roots need no explanation.
@@ -6796,8 +6829,15 @@ impl Resource for VerbalizeAnswer {
             .targets
             .iter()
             .map(|report| {
+                let name = match self.target_link(&report.name) {
+                    Some(href) => Value::Link {
+                        href,
+                        label: &report.name,
+                    },
+                    None => Value::Text(&report.name),
+                };
                 vec![
-                    Value::Text(&report.name),
+                    name,
                     Value::Code(&report.class),
                     Value::Number(report.members),
                     Value::Number(report.sampled),
@@ -6861,6 +6901,9 @@ impl Resource for VerbalizeAnswer {
                     h2 { "Texts" }
                     @if let Some(draw) = self.draw_note() {
                         (note(&draw))
+                        @if let Some(next) = self.redraw_link() {
+                            (pager(&next, "Draw another sample →"))
+                        }
                     }
                     @if self.records.is_empty() {
                         (note("Nothing was rendered."))
