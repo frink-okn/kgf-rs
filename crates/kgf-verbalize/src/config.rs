@@ -37,7 +37,8 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_PREDICATE_LIMIT: u32 = 3;
 
 /// The verbalization section as written: in `build.yaml`, or in the body of a
-/// preview request.
+/// preview request. Serialized, it leaves out every field that holds its
+/// default, so a published config reads as what its author wrote.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -49,17 +50,17 @@ pub struct Config {
 
     /// Predicate lists merged into every target: a target's own list is
     /// appended, without duplicates.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Lists::is_empty")]
     pub defaults: Lists,
 
     /// Label templates keyed by class, applied to a node of that class in any
     /// position. The key is a local name for the profile.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, Profile>,
 
     /// The classes whose members become roots. The key is a local name for
     /// the target, used in output and diagnostics.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub targets: BTreeMap<String, Target>,
 }
 
@@ -73,17 +74,26 @@ pub struct Lists {
     /// description, identifier, citation: text that names a node *somehow*
     /// when nothing better exists, and that a label endpoint should never
     /// return. Full IRIs.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub label_predicates: Vec<String>,
 
     /// Predicates left out of the walk. Full IRIs.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore_predicates: Vec<String>,
 
     /// When non-empty, the only predicates walked; `ignore_predicates` still
     /// applies within it. Full IRIs.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include_predicates: Vec<String>,
+}
+
+impl Lists {
+    /// No list has an entry: the defaults a document that writes none has.
+    pub fn is_empty(&self) -> bool {
+        self.label_predicates.is_empty()
+            && self.ignore_predicates.is_empty()
+            && self.include_predicates.is_empty()
+    }
 }
 
 /// A label template for one class.
@@ -96,7 +106,7 @@ pub struct Profile {
     /// The template, with `{field}` placeholders naming entries of `fields`.
     pub template: String,
     /// Placeholder name → predicate IRI whose value fills it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fields: BTreeMap<String, String>,
 }
 
@@ -108,13 +118,13 @@ pub struct Target {
     #[serde(rename = "type")]
     pub class: String,
     /// See [`Lists::label_predicates`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub label_predicates: Vec<String>,
     /// See [`Lists::ignore_predicates`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore_predicates: Vec<String>,
     /// See [`Lists::include_predicates`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include_predicates: Vec<String>,
     /// Overrides the document's `predicate_limit` for this target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,7 +134,7 @@ pub struct Target {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label_template: Option<String>,
     /// Placeholder name → predicate IRI, for `label_template`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub label_fields: BTreeMap<String, String>,
 }
 
