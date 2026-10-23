@@ -3525,6 +3525,25 @@ builder image target. Still open: whether the separate commands stay beside the 
 stage for the authoring loop, and where the streams and the embedding checkpoint live
 during a build, since a checkpoint must outlive a failed build's staging.
 
+**Which texts the model truncated (decided 2026-10-23, this unit).** The embedding
+model reads at most `max_seq_length` tokens (256 for the current model) and embeds a
+longer text from its first 256 alone. The embedding stage measures this with the
+model's own tokenizer but keeps only a total, `truncated_records` in the Parquet
+footer (453 of SOCKG's 1,215 texts), so nothing can say *which* texts were cut, and
+kgf shows not even the total yet. The change spans both repositories:
+`okn-indexing embed-texts` writes each row's token count as a column (a new footer
+`format`, and an okn-embeddings release); `kgf vectors` carries it into the sidecar —
+into the id map or a small file beside it, since the server never parses Parquet;
+and `/describe`'s embedded text says how much of it the model read and marks where
+the cut falls, with the total in the manifest's `vectors` block. `/verbalize` cannot
+know token counts without the tokenizer, so a preview can only report characters.
+
+That makes "truncated" the model's word. `/verbalize` already uses it for something
+else — a text the preview's read or byte budget stopped short — and its page now
+calls that "cut by budget"; the JSON fields (`truncated` on a record, on a target
+report, and on `/describe`'s `embedded_text`) should be renamed to match in this unit,
+before the model's meaning arrives beside them.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
