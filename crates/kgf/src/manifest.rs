@@ -249,6 +249,7 @@ pub fn run(args: Args) -> Result<()> {
         manifest.verify_against(&facts, &dir)?;
         verify_described_artifacts(&manifest, &bundle, &facts)?;
         verify_description_artifacts(&bundle, &manifest)?;
+        verify_vectors_description(&manifest, &bundle)?;
         println!(
             "{}: manifest agrees with its artifacts ({} triples, {})",
             dir.display(),
@@ -643,6 +644,7 @@ fn build(
     .unwrap_or_else(now_rfc3339);
     let prefixes = prefixes(requested, previous)?;
     let predicate_roles = predicate_roles(requested, previous, &prefixes)?;
+    let capabilities = capabilities(bundle, facts)?;
 
     Ok(Manifest {
         id,
@@ -684,10 +686,7 @@ fn build(
             .clone()
             .or_else(|| previous.and_then(|m| m.design.clone())),
         counts: facts.counts(),
-        capabilities: facts
-            .capabilities()
-            .map(|capability| (capability.as_str().to_owned(), serde_json::json!({})))
-            .collect(),
+        capabilities,
         prefixes,
         predicate_roles,
         artifacts: artifacts.into_iter().collect(),
@@ -703,6 +702,50 @@ fn build(
             .clone()
             .or_else(|| previous.and_then(|m| m.source.clone())),
     })
+}
+
+/// Each capability the artifacts support, with what it declares: an empty
+/// object, except `vectors`, which describes its space, model and index (see
+/// [`crate::vectors::describe`]).
+fn capabilities(
+    bundle: &PublishedBundle,
+    facts: &BundleFacts,
+) -> Result<BTreeMap<String, serde_json::Value>> {
+    let vectors = crate::vectors::describe(bundle)?;
+    facts
+        .capabilities()
+        .map(|capability| {
+            let value = match (capability, &vectors) {
+                (Capability::Vectors, Some(description)) => serde_json::to_value(description)
+                    .context("serializing the vectors description")?,
+                _ => serde_json::json!({}),
+            };
+            Ok((capability.as_str().to_owned(), value))
+        })
+        .collect()
+}
+
+/// The `vectors` description a manifest carries must be the one its sidecar
+/// gives now: a sidecar reassembled after the manifest was written would
+/// otherwise go on declaring the old model or counts.
+fn verify_vectors_description(manifest: &Manifest, bundle: &PublishedBundle) -> Result<()> {
+    let Some(expected) = crate::vectors::describe(bundle)? else {
+        return Ok(());
+    };
+    match manifest.vectors() {
+        Some(declared) if declared == expected => Ok(()),
+        Some(_) => bail!(
+            "the manifest's `vectors` description disagrees with the sidecar in {}; \
+             regenerate it with `kgf manifest {}`",
+            bundle.path().display(),
+            bundle.path().display()
+        ),
+        None => bail!(
+            "the manifest declares `vectors` without describing it; \
+             regenerate it with `kgf manifest {}`",
+            bundle.path().display()
+        ),
+    }
 }
 
 fn predicate_roles(

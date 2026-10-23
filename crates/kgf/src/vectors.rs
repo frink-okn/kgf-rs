@@ -262,26 +262,8 @@ fn read_embeddings(path: &Path, index_path: &Path) -> Result<ReadEmbeddings> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .with_context(|| format!("reading {} as Parquet", path.display()))?;
 
-    let footer: BTreeMap<String, String> = builder
-        .metadata()
-        .file_metadata()
-        .key_value_metadata()
-        .into_iter()
-        .flatten()
-        .filter_map(|KeyValue { key, value }| {
-            key.strip_prefix(FOOTER_PREFIX)
-                .map(|key| (key.to_owned(), value.clone().unwrap_or_default()))
-        })
-        .collect();
-    let footer_field = |name: &str| {
-        footer.get(name).ok_or_else(|| {
-            anyhow!(
-                "{} carries no `{FOOTER_PREFIX}{name}` in its footer; \
-                 it was not written by the embedding stage",
-                path.display()
-            )
-        })
-    };
+    let footer = Footer::of(path, builder.metadata().file_metadata());
+    let footer_field = |name: &str| footer.field(name);
     let format = footer_field("format")?;
     ensure!(
         format == TEXTS_FORMAT,
@@ -561,6 +543,124 @@ impl RootsBatch {
             .write(&batch)
             .with_context(|| format!("writing {}", path.display()))
     }
+}
+
+/// The embedding stage's footer keys, without their prefix.
+struct Footer<'a> {
+    path: &'a Path,
+    fields: BTreeMap<String, String>,
+}
+
+impl<'a> Footer<'a> {
+    fn of(path: &'a Path, metadata: &parquet::file::metadata::FileMetaData) -> Self {
+        let fields = metadata
+            .key_value_metadata()
+            .into_iter()
+            .flatten()
+            .filter_map(|KeyValue { key, value }| {
+                key.strip_prefix(FOOTER_PREFIX)
+                    .map(|key| (key.to_owned(), value.clone().unwrap_or_default()))
+            })
+            .collect();
+        Self { path, fields }
+    }
+
+    /// Read only the footer of the Parquet at `path`.
+    fn read(path: &'a Path) -> Result<Self> {
+        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("reading {} as Parquet", path.display()))?;
+        Ok(Self::of(path, builder.metadata().file_metadata()))
+    }
+
+    fn field(&self, name: &str) -> Result<&String> {
+        self.fields.get(name).ok_or_else(|| {
+            anyhow!(
+                "{} carries no `{FOOTER_PREFIX}{name}` in its footer; \
+                 it was not written by the embedding stage",
+                self.path.display()
+            )
+        })
+    }
+
+    fn parsed<T: std::str::FromStr>(&self, name: &str) -> Result<T>
+    where
+        T::Err: std::error::Error + Send + Sync + 'static,
+    {
+        self.field(name)?
+            .parse()
+            .with_context(|| format!("{}'s {name}", self.path.display()))
+    }
+}
+
+/// What a bundle's `vectors` capability declares, for `kgf manifest` to write
+/// into the manifest: the sidecar's own facts, the space and the model from
+/// the embedding stage's footer (read here once, so a server never parses the
+/// Parquet), and the targets from the published config. `None` for a bundle
+/// without the sidecar, and for one whose sidecar does not publish the
+/// Parquet: the model is known only from its footer, and a sidecar is servable
+/// without it. Without the config, the targets are empty.
+///
+/// The index's library version is the one this binary links. The sidecar is
+/// written by `kgf vectors` and described by `kgf manifest`, which `--locked`
+/// builds from one lockfile, so it is also the version that wrote the index.
+pub fn describe(
+    bundle: &kgf_store::PublishedBundle,
+) -> Result<Option<kgf_store::VectorsDescription>> {
+    let Some(facts) = kgf_store::vectors_sidecar_facts(bundle)
+        .with_context(|| format!("opening the vector sidecar in {}", bundle.path().display()))?
+    else {
+        return Ok(None);
+    };
+    let parquet = bundle.path().join(artifact::VECTORS_EMBEDDINGS);
+    if !parquet.is_file() {
+        return Ok(None);
+    }
+    let footer = Footer::read(&parquet)?;
+    let convention_id = footer.field("convention_id")?;
+    ensure!(
+        parse_digest(convention_id)? == facts.convention_id,
+        "{} names a different vector space than the id map beside it; \
+         assemble the sidecar again with `kgf vectors`",
+        parquet.display()
+    );
+    let dimensions: u32 = footer.parsed("dim")?;
+    ensure!(
+        dimensions == facts.dimensions,
+        "{} holds {dimensions}-dimensional vectors but the id map says {}",
+        parquet.display(),
+        facts.dimensions
+    );
+    let config_path = bundle.path().join(artifact::VECTORS_CONFIG);
+    let targets = if config_path.is_file() {
+        read_config(&config_path)?
+            .targets
+            .into_iter()
+            .map(|(name, target)| (name, target.class))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    Ok(Some(kgf_store::VectorsDescription {
+        model: footer.field("model")?.clone(),
+        convention_id: convention_id.clone(),
+        dimensions,
+        metric: footer.field("metric")?.clone(),
+        normalized: footer.parsed("normalized")?,
+        max_seq_length: footer.parsed("max_seq_length")?,
+        entities: facts.entities,
+        records: facts.records,
+        truncated_records: footer.parsed("truncated_records")?,
+        targets,
+        index: kgf_store::VectorsIndexDescription {
+            library: "usearch".to_owned(),
+            library_version: usearch::version().to_owned(),
+            kind: "hnsw".to_owned(),
+            quantization: "f16".to_owned(),
+            connectivity: facts.connectivity,
+            expansion_search: facts.expansion_search,
+        },
+    }))
 }
 
 /// The config as given, YAML or JSON.

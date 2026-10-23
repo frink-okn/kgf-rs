@@ -209,6 +209,8 @@ fn write_parquet(out: &Path, digests: &[[u8; 32]], format: &str) {
         ("normalized", "false".to_owned()),
         ("record_count", digests.len().to_string()),
         ("convention_id", CONVENTION.to_owned()),
+        ("max_seq_length", "256".to_owned()),
+        ("truncated_records", "1".to_owned()),
     ]
     .into_iter()
     .map(|(key, value)| KeyValue::new(format!("okn-embeddings.{key}"), value))
@@ -299,6 +301,22 @@ fn the_verbalizers_streams_become_a_sidecar_the_server_opens() {
         manifest["artifacts"]
             .get("vectors/verbalize.json")
             .is_some()
+    );
+    // The capability describes the space, the coverage and the index, from
+    // the footer and the sidecar, so a reader needs neither.
+    let description = &declared[Capability::Vectors.as_str()];
+    assert_eq!(description["model"], "test-model", "{description}");
+    assert_eq!(description["convention_id"], CONVENTION);
+    assert_eq!(description["dimensions"], DIM);
+    assert_eq!(description["max_seq_length"], 256);
+    assert_eq!(description["truncated_records"], 1);
+    assert_eq!(description["records"], vectors.records());
+    assert_eq!(description["entities"], vectors.entities());
+    assert_eq!(description["targets"]["things"], T);
+    assert_eq!(description["index"]["kind"], "hnsw");
+    assert_eq!(
+        description["index"]["connectivity"],
+        vectors.connectivity() as u64
     );
 
     // A live render under the stored config is the text that was embedded:
@@ -417,6 +435,20 @@ fn kgf_manifest_refuses_a_sidecar_that_does_not_describe_its_bundle() {
     std::fs::write(&id_map, &good).unwrap();
     published.describe();
     published.check().expect("restored, it checks again");
+
+    // A manifest whose description no longer matches the sidecar is caught.
+    let manifest_path = published.bundle().join("manifest.json");
+    let good_manifest = std::fs::read(&manifest_path).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_slice(&good_manifest).unwrap();
+    manifest["capabilities"]["vectors"]["model"] = "another-model".into();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let error = format!("{:#}", published.check().unwrap_err());
+    assert!(error.contains("disagrees with the sidecar"), "{error}");
+    std::fs::write(&manifest_path, &good_manifest).unwrap();
 }
 
 #[test]

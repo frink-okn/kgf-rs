@@ -611,6 +611,44 @@ pub fn verify_vectors_artifacts(
     Ok(())
 }
 
+/// What a bundle's vector sidecar says about itself, for a manifest to
+/// declare: read at open, without the walk [`verify_vectors_artifacts`]
+/// makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidecarFacts {
+    /// Vector width.
+    pub dimensions: u32,
+    /// Distinct vectors.
+    pub records: u64,
+    /// Nodes with a vector.
+    pub entities: u64,
+    /// The vector space, as the id map records it.
+    pub convention_id: [u8; 32],
+    /// Links per node in the index's graph.
+    pub connectivity: u64,
+    /// Candidates one probe visits.
+    pub expansion_search: u64,
+}
+
+/// Open a bundle's vector sidecar and report what it says about itself;
+/// `None` for a bundle without one.
+pub fn vectors_sidecar_facts(bundle: &PublishedBundle) -> Result<Option<SidecarFacts>> {
+    let artifacts = crate::store::ArtifactSet::resolve(bundle.path())?;
+    let hdt = open_published(bundle, &artifacts.hdt)?;
+    let perm = open_published(bundle, &artifacts.perm)?;
+    let data = IndexedHdt::open(hdt, perm)?;
+    Ok(artifacts
+        .open_vectors(bundle, &data, 1)?
+        .map(|vectors| SidecarFacts {
+            dimensions: vectors.header().dimensions,
+            records: vectors.records(),
+            entities: vectors.entities(),
+            convention_id: vectors.header().convention_id,
+            connectivity: vectors.connectivity() as u64,
+            expansion_search: vectors.expansion_search() as u64,
+        }))
+}
+
 /// One record as the id-map writer takes it: in record order, so the `n`th
 /// row given is record `n`.
 #[derive(Debug, Clone)]

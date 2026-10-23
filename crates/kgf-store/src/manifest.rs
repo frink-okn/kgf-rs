@@ -702,6 +702,59 @@ impl ArtifactEntry {
     }
 }
 
+/// What a bundle's `vectors` capability declares, as the value of that
+/// capability in the manifest: the space its vectors are in, what was
+/// embedded, and the index over them. `kgf manifest` writes it from the
+/// sidecar, the embedding stage's footer and the published verbalization
+/// config, so a reader learns all of it from the manifest alone — a server
+/// never parses the Parquet it came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorsDescription {
+    /// The embedding model, as the embedding stage names it.
+    pub model: String,
+    /// The vector space: hex SHA-256 over the model, width, metric and
+    /// normalization. Two bundles' vectors are comparable exactly when it
+    /// agrees.
+    pub convention_id: String,
+    /// Vector width.
+    pub dimensions: u32,
+    /// The distance the vectors are compared under.
+    pub metric: String,
+    /// Whether every vector is unit length.
+    pub normalized: bool,
+    /// The most tokens of a text the model reads; a longer text is embedded
+    /// from its first `max_seq_length` tokens.
+    pub max_seq_length: u32,
+    /// Nodes with a vector.
+    pub entities: u64,
+    /// Distinct vectors: nodes whose texts are identical share one.
+    pub records: u64,
+    /// Records whose text was longer than `max_seq_length` tokens.
+    pub truncated_records: u64,
+    /// The verbalization targets the embedded nodes were drawn from: target
+    /// name to class IRI.
+    pub targets: BTreeMap<String, String>,
+    /// The approximate-nearest-neighbour index.
+    pub index: VectorsIndexDescription,
+}
+
+/// The index a bundle's `/similar` searches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorsIndexDescription {
+    /// The library whose file format `index.usearch` is.
+    pub library: String,
+    /// The library version that wrote it.
+    pub library_version: String,
+    /// The graph structure: a hierarchical navigable small world.
+    pub kind: String,
+    /// The scalar type a stored vector is held in.
+    pub quantization: String,
+    /// Links per node in the graph.
+    pub connectivity: u64,
+    /// Candidates one probe visits: the search's breadth.
+    pub expansion_search: u64,
+}
+
 /// A bundle manifest.
 ///
 /// Field order here is the serialized order and every collection is a
@@ -856,6 +909,17 @@ impl ComponentRole {
             Self::Derived => "derived",
             Self::Entailment => "entailment",
         }
+    }
+}
+
+impl Manifest {
+    /// What the `vectors` capability declares, when it declares it and in a
+    /// form this build reads. `None` for a bundle without vectors, and for
+    /// one whose manifest predates the description (an empty object).
+    pub fn vectors(&self) -> Option<VectorsDescription> {
+        self.capabilities
+            .get(Capability::Vectors.as_str())
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
     }
 }
 
