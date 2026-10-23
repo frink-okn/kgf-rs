@@ -414,7 +414,15 @@ impl Target {
 
     /// The GET editor for this answer, absent for a body-addressed request.
     fn form(&self) -> Option<maud::Markup> {
-        if self.body {
+        self.form_beside(maud::html! {})
+    }
+
+    /// The GET editor for this answer with `panels` in the same row of
+    /// toggles, or `panels` alone for a body-addressed request — which has no
+    /// editor but may still have something to show. `None` when there is
+    /// neither.
+    fn form_beside(&self, panels: maud::Markup) -> Option<maud::Markup> {
+        let form = if self.body {
             None
         } else {
             forms::operation_form(
@@ -425,7 +433,10 @@ impl Target {
                 &self.params,
                 self.offers,
             )
-        }
+        };
+        (form.is_some() || !panels.0.is_empty()).then(
+            || maud::html! { div."query-stack" { @if let Some(form) = form { (form) } (panels) } },
+        )
     }
 }
 
@@ -10220,30 +10231,10 @@ impl Resource for Answer {
                 @if let Some(identifier) = self.described_identifier() {
                     p."focus-identifier" { code { (identifier) } }
                 }
-                @if let Some(link) = self.more_like_this() {
-                    p."more-like-this" { a href=(link) { "More like this →" } }
-                }
-                @if let Some(embedded) = self.embedded_text() {
-                    section."section-block" {
-                        h2 { "Embedded text" }
-                        @if embedded.matches_embedded {
-                            (note(&format!(
-                                "The text this resource's vector was computed from, rendered live under the bundle's verbalization config as target {:?}.",
-                                embedded.target
-                            )))
-                        } @else {
-                            (note(&format!(
-                                "Rendered live under the bundle's verbalization config as target {:?}; it differs from the text the vector was computed from, so the verbalizer has changed since this version was built.",
-                                embedded.target
-                            )))
-                        }
-                        pre."embedded-text" { (embedded.text) }
-                    }
-                }
                 div."answer-summary" {
                     (fields(&summary))
                 }
-                @if let Some(form) = self.target.form() {
+                @if let Some(form) = self.target.form_beside(self.describe_panels()) {
                     div."query-editor" { (form) }
                 }
                 @if !self.absent_terms.is_empty() {
@@ -10303,6 +10294,39 @@ impl Answer {
         }
     }
 
+    /// The describe page's own toggles, beside its editor: the
+    /// text its vector was computed from, closed until asked for, and a link
+    /// to its nearest neighbours in vector space. Empty on every other page.
+    fn describe_panels(&self) -> maud::Markup {
+        maud::html! {
+            @if let Some(embedded) = self.embedded_text() {
+                details."query-form" {
+                    summary { "Embedded text" }
+                    div."panel-body" {
+                        @if embedded.matches_embedded {
+                            (note(&format!(
+                                "The text this resource's vector was computed from, rendered live under the bundle's verbalization config as target {:?}.",
+                                embedded.target
+                            )))
+                        } @else {
+                            (note(&format!(
+                                "Rendered live under the bundle's verbalization config as target {:?}; it differs from the text the vector was computed from, so the verbalizer has changed since this version was built.",
+                                embedded.target
+                            )))
+                        }
+                        pre."embedded-text" { (embedded.text) }
+                    }
+                }
+            }
+            @if let Some(link) = self.similar_link() {
+                a."stack-link" href=(link)
+                    title="The resources whose embedding vectors are nearest this one's" {
+                    "Similar by embedding →"
+                }
+            }
+        }
+    }
+
     fn embedded_text(&self) -> Option<&EmbeddedText> {
         match &self.echo {
             Echo::Describe { embedded_text, .. } => embedded_text.as_ref(),
@@ -10312,7 +10336,7 @@ impl Answer {
 
     /// A link to the resource's nearest neighbours, offered only where
     /// `/similar` will answer: the id map said it has a vector.
-    fn more_like_this(&self) -> Option<String> {
+    fn similar_link(&self) -> Option<String> {
         let Echo::Describe {
             resource,
             embedded: Some(true),

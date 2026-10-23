@@ -850,6 +850,20 @@ span.term-static { color: var(--dim); }
 .query-form[open] summary { border: 0; border-bottom: 1px solid var(--rule); border-radius: .7rem .7rem 0 0; background: var(--accent-soft); color: var(--accent); }
 .query-form form { padding: 1rem; }
 .query-form form > .note { margin-bottom: .9rem; }
+.query-form .panel-body { padding: 1rem; }
+.query-form .panel-body > .note { margin-bottom: .9rem; }
+.embedded-text { margin: 0; max-height: 28rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .82rem; line-height: 1.55; }
+.stack-link {
+  border: 1px solid var(--rule-strong);
+  border-radius: .5rem;
+  background: var(--surface);
+  color: var(--dim);
+  padding: .42rem .7rem;
+  font-size: .82rem;
+  font-weight: 650;
+  text-decoration: none;
+}
+.stack-link:hover { border-color: var(--accent); color: var(--accent); }
 .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: .85rem 1rem; margin-bottom: 1rem; }
 .form-grid > label { display: flex; min-width: 0; flex-direction: column; gap: .3rem; }
 .control-label, .choice legend { color: var(--dim); font-size: .78rem; font-weight: 550; }

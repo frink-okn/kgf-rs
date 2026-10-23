@@ -54,7 +54,8 @@ pub(crate) fn manifest_forms(
     }
 }
 
-/// The editor shown above an existing GET answer.
+/// The editor shown above an existing GET answer: one collapsible form, which
+/// the caller places in a `query-stack` beside any panels of its own.
 pub(crate) fn operation_form(
     mount: &Mount,
     dataset: &str,
@@ -63,7 +64,7 @@ pub(crate) fn operation_form(
     params: &Params,
     offers: Offers,
 ) -> Option<Markup> {
-    let form = match operation {
+    match operation {
         "fragment" => Some(fragment(mount, dataset, version, params, offers, false)),
         "tpf" => Some(tpf(mount, dataset, version, params, offers, false)),
         "count" => Some(count(mount, dataset, version, params, offers, false)),
@@ -75,8 +76,7 @@ pub(crate) fn operation_form(
         "vector" => Some(vector_form(mount, dataset, version, params, false)),
         "similar" => Some(similar_form(mount, dataset, version, params, false)),
         _ => None,
-    }?;
-    Some(html! { div."query-stack" { (form) } })
+    }
 }
 
 fn tpf(

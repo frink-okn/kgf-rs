@@ -6402,7 +6402,7 @@ fn vectors_answer_over_the_wire_and_refuse_what_is_not_embedded() {
     let page = server
         .request("GET", "/vec/v/v1/describe?iri=ex:a", &html)
         .text();
-    assert!(page.contains("More like this"), "{page}");
+    assert!(page.contains("Similar by embedding"), "{page}");
     assert!(page.contains("/vec/v/v1/similar?iri="), "{page}");
     let not_embedded = server.get("/vec/v/v1/describe?iri=ex:f").json();
     assert_eq!(not_embedded["embedded"], false);
@@ -6410,7 +6410,7 @@ fn vectors_answer_over_the_wire_and_refuse_what_is_not_embedded() {
     let page = server
         .request("GET", "/vec/v/v1/describe?iri=ex:f", &html)
         .text();
-    assert!(!page.contains("More like this"));
+    assert!(!page.contains("Similar by embedding"));
     let no_vectors = server.get("/tox/v/v1/describe?iri=ex:site1").json();
     assert!(no_vectors.get("embedded").is_none());
 

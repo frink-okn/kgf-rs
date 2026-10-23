@@ -3404,7 +3404,7 @@ library's own context lease is recorded under unit 38.
 
 **`/describe` answers the third state.** One binary search in the id map adds
 `"embedded": true|false` (and `record` when true) to a describe answer on a bundle that
-publishes vectors, and its page offers "More like this" — a link to `/similar` — only
+publishes vectors, and its page offers "Similar by embedding" — a link to `/similar` — only
 when true: `/similar` refuses a term without a vector, and a page should not offer a
 link that fails.
 
