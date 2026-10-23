@@ -2893,10 +2893,14 @@ them written out, in dictionary lookups; `max_verbalize_roots` rank descents;
 IRIs draws `n` seeded-uniform members, the same draw `/sample` makes; a config alone is
 a *plan* — every target's member count and `n` sampled texts with length statistics,
 each text reporting `limited` (predicates sampled down to the limit: the tuning signal)
-and `truncated` (the server's bound, not a config problem). The config travels as YAML
+and `truncated` (the server's bound, not a config problem; the page calls it "cut by
+budget", and unit 40 renames the field, since "truncated" is the embedding model's
+word). The config travels as YAML
 or JSON text in a GET parameter for a browser and as a JSON body on `QUERY` (canonical)
 and `POST` (fallback), with the same fields either way. The HTML representation carries
 the config in a form, so a config can be drafted in a browser against a served bundle.
+On a bundle that publishes its own config, the form starts from it, as YAML, and leaves
+it out of the submitted URL while unchanged (2026-10-23).
 
 **Not a manifest capability.** The route needs no artifact, so declaring it would tell a
 reader of the manifest nothing about the bundle (unit 27's rule), and the manifest is a
@@ -3317,9 +3321,10 @@ held twice, and a digest that is not hex — checked for ASCII before it is slic
 bad line is refused rather than a panic. The manifest is not rewritten: `kgf manifest`
 derives the capability from the files, and on both its paths now walks the id map with
 `Vectors::verify` and checks its recorded parent digest against the Parquet's checksum,
-beside the graph index's binding check. The `vectors` block the manifest should carry
-for a reader without the bundle — model, `convention_id`, width, the probes, the index's
-build parameters, the declared scope — is unit 40's, with the build stage.
+beside the graph index's binding check. It also writes the capability's value: a
+description of the space, the coverage and the index for a reader without the bundle,
+read from the Parquet's footer there and never by a server (2026-10-23; see unit 40,
+where it was planned, for its fields).
 
 **The build's memory is linear in the records, and the library cannot bound it.** The
 usearch crate's `add` copies every vector in and builds the graph in memory; there is
@@ -3394,7 +3399,7 @@ parse, and by the store to the records that exist; a batch to `max_vector_iris` 
 a vector to the bundle's width and to finite components, refused as `malformed_request`
 with the width named; a request above a cap is `cap_exceeded`. A probe costs the index's
 search expansion times its connectivity, both readable from the open store and
-published in the manifest's `vectors` block once unit 40 writes it. The entities a
+published in the manifest's `vectors` description. The entities a
 record expands to are not trusted to the header's `max_entities_per_record`: each is
 charged to the response's byte budget, which stops the answer with
 `budget_exhausted: response_bytes` and the first record always kept. Search contexts
@@ -3443,6 +3448,17 @@ composes with what exists and is not needed for the first end-to-end run. `/expo
 of the sidecar's files — the Parquet
 for DuckDB, the config for a client — waits on the export route taking nested
 artifact names; today it serves `data.hdt` and `data.nt` alone.
+
+**The pages (2026-10-23).** Written while using the served SOCKG bundle. `/describe`
+puts the embedded text in a collapsed toggle beside the editor, followed by "Similar by
+embedding", rather than in a section above the answer. `/verbalize` links each text to
+its root by bracketed IRI (it had passed the bare IRI, a CURIE to the parser), says its
+texts are a seeded uniform sample, offers "Draw another sample" (the next seed) and a
+link per target in the plan table (that target alone, twenty roots). The summary page —
+built from a card written with the description, which knows nothing of vectors a later
+version adds — gets from the server an "Explore verbalizations" link when the release
+publishes a config, and a closing Embeddings panel rendering the manifest's
+description, or the sidecar's counts for a manifest that predates it.
 
 **Run end to end on SOCKG (2026-10-22).** From `../okn-embeddings/graph.hdt` (27.1 M
 triples): `kgf build` with the authoring run's config, then `kgf verbalize` (1,237 roots
@@ -3528,8 +3544,10 @@ once there, never by a server), the id map, the index and the published config: 
 embedded nodes and distinct vectors, targets, and the index (usearch version, HNSW,
 f16, connectivity, search breadth). `--check` refuses a description that no longer
 matches the sidecar. The probes stay in the Parquet: twelve full vectors are too large
-for a manifest, and only reuse needs them. The summary page renders the description. Still open: whether the separate commands stay beside the build
-stage for the authoring loop, and where the streams and the embedding checkpoint live
+for a manifest, and only reuse needs them. The summary page renders the description.
+
+Still open: whether the separate commands stay beside the build stage for the
+authoring loop, and where the streams and the embedding checkpoint live
 during a build, since a checkpoint must outlive a failed build's staging.
 
 **Which texts the model truncated (decided 2026-10-23, this unit).** The embedding
