@@ -3590,7 +3590,21 @@ impl VoidResource {
 struct SummaryResource {
     markdown: String,
     card: Option<SummaryCard>,
+    /// The vector sidecar's sizes, read from the bundle rather than the card:
+    /// the card is written with the description, and vectors can arrive in a
+    /// later version derived from it.
+    vectors: Option<SummaryVectors>,
     target: Target,
+}
+
+/// What a release's vector sidecar holds, for the summary page.
+#[derive(Debug, Clone, Copy)]
+struct SummaryVectors {
+    /// Nodes that have a vector.
+    entities: u64,
+    /// Distinct vectors: nodes whose texts are identical share one.
+    records: u64,
+    dimensions: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3780,9 +3794,23 @@ impl SummaryResource {
                         ("dataset", Value::Code(&card.dataset.id)),
                         ("version", Value::Code(&card.dataset.version)),
                     ]))
-                    (summary_actions(&card.links))
+                    (summary_actions(&card.links, self.target.verbalize_yaml.is_some()))
                 }
                 div."dashboard-grid" {
+                    @if let Some(vectors) = self.vectors {
+                        section."panel" {
+                            h2 { "Embeddings" }
+                            (note(
+                                "Nodes with a vector, and the distinct vectors among them: nodes whose \
+                                 texts are identical share one."
+                            ))
+                            (fields(&[
+                                ("embedded nodes", Value::Number(vectors.entities)),
+                                ("distinct vectors", Value::Number(vectors.records)),
+                                ("dimensions", Value::Number(vectors.dimensions as u64)),
+                            ]))
+                        }
+                    }
                     section."panel" {
                         h2 { "Top classes" }
                         (note("Observed classes ranked by entity count in the designed-schema view."))
@@ -3855,7 +3883,11 @@ fn schema_views(target: &Target, views: &[String], current: &str) -> maud::Marku
     }
 }
 
-fn summary_actions(links: &BTreeMap<String, String>) -> maud::Markup {
+/// The summary's discovery links: those the published card names, and —
+/// because a card is written when the bundle's description is built, and
+/// vectors can arrive in a later version derived from it — one the server adds
+/// itself when the release publishes a verbalization config.
+fn summary_actions(links: &BTreeMap<String, String>, verbalize: bool) -> maud::Markup {
     const ACTIONS: [(&str, &str, &str); 7] = [
         (
             "classes",
@@ -3902,6 +3934,14 @@ fn summary_actions(links: &BTreeMap<String, String>) -> maud::Markup {
                             a href=(href) {
                                 strong { (label) }
                                 span { (description) }
+                            }
+                        }
+                    }
+                    @if relation == "fragment" && verbalize {
+                        li {
+                            a href="verbalize" {
+                                strong { "Explore verbalizations" }
+                                span { "The text behind each embedded node's vector." }
                             }
                         }
                     }
@@ -4063,6 +4103,11 @@ pub fn summary(
                     .summary_markdown()
                     .map_err(|error| unreadable("reading the summary card", &error))?
                     .to_owned(),
+                vectors: store.vectors().map(|vectors| SummaryVectors {
+                    entities: vectors.entities(),
+                    records: vectors.records(),
+                    dimensions: vectors.dimensions(),
+                }),
                 target,
             };
             Bytes::from(resource.to_html())
@@ -11625,6 +11670,24 @@ impl<'a> Cell<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_summary_offers_verbalizations_only_where_the_release_has_a_config() {
+        // The card is written with the description and knows nothing of
+        // vectors, so the link is the server's, after the triples link.
+        let links: BTreeMap<String, String> = [
+            ("fragment".to_owned(), "fragment".to_owned()),
+            ("void".to_owned(), "void".to_owned()),
+        ]
+        .into();
+        let with = summary_actions(&links, true).into_string();
+        let fragment = with.find("href=\"fragment\"").unwrap();
+        let verbalize = with.find("href=\"verbalize\"").unwrap();
+        let void = with.find("href=\"void\"").unwrap();
+        assert!(fragment < verbalize && verbalize < void, "{with}");
+        let without = summary_actions(&links, false).into_string();
+        assert!(!without.contains("verbalize"), "{without}");
+    }
 
     #[test]
     fn binding_cardinalities_cannot_overflow_the_wire_integer() {
