@@ -3597,14 +3597,123 @@ struct SummaryResource {
     target: Target,
 }
 
-/// What a release's vector sidecar holds, for the summary page.
-#[derive(Debug, Clone, Copy)]
+/// What a release's vector sidecar holds, for the summary page: the counts
+/// the sidecar states at open, and the manifest's description of the model
+/// and index when it carries one — a manifest written before descriptions
+/// were has only the counts to show.
+#[derive(Debug, Clone)]
 struct SummaryVectors {
     /// Nodes that have a vector.
     entities: u64,
     /// Distinct vectors: nodes whose texts are identical share one.
     records: u64,
     dimensions: usize,
+    description: Option<kgf_store::VectorsDescription>,
+}
+
+impl SummaryVectors {
+    /// The full-width panel: the model, what was embedded, and the index.
+    fn panel(&self) -> maud::Markup {
+        let records = group_digits(self.records);
+        let truncated = self.description.as_ref().map(|description| {
+            let percent = if self.records == 0 {
+                0
+            } else {
+                (description.truncated_records * 100 + self.records / 2) / self.records
+            };
+            format!(
+                "{} of {records} texts (~{percent}%)",
+                group_digits(description.truncated_records)
+            )
+        });
+        let max_tokens = self.description.as_ref().map(|description| {
+            format!(
+                "{} tokens",
+                group_digits(u64::from(description.max_seq_length))
+            )
+        });
+        let library = self.description.as_ref().map(|description| {
+            format!(
+                "{} {}",
+                description.index.library, description.index.library_version
+            )
+        });
+        let structure = self.description.as_ref().map(|description| {
+            format!(
+                "{}, {} vectors, {} distance",
+                description.index.kind.to_uppercase(),
+                description.index.quantization,
+                description.metric
+            )
+        });
+        let targets = self.description.as_ref().map(|description| {
+            description
+                .targets
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
+        fn text(value: &Option<String>) -> Value<'_> {
+            value.as_deref().map_or(Value::Absent, Value::Text)
+        }
+        let description = self.description.as_ref();
+        html! {
+            section."panel"."embeddings-panel" {
+                h2 { "Embeddings" }
+                (note(
+                    "Each embedded node has a vector computed from its verbalized text; nodes \
+                     whose texts are identical share one. /similar searches them through the index."
+                ))
+                div."embeddings-grid" {
+                    div {
+                        h3 { "Model" }
+                        (fields(&[
+                            ("model", description.map_or(Value::Absent, |d| Value::Code(&d.model))),
+                            ("dimensions", Value::Number(self.dimensions as u64)),
+                            ("reads at most", text(&max_tokens)),
+                            ("truncated", text(&truncated)),
+                            (
+                                "normalized",
+                                description.map_or(Value::Absent, |d| {
+                                    Value::Text(if d.normalized { "yes" } else { "no" })
+                                }),
+                            ),
+                        ]))
+                    }
+                    div {
+                        h3 { "Coverage" }
+                        (fields(&[
+                            ("embedded nodes", Value::Number(self.entities)),
+                            ("distinct vectors", Value::Number(self.records)),
+                            ("targets", text(&targets)),
+                        ]))
+                    }
+                    div {
+                        h3 { "Index" }
+                        (fields(&[
+                            ("library", text(&library)),
+                            ("structure", text(&structure)),
+                            (
+                                "connectivity",
+                                description.map_or(Value::Absent, |d| Value::Number(d.index.connectivity)),
+                            ),
+                            (
+                                "search breadth",
+                                description.map_or(Value::Absent, |d| Value::Number(d.index.expansion_search)),
+                            ),
+                        ]))
+                    }
+                }
+                @if let Some(description) = description {
+                    p."note" {
+                        "Vector space " code { (description.convention_id) }
+                        ": bundles whose vectors share it can be compared directly."
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3797,20 +3906,6 @@ impl SummaryResource {
                     (summary_actions(&card.links, self.target.verbalize_yaml.is_some()))
                 }
                 div."dashboard-grid" {
-                    @if let Some(vectors) = self.vectors {
-                        section."panel" {
-                            h2 { "Embeddings" }
-                            (note(
-                                "Nodes with a vector, and the distinct vectors among them: nodes whose \
-                                 texts are identical share one."
-                            ))
-                            (fields(&[
-                                ("embedded nodes", Value::Number(vectors.entities)),
-                                ("distinct vectors", Value::Number(vectors.records)),
-                                ("dimensions", Value::Number(vectors.dimensions as u64)),
-                            ]))
-                        }
-                    }
                     section."panel" {
                         h2 { "Top classes" }
                         (note("Observed classes ranked by entity count in the designed-schema view."))
@@ -3848,6 +3943,9 @@ impl SummaryResource {
                         &["Subject class", "Property", "Object class", "Triples"],
                         &relation_rows,
                     ))
+                }
+                @if let Some(vectors) = &self.vectors {
+                    (vectors.panel())
                 }
             },
         )
@@ -4107,6 +4205,10 @@ pub fn summary(
                     entities: vectors.entities(),
                     records: vectors.records(),
                     dimensions: vectors.dimensions(),
+                    description: target
+                        .declarations
+                        .as_ref()
+                        .and_then(|manifest| manifest.vectors()),
                 }),
                 target,
             };

@@ -725,6 +725,9 @@ pre code { background: none; padding: 0; word-break: normal; }
 .section-block { margin-top: 2.2rem; }
 .section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-bottom: .85rem; }
 .dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(19rem, .9fr); gap: 1rem; margin-top: 2rem; }
+.embeddings-panel { margin-top: 2rem; }
+.embeddings-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem 2rem; margin: 1rem 0; }
+.embeddings-grid h3 { margin: 0 0 .6rem; color: var(--dim); font-size: .72rem; font-weight: 650; letter-spacing: .055em; text-transform: uppercase; }
 .panel { min-width: 0; padding: 1.25rem 1.35rem; }
 .panel > h2:not(:first-child) { margin-top: 1.65rem; }
 .fields {
@@ -903,6 +906,7 @@ footer a:hover { text-decoration: underline; }
   main { padding-block: 1.5rem 3rem; }
   .overview, .panel, .workbench { padding: 1rem; }
   .dashboard-grid { grid-template-columns: 1fr; }
+  .embeddings-grid { grid-template-columns: 1fr; }
   .answer-summary .fields { grid-template-columns: 1fr; gap: .7rem; }
   .field { grid-template-columns: 1fr; gap: .1rem; }
   .fields dd { margin-bottom: .55rem; }
