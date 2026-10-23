@@ -3519,9 +3519,16 @@ only the bundle's copy.
 --from <version>` deriving a version by hard-linking unchanged artifacts; a
 `contents.vectors` section in `build.yaml` naming the config file; a second runner
 shelling out to `okn-indexing embed-texts` (with `--reuse` the previous version's
-Parquet) as the first shells out to `hdtc`; the manifest's `vectors` block (model,
-`convention_id`, probes, index library and version, scope, `truncated_records`); and the
-builder image target. Still open: whether the separate commands stay beside the build
+Parquet) as the first shells out to `hdtc`; and the builder image target.
+
+*Landed early, in the vectors PR:* the manifest's `vectors` description — the
+`vectors` capability's value, written by `kgf manifest` from the Parquet footer (read
+once there, never by a server), the id map, the index and the published config: model,
+`convention_id`, width, metric, normalization, `max_seq_length`, `truncated_records`,
+embedded nodes and distinct vectors, targets, and the index (usearch version, HNSW,
+f16, connectivity, search breadth). `--check` refuses a description that no longer
+matches the sidecar. The probes stay in the Parquet: twelve full vectors are too large
+for a manifest, and only reuse needs them. The summary page renders the description. Still open: whether the separate commands stay beside the build
 stage for the authoring loop, and where the streams and the embedding checkpoint live
 during a build, since a checkpoint must outlive a failed build's staging.
 
