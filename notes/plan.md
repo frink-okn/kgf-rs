@@ -3468,6 +3468,63 @@ for a subject without a vector and for a term that is not a subject; `cap_exceed
 the 501 gate on a bundle without the sidecar; and a page for each route — plus the
 methods-statement test, which now covers the gate's 501 and a 405 on the new resources.
 
+### 40. The vectors build stage — from a registry entry to a version with vectors
+
+Not started; the follow-up to units 38–39, kept apart on purpose. Those units made the
+sidecar and its routes work from separate commands (`kgf verbalize`, `okn-indexing
+embed-texts`, `kgf vectors`, `kgf manifest`); this one is how a build obtains its
+inputs and runs the chain, which is almost orthogonal to what the sidecar is.
+
+**Where the verbalization config lives (decided 2026-10-23): in the OKN registry, as
+its own file.** A KG's registry entry already carries small KGF settings inline under
+`frink-options.kgf` (`semantics.prefixes`, `roles`, `authoritative_namespaces`). A
+verbalization config — targets, profiles, templates, predicate lists — is larger and
+graph-specific, so it lives beside the entries as a file, and the entry names it:
+
+```yaml
+frink-options:
+  kgf:
+    semantics: { … }
+    vectors:
+      verbalize-config: verbalize/sockg.yaml   # docs/registry/verbalize/sockg.yaml
+```
+
+The registry already has this shape: `neo4j-conversion-config-path` points at a
+per-KG file under `docs/registry/neo4j-conf/`, and `queries/<kg>/` holds per-KG files
+the same way. Three consequences:
+
+- *It fits how a config is written.* A graph's first build has no config, because the
+  config is authored against a served bundle — `/schema`, `/sample`, `/describe`,
+  `/verbalize`, none of which need a local copy. A KG's maintainers can draft one
+  against the live endpoint and propose it as a registry change; that change is what
+  calls for a derived version with vectors (`kgf build --from`).
+- *The registry holds the source; the bundle holds the record.* A bundle publishes the
+  config its texts were rendered under as canonical `vectors/verbalize.json`, under the
+  manifest's checksums, so editing the registry file never changes what a published
+  version says about itself. This revises `vectors-plan.md` §5.1's "the whole bundle is
+  reproducible from one file": the build input names the config rather than inlining
+  it, and the published copy is what makes a version reproducible.
+- *A path in the registry repository, not a URL.* The neo4j entries use
+  `raw.githubusercontent.com/…/refs/heads/main/…`, a moving branch. A repo-relative
+  path keeps an entry and its config in one commit, so whatever turns
+  `frink-options.kgf` into a build can record that commit. That consumer is outside
+  this repo and must resolve the path.
+
+Nothing else per-KG goes in the entry: the model is a federation convention, a constant
+in kgf, and a config's label cascade already falls back to `semantics.roles.label`.
+The registry file stays YAML, the form `kgf verbalize --config` reads; canonical JSON is
+only the bundle's copy.
+
+**The rest of the unit** is `vectors-plan.md` §11's units 26a and 26: `kgf build
+--from <version>` deriving a version by hard-linking unchanged artifacts; a
+`contents.vectors` section in `build.yaml` naming the config file; a second runner
+shelling out to `okn-indexing embed-texts` (with `--reuse` the previous version's
+Parquet) as the first shells out to `hdtc`; the manifest's `vectors` block (model,
+`convention_id`, probes, index library and version, scope, `truncated_records`); and the
+builder image target. Still open: whether the separate commands stay beside the build
+stage for the authoring loop, and where the streams and the embedding checkpoint live
+during a build, since a checkpoint must outlive a failed build's staging.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that
@@ -4744,6 +4801,13 @@ following the code.
     fixed point of storage (unit 38); `/vector` should return exactly what the index
     compares, with full precision available through the Parquet export. Doc 13 §13.2
     should say which precision the route carries.
+112. **Where a KG's verbalization config lives is a deployment matter doc 13 should
+    name.** Doc 13 §13.3 treats the recipe as part of the build; it does not say where a
+    federation keeps forty of them. Unit 40 puts each in the OKN registry as a file the
+    KG's entry names, authored against the served bundle and reviewed like any registry
+    change, with the bundle's published `vectors/verbalize.json` as the record of what a
+    version used. Doc 13 (or doc 04's build inputs) should say that the config is an
+    input named by reference and the bundle's copy is canonical for that version.
 
 ## Not in this plan
 
