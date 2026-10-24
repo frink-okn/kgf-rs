@@ -6564,6 +6564,9 @@ fn scanned_row(
 /// says the candidate budget was exhausted. The roots are bounded by
 /// `max_verbalize_roots`. A class's member count is a range width, and
 /// drawing a member is one rank descent, so a plan never enumerates a class.
+/// A drawn member an earlier target's class also holds is that target's root,
+/// as in a build, and is counted rather than rendered: one existence probe
+/// per earlier target, for each of at most `max_verbalize_roots` draws.
 ///
 /// The response stops at its byte budget, and so does the text built for it:
 /// the verbalizer charges every line and every piece a template appends to a
@@ -6672,6 +6675,13 @@ pub fn verbalize(
                     let subject = verbalizer
                         .root_at(index, position)
                         .map_err(|error| unreadable("drawing a class member", &error))?;
+                    if verbalizer
+                        .claimed_before(index, subject)
+                        .map_err(|error| unreadable("finding a root's target", &error))?
+                    {
+                        report.claimed_before += 1;
+                        continue;
+                    }
                     let rendered = verbalizer
                         .verbalize(index, subject)
                         .map_err(|error| unreadable("verbalizing a root", &error))?;
@@ -6730,6 +6740,9 @@ pub struct VerbalizeTargetReport {
     members: u64,
     /// Roots rendered from it whose texts this answer carries.
     sampled: u64,
+    /// Drawn members an earlier target claims: roots of that target, not
+    /// this one, so not rendered here.
+    claimed_before: u64,
     /// Mean characters per rendered text.
     mean_chars: u64,
     /// The longest rendered text, in characters.
@@ -6756,6 +6769,7 @@ impl VerbalizeTargetReport {
             class,
             members,
             sampled: 0,
+            claimed_before: 0,
             mean_chars: 0,
             max_chars: 0,
             mean_lines: 0,
@@ -6988,6 +7002,7 @@ impl Resource for VerbalizeAnswer {
                     Value::Code(&report.class),
                     Value::Number(report.members),
                     Value::Number(report.sampled),
+                    Value::Number(report.claimed_before),
                     Value::Number(report.mean_chars),
                     Value::Number(report.max_chars),
                     Value::Number(report.mean_lines),
@@ -7031,7 +7046,10 @@ impl Resource for VerbalizeAnswer {
                         h2 { "Targets" }
                         (note(
                             "Members counts every node of the class. Sampled texts are drawn \
-                             uniformly by seed; lengths are in characters and lines. Limited \
+                             uniformly by seed; lengths are in characters and lines. Claimed \
+                             earlier counts drawn members that an earlier target's class also \
+                             holds: a node is a root of the first target that claims it, so \
+                             those are not rendered here. Limited \
                              counts predicates sampled down to the limit across the texts — the \
                              number to tune the limit or the lists by. Cut by budget counts texts \
                              this preview stopped short because one request may read or send only \
@@ -7039,7 +7057,7 @@ impl Resource for VerbalizeAnswer {
                              model's own limit on what it reads."
                         ))
                         (results_table(
-                            &["target", "class", "members", "sampled", "mean chars", "max chars", "mean lines", "limited", "cut by budget"],
+                            &["target", "class", "members", "sampled", "claimed earlier", "mean chars", "max chars", "mean lines", "limited", "cut by budget"],
                             &target_rows,
                         ))
                     }

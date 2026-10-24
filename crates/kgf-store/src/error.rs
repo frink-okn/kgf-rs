@@ -174,6 +174,20 @@ pub enum Error {
     #[error("id map input: {0}")]
     IdMapInput(String),
 
+    /// One entity offered to the id-map writer under two records: a map that
+    /// would answer with one of them and drop the other. Separate from
+    /// [`IdMapInput`](Self::IdMapInput) so a caller holding the entity's
+    /// source can name it rather than its id.
+    #[error("id map input: entity {entity} is named by records {first} and {second}")]
+    IdMapEntityTwice {
+        /// The entity's subject id.
+        entity: u64,
+        /// The first record naming it.
+        first: u64,
+        /// The second.
+        second: u64,
+    },
+
     /// Anything the OS refused.
     #[error(transparent)]
     Io(#[from] std::io::Error),

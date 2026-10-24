@@ -3415,7 +3415,8 @@ link that fails.
 
 **The recipe travels with the vectors.** A bundle carried vectors without the config
 that produced their texts. `kgf vectors --config` now writes `vectors/verbalize.json`
-in canonical JSON — sorted keys, fixed field order — so the same config is the same
+in canonical JSON — fixed field order, sorted keys except the targets', which keep
+their written order (below) — so the same config is the same
 bytes and the artifact's checksum is the recipe's hash the unit 35 review asked for,
 covered by `content_digest` with the vectors it produced; a roots line under a target
 the config does not declare is refused. A server reads it beside the manifest at
@@ -3435,6 +3436,30 @@ it by design. A target was required before only to disambiguate, and membership
 disambiguates better than the client guessing. The text is also what a
 client needs to embed a query the way the bundle embeds its entities: the recipe is a
 public config plus a public verbalizer.
+
+**A node is a root of one target: the first in the config that claims it.** A node
+typed with two targets' classes was verbalized once per target, and if the targets
+rendered it differently it had two texts, which `kgf vectors` could not join: the id
+map holds one record per entity, and its writer refused the second with bare ids.
+Giving such a node a vector per target was the alternative, and was rejected: it
+changes the id map, makes `/vector?iri=` ambiguous, and lets one node fill two of
+`/similar`'s places. The rule chosen is the one `Bound::target_of` already applied for
+`/describe`'s live text, now applied by enumeration too, so the target a page renders a
+node under is the one its vector came from. `Verbalizer::roots` skips a member that an
+earlier target claims (one existence probe per earlier target, counted in
+`Roots::claimed_before`), `kgf verbalize` reports how many it passed over, and
+`--limit` counts only the target's own roots. `/verbalize`'s `sample` and `plan` count
+a drawn member that an earlier target claims as `claimed_before` rather than rendering it,
+so the preview shows what a build would embed. The draw stays one rank descent
+plus at most one probe per earlier target, for each of at most `max_verbalize_roots`
+draws. Members stays a range width, and an exact count of a target's own roots would
+mean enumerating the class. `iris` mode under a named target still renders any subject
+there, by design. Because "first" is now meaning, the config's `targets` keep the
+order they were written in (an `IndexMap`, serialized the same way), where they
+were sorted by name before. Two targets naming one class are refused, as two profiles
+are, because the second could never own a root. `kgf vectors` names the node, and
+the lines and targets it appears under, when a roots stream from an older verbalizer
+still gives one node two texts.
 
 **`/similar`'s entities are labelled by default**, as `/search`'s subjects are: an
 entity list unlabelled names nothing. Each entity's term object carries `label` (and

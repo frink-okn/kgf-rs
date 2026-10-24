@@ -5618,12 +5618,13 @@ fn verbalize_previews_a_config_in_three_modes_over_get_query_and_post() {
     assert_eq!(body["complete"], true);
     let targets = body["targets"].as_array().unwrap();
     assert_eq!(targets.len(), 2);
-    assert_eq!(targets[0]["name"], "location");
-    assert_eq!(targets[0]["members"], 1);
-    assert_eq!(targets[0]["sampled"], 1);
-    assert_eq!(targets[1]["name"], "site");
-    assert_eq!(targets[1]["members"], 2);
-    assert_eq!(targets[1]["sampled"], 2);
+    // In the order the config writes them.
+    assert_eq!(targets[0]["name"], "site");
+    assert_eq!(targets[0]["members"], 2);
+    assert_eq!(targets[0]["sampled"], 2);
+    assert_eq!(targets[1]["name"], "location");
+    assert_eq!(targets[1]["members"], 1);
+    assert_eq!(targets[1]["sampled"], 1);
     assert_eq!(body["records"].as_array().unwrap().len(), 3);
     assert_eq!(body["unknown"].as_array().unwrap().len(), 0);
 
@@ -6022,6 +6023,51 @@ fn verbalize_cuts_its_first_record_to_fit_rather_than_send_it_over() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     assert_eq!(record["digest"], digest);
+}
+
+#[test]
+fn verbalize_renders_a_node_of_two_targets_under_the_first_written() {
+    // site1 is a Location too. It is a root of whichever target the config
+    // writes first, as in a build: drawn under the other, it is counted as
+    // claimed earlier and not rendered.
+    let deployment = Deployment::new();
+    let graph = format!(
+        "{TYPED_NT}<http://example.org/site1> \
+         <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Location> .\n"
+    );
+    deployment.publish("tox", "2026-06-01", &graph, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let site_first = r#"{"targets": {
+        "site": {"type": "http://example.org/Site"},
+        "location": {"type": "http://example.org/Location"}}}"#;
+    let location_first = r#"{"targets": {
+        "location": {"type": "http://example.org/Location"},
+        "site": {"type": "http://example.org/Site"}}}"#;
+    for (config, first, second) in [
+        (site_first, "site", "location"),
+        (location_first, "location", "site"),
+    ] {
+        let body = server.get(&verbalize_url(&[("config", config)])).json();
+        let targets = body["targets"].as_array().unwrap();
+        assert_eq!(targets[0]["name"], first, "{body}");
+        assert_eq!(targets[0]["claimed_before"], 0, "{body}");
+        assert_eq!(targets[1]["name"], second, "{body}");
+        assert_eq!(targets[1]["claimed_before"], 1, "{body}");
+        let site1: Vec<&serde_json::Value> = body["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|record| record["iri"]["value"] == "http://example.org/site1")
+            .collect();
+        assert_eq!(site1.len(), 1, "{body}");
+        assert_eq!(site1[0]["target"], first);
+
+        // Named without a target, it renders under the same one.
+        let named = server
+            .get(&verbalize_url(&[("config", config), ("iri", "ex:site1")]))
+            .json();
+        assert_eq!(named["records"][0]["target"], first, "{named}");
+    }
 }
 
 #[test]

@@ -92,6 +92,7 @@ fn all_records(store: &Store, config: &Config) -> Vec<Record> {
     let mut by_digest: BTreeMap<[u8; 32], Record> = BTreeMap::new();
     for target in 0..bound.targets().len() {
         for root in verbalizer.roots(target).expect("roots") {
+            let root = root.expect("a root");
             let Some(rendered) = verbalizer.verbalize(target, root).expect("verbalize") else {
                 continue;
             };
@@ -475,13 +476,13 @@ fn iris_the_bundle_lacks_are_reported_and_bind_to_nothing() {
     assert_eq!(
         unknown,
         [
-            ("targets.ghost.type", "http://example.com/Ghost"),
             ("targets.thing.ignore_predicates", "http://example.com/nope"),
+            ("targets.ghost.type", "http://example.com/Ghost"),
         ]
     );
     let verbalizer = Verbalizer::new(&published.store, &bound);
-    assert!(verbalizer.roots(0).unwrap().is_empty());
-    assert_eq!(verbalizer.roots(1).unwrap().len(), 1);
+    assert_eq!(verbalizer.roots(0).unwrap().members(), 1);
+    assert_eq!(verbalizer.roots(1).unwrap().members(), 0);
 }
 
 #[test]
@@ -881,11 +882,12 @@ fn a_class_is_walked_by_position_across_pages() {
     let mut verbalizer = Verbalizer::new(&published.store, &bound);
 
     let roots = verbalizer.roots(0).unwrap();
-    assert_eq!(roots.len(), MEMBERS as u64);
+    assert_eq!(roots.members(), MEMBERS as u64);
     let mut seen = Seen::new();
     let mut walked = 0;
     let mut previous = None;
     for root in roots {
+        let root = root.unwrap();
         let rendered = verbalizer.verbalize(0, root).unwrap().unwrap();
         assert!(seen.first(rendered.digest), "repeated {}", rendered.iri);
         assert!(previous.is_none_or(|p| p < root), "out of order at {root}");

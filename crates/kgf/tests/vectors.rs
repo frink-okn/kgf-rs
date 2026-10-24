@@ -103,12 +103,17 @@ impl Published {
 
     /// `kgf verbalize` over every member of `T`, to `roots` and `texts`.
     fn verbalize(&self, roots: &Path, texts: &Path) {
+        self.verbalize_with(
+            &format!(r#"{{"targets": {{"things": {{"type": "{T}"}}}}}}"#),
+            roots,
+            texts,
+        );
+    }
+
+    /// `kgf verbalize` under `config` (JSON), to `roots` and `texts`.
+    fn verbalize_with(&self, config_json: &str, roots: &Path, texts: &Path) {
         let config = self.beside("config.json");
-        std::fs::write(
-            &config,
-            format!(r#"{{"targets": {{"things": {{"type": "{T}"}}}}}}"#),
-        )
-        .unwrap();
+        std::fs::write(&config, config_json).unwrap();
         #[derive(clap::Parser)]
         struct Cli {
             #[command(flatten)]
@@ -389,6 +394,118 @@ fn the_verbalizers_streams_become_a_sidecar_the_server_opens() {
             .collect::<Vec<_>>(),
         ["iri", "target", "text_digest"]
     );
+}
+
+/// A node that is a member of two targets' classes is embedded once, under
+/// the first target in config order — the one `/describe` renders it by —
+/// even when the two targets would render it differently.
+#[test]
+fn a_node_under_two_targets_is_embedded_once_under_the_first() {
+    const U: &str = "http://example.org/U";
+    const NOTE: &str = "http://example.org/note";
+    let mut graph = graph();
+    graph += &format!("<http://example.org/a> <{RDF_TYPE}> <{U}> .\n");
+    graph += &format!("<http://example.org/a> <{NOTE}> \"only things say this\" .\n");
+    graph += &format!("<http://example.org/e> <{RDF_TYPE}> <{U}> .\n");
+    graph += &format!("<http://example.org/e> <{RDFS_LABEL}> \"Echo\" .\n");
+    let published = Published::build(&graph);
+    let (roots, texts) = (
+        published.beside("roots.jsonl"),
+        published.beside("texts.jsonl"),
+    );
+    // `units` ignores the note, so `a` reads differently under each target.
+    published.verbalize_with(
+        &format!(
+            r#"{{"targets": {{
+                "things": {{"type": "{T}"}},
+                "units": {{"type": "{U}", "ignore_predicates": ["{NOTE}"]}}
+            }}}}"#
+        ),
+        &roots,
+        &texts,
+    );
+    let listed = read_roots(&roots);
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|(iri, _)| iri == "http://example.org/a")
+            .count(),
+        1,
+        "a is one root: {listed:?}"
+    );
+    let embeddings = published.beside("embeddings.parquet");
+    let digests = embed(&texts, &embeddings, "2");
+
+    // Roots from a verbalizer that rooted `a` under both targets, with a
+    // second text, are refused naming the node and where it appears.
+    let stale = published.beside("stale.jsonl");
+    std::fs::copy(&roots, &stale).unwrap();
+    let other = digests
+        .iter()
+        .find(|d| {
+            !listed
+                .iter()
+                .any(|(iri, digest)| iri.ends_with("/a") && digest == *d)
+        })
+        .unwrap();
+    writeln!(
+        File::options().append(true).open(&stale).unwrap(),
+        r#"{{"iri": "http://example.org/a", "target": "units", "digest": "{}"}}"#,
+        kgf_verbalize::text::hex(other)
+    )
+    .unwrap();
+    let error = kgf::vectors::assemble(
+        &published.bundle(),
+        &embeddings,
+        &stale,
+        &published.beside("config.json"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("http://example.org/a is a root with two texts")
+            && error.contains(r#"line 1 under "things""#)
+            && error.contains(r#"under "units""#),
+        "{error}"
+    );
+    assert!(!published.bundle().join("vectors").exists());
+
+    let assembled = kgf::vectors::assemble(
+        &published.bundle(),
+        &embeddings,
+        &roots,
+        &published.beside("config.json"),
+    )
+    .expect("a node under two targets assembles");
+    assert_eq!(assembled.entities, 5, "a, b, c, d and e");
+
+    published.describe();
+    let store = published.open();
+    let vectors = store.vectors().expect("the sidecar opened");
+    let stored: kgf_verbalize::Config = serde_json::from_slice(
+        &std::fs::read(published.bundle().join("vectors/verbalize.json")).unwrap(),
+    )
+    .unwrap();
+    let resolved = stored.resolve().unwrap();
+    let bound = kgf_verbalize::Bound::bind(&store, &resolved, &[RDFS_LABEL.to_owned()]).unwrap();
+    let a = store
+        .dict()
+        .locate(Role::Subject, b"http://example.org/a")
+        .unwrap()
+        .unwrap();
+    let first = bound.target_of(&store, a.0).unwrap().expect("a is claimed");
+    assert_eq!(bound.targets().nth(first), Some("things"));
+    let rendered = kgf_verbalize::Verbalizer::new(&store, &bound)
+        .verbalize(first, a.0)
+        .unwrap()
+        .expect("a is not blank");
+    assert!(
+        rendered.text.contains("only things say this"),
+        "{}",
+        rendered.text
+    );
+    let row = vectors.row_of(a).unwrap().unwrap();
+    assert_eq!(vectors.digest_of(row).unwrap(), rendered.digest);
 }
 
 #[test]

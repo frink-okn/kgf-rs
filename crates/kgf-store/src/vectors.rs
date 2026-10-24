@@ -719,10 +719,11 @@ pub fn write_id_map(
     }
     by_id.sort_unstable();
     if let Some(pair) = by_id.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-        return Err(Error::IdMapInput(format!(
-            "entity {} is named by records {} and {}",
-            pair[0].0, pair[0].1, pair[1].1
-        )));
+        return Err(Error::IdMapEntityTwice {
+            entity: pair[0].0,
+            first: pair[0].1,
+            second: pair[1].1,
+        });
     }
 
     let header = IdMapHeader {

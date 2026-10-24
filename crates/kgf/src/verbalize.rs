@@ -54,7 +54,8 @@ pub struct Args {
     #[arg(long, value_name = "NAME")]
     pub target: Vec<String>,
 
-    /// Stop after this many roots per target.
+    /// Stop after this many roots per target. A member an earlier target
+    /// claims is not one of this target's roots and does not count.
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
 
@@ -129,25 +130,26 @@ pub fn run(args: Args) -> Result<()> {
         }
     } else {
         for (index, name) in &targets {
-            let roots = verbalizer.roots(*index)?;
-            let total = args.limit.map_or(roots.len(), |limit| {
-                u64::try_from(limit).unwrap_or(u64::MAX).min(roots.len())
-            });
+            let mut roots = verbalizer.roots(*index)?;
+            let limit = args.limit.unwrap_or(usize::MAX);
             let target_started = Instant::now();
             // Roots with a predicate sampled down to the limit: the signal
             // for tuning the config, reported here rather than carried on
             // the records, which no later stage would read it from.
             let mut limited = 0u64;
-            for root in roots.take(usize::try_from(total).unwrap_or(usize::MAX)) {
-                if let Some(rendered) = verbalizer.verbalize(*index, root)? {
+            let mut total = 0u64;
+            for root in roots.by_ref().take(limit) {
+                total += 1;
+                if let Some(rendered) = verbalizer.verbalize(*index, root?)? {
                     limited += u64::from(rendered.limited > 0);
                     out.write(&rendered, name)?;
                 }
             }
             eprintln!(
                 "{name}: {total} roots in {:.1?} ({limited} with a predicate sampled down; \
-                 {} distinct texts so far)",
+                 {} members left to an earlier target; {} distinct texts so far)",
                 target_started.elapsed(),
+                roots.claimed_before(),
                 out.seen.len()
             );
         }

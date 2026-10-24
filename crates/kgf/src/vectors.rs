@@ -170,9 +170,11 @@ pub fn assemble(
         &scratch.path().join(file_name(artifact::VECTORS_ROOTS)),
     )?;
 
-    // Canonical: keys sorted, as the config type's maps are, and the field
-    // order fixed by the type, so the same config always has the same bytes
-    // and the artifact's checksum is the recipe's hash.
+    // Canonical: the field order fixed by the type, every map's keys sorted
+    // except the targets', which keep the order written because the order
+    // decides which target a node of two targeted classes belongs to. The
+    // same config always has the same bytes, so the artifact's checksum is
+    // the recipe's hash.
     let mut canonical = serde_json::to_vec_pretty(&verbalize).context("serializing the config")?;
     canonical.push(b'\n');
     let config_path = scratch.path().join(file_name(artifact::VECTORS_CONFIG));
@@ -189,8 +191,12 @@ pub fn assemble(
     let mut out = BufWriter::new(
         File::create(&id_map).with_context(|| format!("creating {}", id_map.display()))?,
     );
-    let summary = write_id_map(&mut out, identity, joined)
-        .with_context(|| format!("writing {}", id_map.display()))?;
+    let summary = match write_id_map(&mut out, identity, joined) {
+        Err(kgf_store::Error::IdMapEntityTwice { entity, .. }) => {
+            return Err(rooted_twice(&store, roots, entity));
+        }
+        written => written.with_context(|| format!("writing {}", id_map.display()))?,
+    };
     out.flush()
         .with_context(|| format!("writing {}", id_map.display()))?;
 
@@ -497,6 +503,40 @@ fn join_roots(
         rows.push(IdMapRow { digest, entities });
     }
     Ok(rows)
+}
+
+/// The refusal for a node the roots stream gives two texts: named by its IRI
+/// and the lines and targets it appears under, which a second read of the
+/// stream finds — the error path only, so the join holds no IRIs for it.
+fn rooted_twice(store: &Store, path: &Path, entity: u64) -> anyhow::Error {
+    let mut scratch = Vec::new();
+    let iri = match store
+        .dict()
+        .extract(Role::Subject, TermId(entity), &mut scratch)
+    {
+        Ok(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        Err(error) => {
+            return anyhow!("subject {entity} is two roots, and naming it failed: {error}");
+        }
+    };
+    let mut places = Vec::new();
+    if let Ok(file) = File::open(path) {
+        for (number, line) in BufReader::new(file).lines().enumerate() {
+            let Ok(line) = line else { break };
+            if let Ok(root) = serde_json::from_str::<RootLine>(&line)
+                && root.iri == iri
+            {
+                places.push(format!("line {} under {:?}", number + 1, root.target));
+            }
+        }
+    }
+    anyhow!(
+        "{}: {iri} is a root with two texts ({}); a node is a root of the first target \
+         that claims it only, so these roots come from a verbalizer that did not apply \
+         that rule; verbalize again",
+        path.display(),
+        places.join(", ")
+    )
 }
 
 /// Roots not yet written to the table.

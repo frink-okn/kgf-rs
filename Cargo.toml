@@ -29,6 +29,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # one hdtc uses for the prefix tables that config points at: one YAML
 # implementation across the toolchain rather than two that disagree at the edges.
 serde_norway = "0.9"
+# A map that keeps the order it was written in: a verbalization config's
+# targets, whose order decides which one a node of two targeted classes belongs
+# to. Already in the tree under serde_json's `preserve_order`.
+indexmap = { version = "2", features = ["serde"] }
 sha2 = "0.10"
 # Operating-system randomness for the access log's per-process salt and
 # request-id prefix. Already in the tree under oxrdf's `rand`.

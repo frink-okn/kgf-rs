@@ -32,7 +32,11 @@
 //! # What a root's text is
 //!
 //! 1. Enumerate roots: the subjects of `? rdf:type <class>`, blank nodes
-//!    skipped.
+//!    skipped, and so is a node an earlier target's class also has as a
+//!    member. A node is a root of one target, the first in the config that
+//!    claims it, so it has one text and one vector, and the target a page
+//!    renders it under ([`Bound::target_of`]) is the one its vector came
+//!    from.
 //! 2. Read the root's star `s ? ?`, group by predicate, drop predicates on the
 //!    ignore list or off a declared allow list.
 //! 3. Per predicate, drop blank-node values, which no line can name, and
@@ -423,23 +427,41 @@ impl Bound {
     /// node finds the config that governs it. `None` when no target claims
     /// the subject, or when the bundle has no `rdf:type`.
     pub fn target_of(&self, store: &Store, subject: u64) -> Result<Option<usize>, Error> {
-        let Some(rdf_type) = self.rdf_type else {
-            return Ok(None);
-        };
-        for (index, target) in self.targets.iter().enumerate() {
-            let Some(class) = target.class else {
-                continue;
-            };
-            let selection = store.resolve(IdPattern {
-                subject: Some(subject),
-                predicate: Some(rdf_type),
-                object: Some(class),
-            })?;
-            if selection.count().value > 0 {
+        for index in 0..self.targets.len() {
+            if self.claims(store, index, subject)? {
                 return Ok(Some(index));
             }
         }
         Ok(None)
+    }
+
+    /// Whether a target before `target` claims `subject`, which is then not
+    /// a root of `target`: one existence probe per earlier target.
+    pub fn claimed_before(
+        &self,
+        store: &Store,
+        target: usize,
+        subject: u64,
+    ) -> Result<bool, Error> {
+        for index in 0..target {
+            if self.claims(store, index, subject)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `subject` is a member of `target`'s class.
+    fn claims(&self, store: &Store, target: usize, subject: u64) -> Result<bool, Error> {
+        let (Some(rdf_type), Some(class)) = (self.rdf_type, self.targets[target].class) else {
+            return Ok(false);
+        };
+        let selection = store.resolve(IdPattern {
+            subject: Some(subject),
+            predicate: Some(rdf_type),
+            object: Some(class),
+        })?;
+        Ok(selection.count().value > 0)
     }
 
     /// `target`'s label cascade, strongest first: the defaults' label
@@ -717,11 +739,13 @@ impl<'a> Verbalizer<'a> {
         self.exhausted
     }
 
-    /// The subject ids of every member of `target`'s class, ascending, a
-    /// page at a time.
+    /// The subject ids of `target`'s roots, ascending, a page at a time:
+    /// every member of its class that no earlier target claims.
     ///
     /// Blank-node members are included; [`verbalize`](Self::verbalize) skips
-    /// them. An empty walk for a class the bundle lacks is the correct
+    /// them. A member an earlier target claims costs one probe per earlier
+    /// target to pass over, and the walk counts them in
+    /// [`claimed_before`](Roots::claimed_before). An empty walk for a class the bundle lacks is the correct
     /// answer, and [`Bound::unknown`] is where that is reported. This walks
     /// the whole class and is for a build; a server draws positions through
     /// [`root_count`](Self::root_count) and [`root_at`](Self::root_at)
@@ -733,15 +757,19 @@ impl<'a> Verbalizer<'a> {
             .as_ref()
             .map_or(0, |selection| selection.count().value);
         Ok(Roots {
+            store: self.store,
+            bound: self.bound,
+            target,
             selection,
             count,
             next: 0,
             page: Vec::new().into_iter(),
+            claimed_before: 0,
         })
     }
 
-    /// How many members `target`'s class has, blank nodes included. A range
-    /// width, not an enumeration.
+    /// How many members `target`'s class has, blank nodes and members an
+    /// earlier target claims included. A range width, not an enumeration.
     pub fn root_count(&self, target: usize) -> Result<u64, Error> {
         Ok(self
             .members(target)?
@@ -750,7 +778,8 @@ impl<'a> Verbalizer<'a> {
 
     /// The member of `target`'s class at `position` in ascending subject
     /// order. One rank descent; `position` must be below
-    /// [`root_count`](Self::root_count).
+    /// [`root_count`](Self::root_count). The member may be another target's
+    /// root, which [`claimed_before`](Self::claimed_before) says.
     pub fn root_at(&self, target: usize, position: u64) -> Result<u64, Error> {
         let selection = self
             .members(target)?
@@ -770,6 +799,12 @@ impl<'a> Verbalizer<'a> {
             predicate: Some(rdf_type),
             object: Some(class),
         })?))
+    }
+
+    /// Whether an earlier target claims `subject`, so that it is not a root
+    /// of `target`: [`Bound::claimed_before`] over this verbalizer's store.
+    pub fn claimed_before(&self, target: usize, subject: u64) -> Result<bool, Error> {
+        self.bound.claimed_before(self.store, target, subject)
     }
 
     /// Verbalize one root of `target`, or `None` if it is a blank node.
@@ -1365,35 +1400,37 @@ impl<'a> Verbalizer<'a> {
     }
 }
 
-/// A class's members by position, in pages: the walk [`Verbalizer::roots`]
-/// returns.
+/// A target's roots, in pages of its class's members: the walk
+/// [`Verbalizer::roots`] returns.
 pub struct Roots<'a> {
+    store: &'a Store,
+    bound: &'a Bound,
+    target: usize,
     selection: Option<Selection<'a>>,
     /// Members in all; the walk ends at this position.
     count: u64,
     /// The position the next page starts at.
     next: u64,
     page: std::vec::IntoIter<u64>,
+    claimed_before: u64,
 }
 
 impl Roots<'_> {
-    /// How many members the walk will yield in all.
-    pub fn len(&self) -> u64 {
+    /// How many members the class has: the most roots the walk can yield,
+    /// and exactly how many when no earlier target shares a member.
+    pub fn members(&self) -> u64 {
         self.count
     }
 
-    /// Whether the class has no members.
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
+    /// Members passed over so far because an earlier target claims them.
+    pub fn claimed_before(&self) -> u64 {
+        self.claimed_before
     }
-}
 
-impl Iterator for Roots<'_> {
-    type Item = u64;
-
-    fn next(&mut self) -> Option<u64> {
-        if let Some(root) = self.page.next() {
-            return Some(root);
+    /// The next member, claimed or not.
+    fn next_member(&mut self) -> Option<u64> {
+        if let Some(member) = self.page.next() {
+            return Some(member);
         }
         let selection = self.selection.as_ref()?;
         if self.next >= self.count {
@@ -1406,6 +1443,21 @@ impl Iterator for Roots<'_> {
         self.next += page.len() as u64;
         self.page = page.into_iter();
         self.page.next()
+    }
+}
+
+impl Iterator for Roots<'_> {
+    type Item = Result<u64, Error>;
+
+    fn next(&mut self) -> Option<Result<u64, Error>> {
+        while let Some(member) = self.next_member() {
+            match self.bound.claimed_before(self.store, self.target, member) {
+                Ok(true) => self.claimed_before += 1,
+                Ok(false) => return Some(Ok(member)),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        None
     }
 }
 
