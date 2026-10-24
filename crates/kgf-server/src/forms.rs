@@ -20,6 +20,7 @@ pub(crate) fn manifest_forms(
     dataset: &str,
     version: &str,
     manifest: &Manifest,
+    verbalize_yaml: Option<&str>,
 ) -> Markup {
     let empty = Params::default();
     let offers = Offers {
@@ -27,6 +28,7 @@ pub(crate) fn manifest_forms(
         graphs: manifest.declares(Capability::Graphs),
     };
     let search = offers.search;
+    let vectors = manifest.declares(Capability::Vectors);
 
     html! {
         h2 { "Try a query" }
@@ -44,12 +46,17 @@ pub(crate) fn manifest_forms(
                 (search_form(mount, dataset, version, &empty, false))
             }
             (terms(mount, dataset, version, &empty, false))
-            (verbalize(mount, dataset, version, &empty, false))
+            (verbalize(mount, dataset, version, &empty, verbalize_yaml, false))
+            @if vectors {
+                (vector_form(mount, dataset, version, &empty, false))
+                (similar_form(mount, dataset, version, &empty, false))
+            }
         }
     }
 }
 
-/// The editor shown above an existing GET answer.
+/// The editor shown above an existing GET answer: one collapsible form, which
+/// the caller places in a `query-stack` beside any panels of its own.
 pub(crate) fn operation_form(
     mount: &Mount,
     dataset: &str,
@@ -57,8 +64,9 @@ pub(crate) fn operation_form(
     operation: &str,
     params: &Params,
     offers: Offers,
+    verbalize_yaml: Option<&str>,
 ) -> Option<Markup> {
-    let form = match operation {
+    match operation {
         "fragment" => Some(fragment(mount, dataset, version, params, offers, false)),
         "tpf" => Some(tpf(mount, dataset, version, params, offers, false)),
         "count" => Some(count(mount, dataset, version, params, offers, false)),
@@ -66,10 +74,18 @@ pub(crate) fn operation_form(
         "sample" => Some(sample(mount, dataset, version, params, false)),
         "search" => Some(search_form(mount, dataset, version, params, false)),
         "terms" => Some(terms(mount, dataset, version, params, false)),
-        "verbalize" => Some(verbalize(mount, dataset, version, params, false)),
+        "verbalize" => Some(verbalize(
+            mount,
+            dataset,
+            version,
+            params,
+            verbalize_yaml,
+            false,
+        )),
+        "vector" => Some(vector_form(mount, dataset, version, params, false)),
+        "similar" => Some(similar_form(mount, dataset, version, params, false)),
         _ => None,
-    }?;
-    Some(html! { div."query-stack" { (form) } })
+    }
 }
 
 fn tpf(
@@ -292,23 +308,43 @@ fn sample(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bo
     )
 }
 
-fn verbalize(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
-    form(
-        "Verbalize",
+/// The verbalize form. `bundle_config` is the bundle's own config as YAML,
+/// when it publishes one: the config field starts from it, is optional, and is
+/// left out of the submitted URL while unchanged — the server's default is
+/// that same config, and kilobytes of YAML in an address bar say nothing the
+/// default does not.
+fn verbalize(
+    mount: &Mount,
+    dataset: &str,
+    version: &str,
+    params: &Params,
+    bundle_config: Option<&str>,
+    open: bool,
+) -> Markup {
+    let description = if bundle_config.is_some() {
+        "Render the texts an embedding config would write. The config starts as the one \
+         this bundle's vectors were built under; edit it to preview a change. Alone it plans \
+         every target: its member count and a few sampled texts. A target samples that one; \
+         IRIs render those roots."
+    } else {
         "Render the texts an embedding config would write. A config alone plans every \
          target: its member count and a few sampled texts. A target samples that one; \
-         IRIs render those roots.",
+         IRIs render those roots."
+    };
+    let config = match (params.get("config"), bundle_config) {
+        (Some(sent), bundle) => ConfigField::Sent {
+            text: sent,
+            required: bundle.is_none(),
+        },
+        (None, Some(bundle)) => ConfigField::Bundle(bundle),
+        (None, None) => ConfigField::Required,
+    };
+    form(
+        "Verbalize",
+        description,
         mount.operation(dataset, version, "verbalize"),
         vec![
-            textarea_control(
-                "verbalize",
-                "config",
-                "Config",
-                params.get("config"),
-                "targets:\n  thing:\n    type: https://example.org/Thing",
-                12,
-                true,
-            ),
+            config_control(config),
             text_control(
                 "verbalize",
                 "target",
@@ -343,6 +379,91 @@ fn verbalize(mount: &Mount, dataset: &str, version: &str, params: &Params, open:
             ),
         ],
         "Render",
+        open,
+    )
+}
+
+/// What the verbalize form's config field holds.
+enum ConfigField<'a> {
+    /// The config this request sent, shown as sent; required when there is no
+    /// bundle config to fall back on.
+    Sent { text: &'a str, required: bool },
+    /// The bundle's own: optional, and omitted on submit while unchanged.
+    Bundle(&'a str),
+    /// Nothing to start from: the bundle publishes no config.
+    Required,
+}
+
+fn config_control(field: ConfigField<'_>) -> Markup {
+    let (value, required, omit_unchanged) = match field {
+        ConfigField::Sent { text, required } => (text, required, false),
+        ConfigField::Bundle(bundle) => (bundle, false, true),
+        ConfigField::Required => ("", true, false),
+    };
+    html! {
+        label for="verbalize-config" ."wide" {
+            span."control-label" { "Config " code { "config" } }
+            textarea
+                id="verbalize-config"
+                name="config"
+                rows="12"
+                placeholder="targets:\n  thing:\n    type: https://example.org/Thing"
+                spellcheck="false"
+                required[required]
+                data-omit-unchanged[omit_unchanged]
+            { (value) }
+        }
+    }
+}
+
+fn vector_form(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
+    form(
+        "Vector",
+        "The stored vector of one embedded entity. Several go in a QUERY body as `iris`.",
+        mount.operation(dataset, version, "vector"),
+        vec![text_control(
+            "vector",
+            "iri",
+            "Entity",
+            params.get("iri"),
+            "ex:resource or <https://example.org/resource>",
+            true,
+        )],
+        "Look up",
+        open,
+    )
+}
+
+fn similar_form(
+    mount: &Mount,
+    dataset: &str,
+    version: &str,
+    params: &Params,
+    open: bool,
+) -> Markup {
+    form(
+        "Similar",
+        "The entities whose embedded text is nearest one entity's. A client with a vector of its own sends it in a QUERY body as `vector`.",
+        mount.operation(dataset, version, "similar"),
+        vec![
+            text_control(
+                "similar",
+                "iri",
+                "Entity",
+                params.get("iri"),
+                "ex:resource or <https://example.org/resource>",
+                true,
+            ),
+            number_control(
+                "similar",
+                "k",
+                "Neighbours",
+                params.get("k"),
+                1,
+                "server default",
+            ),
+        ],
+        "Find",
         open,
     )
 }
@@ -652,7 +773,8 @@ mod tests {
         // Every form whose operation needs no sidecar is offered whatever the
         // manifest says, because no bundle can fail to answer it. Only the ones
         // reading bytes a bundle may not carry follow a declaration.
-        let core = manifest_forms(&Mount::default(), "tox", "v1", &manifest(&[])).into_string();
+        let core =
+            manifest_forms(&Mount::default(), "tox", "v1", &manifest(&[]), None).into_string();
         assert!(core.contains("class=\"query-stack\""));
         for operation in ["fragment", "tpf", "count", "describe", "sample", "terms"] {
             assert!(
@@ -668,6 +790,7 @@ mod tests {
             "tox",
             "v1",
             &manifest(&[Capability::Search]),
+            None,
         )
         .into_string();
         assert!(searchable.contains("action=\"/tox/v/v1/search\""));
@@ -684,6 +807,7 @@ mod tests {
             "fragment",
             &params,
             Offers::default(),
+            None,
         )
         .unwrap()
         .into_string();
@@ -706,6 +830,7 @@ mod tests {
             "tox",
             "v1",
             &manifest(&[Capability::Sample, Capability::Search, Capability::Terms]),
+            None,
         )
         .into_string();
         for operation in [
@@ -729,6 +854,7 @@ mod tests {
             "fragment",
             &params,
             Offers::default(),
+            None,
         )
         .unwrap()
         .into_string();

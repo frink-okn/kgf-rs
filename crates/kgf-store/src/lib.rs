@@ -57,6 +57,7 @@ pub mod rank;
 pub mod scope;
 pub mod store;
 pub mod triple_terms;
+pub mod vectors;
 
 // Golden-bundle fixtures. Behind a feature rather than `cfg(test)` because
 // `kgf-server` and the `kgf` binary need the same hdtc-built bundles, and a
@@ -76,10 +77,16 @@ pub use description::{
 };
 pub use error::{Error, Result};
 pub use graphs::{GraphFacts, GraphId, Graphs, UNION_GRAPH_IRI, UNNAMED_GRAPH_IRI};
-pub use manifest::{BundleFacts, Capability, Manifest, ManifestDocument};
+pub use manifest::{
+    BundleFacts, Capability, Manifest, ManifestDocument, VectorsDescription,
+    VectorsIndexDescription,
+};
 pub use map::{PublishedBundle, PublishedRoot};
 pub use scope::{QuadRow, QuadSelection, ScopedSelection};
 pub use store::{OpenOptions, Store};
+pub use vectors::{
+    Hit, Row, SidecarFacts, Vectors, vectors_sidecar_facts, verify_vectors_artifacts,
+};
 
 /// A term identifier in one of HDT's role-scoped id spaces.
 ///

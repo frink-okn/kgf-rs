@@ -268,6 +268,8 @@ pub enum Capability {
     /// The declaration is for a reader without the bundle: it says which
     /// datasets are worth asking about statements.
     Reification,
+    /// `GET /vector` and `QUERY /similar`; needs the `vectors/` sidecar.
+    Vectors,
 }
 
 impl Capability {
@@ -286,6 +288,7 @@ impl Capability {
             Self::Filters => "filters",
             Self::Keysets => "keysets",
             Self::Reification => "reification",
+            Self::Vectors => "vectors",
         }
     }
 }
@@ -329,6 +332,7 @@ impl BundleFacts {
 
         let _graphs = artifacts.open_graphs(bundle)?;
         let _triple_terms = artifacts.open_triple_terms(bundle, &data)?;
+        let _vectors = artifacts.open_vectors(bundle, &data, 1)?;
         let _description = artifacts.open_description(bundle)?;
         // A manifest must not describe an optional capability whose complete
         // artifact cannot be opened. Reading only hdtc-text.meta would accept
@@ -408,6 +412,9 @@ fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
     if artifacts.triple_terms.is_some() {
         capabilities.insert(Capability::Reification);
     }
+    if artifacts.vectors.is_some() {
+        capabilities.insert(Capability::Vectors);
+    }
     // Each sketch family is all-or-nothing: both filter roles or neither, both
     // sketch roles or neither. A bundle carrying one role of a
     // family is not a bundle with a partial capability — it is a bundle whose
@@ -427,7 +434,7 @@ fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
 /// The artifact file names present, in canonical bundle-layout order.
 ///
 /// **This list must grow with every sidecar.** Reserved future locations include `labels/`,
-/// `ranges/`, `closures/`, `geo/` and `vectors/`, none of which has a
+/// `ranges/`, `closures/` and `geo/`, none of which has a
 /// producer yet; an artifact absent from here
 /// is absent from the manifest's checksums and therefore from
 /// `content_digest`. Adding a sidecar without adding it here silently narrows a
@@ -463,6 +470,9 @@ fn artifact_names_for(artifacts: &ArtifactSet) -> Vec<&'static str> {
     }
     names.extend(artifacts.filters.iter().copied());
     names.extend(artifacts.keysets.iter().copied());
+    if let Some(vectors) = &artifacts.vectors {
+        names.extend(vectors.names());
+    }
     names
 }
 
@@ -692,6 +702,59 @@ impl ArtifactEntry {
     }
 }
 
+/// What a bundle's `vectors` capability declares, as the value of that
+/// capability in the manifest: the space its vectors are in, what was
+/// embedded, and the index over them. `kgf manifest` writes it from the
+/// sidecar, the embedding stage's footer and the published verbalization
+/// config, so a reader learns all of it from the manifest alone — a server
+/// never parses the Parquet it came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorsDescription {
+    /// The embedding model, as the embedding stage names it.
+    pub model: String,
+    /// The vector space: hex SHA-256 over the model, width, metric and
+    /// normalization. Two bundles' vectors are comparable exactly when it
+    /// agrees.
+    pub convention_id: String,
+    /// Vector width.
+    pub dimensions: u32,
+    /// The distance the vectors are compared under.
+    pub metric: String,
+    /// Whether every vector is unit length.
+    pub normalized: bool,
+    /// The most tokens of a text the model reads; a longer text is embedded
+    /// from its first `max_seq_length` tokens.
+    pub max_seq_length: u32,
+    /// Nodes with a vector.
+    pub entities: u64,
+    /// Distinct vectors: nodes whose texts are identical share one.
+    pub records: u64,
+    /// Records whose text was longer than `max_seq_length` tokens.
+    pub truncated_records: u64,
+    /// The verbalization targets the embedded nodes were drawn from: target
+    /// name to class IRI.
+    pub targets: BTreeMap<String, String>,
+    /// The approximate-nearest-neighbour index.
+    pub index: VectorsIndexDescription,
+}
+
+/// The index a bundle's `/similar` searches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorsIndexDescription {
+    /// The library whose file format `index.usearch` is.
+    pub library: String,
+    /// The library version that wrote it.
+    pub library_version: String,
+    /// The graph structure: a hierarchical navigable small world.
+    pub kind: String,
+    /// The scalar type a stored vector is held in.
+    pub quantization: String,
+    /// Links per node in the graph.
+    pub connectivity: u64,
+    /// Candidates one probe visits: the search's breadth.
+    pub expansion_search: u64,
+}
+
 /// A bundle manifest.
 ///
 /// Field order here is the serialized order and every collection is a
@@ -846,6 +909,17 @@ impl ComponentRole {
             Self::Derived => "derived",
             Self::Entailment => "entailment",
         }
+    }
+}
+
+impl Manifest {
+    /// What the `vectors` capability declares, when it declares it and in a
+    /// form this build reads. `None` for a bundle without vectors, and for
+    /// one whose manifest predates the description (an empty object).
+    pub fn vectors(&self) -> Option<VectorsDescription> {
+        self.capabilities
+            .get(Capability::Vectors.as_str())
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
     }
 }
 

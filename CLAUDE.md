@@ -43,7 +43,7 @@ Source/
 | `kgf-store` | The memory-mapped read layer (doc 20). No HTTP, no async, no locks on the read path. |
 | `kgf-verbalize` | A bundle's roots as embedding text, over `kgf-store`. Called by the build stage and by `/verbalize` alike; knows nothing of HTTP. |
 | `kgf-server` | The HTTP API (doc 03) over `kgf-store`: caps, budgets, cursors, formats. |
-| `kgf` | The binary: `kgf build`, `kgf serve`, `kgf manifest`, `kgf verbalize`. |
+| `kgf` | The binary: `kgf build`, `kgf serve`, `kgf manifest`, `kgf verbalize`, `kgf vectors`. |
 
 **Status: M1 is built and answers.** `kgf-store` implements doc 20's read layer in
 full — mapped bundles, dictionary, all eight patterns with exact counts and positional
@@ -68,7 +68,12 @@ option.
 **M1 is not doc 03 §3.1's core profile**, and the two read like the same set. This
 implementation now extends past M1 with bindings QUERY (§3.4.2) and the complete
 description surface, closing that gap. Present and *not* in M1: `/sample`, `o.text`,
-and `/terms`, all optional capabilities. `/terms` is only half of §3.4.8: the prefix
+`/terms`, and the `vectors` sidecar — one vector per embedded entity and an ANN index
+over them, assembled by `kgf vectors` from the embedding stage's Parquet and the
+verbalizer's roots, answering `/vector` and `/similar` (`not_embedded`, 422, for an
+entity the build gave no vector), with the verbalization config published beside the
+vectors so `/describe` renders an embedded entity's text live and `/verbalize` needs
+no config of its own (`plan.md` units 38–39) — all optional capabilities. `/terms` is only half of §3.4.8: the prefix
 scan needs no artifact, while key resolution needs a derived key-to-id index no bundle
 carries, so QUERY on that route is a 405 and no manifest declares the capability —
 declaring one commits to its full contract, methods included (`plan.md` question 67).
@@ -165,10 +170,10 @@ promise.** `PublishedBundle::new` and `PublishedRoot::new` are `pub unsafe` prec
 that promise is made from *outside* `kgf-store`, by the layer that can know it: a
 library cannot establish that a directory will not be rewritten, and a deployment can.
 That layer is the `kgf` binary, and only it carries `#[allow(unsafe_code)]`: `serve`
-asserts it for the root a deployment serves, and the one-shot commands `manifest` and
-`verbalize` assert it for a directory the operator named (or a build's own staging
-directory), each under a SAFETY comment saying what the command writes and why that is
-not the mapped bytes. `kgf-server` stays `deny(unsafe_code)` and takes a `PublishedRoot`
+asserts it for the root a deployment serves, and the one-shot commands `manifest`,
+`verbalize` and `vectors` assert it for a directory the operator named (or a build's
+own staging directory), each under a SAFETY comment saying what the command writes and
+why that is not the mapped bytes. `kgf-server` stays `deny(unsafe_code)` and takes a `PublishedRoot`
 in its `Config` rather than a path, because it is a library that can be embedded and
 must not make the promise on an unknown caller's behalf. A site of a new kind — in a
 library, or over a directory nobody has promised anything about — is a design change to
@@ -223,9 +228,9 @@ quietly.
 8. **A capability gate belongs only where an artifact can be absent.** A manifest's
    capability list is derived entirely from which artifact files a bundle carries, so it
    tells a server holding that bundle nothing new; its audience is the consumer reading
-   manifests *without* the bundle. `search`, `graphs`, and the sketch families are
-   therefore refused before the open when undeclared, because the bytes may really be
-   missing. `sample`, `labels`, and `terms` are never gated: they compose artifacts every
+   manifests *without* the bundle. `search`, `graphs`, `vectors`, and the sketch
+   families are therefore refused before the open when undeclared, because the bytes
+   may really be missing. `sample`, `labels`, and `terms` are never gated: they compose artifacts every
    bundle is required to carry, so a check could only suppress work the bytes support
    because the metadata is older than the code. What the *bundle carries* is the
    manifest's statement; what this *deployment routes* is the service descriptor's.

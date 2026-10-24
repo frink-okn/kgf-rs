@@ -66,6 +66,8 @@ use crate::representation::{RdfSyntax, Representation};
 use crate::service::{PredicateRoles, RolesByPredicate};
 use crate::term::{Literal as KgfLiteral, PrefixMap, Term, TripleTerm};
 use crate::url::Params;
+use std::sync::Arc;
+
 use kgf_verbalize::{Config as VerbalizeConfig, Resolved as VerbalizeResolved};
 
 // ---------------------------------------------------------------------------
@@ -1071,7 +1073,8 @@ const VERBALIZE_DEFAULT_N: u32 = 5;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireVerbalize {
-    config: VerbalizeConfig,
+    #[serde(default)]
+    config: Option<VerbalizeConfig>,
     #[serde(default)]
     target: Option<String>,
     #[serde(default)]
@@ -1094,25 +1097,28 @@ impl Verbalize {
         limits: Limits<'_>,
         prefixes: &PrefixMap,
         profile: &PredicateRoles,
+        default: Option<&Arc<VerbalizeResolved>>,
     ) -> Result<Self, Problem> {
         accept_only(params, VERBALIZE, Self::PARAMETERS)?;
-        let Some(text) = params.get("config") else {
-            return Err(Problem::new(
-                ErrorCode::MalformedRequest,
-                "config is required: the verbalization config, as YAML or JSON",
-            ));
+        let resolved = match params.get("config") {
+            None => Self::default_config(default)?,
+            Some(text) => {
+                if text.len() as u64 > limits.budgets.max_request_bytes {
+                    return Err(Problem::new(
+                        ErrorCode::PayloadTooLarge,
+                        format!(
+                            "config is {} bytes, over this server's max_request_bytes of {}",
+                            text.len(),
+                            limits.budgets.max_request_bytes
+                        ),
+                    ));
+                }
+                resolve_config(verbalize_config_text(
+                    text,
+                    limits.budgets.max_request_bytes,
+                )?)?
+            }
         };
-        if text.len() as u64 > limits.budgets.max_request_bytes {
-            return Err(Problem::new(
-                ErrorCode::PayloadTooLarge,
-                format!(
-                    "config is {} bytes, over this server's max_request_bytes of {}",
-                    text.len(),
-                    limits.budgets.max_request_bytes
-                ),
-            ));
-        }
-        let config = verbalize_config_text(text, limits.budgets.max_request_bytes)?;
         let mut iris = Vec::new();
         if let Some(list) = params.get("iri") {
             for text in term_list("iri", list)? {
@@ -1130,7 +1136,7 @@ impl Verbalize {
             )?),
         };
         Self::finish(
-            config,
+            resolved,
             params.get("target").map(str::to_owned),
             iris,
             n,
@@ -1141,16 +1147,22 @@ impl Verbalize {
         )
     }
 
-    /// Parse the JSON body form: the config as an object in `config`.
+    /// Parse the JSON body form: the config as an object in `config`, or the
+    /// bundle's own when the body carries none.
     pub fn parse_body(
         params: &Params,
         body: &[u8],
         limits: Limits<'_>,
         prefixes: &PrefixMap,
         profile: &PredicateRoles,
+        default: Option<&Arc<VerbalizeResolved>>,
     ) -> Result<Self, Problem> {
         accept_only(params, VERBALIZE, &["format"])?;
         let wire: WireVerbalize = parse_body(body)?;
+        let resolved = match wire.config {
+            None => Self::default_config(default)?,
+            Some(config) => resolve_config(config)?,
+        };
         let mut iris = Vec::new();
         for (index, iri) in wire.iris.unwrap_or_default().into_iter().enumerate() {
             iris.push(
@@ -1176,7 +1188,7 @@ impl Verbalize {
             }
         }
         Self::finish(
-            wire.config,
+            resolved,
             wire.target,
             iris,
             wire.n,
@@ -1189,9 +1201,22 @@ impl Verbalize {
 
     /// The rules both forms share: which mode the request is, and that it
     /// fits under the root cap.
+    /// The bundle's own config, for a request that sent none.
+    fn default_config(
+        default: Option<&Arc<VerbalizeResolved>>,
+    ) -> Result<VerbalizeResolved, Problem> {
+        match default {
+            Some(resolved) => Ok((**resolved).clone()),
+            None => Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "config is required: the verbalization config, as YAML or JSON; this bundle publishes none to fall back on",
+            )),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn finish(
-        config: VerbalizeConfig,
+        resolved: VerbalizeResolved,
         target: Option<String>,
         iris: Vec<BoundTerm>,
         n: Option<u32>,
@@ -1200,12 +1225,6 @@ impl Verbalize {
         limits: Limits<'_>,
         profile: &PredicateRoles,
     ) -> Result<Self, Problem> {
-        let resolved = config.resolve().map_err(|error| {
-            Problem::new(
-                ErrorCode::MalformedRequest,
-                format!("config is not a usable verbalization config: {error}"),
-            )
-        })?;
         let names: Vec<&str> = resolved
             .targets
             .iter()
@@ -1245,11 +1264,10 @@ impl Verbalize {
                     ),
                 ));
             }
-            (
-                VerbalizeMode::Iris(iris),
-                Self::one_target(target, &names)?,
-                VERBALIZE_DEFAULT_N,
-            )
+            // A target is needed only to disambiguate: without one, each
+            // IRI renders under the first target whose class it is an
+            // instance of, and the answer says which.
+            (VerbalizeMode::Iris(iris), target, VERBALIZE_DEFAULT_N)
         } else if plan || target.is_none() {
             let selected = if target.is_some() {
                 1
@@ -1355,7 +1373,7 @@ impl Verbalize {
 
 impl GetRequest for Verbalize {
     fn normalize_params(params: &Params) -> Params {
-        params.without_empty(&["target", "iri", "n", "seed", "plan"])
+        params.without_empty(&["config", "target", "iri", "n", "seed", "plan"])
     }
 
     fn work_class(&self) -> WorkClass {
@@ -1371,6 +1389,16 @@ impl ObservedRequest for Verbalize {
             roots: self.requested_roots(),
         }
     }
+}
+
+/// A config as sent, validated and defaulted.
+fn resolve_config(config: VerbalizeConfig) -> Result<VerbalizeResolved, Problem> {
+    config.resolve().map_err(|error| {
+        Problem::new(
+            ErrorCode::MalformedRequest,
+            format!("config is not a usable verbalization config: {error}"),
+        )
+    })
 }
 
 /// Parse `/verbalize`'s GET config, YAML or JSON, held to `limit` bytes once
@@ -3709,6 +3737,20 @@ pub struct Describe {
     pub binding: CursorBinding,
     /// How the response labels its IRIs; `None` unless `labels=true`.
     pub labels: Option<Labeling>,
+    /// What renders an embedded resource's text live, when the bundle
+    /// publishes a verbalization config.
+    pub verbalize: Option<DescribeVerbalize>,
+}
+
+/// The bundle's verbalization config as a describe request carries it.
+#[derive(Debug)]
+pub struct DescribeVerbalize {
+    /// The resolved config, shared with the release.
+    pub resolved: Arc<VerbalizeResolved>,
+    /// The release's `label` role, the cascade's last resort.
+    pub label_predicates: Vec<String>,
+    /// Reads one render may make.
+    pub read_budget: u64,
 }
 
 impl Describe {
@@ -3766,7 +3808,28 @@ impl Describe {
             cursor: resume(params, &binding)?,
             binding,
             labels: Labeling::from_params(params, false, profile, prefixes, limits)?,
+            verbalize: None,
         })
+    }
+
+    /// Carry the bundle's verbalization config, so the answer can render the
+    /// resource's embedded text.
+    #[must_use]
+    pub fn with_verbalize(
+        mut self,
+        config: Option<&Arc<VerbalizeResolved>>,
+        profile: &PredicateRoles,
+        limits: Limits<'_>,
+    ) -> Self {
+        self.verbalize = config.map(|resolved| DescribeVerbalize {
+            resolved: Arc::clone(resolved),
+            label_predicates: profile
+                .get("label")
+                .map(<[String]>::to_vec)
+                .unwrap_or_default(),
+            read_budget: limits.budgets.candidate_budget,
+        });
+        self
     }
 }
 
@@ -4968,6 +5031,324 @@ const SAMPLE: &str = "sample";
 const SCHEMA: &str = "schema";
 const VOID: &str = "void";
 const SUMMARY: &str = "summary";
+const VECTOR: &str = "vector";
+const SIMILAR: &str = "similar";
+
+/// `GET|QUERY /vector` — the stored vector of each submitted entity.
+///
+/// A lookup table like `/labels`: the answer is an array in input order, and
+/// an entity with no vector is an entry saying why rather than a refusal, so
+/// a mixed batch gets one answer. `/similar` is where "not embedded" is an
+/// error, because there the operation cannot proceed.
+pub struct Vector {
+    iris: Vec<BoundTerm>,
+    /// Bytes the result rows may occupy.
+    pub bytes: ResponseBytes,
+}
+
+impl Vector {
+    const PARAMETERS: &'static [&'static str] = &["iri", "format"];
+
+    /// Parse the GET form: one entity in `iri`.
+    pub fn parse(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+    ) -> Result<Self, Problem> {
+        accept_only(params, VECTOR, Self::PARAMETERS)?;
+        let Some(text) = params.get("iri") else {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "`iri` names the entity whose vector to return; several go in a QUERY body as `iris`",
+            ));
+        };
+        let iri = BoundTerm::parse("iri", text, limits, prefixes)?.require_iri("iri")?;
+        Ok(Self {
+            iris: vec![iri],
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+        })
+    }
+
+    /// Parse the JSON body form: entities in `iris`, held to `max_vector_iris`.
+    pub fn parse_body(
+        params: &Params,
+        body: &[u8],
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+    ) -> Result<Self, Problem> {
+        accept_only(params, VECTOR, &["format"])?;
+        let wire: WireVector = parse_body(body)?;
+        if wire.iris.len() > limits.caps.max_vector_iris as usize {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "vector received {} IRIs, over this server's max_vector_iris of {}",
+                    wire.iris.len(),
+                    limits.caps.max_vector_iris
+                ),
+            ));
+        }
+        let mut iris = Vec::with_capacity(wire.iris.len());
+        for (index, iri) in wire.iris.into_iter().enumerate() {
+            iris.push(
+                BoundTerm::parse_body(&format!("iris[{index}]"), iri, limits, prefixes)?
+                    .require_iri(&format!("iris[{index}]"))?,
+            );
+        }
+        Ok(Self {
+            iris,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+        })
+    }
+
+    /// The entities, in request order.
+    pub fn iris(&self) -> &[BoundTerm] {
+        &self.iris
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireVector {
+    iris: Vec<WireTerm>,
+}
+
+impl ObservedRequest for Vector {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Vector {
+            iris: self.iris.len() as u64,
+        }
+    }
+}
+
+impl GetRequest for Vector {
+    fn normalize_params(params: &Params) -> Params {
+        params.without_empty(&[])
+    }
+}
+
+/// What `/similar` ranks the bundle's records against.
+pub enum SimilarQuery {
+    /// An embedded entity's own stored vector; the entity's record is left
+    /// out of the answer.
+    Entity(BoundTerm),
+    /// A vector the client computed, in the bundle's space.
+    Vector(Vec<f32>),
+}
+
+/// `GET|QUERY /similar` — the `k` records nearest a vector, with the entities
+/// each one names.
+pub struct Similar {
+    /// What to rank against.
+    pub query: SimilarQuery,
+    /// Records wanted.
+    pub k: u32,
+    /// Bytes the result rows may occupy.
+    pub bytes: ResponseBytes,
+    /// How each entity's preferred label is resolved; `None` for
+    /// `labels=false`. On by default, as `/search` has it: a list of entities
+    /// is what this operation returns, and unlabelled it names nothing.
+    pub labels: Option<Labeling>,
+}
+
+impl Similar {
+    const PARAMETERS: &'static [&'static str] = &[
+        "iri",
+        "vector",
+        "k",
+        "labels",
+        "lang",
+        "label_source",
+        "format",
+    ];
+
+    /// Parse the GET form: one of an entity in `iri` and a comma-separated
+    /// vector in `vector`, and `k`.
+    pub fn parse(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        profile: &PredicateRoles,
+    ) -> Result<Self, Problem> {
+        accept_only(params, SIMILAR, Self::PARAMETERS)?;
+        let query = match (params.get("iri"), params.get("vector")) {
+            (Some(text), None) => SimilarQuery::Entity(
+                BoundTerm::parse("iri", text, limits, prefixes)?.require_iri("iri")?,
+            ),
+            (None, Some(text)) => SimilarQuery::Vector(Self::parse_vector_text(text, limits)?),
+            (Some(_), Some(_)) => {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    "`iri` and `vector` are alternatives; name one",
+                ));
+            }
+            (None, None) => {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    "name the entity to find the neighbours of in `iri`, or a vector in `vector`",
+                ));
+            }
+        };
+        let k = page_size(
+            params,
+            "k",
+            Self::default_k(limits),
+            limits.caps.max_similar_k,
+            "omit similar when no neighbours are wanted",
+        )?;
+        Ok(Self {
+            query,
+            k,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            labels: Labeling::from_params(params, true, profile, prefixes, limits)?,
+        })
+    }
+
+    /// A GET `vector`: decimal numbers separated by commas.
+    ///
+    /// Held to `max_term_bytes` before it is split, as a term is: the bundle's
+    /// width is not known until the store answers, and a parse must not be
+    /// bounded only by what a URL can carry.
+    fn parse_vector_text(text: &str, limits: Limits<'_>) -> Result<Vec<f32>, Problem> {
+        let max = limits.budgets.max_term_bytes;
+        if text.len() as u64 > max {
+            return Err(Problem::new(
+                ErrorCode::CapExceeded,
+                format!(
+                    "`vector` is {} bytes, over this server's max_term_bytes of {max}",
+                    text.len()
+                ),
+            ));
+        }
+        let mut vector = Vec::new();
+        for (position, piece) in text.split(',').enumerate() {
+            let number: f32 = piece.trim().parse().map_err(|_| {
+                Problem::new(
+                    ErrorCode::MalformedRequest,
+                    format!("vector[{position}] is not a number: {piece:?}"),
+                )
+            })?;
+            vector.push(number);
+        }
+        Self::finite_vector(vector)
+    }
+
+    /// A vector with at least one component, every one finite.
+    fn finite_vector(vector: Vec<f32>) -> Result<Vec<f32>, Problem> {
+        if vector.is_empty() {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "`vector` is empty; it must have the bundle's number of dimensions",
+            ));
+        }
+        if let Some(position) = vector.iter().position(|x| !x.is_finite()) {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!("vector[{position}] is not a finite number"),
+            ));
+        }
+        Ok(vector)
+    }
+
+    /// Parse the JSON body form: one of `iri` and `vector`, and `k`.
+    pub fn parse_body(
+        params: &Params,
+        body: &[u8],
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        profile: &PredicateRoles,
+    ) -> Result<Self, Problem> {
+        accept_only(params, SIMILAR, &["format"])?;
+        let wire: WireSimilar = parse_body(body)?;
+        let query = match (wire.iri, wire.vector) {
+            (Some(iri), None) => SimilarQuery::Entity(
+                BoundTerm::parse_body("iri", iri, limits, prefixes)?.require_iri("iri")?,
+            ),
+            (None, Some(vector)) => SimilarQuery::Vector(Self::finite_vector(vector)?),
+            (Some(_), Some(_)) => {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    "`iri` and `vector` are alternatives; name one",
+                ));
+            }
+            (None, None) => {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    "name the entity to find the neighbours of in `iri`, or a vector in `vector`",
+                ));
+            }
+        };
+        let k = match wire.k {
+            None => Self::default_k(limits),
+            Some(0) => {
+                return Err(Problem::new(
+                    ErrorCode::MalformedRequest,
+                    "k=0 asks for nothing back; omit k to take the default",
+                ));
+            }
+            Some(k) if k > limits.caps.max_similar_k => {
+                return Err(Problem::new(
+                    ErrorCode::CapExceeded,
+                    format!(
+                        "k={k} is over this server's max_similar_k of {}",
+                        limits.caps.max_similar_k
+                    ),
+                ));
+            }
+            Some(k) => k,
+        };
+        Ok(Self {
+            query,
+            k,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            labels: Labeling::from_body(
+                wire.labels,
+                wire.lang,
+                wire.label_source,
+                true,
+                profile,
+                prefixes,
+                limits,
+            )?,
+        })
+    }
+
+    /// `k` when the request names none: the page default, within the cap.
+    fn default_k(limits: Limits<'_>) -> u32 {
+        limits.caps.default_limit.min(limits.caps.max_similar_k)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireSimilar {
+    iri: Option<WireTerm>,
+    vector: Option<Vec<f32>>,
+    k: Option<u32>,
+    labels: Option<WireLabelsControl>,
+    lang: Option<Vec<String>>,
+    label_source: Option<bool>,
+}
+
+impl ObservedRequest for Similar {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Similar {
+            by: match self.query {
+                SimilarQuery::Entity(_) => "iri",
+                SimilarQuery::Vector(_) => "vector",
+            },
+            k: self.k,
+            labels: self.labels.is_some(),
+        }
+    }
+}
+
+impl GetRequest for Similar {
+    fn normalize_params(params: &Params) -> Params {
+        params.without_empty(&["iri", "vector", "k", "labels", "lang", "label_source"])
+    }
+}
+
 const SEARCH: &str = "search";
 const TERMS: &str = "terms";
 const LABELS: &str = "labels";

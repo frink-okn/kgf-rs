@@ -119,6 +119,9 @@ pub struct Target {
     mount: Mount,
     body: bool,
     offers: Offers,
+    /// The release's verbalization config as YAML, for the verbalize form to
+    /// start from; `None` when it publishes none.
+    verbalize_yaml: Option<Arc<str>>,
     /// Logical dataset identity and the description link this release can
     /// actually answer, from the immutable manifest.
     dataset: Option<DatasetMetadata>,
@@ -189,10 +192,17 @@ impl Target {
             mount,
             body: false,
             offers,
+            verbalize_yaml: None,
             request_url,
             dataset: None,
             declarations: None,
         }
+    }
+
+    /// Attach the release's verbalization config, for its form to start from.
+    pub(crate) fn with_verbalize_yaml(mut self, yaml: Option<Arc<str>>) -> Self {
+        self.verbalize_yaml = yaml;
+        self
     }
 
     /// Attach the release's manifest, for the declarations a page renders.
@@ -245,6 +255,7 @@ impl Target {
             mount,
             body: true,
             offers: Offers::default(),
+            verbalize_yaml: None,
             request_url: None,
             dataset: None,
             declarations: None,
@@ -340,6 +351,13 @@ impl Target {
         (!self.body).then(|| query(self.base(), &self.params.with("cursor", token)))
     }
 
+    /// This same request with its parameters rewritten by `edit`, for a link
+    /// that varies it; `None` for a body-addressed request, which has no URL
+    /// to vary.
+    fn varied(&self, edit: impl FnOnce(&Params) -> Params) -> Option<String> {
+        (!self.body).then(|| query(self.base(), &edit(&self.params)))
+    }
+
     /// A one-parameter request against another operation of the same bundle,
     /// for a link on a page.
     fn ask(&self, operation: &str, parameter: &str, value: &str) -> String {
@@ -400,6 +418,8 @@ impl Target {
             AccessOperation::Schema => "Schema",
             AccessOperation::Labels => "Labels",
             AccessOperation::Verbalize => "Verbalize",
+            AccessOperation::Vector => "Vector",
+            AccessOperation::Similar => "Similar",
             AccessOperation::Void => "void",
             AccessOperation::Summary => "summary",
             AccessOperation::Manifest => "manifest",
@@ -412,7 +432,15 @@ impl Target {
 
     /// The GET editor for this answer, absent for a body-addressed request.
     fn form(&self) -> Option<maud::Markup> {
-        if self.body {
+        self.form_beside(maud::html! {})
+    }
+
+    /// The GET editor for this answer with `panels` in the same row of
+    /// toggles, or `panels` alone for a body-addressed request — which has no
+    /// editor but may still have something to show. `None` when there is
+    /// neither.
+    fn form_beside(&self, panels: maud::Markup) -> Option<maud::Markup> {
+        let form = if self.body {
             None
         } else {
             forms::operation_form(
@@ -422,8 +450,12 @@ impl Target {
                 self.operation.path_segment(),
                 &self.params,
                 self.offers,
+                self.verbalize_yaml.as_deref(),
             )
-        }
+        };
+        (form.is_some() || !panels.0.is_empty()).then(
+            || maud::html! { div."query-stack" { @if let Some(form) = form { (form) } (panels) } },
+        )
     }
 }
 
@@ -1233,12 +1265,39 @@ enum Echo {
     Describe {
         resource: String,
         direction: Direction,
+        /// Whether the resource has a vector in this bundle: the third of the
+        /// three states a term can be in, answered for free by the id map.
+        /// Absent when the bundle publishes no vectors.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        embedded: Option<bool>,
+        /// Its record, when embedded.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        record: Option<u64>,
+        /// The text the vector was computed from, rendered live under the
+        /// bundle's config, when it publishes one and a target claims the
+        /// resource.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        embedded_text: Option<EmbeddedText>,
     },
     Sample {
         pattern: Pattern,
         n: u32,
         seed: u64,
     },
+}
+
+/// An embedded resource's text, rendered live under the bundle's config.
+#[derive(Debug, Clone, Serialize)]
+struct EmbeddedText {
+    /// The config target whose class the resource is an instance of.
+    target: String,
+    text: String,
+    /// Whether the live text's digest is the one the id map recorded for
+    /// the resource's record: false means the verbalizer has changed since
+    /// this version was built, and the vector was computed from other text.
+    matches_embedded: bool,
+    /// Whether the render stopped at a budget.
+    truncated: bool,
 }
 
 /// The keys a page's rows carry: the unbound positions, and `g` in the quad
@@ -3531,7 +3590,130 @@ impl VoidResource {
 struct SummaryResource {
     markdown: String,
     card: Option<SummaryCard>,
+    /// The vector sidecar's sizes, read from the bundle rather than the card:
+    /// the card is written with the description, and vectors can arrive in a
+    /// later version derived from it.
+    vectors: Option<SummaryVectors>,
     target: Target,
+}
+
+/// What a release's vector sidecar holds, for the summary page: the counts
+/// the sidecar states at open, and the manifest's description of the model
+/// and index when it carries one — a manifest written before descriptions
+/// were has only the counts to show.
+#[derive(Debug, Clone)]
+struct SummaryVectors {
+    /// Nodes that have a vector.
+    entities: u64,
+    /// Distinct vectors: nodes whose texts are identical share one.
+    records: u64,
+    dimensions: usize,
+    description: Option<kgf_store::VectorsDescription>,
+}
+
+impl SummaryVectors {
+    /// The full-width panel: the model, what was embedded, and the index.
+    fn panel(&self) -> maud::Markup {
+        let records = group_digits(self.records);
+        let truncated = self.description.as_ref().map(|description| {
+            let percent = if self.records == 0 {
+                0
+            } else {
+                (description.truncated_records * 100 + self.records / 2) / self.records
+            };
+            format!(
+                "{} of {records} texts (~{percent}%)",
+                group_digits(description.truncated_records)
+            )
+        });
+        let max_tokens = self.description.as_ref().map(|description| {
+            format!(
+                "{} tokens",
+                group_digits(u64::from(description.max_seq_length))
+            )
+        });
+        let library = self.description.as_ref().map(|description| {
+            format!(
+                "{} {}",
+                description.index.library, description.index.library_version
+            )
+        });
+        let structure = self.description.as_ref().map(|description| {
+            format!(
+                "{}, {} vectors, {} distance",
+                description.index.kind.to_uppercase(),
+                description.index.quantization,
+                description.metric
+            )
+        });
+        let targets = self.description.as_ref().map(|description| {
+            description
+                .targets
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
+        fn text(value: &Option<String>) -> Value<'_> {
+            value.as_deref().map_or(Value::Absent, Value::Text)
+        }
+        let description = self.description.as_ref();
+        html! {
+            section."panel"."embeddings-panel" {
+                h2 { "Embeddings" }
+                (note(
+                    "Each embedded node has a vector computed from its verbalized text; nodes \
+                     whose texts are identical share one. /similar searches them through the index."
+                ))
+                div."embeddings-grid" {
+                    div {
+                        h3 { "Model" }
+                        (fields(&[
+                            ("model", description.map_or(Value::Absent, |d| Value::Code(&d.model))),
+                            ("dimensions", Value::Number(self.dimensions as u64)),
+                            ("reads at most", text(&max_tokens)),
+                            ("truncated", text(&truncated)),
+                            (
+                                "normalized",
+                                description.map_or(Value::Absent, |d| {
+                                    Value::Text(if d.normalized { "yes" } else { "no" })
+                                }),
+                            ),
+                        ]))
+                    }
+                    div {
+                        h3 { "Coverage" }
+                        (fields(&[
+                            ("embedded nodes", Value::Number(self.entities)),
+                            ("distinct vectors", Value::Number(self.records)),
+                            ("targets", text(&targets)),
+                        ]))
+                    }
+                    div {
+                        h3 { "Index" }
+                        (fields(&[
+                            ("library", text(&library)),
+                            ("structure", text(&structure)),
+                            (
+                                "connectivity",
+                                description.map_or(Value::Absent, |d| Value::Number(d.index.connectivity)),
+                            ),
+                            (
+                                "search breadth",
+                                description.map_or(Value::Absent, |d| Value::Number(d.index.expansion_search)),
+                            ),
+                        ]))
+                    }
+                }
+                @if let Some(description) = description {
+                    p."note" {
+                        "Vector space " code { (description.convention_id) }
+                        ": bundles whose vectors share it can be compared directly."
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3721,7 +3903,7 @@ impl SummaryResource {
                         ("dataset", Value::Code(&card.dataset.id)),
                         ("version", Value::Code(&card.dataset.version)),
                     ]))
-                    (summary_actions(&card.links))
+                    (summary_actions(&card.links, self.target.verbalize_yaml.is_some()))
                 }
                 div."dashboard-grid" {
                     section."panel" {
@@ -3762,6 +3944,9 @@ impl SummaryResource {
                         &relation_rows,
                     ))
                 }
+                @if let Some(vectors) = &self.vectors {
+                    (vectors.panel())
+                }
             },
         )
     }
@@ -3796,7 +3981,11 @@ fn schema_views(target: &Target, views: &[String], current: &str) -> maud::Marku
     }
 }
 
-fn summary_actions(links: &BTreeMap<String, String>) -> maud::Markup {
+/// The summary's discovery links: those the published card names, and —
+/// because a card is written when the bundle's description is built, and
+/// vectors can arrive in a later version derived from it — one the server adds
+/// itself when the release publishes a verbalization config.
+fn summary_actions(links: &BTreeMap<String, String>, verbalize: bool) -> maud::Markup {
     const ACTIONS: [(&str, &str, &str); 7] = [
         (
             "classes",
@@ -3843,6 +4032,14 @@ fn summary_actions(links: &BTreeMap<String, String>) -> maud::Markup {
                             a href=(href) {
                                 strong { (label) }
                                 span { (description) }
+                            }
+                        }
+                    }
+                    @if relation == "fragment" && verbalize {
+                        li {
+                            a href="verbalize" {
+                                strong { "Explore verbalizations" }
+                                span { "The text behind each embedded node's vector." }
                             }
                         }
                     }
@@ -4004,6 +4201,15 @@ pub fn summary(
                     .summary_markdown()
                     .map_err(|error| unreadable("reading the summary card", &error))?
                     .to_owned(),
+                vectors: store.vectors().map(|vectors| SummaryVectors {
+                    entities: vectors.entities(),
+                    records: vectors.records(),
+                    dimensions: vectors.dimensions(),
+                    description: target
+                        .declarations
+                        .as_ref()
+                        .and_then(|manifest| manifest.vectors()),
+                }),
                 target,
             };
             Bytes::from(resource.to_html())
@@ -5055,6 +5261,23 @@ fn searcher<'a>(store: &'a Store, target: &Target) -> Result<&'a TextSearcher, P
     })
 }
 
+/// The vector sidecar, or the 501 for a bundle that declared `vectors`
+/// without carrying it — the second half of the gate, as [`searcher`] is for
+/// `search`.
+fn vectors<'a>(store: &'a Store, target: &Target) -> Result<&'a kgf_store::Vectors, Problem> {
+    store.vectors().ok_or_else(|| {
+        tracing::error!(
+            dataset = %target.id.dataset,
+            version = %target.id.version,
+            "a bundle declaring `vectors` has no vector sidecar",
+        );
+        Problem::new(
+            ErrorCode::CapabilityNotAvailable,
+            "this bundle declares `vectors` but carries no vector sidecar",
+        )
+    })
+}
+
 /// `GET /count` — a pattern's cardinality.
 pub fn count(
     store: &Store,
@@ -5685,6 +5908,439 @@ pub fn labels(
     })
 }
 
+/// Render an embedded resource's text live under the bundle's config, and
+/// say whether it is the text the vector was computed from.
+///
+/// One bounded render: the config's IRIs bound once (a dictionary lookup
+/// each), one existence probe per target to find the resource's, then the
+/// walk `/verbalize` makes for one root, under the request's read and byte
+/// budgets. `None` when no target claims the resource.
+fn embedded_text(
+    store: &Store,
+    vectors: &kgf_store::Vectors,
+    row: kgf_store::Row,
+    subject: u64,
+    config: &request::DescribeVerbalize,
+    bytes: u64,
+) -> Result<Option<EmbeddedText>, Problem> {
+    let bound = Bound::bind(store, &config.resolved, &config.label_predicates)
+        .map_err(|error| unreadable("binding the bundle's verbalization config", &error))?;
+    let Some(index) = bound
+        .target_of(store, subject)
+        .map_err(|error| unreadable("finding a resource's target", &error))?
+    else {
+        return Ok(None);
+    };
+    let mut verbalizer = Verbalizer::new(store, &bound)
+        .with_read_budget(usize::try_from(config.read_budget).unwrap_or(usize::MAX))
+        .with_byte_budget(usize::try_from(bytes).unwrap_or(usize::MAX));
+    let Some(rendered) = verbalizer
+        .verbalize(index, subject)
+        .map_err(|error| unreadable("verbalizing a resource", &error))?
+    else {
+        return Ok(None);
+    };
+    let recorded = vectors
+        .digest_of(row)
+        .map_err(|error| unreadable("reading a record's digest", &error))?;
+    Ok(Some(EmbeddedText {
+        target: bound
+            .targets()
+            .nth(index)
+            .expect("the target index came from this binding")
+            .to_owned(),
+        matches_embedded: rendered.digest == recorded,
+        truncated: rendered.truncated,
+        text: rendered.text,
+    }))
+}
+
+/// `GET|QUERY /vector` — each submitted entity's stored vector.
+pub fn vector(
+    store: &Store,
+    target: Target,
+    request: &request::Vector,
+) -> Result<VectorAnswer, Problem> {
+    let dictionary = store.dict();
+    let blank_nodes = SkolemScope::of(store);
+    let vectors = vectors(store, &target)?;
+    let dimensions = vectors.dimensions();
+    let mut results = Vec::with_capacity(request.iris().len());
+    let mut spent = 0u64;
+    let mut stopped = None;
+
+    for requested in request.iris() {
+        let located = locate_scoped(
+            &dictionary,
+            &blank_nodes,
+            store.triple_terms(),
+            Role::Subject,
+            requested,
+        )?;
+        let result = match located {
+            None => VectorResult::absent(requested.dictionary(), "unknown_term"),
+            Some(id) => {
+                let row = vectors
+                    .row_of(TermId(id))
+                    .map_err(|error| unreadable("looking up an entity's record", &error))?;
+                match row {
+                    None => VectorResult::absent(requested.dictionary(), "not_embedded"),
+                    Some(row) => {
+                        let stored = vectors
+                            .vector(row)
+                            .map_err(|error| unreadable("reading a stored vector", &error))?;
+                        VectorResult::found(requested.dictionary(), row.0, stored)
+                    }
+                }
+            }
+        };
+        let next = spent.saturating_add(result.serialized);
+        if next > request.bytes.0 && !results.is_empty() {
+            stopped = Some(BudgetReason::ResponseBytes);
+            break;
+        }
+        spent = next;
+        results.push(result);
+    }
+
+    Ok(VectorAnswer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        dimensions,
+        vectors: results,
+        completeness: match stopped {
+            Some(reason) => Completeness::budget_exhausted_without_resume(reason),
+            None => Completeness::complete(),
+        },
+        target,
+    })
+}
+
+/// `GET|QUERY /similar` — the records nearest a vector, and their entities.
+pub fn similar(
+    store: &Store,
+    target: Target,
+    request: &request::Similar,
+) -> Result<SimilarAnswer, Problem> {
+    let dictionary = store.dict();
+    let blank_nodes = SkolemScope::of(store);
+    let vectors = vectors(store, &target)?;
+
+    // The query vector, and the record to leave out of the answer when it is
+    // an entity's own.
+    let (query, own, echo) = match &request.query {
+        request::SimilarQuery::Entity(entity) => {
+            let located = locate_scoped(
+                &dictionary,
+                &blank_nodes,
+                store.triple_terms(),
+                Role::Subject,
+                entity,
+            )?;
+            let Some(id) = located else {
+                return Err(Problem::new(
+                    ErrorCode::NotEmbedded,
+                    format!(
+                        "{} is not a subject of this bundle, so it has no vector; find it through /search or /describe",
+                        entity.dictionary()
+                    ),
+                ));
+            };
+            let row = vectors
+                .row_of(TermId(id))
+                .map_err(|error| unreadable("looking up an entity's record", &error))?;
+            let Some(row) = row else {
+                return Err(Problem::new(
+                    ErrorCode::NotEmbedded,
+                    format!(
+                        "{} is a subject of this bundle but not an embedding target of this version, so it has no vector to compare; /search and /describe answer for it",
+                        entity.dictionary()
+                    ),
+                ));
+            };
+            let stored = vectors
+                .vector(row)
+                .map_err(|error| unreadable("reading a stored vector", &error))?;
+            (stored, Some(row), SimilarEcho::entity(entity.dictionary()))
+        }
+        request::SimilarQuery::Vector(vector) => {
+            (vector.clone(), None, SimilarEcho::vector(vector.len()))
+        }
+    };
+
+    // One more than asked when the entity's own record will be dropped.
+    let probe = request.k as usize + usize::from(own.is_some());
+    let hits = vectors
+        .similar(&query, probe)
+        .map_err(|error| match error {
+            kgf_store::Error::QueryDimension { expected, found } => Problem::new(
+                ErrorCode::MalformedRequest,
+                format!("`vector` has {found} dimensions; this bundle's vectors have {expected}"),
+            ),
+            kgf_store::Error::QueryNotFinite { position } => Problem::new(
+                ErrorCode::MalformedRequest,
+                format!("vector[{position}] is not a finite number"),
+            ),
+            other => unreadable("searching the vector index", &other),
+        })?;
+
+    let mut cache = TermCache::new();
+    let mut published = PublishedTerms::new(blank_nodes.clone(), store);
+    let mut labels = ItemLabels::of(store, request.labels.as_ref())?;
+    let mut results = Vec::with_capacity(request.k as usize);
+    let mut spent = 0u64;
+    let mut stopped = None;
+    'hits: for hit in hits {
+        if results.len() >= request.k as usize {
+            break;
+        }
+        if own == Some(hit.row) {
+            continue;
+        }
+        let mut entities = Vec::new();
+        let mut serialized = SimilarResult::FIXED_BYTES;
+        let members = vectors
+            .entities_of(hit.row)
+            .map_err(|error| unreadable("reading a record's entities", &error))?;
+        for entity in members {
+            let (term, bytes) = published
+                .measured(&mut cache, &dictionary, Role::Subject, entity)
+                .map_err(|error| unreadable("materializing an embedded entity", &error))?;
+            let text = term
+                .published
+                .text()
+                .cloned()
+                .expect("a subject is never a triple term");
+            // The label cascade's allowance is shared by the request; a
+            // record it cannot settle ends the answer there, as a search
+            // hit's does.
+            let label = match &mut labels {
+                None => None,
+                Some(labels) => {
+                    match labels.label(Some(entity.0), Spend::first_if(results.is_empty()))? {
+                        Some(label) => Some(label),
+                        None => {
+                            stopped = Some(BudgetReason::Candidate);
+                            break 'hits;
+                        }
+                    }
+                }
+            };
+            serialized += bytes + label.as_ref().map_or(0, RowLabel::appended);
+            entities.push(Entity { term: text, label });
+        }
+        let next = spent.saturating_add(serialized);
+        if next > request.bytes.0 && !results.is_empty() {
+            stopped = Some(BudgetReason::ResponseBytes);
+            break;
+        }
+        spent = next;
+        results.push(SimilarResult {
+            record: hit.row.0,
+            distance: hit.distance,
+            similarity: 1.0 - hit.distance,
+            entities,
+        });
+    }
+
+    Ok(SimilarAnswer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        query: echo,
+        k: request.k,
+        labels: request.labels.is_some(),
+        dimensions: vectors.dimensions(),
+        results,
+        completeness: match stopped {
+            Some(reason) => Completeness::budget_exhausted_without_resume(reason),
+            None => Completeness::complete(),
+        },
+        target,
+        blank_nodes,
+    })
+}
+
+/// A published subject with its label, written as one term object: the
+/// term's `type` and `value`, then `label` (and `label_source`) when labels
+/// were asked for — the shape a search hit's subject has.
+#[derive(Debug, Clone)]
+struct Entity {
+    term: Rc<str>,
+    label: Option<RowLabel>,
+}
+
+impl Serialize for Entity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        // A published subject is always an IRI: a blank node is published
+        // under its bundle-scoped IRI.
+        map.serialize_entry("type", "iri")?;
+        map.serialize_entry("value", &*self.term)?;
+        if let Some(label) = &self.label {
+            label.serialize_into(&mut map)?;
+        }
+        map.end()
+    }
+}
+
+/// A published subject, written as a term object.
+#[derive(Debug, Clone)]
+struct EntityTerm(Rc<str>);
+
+impl Serialize for EntityTerm {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Term::from_dictionary(&self.0).serialize(serializer)
+    }
+}
+
+/// `/vector`'s response: one entry per submitted entity, in request order.
+#[derive(Debug, Serialize)]
+pub struct VectorAnswer {
+    dataset: String,
+    version: String,
+    dimensions: usize,
+    vectors: Vec<VectorResult>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+}
+
+/// One submitted entity: its vector, or why it has none.
+#[derive(Debug, Serialize)]
+struct VectorResult {
+    iri: EntityTerm,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record: Option<u64>,
+    vector: Option<Vec<f32>>,
+    /// `unknown_term` or `not_embedded`; absent when the vector is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    absent: Option<&'static str>,
+    #[serde(skip)]
+    serialized: u64,
+}
+
+impl VectorResult {
+    fn found(iri: &str, record: u64, vector: Vec<f32>) -> Self {
+        // A float writes in at most 16 characters plus its comma.
+        let serialized = Self::fixed_bytes(iri) + 17 * vector.len() as u64;
+        Self {
+            iri: EntityTerm(Rc::from(iri)),
+            record: Some(record),
+            vector: Some(vector),
+            absent: None,
+            serialized,
+        }
+    }
+
+    fn absent(iri: &str, reason: &'static str) -> Self {
+        Self {
+            iri: EntityTerm(Rc::from(iri)),
+            record: None,
+            vector: None,
+            absent: Some(reason),
+            serialized: Self::fixed_bytes(iri),
+        }
+    }
+
+    fn fixed_bytes(iri: &str) -> u64 {
+        serialized_object([
+            ("type", serialized_json_string("iri")),
+            ("value", serialized_json_string(iri)),
+        ]) + 64
+    }
+}
+
+impl Renders for VectorAnswer {
+    fn render(self, representation: Representation) -> Result<Rendered, Problem> {
+        let body = standard_body(&self, representation);
+        let rows = Some(self.vectors.len() as u64);
+        Ok(Rendered {
+            body,
+            completeness: self.completeness,
+            rows,
+            cardinality: None,
+        })
+    }
+}
+
+/// What a `/similar` request ranked against, echoed.
+#[derive(Debug, Serialize)]
+struct SimilarEcho {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iri: Option<EntityTerm>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vector: Option<SimilarEchoVector>,
+}
+
+#[derive(Debug, Serialize)]
+struct SimilarEchoVector {
+    dimensions: usize,
+}
+
+impl SimilarEcho {
+    fn entity(iri: &str) -> Self {
+        Self {
+            iri: Some(EntityTerm(Rc::from(iri))),
+            vector: None,
+        }
+    }
+
+    fn vector(dimensions: usize) -> Self {
+        Self {
+            iri: None,
+            vector: Some(SimilarEchoVector { dimensions }),
+        }
+    }
+}
+
+/// `/similar`'s response: records nearest first, each with its entities.
+#[derive(Debug, Serialize)]
+pub struct SimilarAnswer {
+    dataset: String,
+    version: String,
+    query: SimilarEcho,
+    k: u32,
+    labels: bool,
+    dimensions: usize,
+    results: Vec<SimilarResult>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+    #[serde(skip)]
+    blank_nodes: SkolemScope,
+}
+
+/// One record found: its distance under the index's metric, and the entities
+/// whose text it is — several where identical texts share a record.
+#[derive(Debug, Serialize)]
+struct SimilarResult {
+    record: u64,
+    distance: f32,
+    similarity: f32,
+    entities: Vec<Entity>,
+}
+
+impl SimilarResult {
+    /// The row's bytes before its entities: the numbers and the keys.
+    const FIXED_BYTES: u64 = 96;
+}
+
+impl Renders for SimilarAnswer {
+    fn render(self, representation: Representation) -> Result<Rendered, Problem> {
+        let body = standard_body(&self, representation);
+        let rows = Some(self.results.len() as u64);
+        Ok(Rendered {
+            body,
+            completeness: self.completeness,
+            rows,
+            cardinality: None,
+        })
+    }
+}
+
 fn resolve_predicate_ids(
     dictionary: &Dictionary<'_>,
     predicates: &[BoundTerm],
@@ -5908,6 +6564,9 @@ fn scanned_row(
 /// says the candidate budget was exhausted. The roots are bounded by
 /// `max_verbalize_roots`. A class's member count is a range width, and
 /// drawing a member is one rank descent, so a plan never enumerates a class.
+/// A drawn member an earlier target's class also holds is that target's root,
+/// as in a build, and is counted rather than rendered: one existence probe
+/// per earlier target, for each of at most `max_verbalize_roots` draws.
 ///
 /// The response stops at its byte budget, and so does the text built for it:
 /// the verbalizer charges every line and every piece a template appends to a
@@ -5931,6 +6590,7 @@ pub fn verbalize(
     let mut records = Vec::new();
     let mut reports = Vec::new();
     let mut absent = Vec::new();
+    let mut unclaimed = Vec::new();
     let mut spent = 0u64;
     // Whether a record was left out, or cut, to keep within the byte budget.
     let mut over_bytes = false;
@@ -5955,10 +6615,40 @@ pub fn verbalize(
 
     match &request.mode {
         request::VerbalizeMode::Iris(iris) => {
-            let index = request.target_indexes()[0];
+            // Under a named target every IRI renders there, member or not —
+            // a target's class drives enumeration and profiles, not
+            // admission. Without one, each IRI's target is the first whose
+            // class it is an instance of: one existence probe per target.
+            let named = request.target.as_ref().map(|name| {
+                names
+                    .iter()
+                    .position(|candidate| candidate == name)
+                    .expect("the request's target is one the config declares")
+            });
+            let dictionary = store.dict();
             for iri in iris {
+                let Some(subject) = dictionary
+                    .locate(Role::Subject, iri.dictionary().as_bytes())
+                    .map_err(|error| unreadable("looking a root up", &error))?
+                else {
+                    absent.push(iri.dictionary().to_owned());
+                    continue;
+                };
+                let index = match named {
+                    Some(index) => index,
+                    None => match bound
+                        .target_of(store, subject.0)
+                        .map_err(|error| unreadable("finding a root's target", &error))?
+                    {
+                        Some(index) => index,
+                        None => {
+                            unclaimed.push(iri.dictionary().to_owned());
+                            continue;
+                        }
+                    },
+                };
                 let rendered = verbalizer
-                    .verbalize_iri(index, iri.dictionary())
+                    .verbalize(index, subject.0)
                     .map_err(|error| unreadable("verbalizing a root", &error))?;
                 match rendered {
                     Some(rendered) => {
@@ -5985,6 +6675,13 @@ pub fn verbalize(
                     let subject = verbalizer
                         .root_at(index, position)
                         .map_err(|error| unreadable("drawing a class member", &error))?;
+                    if verbalizer
+                        .claimed_before(index, subject)
+                        .map_err(|error| unreadable("finding a root's target", &error))?
+                    {
+                        report.claimed_before += 1;
+                        continue;
+                    }
                     let rendered = verbalizer
                         .verbalize(index, subject)
                         .map_err(|error| unreadable("verbalizing a root", &error))?;
@@ -6025,6 +6722,7 @@ pub fn verbalize(
         seed: request.seed,
         unknown: bound.unknown().to_vec(),
         absent,
+        unclaimed,
         targets: reports,
         records,
         completeness,
@@ -6042,6 +6740,9 @@ pub struct VerbalizeTargetReport {
     members: u64,
     /// Roots rendered from it whose texts this answer carries.
     sampled: u64,
+    /// Drawn members an earlier target claims: roots of that target, not
+    /// this one, so not rendered here.
+    claimed_before: u64,
     /// Mean characters per rendered text.
     mean_chars: u64,
     /// The longest rendered text, in characters.
@@ -6068,6 +6769,7 @@ impl VerbalizeTargetReport {
             class,
             members,
             sampled: 0,
+            claimed_before: 0,
             mean_chars: 0,
             max_chars: 0,
             mean_lines: 0,
@@ -6197,6 +6899,11 @@ pub struct VerbalizeAnswer {
     /// Requested roots that are not subjects in this bundle.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     absent: Vec<String>,
+    /// Requested roots that are subjects, but instances of none of the
+    /// config's target classes, so no target claims them; name one with
+    /// `target` to render them under it anyway.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unclaimed: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     targets: Vec<VerbalizeTargetReport>,
     records: Vec<VerbalizeRecord>,
@@ -6216,6 +6923,50 @@ impl Renders for VerbalizeAnswer {
             rows,
             cardinality: None,
         })
+    }
+}
+
+/// Roots a target's link in the plan table asks for: enough to read the
+/// target's range of texts, well under the request cap.
+const VERBALIZE_TARGET_LINK_N: u32 = 20;
+
+impl VerbalizeAnswer {
+    /// One target alone, with more of its roots, under the same config and
+    /// seed. Only the plan mode's table links its targets; a single-target
+    /// table is already that page.
+    fn target_link(&self, name: &str) -> Option<String> {
+        if self.mode != "plan" {
+            return None;
+        }
+        self.target.varied(|params| {
+            params
+                .without("plan")
+                .with("target", name)
+                .with("n", &VERBALIZE_TARGET_LINK_N.to_string())
+        })
+    }
+
+    /// The same request under the next seed: another sample of the same size.
+    fn redraw_link(&self) -> Option<String> {
+        let seed = self.seed.checked_add(1)?;
+        self.target
+            .varied(|params| params.with("seed", &seed.to_string()))
+    }
+
+    /// What the texts below are, for the two modes that draw them: a seeded
+    /// uniform sample, so the same seed shows the same roots on every reload.
+    /// Named roots need no explanation.
+    fn draw_note(&self) -> Option<String> {
+        let of = match (self.mode, &self.target_name) {
+            ("plan", _) => "each target".to_owned(),
+            ("sample", Some(target)) => format!("target {target:?}"),
+            _ => return None,
+        };
+        Some(format!(
+            "Up to {} roots of {of}, drawn uniformly at random with seed {}. The same seed \
+             draws the same roots; change it to see others.",
+            self.n, self.seed
+        ))
     }
 }
 
@@ -6239,11 +6990,19 @@ impl Resource for VerbalizeAnswer {
             .targets
             .iter()
             .map(|report| {
+                let name = match self.target_link(&report.name) {
+                    Some(href) => Value::Link {
+                        href,
+                        label: &report.name,
+                    },
+                    None => Value::Text(&report.name),
+                };
                 vec![
-                    Value::Text(&report.name),
+                    name,
                     Value::Code(&report.class),
                     Value::Number(report.members),
                     Value::Number(report.sampled),
+                    Value::Number(report.claimed_before),
                     Value::Number(report.mean_chars),
                     Value::Number(report.max_chars),
                     Value::Number(report.mean_lines),
@@ -6275,31 +7034,49 @@ impl Resource for VerbalizeAnswer {
                         self.absent.join(", ")
                     )))
                 }
+                @if !self.unclaimed.is_empty() {
+                    (note(&format!(
+                        "Instances of none of the config's target classes, so no target claims \
+                         them; name one with target to render them under it: {}",
+                        self.unclaimed.join(", ")
+                    )))
+                }
                 @if !self.targets.is_empty() {
                     section."section-block" {
                         h2 { "Targets" }
                         (note(
                             "Members counts every node of the class. Sampled texts are drawn \
-                             uniformly by seed; lengths are in characters and lines. Limited \
+                             uniformly by seed; lengths are in characters and lines. Claimed \
+                             earlier counts drawn members that an earlier target's class also \
+                             holds: a node is a root of the first target that claims it, so \
+                             those are not rendered here. Limited \
                              counts predicates sampled down to the limit across the texts — the \
-                             number to tune the limit or the lists by. A truncated text needed more \
-                             reads than one request may make."
+                             number to tune the limit or the lists by. Cut by budget counts texts \
+                             this preview stopped short because one request may read or send only \
+                             so much; a build is not cut this way, and this is not the embedding \
+                             model's own limit on what it reads."
                         ))
                         (results_table(
-                            &["target", "class", "members", "sampled", "mean chars", "max chars", "mean lines", "limited", "truncated"],
+                            &["target", "class", "members", "sampled", "claimed earlier", "mean chars", "max chars", "mean lines", "limited", "cut by budget"],
                             &target_rows,
                         ))
                     }
                 }
                 section."section-block" {
                     h2 { "Texts" }
+                    @if let Some(draw) = self.draw_note() {
+                        (note(&draw))
+                        @if let Some(next) = self.redraw_link() {
+                            (pager(&next, "Draw another sample →"))
+                        }
+                    }
                     @if self.records.is_empty() {
                         (note("Nothing was rendered."))
                     }
                     @for record in &self.records {
                         article."verbalized" {
                             h3 { (record.target) " · " (record.label) }
-                            p { a href=(self.target.ask("describe", "iri", &record.iri)) { code { (record.iri) } } }
+                            p { a href=(self.target.ask("describe", "iri", &format!("<{}>", record.iri))) { code { (record.iri) } } }
                             pre { (record.text) }
                             p."note" {
                                 (group_digits(record.chars)) " characters · "
@@ -6405,9 +7182,40 @@ pub fn describe(
 ) -> Result<Answer, Problem> {
     let dictionary = store.dict();
     let blank_nodes = SkolemScope::of(store);
+    // One binary search in the id map, so the page offers "more like this"
+    // only where /similar will answer, and a client reads the same fact.
+    let (embedded, record, embedded_text) = match store.vectors() {
+        None => (None, None, None),
+        Some(vectors) => {
+            let located = locate_scoped(
+                &dictionary,
+                &blank_nodes,
+                store.triple_terms(),
+                Role::Subject,
+                &request.resource,
+            )?;
+            let row = match located {
+                Some(id) => vectors
+                    .row_of(TermId(id))
+                    .map_err(|error| unreadable("looking up an entity's record", &error))?
+                    .map(|row| (id, row)),
+                None => None,
+            };
+            let text = match (row, &request.verbalize) {
+                (Some((id, row)), Some(config)) => {
+                    embedded_text(store, vectors, row, id, config, request.bytes.0)?
+                }
+                _ => None,
+            };
+            (Some(row.is_some()), row.map(|(_, row)| row.0), text)
+        }
+    };
     let echo = Echo::Describe {
         resource: request.resource.requested().to_owned(),
         direction: request.direction,
+        embedded,
+        record,
+        embedded_text,
     };
 
     let mut phases = Vec::new();
@@ -9669,7 +10477,7 @@ impl Resource for Answer {
                 div."answer-summary" {
                     (fields(&summary))
                 }
-                @if let Some(form) = self.target.form() {
+                @if let Some(form) = self.target.form_beside(self.describe_panels()) {
                     div."query-editor" { (form) }
                 }
                 @if !self.absent_terms.is_empty() {
@@ -9727,6 +10535,60 @@ impl Answer {
             }
             Echo::Sample { .. } => "Sample".to_owned(),
         }
+    }
+
+    /// The describe page's own toggles, beside its editor: the
+    /// text its vector was computed from, closed until asked for, and a link
+    /// to its nearest neighbours in vector space. Empty on every other page.
+    fn describe_panels(&self) -> maud::Markup {
+        maud::html! {
+            @if let Some(embedded) = self.embedded_text() {
+                details."query-form" {
+                    summary { "Embedded text" }
+                    div."panel-body" {
+                        @if embedded.matches_embedded {
+                            (note(&format!(
+                                "The text this resource's vector was computed from, rendered live under the bundle's verbalization config as target {:?}.",
+                                embedded.target
+                            )))
+                        } @else {
+                            (note(&format!(
+                                "Rendered live under the bundle's verbalization config as target {:?}; it differs from the text the vector was computed from, so the verbalizer has changed since this version was built.",
+                                embedded.target
+                            )))
+                        }
+                        pre."embedded-text" { (embedded.text) }
+                    }
+                }
+            }
+            @if let Some(link) = self.similar_link() {
+                a."stack-link" href=(link)
+                    title="The resources whose embedding vectors are nearest this one's" {
+                    "Similar by embedding →"
+                }
+            }
+        }
+    }
+
+    fn embedded_text(&self) -> Option<&EmbeddedText> {
+        match &self.echo {
+            Echo::Describe { embedded_text, .. } => embedded_text.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// A link to the resource's nearest neighbours, offered only where
+    /// `/similar` will answer: the id map said it has a vector.
+    fn similar_link(&self) -> Option<String> {
+        let Echo::Describe {
+            resource,
+            embedded: Some(true),
+            ..
+        } = &self.echo
+        else {
+            return None;
+        };
+        Some(self.target.ask("similar", "iri", resource))
     }
 
     fn described_label(&self) -> Option<&str> {
@@ -10396,6 +11258,166 @@ impl Resource for LabelsAnswer {
     }
 }
 
+impl Resource for VectorAnswer {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let rendered: Vec<String> = self
+            .vectors
+            .iter()
+            .map(|result| match &result.vector {
+                Some(vector) => vector
+                    .iter()
+                    .map(|x| format!("{x:.4}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                None => String::new(),
+            })
+            .collect();
+        let records: Vec<String> = self
+            .vectors
+            .iter()
+            .map(|result| result.record.map(|r| r.to_string()).unwrap_or_default())
+            .collect();
+        let rows: Vec<Vec<Value<'_>>> = self
+            .vectors
+            .iter()
+            .enumerate()
+            .map(|(index, result)| {
+                vec![
+                    Value::Code(&result.iri.0),
+                    match result.absent {
+                        Some(reason) => Value::Text(reason),
+                        None => Value::Text(&records[index]),
+                    },
+                    if result.vector.is_some() {
+                        Value::Text(&rendered[index])
+                    } else {
+                        Value::Absent
+                    },
+                ]
+            })
+            .collect();
+        let returned = self.vectors.len() as u64;
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        operation_page(
+            &self.target.mount,
+            &self.target.title(),
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" {
+                    (fields(&[
+                        ("dimensions", Value::Number(self.dimensions as u64)),
+                        ("returned", Value::Number(returned)),
+                        ("complete", Value::Text(completeness_text(&self.completeness))),
+                    ]))
+                }
+                @if let Some(form) = self.target.form() {
+                    div."query-editor" { (form) }
+                }
+                section."section-block" {
+                    h2 { "Vectors" }
+                    @if rows.is_empty() {
+                        (note("No entities were submitted."))
+                    } @else {
+                        (results_table(&["entity", "record", "vector"], &rows))
+                    }
+                }
+            },
+        )
+    }
+}
+
+impl Resource for SimilarAnswer {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        // One row per entity, so a record shared by several reads as several
+        // neighbours at one distance.
+        let cells: Vec<(Cell<'_>, String, String, String)> = self
+            .results
+            .iter()
+            .flat_map(|result| {
+                result.entities.iter().map(move |entity| {
+                    (
+                        term_cell(
+                            &self.target,
+                            &self.blank_nodes,
+                            &entity.term,
+                            entity.label.as_ref().and_then(RowLabel::value),
+                        ),
+                        format!("{:.4}", result.distance),
+                        format!("{:.4}", result.similarity),
+                        result.record.to_string(),
+                    )
+                })
+            })
+            .collect();
+        let rows: Vec<Vec<Value<'_>>> = cells
+            .iter()
+            .map(|(cell, distance, similarity, record)| {
+                vec![
+                    cell.value(),
+                    Value::Text(distance),
+                    Value::Text(similarity),
+                    Value::Text(record),
+                ]
+            })
+            .collect();
+        let query_text = match &self.query.iri {
+            Some(iri) => iri.0.to_string(),
+            None => format!("a client vector of {} dimensions", self.dimensions),
+        };
+        let heading = match &self.query.iri {
+            Some(iri) => format!("Similar to {}", iri.0),
+            None => "Similar to a vector".to_owned(),
+        };
+        let returned = self.results.len() as u64;
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        operation_page(
+            &self.target.mount,
+            &heading,
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" {
+                    (fields(&[
+                        ("query", if self.query.iri.is_some() { Value::Code(&query_text) } else { Value::Text(&query_text) }),
+                        ("k", Value::Number(u64::from(self.k))),
+                        ("records", Value::Number(returned)),
+                        ("complete", Value::Text(completeness_text(&self.completeness))),
+                    ]))
+                }
+                @if let Some(form) = self.target.form() {
+                    div."query-editor" { (form) }
+                }
+                @if !self.completeness.is_complete() {
+                    (note(
+                        "The response's byte budget stopped the answer before its k records; ask for fewer."
+                    ))
+                }
+                section."section-block" {
+                    h2 { "Nearest" }
+                    @if rows.is_empty() {
+                        (note("No records."))
+                    } @else {
+                        (results_table(&["entity", "distance", "similarity", "record"], &rows))
+                    }
+                }
+            },
+        )
+    }
+}
+
 impl Resource for CountAnswer {
     fn to_json(&self) -> Bytes {
         json_body(self)
@@ -10768,6 +11790,24 @@ impl<'a> Cell<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_summary_offers_verbalizations_only_where_the_release_has_a_config() {
+        // The card is written with the description and knows nothing of
+        // vectors, so the link is the server's, after the triples link.
+        let links: BTreeMap<String, String> = [
+            ("fragment".to_owned(), "fragment".to_owned()),
+            ("void".to_owned(), "void".to_owned()),
+        ]
+        .into();
+        let with = summary_actions(&links, true).into_string();
+        let fragment = with.find("href=\"fragment\"").unwrap();
+        let verbalize = with.find("href=\"verbalize\"").unwrap();
+        let void = with.find("href=\"void\"").unwrap();
+        assert!(fragment < verbalize && verbalize < void, "{with}");
+        let without = summary_actions(&links, false).into_string();
+        assert!(!without.contains("verbalize"), "{without}");
+    }
 
     #[test]
     fn binding_cardinalities_cannot_overflow_the_wire_integer() {

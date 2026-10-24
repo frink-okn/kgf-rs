@@ -16,4 +16,5 @@
 pub mod build;
 pub mod manifest;
 pub mod serve;
+pub mod vectors;
 pub mod verbalize;

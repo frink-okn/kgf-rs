@@ -2870,6 +2870,20 @@ fn a_resource_states_its_methods_where_they_cannot_go_stale() {
             405,
             server.request("DELETE", &path("verbalize"), &[]),
         ),
+        // This bundle declares no `vectors`: the gate answers, and the
+        // resource still states what it takes.
+        (
+            "GET vector, undeclared",
+            READ_OR_BODY,
+            501,
+            server.get(&path("vector?iri=ex:site1")),
+        ),
+        (
+            "DELETE similar",
+            READ_OR_BODY,
+            405,
+            server.request("DELETE", &path("similar"), &[]),
+        ),
         (
             "QUERY labels",
             BODY,
@@ -5604,12 +5618,13 @@ fn verbalize_previews_a_config_in_three_modes_over_get_query_and_post() {
     assert_eq!(body["complete"], true);
     let targets = body["targets"].as_array().unwrap();
     assert_eq!(targets.len(), 2);
-    assert_eq!(targets[0]["name"], "location");
-    assert_eq!(targets[0]["members"], 1);
-    assert_eq!(targets[0]["sampled"], 1);
-    assert_eq!(targets[1]["name"], "site");
-    assert_eq!(targets[1]["members"], 2);
-    assert_eq!(targets[1]["sampled"], 2);
+    // In the order the config writes them.
+    assert_eq!(targets[0]["name"], "site");
+    assert_eq!(targets[0]["members"], 2);
+    assert_eq!(targets[0]["sampled"], 2);
+    assert_eq!(targets[1]["name"], "location");
+    assert_eq!(targets[1]["members"], 1);
+    assert_eq!(targets[1]["sampled"], 1);
     assert_eq!(body["records"].as_array().unwrap().len(), 3);
     assert_eq!(body["unknown"].as_array().unwrap().len(), 0);
 
@@ -5705,6 +5720,9 @@ fn verbalize_previews_a_config_in_three_modes_over_get_query_and_post() {
     );
     assert!(html.contains("<pre>label: Site one"), "{html}");
     assert!(html.contains("Location ALAU"));
+    // Each text links to its root's description by a bracketed IRI, which
+    // resolves whether or not the bundle declares a prefix covering it.
+    assert!(html.contains("/describe?iri=%3Chttp"), "{html}");
 }
 
 #[test]
@@ -5749,18 +5767,15 @@ fn verbalize_refuses_what_it_cannot_answer_by_name() {
             .contains("\"site\"")
     );
 
-    // Two targets and IRIs to render: which target is not a guess.
-    let ambiguous = server.get(&verbalize_url(&[
+    // Two targets and IRIs to render, none named: each IRI's target is the
+    // one whose class it is an instance of, and the record says which.
+    let inferred = server.get(&verbalize_url(&[
         ("config", VERBALIZE_CONFIG),
         ("iri", "ex:site1"),
     ]));
-    ambiguous.assert_status(400);
-    assert!(
-        ambiguous.json()["detail"]
-            .as_str()
-            .unwrap()
-            .contains("target is required")
-    );
+    inferred.assert_status(200);
+    assert_eq!(inferred.json()["records"][0]["target"], "site");
+    assert!(inferred.json().get("target").is_none());
 
     // The root cap bounds a plan across its targets, and says what to do.
     let over = server.get(&verbalize_url(&[
@@ -6011,6 +6026,51 @@ fn verbalize_cuts_its_first_record_to_fit_rather_than_send_it_over() {
 }
 
 #[test]
+fn verbalize_renders_a_node_of_two_targets_under_the_first_written() {
+    // site1 is a Location too. It is a root of whichever target the config
+    // writes first, as in a build: drawn under the other, it is counted as
+    // claimed earlier and not rendered.
+    let deployment = Deployment::new();
+    let graph = format!(
+        "{TYPED_NT}<http://example.org/site1> \
+         <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Location> .\n"
+    );
+    deployment.publish("tox", "2026-06-01", &graph, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let site_first = r#"{"targets": {
+        "site": {"type": "http://example.org/Site"},
+        "location": {"type": "http://example.org/Location"}}}"#;
+    let location_first = r#"{"targets": {
+        "location": {"type": "http://example.org/Location"},
+        "site": {"type": "http://example.org/Site"}}}"#;
+    for (config, first, second) in [
+        (site_first, "site", "location"),
+        (location_first, "location", "site"),
+    ] {
+        let body = server.get(&verbalize_url(&[("config", config)])).json();
+        let targets = body["targets"].as_array().unwrap();
+        assert_eq!(targets[0]["name"], first, "{body}");
+        assert_eq!(targets[0]["claimed_before"], 0, "{body}");
+        assert_eq!(targets[1]["name"], second, "{body}");
+        assert_eq!(targets[1]["claimed_before"], 1, "{body}");
+        let site1: Vec<&serde_json::Value> = body["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|record| record["iri"]["value"] == "http://example.org/site1")
+            .collect();
+        assert_eq!(site1.len(), 1, "{body}");
+        assert_eq!(site1[0]["target"], first);
+
+        // Named without a target, it renders under the same one.
+        let named = server
+            .get(&verbalize_url(&[("config", config), ("iri", "ex:site1")]))
+            .json();
+        assert_eq!(named["records"][0]["target"], first, "{named}");
+    }
+}
+
+#[test]
 fn verbalize_plan_counts_only_the_texts_it_carries() {
     // A budget with room for the plan's first record and not its second:
     // the second is rendered and left out, and the plan's statistics must
@@ -6080,5 +6140,371 @@ fn verbalize_charges_a_probe_that_finds_nothing() {
             .unwrap()
             .contains("at: Auburn"),
         "{body}"
+    );
+}
+
+/// Five typed subjects of which four are embedded — `b` and `c` with one
+/// shared record — and one subject that is not.
+const EMBEDDED_NT: &str = concat!(
+    "<http://example.org/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/T> .\n",
+    "<http://example.org/a> <http://example.org/name> \"Alpha\" .\n",
+    "<http://example.org/b> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/T> .\n",
+    "<http://example.org/c> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/T> .\n",
+    "<http://example.org/d> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/T> .\n",
+    "<http://example.org/e> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/T> .\n",
+    "<http://example.org/f> <http://example.org/name> \"not embedded\" .\n",
+    "<http://example.org/T> <http://example.org/name> \"a class\" .\n",
+);
+
+/// The config the fixture's texts would be rendered under.
+const EMBEDDED_CONFIG: &str = r#"{"targets": {"things": {"type": "http://example.org/T"}}}"#;
+
+const EMBEDDED_GROUPS: &[&[&str]] = &[
+    &["http://example.org/a"],
+    &["http://example.org/b", "http://example.org/c"],
+    &["http://example.org/d", "http://example.org/e"],
+    &["http://example.org/T"],
+];
+
+#[test]
+fn vectors_answer_over_the_wire_and_refuse_what_is_not_embedded() {
+    use kgf_store::testing::fixture_vector;
+
+    let deployment = Deployment::new();
+    deployment.publish_fixture(
+        "vec",
+        "v1",
+        Fixture::build(EMBEDDED_NT)
+            .with_vectors(EMBEDDED_GROUPS)
+            .with_verbalize_config(EMBEDDED_CONFIG),
+        "2026-10-22T10:00:00Z",
+    );
+    deployment.publish("tox", "v1", TYPED_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let json = [("Content-Type", "application/json")];
+    let html = [("Accept", "text/html")];
+
+    // Declared where a client looks: the manifest, and the descriptor's links
+    // for this release only.
+    let manifest = server.get("/vec/v/v1/manifest").json();
+    assert!(manifest["capabilities"].get("vectors").is_some());
+    let descriptor = server.get("/").json();
+    let links = |dataset: &str| {
+        descriptor["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"] == dataset)
+            .unwrap()["links"]
+            .clone()
+    };
+    assert!(links("vec")["vector"].is_string() && links("vec")["similar"].is_string());
+    assert!(links("tox").get("vector").is_none() && links("tox").get("similar").is_none());
+
+    // One entity by GET.
+    let one = server.get("/vec/v/v1/vector?iri=ex:a");
+    one.assert_status(200);
+    let one = one.json();
+    assert_eq!(one["dimensions"], 8);
+    assert_eq!(one["complete"], true);
+    let entry = &one["vectors"][0];
+    assert_eq!(entry["iri"]["value"], "http://example.org/a");
+    assert_eq!(entry["record"], 0);
+    let stored: Vec<f32> = entry["vector"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_f64().unwrap() as f32)
+        .collect();
+    assert_eq!(stored.len(), 8);
+    for (got, want) in stored.iter().zip(fixture_vector(0)) {
+        assert!((got - want).abs() < 1e-3, "{got} vs {want}");
+    }
+
+    // A batch by QUERY: in request order, the absent ones saying why.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "iris": ["ex:c", "ex:f", "ex:nobody", "ex:a"]
+    }))
+    .unwrap();
+    let batch = server.request_with_body("QUERY", "/vec/v/v1/vector", &json, &body);
+    batch.assert_status(200);
+    let batch = batch.json();
+    let entries = batch["vectors"].as_array().unwrap();
+    assert_eq!(entries.len(), 4);
+    assert_eq!(entries[0]["record"], 1);
+    assert!(entries[0]["vector"].is_array());
+    assert_eq!(entries[1]["absent"], "not_embedded");
+    assert!(entries[1]["vector"].is_null() && entries[1].get("record").is_none());
+    assert_eq!(entries[2]["absent"], "unknown_term");
+    assert_eq!(entries[3]["record"], 0);
+
+    // Nearest an entity's own vector, its own record left out. b and c share
+    // record 1, so neither appears for b.
+    let near = server.get("/vec/v/v1/similar?iri=ex:b&k=2");
+    near.assert_status(200);
+    let near = near.json();
+    assert_eq!(near["query"]["iri"]["value"], "http://example.org/b");
+    assert_eq!(near["k"], 2);
+    let results = near["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    for result in results {
+        assert_ne!(result["record"], 1);
+        let distance = result["distance"].as_f64().unwrap();
+        assert!((0.0..=2.0).contains(&distance));
+        assert!(
+            result["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["type"] == "iri")
+        );
+    }
+    assert!(results[0]["distance"].as_f64() <= results[1]["distance"].as_f64());
+
+    // A client's own vector: record 0's vector finds record 0 first, with a.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "vector": fixture_vector(0),
+        "k": 3
+    }))
+    .unwrap();
+    let own = server.request_with_body("QUERY", "/vec/v/v1/similar", &json, &body);
+    own.assert_status(200);
+    let own = own.json();
+    assert_eq!(own["query"]["vector"]["dimensions"], 8);
+    assert_eq!(own["results"][0]["record"], 0);
+    assert_eq!(
+        own["results"][0]["entities"][0]["value"],
+        "http://example.org/a"
+    );
+    // Labelled by default, through the release's label role; an entity with
+    // no label says so with null; labels=false leaves the key out.
+    assert_eq!(own["labels"], true);
+    assert_eq!(own["results"][0]["entities"][0]["label"], "Alpha");
+    let unlabelled = own["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["record"] == 1)
+        .unwrap();
+    assert!(unlabelled["entities"][0]["label"].is_null());
+    let bare_body = serde_json::to_vec(&serde_json::json!({
+        "vector": fixture_vector(0),
+        "k": 1,
+        "labels": false
+    }))
+    .unwrap();
+    let bare = server
+        .request_with_body("QUERY", "/vec/v/v1/similar", &json, &bare_body)
+        .json();
+    assert_eq!(bare["labels"], false);
+    assert!(bare["results"][0]["entities"][0].get("label").is_none());
+    let page = server
+        .request(
+            "GET",
+            "/vec/v/v1/similar?vector=0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1&k=4",
+            &html,
+        )
+        .text();
+    assert!(page.contains("Alpha"), "{page}");
+    assert!(own["results"][0]["distance"].as_f64().unwrap() < 1e-3);
+    assert_eq!(own["results"].as_array().unwrap().len(), 3);
+    // Two entities on one shared record come back together.
+    let shared = own["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["record"] == 1)
+        .expect("record 1 is among three of four");
+    assert_eq!(shared["entities"].as_array().unwrap().len(), 2);
+
+    // The same vector by GET, comma-separated, and by POST: three methods,
+    // one answer.
+    let text = fixture_vector(0)
+        .iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let by_get = server.get(&format!("/vec/v/v1/similar?vector={text}&k=3"));
+    by_get.assert_status(200);
+    assert_eq!(by_get.json()["results"], own["results"]);
+    let by_post = server.request_with_body("POST", "/vec/v/v1/similar", &json, &body);
+    by_post.assert_status(200);
+    assert_eq!(by_post.json()["results"], own["results"]);
+    let both = server.get(&format!("/vec/v/v1/similar?iri=ex:a&vector={text}"));
+    both.assert_status(400);
+    assert_eq!(both.json()["code"], "malformed_request");
+    let nan = server.get("/vec/v/v1/similar?vector=0.1,x,0.3");
+    nan.assert_status(400);
+    assert!(nan.json()["detail"].as_str().unwrap().contains("vector[1]"));
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.max_term_bytes = 16;
+    let narrow_terms = deployment.serve_with_limits(kgf_server::Caps::new(), budgets);
+    let long = narrow_terms.get(&format!("/vec/v/v1/similar?vector={text}"));
+    long.assert_status(400);
+    assert_eq!(long.json()["code"], "cap_exceeded");
+
+    // Not embedded is a refusal with its own code, never an empty answer.
+    for (iri, says) in [
+        ("ex:f", "not an embedding target"),
+        ("ex:nobody", "not a subject of this bundle"),
+    ] {
+        let refused = server.get(&format!("/vec/v/v1/similar?iri={iri}"));
+        refused.assert_status(422);
+        let problem = refused.json();
+        assert_eq!(problem["code"], "not_embedded");
+        assert!(
+            problem["detail"].as_str().unwrap().contains(says),
+            "{problem}"
+        );
+    }
+
+    // Caps and shapes.
+    let over = server.get("/vec/v/v1/similar?iri=ex:a&k=101");
+    over.assert_status(400);
+    assert_eq!(over.json()["code"], "cap_exceeded");
+    let body = serde_json::to_vec(&serde_json::json!({"vector": [0.5, 0.5]})).unwrap();
+    let narrow = server.request_with_body("QUERY", "/vec/v/v1/similar", &json, &body);
+    narrow.assert_status(400);
+    assert_eq!(narrow.json()["code"], "malformed_request");
+    assert!(
+        narrow.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("2 dimensions")
+    );
+    let body = serde_json::to_vec(&serde_json::json!({"iri": "ex:a", "vector": [0.5]})).unwrap();
+    let both = server.request_with_body("QUERY", "/vec/v/v1/similar", &json, &body);
+    both.assert_status(400);
+    let body = serde_json::to_vec(&serde_json::json!({"iris": vec!["ex:a"; 1001]})).unwrap();
+    let many = server.request_with_body("QUERY", "/vec/v/v1/vector", &json, &body);
+    many.assert_status(400);
+    assert_eq!(many.json()["code"], "cap_exceeded");
+
+    // The gate on a bundle without the sidecar.
+    let gated = server.get("/tox/v/v1/similar?iri=ex:site1");
+    gated.assert_status(501);
+    assert_eq!(gated.json()["code"], "capability_not_available");
+
+    // /describe says whether a resource is embedded, and its page offers
+    // neighbours only then.
+    let embedded = server.get("/vec/v/v1/describe?iri=ex:a").json();
+    assert_eq!(embedded["embedded"], true);
+    assert_eq!(embedded["record"], 0);
+    // The text rendered live under the bundle's own config; the fixture's
+    // digests are not of any text, so it is reported as not the embedded one.
+    assert_eq!(embedded["embedded_text"]["target"], "things");
+    assert!(
+        embedded["embedded_text"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("label: Alpha\n"),
+        "{embedded}"
+    );
+    assert_eq!(embedded["embedded_text"]["matches_embedded"], false);
+    let page = server
+        .request("GET", "/vec/v/v1/describe?iri=ex:a", &html)
+        .text();
+    assert!(
+        page.contains("Embedded text") && page.contains("label: Alpha"),
+        "{page}"
+    );
+
+    // /verbalize falls back to the bundle's config, and only there.
+    let rendered = server.get("/vec/v/v1/verbalize?target=things&iri=ex:a");
+    rendered.assert_status(200);
+    assert!(
+        rendered.json()["records"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("label: Alpha"),
+        "{}",
+        rendered.json()
+    );
+    // No target named: each IRI renders under the target whose class it is
+    // an instance of, and one no target claims is said to be unclaimed.
+    let inferred = server.get("/vec/v/v1/verbalize?iri=ex:a,ex:f");
+    inferred.assert_status(200);
+    let inferred = inferred.json();
+    assert_eq!(
+        inferred["records"].as_array().unwrap().len(),
+        1,
+        "{inferred}"
+    );
+    assert_eq!(inferred["records"][0]["target"], "things");
+    assert_eq!(
+        inferred["unclaimed"],
+        serde_json::json!(["http://example.org/f"])
+    );
+    assert!(inferred.get("target").is_none());
+    // Named, a target admits any subject.
+    let forced = server.get("/vec/v/v1/verbalize?target=things&iri=ex:f");
+    forced.assert_status(200);
+    assert_eq!(forced.json()["records"].as_array().unwrap().len(), 1);
+    // The page's config field starts from the bundle's config as YAML, is
+    // optional, and is marked to be left out of the URL while unchanged; the
+    // plan table links each target alone, and the texts offer another draw.
+    let page = server.request("GET", "/vec/v/v1/verbalize", &html).text();
+    assert!(
+        page.contains("data-omit-unchanged>targets:\n  things:\n    type: http://example.org/T"),
+        "{page}"
+    );
+    assert!(!page.contains("required"), "{page}");
+    assert!(
+        page.contains("/vec/v/v1/verbalize?n=20&amp;target=things"),
+        "{page}"
+    );
+    assert!(page.contains("/vec/v/v1/verbalize?seed=1"), "{page}");
+    // A sent config is shown as sent, and still optional here.
+    let page = server
+        .request(
+            "GET",
+            "/vec/v/v1/verbalize?config=targets%3A%7Bx%3A%7Btype%3A%20ex%3AT%7D%7D",
+            &html,
+        )
+        .text();
+    assert!(!page.contains("data-omit-unchanged>"), "{page}");
+    // Without a bundle config there is nothing to start from: the field is
+    // required and empty.
+    let page = server.request("GET", "/tox/v/v1/manifest", &html).text();
+    assert!(page.contains("name=\"config\""), "{page}");
+    assert!(!page.contains("data-omit-unchanged>"), "{page}");
+    let unconfigured = server.get("/tox/v/v1/verbalize?iri=ex:site1");
+    unconfigured.assert_status(400);
+    assert!(
+        unconfigured.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("publishes none")
+    );
+    let page = server
+        .request("GET", "/vec/v/v1/describe?iri=ex:a", &html)
+        .text();
+    assert!(page.contains("Similar by embedding"), "{page}");
+    assert!(page.contains("/vec/v/v1/similar?iri="), "{page}");
+    let not_embedded = server.get("/vec/v/v1/describe?iri=ex:f").json();
+    assert_eq!(not_embedded["embedded"], false);
+    assert!(not_embedded.get("record").is_none());
+    let page = server
+        .request("GET", "/vec/v/v1/describe?iri=ex:f", &html)
+        .text();
+    assert!(!page.contains("Similar by embedding"));
+    let no_vectors = server.get("/tox/v/v1/describe?iri=ex:site1").json();
+    assert!(no_vectors.get("embedded").is_none());
+
+    // Every route has a page.
+    for path in [
+        "/vec/v/v1/vector?iri=ex:a",
+        "/vec/v/v1/similar?iri=ex:a&k=2",
+    ] {
+        let page = server.request("GET", path, &html);
+        page.assert_status(200);
+        let text = page.text();
+        assert!(text.contains("<form"), "{path}: {text}");
+        assert!(text.contains("http://example.org/"), "{path}");
+    }
+    let manifest_page = server.request("GET", "/vec/v/v1/manifest", &html).text();
+    assert!(
+        manifest_page.contains("/vec/v/v1/similar"),
+        "the manifest page offers the form"
     );
 }

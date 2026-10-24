@@ -149,6 +149,45 @@ pub enum Error {
         remedy: String,
     },
 
+    /// A query vector is not the width of the bundle's vectors.
+    #[error("query vector has {found} dimensions; this bundle's vectors have {expected}")]
+    QueryDimension {
+        /// The bundle's vector width.
+        expected: usize,
+        /// The width of the vector given.
+        found: usize,
+    },
+
+    /// A query vector holds a NaN or infinite component, under which every
+    /// distance is NaN and the ranking means nothing.
+    #[error("query vector component {position} is not a finite number")]
+    QueryNotFinite {
+        /// The first such component.
+        position: usize,
+    },
+
+    /// The ANN library refused a search it had the capacity reserved for.
+    #[error("vector search failed: {0}")]
+    VectorSearch(String),
+
+    /// Rows offered to the id-map writer that no id map can hold.
+    #[error("id map input: {0}")]
+    IdMapInput(String),
+
+    /// One entity offered to the id-map writer under two records: a map that
+    /// would answer with one of them and drop the other. Separate from
+    /// [`IdMapInput`](Self::IdMapInput) so a caller holding the entity's
+    /// source can name it rather than its id.
+    #[error("id map input: entity {entity} is named by records {first} and {second}")]
+    IdMapEntityTwice {
+        /// The entity's subject id.
+        entity: u64,
+        /// The first record naming it.
+        first: u64,
+        /// The second.
+        second: u64,
+    },
+
     /// Anything the OS refused.
     #[error(transparent)]
     Io(#[from] std::io::Error),
