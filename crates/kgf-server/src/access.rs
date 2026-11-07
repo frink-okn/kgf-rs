@@ -342,6 +342,8 @@ pub enum AccessOperation {
     Describe,
     /// Deterministic sample.
     Sample,
+    /// Distinct values of one pattern position, with counts.
+    Distinct,
     /// Entity search.
     Search,
     /// Dictionary prefix scan.
@@ -378,6 +380,7 @@ impl AccessOperation {
         Self::Count,
         Self::Describe,
         Self::Sample,
+        Self::Distinct,
         Self::Search,
         Self::Terms,
         Self::Graphs,
@@ -401,6 +404,7 @@ impl AccessOperation {
             Self::Count => "count",
             Self::Describe => "describe",
             Self::Sample => "sample",
+            Self::Distinct => "distinct",
             Self::Search => "search",
             Self::Terms => "terms",
             Self::Graphs => "graphs",
@@ -518,6 +522,21 @@ pub enum RequestShape {
         direction: &'static str,
         /// Requested page size.
         limit: u32,
+    },
+    /// Distinct-values request: one pattern grouped by one position.
+    Distinct {
+        /// Shape of the pattern, as for a pattern request.
+        pattern: String,
+        /// The grouped position: `s`, `p`, or `o`.
+        group: &'static str,
+        /// Requested page size, in groups.
+        limit: u32,
+        /// Submitted binding rows; absent without bindings.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        k: Option<u64>,
+        /// Submitted binding columns; absent without bindings.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        columns: Option<u64>,
     },
     /// Sampling request.
     Sample {
@@ -1348,6 +1367,7 @@ fn operation_for_route(route: &str) -> Option<AccessOperation> {
         "/{dataset}/v/{version}/count" => Some(AccessOperation::Count),
         "/{dataset}/v/{version}/describe" => Some(AccessOperation::Describe),
         "/{dataset}/v/{version}/sample" => Some(AccessOperation::Sample),
+        "/{dataset}/v/{version}/distinct" => Some(AccessOperation::Distinct),
         "/{dataset}/v/{version}/search" => Some(AccessOperation::Search),
         "/{dataset}/v/{version}/terms" => Some(AccessOperation::Terms),
         "/{dataset}/v/{version}/graphs" => Some(AccessOperation::Graphs),

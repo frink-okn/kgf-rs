@@ -14,8 +14,10 @@ use std::path::{Path, PathBuf};
 
 use hdtc::format::TextSearcher;
 
+use crate::Role;
 use crate::description::DescriptionStore;
 use crate::dict::Dictionary;
+use crate::distinct::{DistinctLimits, DistinctPlan};
 use crate::error::{Error, Result};
 use crate::graphs::Graphs;
 use crate::indexed::IndexedHdt;
@@ -350,6 +352,17 @@ impl Store {
     /// an encoded cursor token, not a live `Selection`.
     pub fn resolve(&self, pattern: IdPattern) -> Result<Selection<'_>> {
         self.data.resolve(pattern)
+    }
+
+    /// Plan the distinct values `patterns`, one per input row, take at
+    /// `group`, with their counts. One descent per row; enumerates nothing.
+    pub fn distinct(
+        &self,
+        patterns: impl IntoIterator<Item = IdPattern>,
+        group: Role,
+        limits: DistinctLimits,
+    ) -> Result<DistinctPlan<'_>> {
+        DistinctPlan::new(self.data.permutations(), patterns, group, limits)
     }
 }
 

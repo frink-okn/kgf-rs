@@ -2382,6 +2382,27 @@ impl BindingPattern {
         })
     }
 
+    /// A plain GET pattern as a bindings pattern: each bound position a term,
+    /// each other position an unnamed variable.
+    fn from_plain(pattern: Pattern) -> Self {
+        let Pattern {
+            subject,
+            predicate,
+            object,
+            ..
+        } = pattern;
+        let cell = |position, term: Option<BoundTerm>| {
+            term.map_or(BindingCell::Unbound(position), BindingCell::Term)
+        };
+        Self {
+            cells: [
+                cell(Position::Subject, subject),
+                cell(Position::Predicate, predicate),
+                cell(Position::Object, object),
+            ],
+        }
+    }
+
     fn cell(&self, position: Position) -> &BindingCell {
         &self.cells[position_index(position)]
     }
@@ -2392,6 +2413,17 @@ impl BindingPattern {
             BindingCell::Variable(variable) => variable.as_str(),
             BindingCell::Unbound(position) => position.default_variable(),
             BindingCell::Term(term) => term.requested(),
+        }
+    }
+
+    /// The spelling at `position` for an echo that writes an unnamed variable
+    /// as `null`, as a GET pattern's echo does: a variable's name, a term's
+    /// requested spelling, or `None` for a position no variable names.
+    pub fn named(&self, position: Position) -> Option<&str> {
+        match self.cell(position) {
+            BindingCell::Variable(variable) => Some(variable.as_str()),
+            BindingCell::Unbound(_) => None,
+            BindingCell::Term(term) => Some(term.requested()),
         }
     }
 
@@ -2997,6 +3029,275 @@ impl BindingCount {
     }
 }
 
+/// `GET|QUERY|POST /distinct` — the distinct terms one position of a pattern
+/// takes, each with its triple count.
+///
+/// GET takes the pattern as `s`/`p`/`o` and has no bindings; a body takes the
+/// pattern with named variables and an optional binding table. Both parse to
+/// one table of rows — a request without bindings is a single row that binds
+/// nothing — so the answer walks every request the same way.
+///
+/// Every pattern shape and grouped position is answered. Two numbers bound the
+/// walks whose cost the answer does not set: a predicate's subjects are merged
+/// from at most `max_bindings` object runs, the fan-in a bindings request may
+/// already ask for, and otherwise found by scanning subjects within the
+/// candidate budget.
+#[derive(Debug)]
+pub struct Distinct {
+    /// The pattern, with each position a variable, an unnamed variable, or a
+    /// term.
+    pub pattern: BindingPattern,
+    /// The grouped position.
+    pub group: Position,
+    /// The input rows: the request's binding table, or one row that binds
+    /// nothing.
+    table: Bindings,
+    /// Whether the request carried a binding table.
+    with_bindings: bool,
+    /// Values this page may carry.
+    pub limit: u32,
+    /// Bytes its values may occupy.
+    pub bytes: ResponseBytes,
+    /// Subjects one page may examine when it scans for a predicate.
+    pub candidates: Candidates,
+    /// Most object runs a predicate's subjects are merged from before they
+    /// are scanned for instead.
+    pub merge_fan_in: u64,
+    /// How each IRI value's preferred label is resolved; `None` unless asked.
+    pub labels: Option<Labeling>,
+    /// Where to resume, if the request carried a cursor.
+    pub cursor: Option<Cursor>,
+    /// What a cursor this request issues must match.
+    pub binding: CursorBinding,
+}
+
+impl Distinct {
+    const PARAMETERS: &'static [&'static str] = &[
+        "s",
+        "p",
+        "o",
+        "group_by",
+        "limit",
+        "labels",
+        "lang",
+        "label_source",
+        "cursor",
+        "format",
+    ];
+
+    /// Read a `GET /distinct` request.
+    pub fn parse(
+        params: &Params,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        profile: &PredicateRoles,
+        bundle: &BundleBinding,
+    ) -> Result<Self, Problem> {
+        accept_only(params, DISTINCT, Self::PARAMETERS)?;
+        let pattern = Pattern::parse(params, limits, prefixes)?;
+        if pattern.triple().is_some() {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "/distinct does not take a pattern inside a triple term; bind the object to a \
+                 ground triple term, or fetch the pattern from /fragment and group it locally",
+            ));
+        }
+        let pattern = BindingPattern::from_plain(pattern);
+        let group = GroupBy::parse(params.get("group_by"))?;
+        Self::assemble(
+            DistinctParts {
+                pattern,
+                group,
+                bindings: None,
+                limit: page_size(
+                    params,
+                    "limit",
+                    limits.caps.default_limit,
+                    limits.caps.max_limit,
+                    "use /count for the number of matching triples",
+                )?,
+                labels: Labeling::from_params(params, false, profile, prefixes, limits)?,
+                cursor: params.get("cursor"),
+            },
+            limits,
+            prefixes,
+            bundle,
+        )
+    }
+
+    /// Read one strict JSON `QUERY|POST /distinct` body.
+    pub fn parse_body(
+        params: &Params,
+        body: &[u8],
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        profile: &PredicateRoles,
+        bundle: &BundleBinding,
+    ) -> Result<Self, Problem> {
+        accept_only(params, DISTINCT, &["format"])?;
+        let wire: WireDistinct = parse_body(body)?;
+        let labels = Labeling::from_body(
+            wire.labels,
+            wire.lang,
+            wire.label_source,
+            false,
+            profile,
+            prefixes,
+            limits,
+        )?;
+        let pattern = BindingPattern::parse(wire.pattern, limits, prefixes)?;
+        let group = GroupBy::parse(Some(&wire.group_by))?;
+        let limit = body_page_size(wire.limit, limits)?;
+        Self::assemble(
+            DistinctParts {
+                pattern,
+                group,
+                bindings: wire.bindings,
+                limit,
+                labels,
+                cursor: wire.cursor.as_deref(),
+            },
+            limits,
+            prefixes,
+            bundle,
+        )
+    }
+
+    fn assemble(
+        parts: DistinctParts<'_>,
+        limits: Limits<'_>,
+        prefixes: &PrefixMap,
+        bundle: &BundleBinding,
+    ) -> Result<Self, Problem> {
+        let DistinctParts {
+            pattern,
+            group,
+            bindings,
+            limit,
+            labels,
+            cursor,
+        } = parts;
+        let group = group.0;
+        if pattern.bound(group).is_some() {
+            return Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "group_by={} names a position the pattern binds, which has one value; \
+                     group by a variable position, or use /count",
+                    group.as_str()
+                ),
+            ));
+        }
+        let with_bindings = bindings.is_some();
+        let table = match bindings {
+            Some(wire) => Bindings::parse(wire, &pattern, limits, prefixes)?,
+            None => {
+                let table = Bindings {
+                    columns: BTreeMap::new(),
+                    variables: Vec::new(),
+                    rows: vec![Vec::new()],
+                };
+                // Without a table nothing binds a repeated variable, and an
+                // unbound `?x p ?x` is an equality filter over the walk.
+                Bindings::require_bounded_repeated_variables(
+                    &pattern,
+                    &table.columns,
+                    &table.rows,
+                )?;
+                table
+            }
+        };
+
+        let mut canonical = CanonicalRequest::new(Operation::Distinct)
+            .with("group_by", group.as_str())
+            .with("pattern", &pattern.canonicalize(String::new()));
+        if with_bindings {
+            canonical = canonical.with("bindings", &table.canonicalize(String::new()));
+        }
+        let binding = CursorBinding::new(bundle, &canonical);
+        let cursor = cursor
+            .map(|token| Cursor::decode(token, &binding).map_err(Problem::from))
+            .transpose()?;
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.space != PositionSpace::DistinctValue)
+        {
+            return Err(Problem::from(StaleCursor));
+        }
+        Ok(Self {
+            pattern,
+            group,
+            table,
+            with_bindings,
+            limit,
+            bytes: ResponseBytes(limits.budgets.max_response_bytes),
+            candidates: Candidates(limits.budgets.candidate_budget),
+            merge_fan_in: u64::from(limits.caps.max_bindings),
+            labels,
+            cursor,
+            binding,
+        })
+    }
+
+    /// The input rows, in order: the binding table's, or the one row of a
+    /// request without one.
+    pub fn rows(&self) -> impl Iterator<Item = BindingRow<'_>> {
+        self.table.rows(&self.pattern)
+    }
+
+    /// Whether the request carried a binding table.
+    pub fn with_bindings(&self) -> bool {
+        self.with_bindings
+    }
+
+    /// Whether this request may scan subjects for a predicate: some row binds
+    /// the predicate alone and groups by subject.
+    fn may_scan(&self) -> bool {
+        self.group == Position::Subject
+            && self.rows().any(|row| {
+                row.bound(Position::Predicate).is_some()
+                    && row.bound(Position::Subject).is_none()
+                    && row.bound(Position::Object).is_none()
+            })
+    }
+}
+
+/// The parsed parts of either spelling of a distinct request, before the
+/// checks both share.
+struct DistinctParts<'a> {
+    pattern: BindingPattern,
+    group: GroupBy,
+    bindings: Option<WireBindings>,
+    limit: u32,
+    labels: Option<Labeling>,
+    cursor: Option<&'a str>,
+}
+
+/// `group_by`: one of the three positions.
+#[derive(Debug, Clone, Copy)]
+struct GroupBy(Position);
+
+impl GroupBy {
+    fn parse(value: Option<&str>) -> Result<Self, Problem> {
+        match value {
+            Some("s") => Ok(Self(Position::Subject)),
+            Some("p") => Ok(Self(Position::Predicate)),
+            Some("o") => Ok(Self(Position::Object)),
+            Some(other) => Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                format!(
+                    "group_by={} is not a position; use s, p, or o",
+                    reflected(other)
+                ),
+            )),
+            None => Err(Problem::new(
+                ErrorCode::MalformedRequest,
+                "/distinct needs group_by: the position whose values to list, s, p, or o",
+            )),
+        }
+    }
+}
+
 fn position_index(position: Position) -> usize {
     match position {
         Position::Subject => 0,
@@ -3061,6 +3362,19 @@ struct WireBindingCount {
     bindings: WireBindings,
     /// The graph scope, in the parameter's own syntax.
     g: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireDistinct {
+    pattern: WirePattern,
+    group_by: String,
+    bindings: Option<WireBindings>,
+    limit: Option<u32>,
+    cursor: Option<String>,
+    labels: Option<WireLabelsControl>,
+    lang: Option<Vec<String>>,
+    label_source: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4742,6 +5056,42 @@ impl ObservedRequest for BindingCount {
     }
 }
 
+impl ObservedRequest for Distinct {
+    fn shape(&self) -> RequestShape {
+        RequestShape::Distinct {
+            pattern: self.pattern.shape(),
+            group: self.group.as_str(),
+            limit: self.limit,
+            k: self.with_bindings.then(|| self.table.row_count()),
+            columns: self.with_bindings.then(|| self.table.column_count()),
+        }
+    }
+
+    fn resumed(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    fn request_hash(&self) -> Option<[u8; 8]> {
+        Some(self.binding.request_hash())
+    }
+}
+
+impl GetRequest for Distinct {
+    fn normalize_params(params: &Params) -> Params {
+        normalize_pattern_params(params, &["limit", "labels", "lang", "label_source"])
+    }
+
+    fn work_class(&self) -> WorkClass {
+        // A scan examines up to the candidate budget of subjects; every other
+        // walk is a descent plus work the page itself bounds.
+        if self.may_scan() {
+            WorkClass::Heavy
+        } else {
+            WorkClass::Ordinary
+        }
+    }
+}
+
 impl ObservedRequest for Labels {
     fn shape(&self) -> RequestShape {
         RequestShape::Labels {
@@ -4965,6 +5315,7 @@ const TPF: &str = "tpf";
 const COUNT: &str = "count";
 const DESCRIBE: &str = "describe";
 const SAMPLE: &str = "sample";
+const DISTINCT: &str = "distinct";
 const SCHEMA: &str = "schema";
 const VOID: &str = "void";
 const SUMMARY: &str = "summary";

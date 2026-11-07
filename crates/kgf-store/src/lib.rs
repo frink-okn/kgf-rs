@@ -46,6 +46,7 @@ pub mod map;
 pub mod catalog;
 pub mod description;
 pub mod dict;
+pub mod distinct;
 pub mod error;
 pub mod graphs;
 pub mod hdt;

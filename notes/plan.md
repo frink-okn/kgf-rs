@@ -3223,6 +3223,163 @@ Patterns without triple terms are unchanged: over the same files, main and this 
 answer 1,000-row pages of `s=`, `o=` and `p=` in the same 0.67–0.73 ms with
 byte-identical bodies.
 
+### 38. Distinct values of a pattern — `GET|QUERY /distinct` ✅
+
+**Implemented 2026-11-07**, against `../kgf` doc 03 §3.4.13, written in the same change
+(doc 07 §7.5 item 38). It lists the distinct terms one position of one pattern takes,
+each with its triple count, in ascending id order. The GET form is
+`GET /distinct?p=…&group_by=o`. The body form takes a pattern with named variables and
+an optional binding table. It was proposed as "bounded facets" independently in five
+places:
+- kgfq's client-suite report;
+- kgf-composer;
+- this repository's Comunica evaluation (§9.2 item 2 of
+  `public-deployment-comunica-evaluation.md`);
+- doc 14 §14.1;
+- the November pilot benchmark, where `xw-CJ1` read 14,157,743 triples in 320 s to
+  count charges per offense category.
+
+**Why `distinct`, and why nothing is refused.** The first cut of this unit was `/facet`
+and refused three shapes. It was revised the same day, before review, for two reasons:
+- An agent looking for `SELECT DISTINCT` or `GROUP BY` searches for "distinct". "Facet"
+  is a UI word.
+- The three refusals left out the most ordinary question of the class, a predicate's
+  distinct subjects. They were also not needed.
+
+With one term bound, the bound and grouped positions form six pairs. A permutation makes
+exactly one pair a run: bound first, grouped second. So SPO, POS and OPS leave three
+pairs to a merge of sorted runs.
+- **`s ? ?` by o and `? ? o` by s** merge their runs across predicates. The fan-in is the
+  bound term's predicate degree, which is bounded by the dataset's predicate count, the
+  same bound `s ? o` already relies on.
+- **`? p ?` by s** is the hard pair for any choice of three permutations. A
+  predicate-first permutation puts subjects or objects in the middle, never predicates.
+  POS makes a predicate's objects a run and its subjects the hard case, and PSO would
+  swap them. So this pair has two routes, and both emit subjects in id order, so one
+  cursor serves either.
+  - It merges POS's object runs while they fit a fan-in budget of `max_bindings` runs,
+    shared by every such row of the request. That fan-in is one a bindings request may
+    already ask for.
+  - Otherwise it scans subjects in SPO, probes each for the predicate, and stops at the
+    candidate budget.
+
+A dedicated index would make that last pair a run instead. It would hold one entry per
+(subject, predicate) pair, which is what HDT-FoQ's predicate index was. On
+`medical-device-kg`, `hdtc validate` counts 15,697,791 pairs against 17,857,085
+triples, about 8% of the HDT at 20 bits a subject. It is not built here. Whether it is
+worth building is a measurement question for doc 07.
+
+**What landed, store side.** `kgf_store::distinct`, with no HTTP in it.
+- `DistinctPlan::new` takes one pattern per input row. Identical patterns collapse into
+  one walk weighted by their number, in a fixed order. It returns one walk per distinct
+  pattern:
+  - a run (level 1, a level-2 range, a level-3 range, or the `s ? o` probe);
+  - a merge of the level-3 runs under one level-2 range;
+  - a bound group;
+  - or, for rows past the fan-in, a share of one subject scan. The scan probes each
+    subject for every row's predicate at once, so a request never scans twice.
+- `groups()` is exact without enumeration for a single row walked as a run.
+- `values_after(after)` merges every stream by id in a heap, summing counts and the
+  rows reaching each value. A scan that spends its budget ends the page with
+  `Exhausted { through }`: every value at or below `through` has been yielded.
+
+**What landed, server side.**
+- `Operation::Distinct`, `PositionSpace::DistinctValue`, `AccessOperation::Distinct`, a
+  `RequestShape::Distinct`, and the route.
+- An unconditional release link and the manifest page's operation row.
+- A workbench form.
+- `Capability::Distinct`, derived for every bundle as `sample` and `labels` are, and
+  never a gate, for the reason unit 27 gives.
+
+Decisions:
+- **The cursor is a frontier.** It names an id such that every value at or below it
+  has been delivered. Usually that is the last value. After a scan stop, it is the last
+  subject examined, so a page that found nothing still advances. It always carries the
+  values delivered so far.
+- **Exact where knowable, otherwise a lower bound.** A run width, or for `? p ?` by s
+  the bundle's own `distinctSubjects` in the queryable view, gives the exact total
+  before the last page. Merges and bindings report a lower bound until then. The last
+  page always reports the values the walk delivered, which wins over a statistic.
+- **One request type for both spellings.** GET parses to a bindings pattern of unnamed
+  variables and a one-row table, so the answer walks every request the same way. The
+  two spellings do not share cursors.
+- **Admission.** A GET that may scan is heavy. Every body request is heavy already.
+- **Absent terms are reported as `/count` reports them.** Labels are opt-in, as on
+  `/fragment`.
+
+The sets `? ? ?` gives for each position are the dictionary's role sections. `/terms`
+already pages those, in lexicographic order and without counts, with exact totals from
+`count=true`. Here they come in id order, each with its triples.
+
+**Reviewed 2026-11-07** by an independent agent, which added a randomized differential
+of 25,000 row sets under every limit setting and found no wrong answer. Its findings
+were about cost and about the client, and are fixed here:
+- Many binding rows multiplied each page's setup. A thousand identical rows built a
+  thousand walks, and a thousand distinct `? p ?` rows could each merge up to
+  `max_bindings` runs: about 10⁶ searches a page. Identical rows now collapse, and the
+  fan-in budget is shared across rows. On `medical-device-kg`, 1,000 identical empty
+  rows over `? ? ?` by o now answer a 10,000-value page in 20.7 ms, the same as one
+  row, and 164 rows binding every predicate, grouped by subject, take 22.5 ms.
+- §3.5 understated two costs, and the spec now states them:
+  - The merges' setup sums over rows, and is paid on every page.
+  - A shared scan probes each subject in `min(t, d)` searches, for `t` scanned
+    predicates and the subject's `d` predicates.
+- The last page's total now comes from the walk, not from a statistic.
+- kgfq gained three refusals and two guards, described in its plan.
+
+*Not here, and the same as every other operation in this build:* the SPARQL Results
+JSON, CSV, Parquet and Arrow formats doc 03 lists, and enforcement of the time budget.
+`kgf manifest --check` on a bundle whose manifest predates this unit reports `distinct`
+missing from its declared capabilities, as it reported `labels` when that was added.
+Serving is unaffected, because the route is not gated.
+
+*Verified by* the following.
+- A store test of every pattern over every id of two fixtures and every grouped
+  position. It is checked against grouping the triples directly, under three limit
+  settings (always merge; always scan, one and three subjects a page), with resume after
+  and between every value.
+- Merges of every subject, every predicate and every row twice, against a hand-built
+  sum.
+- At the HTTP layer, an exhaustive differential of every GET answer against grouping
+  `/fragment`'s rows. It is run once with defaults and once with every scan forced to
+  one subject a page.
+- A bindings answer grouped by predicate and by object against the bindings fragment.
+- Grouping by the bound variable as the semijoin.
+- An empty budget-stopped page that still advances.
+- A byte budget of one byte.
+- The refusals that remain, which are all malformed requests.
+- Socket tests of GET, a literal QUERY line and POST, plus the exact first-page total
+  from a `kgf build` bundle's statistics.
+
+**Measured** on the local `medical-device-kg` bundle: 17,857,085 triples, 897,968
+subjects and 164 predicates. Release build, warm page cache, one client, times from the
+same machine. Per page is at `limit` 10,000.
+
+| Request | Route | Answer | Time |
+|---|---|---|---|
+| `group_by=p`, nothing bound | run | 164 values summing to 17,857,085 | 44 ms, cold open included |
+| `? rdf:type ?` by o | run | 36 values behind 927,096 triples | 0.6 ms |
+| `? md:sourceDataset ?` by o | run | 17 values behind 685,543 triples | 0.5 ms |
+| `? md:city ?` by o | run | 33,583 values, 4 pages | 12 ms a page |
+| `? rdf:type ?` by s | merge of 36 object runs | 897,968 subjects, 90 pages, exact total from page 1 | 937 ms in all, about 10 ms a page |
+| `? md:city ?` by s | subject scan (33,583 objects) | 574,671 subjects, 58 pages, exact total from page 1 | 1.1 s in all, about 19 ms a page |
+| `? md:feiNumber ?` by s | subject scan | 104,208 subjects, 11 pages | 404 ms in all |
+| `? ? md:DeNovoRecord` by s | merge per predicate | 484 subjects, 1 page | 1 ms |
+| 1,000 subjects as bindings, `?x ?p ?y` by p | runs, merged | 20 values, 10,323 triples, 3.7 kB | 6.8 ms |
+
+For comparison:
+- One 10,000-row `/fragment` page of `? md:city ?` is 2.1 MB in 10 ms, so reading
+  that predicate whole is 58 such pages.
+- The bindings `/fragment` for the same 1,000 subjects returns 3.7 MB in 58 ms and is
+  still incomplete.
+
+The `md:city` scan examined all 897,968 subjects in about a second, including writing
+574,671 values, so the candidate budget's default of 1,000,000 covers this whole
+bundle in one page. It never
+stopped a page in these runs: each filled its 10,000 values first. On a bundle with
+10⁸ subjects, a rare predicate's subjects would take about a hundred budget-limited
+pages. That is the case the deferred (subject, predicate) index would fix.
+
 ## Testing spine
 
 Set up at unit 1 rather than bolted on afterwards. Per doc 20 §20.9 the tests that

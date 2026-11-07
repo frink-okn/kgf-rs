@@ -100,6 +100,8 @@ pub enum Operation {
     Terms = 6,
     /// `GET /graphs`.
     Graphs = 7,
+    /// `GET|QUERY /distinct`.
+    Distinct = 8,
 }
 
 impl Operation {
@@ -117,6 +119,7 @@ impl Operation {
             5 => Some(Self::Tpf),
             6 => Some(Self::Terms),
             7 => Some(Self::Graphs),
+            8 => Some(Self::Distinct),
             _ => None,
         }
     }
@@ -202,6 +205,21 @@ pub enum PositionSpace {
     /// A candidate of a budgeted triple-term count, with the rows counted
     /// before it in [`Cursor::scan_position`].
     TripleTermScan = 13,
+    /// A `/distinct` page's frontier: every value whose id, in the grouped
+    /// position's space, is at most this one has been delivered. Usually the
+    /// last value delivered; after a scan that spent its budget, the last
+    /// subject it examined, which may be no value at all. The values
+    /// delivered so far ride in [`Cursor::scan_position`].
+    ///
+    /// An id rather than per-run positions, for the reason
+    /// [`DictionaryPrefix`](PositionSpace::DictionaryPrefix) names a term: a
+    /// request merges one run per input row, or per predicate of a bound term,
+    /// and each resumes from the id by one binary search, where a set of
+    /// positions would need a number per run. The count rides along because
+    /// only a walk to the end learns how many values the runs share, so a page
+    /// reports those delivered through it as a lower bound, and the last page
+    /// the exact total.
+    DistinctValue = 14,
 }
 
 impl PositionSpace {
@@ -256,6 +274,7 @@ impl PositionSpace {
             11 => Some(Self::Graph),
             12 => Some(Self::TripleTerm),
             13 => Some(Self::TripleTermScan),
+            14 => Some(Self::DistinctValue),
             _ => None,
         }
     }
@@ -521,6 +540,15 @@ impl Cursor {
         Self::at(binding, PositionSpace::Graph, next)
     }
 
+    /// Resume a `/distinct` walk after the frontier `through`, with the
+    /// values delivered so far.
+    pub fn at_distinct_value(binding: &CursorBinding, through: u64, delivered: u64) -> Self {
+        Self {
+            scan_position: Some(delivered),
+            ..Self::at(binding, PositionSpace::DistinctValue, through)
+        }
+    }
+
     /// Encode to the opaque token clients round-trip.
     ///
     /// Fixed layout, little-endian, then URL-safe base64 without padding: 29
@@ -614,6 +642,7 @@ impl Cursor {
             | PositionSpace::ClassProperty
             | PositionSpace::DictionaryPrefix
             | PositionSpace::Graph => binding_index.is_none() && scan_position.is_none(),
+            PositionSpace::DistinctValue => binding_index.is_none() && scan_position.is_some(),
             PositionSpace::Spo
             | PositionSpace::Pos
             | PositionSpace::Ops

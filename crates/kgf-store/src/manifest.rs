@@ -216,6 +216,10 @@ pub enum Capability {
     Star,
     /// `GET /sample` — pseudo-random members of a pattern's results.
     Sample,
+    /// `GET|QUERY /distinct` — the distinct values of one pattern position,
+    /// with counts. Walks only the HDT and its permutation sidecar, so every
+    /// bundle declares it.
+    Distinct,
     /// `GET|QUERY /terms` — dictionary access.
     ///
     /// **Never derived, and therefore never declared by a manifest this crate
@@ -276,6 +280,7 @@ impl Capability {
         match self {
             Self::Star => "star",
             Self::Sample => "sample",
+            Self::Distinct => "distinct",
             Self::Terms => "terms",
             Self::Export => "export",
             Self::Graphs => "graphs",
@@ -398,7 +403,8 @@ impl BundleFacts {
 /// capabilities belong in the vocabulary at all is a separate question from
 /// whether this one can be declared honestly.
 fn capabilities_for(artifacts: &ArtifactSet) -> BTreeSet<Capability> {
-    let mut capabilities = BTreeSet::from([Capability::Sample, Capability::Labels]);
+    let mut capabilities =
+        BTreeSet::from([Capability::Sample, Capability::Distinct, Capability::Labels]);
     if artifacts.graphs.is_some() {
         capabilities.insert(Capability::Graphs);
     }
@@ -1607,7 +1613,10 @@ mod tests {
         let fixture = Fixture::build(TINY_NT);
         let capabilities: Vec<_> = facts(&fixture).capabilities().collect();
 
-        assert_eq!(capabilities, vec![Capability::Sample, Capability::Labels]);
+        assert_eq!(
+            capabilities,
+            vec![Capability::Sample, Capability::Distinct, Capability::Labels]
+        );
         // Answerable by every bundle, and deliberately not declared: the name
         // covers a key-resolution operation no bundle can answer, and the route
         // is not gated on the declaration anyway.

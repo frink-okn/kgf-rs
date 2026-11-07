@@ -56,6 +56,7 @@ use serde::{Deserialize, Serialize};
 use hdtc::format::{TextScanPosition, TextSearcher, parse_literal};
 use kgf_store::catalog::BundleId;
 use kgf_store::dict::{DictPosition, Dictionary, RoleCounts, ScanFlow, ScannedTerm};
+use kgf_store::distinct::{DistinctItem, DistinctLimits, DistinctValue};
 use kgf_store::manifest::Manifest;
 use kgf_store::pattern::{IdPattern, Selection};
 use kgf_store::{
@@ -394,6 +395,7 @@ impl Target {
             AccessOperation::Count => "Count",
             AccessOperation::Describe => "Describe",
             AccessOperation::Sample => "Sample",
+            AccessOperation::Distinct => "Distinct",
             AccessOperation::Search => "Search",
             AccessOperation::Terms => "Terms",
             AccessOperation::Graphs => "Graphs",
@@ -5263,6 +5265,445 @@ pub fn binding_count(
         completeness: Completeness::complete(),
         target,
     })
+}
+
+/// `GET|QUERY|POST /distinct` — the distinct terms one position of a pattern
+/// takes, with counts, in ascending id order.
+///
+/// Each input row resolves to one walk — a run of an index, a merge of a
+/// bound term's runs, or, for a predicate's subjects past the fan-in limit, a
+/// share of one subject scan — and the walks are merged by id, so a term
+/// several rows reach is one value with their counts summed. The triples
+/// behind the values are never read, except that a scan examines up to the
+/// candidate budget of subjects a page.
+///
+/// The cursor names the page's frontier: every value at or below it has been
+/// delivered. That is the last value, or after a scan spent its budget the
+/// last subject examined, so a page that found nothing still advances. The
+/// last page reports the values delivered across every page, exactly. Before
+/// it, the number is exact when a run width states it or the bundle's
+/// statistics do, and otherwise a lower bound: the values delivered so far,
+/// carried forward in the cursor.
+pub fn distinct(
+    store: &Store,
+    target: Target,
+    request: &request::Distinct,
+) -> Result<DistinctAnswer, Problem> {
+    let blank_nodes = SkolemScope::of(store);
+    let role = request.group.role();
+    let mut lookups = LookupCache::new(store.dict(), blank_nodes.clone(), store.triple_terms());
+    let mut patterns = Vec::new();
+    for row in request.rows() {
+        // A row naming a term this bundle lacks matches nothing.
+        if let Some(ids) = resolve_binding(&mut lookups, row)? {
+            patterns.push(ids);
+        }
+    }
+    let plan = store
+        .distinct(
+            patterns.iter().copied(),
+            role,
+            DistinctLimits {
+                merge_fan_in: request.merge_fan_in,
+                candidates: request.candidates.0,
+            },
+        )
+        .map_err(|error| unreadable("planning a distinct walk", &error))?;
+
+    let dictionary = store.dict();
+    let absent_terms = if request.with_bindings() || !patterns.is_empty() {
+        Vec::new()
+    } else {
+        absent_pattern_terms(
+            &dictionary,
+            &blank_nodes,
+            store.triple_terms(),
+            &request.pattern,
+        )?
+    };
+    // Exact without walking: a run width, or for a predicate's subjects the
+    // bundle's own statistic, which counts the same merged graph.
+    let known = plan.groups().or_else(|| match patterns.as_slice() {
+        [only] if !request.with_bindings() => predicate_subjects(store, &dictionary, *only, role),
+        _ => None,
+    });
+
+    let after = request.cursor.as_ref().map(|cursor| cursor.position);
+    let delivered_before = request
+        .cursor
+        .as_ref()
+        .and_then(|cursor| cursor.scan_position)
+        .unwrap_or(0);
+    let mut labels = ItemLabels::of(store, request.labels.as_ref())?;
+    let mut cache = TermCache::new();
+    let mut published = PublishedTerms::new(blank_nodes.clone(), store);
+    let limit = request.limit as usize;
+    let mut rows: Vec<DistinctRow> = Vec::with_capacity(limit.min(1024));
+    let mut spent = 0u64;
+    let mut stop: Option<(Option<BudgetReason>, u64)> = None;
+    let mut last = None;
+    for item in plan.values_after(after) {
+        let value = match item {
+            DistinctItem::Value(value) => value,
+            DistinctItem::Exhausted { through } => {
+                // Every value up to `through` has been yielded, and all of
+                // them are on this page: resume after it.
+                stop = Some((Some(BudgetReason::Candidate), through));
+                break;
+            }
+        };
+        if rows.len() >= limit {
+            stop = Some((None, last.expect("a full page has a last value")));
+            break;
+        }
+        let (term, serialized) = published
+            .measured(&mut cache, &dictionary, role, TermId(value.id))
+            .map_err(|error| unreadable("materializing a distinct value", &error))?;
+        let label = match labels.as_mut() {
+            None => None,
+            Some(labels) => {
+                // A label hangs off a subject, so a predicate or object value
+                // is looked up there by its spelling; a literal never is one.
+                let subject = match role {
+                    Role::Subject => Some(value.id),
+                    Role::Predicate | Role::Object => dictionary
+                        .locate(Role::Subject, term.stored.as_bytes())
+                        .map_err(|error| unreadable("looking a distinct value up", &error))?
+                        .map(|id| id.0),
+                };
+                match labels.label(subject, Spend::first_if(rows.is_empty()))? {
+                    Some(label) => Some(label),
+                    None => {
+                        let through = last.expect("the first value's label is settled");
+                        stop = Some((Some(BudgetReason::Candidate), through));
+                        break;
+                    }
+                }
+            }
+        };
+        let row = DistinctRow::new(
+            request.group,
+            term.published,
+            serialized,
+            value,
+            request.with_bindings(),
+            label,
+        );
+        spent = spent.saturating_add(row.serialized);
+        // Never on the first value, for the reason every page keeps its
+        // first row: a page that carries nothing would resume where it was
+        // issued.
+        if spent > request.bytes.0 && !rows.is_empty() {
+            let through = last.expect("a page past its first value has a last one");
+            stop = Some((Some(BudgetReason::ResponseBytes), through));
+            break;
+        }
+        last = Some(value.id);
+        rows.push(row);
+    }
+
+    let delivered = delivered_before + rows.len() as u64;
+    let completeness = match stop {
+        None => Completeness::complete(),
+        Some((reason, through)) => {
+            let token = Cursor::at_distinct_value(&request.binding, through, delivered).encode();
+            match reason {
+                None => Completeness::page_limit(token),
+                Some(reason) => Completeness::budget_exhausted(reason, token),
+            }
+        }
+    };
+    // The last page's count is the walk's own, and wins over any statistic:
+    // a description assembled by hand, or by an older producer, may disagree
+    // with the rows this request actually delivered.
+    let total = match known {
+        _ if completeness.next_cursor().is_none() => Cardinality::exact(delivered),
+        Some(total) => Cardinality::exact(total),
+        None => Cardinality::estimated(delivered).at_least(delivered),
+    };
+
+    let mut vars = vec![request.group.as_str(), "count"];
+    if request.with_bindings() {
+        vars.push("bindings");
+    }
+    Ok(DistinctAnswer {
+        dataset: target.id.dataset.clone(),
+        version: target.id.version.clone(),
+        pattern: DistinctPattern(request.pattern.clone()),
+        group_by: request.group.as_str(),
+        order: "index",
+        absent_terms,
+        cardinality: Cardinality::exact(plan.triples()),
+        distinct: total,
+        vars,
+        rows,
+        completeness,
+        target,
+        blank_nodes,
+    })
+}
+
+/// `? p ?` grouped by subject: the bundle's distinct-subject count for `p` in
+/// the queryable view, whose numbers are the merged graph's, when the bundle
+/// carries one. Any other shape, or a bundle without statistics, says nothing.
+fn predicate_subjects(
+    store: &Store,
+    dictionary: &Dictionary<'_>,
+    pattern: IdPattern,
+    group: Role,
+) -> Option<u64> {
+    let (None, Some(predicate), None, Role::Subject) =
+        (pattern.subject, pattern.predicate, pattern.object, group)
+    else {
+        return None;
+    };
+    let mut scratch = Vec::new();
+    let iri = dictionary
+        .extract(Role::Predicate, TermId(predicate), &mut scratch)
+        .ok()?;
+    let iri = std::str::from_utf8(iri).ok()?;
+    store
+        .description()?
+        .view(&StatsView::Queryable)?
+        .schema_node(kgf_store::SchemaSelector::Property {
+            class: None,
+            predicate: iri,
+        })
+        .ok()??
+        .counts()
+        .distinct_subjects
+}
+
+/// The pattern's bound terms this release does not hold, for a request without
+/// bindings that matched nothing — the same report `/count` makes, so an empty
+/// answer says whether it is empty because a term is missing.
+fn absent_pattern_terms(
+    dictionary: &Dictionary<'_>,
+    blank_nodes: &SkolemScope,
+    triple_terms: Option<&TripleTerms>,
+    pattern: &BindingPattern,
+) -> Result<Vec<AbsentTerm>, Problem> {
+    let mut absent = Vec::new();
+    for position in Position::ALL {
+        let Some(term) = pattern.bound(position) else {
+            continue;
+        };
+        if locate_scoped(dictionary, blank_nodes, triple_terms, position.role(), term)?.is_none()
+            && !held_by_propositions(dictionary, blank_nodes, triple_terms, position.role(), term)?
+        {
+            absent.push(AbsentTerm::new(position.as_str(), term));
+        }
+    }
+    Ok(absent)
+}
+
+/// A distinct request's pattern echo: each position as the request spelled
+/// it, and an unnamed variable as `null`, as a GET pattern echoes everywhere.
+#[derive(Debug, Clone)]
+struct DistinctPattern(BindingPattern);
+
+impl Serialize for DistinctPattern {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(Position::ALL.len()))?;
+        for position in Position::ALL {
+            map.serialize_entry(position.as_str(), &self.0.named(position))?;
+        }
+        map.end()
+    }
+}
+
+/// One value of a distinct page: the term, its triples, under bindings the
+/// input rows that reached it, and its label when one was asked for.
+#[derive(Debug)]
+struct DistinctRow {
+    group: Position,
+    published: Published,
+    count: u64,
+    bindings: Option<u32>,
+    label: Option<RowLabel>,
+    serialized: u64,
+}
+
+impl DistinctRow {
+    fn new(
+        group: Position,
+        published: Published,
+        term: u64,
+        merged: DistinctValue,
+        with_bindings: bool,
+        label: Option<RowLabel>,
+    ) -> Self {
+        let digits = |value: u64| value.to_string().len() as u64;
+        let bindings = with_bindings.then_some(merged.rows);
+        let serialized = match bindings {
+            None => serialized_object([(group.as_str(), term), ("count", digits(merged.count))]),
+            Some(walks) => serialized_object([
+                (group.as_str(), term),
+                ("count", digits(merged.count)),
+                ("bindings", digits(u64::from(walks))),
+            ]),
+        } + label.as_ref().map_or(0, RowLabel::appended);
+        Self {
+            group,
+            published,
+            count: merged.count,
+            bindings,
+            label,
+            serialized,
+        }
+    }
+}
+
+impl Serialize for DistinctRow {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry(self.group.as_str(), &self.published)?;
+        map.serialize_entry("count", &self.count)?;
+        if let Some(bindings) = self.bindings {
+            map.serialize_entry("bindings", &bindings)?;
+        }
+        if let Some(label) = &self.label {
+            label.serialize_into(&mut map)?;
+        }
+        map.end()
+    }
+}
+
+/// `/distinct`'s page of values.
+#[derive(Debug, Serialize)]
+pub struct DistinctAnswer {
+    dataset: String,
+    version: String,
+    pattern: DistinctPattern,
+    group_by: &'static str,
+    /// Always `index`: ascending dictionary id of the grouped role, which is
+    /// the order a run is stored in and carries no meaning beyond stability.
+    order: &'static str,
+    /// The pattern's terms this release does not hold, when that is why it
+    /// matched nothing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    absent_terms: Vec<AbsentTerm>,
+    /// Matching triples, the sum of every group's count, exactly.
+    cardinality: Cardinality,
+    /// Distinct values across every page: exact where a run width or the
+    /// bundle's statistics state it, otherwise a lower bound until the last
+    /// page.
+    distinct: Cardinality,
+    vars: Vec<&'static str>,
+    rows: Vec<DistinctRow>,
+    #[serde(flatten)]
+    completeness: Completeness,
+    #[serde(skip)]
+    target: Target,
+    /// Only the page needs this: a grouped term is already published scoped,
+    /// and HTML spells such a term `_:{section}-{local-id}` for its reader.
+    #[serde(skip)]
+    blank_nodes: SkolemScope,
+}
+
+impl Renders for DistinctAnswer {
+    fn render(self, representation: Representation) -> Result<Rendered, Problem> {
+        let body = standard_body(&self, representation);
+        let rows = Some(self.rows.len() as u64);
+        Ok(Rendered {
+            body,
+            completeness: self.completeness,
+            rows,
+            cardinality: Some(self.distinct),
+        })
+    }
+}
+
+impl Resource for DistinctAnswer {
+    fn to_json(&self) -> Bytes {
+        json_body(self)
+    }
+
+    fn to_html(&self) -> String {
+        let cells: Vec<Cell<'_>> = self
+            .rows
+            .iter()
+            .map(|row| {
+                row_cell(
+                    &self.target,
+                    &self.blank_nodes,
+                    &row.published,
+                    row.label.as_ref().and_then(RowLabel::value),
+                    None,
+                )
+            })
+            .collect();
+        let rows: Vec<Vec<Value<'_>>> = cells
+            .iter()
+            .zip(&self.rows)
+            .map(|(cell, row)| {
+                let mut values = vec![cell.value(), Value::Number(row.count)];
+                if let Some(bindings) = row.bindings {
+                    values.push(Value::Number(u64::from(bindings)));
+                }
+                values
+            })
+            .collect();
+        let columns: &[&str] = if self.vars.len() == 3 {
+            &["value", "count", "bindings"]
+        } else {
+            &["value", "count"]
+        };
+        let canonical = self.target.canonical();
+        let context = self.target.context();
+        let mut summary = binding_pattern_fields(&self.pattern.0, self.target.operation);
+        summary.push(("group_by", Value::Code(self.group_by)));
+        summary.push(("triples", Value::Number(self.cardinality.value())));
+        summary.push((
+            if self.distinct.is_exact() {
+                "distinct"
+            } else {
+                "distinct (at least)"
+            },
+            Value::Number(self.distinct.value()),
+        ));
+        summary.push(("returned", Value::Number(self.rows.len() as u64)));
+        summary.push((
+            "complete",
+            Value::Text(completeness_text(&self.completeness)),
+        ));
+        operation_page(
+            &self.target.mount,
+            &format!("Distinct values of {}", self.group_by),
+            &context,
+            &self.target.crumbs(),
+            canonical.as_deref(),
+            html! {
+                div."answer-summary" { (fields(&summary)) }
+                @if !self.absent_terms.is_empty() {
+                    (note(&format!(
+                        "{}, so there are no values.",
+                        absent_terms_text(&self.absent_terms)
+                    )))
+                }
+                @if let Some(form) = self.target.form() {
+                    div."query-editor" { (form) }
+                }
+                section."section-block" {
+                    h2 { "Values" }
+                    @if rows.is_empty() {
+                        (note("No triple matches this pattern."))
+                    } @else {
+                        (results_table(columns, &rows))
+                    }
+                }
+                @if let Some(token) = self.completeness.next_cursor() {
+                    @if let Some(next) = self.target.next(token) {
+                        (pager(&next, "Next page →"))
+                    } @else {
+                        (note(&format!(
+                            "More values follow. Send the same body again with \"cursor\": \"{token}\"."
+                        )))
+                    }
+                }
+            },
+        )
+    }
 }
 
 /// `GET /graphs` — every graph with its membership count, paged by graph id.
