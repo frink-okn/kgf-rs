@@ -4980,6 +4980,7 @@ fn access_operation(operation: &str) -> AccessOperation {
         "count" => AccessOperation::Count,
         "describe" => AccessOperation::Describe,
         "sample" => AccessOperation::Sample,
+        "distinct" => AccessOperation::Distinct,
         "search" => AccessOperation::Search,
         "terms" => AccessOperation::Terms,
         "graphs" => AccessOperation::Graphs,
@@ -5123,4 +5124,543 @@ fn text_over_triple_terms_answers_from_data_hdt_alone() {
         .try_fragment(&store, "o.text=Alice")
         .expect("an answer");
     assert!(!alice["rows"].as_array().unwrap().is_empty(), "{alice}");
+}
+
+// ---------------------------------------------------------------------------
+// /distinct
+// ---------------------------------------------------------------------------
+
+impl Served {
+    /// `GET /distinct` under the given limits, or its refusal.
+    fn try_distinct_within(
+        &self,
+        store: &Store,
+        query: &str,
+        limits: Limits<'_>,
+    ) -> Result<serde_json::Value, kgf_server::envelope::Problem> {
+        let request = request::Distinct::parse(
+            &params(query),
+            limits,
+            self.release().prefixes(),
+            self.release().predicate_roles(),
+            &self.release().binding(),
+        )?;
+        let answer = answer::distinct(store, self.target("distinct", query), &request)?;
+        Ok(json(answer, Representation::Json))
+    }
+
+    fn try_distinct(
+        &self,
+        store: &Store,
+        query: &str,
+    ) -> Result<serde_json::Value, kgf_server::envelope::Problem> {
+        self.try_distinct_within(store, query, self.limits())
+    }
+
+    fn distinct(&self, store: &Store, query: &str) -> serde_json::Value {
+        self.try_distinct(store, query)
+            .unwrap_or_else(|error| panic!("GET /distinct?{query}: {error}"))
+    }
+
+    /// Every page of a GET request under `limits`, concatenated, and the pages.
+    fn distinct_pages(
+        &self,
+        store: &Store,
+        query: &str,
+        limits: Limits<'_>,
+    ) -> (Vec<(String, u64)>, Vec<serde_json::Value>) {
+        let mut rows = Vec::new();
+        let mut pages = Vec::new();
+        let mut next = query.to_owned();
+        loop {
+            let page = self
+                .try_distinct_within(store, &next, limits)
+                .unwrap_or_else(|error| panic!("GET /distinct?{next}: {error}"));
+            rows.extend(distinct_rows(&page));
+            let token = page["next"].as_str().map(str::to_owned);
+            pages.push(page);
+            match token {
+                Some(token) => next = format!("{query}&cursor={token}"),
+                None => return (rows, pages),
+            }
+        }
+    }
+
+    /// `QUERY /distinct` with a JSON body, or its refusal.
+    fn try_distinct_body(
+        &self,
+        store: &Store,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, kgf_server::envelope::Problem> {
+        let encoded = serde_json::to_vec(body).expect("a JSON body");
+        let request = request::Distinct::parse_body(
+            &params(""),
+            &encoded,
+            self.limits(),
+            self.release().prefixes(),
+            self.release().predicate_roles(),
+            &self.release().binding(),
+        )?;
+        let answer = answer::distinct(
+            store,
+            Target::body(
+                self.id(),
+                AccessOperation::Distinct,
+                params(""),
+                self.release().prefixes().clone(),
+                kgf_server::url::Mount::default(),
+            ),
+            &request,
+        )?;
+        Ok(json(answer, Representation::Json))
+    }
+
+    fn distinct_body(&self, store: &Store, body: &serde_json::Value) -> serde_json::Value {
+        self.try_distinct_body(store, body)
+            .unwrap_or_else(|error| panic!("QUERY /distinct {body}: {error}"))
+    }
+
+    /// Every page of a body request at `limit` values a page, concatenated,
+    /// and the pages.
+    fn distinct_body_pages(
+        &self,
+        store: &Store,
+        body: &serde_json::Value,
+        limit: u64,
+    ) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        let mut body = body.clone();
+        body["limit"] = serde_json::json!(limit);
+        let mut rows = Vec::new();
+        let mut pages = Vec::new();
+        loop {
+            let page = self.distinct_body(store, &body);
+            rows.extend(page["rows"].as_array().unwrap().iter().cloned());
+            let next = page["next"].clone();
+            pages.push(page);
+            match next.as_str() {
+                Some(token) => body["cursor"] = serde_json::json!(token),
+                None => return (rows, pages),
+            }
+        }
+    }
+}
+
+/// A distinct answer's rows as (term, count), in the order sent.
+fn distinct_rows(answer: &serde_json::Value) -> Vec<(String, u64)> {
+    let position = answer["group_by"].as_str().expect("group_by").to_owned();
+    answer["rows"]
+        .as_array()
+        .expect("rows is an array")
+        .iter()
+        .map(|row| {
+            (
+                dictionary_spelling(&row[position.as_str()]),
+                row["count"].as_u64().expect("a count"),
+            )
+        })
+        .collect()
+}
+
+/// The rows of a `/fragment` answer grouped by one position, the slow way: what
+/// the distinct answer to the same request is defined to be.
+fn grouped(answer: &serde_json::Value, position: &str) -> std::collections::BTreeMap<String, u64> {
+    let mut counts = std::collections::BTreeMap::new();
+    for row in answer["rows"].as_array().expect("rows") {
+        *counts
+            .entry(dictionary_spelling(&row[position]))
+            .or_insert(0) += 1;
+    }
+    counts
+}
+
+/// Caps that force every walk whose cost the answer does not set: a fan-in of
+/// no object runs, so a predicate's subjects are always scanned for. Only GET
+/// requests run under them, so no binding table meets the zero.
+const SCANNING_CAPS: Caps = Caps {
+    max_bindings: 0,
+    ..Caps::new()
+};
+
+#[test]
+fn every_distinct_answer_is_the_grouping_of_its_fragment() {
+    // The normative definition, checked exhaustively: for every pattern over
+    // every term of the bundle and every unbound position, the answer is the
+    // grouping by that position of exactly the rows `/fragment` returns, in
+    // ascending id order, with nothing refused. Each is then paged one value
+    // at a time, and again with a predicate's subjects scanned for one subject
+    // a page.
+    let served = Served::new();
+    let store = served.store();
+    let terms = served.terms(&store);
+    let by_spelling: std::collections::HashMap<(Role, String), u64> =
+        [Role::Subject, Role::Predicate, Role::Object]
+            .into_iter()
+            .flat_map(|role| {
+                let ids: Vec<_> = terms.of(role).iter().map(|(id, _)| *id).collect();
+                let dictionary = store.dict();
+                let mut scratch = Vec::new();
+                ids.into_iter()
+                    .map(|id| {
+                        let stored = dictionary.extract(role, TermId(id), &mut scratch).unwrap();
+                        let text = String::from_utf8(stored.to_vec()).unwrap();
+                        ((role, published_spelling(&store, role, id, &text)), id)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+    let scanning_budget = Budgets {
+        candidate_budget: 1,
+        ..BUDGETS
+    };
+    let scanning = Limits {
+        caps: &SCANNING_CAPS,
+        budgets: &scanning_budget,
+    };
+
+    let mut answered = 0;
+    let mut scanned = 0;
+    for subject in options(&terms, Role::Subject) {
+        for predicate in options(&terms, Role::Predicate) {
+            for object in options(&terms, Role::Object) {
+                let query = pattern_query(&terms, subject, predicate, object);
+                for (group, role, unbound) in [
+                    ("s", Role::Subject, subject.is_none()),
+                    ("p", Role::Predicate, predicate.is_none()),
+                    ("o", Role::Object, object.is_none()),
+                ] {
+                    if !unbound {
+                        continue;
+                    }
+                    let request = format!("{query}&group_by={group}&limit=10000");
+                    let answer = served.distinct(&store, &request);
+                    answered += 1;
+                    let fragment = served.fragment(&store, &format!("{query}&limit=10000"));
+                    let expected = grouped(&fragment, group);
+                    let rows = distinct_rows(&answer);
+                    let actual: std::collections::BTreeMap<_, _> = rows.iter().cloned().collect();
+                    assert_eq!(actual, expected, "GET /distinct?{request}");
+                    assert_eq!(rows.len(), expected.len(), "one row per value: {request}");
+                    assert_eq!(
+                        answer["distinct"],
+                        serde_json::json!({"value": expected.len(), "exact": true}),
+                        "{request}"
+                    );
+                    assert_eq!(answer["cardinality"], fragment["cardinality"], "{request}");
+                    assert_eq!(answer["complete"], serde_json::json!(true), "{request}");
+                    assert_eq!(answer["order"], "index");
+                    let ids: Vec<u64> = rows
+                        .iter()
+                        .map(|(spelling, _)| by_spelling[&(role, spelling.clone())])
+                        .collect();
+                    assert!(
+                        ids.windows(2).all(|pair| pair[0] < pair[1]),
+                        "{request}: {ids:?}"
+                    );
+
+                    // One value a page, resumed by cursor, is the same answer.
+                    let one = format!("{query}&group_by={group}&limit=1");
+                    let (paged, _) = served.distinct_pages(&store, &one, served.limits());
+                    assert_eq!(paged, rows, "paged one value at a time: {request}");
+
+                    // And with every scan forced and budgeted to one subject.
+                    let (scanned_rows, pages) = served.distinct_pages(&store, &request, scanning);
+                    assert_eq!(scanned_rows, rows, "scanned: {request}");
+                    let stops = pages
+                        .iter()
+                        .filter(|page| page["truncation_reason"] == "candidate_budget")
+                        .count();
+                    scanned += usize::from(stops > 0);
+                    let last = pages.last().unwrap();
+                    assert_eq!(
+                        last["distinct"],
+                        serde_json::json!({"value": expected.len(), "exact": true}),
+                        "{request}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(answered > 100, "{answered} answered");
+    assert!(scanned > 0, "the scan route was exercised over the wire");
+}
+
+#[test]
+fn a_bindings_distinct_answer_groups_what_the_bindings_fragment_returns() {
+    // Every subject, one of them twice, and a term the bundle lacks: the
+    // bindings fragment's rows grouped by predicate, and by object, counted
+    // with the multiplicity a VALUES join has, and `bindings` saying how many
+    // input rows reached each value.
+    let served = Served::new();
+    let store = served.store();
+    let subjects = [
+        "<http://example.org/alice>",
+        "<http://example.org/bob>",
+        "<http://example.org/carol>",
+        "<http://example.org/alice>",
+        "<http://example.org/nobody>",
+    ];
+    for (group, triples_of_alice_knows) in [("p", Some(2 + 1 + 2)), ("o", None)] {
+        let body = serde_json::json!({
+            "pattern": {"s": "?x", "p": "?p", "o": "?y"},
+            "group_by": group,
+            "bindings": {"vars": ["?x"], "rows": subjects.iter().map(|s| [s]).collect::<Vec<_>>()},
+        });
+        let mut fragment_body = body.clone();
+        fragment_body.as_object_mut().unwrap().remove("group_by");
+        fragment_body["limit"] = serde_json::json!(10000);
+        let fragment = served.binding_fragment(&store, &fragment_body);
+        let expected = grouped(&fragment, group);
+        let mut reached: std::collections::BTreeMap<String, BTreeSet<u64>> = Default::default();
+        for row in fragment["rows"].as_array().unwrap() {
+            reached
+                .entry(dictionary_spelling(&row[group]))
+                .or_default()
+                .insert(row["binding"].as_u64().unwrap());
+        }
+
+        let answer = served.distinct_body(&store, &body);
+        assert_eq!(
+            answer["vars"],
+            serde_json::json!([group, "count", "bindings"])
+        );
+        let actual: std::collections::BTreeMap<_, _> = distinct_rows(&answer).into_iter().collect();
+        assert_eq!(actual, expected, "by {group}");
+        for row in answer["rows"].as_array().unwrap() {
+            let value = dictionary_spelling(&row[group]);
+            assert_eq!(
+                row["bindings"].as_u64().unwrap() as usize,
+                reached[&value].len(),
+                "{value}"
+            );
+        }
+        if let Some(knows) = triples_of_alice_knows {
+            // alice is bound twice, so `knows` counts her two triples twice.
+            assert_eq!(actual["http://example.org/knows"], knows);
+        }
+        assert_eq!(answer["cardinality"], fragment["cardinality"]);
+        assert_eq!(
+            answer["distinct"],
+            serde_json::json!({"value": expected.len(), "exact": true})
+        );
+
+        // Paged one value at a time: the same rows, a lower bound on every
+        // page but the last, and the exact total on the last.
+        let (rows, pages) = served.distinct_body_pages(&store, &body, 1);
+        assert_eq!(rows, answer["rows"].as_array().unwrap().clone());
+        for (index, page) in pages.iter().enumerate() {
+            if index + 1 < pages.len() {
+                assert_eq!(
+                    page["distinct"],
+                    serde_json::json!({"value": index + 1, "exact": false, "min": index + 1}),
+                    "page {index}"
+                );
+            } else {
+                assert_eq!(
+                    page["distinct"],
+                    serde_json::json!({"value": expected.len(), "exact": true})
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn grouping_by_the_bound_variable_is_the_semijoin_over_values() {
+    // Which of these values occur as subjects of `ex:name`, and how often:
+    // sparse, keyed by value, with the absent and the non-matching left out.
+    let served = Served::new();
+    let store = served.store();
+    let body = serde_json::json!({
+        "pattern": {"s": "?x", "p": "<http://example.org/name>", "o": "?name"},
+        "group_by": "s",
+        "bindings": {"vars": ["?x"], "rows": [
+            ["<http://example.org/carol>"],
+            ["<http://example.org/nobody>"],
+            ["<http://example.org/alice>"],
+            ["\"Alice\""],
+            ["<http://example.org/carol>"],
+        ]},
+    });
+    let answer = served.distinct_body(&store, &body);
+    let rows: Vec<_> = answer["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                dictionary_spelling(&row["s"]),
+                row["count"].as_u64().unwrap(),
+                row["bindings"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    // Ascending subject id: alice before carol, whatever the input order.
+    assert_eq!(
+        rows,
+        [
+            ("http://example.org/alice".to_owned(), 1, 1),
+            ("http://example.org/carol".to_owned(), 2, 2),
+        ]
+    );
+}
+
+#[test]
+fn distinct_refuses_only_what_is_not_a_distinct_request() {
+    let served = Served::new();
+    let store = served.store();
+    let code = |result: Result<serde_json::Value, kgf_server::envelope::Problem>| {
+        let problem = result.expect_err("a refusal");
+        (problem.code().as_str(), problem.status())
+    };
+
+    // The shapes once refused are answered, among them a predicate's
+    // subjects, an object's subjects and a subject's objects.
+    for query in [
+        "p=ex:name&group_by=s",
+        "o=ex:alice&group_by=s",
+        "s=ex:alice&group_by=o",
+    ] {
+        assert!(served.try_distinct(&store, query).is_ok(), "{query}");
+    }
+
+    for query in [
+        "p=ex:name",
+        "p=ex:name&group_by=p",
+        "p=ex:name&group_by=x",
+        "p=ex:name&group_by=o&o.text=alice",
+        "p=ex:name&group_by=o&g=*",
+        "o=%3C%3C(%20ex%3Aalice%20%3Fp%20%3Fo%20)%3E%3E&group_by=s",
+    ] {
+        assert_eq!(
+            code(served.try_distinct(&store, query)),
+            ("malformed_request", 400),
+            "{query}"
+        );
+    }
+    // A repeated variable nothing binds is an equality filter, not a walk.
+    assert_eq!(
+        code(served.try_distinct_body(
+            &store,
+            &serde_json::json!({
+                "pattern": {"s": "?x", "p": "?p", "o": "?x"},
+                "group_by": "p",
+            }),
+        )),
+        ("malformed_request", 400)
+    );
+    // A cursor for another request is stale.
+    let first = served.distinct(&store, "group_by=p&limit=1");
+    let token = first["next"].as_str().expect("more than one predicate");
+    assert_eq!(
+        code(served.try_distinct(&store, &format!("group_by=o&limit=1&cursor={token}"))),
+        ("stale_cursor", 400)
+    );
+    // A body's cursor resumes the same body, and only it.
+    let mut body = serde_json::json!({
+        "pattern": {"s": "?s", "p": "?p", "o": "?o"},
+        "group_by": "p",
+        "limit": 1,
+    });
+    let first = served.distinct_body(&store, &body);
+    body["cursor"] = first["next"].clone();
+    let resumed = served.distinct_body(&store, &body);
+    assert_ne!(resumed["rows"], first["rows"]);
+    body["group_by"] = serde_json::json!("o");
+    assert_eq!(
+        code(served.try_distinct_body(&store, &body)),
+        ("stale_cursor", 400)
+    );
+}
+
+#[test]
+fn a_scan_that_spends_its_budget_still_advances() {
+    // `? ex:age ?` grouped by subject, scanned one subject a page. Only carol
+    // has an age, so the pages before hers examine a subject, find nothing,
+    // and still resume past it; paging ends with every subject accounted for.
+    let served = Served::new();
+    let store = served.store();
+    let budgets = Budgets {
+        candidate_budget: 1,
+        ..BUDGETS
+    };
+    let limits = Limits {
+        caps: &SCANNING_CAPS,
+        budgets: &budgets,
+    };
+    let (rows, pages) = served.distinct_pages(&store, "p=ex:age&group_by=s", limits);
+    assert_eq!(rows, [("http://example.org/carol".to_owned(), 1)]);
+    let empty_stops = pages
+        .iter()
+        .filter(|page| {
+            page["rows"] == serde_json::json!([]) && page["truncation_reason"] == "candidate_budget"
+        })
+        .count();
+    assert!(empty_stops >= 1, "{pages:?}");
+    for page in &pages[..pages.len() - 1] {
+        assert_eq!(page["distinct"]["exact"], false);
+    }
+    assert_eq!(
+        pages.last().unwrap()["distinct"],
+        serde_json::json!({"value": 1, "exact": true})
+    );
+}
+
+#[test]
+fn a_distinct_answer_over_an_absent_term_says_why_it_is_empty() {
+    let served = Served::new();
+    let store = served.store();
+    let answer = served.distinct(&store, "p=ex:missing&group_by=o");
+    assert_eq!(answer["rows"], serde_json::json!([]));
+    assert_eq!(
+        answer["distinct"],
+        serde_json::json!({"value": 0, "exact": true})
+    );
+    assert_eq!(answer["absent_terms"][0]["parameter"], "p");
+    assert_eq!(
+        answer["pattern"],
+        serde_json::json!({"s": null, "p": "ex:missing", "o": null})
+    );
+}
+
+#[test]
+fn a_distinct_page_ends_at_the_byte_budget_and_resumes() {
+    // A budget smaller than two values: every page carries one value, never
+    // none, and says the bytes stopped it.
+    let served = Served::new();
+    let store = served.store();
+    let budgets = Budgets {
+        max_response_bytes: 1,
+        ..BUDGETS
+    };
+    let full = served.distinct(&store, "group_by=p");
+    let (paged, pages) = served.distinct_pages(&store, "group_by=p", served.within(&budgets));
+    for page in &pages[..pages.len() - 1] {
+        assert_eq!(distinct_rows(page).len(), 1);
+        assert_eq!(page["truncation_reason"], "response_bytes");
+    }
+    assert_eq!(paged, distinct_rows(&full));
+}
+
+#[test]
+fn a_distinct_page_renders_for_a_browser() {
+    use kgf_server::answer::Renders;
+
+    let served = Served::new();
+    let store = served.store();
+    let query = "p=ex:knows&group_by=o";
+    let request = request::Distinct::parse(
+        &params(query),
+        served.limits(),
+        served.release().prefixes(),
+        served.release().predicate_roles(),
+        &served.release().binding(),
+    )
+    .unwrap();
+    let rendered = answer::distinct(&store, served.target("distinct", query), &request)
+        .unwrap()
+        .render(Representation::Html)
+        .unwrap();
+    let page = String::from_utf8(rendered.body.to_vec()).unwrap();
+    assert!(page.contains("Distinct values of o"), "{page}");
+    assert!(page.contains("group_by"), "{page}");
 }

@@ -2894,7 +2894,7 @@ IRIs draws `n` seeded-uniform members, the same draw `/sample` makes; a config a
 a *plan* — every target's member count and `n` sampled texts with length statistics,
 each text reporting `limited` (predicates sampled down to the limit: the tuning signal)
 and `truncated` (the server's bound, not a config problem; the page calls it "cut by
-budget", and unit 40 renames the field, since "truncated" is the embedding model's
+budget", and unit 41 renames the field, since "truncated" is the embedding model's
 word). The config travels as YAML
 or JSON text in a GET parameter for a browser and as a JSON body on `QUERY` (canonical)
 and `POST` (fallback), with the same fields either way. The HTML representation carries
@@ -3227,15 +3227,172 @@ Patterns without triple terms are unchanged: over the same files, main and this 
 answer 1,000-row pages of `s=`, `o=` and `p=` in the same 0.67–0.73 ms with
 byte-identical bodies.
 
-### 38. The `vectors/` sidecar in `kgf-store` — the id map and the mapped index ✅
+### 38. Distinct values of a pattern — `GET|QUERY /distinct` ✅
+
+**Implemented 2026-11-07**, against `../kgf` doc 03 §3.4.13, written in the same change
+(doc 07 §7.5 item 38). It lists the distinct terms one position of one pattern takes,
+each with its triple count, in ascending id order. The GET form is
+`GET /distinct?p=…&group_by=o`. The body form takes a pattern with named variables and
+an optional binding table. It was proposed as "bounded facets" independently in five
+places:
+- kgfq's client-suite report;
+- kgf-composer;
+- this repository's Comunica evaluation (§9.2 item 2 of
+  `public-deployment-comunica-evaluation.md`);
+- doc 14 §14.1;
+- the November pilot benchmark, where `xw-CJ1` read 14,157,743 triples in 320 s to
+  count charges per offense category.
+
+**Why `distinct`, and why nothing is refused.** The first cut of this unit was `/facet`
+and refused three shapes. It was revised the same day, before review, for two reasons:
+- An agent looking for `SELECT DISTINCT` or `GROUP BY` searches for "distinct". "Facet"
+  is a UI word.
+- The three refusals left out the most ordinary question of the class, a predicate's
+  distinct subjects. They were also not needed.
+
+With one term bound, the bound and grouped positions form six pairs. A permutation makes
+exactly one pair a run: bound first, grouped second. So SPO, POS and OPS leave three
+pairs to a merge of sorted runs.
+- **`s ? ?` by o and `? ? o` by s** merge their runs across predicates. The fan-in is the
+  bound term's predicate degree, which is bounded by the dataset's predicate count, the
+  same bound `s ? o` already relies on.
+- **`? p ?` by s** is the hard pair for any choice of three permutations. A
+  predicate-first permutation puts subjects or objects in the middle, never predicates.
+  POS makes a predicate's objects a run and its subjects the hard case, and PSO would
+  swap them. So this pair has two routes, and both emit subjects in id order, so one
+  cursor serves either.
+  - It merges POS's object runs while they fit a fan-in budget of `max_bindings` runs,
+    shared by every such row of the request. That fan-in is one a bindings request may
+    already ask for.
+  - Otherwise it scans subjects in SPO, probes each for the predicate, and stops at the
+    candidate budget.
+
+A dedicated index would make that last pair a run instead. It would hold one entry per
+(subject, predicate) pair, which is what HDT-FoQ's predicate index was. On
+`medical-device-kg`, `hdtc validate` counts 15,697,791 pairs against 17,857,085
+triples, about 8% of the HDT at 20 bits a subject. It is not built here. Whether it is
+worth building is a measurement question for doc 07.
+
+**What landed, store side.** `kgf_store::distinct`, with no HTTP in it.
+- `DistinctPlan::new` takes one pattern per input row. Identical patterns collapse into
+  one walk weighted by their number, in a fixed order. It returns one walk per distinct
+  pattern:
+  - a run (level 1, a level-2 range, a level-3 range, or the `s ? o` probe);
+  - a merge of the level-3 runs under one level-2 range;
+  - a bound group;
+  - or, for rows past the fan-in, a share of one subject scan. The scan probes each
+    subject for every row's predicate at once, so a request never scans twice.
+- `groups()` is exact without enumeration for a single row walked as a run.
+- `values_after(after)` merges every stream by id in a heap, summing counts and the
+  rows reaching each value. A scan that spends its budget ends the page with
+  `Exhausted { through }`: every value at or below `through` has been yielded.
+
+**What landed, server side.**
+- `Operation::Distinct`, `PositionSpace::DistinctValue`, `AccessOperation::Distinct`, a
+  `RequestShape::Distinct`, and the route.
+- An unconditional release link and the manifest page's operation row.
+- A workbench form.
+- `Capability::Distinct`, derived for every bundle as `sample` and `labels` are, and
+  never a gate, for the reason unit 27 gives.
+
+Decisions:
+- **The cursor is a frontier.** It names an id such that every value at or below it
+  has been delivered. Usually that is the last value. After a scan stop, it is the last
+  subject examined, so a page that found nothing still advances. It always carries the
+  values delivered so far.
+- **Exact where knowable, otherwise a lower bound.** A run width, or for `? p ?` by s
+  the bundle's own `distinctSubjects` in the queryable view, gives the exact total
+  before the last page. Merges and bindings report a lower bound until then. The last
+  page always reports the values the walk delivered, which wins over a statistic.
+- **One request type for both spellings.** GET parses to a bindings pattern of unnamed
+  variables and a one-row table, so the answer walks every request the same way. The
+  two spellings do not share cursors.
+- **Admission.** A GET that may scan is heavy. Every body request is heavy already.
+- **Absent terms are reported as `/count` reports them.** Labels are opt-in, as on
+  `/fragment`.
+
+The sets `? ? ?` gives for each position are the dictionary's role sections. `/terms`
+already pages those, in lexicographic order and without counts, with exact totals from
+`count=true`. Here they come in id order, each with its triples.
+
+**Reviewed 2026-11-07** by an independent agent, which added a randomized differential
+of 25,000 row sets under every limit setting and found no wrong answer. Its findings
+were about cost and about the client, and are fixed here:
+- Many binding rows multiplied each page's setup. A thousand identical rows built a
+  thousand walks, and a thousand distinct `? p ?` rows could each merge up to
+  `max_bindings` runs: about 10⁶ searches a page. Identical rows now collapse, and the
+  fan-in budget is shared across rows. On `medical-device-kg`, 1,000 identical empty
+  rows over `? ? ?` by o now answer a 10,000-value page in 20.7 ms, the same as one
+  row, and 164 rows binding every predicate, grouped by subject, take 22.5 ms.
+- §3.5 understated two costs, and the spec now states them:
+  - The merges' setup sums over rows, and is paid on every page.
+  - A shared scan probes each subject in `min(t, d)` searches, for `t` scanned
+    predicates and the subject's `d` predicates.
+- The last page's total now comes from the walk, not from a statistic.
+- kgfq gained three refusals and two guards, described in its plan.
+
+*Not here, and the same as every other operation in this build:* the SPARQL Results
+JSON, CSV, Parquet and Arrow formats doc 03 lists, and enforcement of the time budget.
+`kgf manifest --check` on a bundle whose manifest predates this unit reports `distinct`
+missing from its declared capabilities, as it reported `labels` when that was added.
+Serving is unaffected, because the route is not gated.
+
+*Verified by* the following.
+- A store test of every pattern over every id of two fixtures and every grouped
+  position. It is checked against grouping the triples directly, under three limit
+  settings (always merge; always scan, one and three subjects a page), with resume after
+  and between every value.
+- Merges of every subject, every predicate and every row twice, against a hand-built
+  sum.
+- At the HTTP layer, an exhaustive differential of every GET answer against grouping
+  `/fragment`'s rows. It is run once with defaults and once with every scan forced to
+  one subject a page.
+- A bindings answer grouped by predicate and by object against the bindings fragment.
+- Grouping by the bound variable as the semijoin.
+- An empty budget-stopped page that still advances.
+- A byte budget of one byte.
+- The refusals that remain, which are all malformed requests.
+- Socket tests of GET, a literal QUERY line and POST, plus the exact first-page total
+  from a `kgf build` bundle's statistics.
+
+**Measured** on the local `medical-device-kg` bundle: 17,857,085 triples, 897,968
+subjects and 164 predicates. Release build, warm page cache, one client, times from the
+same machine. Per page is at `limit` 10,000.
+
+| Request | Route | Answer | Time |
+|---|---|---|---|
+| `group_by=p`, nothing bound | run | 164 values summing to 17,857,085 | 44 ms, cold open included |
+| `? rdf:type ?` by o | run | 36 values behind 927,096 triples | 0.6 ms |
+| `? md:sourceDataset ?` by o | run | 17 values behind 685,543 triples | 0.5 ms |
+| `? md:city ?` by o | run | 33,583 values, 4 pages | 12 ms a page |
+| `? rdf:type ?` by s | merge of 36 object runs | 897,968 subjects, 90 pages, exact total from page 1 | 937 ms in all, about 10 ms a page |
+| `? md:city ?` by s | subject scan (33,583 objects) | 574,671 subjects, 58 pages, exact total from page 1 | 1.1 s in all, about 19 ms a page |
+| `? md:feiNumber ?` by s | subject scan | 104,208 subjects, 11 pages | 404 ms in all |
+| `? ? md:DeNovoRecord` by s | merge per predicate | 484 subjects, 1 page | 1 ms |
+| 1,000 subjects as bindings, `?x ?p ?y` by p | runs, merged | 20 values, 10,323 triples, 3.7 kB | 6.8 ms |
+
+For comparison:
+- One 10,000-row `/fragment` page of `? md:city ?` is 2.1 MB in 10 ms, so reading
+  that predicate whole is 58 such pages.
+- The bindings `/fragment` for the same 1,000 subjects returns 3.7 MB in 58 ms and is
+  still incomplete.
+
+The `md:city` scan examined all 897,968 subjects in about a second, including writing
+574,671 values, so the candidate budget's default of 1,000,000 covers this whole
+bundle in one page. It never
+stopped a page in these runs: each filled its 10,000 values first. On a bundle with
+10⁸ subjects, a rare predicate's subjects would take about a hundred budget-limited
+pages. That is the case the deferred (subject, predicate) index would fix.
+
+### 39. The `vectors/` sidecar in `kgf-store` — the id map and the mapped index ✅
 
 **Implemented 2026-10-22, on `vectors-store`.** Doc 13 §13.1's third stage, read side:
 a bundle may carry one vector per embedded entity and an ANN index over them, and a
 `Store` that opens such a bundle answers entity → record, record → entities, record →
 stored vector, record → text digest, and nearest-`k` by vector, all in id space. No
-HTTP: the routes are unit 39's. The embedding stage that produces the vectors is
+HTTP: the routes are unit 40's. The embedding stage that produces the vectors is
 Python (`okn-indexing embed-texts`, in `../okn-embeddings`), and the build stage that
-assembles the sidecar from its output is unit 40's; this unit is the format, the
+assembles the sidecar from its output is unit 41's; this unit is the format, the
 reader, the one writer of the format, and the binding checks.
 
 **Who owns what, and why not hdtc.** Review of unit 35 proposed that hdtc own the
@@ -3323,7 +3480,7 @@ derives the capability from the files, and on both its paths now walks the id ma
 `Vectors::verify` and checks its recorded parent digest against the Parquet's checksum,
 beside the graph index's binding check. It also writes the capability's value: a
 description of the space, the coverage and the index for a reader without the bundle,
-read from the Parquet's footer there and never by a server (2026-10-23; see unit 40,
+read from the Parquet's footer there and never by a server (2026-10-23; see unit 41,
 where it was planned, for its fields).
 
 **The build's memory is linear in the records, and the library cannot bound it.** The
@@ -3369,9 +3526,9 @@ verbalizer's streams through a Parquet written as the embedding stage writes one
 commands, the never-replaced sidecar, and `kgf manifest` catching an id map whose
 parent digest or regions disagree.
 
-### 39. `/vector` and `/similar` — the vector sidecar over HTTP ✅
+### 40. `/vector` and `/similar` — the vector sidecar over HTTP ✅
 
-**Implemented 2026-10-22, on `vectors-store`.** Two routes over unit 38's store, gated on
+**Implemented 2026-10-22, on `vectors-store`.** Two routes over unit 39's store, gated on
 `vectors` as `search` is on its sidecar, each with a GET form for a browser and a JSON
 body by QUERY (canonical) or POST, each with a page, each a row in the cost table.
 
@@ -3405,7 +3562,7 @@ charged to the response's byte budget, which stops the answer with
 `budget_exhausted: response_bytes` and the first record always kept. Search contexts
 are reserved at `max_concurrent_work`, so admission is the bound the library's pool is
 sized to. Work class is ordinary: a probe is microseconds. No lock is added; the
-library's own context lease is recorded under unit 38.
+library's own context lease is recorded under unit 39.
 
 **`/describe` answers the third state.** One binary search in the id map adds
 `"embedded": true|false` (and `record` when true) to a describe answer on a bundle that
@@ -3509,9 +3666,9 @@ for a subject without a vector and for a term that is not a subject; `cap_exceed
 the 501 gate on a bundle without the sidecar; and a page for each route — plus the
 methods-statement test, which now covers the gate's 501 and a 405 on the new resources.
 
-### 40. The vectors build stage — from a registry entry to a version with vectors
+### 41. The vectors build stage — from a registry entry to a version with vectors
 
-Not started; the follow-up to units 38–39, kept apart on purpose. Those units made the
+Not started; the follow-up to units 39–40, kept apart on purpose. Those units made the
 sidecar and its routes work from separate commands (`kgf verbalize`, `okn-indexing
 embed-texts`, `kgf vectors`, `kgf manifest`); this one is how a build obtains its
 inputs and runs the chain, which is almost orthogonal to what the sidecar is.
@@ -4833,7 +4990,7 @@ following the code.
     as its label is left to doc 13's embedding view.
 106. **Who builds the vectors sidecar.** Doc 04 §4.3 has components (external tools)
     and sidecars (`kgf build` itself); doc 13 §13.1 leaves the index build to
-    measurement. Unit 38 settles it for this implementation: the model runs in Python
+    measurement. Unit 39 settles it for this implementation: the model runs in Python
     and produces the data (`embeddings.parquet`, keyed by text digest, never seeing an
     IRI or an id); `kgf build` builds the index and the id map from it, with the crate
     that serves them, so `--locked` pins writer and reader; hdtc owns neither, since
@@ -4843,7 +5000,7 @@ following the code.
     which makes it data by doc 04 §4.3's own test, yet it lives under `vectors/` beside
     the indexes derived from it. The line is the model's output as data, the ANN
     structure as index — and the reason an index is never the canonical store of
-    vectors (unit 38). Doc 13 §13.1 item 3 should draw it.
+    vectors (unit 39). Doc 13 §13.1 item 3 should draw it.
 108. **`convention_id` names a space; probes show it.** Doc 13 §13.3's recipe hash is
     what two parties *say* they share. A library upgrade under the same model name
     moves every vector, and mixing two such spaces fails silently. The embedding stage
@@ -4853,26 +5010,26 @@ following the code.
     claiming the space — is gated on them, not on the hash.
 110. **`/vector`, `/similar`, `not_embedded`, `max_vector_iris` and `max_similar_k` are
     additions to doc 03.** Doc 13 §13.2 sketches the two routes; doc 03's URL space,
-    error table and cap list do not have them. Unit 39 fixes the wire shapes: `/vector`
+    error table and cap list do not have them. Unit 40 fixes the wire shapes: `/vector`
     as an ordered array with `absent` reasons, `/similar` with `record`, `distance`,
     `similarity` and `entities`, an entity's own record excluded, and `not_embedded` at
     422 as the one code for a term the bundle cannot rank. Doc 03 should carry them as
     question 97 asked for `/verbalize`, and doc 13 §13.2's `filter` stays open.
 111. **Doc 13's sizing paragraph should say what bounds the index build.** §13.1's
     "sizing honesty" sizes the sidecar on disk; the build's memory is the other half.
-    An in-memory HNSW build (usearch, unit 38) needs RAM for the finished index, linear
+    An in-memory HNSW build (usearch, unit 39) needs RAM for the finished index, linear
     in the records, and the library has no bounded alternative — ~90 GB at the 10⁸
     entities §13.1 contemplates. The design's answer is already in place: with the
     vectors canonical and the index derived, a disk-backed library (§13.1's
     Vamana/DiskANN candidates) is a rebuild, not a re-embed. Doc 13 should say so, and
     say the manifest names the index's library and version so a reader knows which.
 109. **`/vector` publishes the index's precision.** The stored vector is f16 and is a
-    fixed point of storage (unit 38); `/vector` should return exactly what the index
+    fixed point of storage (unit 39); `/vector` should return exactly what the index
     compares, with full precision available through the Parquet export. Doc 13 §13.2
     should say which precision the route carries.
 112. **Where a KG's verbalization config lives is a deployment matter doc 13 should
     name.** Doc 13 §13.3 treats the recipe as part of the build; it does not say where a
-    federation keeps forty of them. Unit 40 puts each in the OKN registry as a file the
+    federation keeps forty of them. Unit 41 puts each in the OKN registry as a file the
     KG's entry names, authored against the served bundle and reviewed like any registry
     change, with the bundle's published `vectors/verbalize.json` as the record of what a
     version used. Doc 13 (or doc 04's build inputs) should say that the config is an

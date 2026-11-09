@@ -129,6 +129,10 @@ pub fn router(service: Arc<Service>) -> Router {
         )
         .route("/{dataset}/v/{version}/describe", read(describe))
         .route("/{dataset}/v/{version}/sample", read(sample))
+        .route(
+            "/{dataset}/v/{version}/distinct",
+            read_or_body(distinct, body_distinct),
+        )
         .route("/{dataset}/v/{version}/search", read(search))
         .route("/{dataset}/v/{version}/terms", read(terms))
         .route("/{dataset}/v/{version}/graphs", read(graphs))
@@ -455,6 +459,7 @@ const VERSION_RESOURCES: &[&str] = &[
     "count",
     "describe",
     "sample",
+    "distinct",
     "search",
     "terms",
     "labels",
@@ -763,6 +768,66 @@ async fn count(
             Ok(request)
         },
         answer::count,
+    )
+    .await
+}
+
+async fn distinct(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate(
+        service,
+        BundleId { dataset, version },
+        AccessOperation::Distinct,
+        wants,
+        // Ungated: the walk reads only `data.hdt` and its permutation
+        // sidecar, which every bundle carries, and its labels resolve through
+        // the same core permutations. See `capability_gate`.
+        |params, limits, release| {
+            request::Distinct::parse(
+                params,
+                limits,
+                release.prefixes(),
+                release.predicate_roles(),
+                &release.binding(),
+            )
+        },
+        answer::distinct,
+    )
+    .await
+}
+
+async fn body_distinct(
+    service: Arc<Service>,
+    id: BundleId,
+    wants: Wants,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+    method: BodyMethod,
+) -> Result<Response, Problem> {
+    require_json(&headers)?;
+    operate_body(
+        service,
+        id,
+        AccessOperation::Distinct,
+        BodyOperation {
+            wants,
+            body,
+            method,
+        },
+        |params, body, limits, release| {
+            request::Distinct::parse_body(
+                params,
+                body,
+                limits,
+                release.prefixes(),
+                release.predicate_roles(),
+                &release.binding(),
+            )
+        },
+        answer::distinct,
     )
     .await
 }

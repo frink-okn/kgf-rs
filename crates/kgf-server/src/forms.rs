@@ -72,6 +72,7 @@ pub(crate) fn operation_form(
         "count" => Some(count(mount, dataset, version, params, offers, false)),
         "describe" => Some(describe(mount, dataset, version, params, false)),
         "sample" => Some(sample(mount, dataset, version, params, false)),
+        "distinct" => Some(distinct(mount, dataset, version, params, false)),
         "search" => Some(search_form(mount, dataset, version, params, false)),
         "terms" => Some(terms(mount, dataset, version, params, false)),
         "verbalize" => Some(verbalize(
@@ -304,6 +305,44 @@ fn sample(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bo
             number_control("sample", "seed", "Seed", params.get("seed"), 0, "0"),
         ],
         "Draw sample",
+        open,
+    )
+}
+
+fn distinct(mount: &Mount, dataset: &str, version: &str, params: &Params, open: bool) -> Markup {
+    form(
+        "Distinct",
+        "List the distinct values one position of a pattern takes, with how many triples hold \
+         each.",
+        mount.operation(dataset, version, "distinct"),
+        vec![
+            term_control("distinct", "s", "Subject", params.get("s"), "ex:subject"),
+            term_control("distinct", "p", "Predicate", params.get("p"), "rdf:type"),
+            term_control(
+                "distinct",
+                "o",
+                "Object",
+                params.get("o"),
+                "ex:object or \"text\"@en",
+            ),
+            text_control(
+                "distinct",
+                "group_by",
+                "Group by",
+                params.get("group_by"),
+                "s, p, or o",
+                true,
+            ),
+            number_control(
+                "distinct",
+                "limit",
+                "Groups",
+                params.get("limit"),
+                1,
+                "server default",
+            ),
+        ],
+        "List values",
         open,
     )
 }

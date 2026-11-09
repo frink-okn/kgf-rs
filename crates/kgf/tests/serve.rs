@@ -2534,6 +2534,101 @@ fn an_extension_method_reaches_the_router_with_its_name_intact() {
 }
 
 #[test]
+fn distinct_answers_get_and_query_over_the_wire() {
+    let deployment = Deployment::new();
+    deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+
+    // `? ex:label ?` grouped by object: alice's two labels, one triple each.
+    let get = server
+        .get("/tox/v/v1/distinct?p=%3Chttp%3A%2F%2Fexample.org%2Flabel%3E&group_by=o&limit=1");
+    get.assert_status(200);
+    get.assert_header("accept-query", "application/json");
+    let page = get.json();
+    assert_eq!(
+        page["distinct"],
+        serde_json::json!({"value": 2, "exact": true})
+    );
+    assert_eq!(
+        page["cardinality"],
+        serde_json::json!({"value": 2, "exact": true})
+    );
+    assert_eq!(page["truncation_reason"], "page_limit");
+    let token = page["next"].as_str().unwrap();
+    let resumed = server.get(&format!(
+        "/tox/v/v1/distinct?p=%3Chttp%3A%2F%2Fexample.org%2Flabel%3E&group_by=o&limit=1&cursor={token}"
+    ));
+    resumed.assert_status(200);
+    assert_eq!(resumed.json()["complete"], true);
+    assert_ne!(resumed.json()["rows"][0]["o"], page["rows"][0]["o"]);
+
+    // The bindings form, sent as a literal QUERY request line.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "pattern": {"s": "?who", "p": "?p", "o": "?o"},
+        "group_by": "p",
+        "bindings": {"vars": ["?who"], "rows": [
+            ["<http://example.org/alice>"], ["<http://example.org/bob>"]
+        ]},
+    }))
+    .unwrap();
+    let query = server.request_with_body(
+        "QUERY",
+        "/tox/v/v1/distinct",
+        &[("Content-Type", "application/json")],
+        &body,
+    );
+    query.assert_status(200);
+    query.assert_cache_control(&["public", "max-age=31536000", "immutable"]);
+    let answer = query.json();
+    let knows = answer["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["p"]["value"] == "http://example.org/knows")
+        .expect("both people know someone");
+    assert_eq!(knows["count"], 2);
+    assert_eq!(knows["bindings"], 2);
+
+    let post = server.request_with_body(
+        "POST",
+        "/tox/v/v1/distinct",
+        &[("Content-Type", "application/json")],
+        &body,
+    );
+    post.assert_status(200);
+    assert_eq!(post.json()["rows"], answer["rows"]);
+
+    // A subject's distinct objects: a merge of its predicates' runs, exact
+    // once the one page holds them all.
+    let merged =
+        server.get("/tox/v/v1/distinct?s=%3Chttp%3A%2F%2Fexample.org%2Falice%3E&group_by=o");
+    merged.assert_status(200);
+    assert_eq!(
+        merged.json()["distinct"],
+        serde_json::json!({"value": 5, "exact": true})
+    );
+}
+
+#[test]
+fn a_predicates_distinct_subjects_are_counted_from_the_bundles_statistics() {
+    // On a bundle `kgf build` assembled, a predicate's subjects are counted
+    // exactly from the first page, before the walk has learned them: the
+    // statistic counts the same merged graph.
+    let deployment = Deployment::new();
+    deployment.publish_built_quads("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
+    let server = deployment.serve();
+    let first =
+        server.get("/tox/v/v1/distinct?p=%3Chttp%3A%2F%2Fexample.org%2Fname%3E&group_by=s&limit=1");
+    first.assert_status(200);
+    let page = first.json();
+    assert_eq!(page["truncation_reason"], "page_limit");
+    assert_eq!(
+        page["distinct"],
+        serde_json::json!({"value": 2, "exact": true})
+    );
+}
+
+#[test]
 fn bindings_query_and_post_answer_over_the_wire() {
     let deployment = Deployment::new();
     deployment.publish("tox", "v1", TINY_NT, "2026-06-01T14:03:22Z");
@@ -4661,7 +4756,7 @@ fn an_operation_needing_no_sidecar_is_not_gated_on_its_declaration() {
         !capabilities.contains_key("terms"),
         "a bundle cannot honestly declare a capability half of which it cannot answer"
     );
-    for capability in ["sample", "labels"] {
+    for capability in ["sample", "distinct", "labels"] {
         assert!(
             capabilities.remove(capability).is_some(),
             "a core bundle declares {capability}"
@@ -4688,7 +4783,7 @@ fn an_operation_needing_no_sidecar_is_not_gated_on_its_declaration() {
     // And they stay advertised, because what this deployment routes is the
     // descriptor's statement rather than the bundle's.
     let links = &server.get("/").json()["datasets"][0]["links"];
-    for operation in ["sample", "terms", "labels"] {
+    for operation in ["sample", "distinct", "terms", "labels"] {
         assert_eq!(
             links[operation],
             serde_json::json!(format!("/tox/v/v1/{operation}")),
@@ -4717,6 +4812,10 @@ fn an_operations_parameters_are_read_before_the_bundle_is_opened() {
             "capability_not_available",
         ),
         ("/tox/v/v1/describe", "malformed_request"),
+        (
+            "/tox/v/v1/distinct?p=%3Chttp%3A%2F%2Fexample.org%2Fknows%3E",
+            "malformed_request",
+        ),
     ] {
         let refused = server.get(target);
         assert_eq!(refused.json()["code"], code, "{target}");
