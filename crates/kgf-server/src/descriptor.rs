@@ -113,6 +113,8 @@ pub struct ReleaseLinks {
     #[serde(skip_serializing_if = "Option::is_none")]
     sample: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    distinct: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     search: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terms: Option<String>,
@@ -488,12 +490,13 @@ fn release_links(
         summary: description.then(|| operation("summary")),
         schema: description.then(|| operation("schema")),
         void: description.then(|| operation("void")),
-        // `sample`, `terms`, and `labels` are unconditional: each composes the
+        // `sample`, `distinct`, `terms`, and `labels` are unconditional: each composes the
         // artifacts every bundle must carry, so a link to one is never a link a
         // release cannot honour. This is where a client learns what *this
         // deployment* routes, which is a different question from what the
         // bundle's manifest declares it carries — see `routes::capability_gate`.
         sample: Some(operation("sample")),
+        distinct: Some(operation("distinct")),
         search: release
             .declares(Capability::Search)
             .then(|| operation("search")),
@@ -833,6 +836,13 @@ fn operations(
         "sample",
         "s, p, o, n, seed, labels, lang, label_source",
         true,
+    ));
+    // Not browsable bare: `group_by` is required, so a link with no
+    // arguments would only earn the refusal that says so.
+    operations.push((
+        "distinct",
+        "s, p, o, group_by, limit, cursor, labels, lang, label_source",
+        false,
     ));
     if search {
         operations.push((

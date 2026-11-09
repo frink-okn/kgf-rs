@@ -82,6 +82,15 @@ exact size of the scan it is paging, a count reports all four positions at once 
 deduplicates rather than summing them — and a cursor names the last term delivered rather
 than a per-section offset.
 
+`/distinct` lists the distinct values one position of one pattern takes, each with its
+triple count, by walking the index rather than reading the triples (unit 38). GET takes
+`s`/`p`/`o` and `group_by`; QUERY/POST takes a pattern with named variables and an
+optional binding table, whose rows' walks are merged by id. Every shape is answered:
+seven are runs of SPO, POS or OPS; `s ? ?` by o and `? ? o` by s merge a term's
+per-predicate runs; `? p ?` by s merges POS's object runs up to `max_bindings` of them
+and otherwise scans subjects within the candidate budget. Values come in ascending id,
+and the cursor names a frontier every value at or below which has been delivered.
+
 A bundle carrying `data.hdt.text` (built by `hdtc text`) declares `search` and answers
 `o.text` on `/fragment` and `/count`: a ranked constraint on the object position,
 resolved through the permutations. `/search` is entity-level and deduplicated, and
