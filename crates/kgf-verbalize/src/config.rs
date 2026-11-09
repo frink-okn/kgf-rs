@@ -31,13 +31,15 @@
 
 use std::collections::BTreeMap;
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 /// How many values one predicate contributes when a config does not say.
 pub const DEFAULT_PREDICATE_LIMIT: u32 = 3;
 
 /// The verbalization section as written: in `build.yaml`, or in the body of a
-/// preview request.
+/// preview request. Serialized, it leaves out every field that holds its
+/// default, so a published config reads as what its author wrote.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -49,18 +51,23 @@ pub struct Config {
 
     /// Predicate lists merged into every target: a target's own list is
     /// appended, without duplicates.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Lists::is_empty")]
     pub defaults: Lists,
 
     /// Label templates keyed by class, applied to a node of that class in any
     /// position. The key is a local name for the profile.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, Profile>,
 
     /// The classes whose members become roots. The key is a local name for
     /// the target, used in output and diagnostics.
-    #[serde(default)]
-    pub targets: BTreeMap<String, Target>,
+    ///
+    /// Kept in the order written, because the order is meaning: a node that
+    /// is a member of two targets' classes is a root of the first of them
+    /// only, so it has one text and one vector, and the target that renders
+    /// it on a page is the one its vector came from.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub targets: IndexMap<String, Target>,
 }
 
 /// The three predicate lists, as written at either level.
@@ -73,17 +80,26 @@ pub struct Lists {
     /// description, identifier, citation: text that names a node *somehow*
     /// when nothing better exists, and that a label endpoint should never
     /// return. Full IRIs.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub label_predicates: Vec<String>,
 
     /// Predicates left out of the walk. Full IRIs.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore_predicates: Vec<String>,
 
     /// When non-empty, the only predicates walked; `ignore_predicates` still
     /// applies within it. Full IRIs.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include_predicates: Vec<String>,
+}
+
+impl Lists {
+    /// No list has an entry: the defaults a document that writes none has.
+    pub fn is_empty(&self) -> bool {
+        self.label_predicates.is_empty()
+            && self.ignore_predicates.is_empty()
+            && self.include_predicates.is_empty()
+    }
 }
 
 /// A label template for one class.
@@ -96,7 +112,7 @@ pub struct Profile {
     /// The template, with `{field}` placeholders naming entries of `fields`.
     pub template: String,
     /// Placeholder name → predicate IRI whose value fills it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fields: BTreeMap<String, String>,
 }
 
@@ -108,13 +124,13 @@ pub struct Target {
     #[serde(rename = "type")]
     pub class: String,
     /// See [`Lists::label_predicates`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub label_predicates: Vec<String>,
     /// See [`Lists::ignore_predicates`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore_predicates: Vec<String>,
     /// See [`Lists::include_predicates`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include_predicates: Vec<String>,
     /// Overrides the document's `predicate_limit` for this target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,7 +140,7 @@ pub struct Target {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label_template: Option<String>,
     /// Placeholder name → predicate IRI, for `label_template`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub label_fields: BTreeMap<String, String>,
 }
 
@@ -166,6 +182,16 @@ pub enum ConfigError {
         /// The template as written.
         template: String,
     },
+    /// Two targets name one class: the second could never own a root.
+    #[error("targets {first:?} and {second:?} both name class {class}")]
+    DuplicateTargetClass {
+        /// The first target's name.
+        first: String,
+        /// The second target's name.
+        second: String,
+        /// The class both name.
+        class: String,
+    },
     /// Two profiles claim one class; which would win is not defined.
     #[error("profiles {first:?} and {second:?} both name class {class}")]
     DuplicateProfileClass {
@@ -188,7 +214,8 @@ pub struct Resolved {
     pub defaults: Lists,
     /// Profiles in name order. Classes are distinct.
     pub profiles: Vec<ResolvedProfile>,
-    /// Targets in name order.
+    /// Targets in the order written, which is the order they claim nodes in.
+    /// Classes are distinct.
     pub targets: Vec<ResolvedTarget>,
 }
 
@@ -324,9 +351,17 @@ impl Config {
         }
 
         let mut targets = Vec::with_capacity(self.targets.len());
+        let mut classes: BTreeMap<&str, &str> = BTreeMap::new();
         for (name, target) in &self.targets {
             let at = format!("targets.{name}");
             check_iri(&format!("{at}.type"), &target.class)?;
+            if let Some(first) = classes.insert(&target.class, name) {
+                return Err(ConfigError::DuplicateTargetClass {
+                    first: first.to_owned(),
+                    second: name.clone(),
+                    class: target.class.clone(),
+                });
+            }
             let own = Lists {
                 label_predicates: target.label_predicates.clone(),
                 ignore_predicates: target.ignore_predicates.clone(),
@@ -480,6 +515,37 @@ mod tests {
         assert_eq!(u.lists, Lists::default());
         assert_eq!(t.predicate_limit, DEFAULT_PREDICATE_LIMIT);
         assert!(t.label_template.is_none());
+    }
+
+    #[test]
+    fn targets_keep_the_order_they_were_written_in() {
+        let written = r#"{"targets":{"zeta":{"type":"http://x/Z"},"alpha":{"type":"http://x/A"}}}"#;
+        let config = parse(written);
+        let names: Vec<String> = config
+            .resolve()
+            .unwrap()
+            .targets
+            .into_iter()
+            .map(|target| target.name)
+            .collect();
+        assert_eq!(names, ["zeta", "alpha"]);
+        // And serialized that way, so a published config claims in the same
+        // order as the one it was assembled under.
+        assert_eq!(serde_json::to_string(&config).unwrap(), written);
+    }
+
+    #[test]
+    fn two_targets_on_one_class_are_refused() {
+        let config =
+            parse(r#"{"targets": {"a": {"type": "http://x/A"}, "b": {"type": "http://x/A"}}}"#);
+        assert_eq!(
+            config.resolve().unwrap_err(),
+            ConfigError::DuplicateTargetClass {
+                first: "a".to_owned(),
+                second: "b".to_owned(),
+                class: "http://x/A".to_owned(),
+            }
+        );
     }
 
     #[test]

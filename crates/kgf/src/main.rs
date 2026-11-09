@@ -37,6 +37,9 @@ enum Command {
 
     /// Write the texts a bundle's roots would be embedded from.
     Verbalize(kgf::verbalize::Args),
+
+    /// Assemble a bundle's vectors/ sidecar from the embedding stage's output.
+    Vectors(kgf::vectors::Args),
 }
 
 fn main() -> Result<()> {
@@ -51,6 +54,7 @@ fn main() -> Result<()> {
         // would be noise in a build script.
         Command::Manifest(args) => kgf::manifest::run(args),
         Command::Verbalize(args) => kgf::verbalize::run(args),
+        Command::Vectors(args) => kgf::vectors::run(args),
     }
 }
 
