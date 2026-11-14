@@ -59,7 +59,7 @@ use crate::access::{AccessState, OpenTiming, millis};
 use crate::admission::AdmissionController;
 use crate::cursor::BundleBinding;
 use crate::envelope::{ErrorCode, Problem, reflected};
-use crate::export::{ArtifactIdentity, ExportArtifact};
+use crate::export::{ArtifactIdentity, Export, ExportArtifact, ExportFiles, Exports};
 use crate::representation::ContentDigest;
 use crate::term::PrefixMap;
 use crate::url::Mount;
@@ -322,17 +322,20 @@ fn descriptor_digest(config: &Config, datasets: &Datasets) -> ContentDigest {
         .expect("a sha256 hex digest is a content digest")
 }
 
-/// A bundle's manifest as it was read: the bytes, and the parse of them.
+/// A bundle's manifest as it was read: the bytes, and the parse of them — and
+/// the downloadable files it lists, as they stood beside it.
 ///
-/// Both, because they answer different questions. The bytes are what
+/// The bytes and the parse answer different questions. The bytes are what
 /// `/manifest` serves, so that a document written by a newer builder keeps the
 /// fields this build does not model. The parse is what the page,
-/// the release ordering and the `ETag` are built from.
+/// the release ordering and the `ETag` are built from. The files are what a
+/// download the manifest lists is checked against before any request for it.
 #[derive(Debug, Clone)]
 pub struct PublishedManifest {
     bytes: Bytes,
     parsed: Arc<Manifest>,
     digest: ContentDigest,
+    export_files: ExportFiles,
 }
 
 impl PublishedManifest {
@@ -358,14 +361,17 @@ impl PublishedManifest {
             )
         })?;
         let digest = bytes_digest(&bytes);
+        let export_files = ExportFiles::scan(bundle_dir, &parsed);
         Ok(Self {
             bytes: bytes.into(),
             parsed: Arc::new(parsed),
             digest,
+            export_files,
         })
     }
 
-    /// Pair a manifest with its canonical serialization.
+    /// Pair a manifest with its canonical serialization, beside a bundle that
+    /// agrees with it.
     ///
     /// `#[cfg(test)]`: every real path reaches a `PublishedManifest` through
     /// [`read`](Self::read), and this one substitutes a re-serialization for
@@ -376,10 +382,12 @@ impl PublishedManifest {
     pub(crate) fn of(parsed: Manifest) -> Result<Self, String> {
         let bytes = parsed.to_json_bytes().map_err(|error| error.to_string())?;
         let digest = bytes_digest(&bytes);
+        let export_files = ExportFiles::as_listed(&parsed);
         Ok(Self {
             bytes: bytes.into(),
             parsed: Arc::new(parsed),
             digest,
+            export_files,
         })
     }
 
@@ -464,10 +472,20 @@ impl Datasets {
                 })?),
             };
             // Every download's validator and digest come from here, so a
-            // manifest that cannot supply them is refused with the rest of its
-            // defects rather than discovered by the first client to ask.
-            let hdt =
-                ArtifactIdentity::from_manifest(&manifest, ExportArtifact::Hdt).map_err(&refuse)?;
+            // manifest that cannot supply them for `data.hdt` is refused with
+            // the rest of its defects rather than discovered by the first
+            // client to ask. A download nothing else depends on is withheld
+            // instead, and said so once, here.
+            let exports = Exports::new(&manifest, &published.export_files).map_err(&refuse)?;
+            for (artifact, defect) in exports.withheld() {
+                tracing::error!(
+                    dataset = %id.dataset,
+                    version = %id.version,
+                    artifact = artifact.name(),
+                    defect = %defect,
+                    "a download this release's manifest lists is withheld",
+                );
+            }
 
             datasets.entry(id.dataset).or_default().insert(
                 id.version,
@@ -481,7 +499,7 @@ impl Datasets {
                     // allocate a hundred strings to read something fixed.
                     prefixes: PrefixMap::from_manifest(&manifest),
                     predicate_roles,
-                    hdt,
+                    exports,
                     manifest: published,
                 },
             );
@@ -760,7 +778,9 @@ pub struct Release {
     created: Option<Instant>,
     prefixes: PrefixMap,
     predicate_roles: PredicateRoles,
-    hdt: ArtifactIdentity,
+    /// What this release serves whole, and what its manifest lists that it
+    /// cannot.
+    exports: Exports,
     manifest: PublishedManifest,
 }
 
@@ -817,11 +837,15 @@ impl Release {
         self.manifest.parsed.declares(capability)
     }
 
-    /// The length and digest of an artifact this release serves whole.
-    pub fn export(&self, artifact: ExportArtifact) -> &ArtifactIdentity {
-        match artifact {
-            ExportArtifact::Hdt => &self.hdt,
-        }
+    /// Whether this release serves `artifact` whole — with the length and
+    /// digest its downloads carry — withholds it, or does not list it.
+    pub fn export(&self, artifact: ExportArtifact) -> Export<'_> {
+        self.exports.get(artifact)
+    }
+
+    /// Everything this release serves whole, `data.hdt` first when it is.
+    pub fn exports(&self) -> &Arc<[(ExportArtifact, ArtifactIdentity)]> {
+        self.exports.served()
     }
 
     /// When this release was published, as `Last-Modified` states it.

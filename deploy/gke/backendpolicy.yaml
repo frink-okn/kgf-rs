@@ -5,11 +5,14 @@
 #
 # An hour: a multi-gigabyte HDT on an ordinary connection finishes inside it,
 # and one that does not is resumed by byte range from where it stopped, since an
-# identity download carries a strong ETag and Accept-Ranges. The bound also caps
-# how long a client that stops reading can hold one of its download slots. Every
-# other response the server sends is bounded by its own budgets and finishes in
-# milliseconds, so raising the ceiling costs them nothing. Google documents an
-# effective maximum of 86,400 s for this load balancer.
+# identity download carries a strong ETag and Accept-Ranges. The same bound
+# applies to each filter, sketch and key set under /export, one response apiece;
+# the README's "Downloads" section works out what it means for the largest of
+# them. The bound also caps how long a client that stops reading can hold one of
+# its download slots. Every other response the server sends is bounded by its
+# own budgets and finishes in milliseconds, so raising the ceiling costs them
+# nothing. Google documents an effective maximum of 86,400 s for this load
+# balancer.
 apiVersion: networking.gke.io/v1
 kind: GCPBackendPolicy
 metadata:

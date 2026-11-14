@@ -35,7 +35,8 @@
 //! and the read operations `/fragment`, `/tpf`, `/count`, `/describe`, `/sample`
 //! and `/schema`, the `/void` and `/summary` description resources, plus bindings
 //! QUERY/POST for fragment and count in [`request`] and [`answer`], and
-//! whole-dataset downloads in [`export`]. The service emits typed, content-free
+//! whole-artifact downloads in [`export`] — the dataset as HDT, and the filters,
+//! sketches and key sets its manifest lists. The service emits typed, content-free
 //! access records through [`access`] when configured.
 
 #![deny(unsafe_code)]

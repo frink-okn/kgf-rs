@@ -109,7 +109,8 @@ impl PublishedBundle {
     /// # Safety
     ///
     /// From construction until this capability and every derived
-    /// [`Store`](crate::store::Store) have been dropped, `dir` must keep resolving
+    /// [`Store`](crate::store::Store) have been dropped — clones included, and a
+    /// [`PublishedFile`] holds one — `dir` must keep resolving
     /// to the same directory, its artifact entries and symlinks at every depth
     /// must not be replaced, and the target files must not be modified or
     /// truncated.
@@ -151,8 +152,9 @@ impl PublishedRoot {
     ///
     /// # Safety
     ///
-    /// From construction until this capability and every derived store have
-    /// been dropped, every discovered bundle path must keep resolving to the
+    /// From construction until this capability and every bundle capability,
+    /// store and [`PublishedFile`] derived from it have been dropped, every
+    /// discovered bundle path must keep resolving to the
     /// same directory, its artifact entries and symlinks at every depth must not
     /// be replaced, and the target files must not be modified or truncated.
     /// Adding unrelated entries beneath `root` is allowed.
@@ -305,6 +307,38 @@ pub(crate) fn open_published(bundle: &PublishedBundle, path: &Path) -> Result<Ma
     // SAFETY: constructing `bundle` established that every artifact reachable
     // beneath this directory remains immutable for the mapping's lifetime.
     unsafe { Mapping::open(path) }
+}
+
+/// One artifact of a published bundle, mapped whole and handed out on its own.
+///
+/// Every other mapping in this crate is owned by a [`Store`](crate::store::Store),
+/// which holds its bundle's capability, so the immutability promise made when
+/// the [`PublishedBundle`] was constructed covers it for exactly as long as it
+/// lives. A mapping handed to a caller can outlive the store it came from, so
+/// it carries a clone of the capability instead: while a `PublishedFile`
+/// exists, so does the promise it was mapped under. Its bytes cannot be
+/// projected through a spec; it is for a caller that reads an artifact as
+/// published, start to end.
+#[derive(Debug)]
+pub struct PublishedFile {
+    mapping: Mapping,
+    /// Held, never read: this is the promise the mapping relies on.
+    _bundle: PublishedBundle,
+}
+
+impl PublishedFile {
+    /// The artifact's bytes. Reading them faults pages.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.mapping.as_bytes()
+    }
+}
+
+/// Map one artifact of `bundle` as a [`PublishedFile`].
+pub(crate) fn open_published_file(bundle: &PublishedBundle, path: &Path) -> Result<PublishedFile> {
+    Ok(PublishedFile {
+        mapping: open_published(bundle, path)?,
+        _bundle: bundle.clone(),
+    })
 }
 
 #[cfg(any(test, feature = "testing"))]

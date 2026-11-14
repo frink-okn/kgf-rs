@@ -1,4 +1,15 @@
-//! Whole-artifact downloads: `/{dataset}/v/{version}/export/{artifact}`.
+//! Whole-artifact downloads: `/{dataset}/v/{version}/export/{artifact}`, where
+//! `{artifact}` is the artifact's name in the bundle — `data.hdt`,
+//! `filters/subjects.minhash`, `keysets/shared.keys`.
+//!
+//! Two kinds of artifact are served, for two kinds of reader. `data.hdt` is the
+//! dataset itself, for someone who would rather hold it than query it. The
+//! membership filters, overlap sketches and key sets under `filters/` and
+//! `keysets/` are what a reader *without* the bundle works from — a federation
+//! index deciding which datasets a question is worth putting to, and what two
+//! of them share. Nothing this server answers reads those, so serving them
+//! whole is the only way they reach the reader they were built for; which of
+//! them a release has is whatever its manifest lists and its bundle holds.
 //!
 //! Static-file semantics over a mapped, publication-verified artifact, built to
 //! the standard of a well-configured file server because the transfers are
@@ -22,7 +33,13 @@
 //!   bytes, because a range of a compressed stream is only meaningful if the
 //!   compressor reproduces that stream exactly, and nothing promises that. A
 //!   client that decodes as it stores holds identity bytes, so the length of
-//!   its partial file is a valid resume offset.
+//!   its partial file is a valid resume offset. The federation artifacts do
+//!   not compress, so they are always identity.
+//!
+//! Nothing is ever held whole: every length, validator and digest comes from
+//! the manifest, read and checked against the bundle's files at startup, and
+//! the body copies out of the mapping one chunk at a time. That matters more for the federation artifacts than for
+//! most HDTs — a large dataset's filter or key set runs to gigabytes.
 //!
 //! A download has one representation per coding and no page: a browser that
 //! follows a link to `data.hdt` must get the file. That makes these routes the
@@ -37,7 +54,10 @@ mod body;
 mod coding;
 mod range;
 
+use std::collections::BTreeMap;
+use std::io;
 use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -53,9 +73,9 @@ use headers::{
     ETag, HeaderMapExt as _, IfMatch, IfModifiedSince, IfNoneMatch, IfRange, IfUnmodifiedSince,
     LastModified,
 };
-use kgf_store::Store;
 use kgf_store::manifest::Manifest;
 use kgf_store::store::artifact;
+use kgf_store::{KeyArtifact, PublishedFile, Store};
 
 use crate::access::{Ledger, RequestShape};
 use crate::admission::DownloadSlot;
@@ -71,28 +91,50 @@ use range::{ByteRangeSet, RangeSelection};
 const REPR_DIGEST: HeaderName = HeaderName::from_static("repr-digest");
 
 /// An artifact this server serves whole.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// A closed vocabulary, not whatever a manifest happens to list. Every name
+/// below is one the bundle layout defines, so a request path is matched
+/// against names this build knows and never becomes a filesystem path; the
+/// access record can describe a download by an artifact name that is not the
+/// client's text; and adding a kind of download is a decision made here
+/// rather than a side effect of what a publisher wrote. Which of these a
+/// given release serves is a separate question, answered by its manifest and
+/// checked against its bundle: see [`Exports`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExportArtifact {
-    /// `data.hdt`: the dataset's triples and dictionary, standard HDT.
+    /// `data.hdt`: the dataset's triples and dictionary, standard HDT. Every
+    /// bundle has one.
     Hdt,
+    /// A membership filter or overlap sketch under `filters/`, or a key set
+    /// under `keysets/`. A bundle carries whichever of them it was built with.
+    Keys(KeyArtifact),
 }
 
 impl ExportArtifact {
-    /// Every exported artifact.
-    pub const ALL: &'static [Self] = &[Self::Hdt];
-
-    /// The artifact a path segment names, if it is one this server exports.
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|artifact| artifact.name() == name)
+    /// Every artifact this server can export, `data.hdt` first and the rest in
+    /// name order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        std::iter::once(Self::Hdt).chain(KeyArtifact::ALL.map(Self::Keys))
     }
 
-    /// The artifact's name in the bundle, which is also its path segment.
+    /// The artifact a request path names below `export/`, if it is one this
+    /// server exports.
+    ///
+    /// An exact match against the vocabulary, on the path as the client spelled
+    /// it: nothing is decoded or normalised, so `filters%2Fsubjects.filter`,
+    /// `filters//subjects.filter` and `filters/../data.hdt` name nothing. Every
+    /// name is spelled in characters a path never needs to escape, so its own
+    /// spelling is its one URL.
+    pub fn from_path(path: &str) -> Option<Self> {
+        Self::all().find(|artifact| artifact.name() == path)
+    }
+
+    /// The artifact's name in the bundle, which is also its path below
+    /// `export/` and its key in the manifest's `artifacts`.
     pub fn name(self) -> &'static str {
         match self {
             Self::Hdt => artifact::HDT,
+            Self::Keys(key) => key.name(),
         }
     }
 
@@ -100,51 +142,310 @@ impl ExportArtifact {
     ///
     /// `application/vnd.hdt` is the type the HDT specification proposes;
     /// clients that do not recognise it still receive the bytes, which is what
-    /// `Content-Disposition` is for.
+    /// `Content-Disposition` is for. The filter, sketch and key-set formats
+    /// have no media type of their own, and a reader identifies each by the
+    /// magic and header its format defines, so they are plain bytes.
     pub fn media_type(self) -> &'static str {
         match self {
             Self::Hdt => "application/vnd.hdt",
+            Self::Keys(_) => "application/octet-stream",
         }
     }
 
+    /// Whether a client may be sent this artifact content-coded.
+    ///
+    /// `data.hdt` shrinks to between a fifth and a half under zstd's default
+    /// level, so a client that weights a coding above identity gets one. A
+    /// filter, a sketch and a key set are hashed keys packed tight: the same
+    /// coder saves nothing on a sketch or a key set and 5–7% on a large filter.
+    /// Coding one would spend the shared blocking pool's CPU on gigabytes for
+    /// that, and cost the client a length and a strong validator, so they are
+    /// always sent as published and their responses do not vary by
+    /// `Accept-Encoding`.
+    pub fn compressible(self) -> bool {
+        matches!(self, Self::Hdt)
+    }
+
     /// The name a download of this artifact is saved under:
-    /// `{dataset}-{version}.{extension}`, so a saved file says which release
-    /// it holds.
+    /// `{dataset}-{version}.{suffix}`, so a saved file says which release it
+    /// holds — `tox-v1.hdt`, `tox-v1.subjects.minhash`.
     pub fn saved_name(self, dataset: &str, version: &str) -> String {
         format!(
             "{}-{}.{}",
             file_name_part(dataset),
             file_name_part(version),
-            self.extension()
+            self.suffix()
         )
     }
 
-    fn extension(self) -> &'static str {
+    /// What follows the release in a saved file's name. A key file keeps its
+    /// own file name, role and extension both: the extension alone would save
+    /// a release's subject and object filters over each other.
+    fn suffix(self) -> &'static str {
         match self {
             Self::Hdt => "hdt",
-        }
-    }
-
-    fn bytes(self, store: &Store) -> &[u8] {
-        match self {
-            Self::Hdt => store.hdt_bytes(),
+            Self::Keys(key) => {
+                let name = key.name();
+                name.rsplit_once('/').map_or(name, |(_, file)| file)
+            }
         }
     }
 }
 
-/// An exported artifact as its bundle maps it.
-struct Mapped {
-    store: Arc<Store>,
-    artifact: ExportArtifact,
+/// The downloadable files beside a release's manifest, as its bundle directory
+/// held them when the manifest was read.
+///
+/// One `stat` at startup for each name in the vocabulary the manifest lists —
+/// at most eleven a release — and no file is opened. It lets a download the
+/// manifest promises be checked against the bytes it describes before any
+/// request arrives, so that every request for it is answered alike: a
+/// revalidation or a range is decided from the manifest without opening the
+/// bundle, and could otherwise answer `304` or `206` for a file a `GET` would
+/// find missing.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExportFiles(BTreeMap<ExportArtifact, OnDisk>);
+
+/// What a bundle directory holds under one artifact's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OnDisk {
+    /// A regular file of this many bytes.
+    File(u64),
+    /// Nothing.
+    Missing,
+    /// Something that is not a regular file, or could not be examined: why.
+    Unusable(String),
+}
+
+impl ExportFiles {
+    /// Examine `bundle_dir` for each exportable artifact `manifest` lists.
+    ///
+    /// Every path is a vocabulary name joined to the bundle's own directory,
+    /// never text a client sent. Links are followed, as mapping would follow
+    /// them.
+    pub(crate) fn scan(bundle_dir: &Path, manifest: &Manifest) -> Self {
+        let files = ExportArtifact::all()
+            .filter(|artifact| manifest.artifacts.contains_key(artifact.name()))
+            .map(|artifact| {
+                let state = match std::fs::metadata(bundle_dir.join(artifact.name())) {
+                    Ok(metadata) if metadata.is_file() => OnDisk::File(metadata.len()),
+                    Ok(_) => OnDisk::Unusable("it is not a regular file".to_owned()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => OnDisk::Missing,
+                    Err(error) => OnDisk::Unusable(format!("it could not be examined: {error}")),
+                };
+                (artifact, state)
+            })
+            .collect();
+        Self(files)
+    }
+
+    /// A bundle that agrees with `manifest`: every listed download present at
+    /// its listed length. For tests of what follows from a manifest alone.
+    #[cfg(test)]
+    pub(crate) fn as_listed(manifest: &Manifest) -> Self {
+        let files = ExportArtifact::all()
+            .filter_map(|artifact| {
+                let entry = manifest.artifacts.get(artifact.name())?;
+                Some((artifact, OnDisk::File(entry.bytes)))
+            })
+            .collect();
+        Self(files)
+    }
+}
+
+/// What one release serves whole, and what its manifest lists that cannot be.
+///
+/// The manifest is the authority on what exists. It is what a reader without
+/// the bundle has, so "listed there" and "served here" are one statement; and
+/// the length and digest it gives are the validators a download sends, so an
+/// artifact it does not describe could not be served verifiably anyway.
+///
+/// `data.hdt` is required of every bundle, so a manifest that does not
+/// identify it is refused, as any other defect in what a release requires is.
+/// Any other trouble with a listed download — a checksum that is not one, no
+/// file in the bundle, a file of another length — withholds that download and
+/// nothing else, because no query reads it: one release's broken sketch must
+/// not keep every dataset of a deployment from starting. A withheld download
+/// is never quietly a `404`, since the manifest told its reader it is there:
+/// every request for it is a `500` naming the defect, whatever its method or
+/// preconditions.
+#[derive(Debug, Clone)]
+pub(crate) struct Exports {
+    served: Arc<[(ExportArtifact, ArtifactIdentity)]>,
+    withheld: Vec<(ExportArtifact, String)>,
+}
+
+/// What a release does with one artifact of the vocabulary.
+#[derive(Debug, Clone, Copy)]
+pub enum Export<'a> {
+    /// Served, under the length and digest its downloads carry.
+    Served(&'a ArtifactIdentity),
+    /// Listed by the manifest but not servable as listed, for this reason.
+    Withheld(&'a str),
+    /// Not listed: this release has no such artifact.
+    Unlisted,
+}
+
+impl Exports {
+    /// Reconcile `manifest`'s downloads with the `files` beside it.
+    pub(crate) fn new(manifest: &Manifest, files: &ExportFiles) -> Result<Self, String> {
+        let mut served = Vec::new();
+        let mut withheld = Vec::new();
+        for artifact in ExportArtifact::all() {
+            let required = artifact == ExportArtifact::Hdt;
+            let name = artifact.name();
+            let Some(entry) = manifest.artifacts.get(name) else {
+                if required {
+                    return Err(format!(
+                        "the manifest lists no size and checksum for {name}; regenerate it with \
+                         `kgf manifest`"
+                    ));
+                }
+                continue;
+            };
+            let Some(sha256) = hex::decode::<32>(&entry.sha256) else {
+                let defect = format!(
+                    "the manifest's checksum for {name} is not 64 lowercase hex digits; \
+                     regenerate it with `kgf manifest`"
+                );
+                if required {
+                    return Err(defect);
+                }
+                withheld.push((artifact, defect));
+                continue;
+            };
+            let listed = entry.bytes;
+            let defect = match files.0.get(&artifact) {
+                Some(OnDisk::File(len)) if *len == listed => {
+                    served.push((artifact, ArtifactIdentity::new(listed, sha256)));
+                    continue;
+                }
+                Some(OnDisk::File(len)) => format!(
+                    "the bundle's {name} is {len} bytes and its manifest lists {listed}; the two \
+                     were written apart, so regenerate the manifest with `kgf manifest`"
+                ),
+                Some(OnDisk::Unusable(why)) => format!("the bundle's {name} is unusable: {why}"),
+                Some(OnDisk::Missing) | None => format!(
+                    "the bundle has no {name}, which its manifest lists; the two were written \
+                     apart, so regenerate the manifest with `kgf manifest`"
+                ),
+            };
+            withheld.push((artifact, defect));
+        }
+        Ok(Self {
+            served: served.into(),
+            withheld,
+        })
+    }
+
+    /// What this release does with `artifact`.
+    pub(crate) fn get(&self, artifact: ExportArtifact) -> Export<'_> {
+        if let Some((_, identity)) = self.served.iter().find(|(served, _)| *served == artifact) {
+            return Export::Served(identity);
+        }
+        match self
+            .withheld
+            .iter()
+            .find(|(withheld, _)| *withheld == artifact)
+        {
+            Some((_, defect)) => Export::Withheld(defect),
+            None => Export::Unlisted,
+        }
+    }
+
+    /// Everything served, in vocabulary order: `data.hdt` first, when it is.
+    pub(crate) fn served(&self) -> &Arc<[(ExportArtifact, ArtifactIdentity)]> {
+        &self.served
+    }
+
+    /// Everything listed and not served, each with why.
+    pub(crate) fn withheld(&self) -> &[(ExportArtifact, String)] {
+        &self.withheld
+    }
+}
+
+/// A download's bytes, mapped and checked against the length its manifest
+/// gives.
+pub(crate) enum Mapped {
+    /// `data.hdt`, through the store, whose mapping every query reads.
+    Hdt(Arc<Store>),
+    /// A key file, mapped for this download alone.
+    Keys(KeyArtifact, PublishedFile),
+}
+
+impl Mapped {
+    /// Map `artifact` from `store` and check it against `len`, the length its
+    /// manifest gives.
+    ///
+    /// Startup found the file at that length, so neither check fails unless a
+    /// bundle changed under a running server — which a published bundle must
+    /// not do — or the mapping itself fails. Either is logged and refused,
+    /// because serving would send nothing, or bytes under a digest they do not
+    /// have. Presence and length are what can be checked without reading the
+    /// file; the digest is `kgf manifest --check`'s job. Maps, so it belongs on
+    /// a blocking thread.
+    pub(crate) fn open(
+        store: Arc<Store>,
+        artifact: ExportArtifact,
+        len: u64,
+    ) -> Result<Self, Problem> {
+        let name = artifact.name();
+        let mapped = match artifact {
+            ExportArtifact::Hdt => Self::Hdt(store),
+            ExportArtifact::Keys(key) => match store.map_key_artifact(key) {
+                Ok(Some(file)) => Self::Keys(key, file),
+                Ok(None) => {
+                    tracing::error!(
+                        artifact = name,
+                        "an exported artifact is missing from its bundle"
+                    );
+                    return Err(Problem::new(
+                        ErrorCode::InternalError,
+                        format!("{name} is listed in the manifest but missing from the bundle"),
+                    ));
+                }
+                Err(error) => {
+                    tracing::error!(
+                        artifact = name,
+                        %error,
+                        "an exported artifact could not be mapped"
+                    );
+                    return Err(Problem::new(
+                        ErrorCode::InternalError,
+                        format!("{name} could not be read from the bundle"),
+                    ));
+                }
+            },
+        };
+        let mapped_len = mapped.bytes().len() as u64;
+        if mapped_len != len {
+            tracing::error!(
+                artifact = name,
+                mapped = mapped_len,
+                manifest = len,
+                "an exported artifact's length disagrees with its manifest",
+            );
+            return Err(Problem::new(
+                ErrorCode::InternalError,
+                format!("{name} does not match the length its manifest publishes"),
+            ));
+        }
+        Ok(mapped)
+    }
 }
 
 impl Source for Mapped {
     fn bytes(&self) -> &[u8] {
-        self.artifact.bytes(&self.store)
+        match self {
+            Self::Hdt(store) => store.hdt_bytes(),
+            Self::Keys(_, file) => file.as_bytes(),
+        }
     }
 
     fn name(&self) -> &'static str {
-        self.artifact.name()
+        match self {
+            Self::Hdt(_) => artifact::HDT,
+            Self::Keys(key, _) => key.name(),
+        }
     }
 }
 
@@ -164,24 +465,6 @@ pub struct ArtifactIdentity {
 }
 
 impl ArtifactIdentity {
-    /// The manifest's entry for `artifact`, or why it cannot identify one.
-    pub(crate) fn from_manifest(
-        manifest: &Manifest,
-        artifact: ExportArtifact,
-    ) -> Result<Self, String> {
-        let name = artifact.name();
-        let entry = manifest.artifacts.get(name).ok_or_else(|| {
-            format!("the manifest lists no size and checksum for {name}; regenerate it with `kgf manifest`")
-        })?;
-        let sha256 = hex::decode::<32>(&entry.sha256).ok_or_else(|| {
-            format!(
-                "the manifest's checksum for {name} is not 64 lowercase hex digits; \
-                 regenerate it with `kgf manifest`"
-            )
-        })?;
-        Ok(Self::new(entry.bytes, sha256))
-    }
-
     /// An artifact of `len` bytes with this digest.
     pub(crate) fn new(len: u64, sha256: [u8; 32]) -> Self {
         let sha256_hex = hex::encode(&sha256);
@@ -269,8 +552,9 @@ impl Conditions {
     /// `Range` repeated across field lines is not a list the grammar allows,
     /// so it is ignored like any other invalid one. An `Accept-Encoding` that
     /// is not text is treated as absent, which selects identity — the one
-    /// coding every client decodes.
-    pub(crate) fn read(headers: &HeaderMap, method: &Method) -> Self {
+    /// coding every client decodes — and so is any `Accept-Encoding` for an
+    /// artifact that is never coded (see [`ExportArtifact::compressible`]).
+    pub(crate) fn read(headers: &HeaderMap, method: &Method, artifact: ExportArtifact) -> Self {
         let range = if method == Method::GET {
             let mut values = headers.get_all(RANGE).iter();
             match (values.next(), values.next()) {
@@ -285,7 +569,8 @@ impl Conditions {
             .iter()
             .map(|value| value.to_str().ok())
             .collect::<Option<Vec<_>>>()
-            .and_then(|lines| (!lines.is_empty()).then(|| lines.join(", ")));
+            .and_then(|lines| (!lines.is_empty()).then(|| lines.join(", ")))
+            .filter(|_| artifact.compressible());
         Self {
             if_match: headers.typed_get(),
             if_unmodified_since: headers.typed_get(),
@@ -425,7 +710,7 @@ pub(crate) struct Delivery<'a> {
     pub(crate) artifact: ExportArtifact,
     pub(crate) identity: &'a ArtifactIdentity,
     pub(crate) last_modified: Option<SystemTime>,
-    /// The saved file's name: `{dataset}-{version}.{extension}`.
+    /// The saved file's name: `{dataset}-{version}.{suffix}`.
     pub(crate) file_name: String,
 }
 
@@ -483,33 +768,32 @@ impl<'a> Delivery<'a> {
     }
 
     /// A `HEAD`: the headers of the full `GET`, and no body.
-    pub(crate) fn head(&self, store: &Store, coding: ContentCoding) -> Result<Response, Problem> {
-        self.verify(store)?;
+    ///
+    /// Takes the mapped artifact without reading it, because a `HEAD` must
+    /// answer as its `GET` would: an artifact that cannot be mapped at its
+    /// manifest's length is refused before either is described.
+    pub(crate) fn head(&self, _mapped: &Mapped, coding: ContentCoding) -> Response {
         let mut response = self.framed(coding, &Extent::Whole, self.identity.len);
         *response.body_mut() = match coding {
             ContentCoding::Identity => Body::empty(),
             ContentCoding::Zstd | ContentCoding::Gzip => Body::new(Unmeasured),
         };
-        Ok(response)
+        response
     }
 
-    /// A `200` or `206` streaming from `store`.
+    /// A `200` or `206` streaming from the mapped artifact.
     pub(crate) fn send(
         &self,
-        store: Arc<Store>,
+        mapped: Mapped,
         coding: ContentCoding,
         extent: &Extent,
         slot: DownloadSlot,
         ledger: Option<Arc<Ledger>>,
     ) -> Result<Response, Problem> {
-        self.verify(&store)?;
         let segments = self.segments(extent);
         let length = segments.iter().map(Segment::len).sum();
         let mut response = self.framed(coding, extent, length);
-        let source = Arc::new(Mapped {
-            store,
-            artifact: self.artifact,
-        });
+        let source = Arc::new(mapped);
         let download = Download::new(source, segments, coding, slot, ledger).map_err(|error| {
             tracing::error!(%error, "a download's encoder could not be created");
             Problem::new(
@@ -519,32 +803,6 @@ impl<'a> Delivery<'a> {
         })?;
         *response.body_mut() = Body::new(download);
         Ok(response)
-    }
-
-    /// Check the mapping's length against the manifest's.
-    ///
-    /// The two can only disagree if a published bundle was rewritten in place,
-    /// and serving then would send bytes under a digest they do not have. A
-    /// length is what can be checked without reading the file; the digest is
-    /// `kgf manifest --check`'s job.
-    fn verify(&self, store: &Store) -> Result<(), Problem> {
-        let mapped = self.artifact.bytes(store).len() as u64;
-        if mapped == self.identity.len {
-            return Ok(());
-        }
-        tracing::error!(
-            artifact = self.artifact.name(),
-            mapped,
-            manifest = self.identity.len,
-            "an exported artifact's length disagrees with its manifest",
-        );
-        Err(Problem::new(
-            ErrorCode::InternalError,
-            format!(
-                "{} does not match the length its manifest publishes",
-                self.artifact.name()
-            ),
-        ))
     }
 
     /// The body's pieces, in order: the artifact spans, and for a multipart
@@ -627,7 +885,12 @@ impl<'a> Delivery<'a> {
         };
         headers.typed_insert(tag.clone());
         headers.typed_insert(CachePolicy::Immutable.header().with_no_transform());
-        headers.insert(VARY, HeaderValue::from_static("accept-encoding"));
+        // Only where a coding could be chosen: an artifact always sent as
+        // published has one representation, and a cache keyed on every
+        // client's `Accept-Encoding` would hold copies of it for nothing.
+        if self.artifact.compressible() {
+            headers.insert(VARY, HeaderValue::from_static("accept-encoding"));
+        }
     }
 
     fn content_range(&self, span: &Range<u64>) -> String {
@@ -684,7 +947,7 @@ mod tests {
                 HeaderValue::from_str(value).unwrap(),
             );
         }
-        Conditions::read(&map, &method).decide(&identity(), Some(created()))
+        Conditions::read(&map, &method, ExportArtifact::Hdt).decide(&identity(), Some(created()))
     }
 
     fn strong() -> String {
@@ -927,11 +1190,258 @@ mod tests {
     }
 
     #[test]
-    fn every_exported_artifact_is_named_by_its_own_segment() {
-        for &artifact in ExportArtifact::ALL {
-            assert_eq!(ExportArtifact::from_name(artifact.name()), Some(artifact));
+    fn every_exported_artifact_is_named_by_its_own_path_and_nothing_else_is() {
+        let all: Vec<_> = ExportArtifact::all().collect();
+        assert_eq!(all[0], ExportArtifact::Hdt);
+        assert_eq!(
+            all.len(),
+            1 + artifact::FILTERS.len() + artifact::KEYSETS.len()
+        );
+        for &artifact in &all {
+            assert_eq!(ExportArtifact::from_path(artifact.name()), Some(artifact));
         }
-        assert_eq!(ExportArtifact::from_name("data.hdt.perm"), None);
-        assert_eq!(ExportArtifact::from_name("manifest.json"), None);
+        for name in [
+            "filters/subjects.filter",
+            "filters/objects.minhash",
+            "keysets/shared.keys",
+        ] {
+            assert!(
+                matches!(
+                    ExportArtifact::from_path(name),
+                    Some(ExportArtifact::Keys(_))
+                ),
+                "{name}"
+            );
+        }
+        // Other artifacts of a bundle, the one that is a directory, a role the
+        // bundle profile leaves out, and spellings that would reach another
+        // file if a path were ever built from them.
+        for other in [
+            "data.hdt.perm",
+            "manifest.json",
+            "data.hdt.text",
+            "stats/void.hdt",
+            "keysets/terms.keys",
+            "filters",
+            "filters/",
+            "filters//subjects.filter",
+            "filters/../data.hdt",
+            "filters%2Fsubjects.filter",
+            "data%2Ehdt",
+            "/data.hdt",
+            "Data.hdt",
+            "",
+        ] {
+            assert_eq!(ExportArtifact::from_path(other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn no_two_artifacts_of_a_release_are_saved_under_one_name() {
+        let names: std::collections::BTreeSet<_> = ExportArtifact::all()
+            .map(|artifact| artifact.saved_name("tox", "v1"))
+            .collect();
+        assert_eq!(names.len(), ExportArtifact::all().count());
+        assert!(names.contains("tox-v1.hdt"));
+        assert!(names.contains("tox-v1.subjects.minhash"));
+        assert!(names.contains("tox-v1.objects.filter"));
+        assert!(names.contains("tox-v1.subjects-only.keys"));
+    }
+
+    fn manifest_listing(artifacts: &[(&str, &str)]) -> Manifest {
+        let listed: serde_json::Map<_, _> = artifacts
+            .iter()
+            .map(|&(name, sha256)| {
+                (
+                    name.to_owned(),
+                    serde_json::json!({"bytes": 7, "sha256": sha256}),
+                )
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "id": "tox",
+            "version": "v1",
+            "content_digest": "sha256:00",
+            "counts": {"triples": 0, "subjects": 0, "predicates": 0, "objects": 0},
+            "artifacts": listed,
+        }))
+        .expect("a minimal manifest")
+    }
+
+    /// The exports of a bundle that agrees with its manifest.
+    fn agreeing(manifest: &Manifest) -> Result<Exports, String> {
+        Exports::new(manifest, &ExportFiles::as_listed(manifest))
+    }
+
+    fn served_names(exports: &Exports) -> Vec<&'static str> {
+        exports
+            .served()
+            .iter()
+            .map(|(artifact, _)| artifact.name())
+            .collect()
+    }
+
+    #[test]
+    fn a_release_exports_the_hdt_and_the_key_files_its_manifest_lists() {
+        // `data.hdt.perm` and `stats/summary.md` are listed and not exported;
+        // the object-side sketch is exportable and not listed.
+        let manifest = manifest_listing(&[
+            ("data.hdt", DIGEST),
+            ("data.hdt.perm", DIGEST),
+            ("filters/subjects.minhash", DIGEST),
+            ("keysets/shared.keys", DIGEST),
+            ("stats/summary.md", DIGEST),
+        ]);
+        let exports = agreeing(&manifest).unwrap();
+        assert_eq!(
+            served_names(&exports),
+            [
+                "data.hdt",
+                "filters/subjects.minhash",
+                "keysets/shared.keys"
+            ]
+        );
+        assert!(exports.withheld().is_empty());
+        for (_, identity) in exports.served().iter() {
+            assert_eq!(identity.size(), 7);
+            assert_eq!(identity.sha256_hex(), DIGEST);
+        }
+        let sketch = ExportArtifact::Keys(KeyArtifact::SubjectsSketch);
+        assert!(matches!(exports.get(sketch), Export::Served(_)));
+        let unlisted = ExportArtifact::Keys(KeyArtifact::ObjectsSketch);
+        assert!(matches!(exports.get(unlisted), Export::Unlisted));
+
+        // A bundle with no key files exports its HDT alone.
+        let plain = agreeing(&manifest_listing(&[("data.hdt", DIGEST)])).unwrap();
+        assert_eq!(served_names(&plain), ["data.hdt"]);
+    }
+
+    #[test]
+    fn a_manifest_that_cannot_identify_data_hdt_is_refused() {
+        let missing = agreeing(&manifest_listing(&[("keysets/shared.keys", DIGEST)]));
+        assert!(missing.unwrap_err().contains("data.hdt"));
+        let unusable = agreeing(&manifest_listing(&[("data.hdt", "not-a-digest")]));
+        assert!(unusable.unwrap_err().contains("data.hdt"));
+    }
+
+    #[test]
+    fn a_download_that_cannot_be_served_as_listed_is_withheld_alone() {
+        let manifest = manifest_listing(&[
+            ("data.hdt", DIGEST),
+            ("filters/objects.minhash", DIGEST),
+            ("filters/subjects.minhash", DIGEST),
+            ("keysets/objects-only.keys", DIGEST),
+            ("keysets/shared.keys", "not-a-digest"),
+            ("keysets/subjects-only.keys", DIGEST),
+        ]);
+        let artifact = |name| ExportArtifact::from_path(name).unwrap();
+        let mut files = ExportFiles::as_listed(&manifest);
+        files
+            .0
+            .insert(artifact("filters/objects.minhash"), OnDisk::File(6));
+        files
+            .0
+            .insert(artifact("keysets/objects-only.keys"), OnDisk::Missing);
+        files.0.insert(
+            artifact("keysets/subjects-only.keys"),
+            OnDisk::Unusable("it is not a regular file".to_owned()),
+        );
+        let exports = Exports::new(&manifest, &files).expect("only data.hdt is required");
+
+        assert_eq!(
+            served_names(&exports),
+            ["data.hdt", "filters/subjects.minhash"]
+        );
+        for (name, says) in [
+            (
+                "filters/objects.minhash",
+                "is 6 bytes and its manifest lists 7",
+            ),
+            (
+                "keysets/objects-only.keys",
+                "the bundle has no keysets/objects-only.keys",
+            ),
+            ("keysets/shared.keys", "is not 64 lowercase hex digits"),
+            ("keysets/subjects-only.keys", "it is not a regular file"),
+        ] {
+            match exports.get(artifact(name)) {
+                Export::Withheld(defect) => assert!(defect.contains(says), "{name}: {defect}"),
+                other => panic!("{name} is {other:?}"),
+            }
+        }
+
+        // `data.hdt` too: its download is withheld, and the release stands.
+        let mut files = ExportFiles::as_listed(&manifest);
+        files.0.insert(ExportArtifact::Hdt, OnDisk::File(8));
+        let exports = Exports::new(&manifest, &files).unwrap();
+        assert!(matches!(
+            exports.get(ExportArtifact::Hdt),
+            Export::Withheld(_)
+        ));
+    }
+
+    #[test]
+    fn a_bundle_directory_is_examined_for_the_downloads_its_manifest_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.hdt"), b"1234567").unwrap();
+        std::fs::create_dir_all(dir.path().join("keysets/shared.keys")).unwrap();
+        let manifest = manifest_listing(&[
+            ("data.hdt", DIGEST),
+            ("data.hdt.perm", DIGEST),
+            ("filters/subjects.filter", DIGEST),
+            ("keysets/shared.keys", DIGEST),
+        ]);
+        let files = ExportFiles::scan(dir.path(), &manifest);
+        assert_eq!(files.0.get(&ExportArtifact::Hdt), Some(&OnDisk::File(7)));
+        assert_eq!(
+            files
+                .0
+                .get(&ExportArtifact::Keys(KeyArtifact::SubjectsFilter)),
+            Some(&OnDisk::Missing)
+        );
+        assert!(matches!(
+            files.0.get(&ExportArtifact::Keys(KeyArtifact::SharedKeys)),
+            Some(OnDisk::Unusable(_))
+        ));
+        // Only what the manifest lists is examined.
+        assert_eq!(files.0.len(), 3);
+    }
+
+    #[test]
+    fn a_key_file_is_never_coded_and_does_not_vary() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCEPT_ENCODING,
+            HeaderValue::from_static("zstd, identity;q=0.5"),
+        );
+        let sketch = ExportArtifact::Keys(KeyArtifact::SubjectsSketch);
+        assert!(!sketch.compressible());
+        assert!(ExportArtifact::Hdt.compressible());
+        let decision =
+            Conditions::read(&headers, &Method::GET, sketch).decide(&identity(), Some(created()));
+        assert_eq!(
+            decision,
+            Decision::Send {
+                coding: ContentCoding::Identity,
+                extent: Extent::Whole
+            }
+        );
+        let hdt = Conditions::read(&headers, &Method::GET, ExportArtifact::Hdt)
+            .decide(&identity(), Some(created()));
+        assert!(matches!(
+            hdt,
+            Decision::Send {
+                coding: ContentCoding::Zstd,
+                ..
+            }
+        ));
+
+        let identity = identity();
+        let sketch = Delivery::new("tox", "v1", sketch, &identity, Some(created()));
+        let response = sketch.not_modified(ContentCoding::Identity);
+        assert_eq!(response.headers().get(VARY), None);
+        let hdt = Delivery::new("tox", "v1", ExportArtifact::Hdt, &identity, Some(created()));
+        let response = hdt.not_modified(ContentCoding::Identity);
+        assert_eq!(response.headers()[VARY], "accept-encoding");
     }
 }

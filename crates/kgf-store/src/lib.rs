@@ -78,9 +78,9 @@ pub use description::{
 pub use error::{Error, Result};
 pub use graphs::{GraphFacts, GraphId, Graphs, UNION_GRAPH_IRI, UNNAMED_GRAPH_IRI};
 pub use manifest::{BundleFacts, Capability, Manifest, ManifestDocument};
-pub use map::{PublishedBundle, PublishedRoot};
+pub use map::{PublishedBundle, PublishedFile, PublishedRoot};
 pub use scope::{QuadRow, QuadSelection, ScopedSelection};
-pub use store::{OpenOptions, Store};
+pub use store::{KeyArtifact, OpenOptions, Store};
 
 /// A term identifier in one of HDT's role-scoped id spaces.
 ///
