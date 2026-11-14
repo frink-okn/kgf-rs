@@ -145,11 +145,16 @@ impl Mount {
     }
 
     /// A whole-artifact download: `/{dataset}/v/{version}/export/{artifact}`.
+    ///
+    /// `artifact` is the artifact's name in the bundle, which for most is a
+    /// path — `filters/subjects.minhash` — so it is encoded a segment at a
+    /// time and its separators are kept.
     pub fn export(&self, dataset: &str, version: &str, artifact: &str) -> String {
+        let path: Vec<String> = artifact.split('/').map(encode_segment).collect();
         format!(
             "{}export/{}",
             self.bundle_base(dataset, version),
-            encode_segment(artifact)
+            path.join("/")
         )
     }
 

@@ -18,7 +18,7 @@ already running.
 | `service.yaml` | Service `frink-kgf-service` | Port 80 to the pod's 8080. |
 | `httproute.yaml` | HTTPRoute `frink-kgf-route` | `apps.okn.us/kgf` with the prefix stripped. |
 | `healthcheckpolicy.yaml` | HealthCheckPolicy `frink-kgf-health-check` | The gateway probes `/healthz` on 8080. |
-| `backendpolicy.yaml` | GCPBackendPolicy `frink-kgf-backend-policy` | The gateway lets one response run for an hour, not 30 s, so `/export` downloads finish. |
+| `backendpolicy.yaml` | GCPBackendPolicy `frink-kgf-backend-policy` | The gateway lets one response run for an hour, not 30 s, so `/export` downloads finish. See [Downloads](#downloads). |
 
 Outside this directory and created once by hand: the bucket
 `gs://frink-kgf-bundles` (us-east4, uniform access, no lifecycle rule), the
@@ -136,6 +136,54 @@ The bundle volume is mounted read-write on purpose, even though the server
 only reads: hdtc's text index reader takes a lock file on open, and a read-only
 mount makes every bundle that carries a text index fail with "could not be
 opened". See the comment in `deployment.yaml`.
+
+## Downloads
+
+`/{dataset}/v/{version}/export/` serves `data.hdt` and every file the release's
+manifest lists under `filters/` and `keysets/` — the membership filters, overlap
+sketches and key sets a federation index fetches — each at its name in the
+bundle (`export/filters/subjects.minhash`). The bucket is private, so this is
+the only way those artifacts leave the deployment. The server streams each from
+its mapping in 512 KiB chunks and holds none of it in memory, whatever its size.
+
+**The gateway ends any one response after an hour** (`backendpolicy.yaml`),
+counted from the request's first byte to the response's last. Each artifact is
+its own response, so the bound is per file, not per release. What it asks of a
+client's connection, sustained for the whole transfer:
+
+| artifact | size | to finish inside the hour |
+|---|---:|---:|
+| a sketch (`.minhash`) | under 1 MB | anything |
+| a 5 GB filter | 5 GB | 1.4 MB/s (11 Mbit/s) |
+| an 8.7 GB key set | 8.7 GB | 2.4 MB/s (20 Mbit/s) |
+
+The two larger rows are the Wikidata bundle's; every OKN bundle's artifacts are
+smaller. A crawler in a data centre clears these in minutes. A client that does
+not is cut off mid-body with nothing wrong on either side, and must treat that
+as routine: resume with `Range: bytes={received}-` and `If-Range` set to the
+artifact's strong `ETag`, which is `"sha256:{hex}"` with the manifest's
+`sha256` — known before the first request, so a resume needs no earlier
+response to have survived. Then check the assembled file against that digest.
+`curl -C -` resumes too but sends no `If-Range`; it is safe at a versioned URL
+and not through `latest`.
+
+Raising `timeoutSec` instead trades that away for longer-held slots: the same
+bound is what releases the download slot of a client that has stopped reading.
+The load balancer's maximum is a day.
+
+Two more limits a bulk fetch meets:
+
+- **Slots.** A streaming download takes one of `--max-concurrent-downloads`
+  (16) and one of its client's `--max-downloads-per-client` (4); past either
+  the answer is 429 with `Retry-After: 30`. A `HEAD`, a `304` and a `416` take
+  none. A crawler fetching several artifacts, or one artifact in parallel
+  ranges, should stay at or under four connections.
+- **Page cache.** A download reads through the same mapping queries use, and
+  nothing a query does ever reads a filter or a key set, so every page of one
+  comes off the disk cold and competes with the index pages the pod is
+  serving from. A release's federation artifacts fetched once are a one-time
+  cost; a bundle rebuilt weekly makes it a weekly one. Watch `major_faults` on
+  query records while such a fetch runs before deciding it needs anything.
 
 ## Build a bundle
 

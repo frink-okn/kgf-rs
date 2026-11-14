@@ -21,7 +21,7 @@ use crate::distinct::{DistinctLimits, DistinctPlan};
 use crate::error::{Error, Result};
 use crate::graphs::Graphs;
 use crate::indexed::IndexedHdt;
-use crate::map::{PublishedBundle, open_published};
+use crate::map::{Mapping, PublishedBundle, open_published};
 use crate::pattern::{IdPattern, Selection};
 use crate::perm::Permutations;
 use crate::triple_terms::{TripleTermPattern, TripleTermSelection, TripleTerms};
@@ -147,6 +147,9 @@ pub struct Store {
     triple_terms: Option<TripleTerms>,
     description: Option<DescriptionStore>,
     text: Option<TextSearcher>,
+    /// The `filters/` and `keysets/` files the bundle carries, each mapped
+    /// whole under its bundle-relative name, in name order.
+    key_artifacts: Vec<(&'static str, Mapping)>,
 }
 
 impl std::fmt::Debug for Store {
@@ -162,6 +165,14 @@ impl std::fmt::Debug for Store {
             .field("triple_terms", &self.triple_terms.is_some())
             .field("description", &self.description.is_some())
             .field("text", &self.text.is_some())
+            .field(
+                "key_artifacts",
+                &self
+                    .key_artifacts
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -236,6 +247,7 @@ impl Store {
             triple_terms,
             description,
             text: artifacts.open_text()?,
+            key_artifacts: artifacts.open_key_artifacts(bundle)?,
         })
     }
 
@@ -326,6 +338,29 @@ impl Store {
     /// thread, like any other store work.
     pub fn hdt_bytes(&self) -> &[u8] {
         self.data.bytes()
+    }
+
+    /// One of the bundle's `filters/` or `keysets/` files exactly as published,
+    /// by its bundle-relative name, for a caller that serves the artifact
+    /// itself. `None` when the bundle does not carry it, and for any name
+    /// outside [`artifact::FILTERS`] and [`artifact::KEYSETS`].
+    ///
+    /// Nothing in this crate reads these bytes. A membership filter, an overlap
+    /// sketch and a key set are what a reader *without* the bundle fetches, to
+    /// decide whether this dataset is worth asking and to measure what it
+    /// shares with another, so the only thing a store does with them is hand
+    /// them out whole.
+    ///
+    /// The name is compared against the names this store mapped at open and is
+    /// never joined to a directory, so a caller may pass text it was sent
+    /// without that text reaching the filesystem. As with
+    /// [`hdt_bytes`](Self::hdt_bytes), reading the slice faults pages, so a
+    /// caller copying out of it belongs on a blocking thread.
+    pub fn key_artifact_bytes(&self, name: &str) -> Option<&[u8]> {
+        self.key_artifacts
+            .iter()
+            .find(|(mapped, _)| *mapped == name)
+            .map(|(_, mapping)| mapping.as_bytes())
     }
 
     /// Total triples in the bundle.
@@ -539,6 +574,27 @@ impl ArtifactSet {
             })
     }
 
+    /// Map the `filters/` and `keysets/` files the bundle carries.
+    ///
+    /// Mapped, and nothing more: no header is read and no page is touched.
+    /// Neither format may have a field interpreted before its CRC32C has been
+    /// verified (`hdtc/docs/sketch-format.md` §8, `keyset-format.md` §4.4),
+    /// which is a pass over the whole file and so belongs to `kgf manifest`,
+    /// never to an open. What an open establishes is that each file is there
+    /// to be handed out, at the cost of one mapping apiece — at most ten, of
+    /// address space rather than memory — so a store never has to map on a
+    /// request, which would take the interior mutability it does without.
+    pub(crate) fn open_key_artifacts(
+        &self,
+        bundle: &PublishedBundle,
+    ) -> Result<Vec<(&'static str, Mapping)>> {
+        self.filters
+            .iter()
+            .chain(&self.keysets)
+            .map(|&name| Ok((name, open_published(bundle, &bundle.path().join(name))?)))
+            .collect()
+    }
+
     /// Open the triple-term artifacts, if the bundle carries them, and refuse
     /// a `data.hdt` that holds triple terms without them.
     ///
@@ -674,14 +730,16 @@ fn require_file(dir: &Path, name: &str, remedy: impl Into<String>) -> Result<Pat
 
 /// Which of a closed set of artifact names a directory carries.
 ///
-/// Existence only. These files are validated when a producer reads their
-/// headers to describe them, which costs a full pass for the CRC32C the two
-/// formats require before any field may be interpreted — far outside what an
-/// open may spend.
+/// Existence as a regular file, and nothing about the contents. These files
+/// are validated when a producer reads their headers to describe them, which
+/// costs a full pass for the CRC32C the two formats require before any field
+/// may be interpreted — far outside what an open may spend. The shape is
+/// checked because an open maps each one: a directory under an artifact's name
+/// is refused here, by name, rather than by whatever mapping it would report.
 fn present(dir: &Path, names: &[&'static str]) -> Result<Vec<&'static str>> {
     let mut found = Vec::new();
     for name in names {
-        if dir.join(name).try_exists()? {
+        if optional_file(dir, name)?.is_some() {
             found.push(*name);
         }
     }
@@ -1122,6 +1180,88 @@ mod tests {
             Store::open(&published, OpenOptions::default()),
             Err(Error::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn key_artifacts_are_handed_out_whole_and_only_where_carried() {
+        // The contents are opaque to an open, which is the point: nothing here
+        // may read a field of either format, so any bytes stand in for them.
+        let fixture = Fixture::build(TINY_NT);
+        let dir = fixture.bundle_path();
+        std::fs::create_dir_all(dir.join("filters")).unwrap();
+        std::fs::create_dir_all(dir.join("keysets")).unwrap();
+        let carried = [
+            ("filters/objects.minhash", &b"an objects sketch"[..]),
+            ("filters/subjects.minhash", b"a subjects sketch"),
+            ("keysets/shared.keys", b"a shared key set"),
+        ];
+        for (name, bytes) in carried {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+
+        let store = Store::open(&published_bundle(dir), OpenOptions::default()).unwrap();
+        for (name, bytes) in carried {
+            assert_eq!(store.key_artifact_bytes(name), Some(bytes), "{name}");
+        }
+        // A family the bundle does not carry, an artifact of another kind, and
+        // a name that would escape the directory if it were ever joined to it.
+        for absent in [
+            "filters/subjects.filter",
+            "keysets/subjects.keys",
+            artifact::HDT,
+            artifact::MANIFEST,
+            "keysets/../data.hdt",
+            "",
+        ] {
+            assert_eq!(store.key_artifact_bytes(absent), None, "{absent:?}");
+        }
+
+        // A bundle with neither directory opens as it always has.
+        let plain = Fixture::build(TINY_NT);
+        let store = Store::open(
+            &published_bundle(plain.bundle_path()),
+            OpenOptions::default(),
+        )
+        .unwrap();
+        for name in artifact::FILTERS.iter().chain(&artifact::KEYSETS) {
+            assert_eq!(store.key_artifact_bytes(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_key_artifact_that_cannot_be_mapped_is_refused_with_the_bundle() {
+        // A directory where the file belongs, and a file with nothing in it:
+        // either would otherwise be listed by a manifest and found unservable
+        // by the first reader to ask for it.
+        let directory = Fixture::build(TINY_NT);
+        let path = directory.bundle_path().join("keysets/shared.keys");
+        std::fs::create_dir_all(&path).unwrap();
+        match Store::open(
+            &published_bundle(directory.bundle_path()),
+            OpenOptions::default(),
+        )
+        .expect_err("a directory is not a key set")
+        {
+            Error::Malformed { artifact, detail } => {
+                assert_eq!(artifact, path);
+                assert_eq!(detail, "artifact is not a regular file");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let empty = Fixture::build(TINY_NT);
+        std::fs::create_dir_all(empty.bundle_path().join("keysets")).unwrap();
+        let path = empty.bundle_path().join("keysets/shared.keys");
+        std::fs::write(&path, b"").unwrap();
+        match Store::open(
+            &published_bundle(empty.bundle_path()),
+            OpenOptions::default(),
+        )
+        .expect_err("an empty file is not a key set")
+        {
+            Error::Malformed { artifact, .. } => assert_eq!(artifact, path),
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[cfg(unix)]

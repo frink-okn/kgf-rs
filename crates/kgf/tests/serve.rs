@@ -2081,6 +2081,373 @@ fn a_download_is_the_published_hdt_resumable_and_verifiable() {
     );
 }
 
+/// The federation artifacts a release's manifest lists — a membership filter,
+/// an overlap sketch, a key set — are downloads exactly as `data.hdt` is: the
+/// published bytes, under the size and SHA-256 the manifest gives a reader to
+/// check them against.
+#[test]
+fn the_filters_sketches_and_key_sets_a_manifest_lists_are_downloads_too() {
+    use base64::Engine as _;
+
+    let deployment = Deployment::new();
+    // The whole build, because that is what writes these files and describes
+    // them in the manifest; a fixture bundle has neither.
+    deployment.publish_built_quads("fed", "v1", WORKED_EXAMPLE_NQ, "2026-01-09T09:00:00Z");
+    let bundle = deployment.bundle("fed", "v1");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+    let log = RecordingAccessLog::default();
+    let server = deployment.serve_with_access(Arc::new(log.clone()), false);
+    let immutable = ["public", "max-age=31536000", "immutable", "no-transform"];
+
+    let artifacts = [
+        ("filters/subjects.filter", "fed-v1.subjects.filter"),
+        ("filters/subjects.minhash", "fed-v1.subjects.minhash"),
+        ("keysets/shared.keys", "fed-v1.shared.keys"),
+    ];
+    for (name, saved) in artifacts {
+        let file = std::fs::read(bundle.join(name)).unwrap_or_else(|_| panic!("{name} is built"));
+        let len = file.len();
+        assert!(len > 32, "{name} is too short to range over: {len}");
+        let digest = Sha256::digest(&file);
+        let strong = format!("\"sha256:{digest:x}\"");
+        let repr_digest = format!(
+            "sha-256=:{}:",
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        );
+        let target = format!("/fed/v/v1/export/{name}");
+
+        // What a crawler has to go on is the manifest: the name there is the
+        // path here, and the size and digest there are the ones served.
+        let entry = &manifest["artifacts"][name];
+        assert_eq!(entry["bytes"], len, "{name}");
+        assert_eq!(entry["sha256"], format!("{digest:x}"), "{name}");
+
+        // The whole artifact, byte for byte, and readable from a browser on
+        // another origin, headers included.
+        let whole = server.request("GET", &target, &[("origin", "https://index.example")]);
+        whole.assert_status(200);
+        assert_eq!(whole.body, file, "{name}");
+        whole.assert_header("content-type", "application/octet-stream");
+        whole.assert_header("content-length", &len.to_string());
+        whole.assert_header("accept-ranges", "bytes");
+        whole.assert_header("etag", &strong);
+        whole.assert_header("repr-digest", &repr_digest);
+        whole.assert_header("last-modified", "Fri, 09 Jan 2026 09:00:00 GMT");
+        whole.assert_header(
+            "content-disposition",
+            &format!("attachment; filename=\"{saved}\""),
+        );
+        whole.assert_cache_control(&immutable);
+        assert_encoding_vary(&whole, name);
+        assert_eq!(whole.header("content-encoding"), None, "{name}");
+        whole.assert_header("access-control-allow-origin", "*");
+        whole.assert_header("access-control-expose-headers", "*");
+
+        // HEAD describes that GET exactly, and sends nothing.
+        let head = server.request("HEAD", &target, &[]);
+        head.assert_status(200);
+        assert!(head.body.is_empty(), "{name}");
+        for header in [
+            "content-length",
+            "etag",
+            "repr-digest",
+            "accept-ranges",
+            "content-type",
+            "last-modified",
+            "content-disposition",
+            "cache-control",
+        ] {
+            assert_eq!(
+                head.header(header),
+                whole.header(header),
+                "{name}: {header}"
+            );
+        }
+
+        // Ranges: a span, a suffix, an open end — each under the whole
+        // artifact's digest, which is what a reassembled file is checked with.
+        let ranges = [
+            ("bytes=8-23".to_owned(), 8..24),
+            ("bytes=-5".to_owned(), len - 5..len),
+            (format!("bytes={}-", len - 9), len - 9..len),
+        ];
+        for (header, span) in ranges {
+            let part = server.request("GET", &target, &[("range", &header)]);
+            part.assert_status(206);
+            assert_eq!(part.body, file[span.clone()], "{name}: {header}");
+            part.assert_header(
+                "content-range",
+                &format!("bytes {}-{}/{len}", span.start, span.end - 1),
+            );
+            part.assert_header("content-length", &span.len().to_string());
+            part.assert_header("etag", &strong);
+            part.assert_header("repr-digest", &repr_digest);
+        }
+        let beyond = server.request("GET", &target, &[("range", &format!("bytes={len}-"))]);
+        beyond.assert_status(416);
+        beyond.assert_header("content-range", &format!("bytes */{len}"));
+
+        // A resume naming this artifact continues it; one naming any other —
+        // `data.hdt` of the same release, say — gets the whole file instead.
+        let resumed = server.request(
+            "GET",
+            &target,
+            &[("range", "bytes=16-"), ("if-range", &strong)],
+        );
+        resumed.assert_status(206);
+        assert_eq!(resumed.body, file[16..], "{name}");
+        let hdt_tag = server
+            .request("HEAD", "/fed/v/v1/export/data.hdt", &[])
+            .header("etag")
+            .expect("the HDT's tag");
+        assert_ne!(hdt_tag, strong, "{name} shares a validator with data.hdt");
+        let spliced = server.request(
+            "GET",
+            &target,
+            &[("range", "bytes=16-"), ("if-range", &hdt_tag)],
+        );
+        spliced.assert_status(200);
+        assert_eq!(spliced.body, file, "{name}");
+
+        // Conditional requests: the client that already holds it, and the one
+        // asserting it holds something else.
+        let unchanged = server.request("GET", &target, &[("if-none-match", &strong)]);
+        unchanged.assert_status(304);
+        assert!(unchanged.body.is_empty(), "{name}");
+        unchanged.assert_header("etag", &strong);
+        unchanged.assert_cache_control(&immutable);
+        let dated = server.request(
+            "GET",
+            &target,
+            &[("if-modified-since", "Fri, 09 Jan 2026 09:00:00 GMT")],
+        );
+        dated.assert_status(304);
+        let refused = server.request("GET", &target, &[("if-match", &hdt_tag)]);
+        refused.assert_status(412);
+        assert_eq!(refused.json()["code"], "precondition_failed");
+        server
+            .request("GET", &target, &[("if-match", &strong)])
+            .assert_status(200);
+
+        // A client that prefers a coding gets one, decoding to the artifact.
+        let coded = server.request(
+            "GET",
+            &target,
+            &[("accept-encoding", "zstd, identity;q=0.5")],
+        );
+        coded.assert_status(200);
+        coded.assert_header("content-encoding", "zstd");
+        coded.assert_header("etag", &format!("W/{strong}"));
+        assert_eq!(
+            zstd::stream::decode_all(coded.content().as_slice()).unwrap(),
+            file,
+            "{name}"
+        );
+
+        // Like every other resource, it has no methods but GET and HEAD, and
+        // `latest` names it by redirect.
+        server.request("POST", &target, &[]).assert_status(405);
+        let latest = server.get(&format!("/fed/latest/export/{name}"));
+        latest.assert_status(307);
+        latest.assert_header("location", &target);
+    }
+
+    // The manifest page links every one of them, and the release's links in
+    // the descriptor stay as they were: the manifest names the files, and
+    // `export/` followed by the name is the whole rule.
+    let page = server.request("GET", "/fed/v/v1/manifest", &[("accept", "text/html")]);
+    let linked = links(&page.text());
+    for (name, _) in artifacts {
+        let target = format!("/fed/v/v1/export/{name}");
+        assert!(
+            linked.iter().any(|(href, _)| *href == target),
+            "the manifest page links {target}"
+        );
+    }
+    let descriptor = server.get("/").json();
+    let release_links = descriptor["datasets"][0]["links"].as_object().unwrap();
+    assert_eq!(release_links["hdt"], "/fed/v/v1/export/data.hdt");
+    assert!(
+        release_links
+            .keys()
+            .all(|key| !key.contains("filter") && !key.contains("key")),
+        "{release_links:?}"
+    );
+
+    // A download of one is recorded by what it was, never by a client's text.
+    let records = log.records();
+    let sketch = records
+        .iter()
+        .map(|record| serde_json::to_value(record).unwrap())
+        .find(|record| {
+            record["method"] == "GET"
+                && record["status"] == 206
+                && record["shape"]["artifact"] == "filters/subjects.minhash"
+        })
+        .expect("a ranged sketch download is recorded");
+    assert_eq!(sketch["operation"], "export");
+    assert_eq!(sketch["route"], "/{dataset}/v/{version}/export/{*artifact}");
+    assert_eq!(
+        sketch["shape"],
+        serde_json::json!({"artifact": "filters/subjects.minhash", "coding": "identity", "ranges": 1})
+    );
+}
+
+/// A path below `export/` that a release's manifest does not list is a 404
+/// saying what the release does export — whether the bundle has every
+/// federation artifact or none of them.
+#[test]
+fn a_path_a_manifest_does_not_list_is_not_a_download() {
+    let deployment = Deployment::new();
+    deployment.publish_built_quads("fed", "v1", WORKED_EXAMPLE_NQ, "2026-01-09T09:00:00Z");
+    // Assembled by hand from an HDT and its index, as a bundle may be: no
+    // `filters/`, no `keysets/`, and a manifest that lists neither.
+    deployment.publish("tox", "v1", TINY_NT, "2026-01-09T09:00:00Z");
+    let server = deployment.serve();
+
+    let exported = |dataset: &str| -> Vec<String> {
+        let manifest = server.get(&format!("/{dataset}/v/v1/manifest")).json();
+        manifest["artifacts"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|name| {
+                *name == "data.hdt" || name.starts_with("filters/") || name.starts_with("keysets/")
+            })
+            .cloned()
+            .collect()
+    };
+    let built = exported("fed");
+    assert!(
+        built.len() > 1,
+        "the build writes filters and key sets: {built:?}"
+    );
+    assert_eq!(exported("tox"), ["data.hdt"]);
+
+    // Every name the manifest lists under those directories is served, and
+    // the 404 for anything else names them all.
+    for name in &built {
+        server
+            .request("HEAD", &format!("/fed/v/v1/export/{name}"), &[])
+            .assert_status(200);
+    }
+    for unlisted in [
+        // Artifacts of the bundle that are not downloads.
+        "data.hdt.perm",
+        "manifest.json",
+        "data.hdt.text",
+        "stats/summary.md",
+        // A role the bundle profile does not build, and a kind no role has.
+        "keysets/terms.keys",
+        "filters/subjects.keys",
+        // A directory, a doubled separator, and a way out of the directory.
+        "filters/",
+        "filters//subjects.filter",
+        "filters/../data.hdt",
+        "nonsense",
+    ] {
+        let missing = server.get(&format!("/fed/v/v1/export/{unlisted}"));
+        missing.assert_status(404);
+        let problem = missing.json();
+        assert_eq!(problem["code"], "not_found", "{unlisted}");
+        let detail = problem["detail"].as_str().unwrap();
+        for name in &built {
+            assert!(detail.contains(name.as_str()), "{unlisted}: {detail}");
+        }
+        assert!(detail.contains("/fed/v/v1/export/{name}"), "{detail}");
+        assert!(detail.contains("/fed/v/v1/manifest"), "{detail}");
+        // A HEAD is refused the same way, without a body.
+        server
+            .request("HEAD", &format!("/fed/v/v1/export/{unlisted}"), &[])
+            .assert_status(404);
+    }
+
+    // A bundle built without them refuses the same paths, lists only what it
+    // has, and goes on serving that.
+    for name in built.iter().filter(|name| *name != "data.hdt") {
+        let missing = server.get(&format!("/tox/v/v1/export/{name}"));
+        missing.assert_status(404);
+        let problem = missing.json();
+        assert_eq!(problem["code"], "not_found", "{name}");
+        let detail = problem["detail"].as_str().unwrap();
+        assert!(detail.contains("it exports data.hdt, each at"), "{detail}");
+    }
+    let hdt = server.get("/tox/v/v1/export/data.hdt");
+    hdt.assert_status(200);
+    assert_eq!(
+        hdt.body,
+        std::fs::read(deployment.bundle("tox", "v1").join("data.hdt")).unwrap()
+    );
+    server.get("/tox/v/v1/count").assert_status(200);
+
+    // A path that is not under `export/` at all is the router's 404, whose
+    // list of a version's resources names the downloads by pattern.
+    let unrouted = server.get("/fed/v/v1/filters/subjects.filter");
+    unrouted.assert_status(404);
+    let detail = unrouted.json()["detail"].as_str().unwrap().to_owned();
+    for resource in [
+        "export/data.hdt",
+        "export/filters/{role}.filter",
+        "export/filters/{role}.minhash",
+        "export/keysets/{role}.keys",
+    ] {
+        assert!(detail.contains(resource), "{resource}: {detail}");
+    }
+}
+
+/// A federation download is a download: it takes a slot from the gate
+/// `data.hdt` takes one from, counted against the same client.
+#[test]
+fn a_filter_download_takes_a_slot_from_the_download_gate() {
+    let deployment = Deployment::new();
+    deployment.publish(
+        "big",
+        "v1",
+        &incompressible_nt(32 << 20),
+        "2026-01-09T09:00:00Z",
+    );
+    deployment.publish_built_quads("fed", "v1", WORKED_EXAMPLE_NQ, "2026-01-09T09:00:00Z");
+    let server = deployment.serve_configured(|config| {
+        config.trusted_proxies = 1;
+        config.admission.max_downloads_per_client = 1;
+    });
+    let filter = "/fed/v/v1/export/filters/subjects.filter";
+
+    // One client's only slot, held by an HDT it is not reading.
+    let stalled = server.stall(
+        "GET",
+        "/big/v/v1/export/data.hdt",
+        &[("x-forwarded-for", "192.0.2.1")],
+    );
+    assert!(
+        stalled.status_line.contains(" 200 "),
+        "{}",
+        stalled.status_line
+    );
+
+    let refused = server.request("GET", filter, &[("x-forwarded-for", "192.0.2.1")]);
+    refused.assert_status(429);
+    assert_eq!(refused.json()["code"], "rate_limited");
+    refused.assert_header("retry-after", "30");
+    // What streams nothing takes no slot: a HEAD, and a revalidation.
+    let head = server.request("HEAD", filter, &[("x-forwarded-for", "192.0.2.1")]);
+    head.assert_status(200);
+    let tag = head.header("etag").expect("a validator");
+    server
+        .request(
+            "GET",
+            filter,
+            &[("x-forwarded-for", "192.0.2.1"), ("if-none-match", &tag)],
+        )
+        .assert_status(304);
+    // Another client is not held to the first one's limit.
+    server
+        .request("GET", filter, &[("x-forwarded-for", "192.0.2.2")])
+        .assert_status(200);
+    drop(stalled);
+}
+
 /// A full-body download is sent uncompressed to every client that has not
 /// said it prefers otherwise — which is every client's default — and
 /// compressed for one that has, decoding to the artifact exactly.
@@ -2198,7 +2565,7 @@ fn a_download_is_recorded_by_its_shape() {
     let exports: Vec<_> = records
         .iter()
         .filter(|record| {
-            record.route.as_deref() == Some("/{dataset}/v/{version}/export/{artifact}")
+            record.route.as_deref() == Some("/{dataset}/v/{version}/export/{*artifact}")
         })
         .map(|record| serde_json::to_value(record).unwrap())
         .collect();
@@ -2372,7 +2739,7 @@ fn a_download_left_partway_is_recorded_with_what_was_sent() {
     let log = RecordingAccessLog::default();
     let server = deployment.serve_with_access(Arc::new(log.clone()), false);
     let target = "/big/v/v1/export/data.hdt";
-    let export_route = Some("/{dataset}/v/{version}/export/{artifact}");
+    let export_route = Some("/{dataset}/v/{version}/export/{*artifact}");
     let length: u64 = server
         .request("HEAD", target, &[])
         .header("content-length")

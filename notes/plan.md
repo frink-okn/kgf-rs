@@ -2556,7 +2556,9 @@ fixed, two recorded below as open.
   so a multi-gigabyte transfer faults every page of it into the pod's page cache and can
   push other bundles' hot index pages out. Reading downloads with `pread` and dropping
   the pages behind (`posix_fadvise(DONTNEED)`) would avoid it, at the cost of a second
-  read path. Worth measuring on the largest bundles before building.
+  read path. Worth measuring on the largest bundles before building. Unit 39 measured the
+  resident size and widened the exposure: the federation artifacts are never read by a
+  query, so a download of one is all cold pages.
 
 ### 32. The human view, revisited — an idea
 
@@ -3379,6 +3381,156 @@ bundle in one page. It never
 stopped a page in these runs: each filled its 10,000 values first. On a bundle with
 10⁸ subjects, a rare predicate's subjects would take about a hundred budget-limited
 pages. That is the case the deferred (subject, predicate) index would fix.
+
+### 39. The federation artifacts as downloads — `/export/filters/…`, `/export/keysets/…` ✅
+
+**Implemented 2026-11-13.** The federation index (`../kgf` doc 07 §7.5 item 39) is a
+crawler over KGF servers, and its second release probes each dataset's membership
+filters and computes overlap from sketches and key sets (doc 05 §5.2.2, ingest step 4).
+It has to fetch those from a server: the bundle bucket is private. Release 0.6.0 listed
+them in every manifest, with `bytes`, `sha256` and `keys`, and answered 404 for each.
+This unit serves them.
+
+**What landed.** `GET|HEAD /{dataset}/v/{version}/export/{name}`, where `{name}` is the
+artifact's name in the bundle: `data.hdt` as before, and now
+`filters/{role}.filter`, `filters/{role}.minhash` and `keysets/{role}.keys`.
+
+- *One download, unchanged.* The new paths go through unit 31's handler, `Delivery`
+  and body, so every property there holds for them without a second implementation:
+  byte ranges and multipart, `If-Range` and the other preconditions in RFC 9110's
+  order, the artifact's SHA-256 as a strong `ETag` and as `Repr-Digest`,
+  `Last-Modified` from the manifest's `created`, immutable `no-transform` caching, a
+  coded body only for a client that weights one above identity, CORS, the access
+  record written when the body ends, the download gate, and the work gate for each
+  chunk. `g` is read as it is for `data.hdt`: these files are built over the whole
+  dictionary, so the union is what they hold.
+- *The route is a wildcard,* `export/{*artifact}`, because most of the names have a
+  directory in them. The access record's `route` changes spelling with it, from
+  `…/export/{artifact}` to `…/export/{*artifact}`; `operation` is still `export`, and
+  `shape.artifact` is the name in the bundle (`filters/subjects.minhash`).
+- *`ExportArtifact` is a closed vocabulary:* `Hdt`, and `Keys(KeyFile)` for the ten
+  names in `kgf_store::store::artifact::{FILTERS, KEYSETS}`. A request path is compared
+  against those names and is never joined to a directory.
+- *The manifest says which of them a release has.* `export::published` runs at
+  startup and keeps, for each name in the vocabulary, the size and digest the manifest
+  lists. `data.hdt` is still required. A listed file whose checksum is not 64 hex
+  digits stops the server, as it does for `data.hdt`, rather than being left out: a
+  reader of the manifest was told the file is there.
+- *The store maps them.* `Store::open` maps each `filters/` and `keysets/` file the
+  bundle carries, and `Store::key_artifact_bytes(name)` hands one out whole. Nothing in
+  `kgf-store` reads a byte of them, and no header is parsed: both formats require
+  their CRC32C before any field is interpreted, which is a pass over the file. The
+  cost is at most ten more mappings per open bundle, of address space. Mapped at open
+  rather than on a request so that `Store` stays immutable and the soundness argument
+  for mapping is untouched: a mapping made per download would be one no `Store` owns,
+  which is not what the `PublishedBundle` promise is written to cover. The closed-name
+  check now requires a regular file, so a directory or an empty file under one of
+  these names refuses the bundle at open where it used to be found by `kgf manifest`.
+- *Before streaming,* the handler checks that the store maps the artifact at the
+  manifest's length. A manifest listing a file the bundle lacks is a 500 naming it, and
+  is logged; it means the two were written apart.
+- *A 404 names what exists.* A path below `export/` that the release does not serve
+  lists the ones it does, by name — at most eleven — with the URL pattern and the
+  manifest to read them from. The router's own 404 lists the three patterns beside
+  `export/data.hdt`.
+- *Served as* `application/octet-stream`, since none of the three formats has a media
+  type, and saved as `{dataset}-{version}.{file name}` (`tox-v1.subjects.minhash`):
+  the extension alone would save a release's subject and object filters over each
+  other.
+- *The manifest page* lists every download with its size and digest, and keeps one
+  worked `curl` command, for `data.hdt`.
+
+**Decided: the two directories, not every single-file artifact.** The manifest also
+lists `data.hdt.perm`, the graph and triple-term sidecars, and the eight description
+files, all single files the store already maps. They stay unexported, for three
+reasons.
+
+- *Who reads them.* A filter, a sketch and a key set exist for a reader that does not
+  hold the bundle; serving them whole is the only use this server has for them. The
+  sidecars are indexes over `data.hdt` that hdtc rebuilds from it, so a download would
+  move bytes the client can compute, and the largest of them is larger than the HDT.
+  The description set already has routes (`/void`, `/schema`, `/summary`).
+- *Their URLs are not settled.* Doc 03 §3.4.11 names the description artifacts flat
+  (`export/void.hdt`) where the bundle has `stats/void.hdt`, and names a
+  `export/dictionary` that is no file at all. Serving every manifest entry at its
+  bundle path would decide that by accident. For the two directories the spec's paths
+  and the bundle's already agree.
+- *A closed list is what keeps a request path away from the filesystem,* and keeps the
+  access record's artifact a name this build chose. "Whatever the manifest lists"
+  would make both depend on what a publisher wrote.
+
+Adding one later is a variant of `ExportArtifact` and an accessor on `Store`. A
+manifest written elsewhere that lists a name outside the vocabulary — hdtc's
+experimental `keysets/terms.keys`, say — gets a 404 for it, and `Store` does not map
+it; that is the same closed list `kgf manifest` checksums from.
+
+**Decided: discovery is the manifest plus one rule, with no new links.** The path
+below `export/` is the key in the manifest's `artifacts`. Since the manifest is at
+`…/v/{version}/manifest`, the download is the relative reference `export/{key}`
+resolved against the manifest's own URL, so a client needs no template. The release
+links keep `hdt` and gain nothing:
+
+- A client cannot use one of these files without the manifest entry beside it — the
+  size and SHA-256 to verify against, and the `keys` block saying which convention and
+  hash make two files comparable — so a link would save no request.
+- Up to ten links a release would be added to every entry of the service descriptor,
+  the document a client loads first, for artifacts only a crawler reads.
+- The strong `ETag` is `"sha256:{hex}"` over the manifest's `sha256`, so a client can
+  build `If-Range` for a resume from the manifest alone.
+
+**Decided: `export` stays undeclared, and nothing is gated on it.** Unit 31's reason
+holds: doc 03's `export` still names artifacts this build does not serve
+(`dictionary`, the description files, Parquet partitions), and declaring a capability
+commits to all of it (question 81). Rule 8 is satisfied without it. These artifacts
+*can* be absent, and what stands in for a gate is the manifest's `artifacts`, read at
+startup, before any bundle is opened. The refusal is a 404 rather than
+`capability_not_available`, because the URL names a file this release does not have,
+not an operation this bundle cannot perform. A reader without the bundle already
+learns that the files exist from the `filters` and `keysets` capabilities, and which
+ones from `artifacts`. Question 106 is what a spec change would have to say.
+
+**Size.** The Wikidata bundle has two 5 GB filters and an 8.7 GB key set.
+
+- *Nothing reads an artifact whole.* Startup reads manifests and nothing else, so the
+  length, validators and digest are fixed without opening a file. `Store::open` maps
+  and reads no page. The handler compares two lengths. The body copies at most 512 KiB
+  per chunk and does not produce the next one until the connection has taken the
+  last. `kgf serve` hashes nothing.
+- *Measured* on a debug build, macOS, loopback: a 6 GiB sparse file put in place of a
+  demo bundle's `keysets/shared.keys`, with the manifest's `bytes` edited to match.
+  Whole in 2.7 s, its last gigabyte by range, and whole again zstd-coded. The process's
+  physical footprint peaked at 12.5 MB. Its resident size reached 6.2 GB, which is the
+  mapping's clean pages and is unit 31's open **page-cache pressure** item, now with a
+  number: a download makes every page of its artifact resident until the kernel takes
+  it back. It weighs more here than for an HDT, because no query ever reads these
+  files, so none of their pages is warm. `pread` with `posix_fadvise(DONTNEED)`
+  remains the fix if `major_faults` on query records shows one is needed. The sparse
+  file's digest was not the manifest's, which the server does not check.
+- *The gateway's hour* is per response: 1.4 MB/s for a 5 GB filter and 2.4 MB/s for
+  the key set, sustained. `deploy/gke/README.md` has the table and what a client does
+  when it is cut off.
+
+*Verified by* unit tests of the vocabulary (every name round-trips, and no other path
+parses, including ones that would escape a directory), of which artifacts a manifest
+publishes, and of the store mapping exactly the files a bundle carries; and over a
+socket against a bundle `kgf build` wrote, for a filter, a sketch and a key set: the
+whole file against the manifest's size and SHA-256, `HEAD`, three range forms, `416`,
+`If-Range` with the artifact's tag and with `data.hdt`'s, `304` by tag and by date,
+`412`, a zstd body decoded back, `405`, the `latest` redirect, CORS headers, the
+manifest page's links, and the access record. A second test covers the 404 for ten
+unlisted paths on a bundle with the artifacts and for every one of them on a bundle
+without, which still serves its HDT. A third holds a client's only slot with a stalled
+HDT and sees a filter refused 429, its `HEAD` and `304` answered, and another client
+served. Against the local `demo` corpus: 84 artifacts of 12 datasets fetched and
+matched to their manifests, each resumed from its midpoint with an `If-Range` built
+from the manifest.
+
+**Not done.**
+- No run against a real multi-gigabyte artifact or through the gateway; the 6 GiB
+  measurement is synthetic and local.
+- The crawler's half is not written here: resuming with `Range` and `If-Range`,
+  staying within four connections, and honouring `429` with `Retry-After`.
+- Directory artifacts (`data.hdt.text`) are not exported.
 
 ## Testing spine
 
@@ -4617,6 +4769,41 @@ following the code.
     place in a sample as an IRI does, keyed by its IRI, which its content fixes.
     Whether a reifier with no label of its own should take its triple term's reading
     as its label is left to doc 13's embedding view.
+
+106. **§3.4.11 should say how the federation artifacts are addressed, found and
+    refused.** Unit 39 serves `filters/{role}.filter`, `filters/{role}.minhash` and
+    `keysets/{role}.keys` from `export/`. What the spec would need to say for a
+    consumer to rely on it:
+    - *Address.* The path below `export/` is the artifact's key in the manifest's
+      `artifacts`, so the download is `export/{key}` relative to the manifest's URL.
+      The two directories already read that way in §3.4.11. The description files do
+      not (`export/void.hdt` against `stats/void.hdt`), and `export/dictionary` is not
+      a file; the section should either adopt the bundle path for every artifact or
+      say where the other names come from. This implementation exports none of those
+      until it does.
+    - *Discovery.* The manifest is the listing: no link relation per artifact. A
+      consumer needs the entry's `bytes`, `sha256` and `keys` beside the file anyway.
+    - *Absence.* A path the manifest does not list is `404 not_found`, not
+      `capability_not_available`: it names a file the release does not have.
+    - *The capability.* `export` cannot be declared honestly while its list mixes a
+      required artifact, optional ones and a later-phase one (question 81). Proposed:
+      drop it as a bundle capability. `data.hdt` is always there; `filters` and
+      `keysets` already say those files are; `artifacts` says which. What a
+      *deployment* routes is the other half, and a deployment that mirrors bundles
+      without serving downloads has nowhere to say so short of the 404. If that needs
+      stating it belongs in the service descriptor, not the manifest.
+    - *The validator is constructible.* Question 82 asks that the `ETag` be exactly the
+      checksum. For these artifacts a client builds `If-Range` from the manifest before
+      its first request, so the spelling itself — `"sha256:{hex}"` — has to be
+      normative, not only the value.
+    - *Media type.* Served as `application/octet-stream`. hdtc's sketch and key-set
+      formats register no type; if one is wanted it is hdtc's to name.
+    - *Cost and the client's duty.* These downloads run to gigabytes (doc 05 §5.2.4.1),
+      and a gateway may bound one response in time. §3.5 should say a download is
+      outside the response budgets and bounded by a download gate (question 81 again),
+      and doc 05 §5.2.2's limits on the crawler should say it resumes an interrupted
+      artifact by range with `If-Range`, keeps within a server's per-client download
+      limit, and verifies the assembled file against the manifest.
 
 ## Not in this plan
 

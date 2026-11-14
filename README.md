@@ -41,3 +41,7 @@ variables inside (`o=<<( ex:s ?p ?o )>>`) under a candidate budget.
 (`curl -C -`) and verifiable by its SHA-256 `ETag` and `Repr-Digest`. It is sent
 uncompressed, so every client can size and resume it; a client that weights zstd or
 gzip above identity (`Accept-Encoding: zstd, identity;q=0.5`) gets a compressed body.
+The membership filters, overlap sketches and key sets a release's manifest lists
+download the same way, each at its name in the bundle
+(`/export/filters/subjects.minhash`, `/export/keysets/shared.keys`), so a federation
+index can fetch them from the server and check them against the manifest.

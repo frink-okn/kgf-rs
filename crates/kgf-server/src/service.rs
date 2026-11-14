@@ -466,8 +466,7 @@ impl Datasets {
             // Every download's validator and digest come from here, so a
             // manifest that cannot supply them is refused with the rest of its
             // defects rather than discovered by the first client to ask.
-            let hdt =
-                ArtifactIdentity::from_manifest(&manifest, ExportArtifact::Hdt).map_err(&refuse)?;
+            let exports = crate::export::published(&manifest).map_err(&refuse)?;
 
             datasets.entry(id.dataset).or_default().insert(
                 id.version,
@@ -481,7 +480,7 @@ impl Datasets {
                     // allocate a hundred strings to read something fixed.
                     prefixes: PrefixMap::from_manifest(&manifest),
                     predicate_roles,
-                    hdt,
+                    exports,
                     manifest: published,
                 },
             );
@@ -760,7 +759,9 @@ pub struct Release {
     created: Option<Instant>,
     prefixes: PrefixMap,
     predicate_roles: PredicateRoles,
-    hdt: ArtifactIdentity,
+    /// What this release serves whole: `data.hdt` first, then the `filters/`
+    /// and `keysets/` files its manifest lists.
+    exports: Vec<(ExportArtifact, ArtifactIdentity)>,
     manifest: PublishedManifest,
 }
 
@@ -817,11 +818,18 @@ impl Release {
         self.manifest.parsed.declares(capability)
     }
 
-    /// The length and digest of an artifact this release serves whole.
-    pub fn export(&self, artifact: ExportArtifact) -> &ArtifactIdentity {
-        match artifact {
-            ExportArtifact::Hdt => &self.hdt,
-        }
+    /// The length and digest of an artifact this release serves whole, or
+    /// `None` for one its manifest does not list.
+    pub fn export(&self, artifact: ExportArtifact) -> Option<&ArtifactIdentity> {
+        self.exports
+            .iter()
+            .find(|(exported, _)| *exported == artifact)
+            .map(|(_, identity)| identity)
+    }
+
+    /// Everything this release serves whole, `data.hdt` first.
+    pub fn exports(&self) -> &[(ExportArtifact, ArtifactIdentity)] {
+        &self.exports
     }
 
     /// When this release was published, as `Last-Modified` states it.

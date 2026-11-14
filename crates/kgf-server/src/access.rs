@@ -1376,7 +1376,7 @@ fn operation_for_route(route: &str) -> Option<AccessOperation> {
         "/{dataset}/v/{version}/summary" => Some(AccessOperation::Summary),
         "/{dataset}/v/{version}/labels" => Some(AccessOperation::Labels),
         "/{dataset}/v/{version}/verbalize" => Some(AccessOperation::Verbalize),
-        "/{dataset}/v/{version}/export/{artifact}" => Some(AccessOperation::Export),
+        crate::routes::EXPORT_ROUTE => Some(AccessOperation::Export),
         _ => None,
     }
 }
@@ -1469,10 +1469,11 @@ mod tests {
     fn every_versioned_operation_is_recoverable_from_its_route() {
         for &operation in AccessOperation::VERSIONED {
             // A download's route names its artifact below the operation
-            // segment; every other operation is the last segment itself.
+            // segment, by a path that may itself have segments; every other
+            // operation is the last segment itself.
             let route = match operation {
                 AccessOperation::Export => format!(
-                    "/{{dataset}}/v/{{version}}/{}/{{artifact}}",
+                    "/{{dataset}}/v/{{version}}/{}/{{*artifact}}",
                     operation.path_segment()
                 ),
                 _ => format!("/{{dataset}}/v/{{version}}/{}", operation.path_segment()),
