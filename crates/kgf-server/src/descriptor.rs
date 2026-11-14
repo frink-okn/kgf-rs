@@ -525,8 +525,8 @@ pub struct BundleManifest {
     parsed: std::sync::Arc<Manifest>,
     /// What the release serves whole, as the downloads themselves identify it
     /// — so the page shows the digest the `ETag` carries, not a second reading
-    /// of the manifest's text.
-    downloads: Vec<(ExportArtifact, ArtifactIdentity)>,
+    /// of the manifest's text. Shared with the release, not copied per page.
+    downloads: std::sync::Arc<[(ExportArtifact, ArtifactIdentity)]>,
 }
 
 impl BundleManifest {
@@ -538,7 +538,7 @@ impl BundleManifest {
         version: &str,
         published: bytes::Bytes,
         parsed: std::sync::Arc<Manifest>,
-        downloads: Vec<(ExportArtifact, ArtifactIdentity)>,
+        downloads: std::sync::Arc<[(ExportArtifact, ArtifactIdentity)]>,
     ) -> Self {
         Self {
             mount,
@@ -608,18 +608,18 @@ impl Resource for BundleManifest {
         // One worked command, for the dataset itself: the page is a person's
         // way in, and what a person downloads is `data.hdt`. Every other row
         // is fetched the same way, by the program that wants it, from the name
-        // in the table.
-        let download_commands: Vec<(String, String)> = self
+        // in the table. None when the release withholds its HDT.
+        let hdt = ExportArtifact::Hdt;
+        let download_command = self
             .downloads
             .iter()
-            .filter(|(artifact, _)| *artifact == ExportArtifact::Hdt)
-            .map(|(artifact, _)| {
+            .any(|(artifact, _)| *artifact == hdt)
+            .then(|| {
                 (
-                    artifact.saved_name(&self.dataset, &self.version),
-                    unmounted.export(&self.dataset, &self.version, artifact.name()),
+                    hdt.saved_name(&self.dataset, &self.version),
+                    unmounted.export(&self.dataset, &self.version, hdt.name()),
                 )
-            })
-            .collect();
+            });
         let federation_downloads = self
             .downloads
             .iter()
@@ -777,9 +777,9 @@ impl Resource for BundleManifest {
                         ))
                     }
                     (table(&["Artifact", "Bytes", "SHA-256"], &download_rows))
-                    pre {
-                        code {
-                            @for (saved, href) in &download_commands {
+                    @if let Some((saved, href)) = &download_command {
+                        pre {
+                            code {
                                 "curl -fL -C - -o " (saved) " \"$KGF" (href) "\"\n"
                                 "shasum -a 256 " (saved) "\n"
                             }
@@ -959,14 +959,15 @@ mod tests {
         )
     }
 
-    fn downloads() -> Vec<(ExportArtifact, ArtifactIdentity)> {
-        vec![
+    fn downloads() -> std::sync::Arc<[(ExportArtifact, ArtifactIdentity)]> {
+        [
             (ExportArtifact::Hdt, ArtifactIdentity::new(912, [0xab; 32])),
             (
                 ExportArtifact::from_path("filters/subjects.minhash").unwrap(),
                 ArtifactIdentity::new(64, [0xcd; 32]),
             ),
         ]
+        .into()
     }
 
     #[test]

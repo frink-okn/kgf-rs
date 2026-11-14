@@ -142,6 +142,18 @@ fn assert_encoding_vary(response: &Response, context: &str) {
     );
 }
 
+/// The counterpart for a resource with one coding: `Vary` may name what CORS
+/// varies on, but not `Accept-Encoding`.
+fn assert_no_encoding_vary(response: &Response, context: &str) {
+    let vary = response.header("vary").unwrap_or_default();
+    assert!(
+        !vary
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("accept-encoding")),
+        "Vary must not name accept-encoding for {context}, got {vary:?}"
+    );
+}
+
 #[test]
 fn the_url_space_answers_over_a_real_listener() {
     let deployment = Deployment::new();
@@ -2139,7 +2151,8 @@ fn the_filters_sketches_and_key_sets_a_manifest_lists_are_downloads_too() {
             &format!("attachment; filename=\"{saved}\""),
         );
         whole.assert_cache_control(&immutable);
-        assert_encoding_vary(&whole, name);
+        // One representation, so nothing for a cache to vary on by coding.
+        assert_no_encoding_vary(&whole, name);
         assert_eq!(whole.header("content-encoding"), None, "{name}");
         whole.assert_header("access-control-allow-origin", "*");
         whole.assert_header("access-control-expose-headers", "*");
@@ -2230,20 +2243,18 @@ fn the_filters_sketches_and_key_sets_a_manifest_lists_are_downloads_too() {
             .request("GET", &target, &[("if-match", &strong)])
             .assert_status(200);
 
-        // A client that prefers a coding gets one, decoding to the artifact.
-        let coded = server.request(
-            "GET",
-            &target,
-            &[("accept-encoding", "zstd, identity;q=0.5")],
-        );
-        coded.assert_status(200);
-        coded.assert_header("content-encoding", "zstd");
-        coded.assert_header("etag", &format!("W/{strong}"));
-        assert_eq!(
-            zstd::stream::decode_all(coded.content().as_slice()).unwrap(),
-            file,
-            "{name}"
-        );
+        // A client that prefers a coding still gets the file as published:
+        // these bytes do not compress, so coding them would only cost the
+        // length and the strong validator.
+        for preference in ["zstd, identity;q=0.5", "gzip;q=1, identity;q=0"] {
+            let offered = server.request("GET", &target, &[("accept-encoding", preference)]);
+            offered.assert_status(200);
+            assert_eq!(offered.header("content-encoding"), None, "{name}");
+            offered.assert_header("content-length", &len.to_string());
+            offered.assert_header("etag", &strong);
+            assert_no_encoding_vary(&offered, name);
+            assert_eq!(offered.body, file, "{name}");
+        }
 
         // Like every other resource, it has no methods but GET and HEAD, and
         // `latest` names it by redirect.
@@ -2345,6 +2356,9 @@ fn a_path_a_manifest_does_not_list_is_not_a_download() {
         "filters/",
         "filters//subjects.filter",
         "filters/../data.hdt",
+        // A listed name spelled with escapes: one artifact, one URL.
+        "filters%2Fsubjects.filter",
+        "data%2Ehdt",
         "nonsense",
     ] {
         let missing = server.get(&format!("/fed/v/v1/export/{unlisted}"));
@@ -2362,6 +2376,14 @@ fn a_path_a_manifest_does_not_list_is_not_a_download() {
             .request("HEAD", &format!("/fed/v/v1/export/{unlisted}"), &[])
             .assert_status(404);
     }
+
+    // A graph scope is refused by what the artifact is: no graph has a filter
+    // of its own, and `/fragment` would not give it one.
+    let scoped = server.get("/fed/v/v1/export/filters/subjects.filter?g=*");
+    scoped.assert_status(501);
+    let detail = scoped.json()["detail"].as_str().unwrap().to_owned();
+    assert!(detail.contains("filters/subjects.filter"), "{detail}");
+    assert!(!detail.contains("/fragment"), "{detail}");
 
     // A bundle built without them refuses the same paths, lists only what it
     // has, and goes on serving that.
@@ -2393,6 +2415,100 @@ fn a_path_a_manifest_does_not_list_is_not_a_download() {
         "export/keysets/{role}.keys",
     ] {
         assert!(detail.contains(resource), "{resource}: {detail}");
+    }
+}
+
+/// A download the manifest lists but the bundle cannot serve as listed is
+/// withheld at startup, and nothing else is: the server starts, queries
+/// answer, the rest of the release downloads, and every request for it —
+/// whatever its method or preconditions — is a 500 naming the defect, never a
+/// `304` or `206` decided from the manifest alone.
+#[test]
+fn a_listed_download_the_bundle_cannot_serve_is_withheld_alone() {
+    let deployment = Deployment::new();
+    deployment.publish_built_quads("fed", "v1", WORKED_EXAMPLE_NQ, "2026-01-09T09:00:00Z");
+    let bundle = deployment.bundle("fed", "v1");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+    // Written apart from the manifest: one key set gone, another longer.
+    std::fs::remove_file(bundle.join("keysets/shared.keys")).unwrap();
+    let longer = bundle.join("keysets/subjects-only.keys");
+    let mut bytes = std::fs::read(&longer).unwrap();
+    bytes.extend_from_slice(b"appended");
+    std::fs::write(&longer, bytes).unwrap();
+    let server = deployment.serve();
+
+    for (name, says) in [
+        (
+            "keysets/shared.keys",
+            "the bundle has no keysets/shared.keys",
+        ),
+        ("keysets/subjects-only.keys", "and its manifest lists"),
+    ] {
+        let target = format!("/fed/v/v1/export/{name}");
+        let entry = &manifest["artifacts"][name];
+        let tag = format!("\"sha256:{}\"", entry["sha256"].as_str().unwrap());
+        let beyond = format!("bytes={}-", entry["bytes"]);
+        let asked: [(&str, &[(&str, &str)]); 5] = [
+            ("GET", &[]),
+            ("HEAD", &[]),
+            ("GET", &[("if-none-match", &tag)]),
+            ("GET", &[("range", "bytes=0-3")]),
+            ("GET", &[("range", &beyond)]),
+        ];
+        for (method, headers) in asked {
+            let response = server.request(method, &target, headers);
+            response.assert_status(500);
+            if method == "GET" {
+                let problem = response.json();
+                assert_eq!(problem["code"], "internal_error", "{name} {headers:?}");
+                let detail = problem["detail"].as_str().unwrap();
+                assert!(detail.contains("is not served"), "{detail}");
+                assert!(detail.contains(says), "{detail}");
+            }
+        }
+    }
+
+    // Everything else stands.
+    server.get("/fed/v/v1/count").assert_status(200);
+    for name in [
+        "data.hdt",
+        "filters/subjects.filter",
+        "keysets/objects-only.keys",
+    ] {
+        server
+            .request("HEAD", &format!("/fed/v/v1/export/{name}"), &[])
+            .assert_status(200);
+    }
+    let missing = server.get("/fed/v/v1/export/nonsense");
+    missing.assert_status(404);
+    let detail = missing.json()["detail"].as_str().unwrap().to_owned();
+    assert!(detail.contains("keysets/objects-only.keys"), "{detail}");
+    assert!(!detail.contains("keysets/shared.keys"), "{detail}");
+    let page = server.request("GET", "/fed/v/v1/manifest", &[("accept", "text/html")]);
+    let linked = links(&page.text());
+    assert!(
+        !linked
+            .iter()
+            .any(|(href, _)| href == "/fed/v/v1/export/keysets/shared.keys"),
+        "a withheld download is not linked"
+    );
+
+    // A file changed under the running server — which a published bundle must
+    // never be, and which is safe here only because nothing has mapped it yet —
+    // is refused when a download maps it, not streamed under a digest it no
+    // longer has.
+    let changed = bundle.join("keysets/objects-only.keys");
+    let mut bytes = std::fs::read(&changed).unwrap();
+    bytes.truncate(bytes.len() / 2);
+    std::fs::write(&changed, bytes).unwrap();
+    for method in ["GET", "HEAD"] {
+        let response = server.request(method, "/fed/v/v1/export/keysets/objects-only.keys", &[]);
+        response.assert_status(500);
+        if method == "GET" {
+            let detail = response.json()["detail"].as_str().unwrap().to_owned();
+            assert!(detail.contains("does not match the length"), "{detail}");
+        }
     }
 }
 

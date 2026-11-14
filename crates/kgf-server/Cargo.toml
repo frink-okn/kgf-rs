@@ -67,3 +67,6 @@ kgf-store = { workspace = true, features = ["testing"] }
 # rely on rather than of our own code, and therefore worth a test that would
 # notice it changing.
 tower = "0.5"
+# A scratch directory for a test that examines a bundle directory's files
+# without building a bundle into it.
+tempfile.workspace = true

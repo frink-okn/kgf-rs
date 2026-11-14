@@ -63,7 +63,7 @@ use crate::admission::{AdmissionController, DownloadClient, WorkClass};
 use crate::answer::{self, Rendered, Renders, Target};
 use crate::descriptor::{BundleManifest, DatasetDescriptor, ServiceDescriptor};
 use crate::envelope::{ErrorCode, PROBLEM_MEDIA_TYPE, Problem, reflected};
-use crate::export::{Conditions, Decision, Delivery, ExportArtifact};
+use crate::export::{Conditions, Decision, Delivery, Export, ExportArtifact, Mapped};
 use crate::html::Resource;
 use crate::representation::{CachePolicy, Representation, etag, etag_for_body, negotiate};
 use crate::request;
@@ -651,7 +651,7 @@ async fn bundle_manifest(
         &version,
         release.manifest().bytes(),
         release.manifest().parsed(),
-        release.exports().to_vec(),
+        Arc::clone(release.exports()),
     );
 
     // The manifest itself is already in memory, but a bundle that cannot be
@@ -1123,9 +1123,11 @@ async fn summary(
 /// `GET|HEAD /{dataset}/v/{version}/export/{artifact}`: an artifact, whole or
 /// by range. See [`crate::export`] for the response's semantics.
 ///
-/// Which artifacts exist is the release's manifest's to say, and that is read
-/// at startup: a path naming none of them is a 404 that costs a comparison,
-/// and one that does is never turned into a file path.
+/// Which artifacts exist is the release's manifest's to say, checked against
+/// the bundle at startup: a path naming none of them is a 404 that costs a
+/// comparison, one the manifest lists but the bundle cannot serve is a 500
+/// naming the defect, and neither is ever turned into a file path. Both are
+/// answered before any precondition, so every method sees the same answer.
 ///
 /// Everything but the body is decided from the manifest before the bundle is
 /// opened, so a revalidation, a failed precondition, and an unsatisfiable range
@@ -1133,17 +1135,31 @@ async fn summary(
 /// only a response that streams takes.
 async fn export(
     State(service): State<Arc<Service>>,
-    Path((dataset, version, path)): Path<(String, String, String)>,
+    Path((dataset, version, _)): Path<(String, String, String)>,
     method: Method,
     uri: axum::http::Uri,
     headers: HeaderMap,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
 ) -> Result<Response, Problem> {
     let release = service.datasets().release(&dataset, &version)?;
-    let exported = ExportArtifact::from_path(&path)
-        .and_then(|artifact| Some((artifact, release.export(artifact)?)));
-    let Some((artifact, identity)) = exported else {
-        return Err(not_exported(&service, &dataset, &version, release, &path));
+    let path = raw_artifact_path(&uri);
+    let Some(artifact) = ExportArtifact::from_path(path) else {
+        return Err(not_exported(&service, &dataset, &version, release, path));
+    };
+    let identity = match release.export(artifact) {
+        Export::Served(identity) => identity,
+        Export::Withheld(defect) => {
+            return Err(Problem::new(
+                ErrorCode::InternalError,
+                format!(
+                    "{} is listed in this release's manifest but is not served: {defect}",
+                    artifact.name()
+                ),
+            ));
+        }
+        Export::Unlisted => {
+            return Err(not_exported(&service, &dataset, &version, release, path));
+        }
     };
     let mut observation = Observation::new(service.access(), AccessOperation::Export)
         .resolved(&dataset, Some(&version));
@@ -1156,6 +1172,7 @@ async fn export(
             service.config().limits(),
             release.prefixes(),
             release.declares(Capability::Graphs),
+            artifact,
         )
     });
     if let Err(problem) = parsed {
@@ -1169,7 +1186,7 @@ async fn export(
         identity,
         release.last_modified(),
     );
-    let conditions = Conditions::read(&headers, &method);
+    let conditions = Conditions::read(&headers, &method, artifact);
     let decision = conditions.decide(delivery.identity, delivery.last_modified);
     observation.shaped(conditions.shape(artifact, &decision));
     let (coding, extent) = match decision {
@@ -1211,28 +1228,45 @@ async fn export(
         }
     };
 
-    // Opened for a `HEAD` as well: a bundle that cannot be opened must not be
-    // described as downloadable, and the `HEAD` must answer as its `GET` would.
+    // Opened and mapped for a `HEAD` as well: an artifact that cannot be
+    // mapped must not be described as downloadable, and the `HEAD` must answer
+    // as its `GET` would. Mapping is a system call, so it shares the open's
+    // blocking task.
     let id = BundleId { dataset, version };
     let opened = Arc::clone(&service);
+    let len = identity.size();
     observation.work_class = Some(WorkClass::Ordinary);
     let open = blocking(service.admission(), WorkClass::Ordinary, move || {
-        opened.open_observed(&id)
+        let (store, timing) = opened.open_observed(&id)?;
+        Ok((Mapped::open(store, artifact, len), timing))
     })
     .await;
-    let store = match open {
-        Ok((store, open)) => {
+    let mapped = match open {
+        Ok((mapped, open)) => {
             observation.open_ms = Some(open.open_ms);
             observation.first_open = Some(open.first_open);
-            store
+            mapped
         }
         Err(problem) => return observed_result(Err(problem), observation),
     };
-    let response = match slot {
-        None => delivery.head(&store, coding),
-        Some(slot) => delivery.send(store, coding, &extent, slot, Ledger::current()),
-    };
+    let response = mapped.and_then(|mapped| match slot {
+        None => Ok(delivery.head(&mapped, coding)),
+        Some(slot) => delivery.send(mapped, coding, &extent, slot, Ledger::current()),
+    });
     observed_result(response, observation)
+}
+
+/// What a download's path names below `export/`, exactly as the client spelled
+/// it.
+///
+/// Read from the request's raw path because the router's capture is
+/// percent-decoded, and matching that would let `filters%2Fsubjects.filter`
+/// name `filters/subjects.filter` too, giving every artifact a second URL. The
+/// router matched `/{dataset}/v/{version}/export/{*artifact}` on this same raw
+/// path, and a raw segment holds no `/`, so the artifact is everything after
+/// the fifth separator.
+fn raw_artifact_path(uri: &axum::http::Uri) -> &str {
+    uri.path().splitn(6, '/').nth(5).unwrap_or_default()
 }
 
 /// The 404 for a path below `export/` that names nothing this release serves.

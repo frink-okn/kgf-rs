@@ -44,4 +44,5 @@ gzip above identity (`Accept-Encoding: zstd, identity;q=0.5`) gets a compressed 
 The membership filters, overlap sketches and key sets a release's manifest lists
 download the same way, each at its name in the bundle
 (`/export/filters/subjects.minhash`, `/export/keysets/shared.keys`), so a federation
-index can fetch them from the server and check them against the manifest.
+index can fetch them from the server and check them against the manifest. They do not
+compress, so they are always sent uncompressed, whatever `Accept-Encoding` says.

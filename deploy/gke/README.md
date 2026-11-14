@@ -145,6 +145,14 @@ sketches and key sets a federation index fetches — each at its name in the
 bundle (`export/filters/subjects.minhash`). The bucket is private, so this is
 the only way those artifacts leave the deployment. The server streams each from
 its mapping in 512 KiB chunks and holds none of it in memory, whatever its size.
+Filters, sketches and key sets are always sent uncompressed — they do not
+compress — so every one has a `Content-Length` and resumes by range.
+
+At startup the server checks every download a manifest lists against the
+bundle's file (present, a regular file, the listed length). One that fails is
+logged as `a download this release's manifest lists is withheld` and answers
+500 naming the defect; the rest of the deployment starts and serves. Only a
+`data.hdt` entry the manifest cannot identify stops startup.
 
 **The gateway ends any one response after an hour** (`backendpolicy.yaml`),
 counted from the request's first byte to the response's last. Each artifact is
@@ -178,7 +186,7 @@ Two more limits a bulk fetch meets:
   the answer is 429 with `Retry-After: 30`. A `HEAD`, a `304` and a `416` take
   none. A crawler fetching several artifacts, or one artifact in parallel
   ranges, should stay at or under four connections.
-- **Page cache.** A download reads through the same mapping queries use, and
+- **Page cache.** A download reads through the page cache queries use, and
   nothing a query does ever reads a filter or a key set, so every page of one
   comes off the disk cold and competes with the index pages the pod is
   serving from. A release's federation artifacts fetched once are a one-time

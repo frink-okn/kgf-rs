@@ -21,7 +21,7 @@ use crate::distinct::{DistinctLimits, DistinctPlan};
 use crate::error::{Error, Result};
 use crate::graphs::Graphs;
 use crate::indexed::IndexedHdt;
-use crate::map::{Mapping, PublishedBundle, open_published};
+use crate::map::{PublishedBundle, PublishedFile, open_published, open_published_file};
 use crate::pattern::{IdPattern, Selection};
 use crate::perm::Permutations;
 use crate::triple_terms::{TripleTermPattern, TripleTermSelection, TripleTerms};
@@ -71,44 +71,24 @@ pub mod artifact {
     /// Rendered Markdown LLM summary card.
     pub const SUMMARY_MD: &str = "stats/summary.md";
 
-    /// Every `filters/` file the sketch convention can produce.
-    ///
-    /// Enumerated rather than discovered by listing the directory, because a
-    /// manifest's artifact set must be a closed vocabulary: a stray file in
-    /// `filters/` is not an artifact, and checksumming whatever happens to be
-    /// there would let one appear in `content_digest`. Sketch families are
-    /// restricted to the subject and object roles, so this is the
-    /// complete space; which of them a bundle carries is discovered.
+    use super::KeyArtifact;
+
+    /// The names of [`KeyArtifact::FILTERS`], for code that matches text.
     pub const FILTERS: [&str; 4] = [
-        "filters/objects.filter",
-        "filters/objects.minhash",
-        "filters/subjects.filter",
-        "filters/subjects.minhash",
+        KeyArtifact::FILTERS[0].name(),
+        KeyArtifact::FILTERS[1].name(),
+        KeyArtifact::FILTERS[2].name(),
+        KeyArtifact::FILTERS[3].name(),
     ];
 
-    /// The same names grouped into the two all-or-nothing families.
-    ///
-    /// Membership filters and overlap sketches are *separately* all-or-nothing.
-    /// Grouping them permits sketches without filters while refusing a
-    /// half-built family.
-    pub const FILTER_FAMILIES: [[&str; 2]; 2] = [
-        ["filters/objects.filter", "filters/subjects.filter"],
-        ["filters/objects.minhash", "filters/subjects.minhash"],
-    ];
-
-    /// Every `keysets/` file the key-set profile can produce.
-    ///
-    /// The disjoint trio is built by default, while the composite roles remain
-    /// available. All six supported roles are listed and presence decides.
-    /// hdtc's experimental `terms` role is deliberately absent because it is
-    /// not part of the bundle profile.
+    /// The names of [`KeyArtifact::KEYSETS`], for code that matches text.
     pub const KEYSETS: [&str; 6] = [
-        "keysets/objects-only.keys",
-        "keysets/objects.keys",
-        "keysets/predicates.keys",
-        "keysets/shared.keys",
-        "keysets/subjects-only.keys",
-        "keysets/subjects.keys",
+        KeyArtifact::KEYSETS[0].name(),
+        KeyArtifact::KEYSETS[1].name(),
+        KeyArtifact::KEYSETS[2].name(),
+        KeyArtifact::KEYSETS[3].name(),
+        KeyArtifact::KEYSETS[4].name(),
+        KeyArtifact::KEYSETS[5].name(),
     ];
 
     /// The complete tier-1 description artifact set, in bundle-layout order.
@@ -122,6 +102,116 @@ pub mod artifact {
         SUMMARY_JSON,
         SUMMARY_MD,
     ];
+}
+
+/// One `filters/` or `keysets/` file of the bundle layout: a membership
+/// filter, an overlap sketch, or a key set.
+///
+/// A closed vocabulary rather than whatever those directories hold, because a
+/// manifest's artifact set must be one: a stray file in `filters/` is not an
+/// artifact, and checksumming whatever happens to be there would let one
+/// appear in `content_digest`. Which of these a bundle carries is discovered.
+///
+/// Sketch families are restricted to the subject and object roles, so the
+/// four filter names are the complete space. Of the key-set roles, the
+/// disjoint trio is built by default while the composite roles remain
+/// available, so all six supported roles are listed and presence decides.
+/// hdtc's experimental `terms` role is deliberately absent because it is not
+/// part of the bundle profile.
+///
+/// Variants are declared in name order, so the derived `Ord` sorts as the
+/// names do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum KeyArtifact {
+    /// `filters/objects.filter`: membership filter over the object role.
+    ObjectsFilter,
+    /// `filters/objects.minhash`: overlap sketch of the object role.
+    ObjectsSketch,
+    /// `filters/subjects.filter`: membership filter over the subject role.
+    SubjectsFilter,
+    /// `filters/subjects.minhash`: overlap sketch of the subject role.
+    SubjectsSketch,
+    /// `keysets/objects-only.keys`: terms that occur only as objects.
+    ObjectsOnlyKeys,
+    /// `keysets/objects.keys`: every object term.
+    ObjectsKeys,
+    /// `keysets/predicates.keys`: every predicate.
+    PredicatesKeys,
+    /// `keysets/shared.keys`: terms that occur as both subject and object.
+    SharedKeys,
+    /// `keysets/subjects-only.keys`: terms that occur only as subjects.
+    SubjectsOnlyKeys,
+    /// `keysets/subjects.keys`: every subject term.
+    SubjectsKeys,
+}
+
+impl KeyArtifact {
+    /// Every key artifact, in name order: the filters, then the key sets.
+    pub const ALL: [Self; 10] = [
+        Self::ObjectsFilter,
+        Self::ObjectsSketch,
+        Self::SubjectsFilter,
+        Self::SubjectsSketch,
+        Self::ObjectsOnlyKeys,
+        Self::ObjectsKeys,
+        Self::PredicatesKeys,
+        Self::SharedKeys,
+        Self::SubjectsOnlyKeys,
+        Self::SubjectsKeys,
+    ];
+
+    /// Every `filters/` file the sketch convention can produce.
+    pub const FILTERS: [Self; 4] = [
+        Self::ObjectsFilter,
+        Self::ObjectsSketch,
+        Self::SubjectsFilter,
+        Self::SubjectsSketch,
+    ];
+
+    /// The filters grouped into the two all-or-nothing families.
+    ///
+    /// Membership filters and overlap sketches are *separately* all-or-nothing.
+    /// Grouping them permits sketches without filters while refusing a
+    /// half-built family.
+    pub const FILTER_FAMILIES: [[Self; 2]; 2] = [
+        [Self::ObjectsFilter, Self::SubjectsFilter],
+        [Self::ObjectsSketch, Self::SubjectsSketch],
+    ];
+
+    /// Every `keysets/` file the key-set profile can produce.
+    pub const KEYSETS: [Self; 6] = [
+        Self::ObjectsOnlyKeys,
+        Self::ObjectsKeys,
+        Self::PredicatesKeys,
+        Self::SharedKeys,
+        Self::SubjectsOnlyKeys,
+        Self::SubjectsKeys,
+    ];
+
+    /// The artifact's path in the bundle, which is also its key in the
+    /// manifest's `artifacts`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ObjectsFilter => "filters/objects.filter",
+            Self::ObjectsSketch => "filters/objects.minhash",
+            Self::SubjectsFilter => "filters/subjects.filter",
+            Self::SubjectsSketch => "filters/subjects.minhash",
+            Self::ObjectsOnlyKeys => "keysets/objects-only.keys",
+            Self::ObjectsKeys => "keysets/objects.keys",
+            Self::PredicatesKeys => "keysets/predicates.keys",
+            Self::SharedKeys => "keysets/shared.keys",
+            Self::SubjectsOnlyKeys => "keysets/subjects-only.keys",
+            Self::SubjectsKeys => "keysets/subjects.keys",
+        }
+    }
+
+    /// The artifact named exactly `name`, if it is one. Nothing is
+    /// normalised: `filters//subjects.filter` names nothing.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|artifact| artifact.name() == name)
+    }
 }
 
 /// Open-time options, reserved for options that preserve bounded,
@@ -147,9 +237,10 @@ pub struct Store {
     triple_terms: Option<TripleTerms>,
     description: Option<DescriptionStore>,
     text: Option<TextSearcher>,
-    /// The `filters/` and `keysets/` files the bundle carries, each mapped
-    /// whole under its bundle-relative name, in name order.
-    key_artifacts: Vec<(&'static str, Mapping)>,
+    /// The `filters/` and `keysets/` files the bundle carries, in name order.
+    /// Found at open and mapped only on request: see
+    /// [`map_key_artifact`](Self::map_key_artifact).
+    key_artifacts: Vec<KeyArtifact>,
 }
 
 impl std::fmt::Debug for Store {
@@ -165,14 +256,7 @@ impl std::fmt::Debug for Store {
             .field("triple_terms", &self.triple_terms.is_some())
             .field("description", &self.description.is_some())
             .field("text", &self.text.is_some())
-            .field(
-                "key_artifacts",
-                &self
-                    .key_artifacts
-                    .iter()
-                    .map(|(name, _)| *name)
-                    .collect::<Vec<_>>(),
-            )
+            .field("key_artifacts", &self.key_artifacts)
             .finish()
     }
 }
@@ -247,7 +331,7 @@ impl Store {
             triple_terms,
             description,
             text: artifacts.open_text()?,
-            key_artifacts: artifacts.open_key_artifacts(bundle)?,
+            key_artifacts: artifacts.key_artifacts(),
         })
     }
 
@@ -340,10 +424,9 @@ impl Store {
         self.data.bytes()
     }
 
-    /// One of the bundle's `filters/` or `keysets/` files exactly as published,
-    /// by its bundle-relative name, for a caller that serves the artifact
-    /// itself. `None` when the bundle does not carry it, and for any name
-    /// outside [`artifact::FILTERS`] and [`artifact::KEYSETS`].
+    /// Map one of the bundle's `filters/` or `keysets/` files whole, exactly as
+    /// published, for a caller that serves the artifact itself. `Ok(None)` when
+    /// the bundle does not carry it.
     ///
     /// Nothing in this crate reads these bytes. A membership filter, an overlap
     /// sketch and a key set are what a reader *without* the bundle fetches, to
@@ -351,16 +434,19 @@ impl Store {
     /// shares with another, so the only thing a store does with them is hand
     /// them out whole.
     ///
-    /// The name is compared against the names this store mapped at open and is
-    /// never joined to a directory, so a caller may pass text it was sent
-    /// without that text reaching the filesystem. As with
-    /// [`hdt_bytes`](Self::hdt_bytes), reading the slice faults pages, so a
-    /// caller copying out of it belongs on a blocking thread.
-    pub fn key_artifact_bytes(&self, name: &str) -> Option<&[u8]> {
-        self.key_artifacts
-            .iter()
-            .find(|(mapped, _)| *mapped == name)
-            .map(|(_, mapping)| mapping.as_bytes())
+    /// Mapped on each call rather than at open, so that a query never pays for
+    /// files only a download reads and a bundle whose key file cannot be mapped
+    /// still answers every query: the failure is this call's, not the open's.
+    /// Each call is one `open` and one `mmap`, and the returned
+    /// [`PublishedFile`] carries the bundle's capability, so it stays sound
+    /// after this store is dropped. As with [`hdt_bytes`](Self::hdt_bytes),
+    /// mapping and reading belong on a blocking thread.
+    pub fn map_key_artifact(&self, artifact: KeyArtifact) -> Result<Option<PublishedFile>> {
+        if !self.key_artifacts.contains(&artifact) {
+            return Ok(None);
+        }
+        let path = self.bundle.path().join(artifact.name());
+        open_published_file(&self.bundle, &path).map(Some)
     }
 
     /// Total triples in the bundle.
@@ -427,10 +513,10 @@ pub(crate) struct ArtifactSet {
     pub(crate) propositions_perm: Option<PathBuf>,
     pub(crate) text: Option<PathBuf>,
     pub(crate) description: Option<DescriptionArtifacts>,
-    /// The `filters/` files present, a subset of [`artifact::FILTERS`].
-    pub(crate) filters: Vec<&'static str>,
-    /// The `keysets/` files present, a subset of [`artifact::KEYSETS`].
-    pub(crate) keysets: Vec<&'static str>,
+    /// The `filters/` files present, a subset of [`KeyArtifact::FILTERS`].
+    pub(crate) filters: Vec<KeyArtifact>,
+    /// The `keysets/` files present, a subset of [`KeyArtifact::KEYSETS`].
+    pub(crate) keysets: Vec<KeyArtifact>,
 }
 
 /// The all-or-none artifact set behind the tier-1 description surface.
@@ -522,8 +608,8 @@ impl ArtifactSet {
             propositions_perm,
             text: optional_dir(dir, artifact::TEXT)?,
             description: DescriptionArtifacts::resolve(dir)?,
-            filters: complete_families(dir, &artifact::FILTER_FAMILIES)?,
-            keysets: present(dir, &artifact::KEYSETS)?,
+            filters: complete_families(dir, &KeyArtifact::FILTER_FAMILIES)?,
+            keysets: present(dir, &KeyArtifact::KEYSETS)?,
         })
     }
 
@@ -574,25 +660,15 @@ impl ArtifactSet {
             })
     }
 
-    /// Map the `filters/` and `keysets/` files the bundle carries.
+    /// The `filters/` and `keysets/` files the bundle carries, in name order.
     ///
-    /// Mapped, and nothing more: no header is read and no page is touched.
+    /// Found, and nothing more: no file is opened and no header is read.
     /// Neither format may have a field interpreted before its CRC32C has been
     /// verified (`hdtc/docs/sketch-format.md` §8, `keyset-format.md` §4.4),
     /// which is a pass over the whole file and so belongs to `kgf manifest`,
-    /// never to an open. What an open establishes is that each file is there
-    /// to be handed out, at the cost of one mapping apiece — at most ten, of
-    /// address space rather than memory — so a store never has to map on a
-    /// request, which would take the interior mutability it does without.
-    pub(crate) fn open_key_artifacts(
-        &self,
-        bundle: &PublishedBundle,
-    ) -> Result<Vec<(&'static str, Mapping)>> {
-        self.filters
-            .iter()
-            .chain(&self.keysets)
-            .map(|&name| Ok((name, open_published(bundle, &bundle.path().join(name))?)))
-            .collect()
+    /// never to an open.
+    pub(crate) fn key_artifacts(&self) -> Vec<KeyArtifact> {
+        self.filters.iter().chain(&self.keysets).copied().collect()
     }
 
     /// Open the triple-term artifacts, if the bundle carries them, and refuse
@@ -728,19 +804,20 @@ fn require_file(dir: &Path, name: &str, remedy: impl Into<String>) -> Result<Pat
     })
 }
 
-/// Which of a closed set of artifact names a directory carries.
+/// Which of a closed set of key artifacts a directory carries.
 ///
 /// Existence as a regular file, and nothing about the contents. These files
 /// are validated when a producer reads their headers to describe them, which
 /// costs a full pass for the CRC32C the two formats require before any field
 /// may be interpreted — far outside what an open may spend. The shape is
-/// checked because an open maps each one: a directory under an artifact's name
-/// is refused here, by name, rather than by whatever mapping it would report.
-fn present(dir: &Path, names: &[&'static str]) -> Result<Vec<&'static str>> {
+/// checked as it is for every other optional artifact: a directory under a
+/// file's name is a malformed bundle, refused here by name rather than found
+/// by the first reader to map it.
+fn present(dir: &Path, artifacts: &[KeyArtifact]) -> Result<Vec<KeyArtifact>> {
     let mut found = Vec::new();
-    for name in names {
-        if optional_file(dir, name)?.is_some() {
-            found.push(*name);
+    for &artifact in artifacts {
+        if optional_file(dir, artifact.name())?.is_some() {
+            found.push(artifact);
         }
     }
     Ok(found)
@@ -754,7 +831,7 @@ fn present(dir: &Path, names: &[&'static str]) -> Result<Vec<&'static str>> {
 /// consumer cannot distinguish "this role was not built" from "this role is
 /// empty". An empty role is stated by a file with `key_count = 0`, never by
 /// silence.
-fn complete_families(dir: &Path, families: &[[&'static str; 2]]) -> Result<Vec<&'static str>> {
+fn complete_families(dir: &Path, families: &[[KeyArtifact; 2]]) -> Result<Vec<KeyArtifact>> {
     let mut found = Vec::new();
     for family in families {
         let members = present(dir, family)?;
@@ -762,10 +839,10 @@ fn complete_families(dir: &Path, families: &[[&'static str; 2]]) -> Result<Vec<&
             0 => {}
             n if n == family.len() => found.extend(members),
             _ => {
-                let missing = family.iter().find(|name| !members.contains(name));
+                let missing = family.iter().find(|artifact| !members.contains(artifact));
                 return Err(Error::MissingRequiredArtifact {
                     bundle: dir.to_path_buf(),
-                    artifact: missing.copied().unwrap_or(family[0]).to_owned(),
+                    artifact: missing.copied().unwrap_or(family[0]).name().to_owned(),
                     remedy: format!(
                         "hdtc sketch {} (both roles in a family must be published together)",
                         dir.join(artifact::HDT).display()
@@ -1200,20 +1277,24 @@ mod tests {
         }
 
         let store = Store::open(&published_bundle(dir), OpenOptions::default()).unwrap();
+        let mut mapped = Vec::new();
         for (name, bytes) in carried {
-            assert_eq!(store.key_artifact_bytes(name), Some(bytes), "{name}");
+            let artifact = KeyArtifact::from_name(name).unwrap();
+            let file = store.map_key_artifact(artifact).unwrap().expect(name);
+            assert_eq!(file.as_bytes(), bytes, "{name}");
+            mapped.push((file, bytes));
         }
-        // A family the bundle does not carry, an artifact of another kind, and
-        // a name that would escape the directory if it were ever joined to it.
-        for absent in [
-            "filters/subjects.filter",
-            "keysets/subjects.keys",
-            artifact::HDT,
-            artifact::MANIFEST,
-            "keysets/../data.hdt",
-            "",
-        ] {
-            assert_eq!(store.key_artifact_bytes(absent), None, "{absent:?}");
+        // Families and roles the bundle does not carry.
+        for absent in [KeyArtifact::SubjectsFilter, KeyArtifact::SubjectsKeys] {
+            assert!(
+                store.map_key_artifact(absent).unwrap().is_none(),
+                "{absent:?}"
+            );
+        }
+        // A mapping carries the bundle's capability, so it outlives the store.
+        drop(store);
+        for (file, bytes) in &mapped {
+            assert_eq!(file.as_bytes(), *bytes);
         }
 
         // A bundle with neither directory opens as it always has.
@@ -1223,16 +1304,53 @@ mod tests {
             OpenOptions::default(),
         )
         .unwrap();
-        for name in artifact::FILTERS.iter().chain(&artifact::KEYSETS) {
-            assert_eq!(store.key_artifact_bytes(name), None, "{name}");
+        for artifact in KeyArtifact::ALL {
+            assert!(
+                store.map_key_artifact(artifact).unwrap().is_none(),
+                "{artifact:?}"
+            );
         }
     }
 
     #[test]
-    fn a_key_artifact_that_cannot_be_mapped_is_refused_with_the_bundle() {
-        // A directory where the file belongs, and a file with nothing in it:
-        // either would otherwise be listed by a manifest and found unservable
-        // by the first reader to ask for it.
+    fn key_artifacts_are_a_closed_vocabulary_in_name_order() {
+        let names: Vec<_> = KeyArtifact::ALL.map(KeyArtifact::name).into();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "ALL is in name order");
+        let mut by_ord = KeyArtifact::ALL;
+        by_ord.sort_unstable();
+        assert_eq!(by_ord, KeyArtifact::ALL, "Ord agrees with the names");
+        assert_eq!(
+            KeyArtifact::ALL.to_vec(),
+            [&KeyArtifact::FILTERS[..], &KeyArtifact::KEYSETS[..]].concat()
+        );
+        for family in KeyArtifact::FILTER_FAMILIES.as_flattened() {
+            assert!(KeyArtifact::FILTERS.contains(family), "{family:?}");
+        }
+        for artifact in KeyArtifact::ALL {
+            assert_eq!(KeyArtifact::from_name(artifact.name()), Some(artifact));
+        }
+        assert_eq!(artifact::FILTERS.len(), KeyArtifact::FILTERS.len());
+        assert_eq!(artifact::KEYSETS.len(), KeyArtifact::KEYSETS.len());
+        // Other artifacts, and names that would escape the directory if they
+        // were ever joined to it.
+        for other in [
+            artifact::HDT,
+            artifact::MANIFEST,
+            "keysets/terms.keys",
+            "keysets/../data.hdt",
+            "filters//subjects.filter",
+            "",
+        ] {
+            assert_eq!(KeyArtifact::from_name(other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_key_artifact_is_shaped_at_open_and_mapped_only_on_request() {
+        // A directory where the file belongs is a malformed bundle, refused by
+        // name as any optional artifact of the wrong shape is.
         let directory = Fixture::build(TINY_NT);
         let path = directory.bundle_path().join("keysets/shared.keys");
         std::fs::create_dir_all(&path).unwrap();
@@ -1249,15 +1367,22 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
 
+        // A file that cannot be mapped is not the open's business: queries
+        // never read it, so the bundle opens and answers, and only the request
+        // for that file fails.
         let empty = Fixture::build(TINY_NT);
         std::fs::create_dir_all(empty.bundle_path().join("keysets")).unwrap();
         let path = empty.bundle_path().join("keysets/shared.keys");
         std::fs::write(&path, b"").unwrap();
-        match Store::open(
+        let store = Store::open(
             &published_bundle(empty.bundle_path()),
             OpenOptions::default(),
         )
-        .expect_err("an empty file is not a key set")
+        .expect("a key file is not read at open");
+        assert!(store.triples() > 0);
+        match store
+            .map_key_artifact(KeyArtifact::SharedKeys)
+            .expect_err("an empty file cannot be mapped")
         {
             Error::Malformed { artifact, .. } => assert_eq!(artifact, path),
             other => panic!("unexpected error: {other}"),
