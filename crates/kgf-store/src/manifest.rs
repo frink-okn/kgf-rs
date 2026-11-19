@@ -749,7 +749,8 @@ pub struct VectorsDescription {
 pub struct VectorsIndexDescription {
     /// The library whose file format `index.usearch` is.
     pub library: String,
-    /// The library version that wrote it.
+    /// The library version that wrote it, as the file's own header records
+    /// it.
     pub library_version: String,
     /// The graph structure: a hierarchical navigable small world.
     pub kind: String,
@@ -757,8 +758,6 @@ pub struct VectorsIndexDescription {
     pub quantization: String,
     /// Links per node in the graph.
     pub connectivity: u64,
-    /// Candidates one probe visits: the search's breadth.
-    pub expansion_search: u64,
 }
 
 /// A bundle manifest.

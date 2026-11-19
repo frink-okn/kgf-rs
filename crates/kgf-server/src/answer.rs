@@ -1297,9 +1297,24 @@ struct EmbeddedText {
     /// Whether the live text's digest is the one the id map recorded for
     /// the resource's record: false means the verbalizer has changed since
     /// this version was built, and the vector was computed from other text.
-    matches_embedded: bool,
+    /// Absent when the render stopped at a budget: a text cut short has
+    /// another digest whatever the verbalizer is, so it says nothing either
+    /// way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matches_embedded: Option<bool>,
     /// Whether the render stopped at a budget.
     truncated: bool,
+}
+
+impl EmbeddedText {
+    /// Bytes the text adds to the response, charged to the page's byte
+    /// budget so a described resource's rows and its text share one bound.
+    fn serialized(&self) -> u64 {
+        serialized_object([
+            ("target", serialized_json_string(&self.target)),
+            ("text", serialized_json_string(&self.text)),
+        ]) + 64
+    }
 }
 
 /// The keys a page's rows carry: the unbound positions, and `g` in the quad
@@ -3610,6 +3625,9 @@ struct SummaryVectors {
     /// Distinct vectors: nodes whose texts are identical share one.
     records: u64,
     dimensions: usize,
+    /// Candidates a search keeps when asked for fewer results than this.
+    /// This server's setting, not a fact the bundle records.
+    search_breadth: usize,
     description: Option<kgf_store::VectorsDescription>,
 }
 
@@ -3700,10 +3718,7 @@ impl SummaryVectors {
                                 "connectivity",
                                 description.map_or(Value::Absent, |d| Value::Number(d.index.connectivity)),
                             ),
-                            (
-                                "search breadth",
-                                description.map_or(Value::Absent, |d| Value::Number(d.index.expansion_search)),
-                            ),
+                            ("search breadth", Value::Number(self.search_breadth as u64)),
                         ]))
                     }
                 }
@@ -4207,6 +4222,7 @@ pub fn summary(
                     entities: vectors.entities(),
                     records: vectors.records(),
                     dimensions: vectors.dimensions(),
+                    search_breadth: vectors.expansion_search(),
                     description: target
                         .declarations
                         .as_ref()
@@ -6354,8 +6370,9 @@ pub fn labels(
 ///
 /// One bounded render: the config's IRIs bound once (a dictionary lookup
 /// each), one existence probe per target to find the resource's, then the
-/// walk `/verbalize` makes for one root, under the request's read and byte
-/// budgets. `None` when no target claims the resource.
+/// walk `/verbalize` makes for one root, within the request's read budget
+/// and `bytes`, which the caller takes from the page's own byte budget.
+/// `None` when no target claims the resource.
 fn embedded_text(
     store: &Store,
     vectors: &kgf_store::Vectors,
@@ -6390,7 +6407,7 @@ fn embedded_text(
             .nth(index)
             .expect("the target index came from this binding")
             .to_owned(),
-        matches_embedded: rendered.digest == recorded,
+        matches_embedded: (!rendered.truncated).then_some(rendered.digest == recorded),
         truncated: rendered.truncated,
         text: rendered.text,
     }))
@@ -6531,19 +6548,28 @@ pub fn similar(
     let mut results = Vec::with_capacity(request.k as usize);
     let mut spent = 0u64;
     let mut stopped = None;
-    'hits: for hit in hits {
+    for hit in hits {
         if results.len() >= request.k as usize {
             break;
         }
         if own == Some(hit.row) {
             continue;
         }
-        let mut entities = Vec::new();
-        let mut serialized = SimilarResult::FIXED_BYTES;
+        let entity_count = vectors
+            .entity_count(hit.row)
+            .map_err(|error| unreadable("reading a record's entities", &error))?;
         let members = vectors
             .entities_of(hit.row)
             .map_err(|error| unreadable("reading a record's entities", &error))?;
+        // A record names as many entities as shared its text, and nothing
+        // bounds that, so each is charged as it is taken and the record is
+        // cut where the budget ends rather than collected first.
+        let mut entities = Vec::new();
+        let mut serialized = SimilarResult::FIXED_BYTES;
+        let mut cut = None;
         for entity in members {
+            // Only the answer's very first entity has nothing before it.
+            let first = results.is_empty() && entities.is_empty();
             let (term, bytes) = published
                 .measured(&mut cache, &dictionary, Role::Subject, entity)
                 .map_err(|error| unreadable("materializing an embedded entity", &error))?;
@@ -6552,36 +6578,46 @@ pub fn similar(
                 .text()
                 .cloned()
                 .expect("a subject is never a triple term");
-            // The label cascade's allowance is shared by the request; a
-            // record it cannot settle ends the answer there, as a search
+            // The label cascade's allowance is shared by the request; an
+            // entity it cannot settle ends the answer there, as a search
             // hit's does.
             let label = match &mut labels {
                 None => None,
-                Some(labels) => {
-                    match labels.label(Some(entity.0), Spend::first_if(results.is_empty()))? {
-                        Some(label) => Some(label),
-                        None => {
-                            stopped = Some(BudgetReason::Candidate);
-                            break 'hits;
-                        }
+                Some(labels) => match labels.label(Some(entity.0), Spend::first_if(first))? {
+                    Some(label) => Some(label),
+                    None => {
+                        cut = Some(BudgetReason::Candidate);
+                        break;
                     }
-                }
+                },
             };
-            serialized += bytes + label.as_ref().map_or(0, RowLabel::appended);
+            let entity_bytes = bytes + label.as_ref().map_or(0, RowLabel::appended);
+            let next = spent
+                .saturating_add(serialized)
+                .saturating_add(entity_bytes);
+            if next > request.bytes.0 && !first {
+                cut = Some(BudgetReason::ResponseBytes);
+                break;
+            }
+            serialized += entity_bytes;
             entities.push(Entity { term: text, label });
         }
-        let next = spent.saturating_add(serialized);
-        if next > request.bytes.0 && !results.is_empty() {
-            stopped = Some(BudgetReason::ResponseBytes);
+        // A record none of whose entities fit is left out; one that was cut
+        // is kept, and says how many it names beside the ones it lists.
+        if !entities.is_empty() {
+            spent = spent.saturating_add(serialized);
+            results.push(SimilarResult {
+                record: hit.row.0,
+                distance: hit.distance,
+                similarity: 1.0 - hit.distance,
+                entity_count,
+                entities,
+            });
+        }
+        if cut.is_some() {
+            stopped = cut;
             break;
         }
-        spent = next;
-        results.push(SimilarResult {
-            record: hit.row.0,
-            distance: hit.distance,
-            similarity: 1.0 - hit.distance,
-            entities,
-        });
     }
 
     Ok(SimilarAnswer {
@@ -6761,6 +6797,10 @@ struct SimilarResult {
     record: u64,
     distance: f32,
     similarity: f32,
+    /// How many entities the record names. More than `entities` lists only
+    /// where a budget ended the answer inside this record, which the
+    /// response's completeness then says.
+    entity_count: u64,
     entities: Vec<Entity>,
 }
 
@@ -7625,9 +7665,11 @@ pub fn describe(
     let blank_nodes = SkolemScope::of(store);
     // One binary search in the id map, so the page offers "more like this"
     // only where /similar will answer, and a client reads the same fact.
-    let (embedded, record, embedded_text) = match store.vectors() {
-        None => (None, None, None),
-        Some(vectors) => {
+    // /similar answers where the release declares `vectors`, so that, and not
+    // the files a store happens to have opened, decides whether this speaks
+    // of vectors at all.
+    let (embedded, record, embedded_text) = match (store.vectors(), &request.embedding) {
+        (Some(vectors), Some(embedding)) => {
             let located = locate_scoped(
                 &dictionary,
                 &blank_nodes,
@@ -7642,15 +7684,26 @@ pub fn describe(
                     .map(|row| (id, row)),
                 None => None,
             };
-            let text = match (row, &request.verbalize) {
-                (Some((id, row)), Some(config)) => {
-                    embedded_text(store, vectors, row, id, config, request.bytes.0)?
+            // Rendered once, on the first page: the text is a fact about
+            // the resource, not about a page of its edges. It may take half
+            // the page's bytes, so the rows always keep the other half.
+            let text = match (row, &embedding.verbalize, &request.cursor) {
+                (Some((id, row)), Some(config), None) => {
+                    embedded_text(store, vectors, row, id, config, request.bytes.0 / 2)?
                 }
                 _ => None,
             };
             (Some(row.is_some()), row.map(|(_, row)| row.0), text)
         }
+        _ => (None, None, None),
     };
+    // What the text spent, the rows do not have.
+    let rows_bytes = ResponseBytes(
+        request
+            .bytes
+            .0
+            .saturating_sub(embedded_text.as_ref().map_or(0, EmbeddedText::serialized)),
+    );
     let echo = Echo::Describe {
         resource: request.resource.requested().to_owned(),
         direction: request.direction,
@@ -7747,7 +7800,7 @@ pub fn describe(
         Paging {
             cursor: request.cursor.as_ref(),
             limit: request.limit,
-            bytes: request.bytes,
+            bytes: rows_bytes,
             binding: &request.binding,
         },
     )?;
@@ -10987,16 +11040,25 @@ impl Answer {
                 details."query-form" {
                     summary { "Embedded text" }
                     div."panel-body" {
-                        @if embedded.matches_embedded {
-                            (note(&format!(
-                                "The text this resource's vector was computed from, rendered live under the bundle's verbalization config as target {:?}.",
-                                embedded.target
-                            )))
-                        } @else {
-                            (note(&format!(
-                                "Rendered live under the bundle's verbalization config as target {:?}; it differs from the text the vector was computed from, so the verbalizer has changed since this version was built.",
-                                embedded.target
-                            )))
+                        @match embedded.matches_embedded {
+                            Some(true) => {
+                                (note(&format!(
+                                    "The text this resource's vector was computed from, rendered live under the bundle's verbalization config as target {:?}.",
+                                    embedded.target
+                                )))
+                            }
+                            Some(false) => {
+                                (note(&format!(
+                                    "Rendered live under the bundle's verbalization config as target {:?}; it differs from the text the vector was computed from, so the verbalizer has changed since this version was built.",
+                                    embedded.target
+                                )))
+                            }
+                            None => {
+                                (note(&format!(
+                                    "Rendered live under the bundle's verbalization config as target {:?}, and cut short by what one request may read or send. The vector was computed from the whole text, so this is its beginning and cannot be compared with it.",
+                                    embedded.target
+                                )))
+                            }
                         }
                         pre."embedded-text" { (embedded.text) }
                     }
@@ -11843,7 +11905,7 @@ impl Resource for SimilarAnswer {
                 }
                 @if !self.completeness.is_complete() {
                     (note(
-                        "The response's byte budget stopped the answer before its k records; ask for fewer."
+                        "A budget stopped the answer early: it holds fewer than k records, or not every entity of its last one. Ask for fewer, or without labels."
                     ))
                 }
                 section."section-block" {

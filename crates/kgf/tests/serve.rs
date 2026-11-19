@@ -6898,6 +6898,30 @@ fn vectors_answer_over_the_wire_and_refuse_what_is_not_embedded() {
         .find(|r| r["record"] == 1)
         .expect("record 1 is among three of four");
     assert_eq!(shared["entities"].as_array().unwrap().len(), 2);
+    assert_eq!(shared["entity_count"], 2);
+
+    // A record's entities are charged to the byte budget one by one, not
+    // collected first. Under a budget that holds one, the record b and c
+    // share lists one of the two it names, says it names two, and the answer
+    // says a budget ended it.
+    let mut budgets = kgf_server::Budgets::new();
+    budgets.max_response_bytes = 1;
+    let tight = deployment.serve_with_limits(kgf_server::Caps::new(), budgets);
+    let cut_body = serde_json::to_vec(&serde_json::json!({
+        "vector": fixture_vector(1),
+        "k": 3,
+        "labels": false
+    }))
+    .unwrap();
+    let cut = tight
+        .request_with_body("QUERY", "/vec/v/v1/similar", &json, &cut_body)
+        .json();
+    assert_eq!(cut["complete"], false, "{cut}");
+    let kept = cut["results"].as_array().unwrap();
+    assert_eq!(kept.len(), 1, "{cut}");
+    assert_eq!(kept[0]["record"], 1);
+    assert_eq!(kept[0]["entity_count"], 2);
+    assert_eq!(kept[0]["entities"].as_array().unwrap().len(), 1);
 
     // The same vector by GET, comma-separated, and by POST: three methods,
     // one answer.
@@ -6990,6 +7014,32 @@ fn vectors_answer_over_the_wire_and_refuse_what_is_not_embedded() {
         page.contains("Embedded text") && page.contains("label: Alpha"),
         "{page}"
     );
+    // The text is a fact about the resource, stated once: a later page of
+    // its edges says it is embedded and does not render the text again.
+    let first = server.get("/vec/v/v1/describe?iri=ex:a&limit=1").json();
+    assert!(first.get("embedded_text").is_some(), "{first}");
+    let token = first["next"].as_str().expect("a has more than one edge");
+    let second = server
+        .get(&format!(
+            "/vec/v/v1/describe?iri=ex:a&limit=1&cursor={token}"
+        ))
+        .json();
+    assert_eq!(second["embedded"], true);
+    assert!(second.get("embedded_text").is_none(), "{second}");
+    // The text is charged to the page's bytes. Where they cut it short it is
+    // not compared with what was embedded, and the page says a budget cut
+    // it, not that the verbalizer changed.
+    let short = tight.get("/vec/v/v1/describe?iri=ex:a").json();
+    assert_eq!(short["embedded_text"]["truncated"], true, "{short}");
+    assert!(
+        short["embedded_text"].get("matches_embedded").is_none(),
+        "{short}"
+    );
+    let page = tight
+        .request("GET", "/vec/v/v1/describe?iri=ex:a", &html)
+        .text();
+    assert!(page.contains("cut short"), "{page}");
+    assert!(!page.contains("verbalizer has changed"), "{page}");
 
     // /verbalize falls back to the bundle's config, and only there.
     let rendered = server.get("/vec/v/v1/verbalize?target=things&iri=ex:a");
@@ -7089,4 +7139,104 @@ fn vectors_answer_over_the_wire_and_refuse_what_is_not_embedded() {
         manifest_page.contains("/vec/v/v1/similar"),
         "the manifest page offers the form"
     );
+}
+
+/// `kgf vectors` adds a sidecar and prints a reminder to run `kgf manifest`.
+/// Served without it, the manifest does not declare `vectors`, the routes
+/// refuse, and `/describe` must not point at them.
+#[test]
+fn a_sidecar_the_manifest_does_not_declare_is_not_spoken_of() {
+    let deployment = Deployment::new();
+    deployment.publish_fixture(
+        "vec",
+        "v1",
+        Fixture::build(EMBEDDED_NT),
+        "2026-10-22T10:00:00Z",
+    );
+    // The same graph, so the same HDT: its sidecar binds to the bundle above.
+    let embedded = tempfile::tempdir().unwrap();
+    Fixture::build(EMBEDDED_NT)
+        .with_vectors(EMBEDDED_GROUPS)
+        .copy_bundle_to(embedded.path());
+    let vectors = deployment.bundle("vec", "v1").join("vectors");
+    std::fs::create_dir_all(&vectors).unwrap();
+    for name in ["index.usearch", "entities.idmap"] {
+        std::fs::copy(
+            embedded.path().join("vectors").join(name),
+            vectors.join(name),
+        )
+        .unwrap();
+    }
+    let server = deployment.serve();
+
+    let described = server.get("/vec/v/v1/describe?iri=ex:a");
+    described.assert_status(200);
+    assert!(
+        described.json().get("embedded").is_none(),
+        "{}",
+        described.json()
+    );
+    let page = server
+        .request(
+            "GET",
+            "/vec/v/v1/describe?iri=ex:a",
+            &[("Accept", "text/html")],
+        )
+        .text();
+    assert!(!page.contains("Similar by embedding"), "{page}");
+    let refused = server.get("/vec/v/v1/similar?iri=ex:a");
+    refused.assert_status(501);
+    assert_eq!(refused.json()["code"], "capability_not_available");
+}
+
+/// A release's verbalization config backs a preview's default and a describe
+/// page's text. One this build cannot read, as a newer builder's would be, is
+/// withheld: the deployment starts, the release answers, and what needed the
+/// config says why it cannot have it.
+#[test]
+fn a_verbalization_config_this_server_cannot_read_is_withheld_alone() {
+    let deployment = Deployment::new();
+    deployment.publish_fixture(
+        "vec",
+        "v1",
+        Fixture::build(EMBEDDED_NT)
+            .with_vectors(EMBEDDED_GROUPS)
+            .with_verbalize_config(EMBEDDED_CONFIG),
+        "2026-10-22T10:00:00Z",
+    );
+    deployment.publish("tox", "v1", TYPED_NT, "2026-06-01T14:03:22Z");
+    std::fs::write(
+        deployment.bundle("vec", "v1").join("vectors/verbalize.json"),
+        r#"{"targets": {"things": {"type": "http://example.org/T"}}, "from_a_newer_builder": true}"#,
+    )
+    .unwrap();
+
+    let server = deployment.serve();
+    let json = [("Content-Type", "application/json")];
+
+    // Every other dataset is served, and so is the rest of this release.
+    server.get("/tox/v/v1/manifest").assert_status(200);
+    let near = server.get("/vec/v/v1/similar?iri=ex:a&k=1");
+    near.assert_status(200);
+    let described = server.get("/vec/v/v1/describe?iri=ex:a").json();
+    assert_eq!(described["embedded"], true);
+    assert!(described.get("embedded_text").is_none(), "{described}");
+
+    // The fallback the manifest promised is the server's failure, and names
+    // the defect; a config sent with the request still renders.
+    let fallback = server.get("/vec/v/v1/verbalize?iri=ex:a");
+    fallback.assert_status(500);
+    let detail = fallback.json()["detail"].as_str().unwrap().to_owned();
+    assert!(
+        detail.contains("cannot use") && detail.contains("from_a_newer_builder"),
+        "{detail}"
+    );
+    let body = serde_json::to_vec(&serde_json::json!({
+        "config": {"targets": {"things": {"type": "http://example.org/T"}}},
+        "iris": ["ex:a"]
+    }))
+    .unwrap();
+    let sent = server.request_with_body("QUERY", "/vec/v/v1/verbalize", &json, &body);
+    sent.assert_status(200);
+    assert_eq!(sent.json()["records"].as_array().unwrap().len(), 1);
 }

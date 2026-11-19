@@ -967,7 +967,8 @@ async fn describe(
                 &release.binding(),
             )
             .map(|request| {
-                request.with_verbalize(
+                request.with_embedding(
+                    release.declares(Capability::Vectors),
                     release.verbalize_config(),
                     release.predicate_roles(),
                     limits,
@@ -1477,7 +1478,7 @@ async fn verbalize(
                 limits,
                 release.prefixes(),
                 release.predicate_roles(),
-                release.verbalize_config(),
+                release.verbalize(),
             )
         },
         answer::verbalize,
@@ -1510,7 +1511,7 @@ async fn verbalize_operation(
                 limits,
                 release.prefixes(),
                 release.predicate_roles(),
-                release.verbalize_config(),
+                release.verbalize(),
             )
         },
         answer::verbalize,

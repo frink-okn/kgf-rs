@@ -335,10 +335,13 @@ pub struct Caps {
     pub max_schema_items: u32,
     /// Entities one `/vector` request may look up.
     pub max_vector_iris: u32,
-    /// Neighbours one `/similar` request may ask for. A probe visits the
-    /// index's search expansion of candidates whatever `k` is, so this bounds
-    /// the answer's rows, and the entities each record expands to are held
-    /// to the response's byte budget.
+    /// Neighbours one `/similar` request may ask for, which is also what
+    /// bounds its probe: a search keeps as many candidates as the larger of
+    /// the index's search expansion and the results wanted, one more than
+    /// `k` when an entity's own record is to be left out. Raising this past
+    /// the expansion raises what a probe costs with it. The entities each
+    /// record expands to are charged to the response's byte budget one by
+    /// one.
     pub max_similar_k: u32,
 }
 

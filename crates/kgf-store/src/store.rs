@@ -244,8 +244,8 @@ pub struct OpenOptions {
     ///
     /// The ANN index reserves a search context per concurrent search at open
     /// and fails, rather than waits, when none is free, so this is the bound
-    /// the caller's own admission control imposes. Fixed memory per context;
-    /// nothing proportional to the bundle.
+    /// the caller's own admission control imposes. Each context is a fixed
+    /// allocation, whatever the bundle's size.
     pub search_contexts: usize,
 }
 
@@ -312,6 +312,11 @@ impl Store {
     /// Maps files, parses headers, and performs a bounded number of metadata and
     /// rank-sentinel reads independent of bundle size. It does not scan payload
     /// regions, rebuild indexes, or compute full digests and CRCs.
+    ///
+    /// The vector sidecar is the exception. The ANN library addresses every
+    /// record when it views an index, so a bundle that carries one opens in
+    /// time and heap linear in its embedded records; see
+    /// [`crate::vectors`]. Nothing else about open depends on size.
     ///
     /// Fails if a required artifact is missing, if exactly one of
     /// `data.hdt.graphs` and `data.hdt.graphs.idx` is present, or if a published

@@ -37,20 +37,38 @@
 //!
 //! The header carries the identity digest of the `data.hdt` the entities
 //! belong to, so an id map copied beside another HDT is refused at open rather
-//! than answering with ids from the wrong dictionary.
+//! than answering with ids from the wrong dictionary. It also carries the
+//! SHA-256 of the Parquet the records came from and of the index built from
+//! it, so the three files of one build are bound to each other; those two are
+//! whole-file digests, compared by `kgf manifest` and never at open.
 //!
 //! # What open checks, and what it leaves to verification
 //!
-//! Open reads the header, checks the file is exactly as long as the header's
-//! counts require, reads the two sentinel offsets, and checks the index's size
-//! and width against the header — a fixed number of reads however many
-//! entities there are. It does not walk the regions: that an entity's record
-//! is in range, that `offsets` is monotone, that the two directions agree, is
-//! [`Vectors::verify`]'s pass, run by `kgf manifest --check`. Because open
-//! leaves the regions unread, an accessor that finds one disagreeing with the
-//! header reports it as [`Error::Malformed`] rather than asserting: this
-//! crate's other accessors assert on conditions their open already excluded,
-//! and these are not, so a request over a corrupt map must refuse, not panic.
+//! Of the id map, open reads the header, checks the file is exactly as long
+//! as the header's counts require, and reads the two sentinel offsets — a
+//! fixed number of reads however many entities there are. It does not walk
+//! the regions: that an entity's record is in range, that `offsets` is
+//! monotone, that the two directions agree, is [`Vectors::verify`]'s pass,
+//! run by `kgf manifest`. Because open leaves the regions unread, an accessor
+//! that finds one disagreeing with the header reports it as
+//! [`Error::Malformed`] rather than asserting: this crate's other accessors
+//! assert on conditions their open already excluded, and these are not, so a
+//! request over a corrupt map must refuse, not panic.
+//!
+//! Of the index, open checks its size, width, metric and stored precision
+//! against what a build writes. Viewing it is the part of open that is not
+//! size-independent: the library allocates per record and reads every node's
+//! key, as [`MappedIndex`] sets out, so opening a sidecar is linear in its
+//! records.
+//!
+//! # Locks
+//!
+//! The index is the library's own structure, and two of its read paths take
+//! a lock this crate cannot remove: a search leases a context from a fixed
+//! pool under a mutex ([`Vectors::similar`]), and a lookup by key reads the
+//! library's key table under a shared lock ([`Vectors::vector`]). Neither is
+//! held across the work it guards. They are the only locks on a store's read
+//! path.
 
 use std::io::Write;
 use std::path::Path;
@@ -64,10 +82,13 @@ use crate::map::{BytesSpec, MappedIndex, Mapping, PackedSpec, PublishedBundle, o
 pub const MAGIC: &[u8; 8] = b"KGFIDMAP";
 
 /// The layout this build reads and writes.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Bytes before the first region.
-pub const HEADER_LEN: u64 = 152;
+pub const HEADER_LEN: u64 = 184;
+
+/// Bytes of the header that hold a field; the rest is reserved.
+const HEADER_FIELDS_LEN: u64 = 168;
 
 /// Bytes of a text digest.
 pub const DIGEST_LEN: u64 = 32;
@@ -107,6 +128,11 @@ pub struct IdMapHeader {
     /// from. Not checked at open — it is a pass over the whole file — but by
     /// `kgf manifest`, like every other whole-file digest.
     pub parent_digest: [u8; 32],
+    /// SHA-256 of the `index.usearch` built in the same run, whose key `i` is
+    /// this map's record `i`. Checked where `parent_digest` is: without it an
+    /// index of the right size from another run would answer with the wrong
+    /// records' vectors.
+    pub index_digest: [u8; 32],
 }
 
 impl IdMapHeader {
@@ -143,6 +169,7 @@ impl IdMapHeader {
             hdt_identity: digest_at(40),
             convention_id: digest_at(72),
             parent_digest: digest_at(104),
+            index_digest: digest_at(136),
         })
     }
 
@@ -156,8 +183,9 @@ impl IdMapHeader {
         out.write_all(&self.hdt_identity)?;
         out.write_all(&self.convention_id)?;
         out.write_all(&self.parent_digest)?;
+        out.write_all(&self.index_digest)?;
         // Reserved to the end of the header.
-        out.write_all(&[0; (HEADER_LEN - 136) as usize])
+        out.write_all(&[0; (HEADER_LEN - HEADER_FIELDS_LEN) as usize])
     }
 
     /// Where each region begins, and the file's total length.
@@ -290,6 +318,22 @@ impl Vectors {
         }
 
         let index = MappedIndex::view(open_published(bundle, index)?, search_contexts)?;
+        // One encoding: a build writes cosine over f16, and every answer that
+        // turns a distance into a similarity or publishes a stored vector
+        // assumes it. An index under another metric or precision is not a
+        // second kind of sidecar to serve; it is not this sidecar.
+        let written = index.written();
+        if written.metric != usearch::MetricKind::Cos
+            || written.quantization != usearch::ScalarKind::F16
+        {
+            return Err(Error::Malformed {
+                artifact: index.path().to_path_buf(),
+                detail: format!(
+                    "the index compares {:?} vectors under {:?}; a build writes F16 under Cos",
+                    written.quantization, written.metric
+                ),
+            });
+        }
         let viewed = index.index();
         if viewed.size() as u64 != header.records
             || viewed.dimensions() as u64 != u64::from(header.dimensions)
@@ -334,10 +378,16 @@ impl Vectors {
         self.header.entities
     }
 
-    /// How far a search looks: the index's stored search expansion, the
-    /// bound on candidates one probe visits.
+    /// Candidates a search keeps while it walks the graph when it is asked
+    /// for fewer results than this; asked for more, it keeps that many. So a
+    /// probe for `k` results is as broad as the larger of the two.
     pub fn expansion_search(&self) -> usize {
         self.index.index().expansion_search()
+    }
+
+    /// The library version that wrote the index, from the file's own header.
+    pub fn library_version(&self) -> (u16, u16, u16) {
+        self.index.written().library_version
     }
 
     /// Links per node in the index's graph, the other build parameter a
@@ -393,10 +443,25 @@ impl Vectors {
     ///
     /// Several when identical texts were deduplicated into one record. The
     /// header's `max_entities_per_record` says how many at most — a statement
-    /// the build made and `kgf manifest` verified, not one open checks — so a
-    /// caller with a budget charges each entity to it rather than trusting the
-    /// figure.
+    /// the build made and `kgf manifest` verified, not one open checks — and
+    /// nothing bounds that figure, so a caller with a budget charges each
+    /// entity to it as it takes one rather than collecting them first.
+    /// [`entity_count`](Self::entity_count) says how many there are without
+    /// reading any.
     pub fn entities_of(&self, row: Row) -> Result<impl Iterator<Item = TermId> + '_> {
+        let (start, end) = self.span_of(row)?;
+        let members = self.spec.members.view(&self.entities);
+        Ok((start..end).map(move |i| TermId(members.get(i))))
+    }
+
+    /// How many entities `row` names: two offset reads.
+    pub fn entity_count(&self, row: Row) -> Result<u64> {
+        let (start, end) = self.span_of(row)?;
+        Ok(end - start)
+    }
+
+    /// Where `row`'s entities lie in `members`.
+    fn span_of(&self, row: Row) -> Result<(u64, u64)> {
         let row = self.checked_row(row)?;
         let offsets = self.spec.offsets.view(&self.entities);
         let (start, end) = (offsets.get(row.0), offsets.get(row.0 + 1));
@@ -406,8 +471,7 @@ impl Vectors {
                 row.0, self.header.entities
             )));
         }
-        let members = self.spec.members.view(&self.entities);
-        Ok((start..end).map(move |i| TermId(members.get(i))))
+        Ok((start, end))
     }
 
     /// The SHA-256 of the text `row` was embedded from.
@@ -422,6 +486,10 @@ impl Vectors {
     }
 
     /// `row`'s stored vector, at the index's precision widened to `f32`.
+    ///
+    /// The library finds a key's vector through its key table, which it reads
+    /// under a shared lock: readers do not exclude each other, but it is a
+    /// lock, and the second of the two the module documentation names.
     pub fn vector(&self, row: Row) -> Result<Vec<f32>> {
         let row = self.checked_row(row)?;
         let mut vector = vec![0f32; self.dimensions()];
@@ -448,12 +516,15 @@ impl Vectors {
     /// The `k` records nearest `query`, nearest first — fewer when the
     /// bundle holds fewer than `k`.
     ///
-    /// One probe of the index at its stored search expansion; the library
+    /// One probe of the index, as broad as the larger of `k` and
+    /// [`expansion_search`](Self::expansion_search): the cost grows with `k`
+    /// once `k` passes the expansion, so a caller's cap on `k` is a cap on
+    /// the probe. The library leases a search context under a mutex and
     /// fails rather than waits if more searches are running than contexts
-    /// were reserved at open, and that failure is reported, not retried.
-    /// `k` is held to the number of records before it reaches the library,
-    /// which sizes its result by it: what bounds the answer is the bundle,
-    /// not the caller.
+    /// were reserved at open; that failure is reported, not retried. `k` is
+    /// held to the number of records before it reaches the library, which
+    /// sizes its result by it: what bounds the answer is the bundle, not the
+    /// caller.
     pub fn similar(&self, query: &[f32], k: usize) -> Result<Vec<Hit>> {
         if query.len() != self.dimensions() {
             return Err(Error::QueryDimension {
@@ -577,43 +648,19 @@ impl Vectors {
     }
 }
 
-/// Open a bundle's vector sidecar as a server would and walk what open does
-/// not: [`Vectors::verify`], and the id map's record of the Parquet it was
-/// built from against `parent_sha256`, the whole-file digest the caller has
-/// computed — which this crate never does. `Ok` for a bundle without the
-/// sidecar.
-///
-/// For `kgf manifest`, which checks a bundle as it describes it; the failure
-/// it prevents is an id map and an index rebuilt from different vectors than
-/// the Parquet published beside them.
-pub fn verify_vectors_artifacts(
-    bundle: &PublishedBundle,
-    parent_sha256: Option<[u8; 32]>,
-) -> Result<()> {
-    let artifacts = crate::store::ArtifactSet::resolve(bundle.path())?;
-    let hdt = open_published(bundle, &artifacts.hdt)?;
-    let perm = open_published(bundle, &artifacts.perm)?;
-    let data = IndexedHdt::open(hdt, perm)?;
-    let Some(vectors) = artifacts.open_vectors(bundle, &data, 1)? else {
-        return Ok(());
-    };
-    vectors.verify(data.dict_counts().len(crate::Role::Subject))?;
-    if let Some(parent) = parent_sha256
-        && vectors.header().parent_digest != parent
-    {
-        return Err(Error::ArtifactBindingMismatch {
-            artifact: vectors.entities.path().to_path_buf(),
-            hdt: bundle.path().join(crate::store::artifact::VECTORS_EMBEDDINGS),
-            detail: "the id map records a different embeddings.parquet than the one published beside it; assemble the sidecar again with `kgf vectors`"
-                .to_owned(),
-        });
-    }
-    Ok(())
+/// The whole-file digests of a sidecar's files, which a caller has computed
+/// and this crate never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidecarDigests {
+    /// SHA-256 of `vectors/index.usearch`.
+    pub index: [u8; 32],
+    /// SHA-256 of `vectors/embeddings.parquet`, when the sidecar publishes
+    /// it: a sidecar is servable without.
+    pub embeddings: Option<[u8; 32]>,
 }
 
 /// What a bundle's vector sidecar says about itself, for a manifest to
-/// declare: read at open, without the walk [`verify_vectors_artifacts`]
-/// makes.
+/// declare. Every field is read from the sidecar's own files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SidecarFacts {
     /// Vector width.
@@ -626,27 +673,59 @@ pub struct SidecarFacts {
     pub convention_id: [u8; 32],
     /// Links per node in the index's graph.
     pub connectivity: u64,
-    /// Candidates one probe visits.
-    pub expansion_search: u64,
+    /// The library version that wrote the index, from the index's header:
+    /// major, minor, patch.
+    pub library_version: (u16, u16, u16),
 }
 
-/// Open a bundle's vector sidecar and report what it says about itself;
-/// `None` for a bundle without one.
-pub fn vectors_sidecar_facts(bundle: &PublishedBundle) -> Result<Option<SidecarFacts>> {
+/// Open a bundle's vector sidecar as a server would, walk what open does not
+/// ([`Vectors::verify`]), check the id map's record of the two files it was
+/// built with against `digests`, and report what the sidecar says about
+/// itself. `Ok(None)` for a bundle without the sidecar.
+///
+/// For `kgf manifest`, which checks a bundle as it describes it, in one open.
+/// The failures it prevents are an id map beside an index or a Parquet from
+/// another run: the right ids for the wrong vectors.
+pub fn verify_vectors_artifacts(
+    bundle: &PublishedBundle,
+    digests: SidecarDigests,
+) -> Result<Option<SidecarFacts>> {
     let artifacts = crate::store::ArtifactSet::resolve(bundle.path())?;
     let hdt = open_published(bundle, &artifacts.hdt)?;
     let perm = open_published(bundle, &artifacts.perm)?;
     let data = IndexedHdt::open(hdt, perm)?;
-    Ok(artifacts
-        .open_vectors(bundle, &data, 1)?
-        .map(|vectors| SidecarFacts {
-            dimensions: vectors.header().dimensions,
-            records: vectors.records(),
-            entities: vectors.entities(),
-            convention_id: vectors.header().convention_id,
-            connectivity: vectors.connectivity() as u64,
-            expansion_search: vectors.expansion_search() as u64,
-        }))
+    let Some(vectors) = artifacts.open_vectors(bundle, &data, 1)? else {
+        return Ok(None);
+    };
+    vectors.verify(data.dict_counts().len(crate::Role::Subject))?;
+    let header = vectors.header();
+    let other_run = |beside: &str, detail: &str| Error::ArtifactBindingMismatch {
+        artifact: vectors.entities.path().to_path_buf(),
+        hdt: bundle.path().join(beside),
+        detail: format!("{detail}; assemble the sidecar again with `kgf vectors`"),
+    };
+    if header.index_digest != digests.index {
+        return Err(other_run(
+            crate::store::artifact::VECTORS_INDEX,
+            "the id map records a different index.usearch than the one published beside it",
+        ));
+    }
+    if let Some(embeddings) = digests.embeddings
+        && header.parent_digest != embeddings
+    {
+        return Err(other_run(
+            crate::store::artifact::VECTORS_EMBEDDINGS,
+            "the id map records a different embeddings.parquet than the one published beside it",
+        ));
+    }
+    Ok(Some(SidecarFacts {
+        dimensions: header.dimensions,
+        records: vectors.records(),
+        entities: vectors.entities(),
+        convention_id: header.convention_id,
+        connectivity: vectors.connectivity() as u64,
+        library_version: vectors.library_version(),
+    }))
 }
 
 /// One record as the id-map writer takes it: in record order, so the `n`th
@@ -670,6 +749,8 @@ pub struct IdMapIdentity {
     pub convention_id: [u8; 32],
     /// SHA-256 of the `embeddings.parquet` the rows came from.
     pub parent_digest: [u8; 32],
+    /// SHA-256 of the `index.usearch` built from the same rows.
+    pub index_digest: [u8; 32],
 }
 
 /// What was written.
@@ -734,6 +815,7 @@ pub fn write_id_map(
         hdt_identity: identity.hdt_identity,
         convention_id: identity.convention_id,
         parent_digest: identity.parent_digest,
+        index_digest: identity.index_digest,
     };
     header.write(out)?;
     for (id, _) in &by_id {
@@ -815,6 +897,10 @@ mod tests {
             let members: Vec<TermId> = vectors.entities_of(Row(row as u64)).unwrap().collect();
             assert_eq!(members, ids, "record {row}");
             assert_eq!(
+                vectors.entity_count(Row(row as u64)).unwrap(),
+                ids.len() as u64
+            );
+            assert_eq!(
                 vectors.digest_of(Row(row as u64)).unwrap(),
                 fixture_digest(row as u64)
             );
@@ -827,6 +913,7 @@ mod tests {
         );
         assert_eq!(vectors.row_of(TermId(u64::MAX)).unwrap(), None);
         assert!(vectors.entities_of(Row(4)).is_err());
+        assert!(vectors.entity_count(Row(4)).is_err());
         assert!(vectors.digest_of(Row(4)).is_err());
         assert!(vectors.vector(Row(4)).is_err());
         vectors
@@ -969,6 +1056,7 @@ mod tests {
                 hdt_identity: store.hdt_identity_digest(),
                 convention_id: [0; 32],
                 parent_digest: [0; 32],
+                index_digest: [0; 32],
             };
             // Three records against the index's four.
             let rows: Vec<IdMapRow> = GROUPS[..3]
@@ -1000,6 +1088,74 @@ mod tests {
             message.contains("4 vectors") && message.contains("records 3"),
             "{message}"
         );
+    }
+
+    /// Save an index of `records` fixture vectors under `metric` and
+    /// `quantization` over the fixture's own.
+    fn replace_index(
+        fixture: &Fixture,
+        records: u64,
+        metric: usearch::MetricKind,
+        quantization: usearch::ScalarKind,
+    ) {
+        let index = usearch::Index::new(&usearch::IndexOptions {
+            dimensions: 8,
+            metric,
+            quantization,
+            ..Default::default()
+        })
+        .unwrap();
+        index.reserve(records as usize).unwrap();
+        for key in 0..records {
+            index.add(key, &fixture_vector(key)).unwrap();
+        }
+        index
+            .save(
+                fixture
+                    .bundle_path()
+                    .join(artifact::VECTORS_INDEX)
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn an_index_a_build_would_not_write_is_refused_at_open() {
+        // The right size and width, so only the encoding differs: a distance
+        // that is not a cosine, then a precision that is not the published one.
+        for (metric, quantization) in [
+            (usearch::MetricKind::L2sq, usearch::ScalarKind::F16),
+            (usearch::MetricKind::Cos, usearch::ScalarKind::F32),
+        ] {
+            let fixture = Fixture::build(SOURCE).with_vectors(GROUPS);
+            replace_index(&fixture, 4, metric, quantization);
+
+            let error = Store::open(
+                &published_bundle(fixture.bundle_path()),
+                OpenOptions::default(),
+            )
+            .expect_err("refused");
+
+            assert!(
+                error.to_string().contains("a build writes F16 under Cos"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sidecar_reports_the_library_that_wrote_it_and_the_breadth_it_searches_at() {
+        let fixture = Fixture::build(SOURCE).with_vectors(GROUPS);
+        let store = open(&fixture);
+        let vectors = store.vectors().expect("sidecar");
+
+        // The fixture's index was written by the library this build links, so
+        // the header's version is that library's.
+        let (major, minor, patch) = vectors.library_version();
+        assert_eq!(format!("{major}.{minor}.{patch}"), usearch::version());
+        // Set by this crate, not left to the library's default.
+        assert_eq!(vectors.expansion_search(), crate::map::SEARCH_EXPANSION);
     }
 
     #[test]
@@ -1066,6 +1222,7 @@ mod tests {
             hdt_identity: [0; 32],
             convention_id: [0; 32],
             parent_digest: [0; 32],
+            index_digest: [0; 32],
         };
         let row = |ids: &[u64]| IdMapRow {
             digest: [0; 32],

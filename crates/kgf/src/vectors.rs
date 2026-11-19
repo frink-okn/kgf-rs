@@ -8,8 +8,8 @@
 //! `kgf verbalize --roots` wrote — each root's IRI, target and text digest —
 //! through the bundle's dictionary, and writes the five files a server and a
 //! client need: the ANN index with row `i` under key `i`, the id map in
-//! subject ids, the Parquet itself (linked where the file system allows),
-//! `roots.parquet`, entity IRI → digest for a client holding the vectors
+//! subject ids, the Parquet itself, `roots.parquet`, entity IRI → digest for a
+//! client holding the vectors
 //! without the bundle, and `verbalize.json`, the config the texts were
 //! rendered under, in canonical JSON — the recipe, published and
 //! digest-covered beside what it produced, so a server can render an
@@ -17,9 +17,20 @@
 //!
 //! Everything is written into a scratch directory beside `vectors/` and
 //! renamed into place at the end, so the sidecar exists whole or not at all.
-//! The Parquet is hard-linked rather than copied where the file system
-//! allows, so it inherits the promise `kgf build --adopt` already relies on:
-//! the operator does not rewrite an input after handing it to a bundle.
+//! The Parquet is copied, so the published artifact shares nothing with the
+//! file the operator named and a later embedding run that writes to the same
+//! path cannot rewrite it. `--adopt` takes the file instead, as it does for
+//! `kgf build`: a hard link where the file system allows, and the named file
+//! removed once the sidecar is published, so there is again one name for the
+//! bytes.
+//!
+//! Two things are checked that the join alone would not catch. Every vector
+//! must be one the index can compare: finite, not all zeros, and within what
+//! the index's 16-bit floats hold. And the config must be the one the roots
+//! were rendered under: the first root of each target is rendered again here
+//! and must have the digest the roots stream records for it, since the config
+//! is published as the recipe for texts this command never sees.
+//!
 //! An existing `vectors/` is never replaced: a sidecar is part of a version's
 //! identity, and a different one is a different version. The manifest is not
 //! rewritten here — `kgf manifest` derives the `vectors` capability from the
@@ -41,14 +52,17 @@ use arrow::array::{Array, AsArray, FixedSizeBinaryArray, RecordBatch, StringArra
 use arrow::datatypes::{DataType, Field, Float32Type, Schema};
 use clap::Parser;
 use kgf_store::vectors::{IdMapIdentity, IdMapRow, write_id_map};
-use kgf_store::{OpenOptions, Role, Store, TermId};
+use kgf_store::{OpenOptions, Role, SidecarFacts, Store, TermId};
+use kgf_verbalize::{Bound, Verbalizer};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
-use sha2::{Digest, Sha256};
 
 use kgf_store::store::artifact;
+
+use crate::manifest::sha256_bytes;
+use crate::verbalize::{label_role, read_config};
 
 /// The base name of one of the sidecar's artifacts, which the store's
 /// vocabulary spells with its `vectors/` directory.
@@ -78,6 +92,10 @@ const TEXTS_FORMAT: &str = "2";
 /// Rows per batch when reading the vectors and writing the roots table.
 const BATCH_ROWS: usize = 8192;
 
+/// The largest magnitude the index's 16-bit floats hold; a larger component
+/// would be stored as an infinity.
+const F16_MAX: f32 = 65504.0;
+
 /// `kgf vectors`.
 #[derive(Debug, Parser)]
 pub struct Args {
@@ -99,6 +117,22 @@ pub struct Args {
     /// YAML or JSON. Published in the sidecar in canonical JSON.
     #[arg(long, value_name = "FILE")]
     pub config: PathBuf,
+
+    /// Take the embeddings file into the bundle instead of copying it: a hard
+    /// link where the file system allows, and the named file removed once
+    /// the sidecar is published.
+    #[arg(long)]
+    pub adopt: bool,
+}
+
+/// What becomes of the embeddings file the operator named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// The bundle gets its own copy and the named file is left as it was.
+    Copy,
+    /// The bundle takes the file: linked where possible, and the named file
+    /// removed after the sidecar is published.
+    Adopt,
 }
 
 /// What was assembled.
@@ -116,7 +150,18 @@ pub struct Assembled {
 
 /// Run the command.
 pub fn run(args: Args) -> Result<()> {
-    let assembled = assemble(&args.bundle, &args.embeddings, &args.roots, &args.config)?;
+    let placement = if args.adopt {
+        Placement::Adopt
+    } else {
+        Placement::Copy
+    };
+    let assembled = assemble(
+        &args.bundle,
+        &args.embeddings,
+        placement,
+        &args.roots,
+        &args.config,
+    )?;
     println!(
         "wrote {} with {} records over {} entities ({} dimensions, at most {} entities a record)",
         sidecar_dir(&args.bundle).display(),
@@ -133,6 +178,7 @@ pub fn run(args: Args) -> Result<()> {
 pub fn assemble(
     bundle: &Path,
     embeddings: &Path,
+    placement: Placement,
     roots: &Path,
     config: &Path,
 ) -> Result<Assembled> {
@@ -141,32 +187,29 @@ pub fn assemble(
     let resolved = verbalize
         .resolve()
         .with_context(|| format!("{} is not a usable verbalization config", config.display()))?;
-    let target_names: Vec<&str> = resolved
-        .targets
-        .iter()
-        .map(|target| target.name.as_str())
-        .collect();
     ensure!(
         !target.exists(),
         "{} already exists; a version's sidecar is never replaced, so assemble a new version",
         target.display()
     );
     let store = open_bundle(bundle)?;
+    // Bound as `kgf verbalize` binds it, so a root rendered here is rendered
+    // as the run that wrote the roots rendered it.
+    let bound = Bound::bind(&store, &resolved, &label_role(bundle)?)
+        .with_context(|| format!("binding {} to the bundle", config.display()))?;
 
     let scratch = tempfile::Builder::new()
         .prefix(".vectors-")
         .tempdir_in(bundle)
         .with_context(|| format!("creating a scratch directory under {}", bundle.display()))?;
 
-    let read = read_embeddings(
-        embeddings,
-        &scratch.path().join(file_name(artifact::VECTORS_INDEX)),
-    )?;
+    let index_path = scratch.path().join(file_name(artifact::VECTORS_INDEX));
+    let read = read_embeddings(embeddings, &index_path)?;
     let joined = join_roots(
         &store,
         roots,
         &read,
-        &target_names,
+        Recipe::new(&store, &bound, config),
         &scratch.path().join(file_name(artifact::VECTORS_ROOTS)),
     )?;
 
@@ -181,11 +224,19 @@ pub fn assemble(
     std::fs::write(&config_path, canonical)
         .with_context(|| format!("writing {}", config_path.display()))?;
 
+    // The id map names the two files of this run it belongs with, so an
+    // index or a Parquet from another run is caught beside it.
+    let digest_of = |path: &Path| -> Result<[u8; 32]> {
+        sha256_bytes(path)
+            .map(|(_, digest)| digest)
+            .with_context(|| format!("hashing {}", path.display()))
+    };
     let identity = IdMapIdentity {
         dimensions: read.dimensions,
         hdt_identity: store.hdt_identity_digest(),
         convention_id: read.convention_id,
-        parent_digest: file_digest(embeddings)?,
+        parent_digest: digest_of(embeddings)?,
+        index_digest: digest_of(&index_path)?,
     };
     let id_map = scratch.path().join(file_name(artifact::VECTORS_ENTITIES));
     let mut out = BufWriter::new(
@@ -200,15 +251,28 @@ pub fn assemble(
     out.flush()
         .with_context(|| format!("writing {}", id_map.display()))?;
 
-    link_or_copy(
+    crate::build::place_unhashed(
         embeddings,
         &scratch.path().join(file_name(artifact::VECTORS_EMBEDDINGS)),
+        placement == Placement::Adopt,
     )?;
 
     drop(store);
     let scratch = scratch.keep();
     std::fs::rename(&scratch, &target)
         .with_context(|| format!("publishing {} as {}", scratch.display(), target.display()))?;
+    // Only now, when the sidecar holds the bytes under its own name: a run
+    // that failed above has cost the operator nothing. A failure here is
+    // reported and not fatal, since the sidecar is published and correct.
+    if placement == Placement::Adopt
+        && let Err(error) = std::fs::remove_file(embeddings)
+    {
+        tracing::warn!(
+            %error,
+            source = %embeddings.display(),
+            "the sidecar is published, but the adopted embeddings could not be removed"
+        );
+    }
 
     Ok(Assembled {
         records: summary.records,
@@ -347,13 +411,19 @@ fn read_embeddings(path: &Path, index_path: &Path) -> Result<ReadEmbeddings> {
             })?;
         for i in 0..batch.num_rows() {
             let digest: [u8; 32] = digests.value(i).try_into().expect("32 bytes");
+            ensure!(
+                !vectors.is_null(i),
+                "{} row {row}: no vector",
+                path.display()
+            );
             let vector = vectors.value(i);
             let floats = vector.as_primitive::<Float32Type>();
             ensure!(
                 floats.null_count() == 0 && floats.len() == dimensions as usize,
-                "{} row {row}: vector is not {dimensions} finite floats",
+                "{} row {row}: vector is not {dimensions} floats",
                 path.display()
             );
+            comparable(floats.values()).with_context(|| format!("{} row {row}", path.display()))?;
             index
                 .add(row, floats.values())
                 .map_err(|e| anyhow!("adding row {row} to the index: {e}"))?;
@@ -399,6 +469,104 @@ fn read_embeddings(path: &Path, index_path: &Path) -> Result<ReadEmbeddings> {
     })
 }
 
+/// Refuse a vector the index could store but not compare.
+///
+/// A NaN or infinite component makes every distance to the record NaN, and a
+/// NaN orders arbitrarily in a ranking. A component past the index's 16-bit
+/// range is stored as an infinity, with the same result. An all-zero vector
+/// has no direction, and a cosine against it is undefined.
+fn comparable(vector: &[f32]) -> Result<()> {
+    if let Some(position) = vector.iter().position(|x| !x.is_finite()) {
+        bail!("component {position} is not a finite number");
+    }
+    if let Some(position) = vector.iter().position(|x| x.abs() > F16_MAX) {
+        bail!(
+            "component {position} is {}, past the {F16_MAX} the index's 16-bit floats hold",
+            vector[position]
+        );
+    }
+    ensure!(
+        vector.iter().any(|x| *x != 0.0),
+        "the vector is all zeros, which has no direction to compare"
+    );
+    Ok(())
+}
+
+/// The check that the config given is the one the roots were rendered under.
+///
+/// The config is published as the recipe for the embedded texts, and this
+/// command sees digests, never texts. So the first root of each target is
+/// rendered again under the config and must have the digest the roots stream
+/// records for it. One render a target: enough to catch a config edited
+/// since the roots were written or belonging to another graph, without
+/// repeating the verbalizer's run.
+struct Recipe<'a> {
+    verbalizer: Verbalizer<'a>,
+    /// Target names, in the config's order.
+    targets: Vec<&'a str>,
+    /// Whether a root of the target at the same position has been rendered.
+    checked: Vec<bool>,
+    config: &'a Path,
+}
+
+impl<'a> Recipe<'a> {
+    fn new(store: &'a Store, bound: &'a Bound, config: &'a Path) -> Self {
+        let targets: Vec<&str> = bound.targets().collect();
+        Self {
+            verbalizer: Verbalizer::new(store, bound),
+            checked: vec![false; targets.len()],
+            targets,
+            config,
+        }
+    }
+
+    /// The position of the target `root` is under, or the refusal for a
+    /// target the config does not declare.
+    fn target_of(&self, root: &RootLine, at: &dyn std::fmt::Display) -> Result<usize> {
+        self.targets
+            .iter()
+            .position(|name| *name == root.target)
+            .ok_or_else(|| {
+                anyhow!(
+                    "{at}: root {} is under target {:?}, which the config does not declare ({}); the roots were verbalized under a different config",
+                    root.iri,
+                    root.target,
+                    self.targets.join(", ")
+                )
+            })
+    }
+
+    /// Render `root` if it is the first of its target, and refuse a text
+    /// other than the one the stream records.
+    fn check(
+        &mut self,
+        target: usize,
+        root: &RootLine,
+        subject: TermId,
+        recorded: &[u8; 32],
+        at: &dyn std::fmt::Display,
+    ) -> Result<()> {
+        if std::mem::replace(&mut self.checked[target], true) {
+            return Ok(());
+        }
+        let rendered = self
+            .verbalizer
+            .verbalize(target, subject.0)
+            .with_context(|| format!("rendering {} under {}", root.iri, self.config.display()))?
+            .ok_or_else(|| anyhow!("{at}: root {} is a blank node, which has no text", root.iri))?;
+        ensure!(
+            rendered.digest == *recorded,
+            "{at}: root {} renders under target {:?} of {} as text {}, but the roots record {};              the roots were verbalized under a different config or by a different kgf, so              verbalize again or pass the config they were written under",
+            root.iri,
+            root.target,
+            self.config.display(),
+            hex(&rendered.digest),
+            hex(recorded)
+        );
+        Ok(())
+    }
+}
+
 /// One line of the roots stream.
 #[derive(Debug, serde::Deserialize)]
 struct RootLine {
@@ -409,12 +577,13 @@ struct RootLine {
 
 /// Resolve every root to a subject id and a record, write `roots.parquet`,
 /// and return the id-map rows in record order. A root under a target the
-/// config does not declare was verbalized under another config.
+/// config does not declare, or one that `recipe` renders to another text,
+/// was verbalized under another config.
 fn join_roots(
     store: &Store,
     path: &Path,
     read: &ReadEmbeddings,
-    targets: &[&str],
+    mut recipe: Recipe<'_>,
     roots_parquet: &Path,
 ) -> Result<Vec<IdMapRow>> {
     let reader =
@@ -447,15 +616,8 @@ fn join_roots(
         }
         let root: RootLine = serde_json::from_str(&line)
             .with_context(|| format!("{}:{number} is not a roots line", path.display()))?;
-        if !targets.contains(&root.target.as_str()) {
-            bail!(
-                "{}:{number}: root {} is under target {:?}, which the config does not declare ({}); the roots were verbalized under a different config",
-                path.display(),
-                root.iri,
-                root.target,
-                targets.join(", ")
-            );
-        }
+        let at = format!("{}:{number}", path.display());
+        let target = recipe.target_of(&root, &at)?;
         let digest = parse_digest(&root.digest)
             .with_context(|| format!("{}:{number}'s digest", path.display()))?;
         let row = read.row_of(&digest).ok_or_else(|| {
@@ -478,6 +640,7 @@ fn join_roots(
                     root.iri
                 )
             })?;
+        recipe.check(target, &root, id, &digest, &at)?;
         per_record[row as usize].push(id);
         batch.push(&root, digest);
         if batch.len() == BATCH_ROWS {
@@ -634,24 +797,22 @@ impl<'a> Footer<'a> {
 }
 
 /// What a bundle's `vectors` capability declares, for `kgf manifest` to write
-/// into the manifest: the sidecar's own facts, the space and the model from
-/// the embedding stage's footer (read here once, so a server never parses the
-/// Parquet), and the targets from the published config. `None` for a bundle
-/// without the sidecar, and for one whose sidecar does not publish the
-/// Parquet: the model is known only from its footer, and a sidecar is servable
-/// without it. Without the config, the targets are empty.
+/// into the manifest: `facts`, which the sidecar's own files state; the space
+/// and the model from the embedding stage's footer (read here once, so a
+/// server never parses the Parquet); and the targets from the published
+/// config. `None` for a sidecar that does not publish the Parquet: the model
+/// is known only from its footer, and a sidecar is servable without it.
+/// Without the config, the targets are empty.
 ///
-/// The index's library version is the one this binary links. The sidecar is
-/// written by `kgf vectors` and described by `kgf manifest`, which `--locked`
-/// builds from one lockfile, so it is also the version that wrote the index.
+/// Everything here is a fact about the bundle: the index's library version is
+/// the one its file header records, not the one this binary links, so a later
+/// `kgf manifest` describes an index as the build that wrote it did. How far
+/// a search looks is not here for the same reason. It is the server's choice
+/// and no file records it.
 pub fn describe(
     bundle: &kgf_store::PublishedBundle,
+    facts: &SidecarFacts,
 ) -> Result<Option<kgf_store::VectorsDescription>> {
-    let Some(facts) = kgf_store::vectors_sidecar_facts(bundle)
-        .with_context(|| format!("opening the vector sidecar in {}", bundle.path().display()))?
-    else {
-        return Ok(None);
-    };
     let parquet = bundle.path().join(artifact::VECTORS_EMBEDDINGS);
     if !parquet.is_file() {
         return Ok(None);
@@ -681,6 +842,7 @@ pub fn describe(
     } else {
         BTreeMap::new()
     };
+    let (major, minor, patch) = facts.library_version;
     Ok(Some(kgf_store::VectorsDescription {
         model: footer.field("model")?.clone(),
         convention_id: convention_id.clone(),
@@ -694,42 +856,16 @@ pub fn describe(
         targets,
         index: kgf_store::VectorsIndexDescription {
             library: "usearch".to_owned(),
-            library_version: usearch::version().to_owned(),
+            library_version: format!("{major}.{minor}.{patch}"),
             kind: "hnsw".to_owned(),
             quantization: "f16".to_owned(),
             connectivity: facts.connectivity,
-            expansion_search: facts.expansion_search,
         },
     }))
 }
 
-/// The config as given, YAML or JSON.
-fn read_config(path: &Path) -> Result<kgf_verbalize::Config> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading the config {}", path.display()))?;
-    serde_norway::from_str(&text).with_context(|| format!("parsing the config {}", path.display()))
-}
-
-/// Hard-link `from` at `to`, or copy it where linking is refused.
-fn link_or_copy(from: &Path, to: &Path) -> Result<()> {
-    if std::fs::hard_link(from, to).is_ok() {
-        return Ok(());
-    }
-    std::fs::copy(from, to)
-        .map(|_| ())
-        .with_context(|| format!("copying {} to {}", from.display(), to.display()))
-}
-
-/// The SHA-256 of a whole file.
-fn file_digest(path: &Path) -> Result<[u8; 32]> {
-    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).with_context(|| format!("hashing {}", path.display()))?;
-    Ok(hasher.finalize().into())
-}
-
 /// Sixty-four hex characters as thirty-two bytes.
-fn parse_digest(hex: &str) -> Result<[u8; 32]> {
+pub(crate) fn parse_digest(hex: &str) -> Result<[u8; 32]> {
     ensure!(
         hex.is_ascii() && hex.len() == 64,
         "{hex:?} is not 64 hex digits"

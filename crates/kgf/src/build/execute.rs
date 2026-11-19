@@ -886,7 +886,7 @@ fn place(source: &Path, dest: &Path, adopt: bool) -> Result<String> {
 /// For a file the manifest does not record as a source input: the bundle's own
 /// per-artifact checksum covers it once it is in place, and hashing it here
 /// would be a second full read for a number nothing asks for.
-fn place_unhashed(source: &Path, dest: &Path, adopt: bool) -> Result<()> {
+pub(crate) fn place_unhashed(source: &Path, dest: &Path, adopt: bool) -> Result<()> {
     if adopt && linked(source, dest) {
         return Ok(());
     }

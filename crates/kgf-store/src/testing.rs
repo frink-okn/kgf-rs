@@ -455,9 +455,11 @@ impl Fixture {
     /// Each group is one record — subjects whose texts were identical — and
     /// the `n`th group is record `n`. Vectors are 8 wide and drawn from a
     /// fixed seed, so which record is nearest which is the same in every run;
-    /// a record's text digest is the SHA-256 of its number in decimal. Written
+    /// a record's text digest is [`fixture_digest`] of its number. Written
     /// with the same index library and id-map writer a build uses, so the
-    /// fixture is the format a build produces.
+    /// fixture is the format a build produces. The id map records its index's
+    /// digest; the one it records for a Parquet is a placeholder, since the
+    /// fixture publishes none.
     ///
     /// Panics on a subject the dictionary does not hold: a fixture naming a
     /// term that is not there would test nothing.
@@ -504,6 +506,12 @@ impl Fixture {
         index
             .save(dir.join("index.usearch").to_str().unwrap())
             .expect("save index");
+        // The id map names the index it belongs with, as a build's does, so
+        // `kgf manifest` accepts the fixture as one run's files.
+        let index_digest = hdtc::format::sha256_to_end(
+            &mut std::fs::File::open(dir.join("index.usearch")).expect("open the index"),
+        )
+        .expect("digest the index");
 
         let mut out = std::io::BufWriter::new(
             std::fs::File::create(dir.join("entities.idmap")).expect("create id map"),
@@ -515,6 +523,7 @@ impl Fixture {
                 hdt_identity,
                 convention_id: [0x11; 32],
                 parent_digest: [0x22; 32],
+                index_digest,
             },
             rows,
         )

@@ -10,10 +10,11 @@ use std::sync::Arc;
 
 use arrow::array::{FixedSizeBinaryArray, FixedSizeListArray, Float32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
+use kgf::vectors::Placement;
 use kgf_store::catalog::{BundleId, Catalog};
 use kgf_store::manifest::Capability;
 use kgf_store::testing::Fixture;
-use kgf_store::vectors::Row;
+use kgf_store::vectors::{HEADER_LEN, Row};
 use kgf_store::{OpenOptions, Role, Store};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -179,6 +180,16 @@ fn embed(texts: &Path, out: &Path, format: &str) -> Vec<[u8; 32]> {
 }
 
 fn write_parquet(out: &Path, digests: &[[u8; 32]], format: &str) {
+    write_parquet_of(out, digests, format, &vector_for);
+}
+
+/// [`write_parquet`], with each text's vector from `vector`.
+fn write_parquet_of(
+    out: &Path,
+    digests: &[[u8; 32]],
+    format: &str,
+    vector: &dyn Fn(&[u8; 32]) -> Vec<f32>,
+) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("text_digest", DataType::FixedSizeBinary(32), false),
         Field::new(
@@ -190,7 +201,7 @@ fn write_parquet(out: &Path, digests: &[[u8; 32]], format: &str) {
             false,
         ),
     ]));
-    let flat: Vec<f32> = digests.iter().flat_map(vector_for).collect();
+    let flat: Vec<f32> = digests.iter().flat_map(vector).collect();
     let vectors = FixedSizeListArray::new(
         Arc::new(Field::new("item", DataType::Float32, false)),
         DIM as i32,
@@ -258,6 +269,7 @@ fn the_verbalizers_streams_become_a_sidecar_the_server_opens() {
     let assembled = kgf::vectors::assemble(
         &published.bundle(),
         &embeddings,
+        Placement::Copy,
         &roots,
         &published.beside("config.json"),
     )
@@ -322,6 +334,14 @@ fn the_verbalizers_streams_become_a_sidecar_the_server_opens() {
     assert_eq!(
         description["index"]["connectivity"],
         vectors.connectivity() as u64
+    );
+    // The library that wrote the index, read from the index: here the one
+    // this build links, since this build wrote it. How far a search looks is
+    // the server's setting and no fact about the bundle, so it is not here.
+    assert_eq!(description["index"]["library_version"], usearch::version());
+    assert!(
+        description["index"].get("expansion_search").is_none(),
+        "{description}"
     );
 
     // A live render under the stored config is the text that was embedded:
@@ -457,6 +477,7 @@ fn a_node_under_two_targets_is_embedded_once_under_the_first() {
     let error = kgf::vectors::assemble(
         &published.bundle(),
         &embeddings,
+        Placement::Copy,
         &stale,
         &published.beside("config.json"),
     )
@@ -473,6 +494,7 @@ fn a_node_under_two_targets_is_embedded_once_under_the_first() {
     let assembled = kgf::vectors::assemble(
         &published.bundle(),
         &embeddings,
+        Placement::Copy,
         &roots,
         &published.beside("config.json"),
     )
@@ -521,6 +543,7 @@ fn kgf_manifest_refuses_a_sidecar_that_does_not_describe_its_bundle() {
     kgf::vectors::assemble(
         &published.bundle(),
         &embeddings,
+        Placement::Copy,
         &roots,
         &published.beside("config.json"),
     )
@@ -536,9 +559,39 @@ fn kgf_manifest_refuses_a_sidecar_that_does_not_describe_its_bundle() {
     let error = format!("{:#}", published.try_describe().unwrap_err());
     assert!(error.contains("different embeddings.parquet"), "{error}");
 
+    // The id map records a different index than the one beside it.
+    let mut bytes = good.clone();
+    bytes[136..168].fill(0xCD);
+    std::fs::write(&id_map, &bytes).unwrap();
+    let error = format!("{:#}", published.try_describe().unwrap_err());
+    assert!(error.contains("different index.usearch"), "{error}");
+
+    // The case that record guards against: an index of the right size and
+    // width from another run. It opens, and it is caught here.
+    std::fs::write(&id_map, &good).unwrap();
+    let index_path = published.bundle().join("vectors/index.usearch");
+    let good_index = std::fs::read(&index_path).unwrap();
+    let other = usearch::Index::new(&usearch::IndexOptions {
+        dimensions: DIM,
+        metric: usearch::MetricKind::Cos,
+        quantization: usearch::ScalarKind::F16,
+        ..Default::default()
+    })
+    .unwrap();
+    other.reserve(3).unwrap();
+    for key in 0..3u64 {
+        let mut vector = vec![0.25f32; DIM];
+        vector[key as usize] = 0.75;
+        other.add(key, &vector).unwrap();
+    }
+    other.save(index_path.to_str().unwrap()).unwrap();
+    let error = format!("{:#}", published.try_describe().unwrap_err());
+    assert!(error.contains("different index.usearch"), "{error}");
+    std::fs::write(&index_path, &good_index).unwrap();
+
     // A region open does not read: the first two member ids swapped.
     let mut bytes = good.clone();
-    let members = 152 + 32 + 32 + 32;
+    let members = HEADER_LEN as usize + 32 + 32 + 32;
     let (x, y) = (
         bytes[members..members + 8].to_vec(),
         bytes[members + 8..members + 16].to_vec(),
@@ -581,6 +634,7 @@ fn an_existing_sidecar_is_never_replaced() {
     kgf::vectors::assemble(
         &published.bundle(),
         &embeddings,
+        Placement::Copy,
         &roots,
         &published.beside("config.json"),
     )
@@ -589,6 +643,7 @@ fn an_existing_sidecar_is_never_replaced() {
     let error = kgf::vectors::assemble(
         &published.bundle(),
         &embeddings,
+        Placement::Copy,
         &roots,
         &published.beside("config.json"),
     )
@@ -620,6 +675,7 @@ fn roots_and_embeddings_from_different_runs_are_refused_naming_the_root() {
     let error = kgf::vectors::assemble(
         &published.bundle(),
         &embeddings,
+        Placement::Copy,
         &foreign,
         &published.beside("config.json"),
     )
@@ -647,6 +703,7 @@ fn roots_and_embeddings_from_different_runs_are_refused_naming_the_root() {
     let error = kgf::vectors::assemble(
         &published.bundle(),
         &embeddings,
+        Placement::Copy,
         &stranger,
         &published.beside("config.json"),
     )
@@ -670,6 +727,7 @@ fn roots_and_embeddings_from_different_runs_are_refused_naming_the_root() {
         let error = kgf::vectors::assemble(
             &published.bundle(),
             &embeddings,
+            Placement::Copy,
             &odd,
             &published.beside("config.json"),
         )
@@ -690,6 +748,7 @@ fn roots_and_embeddings_from_different_runs_are_refused_naming_the_root() {
     let error = kgf::vectors::assemble(
         &published.bundle(),
         &embeddings,
+        Placement::Copy,
         &other,
         &published.beside("config.json"),
     )
@@ -708,6 +767,7 @@ fn roots_and_embeddings_from_different_runs_are_refused_naming_the_root() {
     let error = kgf::vectors::assemble(
         &published.bundle(),
         &wider,
+        Placement::Copy,
         &roots,
         &published.beside("config.json"),
     )
@@ -723,9 +783,155 @@ fn roots_and_embeddings_from_different_runs_are_refused_naming_the_root() {
     let error = kgf::vectors::assemble(
         &published.bundle(),
         &old,
+        Placement::Copy,
         &roots,
         &published.beside("config.json"),
     )
     .unwrap_err();
     assert!(error.to_string().contains("layout format 1"), "{error:#}");
+}
+
+#[test]
+fn a_vector_the_index_cannot_compare_is_refused_naming_its_row() {
+    let published = Published::build(&graph());
+    let (roots, texts) = (
+        published.beside("roots.jsonl"),
+        published.beside("texts.jsonl"),
+    );
+    published.verbalize(&roots, &texts);
+    let digests = embed(&texts, &published.beside("good.parquet"), "2");
+    let poisoned = digests[1];
+
+    for (name, value, says) in [
+        ("nan", f32::NAN, "component 3 is not a finite number"),
+        (
+            "infinite",
+            f32::INFINITY,
+            "component 3 is not a finite number",
+        ),
+        ("wide", 1.0e9, "16-bit floats"),
+        ("zeros", 0.0, "all zeros"),
+    ] {
+        let embeddings = published.beside(&format!("{name}.parquet"));
+        write_parquet_of(&embeddings, &digests, "2", &|digest| {
+            let mut vector = vector_for(digest);
+            if *digest == poisoned {
+                if value == 0.0 {
+                    vector.fill(0.0);
+                } else {
+                    vector[3] = value;
+                }
+            }
+            vector
+        });
+
+        let error = format!(
+            "{:#}",
+            kgf::vectors::assemble(
+                &published.bundle(),
+                &embeddings,
+                Placement::Copy,
+                &roots,
+                &published.beside("config.json"),
+            )
+            .unwrap_err()
+        );
+
+        assert!(
+            error.contains("row 1") && error.contains(says),
+            "{name}: {error}"
+        );
+        assert!(
+            !published.bundle().join("vectors").exists(),
+            "{name}: nothing published"
+        );
+    }
+}
+
+/// The config is published as the recipe for the embedded texts, so one the
+/// roots were not rendered under is refused, though it declares their target.
+#[test]
+fn a_config_the_roots_were_not_rendered_under_is_refused() {
+    let published = Published::build(&graph());
+    let (roots, texts) = (
+        published.beside("roots.jsonl"),
+        published.beside("texts.jsonl"),
+    );
+    published.verbalize(&roots, &texts);
+    let embeddings = published.beside("embeddings.parquet");
+    embed(&texts, &embeddings, "2");
+    // The same target under another label template: every text reads
+    // differently, and nothing in the roots or the vectors says so.
+    let edited = published.beside("edited.json");
+    std::fs::write(
+        &edited,
+        format!(
+            r#"{{"targets": {{"things": {{
+                "type": "{T}",
+                "label_template": "A thing called {{name}}",
+                "label_fields": {{"name": "{RDFS_LABEL}"}}
+            }}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let error = format!(
+        "{:#}",
+        kgf::vectors::assemble(
+            &published.bundle(),
+            &embeddings,
+            Placement::Copy,
+            &roots,
+            &edited,
+        )
+        .unwrap_err()
+    );
+
+    assert!(
+        error.contains(r#"renders under target "things""#) && error.contains("different config"),
+        "{error}"
+    );
+    assert!(!published.bundle().join("vectors").exists());
+}
+
+#[test]
+fn the_embeddings_are_copied_unless_adopted() {
+    let assembled = |placement: Placement| {
+        let published = Published::build(&graph());
+        let (roots, texts) = (
+            published.beside("roots.jsonl"),
+            published.beside("texts.jsonl"),
+        );
+        published.verbalize(&roots, &texts);
+        let embeddings = published.beside("embeddings.parquet");
+        embed(&texts, &embeddings, "2");
+        kgf::vectors::assemble(
+            &published.bundle(),
+            &embeddings,
+            placement,
+            &roots,
+            &published.beside("config.json"),
+        )
+        .unwrap();
+        (published, embeddings)
+    };
+
+    // Copied: the named file stays, and the bundle's is another file, so a
+    // later embedding run writing to the same path cannot rewrite it.
+    let (published, embeddings) = assembled(Placement::Copy);
+    let placed = published.bundle().join("vectors/embeddings.parquet");
+    assert!(embeddings.is_file());
+    assert!(!same_file::is_same_file(&embeddings, &placed).unwrap());
+
+    // Adopted: the bundle has the bytes and the named file is gone.
+    let (published, embeddings) = assembled(Placement::Adopt);
+    assert!(!embeddings.exists());
+    assert!(
+        published
+            .bundle()
+            .join("vectors/embeddings.parquet")
+            .is_file()
+    );
+    published.describe();
+    published.check().expect("an adopted sidecar checks");
 }

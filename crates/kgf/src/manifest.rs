@@ -32,7 +32,7 @@ use kgf_store::manifest::{
     content_digest_preimage, effective_predicate_roles, validate_predicate_role_iri,
 };
 use kgf_store::store::artifact;
-use kgf_store::{PublishedBundle, verify_description_artifacts};
+use kgf_store::{PublishedBundle, SidecarDigests, SidecarFacts, verify_description_artifacts};
 use sha2::{Digest, Sha256};
 
 /// Arguments for `kgf manifest`.
@@ -247,9 +247,9 @@ pub fn run(args: Args) -> Result<()> {
         // Counts first: they are free, and they are what catches a rebuild that
         // changed the data. Then the bytes, which catch a rebuild that did not.
         manifest.verify_against(&facts, &dir)?;
-        verify_described_artifacts(&manifest, &bundle, &facts)?;
+        let sidecar = verify_described_artifacts(&manifest, &bundle, &facts)?;
         verify_description_artifacts(&bundle, &manifest)?;
-        verify_vectors_description(&manifest, &bundle)?;
+        verify_vectors_description(&manifest, &bundle, sidecar.as_ref())?;
         println!(
             "{}: manifest agrees with its artifacts ({} triples, {})",
             dir.display(),
@@ -504,7 +504,7 @@ fn verify_described_artifacts(
     manifest: &Manifest,
     bundle: &PublishedBundle,
     facts: &BundleFacts,
-) -> Result<()> {
+) -> Result<Option<SidecarFacts>> {
     let dir = bundle.path();
     let remedy = format!("kgf manifest {}", dir.display());
 
@@ -520,7 +520,10 @@ fn verify_described_artifacts(
         );
     }
 
-    let computed = checksum_artifacts(bundle, facts)?;
+    let Checksummed {
+        entries: computed,
+        sidecar,
+    } = checksum_artifacts(bundle, facts)?;
     let listed: BTreeSet<&str> = manifest.artifacts.keys().map(String::as_str).collect();
     let present: BTreeSet<&str> = computed.iter().map(|(name, _)| name.as_str()).collect();
     if listed != present {
@@ -575,7 +578,7 @@ fn verify_described_artifacts(
             digest,
         );
     }
-    Ok(())
+    Ok(sidecar)
 }
 
 fn manifest_path(dir: &Path) -> PathBuf {
@@ -628,7 +631,10 @@ fn build(
     )
     .context("cannot infer a version from the bundle path; pass --version")?;
 
-    let mut artifacts = checksum_artifacts(bundle, facts)?;
+    let Checksummed {
+        entries: mut artifacts,
+        sidecar,
+    } = checksum_artifacts(bundle, facts)?;
     carry_artifact_metadata(&mut artifacts, previous, generated_description)?;
     let content_digest =
         content_digest(artifacts.iter().map(|(name, entry)| (name.as_str(), entry)));
@@ -644,7 +650,7 @@ fn build(
     .unwrap_or_else(now_rfc3339);
     let prefixes = prefixes(requested, previous)?;
     let predicate_roles = predicate_roles(requested, previous, &prefixes)?;
-    let capabilities = capabilities(bundle, facts)?;
+    let capabilities = capabilities(bundle, facts, sidecar.as_ref())?;
 
     Ok(Manifest {
         id,
@@ -706,12 +712,16 @@ fn build(
 
 /// Each capability the artifacts support, with what it declares: an empty
 /// object, except `vectors`, which describes its space, model and index (see
-/// [`crate::vectors::describe`]).
+/// [`crate::vectors::describe`]) from what the verified `sidecar` states.
 fn capabilities(
     bundle: &PublishedBundle,
     facts: &BundleFacts,
+    sidecar: Option<&SidecarFacts>,
 ) -> Result<BTreeMap<String, serde_json::Value>> {
-    let vectors = crate::vectors::describe(bundle)?;
+    let vectors = match sidecar {
+        Some(sidecar) => crate::vectors::describe(bundle, sidecar)?,
+        None => None,
+    };
     facts
         .capabilities()
         .map(|capability| {
@@ -727,9 +737,18 @@ fn capabilities(
 
 /// The `vectors` description a manifest carries must be the one its sidecar
 /// gives now: a sidecar reassembled after the manifest was written would
-/// otherwise go on declaring the old model or counts.
-fn verify_vectors_description(manifest: &Manifest, bundle: &PublishedBundle) -> Result<()> {
-    let Some(expected) = crate::vectors::describe(bundle)? else {
+/// otherwise go on declaring the old model or counts. Every field compared is
+/// read from the bundle's files, so the answer does not depend on which build
+/// of this command asks.
+fn verify_vectors_description(
+    manifest: &Manifest,
+    bundle: &PublishedBundle,
+    sidecar: Option<&SidecarFacts>,
+) -> Result<()> {
+    let Some(sidecar) = sidecar else {
+        return Ok(());
+    };
+    let Some(expected) = crate::vectors::describe(bundle, sidecar)? else {
         return Ok(());
     };
     match manifest.vectors() {
@@ -893,10 +912,7 @@ fn verify_text_binding(dir: &Path) -> Result<()> {
 /// The one place in KGF that reads whole artifacts. That is why it is here and
 /// not in `kgf-store`: full digests belong to publication and `kgf verify`,
 /// never to the latency-sensitive open path.
-fn checksum_artifacts(
-    bundle: &PublishedBundle,
-    facts: &BundleFacts,
-) -> Result<Vec<(String, ArtifactEntry)>> {
+fn checksum_artifacts(bundle: &PublishedBundle, facts: &BundleFacts) -> Result<Checksummed> {
     let dir = bundle.path();
     // Computed at most once, and only if a key artifact needs it. Seven
     // sidecars would otherwise rescan the same HDT seven times for one answer —
@@ -923,42 +939,49 @@ fn checksum_artifacts(
     }
     verify_key_decomposition(dir, &entries)?;
     verify_graph_index_binding(dir, &entries)?;
-    verify_vectors_binding(bundle, &entries)?;
-    Ok(entries)
+    let sidecar = verify_vectors_binding(bundle, &entries)?;
+    Ok(Checksummed { entries, sidecar })
 }
 
-/// Walk the vector sidecar's id map and check its record of the Parquet it
-/// was built from against the Parquet's checksum computed above.
+/// What the pass over a bundle's artifacts found.
+struct Checksummed {
+    /// Each artifact's checksum entry, in bundle-layout order.
+    entries: Vec<(String, ArtifactEntry)>,
+    /// What the vector sidecar states about itself, verified against those
+    /// checksums; `None` for a bundle without one.
+    sidecar: Option<SidecarFacts>,
+}
+
+/// Walk the vector sidecar's id map, check its record of the index and the
+/// Parquet it was built with against their checksums computed above, and
+/// return what the sidecar states about itself. `None` for a bundle without
+/// one.
 ///
 /// Opening checks the id map's header and sentinels alone; its regions, and
-/// whether the index and the id map were built from the vectors published
-/// beside them, are a pass over the files, which belongs here with the other
-/// whole-file checks. The failure it prevents is an id map that answers with
-/// the right ids for the wrong vectors.
+/// whether the three files beside each other come from one run, are a pass
+/// over the files, which belongs here with the other whole-file checks. The
+/// failure it prevents is an id map that answers with the right ids for the
+/// wrong vectors. This is the one open of the sidecar a run makes after the
+/// bundle's facts are read: the description is written from what it returns.
 fn verify_vectors_binding(
     bundle: &PublishedBundle,
     entries: &[(String, ArtifactEntry)],
-) -> Result<()> {
-    let checksum = |name: &str| {
+) -> Result<Option<SidecarFacts>> {
+    let checksum = |name: &str| -> Result<Option<[u8; 32]>> {
         entries
             .iter()
             .find(|(entry_name, _)| entry_name == name)
-            .map(|(_, entry)| entry.sha256.as_str())
+            .map(|(_, entry)| crate::vectors::parse_digest(&entry.sha256))
+            .transpose()
     };
-    if checksum(artifact::VECTORS_ENTITIES).is_none() {
-        return Ok(());
-    }
-    let parent = checksum(artifact::VECTORS_EMBEDDINGS)
-        .map(|hex| {
-            let mut digest = [0u8; 32];
-            for (i, byte) in digest.iter_mut().enumerate() {
-                *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)
-                    .context("an artifact checksum is hex")?;
-            }
-            Ok::<_, anyhow::Error>(digest)
-        })
-        .transpose()?;
-    kgf_store::verify_vectors_artifacts(bundle, parent).with_context(|| {
+    let Some(index) = checksum(artifact::VECTORS_INDEX)? else {
+        return Ok(None);
+    };
+    let digests = SidecarDigests {
+        index,
+        embeddings: checksum(artifact::VECTORS_EMBEDDINGS)?,
+    };
+    kgf_store::verify_vectors_artifacts(bundle, digests).with_context(|| {
         format!(
             "{} does not describe its bundle",
             bundle.path().join(artifact::VECTORS_ENTITIES).display()
@@ -1419,6 +1442,13 @@ fn walk(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
 /// Ubergraph sidecar is 4.1 GB — and this is a build step on the same small
 /// machines the toolchain targets.
 fn sha256_file(path: &Path) -> Result<(u64, String)> {
+    let (bytes, digest) = sha256_bytes(path)?;
+    Ok((bytes, hex(&digest)))
+}
+
+/// [`sha256_file`] with the digest as bytes, for a caller that stores or
+/// compares it rather than printing it.
+pub(crate) fn sha256_bytes(path: &Path) -> Result<(u64, [u8; 32])> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 20];
@@ -1431,7 +1461,7 @@ fn sha256_file(path: &Path) -> Result<(u64, String)> {
         hasher.update(&buffer[..read]);
         bytes += read as u64;
     }
-    Ok((bytes, hex(&hasher.finalize())))
+    Ok((bytes, hasher.finalize().into()))
 }
 
 /// Compute the bundle content digest over its artifact entries.

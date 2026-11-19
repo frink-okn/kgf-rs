@@ -347,7 +347,34 @@ pub struct PublishedManifest {
     export_files: ExportFiles,
     /// The vector sidecar's verbalization config, read beside the manifest
     /// when it lists one; see [`read_verbalize_config`].
-    verbalize: Option<Arc<BundleVerbalize>>,
+    verbalize: PublishedVerbalize,
+}
+
+/// A release's verbalization config, as startup found it.
+#[derive(Debug, Clone)]
+enum PublishedVerbalize {
+    /// The manifest lists none.
+    Absent,
+    /// Read and resolved.
+    Published(Arc<BundleVerbalize>),
+    /// Listed, and not a config this build can use: the defect. Withheld
+    /// rather than fatal, as a download that cannot be served as listed is:
+    /// the config backs a preview's default and a describe page's text, and
+    /// neither is worth every dataset of a deployment failing to start. A
+    /// bundle written by a newer builder, whose config has a field this build
+    /// does not know, is the ordinary way to get here.
+    Withheld(Arc<str>),
+}
+
+/// A release's verbalization config, as a request that needs one sees it.
+#[derive(Debug, Clone, Copy)]
+pub enum BundleConfig<'a> {
+    /// The release publishes none.
+    Absent,
+    /// The release's own.
+    Published(&'a Arc<VerbalizeResolved>),
+    /// The release lists one this server cannot use, and why.
+    Withheld(&'a str),
 }
 
 /// A bundle's published verbalization config, held the two ways it is used.
@@ -387,7 +414,11 @@ impl PublishedManifest {
         })?;
         let digest = bytes_digest(&bytes);
         let export_files = ExportFiles::scan(bundle_dir, &parsed);
-        let verbalize = read_verbalize_config(bundle_dir, &parsed)?;
+        let verbalize = match read_verbalize_config(bundle_dir, &parsed) {
+            Ok(Some(config)) => PublishedVerbalize::Published(config),
+            Ok(None) => PublishedVerbalize::Absent,
+            Err(defect) => PublishedVerbalize::Withheld(defect.into()),
+        };
         Ok(Self {
             bytes: bytes.into(),
             parsed: Arc::new(parsed),
@@ -415,7 +446,7 @@ impl PublishedManifest {
             parsed: Arc::new(parsed),
             digest,
             export_files,
-            verbalize: None,
+            verbalize: PublishedVerbalize::Absent,
         })
     }
 
@@ -429,14 +460,31 @@ impl PublishedManifest {
         Arc::clone(&self.parsed)
     }
 
-    /// The bundle's verbalization config, when it publishes one.
+    /// The bundle's verbalization config, as a request that needs one sees
+    /// it: published, absent, or listed and unusable.
+    pub fn verbalize(&self) -> BundleConfig<'_> {
+        match &self.verbalize {
+            PublishedVerbalize::Absent => BundleConfig::Absent,
+            PublishedVerbalize::Published(config) => BundleConfig::Published(&config.resolved),
+            PublishedVerbalize::Withheld(defect) => BundleConfig::Withheld(defect),
+        }
+    }
+
+    /// The bundle's verbalization config, when it publishes one this server
+    /// can use.
     pub fn verbalize_config(&self) -> Option<&Arc<VerbalizeResolved>> {
-        self.verbalize.as_ref().map(|verbalize| &verbalize.resolved)
+        match &self.verbalize {
+            PublishedVerbalize::Published(config) => Some(&config.resolved),
+            PublishedVerbalize::Absent | PublishedVerbalize::Withheld(_) => None,
+        }
     }
 
     /// The same config as YAML, for a form to start from.
     pub fn verbalize_yaml(&self) -> Option<&Arc<str>> {
-        self.verbalize.as_ref().map(|verbalize| &verbalize.yaml)
+        match &self.verbalize {
+            PublishedVerbalize::Published(config) => Some(&config.yaml),
+            PublishedVerbalize::Absent | PublishedVerbalize::Withheld(_) => None,
+        }
     }
 
     /// Identity of the complete immutable publication profile.
@@ -524,7 +572,14 @@ impl Datasets {
                     "a download this release's manifest lists is withheld",
                 );
             }
-            let verbalize = published.verbalize.clone();
+            if let BundleConfig::Withheld(defect) = published.verbalize() {
+                tracing::error!(
+                    dataset = %id.dataset,
+                    version = %id.version,
+                    defect = %defect,
+                    "this release's verbalization config is withheld",
+                );
+            }
 
             datasets.entry(id.dataset).or_default().insert(
                 id.version,
@@ -540,7 +595,6 @@ impl Datasets {
                     predicate_roles,
                     exports,
                     manifest: published,
-                    verbalize,
                 },
             );
         }
@@ -822,11 +876,6 @@ pub struct Release {
     /// cannot.
     exports: Exports,
     manifest: PublishedManifest,
-    /// The verbalization config the vector sidecar's texts were rendered
-    /// under: `/verbalize`'s default, what renders an embedded entity's text
-    /// live, and what the verbalize form starts from. `None` when the bundle
-    /// publishes none.
-    verbalize: Option<Arc<BundleVerbalize>>,
 }
 
 impl Release {
@@ -845,14 +894,22 @@ impl Release {
         &self.manifest
     }
 
-    /// The bundle's own verbalization config, if it publishes one.
+    /// The verbalization config the vector sidecar's texts were rendered
+    /// under, as `/verbalize` falls back on it: published, absent, or listed
+    /// and unusable.
+    pub fn verbalize(&self) -> BundleConfig<'_> {
+        self.manifest.verbalize()
+    }
+
+    /// The same config where this server can use it: what renders an
+    /// embedded entity's text live.
     pub fn verbalize_config(&self) -> Option<&Arc<VerbalizeResolved>> {
-        self.verbalize.as_ref().map(|verbalize| &verbalize.resolved)
+        self.manifest.verbalize_config()
     }
 
     /// The same config as YAML, for the verbalize form to start from.
     pub fn verbalize_yaml(&self) -> Option<&Arc<str>> {
-        self.verbalize.as_ref().map(|verbalize| &verbalize.yaml)
+        self.manifest.verbalize_yaml()
     }
 
     /// The logical dataset identity declared by this immutable release.
@@ -986,9 +1043,10 @@ fn offset_is_rfc_3339(text: &str) -> bool {
 use jiff::Timestamp as Instant;
 
 /// The vector sidecar's verbalization config, resolved and as YAML, when the
-/// manifest lists one. Read at startup with the manifest: a config that does not
-/// parse or resolve stops the server naming the file, as a manifest that
-/// does not parse does, rather than failing the first request that needs it.
+/// manifest lists one. Read at startup with the manifest, so a config that
+/// does not parse or resolve is found then, and reported naming the file,
+/// rather than by the first request that needs it. The caller withholds the
+/// config in that case; it does not refuse the release.
 fn read_verbalize_config(
     bundle: &Path,
     manifest: &kgf_store::Manifest,

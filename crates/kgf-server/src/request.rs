@@ -64,7 +64,7 @@ use crate::envelope::{ErrorCode, Problem, reflected};
 use crate::export::ExportArtifact;
 use crate::label::{LanguageRange, Languages};
 use crate::representation::{RdfSyntax, Representation};
-use crate::service::{PredicateRoles, RolesByPredicate};
+use crate::service::{BundleConfig, PredicateRoles, RolesByPredicate};
 use crate::term::{Literal as KgfLiteral, PrefixMap, Term, TripleTerm};
 use crate::url::Params;
 use std::sync::Arc;
@@ -1098,7 +1098,7 @@ impl Verbalize {
         limits: Limits<'_>,
         prefixes: &PrefixMap,
         profile: &PredicateRoles,
-        default: Option<&Arc<VerbalizeResolved>>,
+        default: BundleConfig<'_>,
     ) -> Result<Self, Problem> {
         accept_only(params, VERBALIZE, Self::PARAMETERS)?;
         let resolved = match params.get("config") {
@@ -1156,7 +1156,7 @@ impl Verbalize {
         limits: Limits<'_>,
         prefixes: &PrefixMap,
         profile: &PredicateRoles,
-        default: Option<&Arc<VerbalizeResolved>>,
+        default: BundleConfig<'_>,
     ) -> Result<Self, Problem> {
         accept_only(params, VERBALIZE, &["format"])?;
         let wire: WireVerbalize = parse_body(body)?;
@@ -1203,14 +1203,23 @@ impl Verbalize {
     /// The rules both forms share: which mode the request is, and that it
     /// fits under the root cap.
     /// The bundle's own config, for a request that sent none.
-    fn default_config(
-        default: Option<&Arc<VerbalizeResolved>>,
-    ) -> Result<VerbalizeResolved, Problem> {
+    ///
+    /// A release that publishes none leaves the request incomplete, which is
+    /// the client's to fix. One that lists a config this server cannot use
+    /// was promised by its manifest, so the failure is the server's, and says
+    /// what a client can still do.
+    fn default_config(default: BundleConfig<'_>) -> Result<VerbalizeResolved, Problem> {
         match default {
-            Some(resolved) => Ok((**resolved).clone()),
-            None => Err(Problem::new(
+            BundleConfig::Published(resolved) => Ok((**resolved).clone()),
+            BundleConfig::Absent => Err(Problem::new(
                 ErrorCode::MalformedRequest,
                 "config is required: the verbalization config, as YAML or JSON; this bundle publishes none to fall back on",
+            )),
+            BundleConfig::Withheld(defect) => Err(Problem::new(
+                ErrorCode::InternalError,
+                format!(
+                    "this release lists a verbalization config this server cannot use, so there is none to fall back on; send one in `config`: {defect}"
+                ),
             )),
         }
     }
@@ -4052,8 +4061,17 @@ pub struct Describe {
     pub binding: CursorBinding,
     /// How the response labels its IRIs; `None` unless `labels=true`.
     pub labels: Option<Labeling>,
-    /// What renders an embedded resource's text live, when the bundle
-    /// publishes a verbalization config.
+    /// What the answer may say of the resource's vector; `None` for a
+    /// release that does not declare `vectors`, whose answers do not mention
+    /// one whatever files its bundle holds.
+    pub embedding: Option<DescribeEmbedding>,
+}
+
+/// What a describe request carries for a release that declares `vectors`.
+#[derive(Debug)]
+pub struct DescribeEmbedding {
+    /// What renders an embedded resource's text live, when the release
+    /// publishes its verbalization config.
     pub verbalize: Option<DescribeVerbalize>,
 }
 
@@ -4123,26 +4141,30 @@ impl Describe {
             cursor: resume(params, &binding)?,
             binding,
             labels: Labeling::from_params(params, false, profile, prefixes, limits)?,
-            verbalize: None,
+            embedding: None,
         })
     }
 
-    /// Carry the bundle's verbalization config, so the answer can render the
-    /// resource's embedded text.
+    /// For a release that declares `vectors`: let the answer say whether the
+    /// resource is embedded, and carry the release's verbalization config,
+    /// when it publishes one, so the answer can render the embedded text.
     #[must_use]
-    pub fn with_verbalize(
+    pub fn with_embedding(
         mut self,
+        declared: bool,
         config: Option<&Arc<VerbalizeResolved>>,
         profile: &PredicateRoles,
         limits: Limits<'_>,
     ) -> Self {
-        self.verbalize = config.map(|resolved| DescribeVerbalize {
-            resolved: Arc::clone(resolved),
-            label_predicates: profile
-                .get("label")
-                .map(<[String]>::to_vec)
-                .unwrap_or_default(),
-            read_budget: limits.budgets.candidate_budget,
+        self.embedding = declared.then(|| DescribeEmbedding {
+            verbalize: config.map(|resolved| DescribeVerbalize {
+                resolved: Arc::clone(resolved),
+                label_predicates: profile
+                    .get("label")
+                    .map(<[String]>::to_vec)
+                    .unwrap_or_default(),
+                read_budget: limits.budgets.candidate_budget,
+            }),
         });
         self
     }

@@ -54,10 +54,13 @@ same-file = "1"
 # per-thread counters but are untested, and macOS keeps no per-thread fault counts.
 nix = { version = "0.30", default-features = false, features = ["resource"] }
 # The ANN index over a bundle's vectors. A cxx binding over the C++ header-only
-# library: it maps the index file itself, outside `kgf_store::map`, under the
-# same published-bundle immutability premise (see `kgf_store::vectors`). Building
-# it needs a C++ toolchain. One crate writes the index in `kgf build` and reads
-# it in `kgf serve`, so `--locked` pins writer and reader together.
+# library. The index file is mapped by `kgf_store::map` like every other
+# artifact and the library is handed the slice, so there is no second mapping
+# site; what the library brings instead is native code that reads that slice
+# unchecked (see `kgf_store::map::MappedIndex`). Building it needs a C++
+# toolchain. One crate writes the index in `kgf vectors` and reads it in
+# `kgf serve`, so `--locked` pins writer and reader together for a bundle built
+# and served by one release.
 usearch = "2.26"
 # The embedding stage's vectors arrive as Parquet, read once at build time by
 # the `kgf` binary to build the index and the id map; a server never parses

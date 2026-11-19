@@ -325,24 +325,65 @@ pub(crate) fn open_published(bundle: &PublishedBundle, path: &Path) -> Result<Ma
 /// site would live in C++ outside this module, over bytes nothing here had
 /// validated. Instead the file is mapped here like any other artifact and the
 /// library is handed the slice, which it reads without copying. Its view keeps
-/// a pointer into that slice, which is the obligation `view` takes on: the
-/// bytes must outlive the view and never change.
+/// a pointer into that slice, which is the first obligation `view` takes on:
+/// the bytes must outlive the view and never change.
 ///
 /// Both halves are held together, view first. Fields drop in declaration
 /// order, so the view is gone before the bytes it points into are unmapped,
 /// and moving the pair moves the mapping's handle, not the mapped pages.
 /// Immutability is the published-bundle premise the mapping already rests on.
 ///
-/// The library checks that the file is long enough for every node its header
-/// declares, so a truncated file is refused at open rather than read past its
-/// end. Within that length it trusts its own links, as it does when it maps
-/// a file itself; what vouches for those bytes is that `kgf build` wrote them
-/// with this same library and the manifest's digest covers them.
+/// # What the library is trusted with
+///
+/// Every other artifact is read by safe code over a slice, so the worst a
+/// corrupt one does is a refusal. This one is read by the library's own C++,
+/// which checks that the file is long enough for every node its header
+/// declares — a truncated file is refused at open — and within that length
+/// follows the neighbour counts and slots it finds without checking them. A
+/// file of the right length holding the wrong bytes is therefore read out of
+/// bounds, not refused. That is the second obligation: the bytes must be an
+/// index this library wrote. Nothing at open can establish it. What does is
+/// the bundle's publication: `kgf vectors` writes the file with the library
+/// version this crate links, and `kgf manifest` records its SHA-256 and binds
+/// it to the id map, so a bundle whose checksums were verified when it was
+/// published carries the index its build wrote.
+///
+/// # What viewing costs
+///
+/// The vectors and the graph stay in the mapping, but the library does not
+/// address them lazily. Viewing allocates, for every record, the address of
+/// its node and of its vector and an entry in the library's key table, and
+/// reads each node's key from the file to fill that table. Open is therefore
+/// linear in the index's records, in time and in heap — tens of bytes a
+/// record — and it faults in the graph's pages. It is the one artifact whose
+/// open depends on its size.
 pub struct MappedIndex {
     // Declared before `mapping`: see the type's documentation.
     index: usearch::Index,
     mapping: Mapping,
+    written: IndexWritten,
 }
+
+/// How an index file says it was written: the facts in its header that a
+/// reader does not choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexWritten {
+    /// The library version that wrote the file, as major, minor, patch.
+    pub library_version: (u16, u16, u16),
+    /// The distance its vectors are compared under.
+    pub metric: usearch::MetricKind,
+    /// The scalar type a stored vector is held in.
+    pub quantization: usearch::ScalarKind,
+}
+
+/// Candidates one search keeps while it walks the graph, when it is asked
+/// for fewer results than this; a search for more keeps as many as it was
+/// asked for.
+///
+/// A property of the reader, not of the file: the library does not store it,
+/// so it is set here rather than left to the library's default, where an
+/// upgrade could change what a probe costs.
+pub const SEARCH_EXPANSION: usize = 64;
 
 impl std::fmt::Debug for MappedIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -361,8 +402,9 @@ impl MappedIndex {
     /// The library gives each running search a context from a fixed pool
     /// and fails a search that finds none free, rather than waiting for one.
     /// The pool is therefore reserved here, once, at the size the caller says
-    /// its concurrency is bounded by. Reserving on a view allocates those
-    /// contexts and nothing else; the stored nodes stay in the mapping.
+    /// its concurrency is bounded by. A context is a fixed allocation; what
+    /// grows with the index is the view itself, as the type's documentation
+    /// says.
     pub(crate) fn view(mapping: Mapping, search_contexts: usize) -> Result<Self> {
         let malformed = |detail: String| Error::Malformed {
             artifact: mapping.path().to_path_buf(),
@@ -382,16 +424,35 @@ impl MappedIndex {
                 .map_err(|_| malformed(format!("{} dimensions", header.dimensions)))?,
             metric: header.metric,
             quantization: header.quantization,
+            expansion_search: SEARCH_EXPANSION,
             multi: false,
             ..Default::default()
         })
         .map_err(|e| malformed(format!("cannot hold this index: {e}")))?;
-        // SAFETY: the view keeps a pointer into the mapped bytes, so it needs
-        // them unchanged and alive for as long as it exists. Unchanged is
-        // `Mapping::open`'s own contract — whoever opened `mapping` undertook
-        // that the file does not change while the mapping lives. Alive is the
-        // field order: the mapping is moved into `Self` beside the view and
-        // declared after it, so it is unmapped only once the view is dropped.
+        let written = IndexWritten {
+            library_version: (
+                header.version_major,
+                header.version_minor,
+                header.version_patch,
+            ),
+            metric: header.metric,
+            quantization: header.quantization,
+        };
+        // SAFETY: the view keeps a pointer into the mapped bytes and follows
+        // the links it finds in them, so it needs two things.
+        //
+        // The bytes unchanged and alive for as long as it exists. Unchanged
+        // is `Mapping::open`'s own contract — whoever opened `mapping`
+        // undertook that the file does not change while the mapping lives.
+        // Alive is the field order: the mapping is moved into `Self` beside
+        // the view and declared after it, so it is unmapped only once the
+        // view is dropped.
+        //
+        // The bytes an index this library wrote, since it does not check a
+        // neighbour slot before following it. That is not established here
+        // and cannot be at open: it is the publication of the bundle, whose
+        // manifest records this file's checksum and whose id map is bound to
+        // it, as the type's documentation sets out.
         unsafe { index.view_from_buffer(mapping.as_bytes()) }
             .map_err(|e| malformed(format!("cannot be viewed: {e}")))?;
         if index.serialized_length() as u64 != mapping.byte_len() {
@@ -404,12 +465,21 @@ impl MappedIndex {
         index
             .reserve_capacity_and_threads(index.size(), search_contexts.max(1))
             .map_err(|e| malformed(format!("cannot reserve search contexts: {e}")))?;
-        Ok(Self { index, mapping })
+        Ok(Self {
+            index,
+            mapping,
+            written,
+        })
     }
 
     /// The viewed index.
     pub(crate) fn index(&self) -> &usearch::Index {
         &self.index
+    }
+
+    /// What the file's header says of how it was written.
+    pub fn written(&self) -> IndexWritten {
+        self.written
     }
 
     /// The file this was mapped from, for error messages.

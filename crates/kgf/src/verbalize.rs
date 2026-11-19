@@ -88,14 +88,7 @@ pub fn run(args: Args) -> Result<()> {
 
     let outputs = Outputs::open(&args.bundle, &args.roots, &args.texts)?;
     let opened = open_bundle(&args.bundle)?;
-    let manifest = Manifest::read(&args.bundle)
-        .with_context(|| format!("reading the manifest of {}", args.bundle.display()))?;
-    let roles = if manifest.predicate_roles.is_empty() {
-        default_predicate_roles()
-    } else {
-        manifest.predicate_roles.clone()
-    };
-    let label_role = roles.get("label").cloned().unwrap_or_default();
+    let label_role = label_role(&args.bundle)?;
 
     let bound = Bound::bind(&opened.store, &resolved, &label_role)?;
     for unknown in bound.unknown() {
@@ -165,7 +158,23 @@ pub fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-fn read_config(path: &Path) -> Result<Config> {
+/// The bundle's `label` role, the last resort of every target's label
+/// cascade: what its manifest declares, or the federation default when it
+/// declares no roles. Shared with `kgf vectors`, which renders a root again
+/// and must render it as this command did.
+pub(crate) fn label_role(bundle: &Path) -> Result<Vec<String>> {
+    let manifest = Manifest::read(bundle)
+        .with_context(|| format!("reading the manifest of {}", bundle.display()))?;
+    let roles = if manifest.predicate_roles.is_empty() {
+        default_predicate_roles()
+    } else {
+        manifest.predicate_roles
+    };
+    Ok(roles.get("label").cloned().unwrap_or_default())
+}
+
+/// The config as given, YAML or JSON; `-` is standard input.
+pub(crate) fn read_config(path: &Path) -> Result<Config> {
     let text = if path == Path::new("-") {
         std::io::read_to_string(std::io::stdin()).context("reading the config from stdin")?
     } else {
