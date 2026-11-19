@@ -1125,6 +1125,7 @@ dependencies = [
  "serde_norway",
  "sha2",
  "spargebra",
+ "tempfile",
  "thiserror",
  "tokio",
  "tower",

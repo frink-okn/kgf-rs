@@ -467,8 +467,8 @@ fn artifact_names_for(artifacts: &ArtifactSet) -> Vec<&'static str> {
     if let Some(description) = &artifacts.description {
         names.extend(description.paths().map(|(name, _)| name));
     }
-    names.extend(artifacts.filters.iter().copied());
-    names.extend(artifacts.keysets.iter().copied());
+    names.extend(artifacts.filters.iter().map(|artifact| artifact.name()));
+    names.extend(artifacts.keysets.iter().map(|artifact| artifact.name()));
     names
 }
 

@@ -112,10 +112,19 @@ it has a single representation and the manifest page's download panel is its pag
 
 `/export/data.hdt` serves the published HDT with static-file semantics (unit 31): byte
 ranges including multipart, `If-Range` and the other RFC 9110 preconditions, and the
-artifact's SHA-256 as a strong `ETag` shared by every mirror and as `Repr-Digest`. It is
-sent uncompressed unless a client weights zstd or gzip above identity, because only an
-identity body can be sized and resumed; a range, and a request carrying `If-Match` or
-`If-Unmodified-Since`, are always identity. The download routes are mounted outside
+artifact's SHA-256 as a strong `ETag` shared by every mirror and as `Repr-Digest`.
+`/export/filters/{role}.filter`, `…/{role}.minhash` and `/export/keysets/{role}.keys`
+serve the membership filters, overlap sketches and key sets a release's manifest lists
+the same way (unit 39): a closed vocabulary (`kgf_store::KeyArtifact`), each at its
+path in the bundle spelled exactly, which `Store::map_key_artifact` maps per download
+and nothing here reads. Startup `stat`s every listed download: one the bundle cannot
+serve as listed is withheld — a 500 naming the defect for every request — while the
+rest of the deployment starts; only an unusable `data.hdt` entry refuses startup. A
+path the manifest does not list is a 404 naming what the release exports. `data.hdt`
+is sent uncompressed unless a client weights zstd or gzip above identity, because only
+an identity body can be sized and resumed; a range, and a request carrying `If-Match`
+or `If-Unmodified-Since`, are always identity. The key files are always identity:
+they do not compress. The download routes are mounted outside
 the compression layer and the ETag-weakening middleware the rest of the API sits
 behind. A download takes a slot from a gate separate from query admission, at most
 `--max-downloads-per-client` of them per client (an IPv4 address or IPv6 /64, as

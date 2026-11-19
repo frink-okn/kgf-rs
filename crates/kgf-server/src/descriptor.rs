@@ -525,8 +525,8 @@ pub struct BundleManifest {
     parsed: std::sync::Arc<Manifest>,
     /// What the release serves whole, as the downloads themselves identify it
     /// — so the page shows the digest the `ETag` carries, not a second reading
-    /// of the manifest's text.
-    downloads: Vec<(ExportArtifact, ArtifactIdentity)>,
+    /// of the manifest's text. Shared with the release, not copied per page.
+    downloads: std::sync::Arc<[(ExportArtifact, ArtifactIdentity)]>,
 }
 
 impl BundleManifest {
@@ -538,7 +538,7 @@ impl BundleManifest {
         version: &str,
         published: bytes::Bytes,
         parsed: std::sync::Arc<Manifest>,
-        downloads: Vec<(ExportArtifact, ArtifactIdentity)>,
+        downloads: std::sync::Arc<[(ExportArtifact, ArtifactIdentity)]>,
     ) -> Self {
         Self {
             mount,
@@ -605,16 +605,25 @@ impl Resource for BundleManifest {
                 ]
             })
             .collect();
-        let download_commands: Vec<(String, String)> = self
+        // One worked command, for the dataset itself: the page is a person's
+        // way in, and what a person downloads is `data.hdt`. Every other row
+        // is fetched the same way, by the program that wants it, from the name
+        // in the table. None when the release withholds its HDT.
+        let hdt = ExportArtifact::Hdt;
+        let download_command = self
             .downloads
             .iter()
-            .map(|(artifact, _)| {
+            .any(|(artifact, _)| *artifact == hdt)
+            .then(|| {
                 (
-                    artifact.saved_name(&self.dataset, &self.version),
-                    unmounted.export(&self.dataset, &self.version, artifact.name()),
+                    hdt.saved_name(&self.dataset, &self.version),
+                    unmounted.export(&self.dataset, &self.version, hdt.name()),
                 )
-            })
-            .collect();
+            });
+        let federation_downloads = self
+            .downloads
+            .iter()
+            .any(|(artifact, _)| matches!(artifact, ExportArtifact::Keys(_)));
         let artifacts: Vec<_> = manifest
             .artifacts
             .iter()
@@ -754,15 +763,23 @@ impl Resource for BundleManifest {
                 section."section-block" {
                     h2 { "Download" }
                     (note(
-                        "The whole dataset as standard HDT. Downloads are sent uncompressed, with \
-                         their size, resume by byte range, and carry their SHA-256 as the ETag and \
-                         Repr-Digest. Use this versioned URL rather than latest, so a resume can \
-                         never continue into a different release."
+                        "data.hdt is the whole dataset as standard HDT. Downloads are sent \
+                         uncompressed, with their size, resume by byte range, and carry their \
+                         SHA-256 as the ETag and Repr-Digest. Use this versioned URL rather than \
+                         latest, so a resume can never continue into a different release."
                     ))
+                    @if federation_downloads {
+                        (note(
+                            "The files under filters/ and keysets/ are this release's membership \
+                             filters, overlap sketches and key sets: what a federation index reads \
+                             to tell which datasets hold a term and what two datasets share. Each \
+                             downloads the same way, at export/ followed by its name here."
+                        ))
+                    }
                     (table(&["Artifact", "Bytes", "SHA-256"], &download_rows))
-                    pre {
-                        code {
-                            @for (saved, href) in &download_commands {
+                    @if let Some((saved, href)) = &download_command {
+                        pre {
+                            code {
                                 "curl -fL -C - -o " (saved) " \"$KGF" (href) "\"\n"
                                 "shasum -a 256 " (saved) "\n"
                             }
@@ -942,8 +959,15 @@ mod tests {
         )
     }
 
-    fn downloads() -> Vec<(ExportArtifact, ArtifactIdentity)> {
-        vec![(ExportArtifact::Hdt, ArtifactIdentity::new(912, [0xab; 32]))]
+    fn downloads() -> std::sync::Arc<[(ExportArtifact, ArtifactIdentity)]> {
+        [
+            (ExportArtifact::Hdt, ArtifactIdentity::new(912, [0xab; 32])),
+            (
+                ExportArtifact::from_path("filters/subjects.minhash").unwrap(),
+                ArtifactIdentity::new(64, [0xcd; 32]),
+            ),
+        ]
+        .into()
     }
 
     #[test]
@@ -973,6 +997,11 @@ mod tests {
         // one the download's ETag carries.
         assert!(page.contains("href=\"/kgf/tox/v/2026-06-01/export/data.hdt\""));
         assert!(page.contains(&"ab".repeat(32)));
+        // A federation artifact is linked at its name in the bundle, directory
+        // and all, with its own digest — and is not given a command of its own.
+        assert!(page.contains("href=\"/kgf/tox/v/2026-06-01/export/filters/subjects.minhash\""));
+        assert!(page.contains(&"cd".repeat(32)));
+        assert_eq!(page.matches("curl -fL -C -").count(), 1);
     }
 
     #[test]

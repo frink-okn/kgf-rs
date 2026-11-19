@@ -61,6 +61,7 @@ use crate::cursor::{
     BundleBinding, CanonicalRequest, Cursor, CursorBinding, Operation, PositionSpace, StaleCursor,
 };
 use crate::envelope::{ErrorCode, Problem, reflected};
+use crate::export::ExportArtifact;
 use crate::label::{LanguageRange, Languages};
 use crate::representation::{RdfSyntax, Representation};
 use crate::service::{PredicateRoles, RolesByPredicate};
@@ -4420,23 +4421,38 @@ impl Export {
     const PARAMETERS: &'static [&'static str] = &["g"];
 
     /// Parse and type one download query before any precondition is read.
+    ///
+    /// Every exported artifact is built over every graph at once, so the union
+    /// is the one scope a download has. The refusal of any other says what
+    /// *this* artifact holds, because the remedy differs: a graph's triples
+    /// can be read another way, while no graph has a filter, sketch or key set
+    /// of its own.
     pub fn parse(
         params: &Params,
         limits: Limits<'_>,
         prefixes: &PrefixMap,
         memberships: bool,
+        artifact: ExportArtifact,
     ) -> Result<Self, Problem> {
         accept_only(params, EXPORT, Self::PARAMETERS)?;
         match GraphScope::parse(params, limits, prefixes)?.selector() {
             GraphSelector::Union => Ok(Self),
             GraphSelector::Unnamed if !memberships => Ok(Self),
             GraphSelector::Unnamed | GraphSelector::Named(_) | GraphSelector::All => {
-                Err(Problem::new(
-                    ErrorCode::CapabilityNotAvailable,
-                    "a download scoped to less than the union is not exported: the artifact \
-                     holds every graph at once. Omit `g` for the whole dataset, or read one \
-                     graph's triples with `/fragment` and the same `g`",
-                ))
+                let name = artifact.name();
+                let detail = match artifact {
+                    ExportArtifact::Hdt => format!(
+                        "a download scoped to less than the union is not exported: {name} \
+                         holds every graph at once. Omit `g` for the whole dataset, or read one \
+                         graph's triples with `/fragment` and the same `g`"
+                    ),
+                    ExportArtifact::Keys(_) => format!(
+                        "a download scoped to less than the union is not exported: {name} is \
+                         built over every graph at once, and no graph has one of its own. \
+                         Omit `g`"
+                    ),
+                };
+                Err(Problem::new(ErrorCode::CapabilityNotAvailable, detail))
             }
         }
     }
