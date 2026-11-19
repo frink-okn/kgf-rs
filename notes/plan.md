@@ -2556,7 +2556,9 @@ fixed, two recorded below as open.
   so a multi-gigabyte transfer faults every page of it into the pod's page cache and can
   push other bundles' hot index pages out. Reading downloads with `pread` and dropping
   the pages behind (`posix_fadvise(DONTNEED)`) would avoid it, at the cost of a second
-  read path. Worth measuring on the largest bundles before building.
+  read path. Worth measuring on the largest bundles before building. Unit 39 measured the
+  resident size and widened the exposure: the federation artifacts are never read by a
+  query, so a download of one is all cold pages.
 
 ### 32. The human view, revisited — an idea
 
@@ -2894,7 +2896,7 @@ IRIs draws `n` seeded-uniform members, the same draw `/sample` makes; a config a
 a *plan* — every target's member count and `n` sampled texts with length statistics,
 each text reporting `limited` (predicates sampled down to the limit: the tuning signal)
 and `truncated` (the server's bound, not a config problem; the page calls it "cut by
-budget", and unit 41 renames the field, since "truncated" is the embedding model's
+budget", and unit 42 renames the field, since "truncated" is the embedding model's
 word). The config travels as YAML
 or JSON text in a GET parameter for a browser and as a JSON body on `QUERY` (canonical)
 and `POST` (fallback), with the same fields either way. The HTML representation carries
@@ -3384,15 +3386,196 @@ stopped a page in these runs: each filled its 10,000 values first. On a bundle w
 10⁸ subjects, a rare predicate's subjects would take about a hundred budget-limited
 pages. That is the case the deferred (subject, predicate) index would fix.
 
-### 39. The `vectors/` sidecar in `kgf-store` — the id map and the mapped index ✅
+### 39. The federation artifacts as downloads — `/export/filters/…`, `/export/keysets/…` ✅
+
+**Implemented 2026-11-13.** The federation index (`../kgf` doc 07 §7.5 item 39) is a
+crawler over KGF servers, and its second release probes each dataset's membership
+filters and computes overlap from sketches and key sets (doc 05 §5.2.2, ingest step 4).
+It has to fetch those from a server: the bundle bucket is private. Release 0.6.0 listed
+them in every manifest, with `bytes`, `sha256` and `keys`, and answered 404 for each.
+This unit serves them.
+
+**What landed.** `GET|HEAD /{dataset}/v/{version}/export/{name}`, where `{name}` is the
+artifact's name in the bundle: `data.hdt` as before, and now
+`filters/{role}.filter`, `filters/{role}.minhash` and `keysets/{role}.keys`.
+
+- *One download, unchanged.* The new paths go through unit 31's handler, `Delivery`
+  and body, so every property there holds for them without a second implementation:
+  byte ranges and multipart, `If-Range` and the other preconditions in RFC 9110's
+  order, the artifact's SHA-256 as a strong `ETag` and as `Repr-Digest`,
+  `Last-Modified` from the manifest's `created`, immutable `no-transform` caching,
+  CORS, the access record written when the body ends, the download gate, and the work
+  gate for each chunk. `g` is read as it is for `data.hdt`: these files are built over
+  the whole dictionary, so the union is what they hold, and a narrower scope is refused
+  with a message saying no graph has a file of its own (where `data.hdt`'s points at
+  `/fragment`).
+- *Never coded.* Unlike `data.hdt`, these are always sent as published, whatever
+  `Accept-Encoding` says, and their responses do not `Vary` on it
+  (`ExportArtifact::compressible`). Measured on the demo corpus with zstd at level 3:
+  sketches and key sets keep 99.8–100% of their size and filters 93–95%, against
+  20–46% for `data.hdt`. Coding them would spend the blocking pool's CPU on gigabytes
+  for that, and cost the client `Content-Length` and the strong validator.
+- *The route is a wildcard,* `export/{*artifact}`, because most of the names have a
+  directory in them. The access record's `route` changes spelling with it, from
+  `…/export/{artifact}` to `…/export/{*artifact}`; `operation` is still `export`, and
+  `shape.artifact` is the name in the bundle (`filters/subjects.minhash`).
+- *One URL per artifact.* The path is matched as the client spelled it, read from the
+  raw request path, because the router's capture is percent-decoded:
+  `filters%2Fsubjects.filter` (and `data%2Ehdt`, which used to be served) is a 404.
+  Every name is spelled in characters a path never escapes.
+- *A closed, typed vocabulary.* `kgf_store::KeyArtifact` names the ten `filters/` and
+  `keysets/` files the bundle layout defines; `artifact::{FILTERS, KEYSETS}` are now
+  derived from it, and `ArtifactSet` carries it rather than strings. `ExportArtifact`
+  is `Hdt` or `Keys(KeyArtifact)`. A request path is compared against those names and
+  is never joined to a directory.
+- *The manifest says which of them a release has, checked against the bundle.*
+  `PublishedManifest::read` also `stat`s each download the manifest lists (at most
+  eleven, no file opened), and `export::Exports::new` reconciles the two at startup.
+  `data.hdt` must be listed with a usable checksum or the server refuses to start, as
+  before. Any other trouble with a listed download — a checksum that is not 64 hex
+  digits, no file, a file of another length, something that is not a regular file —
+  withholds that one download, logged once at startup, and nothing else: no query
+  reads it, so one release's broken sketch must not keep every dataset of a deployment
+  from starting. A withheld download is a 500 naming the defect for every request,
+  answered before any precondition, so a `HEAD`, a revalidation and a range all see
+  what a `GET` sees. A 404 would be wrong, because the manifest told its reader the
+  file is there.
+- *Mapped per download, not at open.* `Store::open` only finds which key files exist
+  (as a regular file; a directory under one of the names refuses the bundle, as for
+  any optional artifact), and `Store::map_key_artifact` maps one when a download asks.
+  So a query never pays for files only a download reads, and a key file that cannot be
+  mapped fails that download and leaves every query answering. The mapping is a
+  `PublishedFile`, which carries a clone of the bundle's `PublishedBundle`: a download
+  can outlive the store it started from, and the immutability promise is stated as
+  lasting while the capability or anything derived from it lives (the safety docs on
+  `PublishedBundle` and `PublishedRoot` now say so). Nothing in `kgf-store` reads a
+  byte of these files, and no header is parsed: both formats require their CRC32C
+  before any field is interpreted, which is a pass over the file.
+- *Before streaming,* on the blocking task that opens the bundle, the handler maps the
+  artifact and checks it against the manifest's length. Startup already checked the
+  file, so this fails only if a bundle changed under the running server or the mapping
+  itself fails; either is a logged 500, never bytes under a digest they lack.
+- *A 404 names what exists.* A path below `export/` that the release does not serve
+  lists the ones it does, by name — at most eleven — with the URL pattern and the
+  manifest to read them from. The router's own 404 lists the three patterns beside
+  `export/data.hdt`.
+- *Served as* `application/octet-stream`, since none of the three formats has a media
+  type, and saved as `{dataset}-{version}.{file name}` (`tox-v1.subjects.minhash`):
+  the extension alone would save a release's subject and object filters over each
+  other.
+- *The manifest page* lists every download it serves with its size and digest, and
+  keeps one worked `curl` command, for `data.hdt` (none if that is withheld). The
+  served list is shared with the release as an `Arc`, not copied per request.
+
+**Decided: the two directories, not every single-file artifact.** The manifest also
+lists `data.hdt.perm`, the graph and triple-term sidecars, and the eight description
+files, all single files the store already maps. They stay unexported, for three
+reasons.
+
+- *Who reads them.* A filter, a sketch and a key set exist for a reader that does not
+  hold the bundle; serving them whole is the only use this server has for them. The
+  sidecars are indexes over `data.hdt` that hdtc rebuilds from it, so a download would
+  move bytes the client can compute, and the largest of them is larger than the HDT.
+  The description set already has routes (`/void`, `/schema`, `/summary`).
+- *Their URLs are not settled.* Doc 03 §3.4.11 names the description artifacts flat
+  (`export/void.hdt`) where the bundle has `stats/void.hdt`, and names a
+  `export/dictionary` that is no file at all. Serving every manifest entry at its
+  bundle path would decide that by accident. For the two directories the spec's paths
+  and the bundle's already agree.
+- *A closed list is what keeps a request path away from the filesystem,* and keeps the
+  access record's artifact a name this build chose. "Whatever the manifest lists"
+  would make both depend on what a publisher wrote.
+
+Adding one later is a variant of `ExportArtifact` and an accessor on `Store`. A
+manifest written elsewhere that lists a name outside the vocabulary — hdtc's
+experimental `keysets/terms.keys`, say — gets a 404 for it, and `Store` never maps
+it; that is the same closed list `kgf manifest` checksums from.
+
+**Decided: discovery is the manifest plus one rule, with no new links.** The path
+below `export/` is the key in the manifest's `artifacts`. Since the manifest is at
+`…/v/{version}/manifest`, the download is the relative reference `export/{key}`
+resolved against the manifest's own URL, so a client needs no template. The release
+links keep `hdt` and gain nothing:
+
+- A client cannot use one of these files without the manifest entry beside it — the
+  size and SHA-256 to verify against, and the `keys` block saying which convention and
+  hash make two files comparable — so a link would save no request.
+- Up to ten links a release would be added to every entry of the service descriptor,
+  the document a client loads first, for artifacts only a crawler reads.
+- The strong `ETag` is `"sha256:{hex}"` over the manifest's `sha256`, so a client can
+  build `If-Range` for a resume from the manifest alone.
+
+**Decided: `export` stays undeclared, and nothing is gated on it.** Unit 31's reason
+holds: doc 03's `export` still names artifacts this build does not serve
+(`dictionary`, the description files, Parquet partitions), and declaring a capability
+commits to all of it (question 81). Rule 8 is satisfied without it. These artifacts
+*can* be absent, and what stands in for a gate is the manifest's `artifacts`, read and
+checked against the bundle directory at startup, before any bundle is opened. The
+refusal is a 404 rather than
+`capability_not_available`, because the URL names a file this release does not have,
+not an operation this bundle cannot perform. A reader without the bundle already
+learns that the files exist from the `filters` and `keysets` capabilities, and which
+ones from `artifacts`. Question 106 is what a spec change would have to say.
+
+**Size.** The Wikidata bundle has two 5 GB filters and an 8.7 GB key set.
+
+- *Nothing reads an artifact whole.* Startup reads manifests and `stat`s what they
+  list, so the length, validators and digest are fixed without opening a file.
+  `Store::open` does not touch a key file. A download maps one and compares two
+  lengths. The body copies at most 512 KiB per chunk and does not produce the next one
+  until the connection has taken the last. `kgf serve` hashes nothing.
+- *Measured* on a debug build, macOS, loopback: a 6 GiB sparse file put in place of a
+  demo bundle's `keysets/shared.keys`, with the manifest's `bytes` edited to match.
+  Whole in 2.7 s, its last gigabyte by range, and whole again zstd-coded (before key
+  files became identity-only). The process's
+  physical footprint peaked at 12.5 MB. Its resident size reached 6.2 GB, which is the
+  mapping's clean pages and is unit 31's open **page-cache pressure** item, now with a
+  number: a download makes every page of its artifact resident until the kernel takes
+  it back. It weighs more here than for an HDT, because no query ever reads these
+  files, so none of their pages is warm. `pread` with `posix_fadvise(DONTNEED)`
+  remains the fix if `major_faults` on query records shows one is needed. The sparse
+  file's digest was not the manifest's, which the server does not check.
+- *The gateway's hour* is per response: 1.4 MB/s for a 5 GB filter and 2.4 MB/s for
+  the key set, sustained. `deploy/gke/README.md` has the table and what a client does
+  when it is cut off.
+
+*Verified by* unit tests of the vocabulary (every name round-trips, `KeyArtifact`'s
+order is its names', and no other path parses, including escaped spellings and ones
+that would escape a directory), of which artifacts a manifest and its bundle publish
+and withhold, of the startup `stat`, of key files never being coded or varying on
+`Accept-Encoding`, and of the store mapping exactly the files a bundle carries — on
+request, outliving the store, with an unmappable one failing alone; and over a socket
+against a bundle `kgf build` wrote, for a filter, a sketch and a key set: the whole
+file against the manifest's size and SHA-256, `HEAD`, three range forms, `416`,
+`If-Range` with the artifact's tag and with `data.hdt`'s, `304` by tag and by date,
+`412`, identity for a client that prefers zstd or gzip, `405`, the `latest` redirect,
+CORS headers, the manifest page's links, and the access record. A second test covers
+the 404 for twelve unlisted paths on a bundle with the artifacts and for every one of
+them on a bundle without, which still serves its HDT, and the graph-scope refusal. A
+third holds a client's only slot with a stalled HDT and sees a filter refused 429, its
+`HEAD` and `304` answered, and another client served. A fourth removes one key set and
+lengthens another before startup and sees each answer 500 to `GET`, `HEAD`, a
+revalidation and two ranges while queries and the other downloads go on, and shortens
+a third under the running server and sees it refused rather than streamed. Against the local `demo` corpus: 84 artifacts of 12 datasets fetched and
+matched to their manifests, each resumed from its midpoint with an `If-Range` built
+from the manifest.
+
+**Not done.**
+- No run against a real multi-gigabyte artifact or through the gateway; the 6 GiB
+  measurement is synthetic and local.
+- The crawler's half is not written here: resuming with `Range` and `If-Range`,
+  staying within four connections, and honouring `429` with `Retry-After`.
+- Directory artifacts (`data.hdt.text`) are not exported.
+
+### 40. The `vectors/` sidecar in `kgf-store` — the id map and the mapped index ✅
 
 **Implemented 2026-10-22, on `vectors-store`.** Doc 13 §13.1's third stage, read side:
 a bundle may carry one vector per embedded entity and an ANN index over them, and a
 `Store` that opens such a bundle answers entity → record, record → entities, record →
 stored vector, record → text digest, and nearest-`k` by vector, all in id space. No
-HTTP: the routes are unit 40's. The embedding stage that produces the vectors is
+HTTP: the routes are unit 41's. The embedding stage that produces the vectors is
 Python (`okn-indexing embed-texts`, in `../okn-embeddings`), and the build stage that
-assembles the sidecar from its output is unit 41's; this unit is the format, the
+assembles the sidecar from its output is unit 42's; this unit is the format, the
 reader, the one writer of the format, and the binding checks.
 
 **Who owns what, and why not hdtc.** Review of unit 35 proposed that hdtc own the
@@ -3480,7 +3663,7 @@ derives the capability from the files, and on both its paths now walks the id ma
 `Vectors::verify` and checks its recorded parent digest against the Parquet's checksum,
 beside the graph index's binding check. It also writes the capability's value: a
 description of the space, the coverage and the index for a reader without the bundle,
-read from the Parquet's footer there and never by a server (2026-10-23; see unit 41,
+read from the Parquet's footer there and never by a server (2026-10-23; see unit 42,
 where it was planned, for its fields).
 
 **The build's memory is linear in the records, and the library cannot bound it.** The
@@ -3491,12 +3674,12 @@ peak memory is therefore the finished index — ~920 bytes a record at 384 dimen
 `--memory-limit`. Known and accepted for the sizes OKN embeds today; what makes it a
 bounded risk rather than a trap is that the Parquet is canonical: a library with a
 disk-backed build replaces `index.usearch` by a rebuild from `embeddings.parquet`,
-minutes against the days a re-embed would cost (question 111).
+minutes against the days a re-embed would cost (question 112).
 
 **The f16 fixed point.** A stored vector read back is the f16 the index keeps, widened;
 fed into a fresh index it is stored bit-identically, so the stored precision is a fixed
 point and the cosine metric does not renormalize on insert. `/vector` can therefore
-publish what the index compares (question 109).
+publish what the index compares (question 110).
 
 **Reuse across builds, in the Python stage.** Embedding is the one slow stage, and
 texts are addressed by content, so `embed-texts --reuse <earlier Parquet>` copies any
@@ -3526,9 +3709,9 @@ verbalizer's streams through a Parquet written as the embedding stage writes one
 commands, the never-replaced sidecar, and `kgf manifest` catching an id map whose
 parent digest or regions disagree.
 
-### 40. `/vector` and `/similar` — the vector sidecar over HTTP ✅
+### 41. `/vector` and `/similar` — the vector sidecar over HTTP ✅
 
-**Implemented 2026-10-22, on `vectors-store`.** Two routes over unit 39's store, gated on
+**Implemented 2026-10-22, on `vectors-store`.** Two routes over unit 40's store, gated on
 `vectors` as `search` is on its sidecar, each with a GET form for a browser and a JSON
 body by QUERY (canonical) or POST, each with a page, each a row in the cost table.
 
@@ -3562,7 +3745,7 @@ charged to the response's byte budget, which stops the answer with
 `budget_exhausted: response_bytes` and the first record always kept. Search contexts
 are reserved at `max_concurrent_work`, so admission is the bound the library's pool is
 sized to. Work class is ordinary: a probe is microseconds. No lock is added; the
-library's own context lease is recorded under unit 39.
+library's own context lease is recorded under unit 40.
 
 **`/describe` answers the third state.** One binary search in the id map adds
 `"embedded": true|false` (and `record` when true) to a describe answer on a bundle that
@@ -3666,9 +3849,9 @@ for a subject without a vector and for a term that is not a subject; `cap_exceed
 the 501 gate on a bundle without the sidecar; and a page for each route — plus the
 methods-statement test, which now covers the gate's 501 and a 405 on the new resources.
 
-### 41. The vectors build stage — from a registry entry to a version with vectors
+### 42. The vectors build stage — from a registry entry to a version with vectors
 
-Not started; the follow-up to units 39–40, kept apart on purpose. Those units made the
+Not started; the follow-up to units 40–41, kept apart on purpose. Those units made the
 sidecar and its routes work from separate commands (`kgf verbalize`, `okn-indexing
 embed-texts`, `kgf vectors`, `kgf manifest`); this one is how a build obtains its
 inputs and runs the chain, which is almost orthogonal to what the sidecar is.
@@ -4988,48 +5171,88 @@ following the code.
     place in a sample as an IRI does, keyed by its IRI, which its content fixes.
     Whether a reifier with no label of its own should take its triple term's reading
     as its label is left to doc 13's embedding view.
-106. **Who builds the vectors sidecar.** Doc 04 §4.3 has components (external tools)
+
+106. **§3.4.11 should say how the federation artifacts are addressed, found and
+    refused.** Unit 39 serves `filters/{role}.filter`, `filters/{role}.minhash` and
+    `keysets/{role}.keys` from `export/`. What the spec would need to say for a
+    consumer to rely on it:
+    - *Address.* The path below `export/` is the artifact's key in the manifest's
+      `artifacts`, so the download is `export/{key}` relative to the manifest's URL.
+      The two directories already read that way in §3.4.11. The description files do
+      not (`export/void.hdt` against `stats/void.hdt`), and `export/dictionary` is not
+      a file; the section should either adopt the bundle path for every artifact or
+      say where the other names come from. This implementation exports none of those
+      until it does. Every key is spelled in characters a path never escapes, so the
+      spec can say the key is the only spelling: an escaped one names nothing.
+    - *Discovery.* The manifest is the listing: no link relation per artifact. A
+      consumer needs the entry's `bytes`, `sha256` and `keys` beside the file anyway.
+    - *Absence.* A path the manifest does not list is `404 not_found`, not
+      `capability_not_available`: it names a file the release does not have. One it
+      lists that the server cannot serve as listed is a `500`, for every method and
+      precondition alike, never a `404`: the manifest's reader was told it exists.
+    - *The capability.* `export` cannot be declared honestly while its list mixes a
+      required artifact, optional ones and a later-phase one (question 81). Proposed:
+      drop it as a bundle capability. `data.hdt` is always there; `filters` and
+      `keysets` already say those files are; `artifacts` says which. What a
+      *deployment* routes is the other half, and a deployment that mirrors bundles
+      without serving downloads has nowhere to say so short of the 404. If that needs
+      stating it belongs in the service descriptor, not the manifest.
+    - *The validator is constructible.* Question 82 asks that the `ETag` be exactly the
+      checksum. For these artifacts a client builds `If-Range` from the manifest before
+      its first request, so the spelling itself — `"sha256:{hex}"` — has to be
+      normative, not only the value.
+    - *Media type and coding.* Served as `application/octet-stream`. hdtc's sketch and
+      key-set formats register no type; if one is wanted it is hdtc's to name. They are
+      never content-coded — they do not compress — so a client can rely on
+      `Content-Length` and the strong `ETag` for them whatever it sends.
+    - *Cost and the client's duty.* These downloads run to gigabytes (doc 05 §5.2.4.1),
+      and a gateway may bound one response in time. §3.5 should say a download is
+      outside the response budgets and bounded by a download gate (question 81 again),
+      and doc 05 §5.2.2's limits on the crawler should say it resumes an interrupted
+      artifact by range with `If-Range`, keeps within a server's per-client download
+      limit, and verifies the assembled file against the manifest.
+107. **Who builds the vectors sidecar.** Doc 04 §4.3 has components (external tools)
     and sidecars (`kgf build` itself); doc 13 §13.1 leaves the index build to
-    measurement. Unit 39 settles it for this implementation: the model runs in Python
+    measurement. Unit 40 settles it for this implementation: the model runs in Python
     and produces the data (`embeddings.parquet`, keyed by text digest, never seeing an
     IRI or an id); `kgf build` builds the index and the id map from it, with the crate
     that serves them, so `--locked` pins writer and reader; hdtc owns neither, since
     neither is an HDT-family format. Doc 13 should say the embedding stage's contract
     is texts in, vectors out, and that the index is built by whoever serves it.
-107. **Data inside a sidecar.** The Parquet is recoverable only by re-running a model,
+108. **Data inside a sidecar.** The Parquet is recoverable only by re-running a model,
     which makes it data by doc 04 §4.3's own test, yet it lives under `vectors/` beside
     the indexes derived from it. The line is the model's output as data, the ANN
     structure as index — and the reason an index is never the canonical store of
-    vectors (unit 39). Doc 13 §13.1 item 3 should draw it.
-108. **`convention_id` names a space; probes show it.** Doc 13 §13.3's recipe hash is
+    vectors (unit 40). Doc 13 §13.1 item 3 should draw it.
+109. **`convention_id` names a space; probes show it.** Doc 13 §13.3's recipe hash is
     what two parties *say* they share. A library upgrade under the same model name
     moves every vector, and mixing two such spaces fails silently. The embedding stage
     now stamps twelve fixed texts' vectors into every file, and reuse across builds
     requires the current embedder to reproduce them within a tolerance. Doc 13 should
     make the probes part of the convention, and say that reuse — and any client
     claiming the space — is gated on them, not on the hash.
-110. **`/vector`, `/similar`, `not_embedded`, `max_vector_iris` and `max_similar_k` are
+111. **`/vector`, `/similar`, `not_embedded`, `max_vector_iris` and `max_similar_k` are
     additions to doc 03.** Doc 13 §13.2 sketches the two routes; doc 03's URL space,
-    error table and cap list do not have them. Unit 40 fixes the wire shapes: `/vector`
+    error table and cap list do not have them. Unit 41 fixes the wire shapes: `/vector`
     as an ordered array with `absent` reasons, `/similar` with `record`, `distance`,
     `similarity` and `entities`, an entity's own record excluded, and `not_embedded` at
     422 as the one code for a term the bundle cannot rank. Doc 03 should carry them as
     question 97 asked for `/verbalize`, and doc 13 §13.2's `filter` stays open.
-111. **Doc 13's sizing paragraph should say what bounds the index build.** §13.1's
+112. **Doc 13's sizing paragraph should say what bounds the index build.** §13.1's
     "sizing honesty" sizes the sidecar on disk; the build's memory is the other half.
-    An in-memory HNSW build (usearch, unit 39) needs RAM for the finished index, linear
+    An in-memory HNSW build (usearch, unit 40) needs RAM for the finished index, linear
     in the records, and the library has no bounded alternative — ~90 GB at the 10⁸
     entities §13.1 contemplates. The design's answer is already in place: with the
     vectors canonical and the index derived, a disk-backed library (§13.1's
     Vamana/DiskANN candidates) is a rebuild, not a re-embed. Doc 13 should say so, and
     say the manifest names the index's library and version so a reader knows which.
-109. **`/vector` publishes the index's precision.** The stored vector is f16 and is a
-    fixed point of storage (unit 39); `/vector` should return exactly what the index
+110. **`/vector` publishes the index's precision.** The stored vector is f16 and is a
+    fixed point of storage (unit 40); `/vector` should return exactly what the index
     compares, with full precision available through the Parquet export. Doc 13 §13.2
     should say which precision the route carries.
-112. **Where a KG's verbalization config lives is a deployment matter doc 13 should
+113. **Where a KG's verbalization config lives is a deployment matter doc 13 should
     name.** Doc 13 §13.3 treats the recipe as part of the build; it does not say where a
-    federation keeps forty of them. Unit 41 puts each in the OKN registry as a file the
+    federation keeps forty of them. Unit 42 puts each in the OKN registry as a file the
     KG's entry names, authored against the served bundle and reviewed like any registry
     change, with the bundle's published `vectors/verbalize.json` as the record of what a
     version used. Doc 13 (or doc 04's build inputs) should say that the config is an

@@ -1,0 +1,41 @@
+# Checks Cargo.lock against the RustSec advisory database. It is separate from
+# CI because it fails for a different reason: CI fails when a change is wrong,
+# and this fails when a crate the lockfile already pins turns out to be
+# vulnerable, which can happen with no change here at all. Hence the weekly run
+# as well as the run on each change. Advisories accepted on purpose, each with
+# its reason, are listed in .cargo/audit.toml.
+#
+# This audits the lockfile `kgf` is built from. The `hdtc` binary in the image
+# is built from hdtc's own Cargo.lock at the tag the Dockerfile pins, so
+# auditing that lockfile belongs to hdtc.
+name: Audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 7 * * 1"
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out kgf-rs
+        uses: actions/checkout@v4
+
+      # A prebuilt binary, where `cargo install` would compile it on every run.
+      # Pinned for the same reason CI pins the toolchain: a new release of the
+      # tool should not be able to fail this with no change here. The advisory
+      # database is deliberately not pinned; following it is the point.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.23.0
+
+      # Run as `cargo-audit audit` rather than `cargo audit`: going through
+      # `cargo` would make rustup install the rust-toolchain.toml toolchain, and
+      # reading a lockfile needs no compiler.
+      - name: cargo audit
+        run: cargo-audit audit

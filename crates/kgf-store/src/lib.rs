@@ -82,9 +82,9 @@ pub use manifest::{
     BundleFacts, Capability, Manifest, ManifestDocument, VectorsDescription,
     VectorsIndexDescription,
 };
-pub use map::{PublishedBundle, PublishedRoot};
+pub use map::{PublishedBundle, PublishedFile, PublishedRoot};
 pub use scope::{QuadRow, QuadSelection, ScopedSelection};
-pub use store::{OpenOptions, Store};
+pub use store::{KeyArtifact, OpenOptions, Store};
 pub use vectors::{
     Hit, Row, SidecarFacts, Vectors, vectors_sidecar_facts, verify_vectors_artifacts,
 };
