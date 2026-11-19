@@ -73,7 +73,10 @@ over them, assembled by `kgf vectors` from the embedding stage's Parquet and the
 verbalizer's roots, answering `/vector` and `/similar` (`not_embedded`, 422, for an
 entity the build gave no vector), with the verbalization config published beside the
 vectors so `/describe` renders an embedded entity's text live and `/verbalize` needs
-no config of its own (`plan.md` units 40–41) — all optional capabilities. `/terms` is only half of §3.4.8: the prefix
+no config of its own (`plan.md` units 40–41) — all optional capabilities. Opening a
+bundle that carries the sidecar is linear in its embedded records, because the ANN
+library addresses every record when it views an index; every other artifact opens in a
+fixed number of reads (`plan.md` question 114). `/terms` is only half of §3.4.8: the prefix
 scan needs no artifact, while key resolution needs a derived key-to-id index no bundle
 carries, so QUERY on that route is a 405 and no manifest declares the capability —
 declaring one commits to its full contract, methods included (`plan.md` question 67).
@@ -206,6 +209,17 @@ that external immutability guarantee; safe store and catalog APIs require those
 capabilities rather than accepting arbitrary paths. Anything that maps a file outside
 that guarantee does not belong in this crate.
 
+**One artifact is read by code that is not safe Rust.** `MappedIndex::view`, in `map`,
+hands the mapped `vectors/index.usearch` to the ANN library, which follows the links
+it finds in the file without checking them. Immutability is not enough for that: the
+bytes must also be an index that library wrote, or a search reads out of bounds where
+any other corrupt artifact is refused. Nothing at open can establish it. Publication
+does: `kgf vectors` writes the file, the id map records its SHA-256, and
+`kgf manifest` checks the two against each other with the rest of the bundle's
+checksums. Both obligations are written on the `unsafe` call that takes them on. A
+second artifact read by native code is a design change to surface, as a second mapping
+site is.
+
 ## Rules that are design decisions, not style
 
 Violating one of these is a change to the design, to be surfaced rather than made
@@ -234,7 +248,11 @@ quietly.
 4. **`Store` is immutable after `open`.** No interior mutability and no locks on the
    read path. Thread safety is by construction. Caches — including the obvious
    per-request term cache — belong to `kgf-server`, because putting one here means a
-   lock on the hot path.
+   lock on the hot path. The one recorded exception is the ANN library behind the
+   `vectors` sidecar: a search leases a context under the library's mutex, and a
+   lookup by key reads its key table under a shared lock. Both are the dependency's,
+   neither is held across the work it guards, and `plan.md` unit 40 says what removing
+   them would take. A lock of this crate's own is still a design change.
 5. **The crate boundary is the point.** HTTP semantics (caps, budgets, the truncation
    vocabulary, serialization formats, cursor tokens) must not leak into `kgf-store`,
    and the store must stay testable headless against fixture bundles.
