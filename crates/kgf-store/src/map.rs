@@ -354,9 +354,17 @@ pub(crate) fn open_published(bundle: &PublishedBundle, path: &Path) -> Result<Ma
 /// address them lazily. Viewing allocates, for every record, the address of
 /// its node and of its vector and an entry in the library's key table, and
 /// reads each node's key from the file to fill that table. Open is therefore
-/// linear in the index's records, in time and in heap — tens of bytes a
-/// record — and it faults in the graph's pages. It is the one artifact whose
-/// open depends on its size.
+/// linear in the index's records, in time and in heap, and it is the one
+/// artifact whose open depends on its size.
+///
+/// Measured with version 2.26.5 of the library at 384 dimensions, a million
+/// records open in about 44 ms with the file in the page cache and in one to
+/// two seconds from a cold local disk. They leave about 51 MB of heap
+/// allocated: 51 to 65 bytes a record, stepping with the key table's
+/// capacity. That heap is not page cache and is not reclaimed. A cold open
+/// reads the graph section whole, 149 bytes a record, and none of the
+/// vectors. Mapping the file and reading its header alone takes microseconds
+/// and allocates nothing.
 pub struct MappedIndex {
     // Declared before `mapping`: see the type's documentation.
     index: usearch::Index,

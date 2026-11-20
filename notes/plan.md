@@ -3655,9 +3655,9 @@ header and against what a build writes. The index and the id map must occur toge
 a Parquet without them is refused. Viewing the index is the part that grows: the
 library allocates, per record, the address of its node and of its vector and an entry
 in its key table, and reads every node's key from the file to fill the table. So a
-bundle with a sidecar opens in time and heap linear in its records — tens of bytes a
-record, and the graph's pages faulted in — where every other artifact opens in a fixed
-number of reads. This unit first said open was size-independent; it is for the id map
+bundle with a sidecar opens in time and heap linear in its records — 51 to 65 bytes of
+heap a record, and the graph section read whole, as measured below — where every other
+artifact opens in a fixed number of reads. This unit first said open was size-independent; it is for the id map
 only (question 114). What open does not walk — ids strictly increasing and within the
 dictionary, rows in range, offsets monotone and every record non-empty, the two
 directions agreeing, the header's widest record, every index key below `records`
@@ -3666,6 +3666,39 @@ a region that disagrees with its header as `Malformed` rather than asserting, af
 unit 35's review found one request could take the process down: open establishes the
 header and the sentinels, not the regions, so a request over a corrupt map must
 refuse, not panic.
+
+**What open costs, measured (2026-11-19).** The four calls `MappedIndex::view` makes —
+header, new, view, reserve at 32 contexts — in a standalone release build against
+usearch 2.26.5, over synthetic indexes of random unit vectors at 384 dimensions, f16,
+cosine, connectivity 16, on an Apple Silicon laptop's internal NVMe. The files came
+out at 916.6 bytes a record, as SOCKG's did.
+
+| records | index file | warm open | cold open | heap after open | heap a record |
+|---|---|---|---|---|---|
+| 100,000 | 92 MB | 3.2–3.7 ms | 89–98 ms | 6.5 MB | 65 B |
+| 250,000 | 229 MB | 9.4–10.9 ms | 258–275 ms | 13.1 MB | 53 B |
+| 1,000,000 | 917 MB | 43–45 ms | 1.0–1.7 s | 50.7 MB | 51 B |
+
+Warm is five runs with the file in the page cache. Cold is three, each on a fresh copy
+written with the cache bypassed and confirmed to have no page in memory before the
+open. Mapping the same file and reading only its header takes 5–6 µs and allocates
+nothing, which is what every other artifact's open looks like. A cold open reads the
+graph section whole — 149 bytes a record, and none of the vectors — and at a million
+records the kernel brought in 209 MB with its read-ahead. Peak footprint during a
+million-record open was 61 MB. The first search after a cold open took 300–490 ms
+against about 2 ms warm, since the vectors it compares are faulted in then. Heap a
+record is not constant, which is consistent with the library rounding its key table's
+capacity up to a power of two.
+
+Both costs grew linearly over that range. Extrapolated to 10⁷ records, and not
+measured: about 0.5 GB of heap for each open bundle, about 0.45 s to open warm, and at
+least 1.5 GB to read cold, which on this disk would be ten seconds or more. Up to
+about a million embedded records the cost is small; an order of magnitude past that, a
+cold open is long enough to time a request out. The heap is the part that accumulates:
+it is not page cache and is not reclaimed, so every open bundle's share counts against
+a pod's memory limit. A network volume will read the graph section slower than this
+disk did. These figures are the index's view alone, not the whole of `Store::open`,
+whose other artifacts add a fixed number of reads.
 
 **`kgf vectors` assembles the sidecar; `kgf manifest` verifies it.** The command takes
 the embedding stage's Parquet and the roots stream, joins them through the dictionary,
@@ -4015,6 +4048,196 @@ else — a text the preview's read or byte budget stopped short — and its page
 calls that "cut by budget"; the JSON fields (`truncated` on a record, on a target
 report, and on `/describe`'s `embedded_text`) should be renamed to match in this unit,
 before the model's meaning arrives beside them.
+
+### 43. The index a server reads in place — a proposal, and the measurements behind it
+
+Proposed 2026-11-19; not decided and not started. Unit 40 serves `/similar` through a
+library that views `index.usearch`, and its review recorded what that costs against
+this implementation's rules: heap and open time linear in the embedded records, two
+locks on the read path, and the one artifact read by code that is not safe Rust. This
+unit records what was measured to choose a replacement, what the measurements settle,
+and the change they point to.
+
+**A cap on embedded records was considered and rejected.** How much of a graph is
+embedded is for the graph and its maintainers to decide; the index's cost should not
+set it. So the question is what a sidecar of any size costs, and the first measurement
+is how large one can get. Counting statements of the commonest naming predicate in
+each bundle (`rdfs:label`, `skos:prefLabel`, `schema:name` under either scheme,
+`dcterms:title`, `foaf:name`; exact counts from `/count`) over the 50 bundles of a
+local copy of the federation:
+
+| | subjects | named |
+|---|---|---|
+| all 50 bundles | 1,313,170,186 | 659,741,054 |
+| babel | 638,232,683 | 433,226,356 |
+| geoconnex | 71,430,662 | 58,306,988 |
+| ufokn | 58,956,893 | 47,103,427 |
+| medical-device-kg | 39,949,859 | 38,908,312 |
+| scales | 171,678,070 | 24,593,501 |
+| spatialkg | 16,767,819 | 14,888,789 |
+| fiokg | 18,379,636 | 10,148,666 |
+
+Thirty-three bundles have under a million named entities, ten have one to ten million,
+and those seven have more. The count is of statements, so an entity named twice counts
+twice, and a config may embed far fewer (or, by template, entities with no name). It
+tracks practice where there is practice to compare: SOCKG has 1,284 `rdfs:label`
+statements and its sidecar embeds 1,237 roots. Tens of millions of records in one
+sidecar is therefore an ordinary case, and at unit 40's measured costs it means half a
+gigabyte of unreclaimed heap per ten million records opened and a gigabyte of build
+memory per million.
+
+**What was compared.** Three readers over the same stored vectors: usearch as unit 40
+uses it; the same graph, parsed out of usearch's saved file into fixed-width tables
+and searched by plain Rust over byte slices (a vector table by record, a level-0
+neighbour table, and the sparse upper levels); and inverted lists (spherical k-means
+on a sample, every record assigned to its nearest centroid, each list's vectors
+contiguous). The corpus is real: Ubergraph v0.0.2's `owl:Class` members verbalized by
+`kgf verbalize` — 4,669,190 members, 3,885,077 of them named nodes, 3,881,887 distinct
+texts — a uniform sample of 1,002,000 of those texts embedded with all-MiniLM-L6-v2 at
+`max_seq_length` 256, and the index built as `kgf vectors` builds it (usearch 2.26.5,
+its default connectivity 16 and build expansion, rows added one after another, f16
+under cosine). The config is an allowlist — definition, exact synonyms, taxon rank,
+gene template, three values each — written to the rules of okn-embeddings' textify
+skill and not reviewed by anyone who curates Ubergraph. Each figure is over 2,000
+queries, 20,000 neighbours judged against exact search at full precision. Three kinds
+of query, because `/similar` takes two: a vector the index has never seen (a client's
+own), a stored vector with its own record left out (a search from an entity), and a
+stored vector with its own record counted, which is how the embedding stage's own
+`eval-index` scores an index.
+
+**The reader is not the question: the tables give the library's answers.** Recall@10
+of usearch and of the plain-Rust reader over the same graph agreed to within 0.0003 in
+every run — 0.9288 and 0.9289 at a million records, 0.9521 and 0.9522 at 300,000 — at
+0.26 ms a query against the library's 0.25, with scalar scoring nobody has tuned. The
+stored f16 costs nothing measurable: exact search over the stored rows finds 0.9999 of
+the full-precision neighbours. The upper levels cannot be dropped: searching level 0
+alone lost 7 points of recall at 300,000 records and 13 at a million.
+
+**A fixed search breadth loses recall as a sidecar grows.** Recall@10 of the index as
+served today, breadth 64:
+
+| queries | 300,000 records | 1,000,000 records |
+|---|---|---|
+| a client's vector | 0.952 | 0.929 |
+| from an entity, own record left out | 0.969 | 0.947 |
+| stored, own record counted | 0.970 | 0.949 |
+
+The work did not grow — 813 vectors compared a query at 300,000 and 836 at a million —
+so the graph's cost is set by the breadth and its recall by the breadth and the size
+together. Breadth 128 gives 0.960 at a million for a client's vector and breadth 256
+gives 0.976. `SEARCH_EXPANSION` is a constant nobody chose a recall for. Two sizes do
+not make a law, so nothing here says how far recall falls at ten million.
+
+**Graph against lists, at a million records, a client's vector.** Pages are distinct
+4 KiB pages of the mapped tables a query touches; reads are the contiguous runs those
+pages fall into, which is what a cold query waits on.
+
+| reader | recall@10 | within 0.01 of the tenth | vectors compared | pages | reads | warm |
+|---|---|---|---|---|---|---|
+| graph tables, breadth 64 | 0.929 | 0.957 | 836 | 982 | 875 | 0.26 ms |
+| graph tables, breadth 128 | 0.960 | 0.981 | 1,348 | 1,618 | 1,438 | 0.45 ms |
+| graph tables, breadth 256 | 0.976 | 0.992 | 2,257 | 2,785 | 2,460 | 0.78 ms |
+| 4,096 lists, 16 probes | 0.932 | 0.973 | 10,274 | 1,177 | 18 | 1.04 ms |
+| 4,096 lists, 32 probes | 0.953 | 0.984 | 15,716 | 2,211 | 34 | 1.83 ms |
+| 4,096 lists, 64 probes | 0.969 | 0.992 | 26,096 | 4,207 | 66 | 3.34 ms |
+| 4,096 lists, 128 probes | 0.981 | 0.996 | 45,902 | 7,963 | 127 | 6.25 ms |
+
+At equal recall the lists compare twelve times the vectors at 0.93 and twenty times at
+0.98, and need 18 to 127 reads where the graph needs 875 to 2,460. Their misses are
+nearer: the third column counts answers within 0.01 cosine of the true tenth
+neighbour, and by it 8 probes (0.955, 7,378 vectors, 10 reads) come within 0.002 of
+the graph at breadth 64. From 300,000 records to a million, with the list count
+doubled and the probes held at 32, the lists kept their recall (0.951, then 0.953) and
+did 1.7 times the work (9,038 vectors, then 15,716); the longest list was eleven times
+the mean (2,679 against 244), and it is the longest list, not the mean, that a cost
+bound has to be written in. A graph's work follows its breadth and connectivity and
+not the size of the sidecar, which is the shape doc 03 §3.5 wants.
+
+**Build memory.** usearch's build peaked at 161 MB for 100,000 records, 372 MB for
+300,000 and 1,070 MB for a million (397 s single-threaded): 1.07 KB a record, above
+unit 40's 920-byte estimate. A list build that clusters a sample and then streams the
+records twice peaked at 113 MB for 100,000 records and 123 MB for 300,000, because
+what it holds is the sample. (The 100,000-record figures and both list figures are
+from the first config's vectors, below; a build's memory does not depend on what the
+vectors say.) Only the lists have a build that fits under a memory limit as it stands.
+
+**What these figures are not.** One graph, one model, one config. A first config that
+kept Ubergraph's materialized subclass closure scored one and a half to two points
+lower in every row (0.933 for a client's vector at 300,000), so a config moves recall
+as much as the kind of query does. okn-embeddings' `docs/local-vs-qdrant.md` reports
+0.984 for a 250,000-record Ubergraph corpus scored the third way, against 0.970 here
+at 300,000; the 1.4 points are unexplained (its selection of records is not recorded,
+and it used 200 queries). On synthetic clustered vectors usearch scored 0.999 and
+4,096 lists at 16 probes 0.998, which real embeddings did not bear out: no figure from
+synthetic vectors should be used to choose here. Warm times are one thread on an Apple
+Silicon laptop. Cold reads were timed only from a USB disk under macOS, whose 16 KiB
+pages and read-ahead are not a Linux server's: at equal recall the first ten queries
+averaged 172 ms for the graph and 49 ms for the lists, and nothing more should be read
+into that than its direction. The harness and its logs are kept outside this
+repository; if the proposal is taken up, its comparison of the two readers belongs
+here as the new reader's differential test.
+
+**The proposal.** Three changes, separable, in the order the evidence supports them.
+
+1. *The server reads tables this project defines, in place.* The sidecar carries the
+   vectors as a table of f16 rows addressed by record, the level-0 neighbours as a
+   table of fixed-width rows (a count and 2 × connectivity record numbers: 132 bytes
+   at connectivity 16), the upper levels as a small sorted table (6% of records have
+   one), and a header with the entry point, the widths and the bindings the id map's
+   header carries today. `kgf-store` searches them in safe Rust over mapped slices.
+   Open becomes a header and a length check; nothing is allocated per record; a search
+   allocates a visited set and two heaps, bounded by the vectors it may read, and
+   takes no lock; `/vector` reads a row at an offset, with no key table. The usearch
+   crate leaves `kgf-store` and stays in the `kgf` binary, where `kgf vectors` goes on
+   building in memory and then writes the tables from the graph it built.
+   `OpenOptions::search_contexts`, rule 4's recorded exception, the `unsafe` call that
+   hands mapped bytes to native code, and questions 114 and 115 all go with it. The
+   published bytes come out the same size, about 900 a record at 384 dimensions. One
+   coupling is new and is the build's alone: the library's API does not expose a
+   node's neighbours, so the tables are written by walking its saved file, which is
+   its private layout. That holds for one pinned version at a time, refuses a file
+   whose walk does not end at its length, and is checked by the differential test;
+   a builder of this project's own would remove it.
+2. *Breadth is a property of the bundle, chosen from measured recall.* `kgf vectors`
+   scores the index it built against exact search over a sample of its own vectors,
+   across a sweep of breadths, and the manifest's `vectors` description publishes the
+   sweep; the breadth served is the smallest that meets a federation target and is
+   recorded in the table's header, so the file states what a search of it does. The
+   embedding stage's `eval-index` already measures exactly this and writes it to its
+   own manifest; the measurement moves to where the index is built. `/similar`'s cost
+   then becomes a row doc 03 §3.5 can state and the reader can enforce: a search stops
+   at a budget of vectors read and answers with what it has. Breadth alone does not
+   bound a search — at breadth 64 the mean was 813 to 836 vectors and the largest
+   2,285, past 64 × 32 — and a budget is something the library does not offer and
+   this project's own reader can (question 118).
+3. *The graph stays the index, until a deployment measurement says otherwise.* Its
+   cost does not grow with the sidecar and its recall is a knob; the lists pay more
+   at every recall and more again at every size. What the lists have is few reads
+   when nothing is in memory and a build under a memory limit, and both are real for
+   this deployment, which serves hundreds of gigabytes from a pod with a few. So this
+   part is a lean, not a finding.
+
+**What would overturn it, and what stays open.** A cold `/similar` at breadth 64 is
+about a thousand scattered page reads, and 2,500 at breadth 256: measure that on the
+deployment's volume before the largest sidecars are built, and if it cannot be lived
+with, the lists (or a compressed copy of the vectors to navigate by, with full vectors
+read only for the final candidates) are the alternatives. The build stays linear in
+memory with a graph — a gigabyte a million records, so babel's 433 million named
+entities would take some 460 GB — and a partitioned build that writes the same tables
+is the route, unbuilt and not small; because the tables are this project's own format,
+a second builder can write them without the server changing. A second corpus of
+another kind (instance data, templated texts) and a size past a million have not been
+measured. And the recall a sidecar should meet is a number nobody has chosen.
+
+**Who owns the format.** Question 107 kept the index out of hdtc because it was a
+third-party library's file. Tables this project defines are not, and by the same rule
+their byte layout and its normative document would be hdtc's, with `hdtc::format`
+exposing the header as it does for every other artifact (question 117).
+
+**Nothing in the HTTP contract changes**, nor the id map's relations, nor the Parquet
+as the canonical vectors: the index is still derived, so this is a rebuild of each
+sidecar from `embeddings.parquet` and a manifest whose index description names another
+kind.
 
 ## Testing spine
 
@@ -5328,6 +5551,8 @@ following the code.
     vectors canonical and the index derived, a disk-backed library (§13.1's
     Vamana/DiskANN candidates) is a rebuild, not a re-embed. Doc 13 should say so, and
     say the manifest names the index's library and version so a reader knows which.
+    Measured since on real vectors at 1.07 KB a record (unit 43), so nearer 107 GB at
+    10⁸.
 110. **`/vector` publishes the index's precision.** The stored vector is f16 and is a
     fixed point of storage (unit 40); `/vector` should return exactly what the index
     compares, with full precision available through the Parquet export. Doc 13 §13.2
@@ -5343,11 +5568,14 @@ following the code.
     make a bounded number of reads whatever the bundle's size. A usearch view cannot:
     it allocates per record and reads every node's key (unit 40), so a bundle with
     vectors opens in time and heap linear in its embedded records, on the request that
-    first touches it and again after eviction. Either doc 20 names the exception and
+    first touches it and again after eviction. Measured at a million records: about
+    44 ms warm, one to two seconds cold from a local disk, and 51 MB of heap that is
+    not page cache. Either doc 20 names the exception and
     doc 03 §3.5 carries an open cost for `vectors`, or the vectors move to a layout
     KGF defines — a flat store of quantized vectors addressed by record, beside an
     index that keeps no key table — which by question 107's rule would be hdtc's to
-    define and build. The second also removes the library's key-table lock.
+    define and build. The second also removes the library's key-table lock. Unit 43
+    measures the second and proposes it (question 117).
 115. **A corrupt index is read out of bounds, not refused.** Every other artifact is
     read by safe code, so the publication invariant (doc 04 §4.6: a published version
     does not change) is all a server's memory safety rests on. `index.usearch` is read
@@ -5364,6 +5592,42 @@ following the code.
     descriptor is where a deployment states it. And a result now carries
     `entity_count` beside `entities`, which a budget may cut short: doc 13 §13.2's
     sketch of the answer should have both.
+117. **A vector index KGF defines, read in place.** Doc 13 §13.1 leaves the choice of
+    index to measurement. Unit 43 has the measurement: the graph a library builds,
+    written out as fixed-width tables (f16 vectors by record, level-0 neighbours, the
+    sparse upper levels) and searched by safe code over the mapping, returns the
+    library's own recall on real embeddings at 300,000 and at a million records, with
+    no heap per record, an open that reads a header, no lock and no native reader.
+    Proposed, not decided. If taken, doc 13 should define the tables or name the
+    document that does, doc 20's open contract needs no exception for `vectors`
+    (question 114), doc 04's reliance on publication-time verification for this
+    artifact lapses (question 115), and question 107's "hdtc owns neither" is revised
+    for the index: a layout KGF defines is an hdtc format by that question's own
+    reasoning, while the id map's ownership is unchanged. Inverted lists were measured
+    beside it and are the alternative if scattered reads prove too costly on a
+    deployment's volume: at a million records they compare twelve to twenty times the
+    vectors for the same recall, in a fiftieth to a twentieth of the reads.
+118. **Recall is something a sidecar publishes, and breadth is the bundle's.** At a
+    fixed breadth of 64, recall@10 on real embeddings fell from 0.969 to 0.947 between
+    300,000 and a million records for a search from an entity, and from 0.952 to 0.929
+    for a client's vector, while the work stayed level (unit 43). So a constant breadth
+    is a recall that silently depends on a graph's size, and nothing published says
+    what it is. Doc 13 should make measured recall against exact search part of the
+    `vectors` description, with the sample and the kind of query it was measured by,
+    and say the breadth is chosen per bundle to meet a federation target and recorded
+    with the index — revising question 116, where the expansion was the server's
+    setting and no file recorded it. Doc 03 §3.5's row for `/similar` should then be a
+    budget of vectors read that the server enforces, since breadth alone does not
+    bound a search. The target itself is a number the design has not chosen.
+119. **Doc 13's sizing should be in named entities, with no cap on what a graph
+    embeds.** §13.1 sizes for 10⁸ entities in the abstract. Counted over 50 federation
+    bundles by their naming statements, about 660 million of 1.31 billion subjects
+    carry a name, 433 million of them in one graph, and seven graphs have ten million
+    or more (unit 43). A limit on
+    embedded records was considered as a way to bound the index's cost and rejected:
+    what a graph embeds is its maintainers' choice. Doc 13 should size the sidecar,
+    its open, its queries and its build against those figures and say that each must
+    hold at any of them.
 
 ## Not in this plan
 

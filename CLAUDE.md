@@ -75,8 +75,11 @@ entity the build gave no vector), with the verbalization config published beside
 vectors so `/describe` renders an embedded entity's text live and `/verbalize` needs
 no config of its own (`plan.md` units 40–41) — all optional capabilities. Opening a
 bundle that carries the sidecar is linear in its embedded records, because the ANN
-library addresses every record when it views an index; every other artifact opens in a
-fixed number of reads (`plan.md` question 114). `/terms` is only half of §3.4.8: the prefix
+library addresses every record when it views an index: measured, about 44 ms warm, one
+to two seconds cold, and 51 MB of unreclaimable heap per million records. Every other
+artifact opens in a fixed number of reads (`plan.md` unit 40 has the measurements,
+question 114 what the design should say, and unit 43 a proposed replacement that reads
+its own tables in place — proposed, not decided). `/terms` is only half of §3.4.8: the prefix
 scan needs no artifact, while key resolution needs a derived key-to-id index no bundle
 carries, so QUERY on that route is a 405 and no manifest declares the capability —
 declaring one commits to its full contract, methods included (`plan.md` question 67).
