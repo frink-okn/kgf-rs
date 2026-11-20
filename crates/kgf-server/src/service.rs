@@ -54,6 +54,7 @@ use kgf_store::manifest::{
     Manifest, Publisher, default_predicate_roles, validate_predicate_role_iri,
 };
 use kgf_store::store::{OpenOptions, Store, artifact};
+use kgf_verbalize::{Config as VerbalizeConfig, Resolved as VerbalizeResolved};
 
 use crate::access::{AccessState, OpenTiming, millis};
 use crate::admission::AdmissionController;
@@ -146,7 +147,15 @@ impl Service {
             .admission
             .validate()
             .map_err(|detail| ServiceError::Configuration { detail })?;
-        let catalog = Catalog::scan(config.bundle_root.clone(), OpenOptions::default())?;
+        // A vector search leases one of a fixed pool of contexts and fails
+        // rather than waits when none is free, so the pool is the admission
+        // bound: as many as requests that may run at once.
+        let catalog = Catalog::scan(
+            config.bundle_root.clone(),
+            OpenOptions::default().with_search_contexts(
+                usize::try_from(config.admission.max_concurrent_work).unwrap_or(usize::MAX),
+            ),
+        )?;
         // Before any manifest is read, because this is a fact about the
         // directory name rather than about the bundle inside it: a hand-
         // assembled or externally produced tree can carry a name `kgf build`
@@ -336,6 +345,49 @@ pub struct PublishedManifest {
     parsed: Arc<Manifest>,
     digest: ContentDigest,
     export_files: ExportFiles,
+    /// The vector sidecar's verbalization config, read beside the manifest
+    /// when it lists one; see [`read_verbalize_config`].
+    verbalize: PublishedVerbalize,
+}
+
+/// A release's verbalization config, as startup found it.
+#[derive(Debug, Clone)]
+enum PublishedVerbalize {
+    /// The manifest lists none.
+    Absent,
+    /// Read and resolved.
+    Published(Arc<BundleVerbalize>),
+    /// Listed, and not a config this build can use: the defect. Withheld
+    /// rather than fatal, as a download that cannot be served as listed is:
+    /// the config backs a preview's default and a describe page's text, and
+    /// neither is worth every dataset of a deployment failing to start. A
+    /// bundle written by a newer builder, whose config has a field this build
+    /// does not know, is the ordinary way to get here.
+    Withheld(Arc<str>),
+}
+
+/// A release's verbalization config, as a request that needs one sees it.
+#[derive(Debug, Clone, Copy)]
+pub enum BundleConfig<'a> {
+    /// The release publishes none.
+    Absent,
+    /// The release's own.
+    Published(&'a Arc<VerbalizeResolved>),
+    /// The release lists one this server cannot use, and why.
+    Withheld(&'a str),
+}
+
+/// A bundle's published verbalization config, held the two ways it is used.
+#[derive(Debug)]
+pub struct BundleVerbalize {
+    /// Resolved once: `/verbalize`'s default, and what renders an embedded
+    /// entity's text live.
+    resolved: Arc<VerbalizeResolved>,
+    /// The same config as YAML, the form a person edits, for a page's config
+    /// field to start from. Rendered from the published JSON, so it says
+    /// exactly what the bundle's texts were rendered under; comments in the
+    /// file the config was authored as are not part of that and are not here.
+    yaml: Arc<str>,
 }
 
 impl PublishedManifest {
@@ -362,11 +414,17 @@ impl PublishedManifest {
         })?;
         let digest = bytes_digest(&bytes);
         let export_files = ExportFiles::scan(bundle_dir, &parsed);
+        let verbalize = match read_verbalize_config(bundle_dir, &parsed) {
+            Ok(Some(config)) => PublishedVerbalize::Published(config),
+            Ok(None) => PublishedVerbalize::Absent,
+            Err(defect) => PublishedVerbalize::Withheld(defect.into()),
+        };
         Ok(Self {
             bytes: bytes.into(),
             parsed: Arc::new(parsed),
             digest,
             export_files,
+            verbalize,
         })
     }
 
@@ -388,6 +446,7 @@ impl PublishedManifest {
             parsed: Arc::new(parsed),
             digest,
             export_files,
+            verbalize: PublishedVerbalize::Absent,
         })
     }
 
@@ -399,6 +458,33 @@ impl PublishedManifest {
     /// The parse.
     pub fn parsed(&self) -> Arc<Manifest> {
         Arc::clone(&self.parsed)
+    }
+
+    /// The bundle's verbalization config, as a request that needs one sees
+    /// it: published, absent, or listed and unusable.
+    pub fn verbalize(&self) -> BundleConfig<'_> {
+        match &self.verbalize {
+            PublishedVerbalize::Absent => BundleConfig::Absent,
+            PublishedVerbalize::Published(config) => BundleConfig::Published(&config.resolved),
+            PublishedVerbalize::Withheld(defect) => BundleConfig::Withheld(defect),
+        }
+    }
+
+    /// The bundle's verbalization config, when it publishes one this server
+    /// can use.
+    pub fn verbalize_config(&self) -> Option<&Arc<VerbalizeResolved>> {
+        match &self.verbalize {
+            PublishedVerbalize::Published(config) => Some(&config.resolved),
+            PublishedVerbalize::Absent | PublishedVerbalize::Withheld(_) => None,
+        }
+    }
+
+    /// The same config as YAML, for a form to start from.
+    pub fn verbalize_yaml(&self) -> Option<&Arc<str>> {
+        match &self.verbalize {
+            PublishedVerbalize::Published(config) => Some(&config.yaml),
+            PublishedVerbalize::Absent | PublishedVerbalize::Withheld(_) => None,
+        }
     }
 
     /// Identity of the complete immutable publication profile.
@@ -484,6 +570,14 @@ impl Datasets {
                     artifact = artifact.name(),
                     defect = %defect,
                     "a download this release's manifest lists is withheld",
+                );
+            }
+            if let BundleConfig::Withheld(defect) = published.verbalize() {
+                tracing::error!(
+                    dataset = %id.dataset,
+                    version = %id.version,
+                    defect = %defect,
+                    "this release's verbalization config is withheld",
                 );
             }
 
@@ -800,6 +894,24 @@ impl Release {
         &self.manifest
     }
 
+    /// The verbalization config the vector sidecar's texts were rendered
+    /// under, as `/verbalize` falls back on it: published, absent, or listed
+    /// and unusable.
+    pub fn verbalize(&self) -> BundleConfig<'_> {
+        self.manifest.verbalize()
+    }
+
+    /// The same config where this server can use it: what renders an
+    /// embedded entity's text live.
+    pub fn verbalize_config(&self) -> Option<&Arc<VerbalizeResolved>> {
+        self.manifest.verbalize_config()
+    }
+
+    /// The same config as YAML, for the verbalize form to start from.
+    pub fn verbalize_yaml(&self) -> Option<&Arc<str>> {
+        self.manifest.verbalize_yaml()
+    }
+
     /// The logical dataset identity declared by this immutable release.
     pub fn dataset_iri(&self) -> Option<&str> {
         self.manifest.parsed.dataset_iri.as_deref()
@@ -929,6 +1041,42 @@ fn offset_is_rfc_3339(text: &str) -> bool {
 }
 
 use jiff::Timestamp as Instant;
+
+/// The vector sidecar's verbalization config, resolved and as YAML, when the
+/// manifest lists one. Read at startup with the manifest, so a config that
+/// does not parse or resolve is found then, and reported naming the file,
+/// rather than by the first request that needs it. The caller withholds the
+/// config in that case; it does not refuse the release.
+fn read_verbalize_config(
+    bundle: &Path,
+    manifest: &kgf_store::Manifest,
+) -> Result<Option<Arc<BundleVerbalize>>, String> {
+    let name = kgf_store::store::artifact::VECTORS_CONFIG;
+    if !manifest.artifacts.contains_key(name) {
+        return Ok(None);
+    }
+    let path = bundle.join(name);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("reading {}: {error}", path.display()))?;
+    let config: VerbalizeConfig = serde_json::from_str(&text).map_err(|error| {
+        format!(
+            "{} is not a verbalization config: {error}; assemble the sidecar again with `kgf vectors`",
+            path.display()
+        )
+    })?;
+    let resolved = config.resolve().map_err(|error| {
+        format!(
+            "{} is not a usable verbalization config: {error}; assemble the sidecar again with `kgf vectors`",
+            path.display()
+        )
+    })?;
+    let yaml = serde_norway::to_string(&config)
+        .map_err(|error| format!("rendering {} as YAML: {error}", path.display()))?;
+    Ok(Some(Arc::new(BundleVerbalize {
+        resolved: Arc::new(resolved),
+        yaml: yaml.into(),
+    })))
+}
 
 #[cfg(test)]
 mod tests {

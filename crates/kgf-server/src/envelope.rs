@@ -483,6 +483,16 @@ pub enum ErrorCode {
     PayloadTooLarge,
     /// The server's current rate or concurrent-work capacity is exhausted.
     RateLimited,
+    /// The entity named is not an embedding target of this bundle: either
+    /// not a subject of it at all, or a subject the build gave no vector —
+    /// coverage is partial by design. Lexical `/search` and `/describe` are
+    /// the routes that answer for it.
+    ///
+    /// Distinct from `capability_not_available`, since the bundle *does*
+    /// publish `vectors`, and never an empty 200: "nothing similar" and "not
+    /// embedded" are opposite facts, and the second is permanent for the
+    /// version, so a client may cache it.
+    NotEmbedded,
     /// The bundle does not offer what the request needs.
     CapabilityNotAvailable,
     /// The server failed. Not the client's mistake, and still coded, so a
@@ -510,6 +520,7 @@ impl ErrorCode {
         Self::PayloadTooLarge,
         Self::UnsupportedMediaType,
         Self::RangeNotSatisfiable,
+        Self::NotEmbedded,
         Self::RateLimited,
         Self::InternalError,
         Self::CapabilityNotAvailable,
@@ -536,6 +547,7 @@ impl ErrorCode {
             Self::UnsupportedMediaType => ("unsupported_media_type", 415, "Unsupported Media Type"),
             Self::PayloadTooLarge => ("payload_too_large", 413, "Content Too Large"),
             Self::RangeNotSatisfiable => ("range_not_satisfiable", 416, "Range Not Satisfiable"),
+            Self::NotEmbedded => ("not_embedded", 422, "Unprocessable Content"),
             Self::RateLimited => ("rate_limited", 429, "Too Many Requests"),
             Self::InternalError => ("internal_error", 500, "Internal Server Error"),
             Self::CapabilityNotAvailable => ("capability_not_available", 501, "Not Implemented"),
@@ -1091,6 +1103,7 @@ mod tests {
                 415,
             ),
             (ErrorCode::RangeNotSatisfiable, "range_not_satisfiable", 416),
+            (ErrorCode::NotEmbedded, "not_embedded", 422),
             (ErrorCode::RateLimited, "rate_limited", 429),
             (ErrorCode::InternalError, "internal_error", 500),
             (

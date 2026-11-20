@@ -11,6 +11,8 @@
 //! three read the same [`plan::ConfigPlan`].
 
 mod execute;
+// `kgf vectors` places its one input file the way a build places an HDT.
+pub(crate) use execute::place_unhashed;
 mod hdtc;
 mod prefixes;
 

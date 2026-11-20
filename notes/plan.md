@@ -2895,10 +2895,14 @@ them written out, in dictionary lookups; `max_verbalize_roots` rank descents;
 IRIs draws `n` seeded-uniform members, the same draw `/sample` makes; a config alone is
 a *plan* — every target's member count and `n` sampled texts with length statistics,
 each text reporting `limited` (predicates sampled down to the limit: the tuning signal)
-and `truncated` (the server's bound, not a config problem). The config travels as YAML
+and `truncated` (the server's bound, not a config problem; the page calls it "cut by
+budget", and unit 42 renames the field, since "truncated" is the embedding model's
+word). The config travels as YAML
 or JSON text in a GET parameter for a browser and as a JSON body on `QUERY` (canonical)
 and `POST` (fallback), with the same fields either way. The HTML representation carries
 the config in a form, so a config can be drafted in a browser against a served bundle.
+On a bundle that publishes its own config, the form starts from it, as YAML, and leaves
+it out of the submitted URL while unchanged (2026-10-23).
 
 **Not a manifest capability.** The route needs no artifact, so declaring it would tell a
 reader of the manifest nothing about the bundle (unit 27's rule), and the manifest is a
@@ -3562,6 +3566,678 @@ from the manifest.
 - The crawler's half is not written here: resuming with `Range` and `If-Range`,
   staying within four connections, and honouring `429` with `Retry-After`.
 - Directory artifacts (`data.hdt.text`) are not exported.
+
+### 40. The `vectors/` sidecar in `kgf-store` — the id map and the mapped index ✅
+
+**Implemented 2026-10-22, on `vectors-store`.** Doc 13 §13.1's third stage, read side:
+a bundle may carry one vector per embedded entity and an ANN index over them, and a
+`Store` that opens such a bundle answers entity → record, record → entities, record →
+stored vector, record → text digest, and nearest-`k` by vector, all in id space. No
+HTTP: the routes are unit 41's. The embedding stage that produces the vectors is
+Python (`okn-indexing embed-texts`, in `../okn-embeddings`), and the build stage that
+assembles the sidecar from its output is unit 42's; this unit is the format, the
+reader, the one writer of the format, and the binding checks.
+
+**Who owns what, and why not hdtc.** Review of unit 35 proposed that hdtc own the
+sidecar format, the quantization and the index build, as it owns `sketch` and `keyset`.
+Declined, for the sidecar as a whole: the index is a third-party library's file and the
+id map carries no HDT knowledge beyond subject ids, so neither is an HDT-family format
+for hdtc's façade to define; and the library that *reads* the index at serve time has
+to be linked into `kgf-store` whatever writes it, so the one way to pin writer and
+reader together is for the same crate to do both — `--locked` then pins them as it pins
+hdtc, where a Python-written index would pair a pip-installed version with a crate
+version and be checked only at open. So `kgf build` builds the index and the id map,
+reading the embedding stage's Parquet at build time only; a server never parses
+Parquet. The Python stage's contract is texts in, vectors out, keyed by text digest —
+the digest-keyed streams unit 35's `--roots`/`--texts` already write — and it never
+sees an IRI or an id. The division falls on doc 04 §4.3's data/index line: the Parquet
+is data, recoverable only by re-running a model; the index and the id map are indexes
+over it, rebuilt from it in minutes.
+
+**The Parquet is canonical; the index is derived.** The alternative — publish the
+index alone and recover unchanged vectors from it for the next build — was rejected
+for the reason a full-text index is not a store of documents: every retrieval knob
+(dtype, connectivity, quantization) would become a one-way step, the canonical record
+would live in a library's private format, and an artifact recoverable only by GPU-days
+is data in every sense that matters. The vectors part of a bundle is ~2.7× the index
+alone at f32; it scales with embedded records, not triples.
+
+**Two files, one relation twice.** `vectors/index.usearch` holds record `i` under key
+`i`. `vectors/entities.idmap` is this crate's own format, little-endian, 8-byte-aligned
+regions after a 184-byte header: entity ids sorted with their records (binary search),
+record offsets into a grouped member list (two reads and a slice), and a 32-byte text
+digest per record. The header records the HDT's identity digest, the embedding stage's
+`convention_id`, the SHA-256 of the Parquet and of the index built from it, and the
+widest record. Subject ids only: roots are subjects. `vectors/embeddings.parquet` and `vectors/roots.parquet` (entity IRI →
+digest, for a client holding the vectors without the bundle) are listed and
+checksummed when present and never read by a server.
+
+**No second mapping site.** The usearch crate can map a file itself, and the working
+plan assumed it would, making a C++ mapping outside the audited module. It does not
+have to: `map.rs` maps the index like any artifact and hands the library the slice
+(`view_from_buffer`), which reads in place. The `unsafe` is that call, in `map.rs`, and
+its obligation — the bytes outlive the view and never change — is the published-bundle
+premise the mapping already rests on, held together as `MappedIndex` with the view
+declared before the mapping so it drops first. The library refuses a file too short for
+its nodes; the view is refused unless it accounts for exactly the file's length; an
+index that allows several vectors per key, or has removed any, is refused, and so is
+one under another metric or precision than a build writes (cosine over f16): that is
+one encoding, not a second kind of sidecar to serve. Within its length the library
+follows the neighbour counts and slots it finds without checking them, so this is the
+one artifact a corrupt copy of which is read out of bounds rather than refused. The
+`unsafe` call therefore has a second obligation, that the bytes are an index this
+library wrote, and it is met by publication, not at open: `kgf manifest` records the
+file's checksum and checks it against the digest the id map holds for its index
+(question 115).
+
+**Search contexts are the concurrency bound, and the library brings two locks.** The
+library takes a search context from a fixed pool per running search and fails — does
+not wait — when none is free, so `OpenOptions::search_contexts` reserves the pool once
+at open, at the figure the caller's admission control bounds concurrency by (default
+32, `max_concurrent_work`'s default). A context is a fixed allocation. A probe is as
+broad as the larger of the search expansion and the results wanted, times the index's
+connectivity; the expansion is this crate's constant (`SEARCH_EXPANSION`, 64), set on
+the reader because the file does not store it and the library's default could move
+under an upgrade. Rule 4 forbids locks on the read path, and the library has two.
+Leasing a context is a ring pop under its mutex; and a lookup by key, which is how a
+stored vector is read for `/vector` and for `/similar` by IRI, reads the library's key
+table under a shared lock. Neither is held across the work it guards. Accepted and
+recorded rather than hidden: they are the dependency's, not this crate's. The C++ API
+has a lock-free search (given its thread id outright) that the Rust binding does not
+expose, and no way to read a vector by slot without the key table. Removing either is
+a binding change, to make if contention ever shows.
+
+**Open of the id map is size-independent; viewing the index is not; `verify` is the
+walk.** Of the id map, open reads the header, checks the file is exactly the length
+its counts imply, reads the two sentinel offsets, and binds the identity digest to
+`data.hdt`. Of the index it checks size, width, metric and precision against the
+header and against what a build writes. The index and the id map must occur together;
+a Parquet without them is refused. Viewing the index is the part that grows: the
+library allocates, per record, the address of its node and of its vector and an entry
+in its key table, and reads every node's key from the file to fill the table. So a
+bundle with a sidecar opens in time and heap linear in its records — 51 to 65 bytes of
+heap a record, and the graph section read whole, as measured below — where every other
+artifact opens in a fixed number of reads. This unit first said open was size-independent; it is for the id map
+only (question 114). What open does not walk — ids strictly increasing and within the
+dictionary, rows in range, offsets monotone and every record non-empty, the two
+directions agreeing, the header's widest record, every index key below `records`
+present exactly once — `Vectors::verify` does, for `kgf manifest`. The accessors report
+a region that disagrees with its header as `Malformed` rather than asserting, after
+unit 35's review found one request could take the process down: open establishes the
+header and the sentinels, not the regions, so a request over a corrupt map must
+refuse, not panic.
+
+**What open costs, measured (2026-11-19).** The four calls `MappedIndex::view` makes —
+header, new, view, reserve at 32 contexts — in a standalone release build against
+usearch 2.26.5, over synthetic indexes of random unit vectors at 384 dimensions, f16,
+cosine, connectivity 16, on an Apple Silicon laptop's internal NVMe. The files came
+out at 916.6 bytes a record, as SOCKG's did.
+
+| records | index file | warm open | cold open | heap after open | heap a record |
+|---|---|---|---|---|---|
+| 100,000 | 92 MB | 3.2–3.7 ms | 89–98 ms | 6.5 MB | 65 B |
+| 250,000 | 229 MB | 9.4–10.9 ms | 258–275 ms | 13.1 MB | 53 B |
+| 1,000,000 | 917 MB | 43–45 ms | 1.0–1.7 s | 50.7 MB | 51 B |
+
+Warm is five runs with the file in the page cache. Cold is three, each on a fresh copy
+written with the cache bypassed and confirmed to have no page in memory before the
+open. Mapping the same file and reading only its header takes 5–6 µs and allocates
+nothing, which is what every other artifact's open looks like. A cold open reads the
+graph section whole — 149 bytes a record, and none of the vectors — and at a million
+records the kernel brought in 209 MB with its read-ahead. Peak footprint during a
+million-record open was 61 MB. The first search after a cold open took 300–490 ms
+against about 2 ms warm, since the vectors it compares are faulted in then. Heap a
+record is not constant, which is consistent with the library rounding its key table's
+capacity up to a power of two.
+
+Both costs grew linearly over that range. Extrapolated to 10⁷ records, and not
+measured: about 0.5 GB of heap for each open bundle, about 0.45 s to open warm, and at
+least 1.5 GB to read cold, which on this disk would be ten seconds or more. Up to
+about a million embedded records the cost is small; an order of magnitude past that, a
+cold open is long enough to time a request out. The heap is the part that accumulates:
+it is not page cache and is not reclaimed, so every open bundle's share counts against
+a pod's memory limit. A network volume will read the graph section slower than this
+disk did. These figures are the index's view alone, not the whole of `Store::open`,
+whose other artifacts add a fixed number of reads.
+
+**`kgf vectors` assembles the sidecar; `kgf manifest` verifies it.** The command takes
+the embedding stage's Parquet and the roots stream, joins them through the dictionary,
+and writes the five files into a scratch directory renamed into place, so the sidecar
+exists whole or not at all; an existing `vectors/` is never replaced, since a sidecar
+is part of a version's identity. The `parquet` and `arrow` crates are linked into the
+`kgf` binary only. It refuses, naming the line, a root whose text the embeddings do
+not hold or whose IRI is not a subject (the two files come from different runs), a
+record no root names, a Parquet in the record layout or under another metric, a digest
+held twice, and a digest that is not hex — checked for ASCII before it is sliced, so a
+bad line is refused rather than a panic. It refuses a vector the index could store but
+not compare: a NaN or infinite component, one past the f16 range, or all zeros, each of
+which would make a record's distances meaningless. And it refuses a config other than
+the one the roots were rendered under: the first root of each target is rendered again
+under `--config` and must have the digest the roots stream records, because the config
+is published as the recipe for texts this command never sees. The Parquet is copied
+into the sidecar; `--adopt` takes it instead, as `kgf build --adopt` takes an HDT — a
+hard link where the file system allows, the named file removed after publishing — so a
+published artifact never shares an inode with a file an embedding run may write again.
+The manifest is not rewritten: `kgf manifest` derives the capability from the files,
+and on both its paths walks the id map with `Vectors::verify` and checks the digests it
+records for its index and its Parquet against their checksums, beside the graph
+index's binding check, in one open of the sidecar. It also writes the capability's
+value: a description of the space, the coverage and the index for a reader without the
+bundle, read from the Parquet's footer there and never by a server (2026-10-23; see
+unit 42, where it was planned, for its fields). Every field is a fact about the
+bundle: the index's library version is the one its file header records, not the one
+the describing binary links, so a later `kgf manifest --check` by a newer build does
+not disagree with a bundle nobody changed.
+
+**The build's memory is linear in the records, and the library cannot bound it.** The
+usearch crate's `add` copies every vector in and builds the graph in memory; there is
+no external-memory build, no graph merge, and a mapped index is immutable. A build's
+peak memory is therefore the finished index — ~920 bytes a record at 384 dimensions,
+~1 GB at 10⁶ records and ~90 GB at 10⁸ — where every hdtc stage runs under
+`--memory-limit`. Known and accepted for the sizes OKN embeds today; what makes it a
+bounded risk rather than a trap is that the Parquet is canonical: a library with a
+disk-backed build replaces `index.usearch` by a rebuild from `embeddings.parquet`,
+minutes against the days a re-embed would cost (question 112).
+
+**The f16 fixed point.** A stored vector read back is the f16 the index keeps, widened;
+fed into a fresh index it is stored bit-identically, so the stored precision is a fixed
+point and the cosine metric does not renormalize on insert. `/vector` can therefore
+publish what the index compares (question 110).
+
+**Reuse across builds, in the Python stage.** Embedding is the one slow stage, and
+texts are addressed by content, so `embed-texts --reuse <earlier Parquet>` copies any
+vector whose digest it holds and embeds the rest. Gated on the model's *output*, not its
+name: twelve fixed probe texts embedded as one batch are stamped in every file, and a
+file is a source only if the current embedder reproduces them within 1e-5 — the same
+model name under a library upgrade can move every vector by far more. No cache
+directory and nothing shared across graphs: the source is a file the operator names.
+`--checkpoint DIR` writes whole parts as a run goes and a rerun reuses them, so a crash
+costs at most one part. Reused output matches a fresh run to ~1e-7, not bit for bit:
+the same text in a different batch rounds differently in the last place, which is why
+the probes are a fixed batch and the sidecar's identity is its recipe, not its bytes.
+
+*Verified by* `crates/kgf-store/src/vectors.rs`'s tests over a golden bundle given a
+sidecar by `Fixture::with_vectors` — every entity round-trips and every record maps
+back; a record is nearest its own stored vector and hits come nearest first; a query of
+the wrong width is refused; the capability and the file names are declared exactly when
+the files are present; an index without its id map is refused naming the id map, vectors
+without their index are refused, a sidecar copied beside another HDT is refused as a
+binding mismatch, an id map disagreeing with its index is refused naming both counts;
+`verify` catches each corruption open does not; the writer refuses an empty record, id
+zero and an entity named twice; and the f16 round trip — and by `map.rs`'s tests that a
+truncated index, trailing bytes and removed keys are refused at open and that as many
+searches as contexts run at once — and by `crates/kgf/tests/vectors.rs`, which takes the
+verbalizer's streams through a Parquet written as the embedding stage writes one,
+`kgf vectors`, `kgf manifest`, and the catalog, and checks the refusals of both
+commands, the never-replaced sidecar, and `kgf manifest` catching an id map whose
+parent digest or regions disagree.
+
+**Revised after review (2026-11-19).** A review that read the library's source
+(usearch 2.26.5) against this unit changed it in five places, each corrected above
+where it was stated. Open is linear in the records, not size-independent, and the
+library has two locks on the read path, not one: both were claims about the library
+made without reading it, and both are now documented as they are rather than removed,
+since no setting the Rust binding exposes avoids either. The id map is format 2: its
+header gained the SHA-256 of its index, because an index of the right size and width
+from another run opened and was accepted by `kgf manifest`, answering with other
+records' vectors. The manifest's index description takes `library_version` from the
+index's header and no longer carries `expansion_search`: both had been read from the
+describing binary, so a newer `kgf manifest --check` would have refused an untouched
+bundle, and a regenerated manifest would have named a library that did not write the
+file. And `kgf vectors` copies its Parquet unless `--adopt` is given, refuses vectors
+the index cannot compare, and checks `--config` against the roots. *Verified by* the
+store's tests that an index under another metric or precision is refused at open and
+that the sidecar reports the library in its header and this crate's expansion, and by
+`crates/kgf/tests/vectors.rs`: each uncomparable vector refused naming its row; a
+config with the roots' target and another template refused; the Parquet copied to
+another file unless adopted, and then removed; and `kgf manifest` catching both a
+changed index digest and an index of the right size from another run.
+
+### 41. `/vector` and `/similar` — the vector sidecar over HTTP ✅
+
+**Implemented 2026-10-22, on `vectors-store`.** Two routes over unit 40's store, gated on
+`vectors` as `search` is on its sidecar, each with a GET form for a browser and a JSON
+body by QUERY (canonical) or POST, each with a page, each a row in the cost table.
+
+**`/vector` is a lookup table; `/similar` is an operation.** `GET /vector?iri=` and
+`QUERY /vector {"iris": […]}` answer an array in request order, one entry per entity
+with its record and stored vector — the index's f16, widened — or `"vector": null` and
+`absent: "not_embedded" | "unknown_term"`, so a mixed batch gets one answer, as
+`/labels` gives one. `GET /similar?iri=|vector=&k=` — the vector comma-separated,
+held to `max_term_bytes` as a term is — and `QUERY /similar {"iri": …} |
+{"vector": […]}, "k"` rank the bundle's records against a vector and return the `k`
+nearest, nearest first, each with its distance (cosine, `1 − similarity`) and the
+entities whose text it is — several where identical texts share a record. An entity's
+own record is left out of its own answer. Here "not embedded" is a refusal with its
+own code: **`not_embedded`, 422** — the request is well formed and the bundle does
+publish `vectors`, which rules out `malformed_request` and `capability_not_available`;
+it is never an empty 200, because "nothing similar" and "not embedded" are opposite
+facts; and it is permanent for the version, so a client may cache it. One code for the
+two states a term can be in — not a subject of the bundle, or a subject the build gave
+no vector — with the detail naming which, since the remedy is the same: `/search` and
+`/describe`. Coverage is partial by design (a measurement node embeds as noise), and
+nothing is approximated in its place.
+
+**Bounds, as unit 35's review asked.** `k` is held to `max_similar_k` (default 100) at
+parse, and by the store to the records that exist; a batch to `max_vector_iris` (1,000);
+a vector to the bundle's width and to finite components, refused as `malformed_request`
+with the width named; a request above a cap is `cap_exceeded`. A probe is as broad as
+the larger of the search expansion (64, this implementation's constant) and the results
+wanted — `k`, or `k + 1` when an entity's own record is to be dropped — times the
+index's connectivity, so `max_similar_k` is what bounds a probe once it passes the
+expansion. The entities a record expands to are not trusted to the header's
+`max_entities_per_record`, which nothing caps: each is charged to the response's byte
+budget as it is materialized, and the answer stops there with `budget_exhausted:
+response_bytes`. A record cut that way is kept with the entities that fit, and every
+record says how many it names (`entity_count`), so a short list is visible as one. Only
+the answer's first entity is exempt, so an answer is never empty. Search contexts
+are reserved at `max_concurrent_work`, so admission is the bound the library's pool is
+sized to. Work class is ordinary: a probe is microseconds. No lock is added; the
+library's two are recorded under unit 40.
+
+**`/describe` answers the third state.** One binary search in the id map adds
+`"embedded": true|false` (and `record` when true) to a describe answer on a release that
+declares `vectors`, and its page offers "Similar by embedding" — a link to `/similar` — only
+when true: `/similar` refuses a term without a vector, and a page should not offer a
+link that fails. It is the declaration that decides, not the files a store opened:
+`/similar` is gated on the manifest, so a sidecar added without running `kgf manifest`
+again is not spoken of.
+
+**The recipe travels with the vectors.** A bundle carried vectors without the config
+that produced their texts. `kgf vectors --config` now writes `vectors/verbalize.json`
+in canonical JSON — fixed field order, sorted keys except the targets', which keep
+their written order (below) — so the same config is the same
+bytes and the artifact's checksum is the recipe's hash the unit 35 review asked for,
+covered by `content_digest` with the vectors it produced; a roots line under a target
+the config does not declare is refused. A server reads it beside the manifest at
+startup, resolved once. One that does not parse or resolve is withheld rather than
+fatal, as a download that cannot be served as listed is (unit 39): the release starts,
+`/verbalize` without a config answers 500 naming the defect, and `/describe` leaves the
+text out. A config refuses unknown fields, so a bundle written by a newer builder is
+the ordinary way to get here, and it must not keep every dataset of a deployment from
+starting. With it,
+`/verbalize` takes the bundle's config as its default by every method and refuses a
+request without one only where the bundle publishes none; and `/describe` renders an
+embedded resource's text live — the config's IRIs bound once, one existence probe per
+target to find the resource's (`Bound::target_of`; `verbalize(target, subject)` itself
+admits any subject, by design), then the one bounded walk `/verbalize` makes for a
+root — and says whether its digest is the one the id map recorded (`matches_embedded`).
+A false there means the verbalizer changed since the build, said on the page rather
+than discovered; on SOCKG a treatment's live text matches. The text is rendered once,
+on the first page of a describe, within half that page's byte budget, and what it
+takes the rows do not have, so a described resource's text and its rows share one
+bound. Where a budget cuts the text short, `matches_embedded` is left out and the page
+says the text was cut: a truncated text has another digest whatever the verbalizer is,
+and a build is never cut. The same probe makes
+`target` optional on `/verbalize`'s `iri` mode: without one, each IRI renders under the
+first target whose class it is an instance of, and the record says which; a subject no
+target claims is listed as `unclaimed`, since naming a target renders any subject under
+it by design. A target was required before only to disambiguate, and membership
+disambiguates better than the client guessing. The text is also what a
+client needs to embed a query the way the bundle embeds its entities: the recipe is a
+public config plus a public verbalizer.
+
+**A node is a root of one target: the first in the config that claims it.** A node
+typed with two targets' classes was verbalized once per target, and if the targets
+rendered it differently it had two texts, which `kgf vectors` could not join: the id
+map holds one record per entity, and its writer refused the second with bare ids.
+Giving such a node a vector per target was the alternative, and was rejected: it
+changes the id map, makes `/vector?iri=` ambiguous, and lets one node fill two of
+`/similar`'s places. The rule chosen is the one `Bound::target_of` already applied for
+`/describe`'s live text, now applied by enumeration too, so the target a page renders a
+node under is the one its vector came from. `Verbalizer::roots` skips a member that an
+earlier target claims (one existence probe per earlier target, counted in
+`Roots::claimed_before`), `kgf verbalize` reports how many it passed over, and
+`--limit` counts only the target's own roots. `/verbalize`'s `sample` and `plan` count
+a drawn member that an earlier target claims as `claimed_before` rather than rendering it,
+so the preview shows what a build would embed. The draw stays one rank descent
+plus at most one probe per earlier target, for each of at most `max_verbalize_roots`
+draws. Members stays a range width, and an exact count of a target's own roots would
+mean enumerating the class. `iris` mode under a named target still renders any subject
+there, by design. Because "first" is now meaning, the config's `targets` keep the
+order they were written in (an `IndexMap`, serialized the same way), where they
+were sorted by name before. Two targets naming one class are refused, as two profiles
+are, because the second could never own a root. `kgf vectors` names the node, and
+the lines and targets it appears under, when a roots stream from an older verbalizer
+still gives one node two texts.
+
+**`/similar`'s entities are labelled by default**, as `/search`'s subjects are: an
+entity list unlabelled names nothing. Each entity's term object carries `label` (and
+`label_source` on request) through the release's cascade with `labels`, `lang` and
+`label_source` as every labelled route takes them, under the one label allowance per
+request — an entity the allowance cannot settle ends the answer there as `candidate`,
+as a search hit's does — and `labels=false` leaves the key out.
+
+**Not here.** `filter` (over-fetch with a candidate budget against one pattern): it
+composes with what exists and is not needed for the first end-to-end run. `/export`
+of the sidecar's files — the Parquet for DuckDB, the config for a client — waits on
+the export route's vocabulary: unit 39 made it take nested names, for the filters,
+sketches and key sets a manifest lists and nothing else.
+
+**The pages (2026-10-23).** Written while using the served SOCKG bundle. `/describe`
+puts the embedded text in a collapsed toggle beside the editor, followed by "Similar by
+embedding", rather than in a section above the answer. `/verbalize` links each text to
+its root by bracketed IRI (it had passed the bare IRI, a CURIE to the parser), says its
+texts are a seeded uniform sample, offers "Draw another sample" (the next seed) and a
+link per target in the plan table (that target alone, twenty roots). The summary page —
+built from a card written with the description, which knows nothing of vectors a later
+version adds — gets from the server an "Explore verbalizations" link when the release
+publishes a config, and a closing Embeddings panel rendering the manifest's
+description, or the sidecar's counts for a manifest that predates it.
+
+**Run end to end on SOCKG (2026-10-22).** From `../okn-embeddings/graph.hdt` (27.1 M
+triples): `kgf build` with the authoring run's config, then `kgf verbalize` (1,237 roots
+over eleven targets, 1,215 distinct texts, 3.1 s), `okn-indexing embed-texts` (52 s on
+eight CPU cores, no GPU; 453 texts over the model's 256 tokens, the treatment and
+location texts the plan mode had already flagged), `kgf vectors` (0.3 s), `kgf manifest`
+and `--check`. The sidecar is 3.2 MB: Parquet 2.0 MB (1,654 B a record at f32), index
+1.1 MB (916 B a record at f16, as estimated), id map 78 KB, roots table 137 KB. Served:
+`/describe` on a treatment says embedded with its record; `/similar?k=5` answers in
+under a millisecond with five treatments at distances 0.0045–0.0137, the query's own
+record left out; a class and an unknown term refuse as `not_embedded` with their
+details; the vector `/vector` returns, sent back as a client vector, finds its own
+record at distance 0 and the same neighbour next; the pages render with the link.
+
+*Verified by* `vectors_answer_over_the_wire_and_refuse_what_is_not_embedded` in
+`crates/kgf/tests/serve.rs`: the capability in the manifest and the links in the
+descriptor for the embedded release only; one entity by GET with its stored vector;
+a batch by QUERY in order with `not_embedded` and `unknown_term` entries; neighbours
+of an entity with its own record left out and distances ascending; a client vector
+finding its record first with the shared record's two entities together; `not_embedded`
+for a subject without a vector and for a term that is not a subject; `cap_exceeded` on
+`k` and on the batch; `malformed_request` on a narrow vector and on `iri` with `vector`;
+the 501 gate on a bundle without the sidecar; and a page for each route — plus the
+methods-statement test, which now covers the gate's 501 and a 405 on the new resources.
+
+**Revised after review (2026-11-19).** Four bounds this unit stated did not hold, and
+are corrected above. `/similar` collected a record's entities before consulting the
+byte budget and exempted the whole first record, so a record naming many entities was
+unbounded work; it now charges each entity as it takes one and reports `entity_count`.
+`/describe` gave the embedded text a full byte budget of its own and rendered it on
+every page; the text now comes out of the page's budget, once. Its page read a text cut
+by a budget as a verbalizer change. And the cap's own description said a probe's
+breadth did not depend on `k`. Two behaviours changed with them: `/describe` speaks of
+vectors only where the release declares them, and a verbalization config a server
+cannot read is withheld instead of stopping startup. *Verified by* the same test — a
+record cut inside under a one-byte budget, listing one of the two entities it names;
+the text absent from a continuation page; a cut text without `matches_embedded`, and a
+page that says so — and by `a_sidecar_the_manifest_does_not_declare_is_not_spoken_of`
+and `a_verbalization_config_this_server_cannot_read_is_withheld_alone`.
+
+### 42. The vectors build stage — from a registry entry to a version with vectors
+
+Not started; the follow-up to units 40–41, kept apart on purpose. Those units made the
+sidecar and its routes work from separate commands (`kgf verbalize`, `okn-indexing
+embed-texts`, `kgf vectors`, `kgf manifest`); this one is how a build obtains its
+inputs and runs the chain, which is almost orthogonal to what the sidecar is.
+
+**Where the verbalization config lives (decided 2026-10-23): in the OKN registry, as
+its own file.** A KG's registry entry already carries small KGF settings inline under
+`frink-options.kgf` (`semantics.prefixes`, `roles`, `authoritative_namespaces`). A
+verbalization config — targets, profiles, templates, predicate lists — is larger and
+graph-specific, so it lives beside the entries as a file, and the entry names it:
+
+```yaml
+frink-options:
+  kgf:
+    semantics: { … }
+    vectors:
+      verbalize-config: verbalize/sockg.yaml   # docs/registry/verbalize/sockg.yaml
+```
+
+The registry already has this shape: `neo4j-conversion-config-path` points at a
+per-KG file under `docs/registry/neo4j-conf/`, and `queries/<kg>/` holds per-KG files
+the same way. Three consequences:
+
+- *It fits how a config is written.* A graph's first build has no config, because the
+  config is authored against a served bundle — `/schema`, `/sample`, `/describe`,
+  `/verbalize`, none of which need a local copy. A KG's maintainers can draft one
+  against the live endpoint and propose it as a registry change; that change is what
+  calls for a derived version with vectors (`kgf build --from`).
+- *The registry holds the source; the bundle holds the record.* A bundle publishes the
+  config its texts were rendered under as canonical `vectors/verbalize.json`, under the
+  manifest's checksums, so editing the registry file never changes what a published
+  version says about itself. This revises `vectors-plan.md` §5.1's "the whole bundle is
+  reproducible from one file": the build input names the config rather than inlining
+  it, and the published copy is what makes a version reproducible.
+- *A path in the registry repository, not a URL.* The neo4j entries use
+  `raw.githubusercontent.com/…/refs/heads/main/…`, a moving branch. A repo-relative
+  path keeps an entry and its config in one commit, so whatever turns
+  `frink-options.kgf` into a build can record that commit. That consumer is outside
+  this repo and must resolve the path.
+
+Nothing else per-KG goes in the entry: the model is a federation convention, a constant
+in kgf, and a config's label cascade already falls back to `semantics.roles.label`.
+The registry file stays YAML, the form `kgf verbalize --config` reads; canonical JSON is
+only the bundle's copy.
+
+**The rest of the unit** is `vectors-plan.md` §11's units 26a and 26: `kgf build
+--from <version>` deriving a version by hard-linking unchanged artifacts; a
+`contents.vectors` section in `build.yaml` naming the config file; a second runner
+shelling out to `okn-indexing embed-texts` (with `--reuse` the previous version's
+Parquet) as the first shells out to `hdtc`; and the builder image target.
+
+*Landed early, in the vectors PR:* the manifest's `vectors` description — the
+`vectors` capability's value, written by `kgf manifest` from the Parquet footer (read
+once there, never by a server), the id map, the index and the published config: model,
+`convention_id`, width, metric, normalization, `max_seq_length`, `truncated_records`,
+embedded nodes and distinct vectors, targets, and the index (usearch version, HNSW,
+f16, connectivity, search breadth). `--check` refuses a description that no longer
+matches the sidecar. The probes stay in the Parquet: twelve full vectors are too large
+for a manifest, and only reuse needs them. The summary page renders the description.
+
+Still open: whether the separate commands stay beside the build stage for the
+authoring loop, and where the streams and the embedding checkpoint live
+during a build, since a checkpoint must outlive a failed build's staging.
+
+**Which texts the model truncated (decided 2026-10-23, this unit).** The embedding
+model reads at most `max_seq_length` tokens (256 for the current model) and embeds a
+longer text from its first 256 alone. The embedding stage measures this with the
+model's own tokenizer but keeps only a total, `truncated_records` in the Parquet
+footer (453 of SOCKG's 1,215 texts), so nothing can say *which* texts were cut, and
+kgf shows not even the total yet. The change spans both repositories:
+`okn-indexing embed-texts` writes each row's token count as a column (a new footer
+`format`, and an okn-embeddings release); `kgf vectors` carries it into the sidecar —
+into the id map or a small file beside it, since the server never parses Parquet;
+and `/describe`'s embedded text says how much of it the model read and marks where
+the cut falls, with the total in the manifest's `vectors` block. `/verbalize` cannot
+know token counts without the tokenizer, so a preview can only report characters.
+
+That makes "truncated" the model's word. `/verbalize` already uses it for something
+else — a text the preview's read or byte budget stopped short — and its page now
+calls that "cut by budget"; the JSON fields (`truncated` on a record, on a target
+report, and on `/describe`'s `embedded_text`) should be renamed to match in this unit,
+before the model's meaning arrives beside them.
+
+### 43. The index a server reads in place — a proposal, and the measurements behind it
+
+Proposed 2026-11-19; not decided and not started. Unit 40 serves `/similar` through a
+library that views `index.usearch`, and its review recorded what that costs against
+this implementation's rules: heap and open time linear in the embedded records, two
+locks on the read path, and the one artifact read by code that is not safe Rust. This
+unit records what was measured to choose a replacement, what the measurements settle,
+and the change they point to.
+
+**A cap on embedded records was considered and rejected.** How much of a graph is
+embedded is for the graph and its maintainers to decide; the index's cost should not
+set it. So the question is what a sidecar of any size costs, and the first measurement
+is how large one can get. Counting statements of the commonest naming predicate in
+each bundle (`rdfs:label`, `skos:prefLabel`, `schema:name` under either scheme,
+`dcterms:title`, `foaf:name`; exact counts from `/count`) over the 50 bundles of a
+local copy of the federation:
+
+| | subjects | named |
+|---|---|---|
+| all 50 bundles | 1,313,170,186 | 659,741,054 |
+| babel | 638,232,683 | 433,226,356 |
+| geoconnex | 71,430,662 | 58,306,988 |
+| ufokn | 58,956,893 | 47,103,427 |
+| medical-device-kg | 39,949,859 | 38,908,312 |
+| scales | 171,678,070 | 24,593,501 |
+| spatialkg | 16,767,819 | 14,888,789 |
+| fiokg | 18,379,636 | 10,148,666 |
+
+Thirty-three bundles have under a million named entities, ten have one to ten million,
+and those seven have more. The count is of statements, so an entity named twice counts
+twice, and a config may embed far fewer (or, by template, entities with no name). It
+tracks practice where there is practice to compare: SOCKG has 1,284 `rdfs:label`
+statements and its sidecar embeds 1,237 roots. Tens of millions of records in one
+sidecar is therefore an ordinary case, and at unit 40's measured costs it means half a
+gigabyte of unreclaimed heap per ten million records opened and a gigabyte of build
+memory per million.
+
+**What was compared.** Three readers over the same stored vectors: usearch as unit 40
+uses it; the same graph, parsed out of usearch's saved file into fixed-width tables
+and searched by plain Rust over byte slices (a vector table by record, a level-0
+neighbour table, and the sparse upper levels); and inverted lists (spherical k-means
+on a sample, every record assigned to its nearest centroid, each list's vectors
+contiguous). The corpus is real: Ubergraph v0.0.2's `owl:Class` members verbalized by
+`kgf verbalize` — 4,669,190 members, 3,885,077 of them named nodes, 3,881,887 distinct
+texts — a uniform sample of 1,002,000 of those texts embedded with all-MiniLM-L6-v2 at
+`max_seq_length` 256, and the index built as `kgf vectors` builds it (usearch 2.26.5,
+its default connectivity 16 and build expansion, rows added one after another, f16
+under cosine). The config is an allowlist — definition, exact synonyms, taxon rank,
+gene template, three values each — written to the rules of okn-embeddings' textify
+skill and not reviewed by anyone who curates Ubergraph. Each figure is over 2,000
+queries, 20,000 neighbours judged against exact search at full precision. Three kinds
+of query, because `/similar` takes two: a vector the index has never seen (a client's
+own), a stored vector with its own record left out (a search from an entity), and a
+stored vector with its own record counted, which is how the embedding stage's own
+`eval-index` scores an index.
+
+**The reader is not the question: the tables give the library's answers.** Recall@10
+of usearch and of the plain-Rust reader over the same graph agreed to within 0.0003 in
+every run — 0.9288 and 0.9289 at a million records, 0.9521 and 0.9522 at 300,000 — at
+0.26 ms a query against the library's 0.25, with scalar scoring nobody has tuned. The
+stored f16 costs nothing measurable: exact search over the stored rows finds 0.9999 of
+the full-precision neighbours. The upper levels cannot be dropped: searching level 0
+alone lost 7 points of recall at 300,000 records and 13 at a million.
+
+**A fixed search breadth loses recall as a sidecar grows.** Recall@10 of the index as
+served today, breadth 64:
+
+| queries | 300,000 records | 1,000,000 records |
+|---|---|---|
+| a client's vector | 0.952 | 0.929 |
+| from an entity, own record left out | 0.969 | 0.947 |
+| stored, own record counted | 0.970 | 0.949 |
+
+The work did not grow — 813 vectors compared a query at 300,000 and 836 at a million —
+so the graph's cost is set by the breadth and its recall by the breadth and the size
+together. Breadth 128 gives 0.960 at a million for a client's vector and breadth 256
+gives 0.976. `SEARCH_EXPANSION` is a constant nobody chose a recall for. Two sizes do
+not make a law, so nothing here says how far recall falls at ten million.
+
+**Graph against lists, at a million records, a client's vector.** Pages are distinct
+4 KiB pages of the mapped tables a query touches; reads are the contiguous runs those
+pages fall into, which is what a cold query waits on.
+
+| reader | recall@10 | within 0.01 of the tenth | vectors compared | pages | reads | warm |
+|---|---|---|---|---|---|---|
+| graph tables, breadth 64 | 0.929 | 0.957 | 836 | 982 | 875 | 0.26 ms |
+| graph tables, breadth 128 | 0.960 | 0.981 | 1,348 | 1,618 | 1,438 | 0.45 ms |
+| graph tables, breadth 256 | 0.976 | 0.992 | 2,257 | 2,785 | 2,460 | 0.78 ms |
+| 4,096 lists, 16 probes | 0.932 | 0.973 | 10,274 | 1,177 | 18 | 1.04 ms |
+| 4,096 lists, 32 probes | 0.953 | 0.984 | 15,716 | 2,211 | 34 | 1.83 ms |
+| 4,096 lists, 64 probes | 0.969 | 0.992 | 26,096 | 4,207 | 66 | 3.34 ms |
+| 4,096 lists, 128 probes | 0.981 | 0.996 | 45,902 | 7,963 | 127 | 6.25 ms |
+
+At equal recall the lists compare twelve times the vectors at 0.93 and twenty times at
+0.98, and need 18 to 127 reads where the graph needs 875 to 2,460. Their misses are
+nearer: the third column counts answers within 0.01 cosine of the true tenth
+neighbour, and by it 8 probes (0.955, 7,378 vectors, 10 reads) come within 0.002 of
+the graph at breadth 64. From 300,000 records to a million, with the list count
+doubled and the probes held at 32, the lists kept their recall (0.951, then 0.953) and
+did 1.7 times the work (9,038 vectors, then 15,716); the longest list was eleven times
+the mean (2,679 against 244), and it is the longest list, not the mean, that a cost
+bound has to be written in. A graph's work follows its breadth and connectivity and
+not the size of the sidecar, which is the shape doc 03 §3.5 wants.
+
+**Build memory.** usearch's build peaked at 161 MB for 100,000 records, 372 MB for
+300,000 and 1,070 MB for a million (397 s single-threaded): 1.07 KB a record, above
+unit 40's 920-byte estimate. A list build that clusters a sample and then streams the
+records twice peaked at 113 MB for 100,000 records and 123 MB for 300,000, because
+what it holds is the sample. (The 100,000-record figures and both list figures are
+from the first config's vectors, below; a build's memory does not depend on what the
+vectors say.) Only the lists have a build that fits under a memory limit as it stands.
+
+**What these figures are not.** One graph, one model, one config. A first config that
+kept Ubergraph's materialized subclass closure scored one and a half to two points
+lower in every row (0.933 for a client's vector at 300,000), so a config moves recall
+as much as the kind of query does. okn-embeddings' `docs/local-vs-qdrant.md` reports
+0.984 for a 250,000-record Ubergraph corpus scored the third way, against 0.970 here
+at 300,000; the 1.4 points are unexplained (its selection of records is not recorded,
+and it used 200 queries). On synthetic clustered vectors usearch scored 0.999 and
+4,096 lists at 16 probes 0.998, which real embeddings did not bear out: no figure from
+synthetic vectors should be used to choose here. Warm times are one thread on an Apple
+Silicon laptop. Cold reads were timed only from a USB disk under macOS, whose 16 KiB
+pages and read-ahead are not a Linux server's: at equal recall the first ten queries
+averaged 172 ms for the graph and 49 ms for the lists, and nothing more should be read
+into that than its direction. The harness and its logs are kept outside this
+repository; if the proposal is taken up, its comparison of the two readers belongs
+here as the new reader's differential test.
+
+**The proposal.** Three changes, separable, in the order the evidence supports them.
+
+1. *The server reads tables this project defines, in place.* The sidecar carries the
+   vectors as a table of f16 rows addressed by record, the level-0 neighbours as a
+   table of fixed-width rows (a count and 2 × connectivity record numbers: 132 bytes
+   at connectivity 16), the upper levels as a small sorted table (6% of records have
+   one), and a header with the entry point, the widths and the bindings the id map's
+   header carries today. `kgf-store` searches them in safe Rust over mapped slices.
+   Open becomes a header and a length check; nothing is allocated per record; a search
+   allocates a visited set and two heaps, bounded by the vectors it may read, and
+   takes no lock; `/vector` reads a row at an offset, with no key table. The usearch
+   crate leaves `kgf-store` and stays in the `kgf` binary, where `kgf vectors` goes on
+   building in memory and then writes the tables from the graph it built.
+   `OpenOptions::search_contexts`, rule 4's recorded exception, the `unsafe` call that
+   hands mapped bytes to native code, and questions 114 and 115 all go with it. The
+   published bytes come out the same size, about 900 a record at 384 dimensions. One
+   coupling is new and is the build's alone: the library's API does not expose a
+   node's neighbours, so the tables are written by walking its saved file, which is
+   its private layout. That holds for one pinned version at a time, refuses a file
+   whose walk does not end at its length, and is checked by the differential test;
+   a builder of this project's own would remove it.
+2. *Breadth is a property of the bundle, chosen from measured recall.* `kgf vectors`
+   scores the index it built against exact search over a sample of its own vectors,
+   across a sweep of breadths, and the manifest's `vectors` description publishes the
+   sweep; the breadth served is the smallest that meets a federation target and is
+   recorded in the table's header, so the file states what a search of it does. The
+   embedding stage's `eval-index` already measures exactly this and writes it to its
+   own manifest; the measurement moves to where the index is built. `/similar`'s cost
+   then becomes a row doc 03 §3.5 can state and the reader can enforce: a search stops
+   at a budget of vectors read and answers with what it has. Breadth alone does not
+   bound a search — at breadth 64 the mean was 813 to 836 vectors and the largest
+   2,285, past 64 × 32 — and a budget is something the library does not offer and
+   this project's own reader can (question 118).
+3. *The graph stays the index, until a deployment measurement says otherwise.* Its
+   cost does not grow with the sidecar and its recall is a knob; the lists pay more
+   at every recall and more again at every size. What the lists have is few reads
+   when nothing is in memory and a build under a memory limit, and both are real for
+   this deployment, which serves hundreds of gigabytes from a pod with a few. So this
+   part is a lean, not a finding.
+
+**What would overturn it, and what stays open.** A cold `/similar` at breadth 64 is
+about a thousand scattered page reads, and 2,500 at breadth 256: measure that on the
+deployment's volume before the largest sidecars are built, and if it cannot be lived
+with, the lists (or a compressed copy of the vectors to navigate by, with full vectors
+read only for the final candidates) are the alternatives. The build stays linear in
+memory with a graph — a gigabyte a million records, so babel's 433 million named
+entities would take some 460 GB — and a partitioned build that writes the same tables
+is the route, unbuilt and not small; because the tables are this project's own format,
+a second builder can write them without the server changing. A second corpus of
+another kind (instance data, templated texts) and a size past a million have not been
+measured. And the recall a sidecar should meet is a number nobody has chosen.
+
+**Who owns the format.** Question 107 kept the index out of hdtc because it was a
+third-party library's file. Tables this project defines are not, and by the same rule
+their byte layout and its normative document would be hdtc's, with `hdtc::format`
+exposing the header as it does for every other artifact (question 117).
+
+**Nothing in the HTTP contract changes**, nor the id map's relations, nor the Parquet
+as the canonical vectors: the index is still derived, so this is a rebuild of each
+sidecar from `embeddings.parquet` and a manifest whose index description names another
+kind.
 
 ## Testing spine
 
@@ -4840,6 +5516,118 @@ following the code.
       and doc 05 §5.2.2's limits on the crawler should say it resumes an interrupted
       artifact by range with `If-Range`, keeps within a server's per-client download
       limit, and verifies the assembled file against the manifest.
+107. **Who builds the vectors sidecar.** Doc 04 §4.3 has components (external tools)
+    and sidecars (`kgf build` itself); doc 13 §13.1 leaves the index build to
+    measurement. Unit 40 settles it for this implementation: the model runs in Python
+    and produces the data (`embeddings.parquet`, keyed by text digest, never seeing an
+    IRI or an id); `kgf build` builds the index and the id map from it, with the crate
+    that serves them, so `--locked` pins writer and reader; hdtc owns neither, since
+    neither is an HDT-family format. Doc 13 should say the embedding stage's contract
+    is texts in, vectors out, and that the index is built by whoever serves it.
+108. **Data inside a sidecar.** The Parquet is recoverable only by re-running a model,
+    which makes it data by doc 04 §4.3's own test, yet it lives under `vectors/` beside
+    the indexes derived from it. The line is the model's output as data, the ANN
+    structure as index — and the reason an index is never the canonical store of
+    vectors (unit 40). Doc 13 §13.1 item 3 should draw it.
+109. **`convention_id` names a space; probes show it.** Doc 13 §13.3's recipe hash is
+    what two parties *say* they share. A library upgrade under the same model name
+    moves every vector, and mixing two such spaces fails silently. The embedding stage
+    now stamps twelve fixed texts' vectors into every file, and reuse across builds
+    requires the current embedder to reproduce them within a tolerance. Doc 13 should
+    make the probes part of the convention, and say that reuse — and any client
+    claiming the space — is gated on them, not on the hash.
+111. **`/vector`, `/similar`, `not_embedded`, `max_vector_iris` and `max_similar_k` are
+    additions to doc 03.** Doc 13 §13.2 sketches the two routes; doc 03's URL space,
+    error table and cap list do not have them. Unit 41 fixes the wire shapes: `/vector`
+    as an ordered array with `absent` reasons, `/similar` with `record`, `distance`,
+    `similarity` and `entities`, an entity's own record excluded, and `not_embedded` at
+    422 as the one code for a term the bundle cannot rank. Doc 03 should carry them as
+    question 97 asked for `/verbalize`, and doc 13 §13.2's `filter` stays open.
+112. **Doc 13's sizing paragraph should say what bounds the index build.** §13.1's
+    "sizing honesty" sizes the sidecar on disk; the build's memory is the other half.
+    An in-memory HNSW build (usearch, unit 40) needs RAM for the finished index, linear
+    in the records, and the library has no bounded alternative — ~90 GB at the 10⁸
+    entities §13.1 contemplates. The design's answer is already in place: with the
+    vectors canonical and the index derived, a disk-backed library (§13.1's
+    Vamana/DiskANN candidates) is a rebuild, not a re-embed. Doc 13 should say so, and
+    say the manifest names the index's library and version so a reader knows which.
+    Measured since on real vectors at 1.07 KB a record (unit 43), so nearer 107 GB at
+    10⁸.
+110. **`/vector` publishes the index's precision.** The stored vector is f16 and is a
+    fixed point of storage (unit 40); `/vector` should return exactly what the index
+    compares, with full precision available through the Parquet export. Doc 13 §13.2
+    should say which precision the route carries.
+113. **Where a KG's verbalization config lives is a deployment matter doc 13 should
+    name.** Doc 13 §13.3 treats the recipe as part of the build; it does not say where a
+    federation keeps forty of them. Unit 42 puts each in the OKN registry as a file the
+    KG's entry names, authored against the served bundle and reviewed like any registry
+    change, with the bundle's published `vectors/verbalize.json` as the record of what a
+    version used. Doc 13 (or doc 04's build inputs) should say that the config is an
+    input named by reference and the bundle's copy is canonical for that version.
+114. **Doc 20's open contract and the ANN index.** Doc 20 has open map files and
+    make a bounded number of reads whatever the bundle's size. A usearch view cannot:
+    it allocates per record and reads every node's key (unit 40), so a bundle with
+    vectors opens in time and heap linear in its embedded records, on the request that
+    first touches it and again after eviction. Measured at a million records: about
+    44 ms warm, one to two seconds cold from a local disk, and 51 MB of heap that is
+    not page cache. Either doc 20 names the exception and
+    doc 03 §3.5 carries an open cost for `vectors`, or the vectors move to a layout
+    KGF defines — a flat store of quantized vectors addressed by record, beside an
+    index that keeps no key table — which by question 107's rule would be hdtc's to
+    define and build. The second also removes the library's key-table lock. Unit 43
+    measures the second and proposes it (question 117).
+115. **A corrupt index is read out of bounds, not refused.** Every other artifact is
+    read by safe code, so the publication invariant (doc 04 §4.6: a published version
+    does not change) is all a server's memory safety rests on. `index.usearch` is read
+    by a C++ library that follows the links in the file unchecked, so it also rests on
+    the file being one that library wrote, which only a verified checksum establishes
+    and no open re-checks. Doc 04 should say that a server relies on publication-time
+    verification for this artifact in particular, and doc 13 that a vector layout
+    KGF defined would not carry the obligation.
+116. **What `/similar` and the manifest say about a search.** A probe is as broad as
+    the larger of the search expansion and the results wanted, so doc 03 §3.5's row
+    for `/similar` should be written in `max_similar_k`, not in the expansion alone.
+    The expansion is the server's setting and no file records it, so the manifest's
+    `vectors` description no longer carries it; if a consumer needs it, the service
+    descriptor is where a deployment states it. And a result now carries
+    `entity_count` beside `entities`, which a budget may cut short: doc 13 §13.2's
+    sketch of the answer should have both.
+117. **A vector index KGF defines, read in place.** Doc 13 §13.1 leaves the choice of
+    index to measurement. Unit 43 has the measurement: the graph a library builds,
+    written out as fixed-width tables (f16 vectors by record, level-0 neighbours, the
+    sparse upper levels) and searched by safe code over the mapping, returns the
+    library's own recall on real embeddings at 300,000 and at a million records, with
+    no heap per record, an open that reads a header, no lock and no native reader.
+    Proposed, not decided. If taken, doc 13 should define the tables or name the
+    document that does, doc 20's open contract needs no exception for `vectors`
+    (question 114), doc 04's reliance on publication-time verification for this
+    artifact lapses (question 115), and question 107's "hdtc owns neither" is revised
+    for the index: a layout KGF defines is an hdtc format by that question's own
+    reasoning, while the id map's ownership is unchanged. Inverted lists were measured
+    beside it and are the alternative if scattered reads prove too costly on a
+    deployment's volume: at a million records they compare twelve to twenty times the
+    vectors for the same recall, in a fiftieth to a twentieth of the reads.
+118. **Recall is something a sidecar publishes, and breadth is the bundle's.** At a
+    fixed breadth of 64, recall@10 on real embeddings fell from 0.969 to 0.947 between
+    300,000 and a million records for a search from an entity, and from 0.952 to 0.929
+    for a client's vector, while the work stayed level (unit 43). So a constant breadth
+    is a recall that silently depends on a graph's size, and nothing published says
+    what it is. Doc 13 should make measured recall against exact search part of the
+    `vectors` description, with the sample and the kind of query it was measured by,
+    and say the breadth is chosen per bundle to meet a federation target and recorded
+    with the index — revising question 116, where the expansion was the server's
+    setting and no file recorded it. Doc 03 §3.5's row for `/similar` should then be a
+    budget of vectors read that the server enforces, since breadth alone does not
+    bound a search. The target itself is a number the design has not chosen.
+119. **Doc 13's sizing should be in named entities, with no cap on what a graph
+    embeds.** §13.1 sizes for 10⁸ entities in the abstract. Counted over 50 federation
+    bundles by their naming statements, about 660 million of 1.31 billion subjects
+    carry a name, 433 million of them in one graph, and seven graphs have ten million
+    or more (unit 43). A limit on
+    embedded records was considered as a way to bound the index's cost and rejected:
+    what a graph embeds is its maintainers' choice. Doc 13 should size the sidecar,
+    its open, its queries and its build against those figures and say that each must
+    hold at any of them.
 
 ## Not in this plan
 

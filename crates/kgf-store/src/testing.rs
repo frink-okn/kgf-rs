@@ -47,6 +47,27 @@ impl Rng {
     }
 }
 
+/// Width of the vectors [`Fixture::with_vectors`] writes.
+pub const FIXTURE_DIMENSIONS: usize = 8;
+
+/// Record `n`'s vector in a [`Fixture::with_vectors`] sidecar: positive
+/// components from a seed of `n`, so records are distinct and a test can
+/// recompute the vector a record was given.
+pub fn fixture_vector(record: u64) -> Vec<f32> {
+    let mut rng = Rng::new(0x5EED_0000 + record);
+    (0..FIXTURE_DIMENSIONS)
+        .map(|_| (rng.next_u64() % 1000) as f32 / 1000.0 + 0.001)
+        .collect()
+}
+
+/// Record `n`'s text digest in a [`Fixture::with_vectors`] sidecar.
+pub fn fixture_digest(record: u64) -> [u8; 32] {
+    let mut digest = [0u8; 32];
+    digest[..8].copy_from_slice(&record.to_le_bytes());
+    digest[8..].fill(0xD1);
+    digest
+}
+
 /// Whether bit `index` of `bytes` is set, LSB-first within each byte.
 ///
 /// The one-line definition of the encoding every oracle in the crate walks.
@@ -429,6 +450,98 @@ impl Fixture {
         self
     }
 
+    /// Add a vector sidecar over `groups` of this bundle's subjects.
+    ///
+    /// Each group is one record — subjects whose texts were identical — and
+    /// the `n`th group is record `n`. Vectors are 8 wide and drawn from a
+    /// fixed seed, so which record is nearest which is the same in every run;
+    /// a record's text digest is [`fixture_digest`] of its number. Written
+    /// with the same index library and id-map writer a build uses, so the
+    /// fixture is the format a build produces. The id map records its index's
+    /// digest; the one it records for a Parquet is a placeholder, since the
+    /// fixture publishes none.
+    ///
+    /// Panics on a subject the dictionary does not hold: a fixture naming a
+    /// term that is not there would test nothing.
+    #[must_use]
+    pub fn with_vectors(self, groups: &[&[&str]]) -> Self {
+        use crate::vectors::{IdMapIdentity, IdMapRow, write_id_map};
+        use crate::{OpenOptions, Role, Store};
+
+        let bundle = crate::map::PublishedBundle::for_fixture(self.dir.path());
+        let store = Store::open(&bundle, OpenOptions::default()).expect("open fixture");
+        let rows: Vec<IdMapRow> = groups
+            .iter()
+            .enumerate()
+            .map(|(n, group)| IdMapRow {
+                digest: fixture_digest(n as u64),
+                entities: group
+                    .iter()
+                    .map(|iri| {
+                        store
+                            .dict()
+                            .locate(Role::Subject, iri.as_bytes())
+                            .expect("dictionary lookup")
+                            .unwrap_or_else(|| panic!("fixture subject {iri} is not in the bundle"))
+                    })
+                    .collect(),
+            })
+            .collect();
+        let hdt_identity = store.hdt_identity_digest();
+        drop(store);
+
+        let dir = self.dir.path().join("vectors");
+        std::fs::create_dir_all(&dir).expect("create vectors/");
+        let index = usearch::Index::new(&usearch::IndexOptions {
+            dimensions: FIXTURE_DIMENSIONS,
+            metric: usearch::MetricKind::Cos,
+            quantization: usearch::ScalarKind::F16,
+            ..Default::default()
+        })
+        .expect("new index");
+        index.reserve(groups.len()).expect("reserve");
+        for n in 0..groups.len() as u64 {
+            index.add(n, &fixture_vector(n)).expect("add vector");
+        }
+        index
+            .save(dir.join("index.usearch").to_str().unwrap())
+            .expect("save index");
+        // The id map names the index it belongs with, as a build's does, so
+        // `kgf manifest` accepts the fixture as one run's files.
+        let index_digest = hdtc::format::sha256_to_end(
+            &mut std::fs::File::open(dir.join("index.usearch")).expect("open the index"),
+        )
+        .expect("digest the index");
+
+        let mut out = std::io::BufWriter::new(
+            std::fs::File::create(dir.join("entities.idmap")).expect("create id map"),
+        );
+        write_id_map(
+            &mut out,
+            IdMapIdentity {
+                dimensions: FIXTURE_DIMENSIONS as u32,
+                hdt_identity,
+                convention_id: [0x11; 32],
+                parent_digest: [0x22; 32],
+                index_digest,
+            },
+            rows,
+        )
+        .expect("write id map");
+        std::io::Write::flush(&mut out).expect("flush id map");
+        self
+    }
+
+    /// Add the verbalization config a vector sidecar's texts were rendered
+    /// under, as `kgf vectors` writes it. The JSON is written as given.
+    #[must_use]
+    pub fn with_verbalize_config(self, json: &str) -> Self {
+        let dir = self.dir.path().join("vectors");
+        std::fs::create_dir_all(&dir).expect("create vectors/");
+        std::fs::write(dir.join("verbalize.json"), json).expect("write the config");
+        self
+    }
+
     fn build_with(source: &str, graphs: bool) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let input = dir
@@ -497,6 +610,11 @@ impl Fixture {
             crate::store::artifact::NAMESPACES,
             crate::store::artifact::SUMMARY_JSON,
             crate::store::artifact::SUMMARY_MD,
+            crate::store::artifact::VECTORS_INDEX,
+            crate::store::artifact::VECTORS_ENTITIES,
+            crate::store::artifact::VECTORS_EMBEDDINGS,
+            crate::store::artifact::VECTORS_ROOTS,
+            crate::store::artifact::VECTORS_CONFIG,
         ] {
             if !self.dir.path().join(name).exists() {
                 continue;

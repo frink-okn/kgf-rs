@@ -147,6 +147,16 @@ pub fn router(service: Arc<Service>) -> Router {
             "/{dataset}/v/{version}/verbalize",
             read_or_body(verbalize, verbalize_operation),
         )
+        // One entity by GET for a browser; a batch, or a client's own vector,
+        // by QUERY or POST.
+        .route(
+            "/{dataset}/v/{version}/vector",
+            read_or_body(vector, vector_operation),
+        )
+        .route(
+            "/{dataset}/v/{version}/similar",
+            read_or_body(similar, similar_operation),
+        )
         .fallback(no_such_route);
     let api = shared_layers(api, &service)
         // Compression sits *outside* access logging on purpose, so `bytes_out`
@@ -461,6 +471,8 @@ const VERSION_RESOURCES: &[&str] = &[
     "search",
     "terms",
     "labels",
+    "vector",
+    "similar",
     "graphs",
     "schema",
     "void",
@@ -652,7 +664,8 @@ async fn bundle_manifest(
         release.manifest().bytes(),
         release.manifest().parsed(),
         Arc::clone(release.exports()),
-    );
+    )
+    .with_verbalize_yaml(release.verbalize_yaml().cloned());
 
     // The manifest itself is already in memory, but a bundle that cannot be
     // opened must not be described as though it can: a client reads
@@ -953,6 +966,14 @@ async fn describe(
                 release.predicate_roles(),
                 &release.binding(),
             )
+            .map(|request| {
+                request.with_embedding(
+                    release.declares(Capability::Vectors),
+                    release.verbalize_config(),
+                    release.predicate_roles(),
+                    limits,
+                )
+            })
         },
         answer::describe,
     )
@@ -1336,6 +1357,109 @@ async fn labels_operation(
     .await
 }
 
+async fn vector(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate(
+        service,
+        BundleId { dataset, version },
+        AccessOperation::Vector,
+        wants,
+        |params, limits, release| {
+            capability_gate(release, Capability::Vectors)?;
+            request::Vector::parse(params, limits, release.prefixes())
+        },
+        answer::vector,
+    )
+    .await
+}
+
+async fn vector_operation(
+    service: Arc<Service>,
+    id: BundleId,
+    wants: Wants,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+    method: BodyMethod,
+) -> Result<Response, Problem> {
+    require_json(&headers)?;
+    operate_body(
+        service,
+        id,
+        AccessOperation::Vector,
+        BodyOperation {
+            wants,
+            body,
+            method,
+        },
+        |params, body, limits, release| {
+            capability_gate(release, Capability::Vectors)?;
+            request::Vector::parse_body(params, body, limits, release.prefixes())
+        },
+        answer::vector,
+    )
+    .await
+}
+
+async fn similar(
+    State(service): State<Arc<Service>>,
+    Path((dataset, version)): Path<(String, String)>,
+    wants: Wants,
+) -> Result<Response, Problem> {
+    operate(
+        service,
+        BundleId { dataset, version },
+        AccessOperation::Similar,
+        wants,
+        |params, limits, release| {
+            capability_gate(release, Capability::Vectors)?;
+            request::Similar::parse(
+                params,
+                limits,
+                release.prefixes(),
+                release.predicate_roles(),
+            )
+        },
+        answer::similar,
+    )
+    .await
+}
+
+async fn similar_operation(
+    service: Arc<Service>,
+    id: BundleId,
+    wants: Wants,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+    method: BodyMethod,
+) -> Result<Response, Problem> {
+    require_json(&headers)?;
+    operate_body(
+        service,
+        id,
+        AccessOperation::Similar,
+        BodyOperation {
+            wants,
+            body,
+            method,
+        },
+        |params, body, limits, release| {
+            capability_gate(release, Capability::Vectors)?;
+            request::Similar::parse_body(
+                params,
+                body,
+                limits,
+                release.prefixes(),
+                release.predicate_roles(),
+            )
+        },
+        answer::similar,
+    )
+    .await
+}
+
 async fn verbalize(
     State(service): State<Arc<Service>>,
     Path((dataset, version)): Path<(String, String)>,
@@ -1354,6 +1478,7 @@ async fn verbalize(
                 limits,
                 release.prefixes(),
                 release.predicate_roles(),
+                release.verbalize(),
             )
         },
         answer::verbalize,
@@ -1386,6 +1511,7 @@ async fn verbalize_operation(
                 limits,
                 release.prefixes(),
                 release.predicate_roles(),
+                release.verbalize(),
             )
         },
         answer::verbalize,
@@ -1580,7 +1706,8 @@ where
         wants.request_url.clone(),
     )
     .with_dataset_metadata(release.dataset_iri(), release.carries_description())
-    .with_declarations(release.declarations());
+    .with_declarations(release.declarations())
+    .with_verbalize_yaml(release.verbalize_yaml().cloned());
     let labels = PageLabelProfile::for_request(&service, release, representation);
     let opened = Arc::clone(&service);
     let result = blocking(service.admission(), work_class, move || {
@@ -1675,7 +1802,8 @@ where
         wants.request_url.clone(),
     )
     .with_dataset_metadata(release.dataset_iri(), release.carries_description())
-    .with_declarations(release.declarations());
+    .with_declarations(release.declarations())
+    .with_verbalize_yaml(release.verbalize_yaml().cloned());
     let opened = Arc::clone(&service);
     let result = blocking(service.admission(), work_class, move || {
         let (store, open) = opened.open_observed(target.id())?;

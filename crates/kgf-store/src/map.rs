@@ -134,6 +134,16 @@ impl PublishedBundle {
         // and leave them untouched until every derived store is dropped.
         unsafe { Self::new(dir) }
     }
+
+    /// [`Self::for_test`] for a [`crate::testing::Fixture`] built under the
+    /// `testing` feature, which owns its directory and adds artifacts only
+    /// while no store derived from it is alive.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn for_fixture(dir: &Path) -> Self {
+        // SAFETY: the fixture writes a sidecar beside the mapped artifacts,
+        // never into them, and drops every store it opened before writing.
+        unsafe { Self::new(dir) }
+    }
 }
 
 /// A catalog root whose bundle versions satisfy [`PublishedBundle`]'s invariant.
@@ -307,6 +317,183 @@ pub(crate) fn open_published(bundle: &PublishedBundle, path: &Path) -> Result<Ma
     // SAFETY: constructing `bundle` established that every artifact reachable
     // beneath this directory remains immutable for the mapping's lifetime.
     unsafe { Mapping::open(path) }
+}
+
+/// An HNSW index read in place from a mapped file.
+///
+/// The ANN library can map an index file itself, but then a second mapping
+/// site would live in C++ outside this module, over bytes nothing here had
+/// validated. Instead the file is mapped here like any other artifact and the
+/// library is handed the slice, which it reads without copying. Its view keeps
+/// a pointer into that slice, which is the first obligation `view` takes on:
+/// the bytes must outlive the view and never change.
+///
+/// Both halves are held together, view first. Fields drop in declaration
+/// order, so the view is gone before the bytes it points into are unmapped,
+/// and moving the pair moves the mapping's handle, not the mapped pages.
+/// Immutability is the published-bundle premise the mapping already rests on.
+///
+/// # What the library is trusted with
+///
+/// Every other artifact is read by safe code over a slice, so the worst a
+/// corrupt one does is a refusal. This one is read by the library's own C++,
+/// which checks that the file is long enough for every node its header
+/// declares — a truncated file is refused at open — and within that length
+/// follows the neighbour counts and slots it finds without checking them. A
+/// file of the right length holding the wrong bytes is therefore read out of
+/// bounds, not refused. That is the second obligation: the bytes must be an
+/// index this library wrote. Nothing at open can establish it. What does is
+/// the bundle's publication: `kgf vectors` writes the file with the library
+/// version this crate links, and `kgf manifest` records its SHA-256 and binds
+/// it to the id map, so a bundle whose checksums were verified when it was
+/// published carries the index its build wrote.
+///
+/// # What viewing costs
+///
+/// The vectors and the graph stay in the mapping, but the library does not
+/// address them lazily. Viewing allocates, for every record, the address of
+/// its node and of its vector and an entry in the library's key table, and
+/// reads each node's key from the file to fill that table. Open is therefore
+/// linear in the index's records, in time and in heap, and it is the one
+/// artifact whose open depends on its size.
+///
+/// Measured with version 2.26.5 of the library at 384 dimensions, a million
+/// records open in about 44 ms with the file in the page cache and in one to
+/// two seconds from a cold local disk. They leave about 51 MB of heap
+/// allocated: 51 to 65 bytes a record, stepping with the key table's
+/// capacity. That heap is not page cache and is not reclaimed. A cold open
+/// reads the graph section whole, 149 bytes a record, and none of the
+/// vectors. Mapping the file and reading its header alone takes microseconds
+/// and allocates nothing.
+pub struct MappedIndex {
+    // Declared before `mapping`: see the type's documentation.
+    index: usearch::Index,
+    mapping: Mapping,
+    written: IndexWritten,
+}
+
+/// How an index file says it was written: the facts in its header that a
+/// reader does not choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexWritten {
+    /// The library version that wrote the file, as major, minor, patch.
+    pub library_version: (u16, u16, u16),
+    /// The distance its vectors are compared under.
+    pub metric: usearch::MetricKind,
+    /// The scalar type a stored vector is held in.
+    pub quantization: usearch::ScalarKind,
+}
+
+/// Candidates one search keeps while it walks the graph, when it is asked
+/// for fewer results than this; a search for more keeps as many as it was
+/// asked for.
+///
+/// A property of the reader, not of the file: the library does not store it,
+/// so it is set here rather than left to the library's default, where an
+/// upgrade could change what a probe costs.
+pub const SEARCH_EXPANSION: usize = 64;
+
+impl std::fmt::Debug for MappedIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedIndex")
+            .field("path", &self.mapping.path())
+            .field("size", &self.index.size())
+            .field("dimensions", &self.index.dimensions())
+            .finish()
+    }
+}
+
+impl MappedIndex {
+    /// View the index file `mapping` holds, ready for `search_contexts`
+    /// concurrent searches.
+    ///
+    /// The library gives each running search a context from a fixed pool
+    /// and fails a search that finds none free, rather than waiting for one.
+    /// The pool is therefore reserved here, once, at the size the caller says
+    /// its concurrency is bounded by. A context is a fixed allocation; what
+    /// grows with the index is the view itself, as the type's documentation
+    /// says.
+    pub(crate) fn view(mapping: Mapping, search_contexts: usize) -> Result<Self> {
+        let malformed = |detail: String| Error::Malformed {
+            artifact: mapping.path().to_path_buf(),
+            detail,
+        };
+        let header = usearch::Index::metadata_from_buffer(mapping.as_bytes())
+            .map_err(|e| malformed(format!("not a readable index header: {e}")))?;
+        if header.multi || header.count_deleted != 0 {
+            return Err(malformed(format!(
+                "the index allows several vectors per key or holds {} removed ones; \
+                 a published index has exactly one vector per key",
+                header.count_deleted
+            )));
+        }
+        let index = usearch::Index::new(&usearch::IndexOptions {
+            dimensions: usize::try_from(header.dimensions)
+                .map_err(|_| malformed(format!("{} dimensions", header.dimensions)))?,
+            metric: header.metric,
+            quantization: header.quantization,
+            expansion_search: SEARCH_EXPANSION,
+            multi: false,
+            ..Default::default()
+        })
+        .map_err(|e| malformed(format!("cannot hold this index: {e}")))?;
+        let written = IndexWritten {
+            library_version: (
+                header.version_major,
+                header.version_minor,
+                header.version_patch,
+            ),
+            metric: header.metric,
+            quantization: header.quantization,
+        };
+        // SAFETY: the view keeps a pointer into the mapped bytes and follows
+        // the links it finds in them, so it needs two things.
+        //
+        // The bytes unchanged and alive for as long as it exists. Unchanged
+        // is `Mapping::open`'s own contract — whoever opened `mapping`
+        // undertook that the file does not change while the mapping lives.
+        // Alive is the field order: the mapping is moved into `Self` beside
+        // the view and declared after it, so it is unmapped only once the
+        // view is dropped.
+        //
+        // The bytes an index this library wrote, since it does not check a
+        // neighbour slot before following it. That is not established here
+        // and cannot be at open: it is the publication of the bundle, whose
+        // manifest records this file's checksum and whose id map is bound to
+        // it, as the type's documentation sets out.
+        unsafe { index.view_from_buffer(mapping.as_bytes()) }
+            .map_err(|e| malformed(format!("cannot be viewed: {e}")))?;
+        if index.serialized_length() as u64 != mapping.byte_len() {
+            return Err(malformed(format!(
+                "the index accounts for {} bytes of a {}-byte file",
+                index.serialized_length(),
+                mapping.byte_len()
+            )));
+        }
+        index
+            .reserve_capacity_and_threads(index.size(), search_contexts.max(1))
+            .map_err(|e| malformed(format!("cannot reserve search contexts: {e}")))?;
+        Ok(Self {
+            index,
+            mapping,
+            written,
+        })
+    }
+
+    /// The viewed index.
+    pub(crate) fn index(&self) -> &usearch::Index {
+        &self.index
+    }
+
+    /// What the file's header says of how it was written.
+    pub fn written(&self) -> IndexWritten {
+        self.written
+    }
+
+    /// The file this was mapped from, for error messages.
+    pub fn path(&self) -> &Path {
+        self.mapping.path()
+    }
 }
 
 /// One artifact of a published bundle, mapped whole and handed out on its own.
@@ -1058,5 +1245,123 @@ mod tests {
         let bytes = [0u8; 2];
         assert!(BitmapView::new(&bytes, 17).is_err());
         assert!(BitmapView::new(&bytes, 16).is_ok());
+    }
+
+    /// `n` distinct 8-dimensional vectors, keyed by position, saved as an
+    /// f16 cosine index the way a build writes one.
+    fn save_index(path: &Path, n: usize) -> Vec<Vec<f32>> {
+        let index = usearch::Index::new(&usearch::IndexOptions {
+            dimensions: 8,
+            metric: usearch::MetricKind::Cos,
+            quantization: usearch::ScalarKind::F16,
+            ..Default::default()
+        })
+        .unwrap();
+        index.reserve(n).unwrap();
+        let mut rng = Rng::new(7);
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|_| {
+                (0..8)
+                    .map(|_| (rng.next_u64() % 1000) as f32 / 1000.0 + 0.001)
+                    .collect()
+            })
+            .collect();
+        for (key, vector) in vectors.iter().enumerate() {
+            index.add(key as u64, vector).unwrap();
+        }
+        index.save(path.to_str().unwrap()).unwrap();
+        vectors
+    }
+
+    #[test]
+    fn a_mapped_index_answers_from_the_mapping() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.usearch");
+        let vectors = save_index(&path, 300);
+
+        let mapped = MappedIndex::view(map_fixture(&path), 4).unwrap();
+        let index = mapped.index();
+
+        assert_eq!((index.size(), index.dimensions()), (300, 8));
+        let mut stored = vec![0f32; 8];
+        assert_eq!(index.get(17, &mut stored).unwrap(), 1);
+        let matches = index.search(&stored, 1).unwrap();
+        assert_eq!(matches.keys, [17]);
+        // f16 storage: close to what was added, not equal.
+        for (got, want) in stored.iter().zip(&vectors[17]) {
+            assert!((got - want).abs() < 1e-3, "{got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn a_truncated_index_is_refused_at_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.usearch");
+        save_index(&path, 300);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+
+        let error = MappedIndex::view(map_fixture(&path), 4).unwrap_err();
+
+        assert!(matches!(error, Error::Malformed { .. }), "{error}");
+    }
+
+    #[test]
+    fn trailing_bytes_after_an_index_are_refused_at_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.usearch");
+        save_index(&path, 300);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[0; 64]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = MappedIndex::view(map_fixture(&path), 4).unwrap_err();
+
+        assert!(error.to_string().contains("accounts for"), "{error}");
+    }
+
+    #[test]
+    fn an_index_with_removed_keys_is_refused_at_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.usearch");
+        save_index(&path, 300);
+        let index = usearch::Index::new(&usearch::IndexOptions {
+            dimensions: 8,
+            metric: usearch::MetricKind::Cos,
+            quantization: usearch::ScalarKind::F16,
+            ..Default::default()
+        })
+        .unwrap();
+        index.load(path.to_str().unwrap()).unwrap();
+        index.remove(3).unwrap();
+        index.save(path.to_str().unwrap()).unwrap();
+
+        let error = MappedIndex::view(map_fixture(&path), 4).unwrap_err();
+
+        assert!(error.to_string().contains("removed"), "{error}");
+    }
+
+    #[test]
+    fn as_many_searches_as_contexts_run_at_once() {
+        // The library fails a search that finds no free context rather than
+        // waiting, so the pool reserved at open is the concurrency bound.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.usearch");
+        let vectors = save_index(&path, 300);
+        let threads = 32;
+        let mapped = MappedIndex::view(map_fixture(&path), threads).unwrap();
+
+        let barrier = std::sync::Barrier::new(threads);
+        std::thread::scope(|scope| {
+            for query in &vectors[..threads] {
+                let (mapped, barrier) = (&mapped, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..200 {
+                        mapped.index().search(query, 5).unwrap();
+                    }
+                });
+            }
+        });
     }
 }

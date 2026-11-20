@@ -14,6 +14,7 @@ kgf-store.workspace = true
 hdtc.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+indexmap.workspace = true
 sha2.workspace = true
 # Absolute-IRI validation for configs, the same parser the store uses for
 # predicate-role profiles.

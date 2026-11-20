@@ -38,6 +38,11 @@ oxiri.workspace = true
 oxrdfio.workspace = true
 tempfile.workspace = true
 same-file.workspace = true
+# Building a vectors sidecar: the embedding stage's Parquet in, the usearch
+# index and the id map out. Build-time only; see the workspace Cargo.toml.
+parquet.workspace = true
+arrow.workspace = true
+usearch.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

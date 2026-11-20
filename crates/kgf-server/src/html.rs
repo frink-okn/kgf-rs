@@ -725,6 +725,9 @@ pre code { background: none; padding: 0; word-break: normal; }
 .section-block { margin-top: 2.2rem; }
 .section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-bottom: .85rem; }
 .dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(19rem, .9fr); gap: 1rem; margin-top: 2rem; }
+.embeddings-panel { margin-top: 2rem; }
+.embeddings-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem 2rem; margin: 1rem 0; }
+.embeddings-grid h3 { margin: 0 0 .6rem; color: var(--dim); font-size: .72rem; font-weight: 650; letter-spacing: .055em; text-transform: uppercase; }
 .panel { min-width: 0; padding: 1.25rem 1.35rem; }
 .panel > h2:not(:first-child) { margin-top: 1.65rem; }
 .fields {
@@ -850,6 +853,20 @@ span.term-static { color: var(--dim); }
 .query-form[open] summary { border: 0; border-bottom: 1px solid var(--rule); border-radius: .7rem .7rem 0 0; background: var(--accent-soft); color: var(--accent); }
 .query-form form { padding: 1rem; }
 .query-form form > .note { margin-bottom: .9rem; }
+.query-form .panel-body { padding: 1rem; }
+.query-form .panel-body > .note { margin-bottom: .9rem; }
+.embedded-text { margin: 0; max-height: 28rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .82rem; line-height: 1.55; }
+.stack-link {
+  border: 1px solid var(--rule-strong);
+  border-radius: .5rem;
+  background: var(--surface);
+  color: var(--dim);
+  padding: .42rem .7rem;
+  font-size: .82rem;
+  font-weight: 650;
+  text-decoration: none;
+}
+.stack-link:hover { border-color: var(--accent); color: var(--accent); }
 .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: .85rem 1rem; margin-bottom: 1rem; }
 .form-grid > label { display: flex; min-width: 0; flex-direction: column; gap: .3rem; }
 .control-label, .choice legend { color: var(--dim); font-size: .78rem; font-weight: 550; }
@@ -889,6 +906,7 @@ footer a:hover { text-decoration: underline; }
   main { padding-block: 1.5rem 3rem; }
   .overview, .panel, .workbench { padding: 1rem; }
   .dashboard-grid { grid-template-columns: 1fr; }
+  .embeddings-grid { grid-template-columns: 1fr; }
   .answer-summary .fields { grid-template-columns: 1fr; gap: .7rem; }
   .field { grid-template-columns: 1fr; gap: .1rem; }
   .fields dd { margin-bottom: .55rem; }
@@ -902,12 +920,18 @@ footer a:hover { text-decoration: underline; }
 /// server gives those the same meaning as omission; removing them here is a
 /// progressive enhancement that also keeps the browser's address-bar URL
 /// canonical. Required controls are never empty after browser validation.
+/// A control marked `data-omit-unchanged` starts from the server's own default
+/// — the verbalize form's bundle config — so it too is removed while it still
+/// holds what the page rendered: sending it would mean the same as omitting it.
 ///
 /// This is intentionally the whole client-side layer: navigation and response
 /// rendering remain ordinary HTTP, and fixed source contains no interpolated
 /// bundle data.
 const FORM_SCRIPT: &str = "\
 document.addEventListener('formdata',event=>{\
+for(const field of event.target.querySelectorAll('[data-omit-unchanged]')){\
+if(field.value===field.defaultValue)event.formData.delete(field.name);\
+}\
 for(const [name,value] of Array.from(event.formData.entries())){\
 if(typeof value==='string'&&value==='')event.formData.delete(name);\
 }\

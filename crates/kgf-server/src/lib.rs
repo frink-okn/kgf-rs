@@ -333,6 +333,16 @@ pub struct Caps {
     pub max_verbalize_roots: u32,
     /// Child or class-relation rows in one `/schema` page.
     pub max_schema_items: u32,
+    /// Entities one `/vector` request may look up.
+    pub max_vector_iris: u32,
+    /// Neighbours one `/similar` request may ask for, which is also what
+    /// bounds its probe: a search keeps as many candidates as the larger of
+    /// the index's search expansion and the results wanted, one more than
+    /// `k` when an entity's own record is to be left out. Raising this past
+    /// the expansion raises what a probe costs with it. The entities each
+    /// record expands to are charged to the response's byte budget one by
+    /// one.
+    pub max_similar_k: u32,
 }
 
 impl Caps {
@@ -356,6 +366,8 @@ impl Caps {
             max_label_predicates: 16,
             max_verbalize_roots: 100,
             max_schema_items: 1_000,
+            max_vector_iris: 1_000,
+            max_similar_k: 100,
         }
     }
 }
@@ -423,6 +435,8 @@ impl Limits<'_> {
         rows("max_label_iris", self.caps.max_label_iris)?;
         rows("max_verbalize_roots", self.caps.max_verbalize_roots)?;
         rows("max_schema_items", self.caps.max_schema_items)?;
+        rows("max_vector_iris", self.caps.max_vector_iris)?;
+        rows("max_similar_k", self.caps.max_similar_k)?;
 
         if self.caps.default_limit > self.caps.max_limit {
             return Err(format!(
@@ -449,12 +463,14 @@ impl Limits<'_> {
             || self.caps.max_label_predicates == 0
             || self.caps.max_verbalize_roots == 0
             || self.caps.max_schema_items == 0
+            || self.caps.max_vector_iris == 0
+            || self.caps.max_similar_k == 0
         {
             return Err(
                 "caps.max_limit, caps.default_limit, caps.max_sample, caps.max_bindings, \
                  caps.max_search_predicates, caps.max_search_results, caps.max_label_iris, \
-                 caps.max_label_languages, caps.max_label_predicates, caps.max_verbalize_roots \
-                 and caps.max_schema_items must be at least 1; \
+                 caps.max_label_languages, caps.max_label_predicates, caps.max_verbalize_roots, \
+                 caps.max_schema_items, caps.max_vector_iris and caps.max_similar_k must be at least 1; \
                  a zero-width operation is not usable"
                     .to_owned(),
             );
